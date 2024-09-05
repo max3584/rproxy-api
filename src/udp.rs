@@ -1,4 +1,6 @@
-﻿
+﻿// The following algorithm is derived from the original rproxy project by glacierx.
+// Some modifications have been made to integrate it into the rproxy-api project.
+
 use std::sync::{Arc, Mutex};
 use futures::future::{try_join, try_join3};
 use std::collections::HashMap;

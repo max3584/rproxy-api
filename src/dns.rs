@@ -1,4 +1,7 @@
-﻿use async_trait::async_trait;
+﻿// The following code has been refactored from the original rproxy project by glacierx.
+// The original function signature and logic have been modified for use in rproxy-api.
+
+use async_trait::async_trait;
 use tokio::net::lookup_host;
 use std::collections::HashSet;
 use log::*;
