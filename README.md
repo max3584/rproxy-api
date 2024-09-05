@@ -37,3 +37,19 @@ nc 127.0.0.2 8888
 ```
 
 <div>このような形であれば何でも反応するようになっています。</div>
+
+---
+### About rproxy-api
+rproxy-api is a derivative of the rproxy project by glacierx. The project utilizes core functionalities from the original rproxy implementation and introduces additional features, including API server capabilities and enhanced logging.
+
+### Original Project
+- **Project Name:** rproxy
+- **Original Author:** glacierx
+- **License:** MIT License
+
+### Modifications
+- Added API server functionality for control and monitoring.
+- Enhanced logging and configuration options.
+
+### License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

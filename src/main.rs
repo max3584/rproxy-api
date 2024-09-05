@@ -1,4 +1,7 @@
-﻿mod lib;
+﻿// This section is derived from the original rproxy project by glacierx.
+// Modifications have been made to handle additional logging features and API functionality.
+
+mod lib;
 mod api;
 mod dns;
 mod tcp;

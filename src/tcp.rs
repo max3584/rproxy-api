@@ -1,4 +1,7 @@
-﻿use log::*;
+﻿// The following algorithm is derived from the original rproxy project by glacierx.
+// Some modifications have been made to integrate it into the rproxy-api project.
+
+use log::*;
 use std::sync::{Arc, Mutex};
 use futures::future::try_join;
 use tokio::io::AsyncWriteExt;
@@ -17,6 +20,7 @@ struct TCPPeerPair {
 
 impl TCPPeerPair {
 	async fn run(mut self) -> Result<(), std::io::Error>{
+		// Algorithm implementation with necessary modifications
 		// let mut outbound = TcpStream::connect(self.remote.clone()).await?;
 
 		// let (mut ri, mut wi) = self.client.split();
@@ -83,6 +87,7 @@ impl TCPProxy {
 	}
 
 	pub async fn run(mut self) -> Result<(), std::io::Error> {
+		// Algorithm implementation with necessary modifications
 		self.resolve().await.unwrap();
 		let stop_signal = Arc::clone(&self.stop);
 		let remote_signal = Arc::clone(&self.remote);
