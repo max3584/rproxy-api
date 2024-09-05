@@ -1,11 +1,11 @@
 [package]
-name = "forward"
-version = "0.1.0"
+name = "rproxy-api"
+version = "0.0.1"
 edition = "2021"
 authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
 description = "Platform independent asynchronous UDP/TCP proxy"
-homepage = "https://github.com/glacierx/rproxy"
-repository = "https://github.com/glacierx/rproxy"
+homepage = "https://github.com/max3584/rproxy-api"
+repository = "https://github.com/max3584/rproxy-api"
 fork_repositry = "https://github.com/glacierx/rproxy"
 readme = "README.md"
 keywords = ["proxy", "TCP", "UDP", "async","openvpn"]
