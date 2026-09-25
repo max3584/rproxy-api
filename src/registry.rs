@@ -383,10 +383,13 @@ impl Registry {
 		}
 		let tls_changed = req.tls.is_some();
 		if let Some(tls) = req.tls {
-			tlsconf::validate(key.protocol, &tls, req.starttls)?;
+			tlsconf::validate_range(key.protocol, &tls, req.starttls, spec.port_count)?;
+			if req.starttls.is_none() && req.starttls_required == Some(false) {
+				return Err(ApiError::invalid("starttls_required needs starttls"));
+			}
 			spec.tls = tls;
 			spec.starttls = req.starttls;
-			spec.starttls_required = req.starttls_required.unwrap_or(true);
+			spec.starttls_required = req.starttls != Some(crate::tlsconf::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
 		}
 		let prepared = self.prepare(&spec).await?;
 
