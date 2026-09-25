@@ -28,7 +28,11 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/tcp.rs` / `src/udp.rs` | データプレーン。停止は `CancellationToken`、転送先は `watch` で受け取る |
 | `src/proxy.rs` | ルールごとの実行時状態 `Runtime`（トークン、watch、統計、`TaskTracker`） |
 | `src/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
-| `src/source.rs` | PROXY protocol v1/v2 ヘッダ、`IP_TRANSPARENT` ソケット、その可否の判定 |
+| `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
+| `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / webrtc-dtls の設定の組み立て（`TlsRuntime`） |
+| `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni`。読んだバイトは転送先へそのまま送る） |
+| `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
+| `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを webrtc-dtls に渡す `Conn` |
 | `src/rule.rs` | ルールの型と検証 |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |
@@ -46,6 +50,13 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
+
+## TLS まわりの約束
+
+- 証明書ファイルは作成・変更・SIGHUP のときだけ読む。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う。
+- STARTTLS では、STARTTLS への応答より前に届いた余分なデータを受け付けない（コマンドの紛れ込み対策）。
+- WebRTC のメディア（DTLS-SRTP）は終端できない（SDP のフィンガープリントに結びついているため）。docs/PROFILES.md に書いてあるとおり passthrough で流す。
+- 設定の例と用途別の推奨は `docs/PROFILES.md`。UI のプロファイルもこれに合わせる。
 
 ## 注意点
 

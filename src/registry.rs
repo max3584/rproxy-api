@@ -2,24 +2,25 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use socket2::{Domain, Socket, Type};
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use crate::error::ApiError;
-use crate::proxy::{Runtime, Stats};
+use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Key, Protocol, RuleRequest, RuleSpec, RuleView, State, UpdateRequest,
+	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleView, State, UpdateRequest,
 };
+use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
 use crate::{tcp, udp};
 
 pub struct Config {
@@ -27,7 +28,11 @@ pub struct Config {
 	pub lookup: Lookup,
 	/// Whether `source_ip: transparent` may be used.
 	pub transparent: bool,
+	/// Largest port range one rule may open.
+	pub max_range_ports: u16,
 }
+
+type Resolver = (CancellationToken, JoinHandle<()>);
 
 struct Running {
 	generation: u64,
@@ -35,7 +40,8 @@ struct Running {
 	rt: Arc<Runtime>,
 	target_tx: Arc<watch::Sender<Vec<SocketAddr>>>,
 	idle_tx: watch::Sender<Duration>,
-	resolver: Option<(CancellationToken, JoinHandle<()>)>,
+	resolver: Option<Resolver>,
+	route_resolvers: Vec<Resolver>,
 	supervisor: JoinHandle<()>,
 }
 
@@ -45,6 +51,12 @@ impl Running {
 			cancel.cancel();
 			task
 		})
+	}
+
+	fn stop_route_resolvers(&mut self) {
+		for (cancel, _) in self.route_resolvers.drain(..) {
+			cancel.cancel();
+		}
 	}
 }
 
@@ -61,6 +73,13 @@ enum Entry {
 }
 
 impl Entry {
+	fn spec(&self) -> &RuleSpec {
+		match self {
+			Entry::Running(r) => &r.spec,
+			Entry::Failed(f) => &f.spec,
+		}
+	}
+
 	fn view(&self) -> RuleView {
 		match self {
 			Entry::Running(r) => RuleView::new(
@@ -75,14 +94,21 @@ impl Entry {
 	}
 }
 
+/// What a rule needs before it can listen: resolved targets and TLS settings.
+struct Prepared {
+	addrs: Vec<SocketAddr>,
+	routes: Vec<(Route, Vec<SocketAddr>)>,
+	tls: Arc<TlsRuntime>,
+}
+
 pub struct Registry {
 	cfg: Config,
 	rules: Mutex<HashMap<Key, Entry>>,
 	next_generation: AtomicU64,
 }
 
-fn bind_error(key: &Key, e: std::io::Error) -> ApiError {
-	ApiError::bind_failed(format!("{}: {e}", key.listen))
+fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
+	ApiError::bind_failed(format!("{addr}: {e}"))
 }
 
 fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
@@ -113,9 +139,29 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 		.unwrap_or_else(|| "unknown panic".into())
 }
 
+/// Two rules clash when they share a protocol, ports and an address (or a wildcard).
+fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
+	let (ai, bi): (IpAddr, IpAddr) = (a.key.listen.ip(), b.key.listen.ip());
+	let same_ip = ai == bi || ai.is_unspecified() || bi.is_unspecified();
+	let (a0, b0) = (u32::from(a.key.listen.port()), u32::from(b.key.listen.port()));
+	let (a1, b1) = (a0 + u32::from(a.port_count) - 1, b0 + u32::from(b.port_count) - 1);
+	a.key.protocol == b.key.protocol && same_ip && a0 <= b1 && b0 <= a1
+}
+
+fn route_spec(route: &Route) -> String {
+	match route.remote_addr.parse::<IpAddr>() {
+		Ok(IpAddr::V6(ip)) => SocketAddr::new(IpAddr::V6(ip), route.remote_port).to_string(),
+		_ => format!("{}:{}", route.remote_addr, route.remote_port),
+	}
+}
+
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
 		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1) })
+	}
+
+	pub fn caps(&self) -> Caps {
+		Caps { transparent: self.cfg.transparent, max_range_ports: self.cfg.max_range_ports }
 	}
 
 	pub fn transparent_available(&self) -> bool {
@@ -139,35 +185,57 @@ impl Registry {
 
 	fn spawn_resolver(
 		&self,
-		spec: &RuleSpec,
+		key: Key,
+		host: &str,
+		target: String,
 		tx: &Arc<watch::Sender<Vec<SocketAddr>>>,
-	) -> Option<(CancellationToken, JoinHandle<()>)> {
-		if resolve::is_ip_literal(&spec.remote_host) {
+	) -> Option<Resolver> {
+		if resolve::is_ip_literal(host) {
 			return None;
 		}
 		let cancel = CancellationToken::new();
-		let task = resolve::spawn_refresh(
-			spec.key,
-			spec.remote(),
-			self.cfg.lookup.clone(),
-			self.cfg.dns_interval,
-			tx.clone(),
-			cancel.clone(),
-		);
+		let task = resolve::spawn_refresh(key, target, self.cfg.lookup.clone(), self.cfg.dns_interval, tx.clone(), cancel.clone());
 		Some((cancel, task))
 	}
 
-	/// Binds the listener and starts serving. Called with the rules lock held.
-	fn start(self: &Arc<Self>, spec: RuleSpec, addrs: Vec<SocketAddr>) -> Result<Running, ApiError> {
+	/// Resolves targets and reads certificates, without holding the rules lock.
+	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
+		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.tls, spec.starttls, spec.starttls_required)?);
+		let addrs = resolve::resolve(&self.cfg.lookup, &spec.remote()).await?;
+		let mut routes = vec![];
+		for route in &spec.tls.routes {
+			routes.push((route.clone(), resolve::resolve(&self.cfg.lookup, &route_spec(route)).await?));
+		}
+		Ok(Prepared { addrs, routes, tls })
+	}
+
+	fn install_routes(&self, key: Key, routes: Vec<(Route, Vec<SocketAddr>)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
+		let mut targets = vec![];
+		let mut resolvers = vec![];
+		for (route, addrs) in routes {
+			let (tx, rx) = watch::channel(addrs);
+			// the resolver task keeps the sender; without one the last value stays readable
+			resolvers.extend(self.spawn_resolver(key, &route.remote_addr, route_spec(&route), &Arc::new(tx)));
+			targets.push(RouteTarget { pattern: route.server_name.clone(), host: route.remote_addr.clone(), target: rx });
+		}
+		(Arc::new(targets), resolvers)
+	}
+
+	/// Binds every port of the rule and starts serving. Called with the rules lock held.
+	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
 		let key = spec.key;
-		let (target_tx, target_rx) = watch::channel(addrs);
+		let (target_tx, target_rx) = watch::channel(prepared.addrs);
 		let target_tx = Arc::new(target_tx);
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
+		let (routes, route_resolvers) = self.install_routes(key, prepared.routes);
 		let kill = CancellationToken::new();
 		let rt = Arc::new(Runtime {
 			key,
 			source_ip: spec.source_ip,
 			target: target_rx,
+			remote_host: RwLock::new(spec.remote_host.clone()),
+			routes: RwLock::new(routes),
+			tls: RwLock::new(prepared.tls),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -175,40 +243,70 @@ impl Registry {
 			tracker: TaskTracker::new(),
 		});
 
-		let serve = match key.protocol {
+		// bind everything first so a failure leaves nothing half-open
+		let mut set = JoinSet::new();
+		match key.protocol {
 			Protocol::Tcp => {
-				let listener = bind_tcp(key.listen).map_err(|e| bind_error(&key, e))?;
-				tokio::spawn(tcp::serve(listener, rt.clone()))
+				let mut listeners = vec![];
+				for offset in 0..spec.port_count {
+					let addr = crate::proxy::shifted(key.listen, offset);
+					listeners.push(bind_tcp(addr).map_err(|e| bind_error(addr, e))?);
+				}
+				for (offset, l) in listeners.into_iter().enumerate() {
+					set.spawn(tcp::serve(l, rt.clone(), offset as u16));
+				}
 			}
 			Protocol::Udp => {
-				let socket = bind_udp(key.listen).map_err(|e| bind_error(&key, e))?;
-				tokio::spawn(udp::serve(socket, rt.clone()))
+				let mut sockets = vec![];
+				for offset in 0..spec.port_count {
+					let addr = crate::proxy::shifted(key.listen, offset);
+					sockets.push(bind_udp(addr).map_err(|e| bind_error(addr, e))?);
+				}
+				for (offset, s) in sockets.into_iter().enumerate() {
+					set.spawn(udp::serve(s, rt.clone(), offset as u16));
+				}
 			}
-		};
+		}
+		let stop = rt.stop.clone();
+		let serve = tokio::spawn(async move {
+			while let Some(done) = set.join_next().await {
+				match done {
+					Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+					// one listener ending on its own fails the whole rule
+					_ if !stop.is_cancelled() => return,
+					_ => {}
+				}
+			}
+		});
 
 		let generation = self.generation();
 		let supervisor = tokio::spawn(supervise(Arc::downgrade(self), key, generation, rt.clone(), serve));
-		let resolver = self.spawn_resolver(&spec, &target_tx);
-		Ok(Running { generation, spec, rt, target_tx, idle_tx, resolver, supervisor })
+		let resolver = self.spawn_resolver(key, &spec.remote_host, spec.remote(), &target_tx);
+		Ok(Running { generation, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
-		let addrs = resolve::resolve(&self.cfg.lookup, &spec.remote()).await?;
+		let prepared = self.prepare(&spec).await?;
 		let mut rules = self.rules.lock().await;
 		if rules.contains_key(&spec.key) {
 			return Err(ApiError::already_exists(spec.key.to_string()));
 		}
+		if let Some((other, _)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
+			return Err(ApiError::already_exists(format!("{} overlaps with {other}", spec.key)));
+		}
 		let key = spec.key;
-		let entry = Entry::Running(self.start(spec, addrs)?);
+		let entry = Entry::Running(self.start(spec, prepared)?);
 		let view = entry.view();
 		rules.insert(key, entry);
 		info!(event = "rule.create", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
-			source_ip = view.source_ip, resolved = ?view.resolved);
+			ports = view.listen_port_end.map(|e| e - view.listen_port + 1).unwrap_or(1),
+			source_ip = view.source_ip, tls = ?view.tls.mode, starttls = view.starttls.map(|s| s.as_str()).unwrap_or(""),
+			resolved = ?view.resolved);
 		Ok(view)
 	}
 
 	pub async fn create(self: &Arc<Self>, req: RuleRequest) -> Result<RuleView, ApiError> {
-		let spec = req.validate(self.cfg.transparent)?;
+		let spec = req.validate(&self.caps())?;
 		self.create_spec(spec).await
 	}
 
@@ -221,32 +319,51 @@ impl Registry {
 
 		let mut spec = {
 			let rules = self.rules.lock().await;
-			match rules.get(key) {
-				Some(Entry::Running(r)) => r.spec.clone(),
-				Some(Entry::Failed(f)) => f.spec.clone(),
-				None => return Err(ApiError::not_found(key.to_string())),
-			}
+			rules.get(key).map(|e| e.spec().clone()).ok_or_else(|| ApiError::not_found(key.to_string()))?
 		};
 		if req.source_ip.is_some_and(|s| s != spec.source_ip) {
 			return Err(ApiError::unsupported("source_ip cannot be changed; delete and re-create the rule"));
+		}
+		if let Some(end) = req.listen_port_end {
+			if end != key.listen.port() + spec.port_count - 1 {
+				return Err(ApiError::unsupported("the port range cannot be changed; delete and re-create the rule"));
+			}
+		}
+		if u32::from(req.remote_port) + u32::from(spec.port_count) - 1 > 65_535 {
+			return Err(ApiError::invalid("remote_port + range length exceeds 65535"));
 		}
 		spec.remote_host = remote_host;
 		spec.remote_port = req.remote_port;
 		if let Some(idle) = udp_idle {
 			spec.udp_idle = idle;
 		}
-		let addrs = resolve::resolve(&self.cfg.lookup, &spec.remote()).await?;
+		let tls_changed = req.tls.is_some();
+		if let Some(tls) = req.tls {
+			tlsconf::validate(key.protocol, &tls, req.starttls)?;
+			spec.tls = tls;
+			spec.starttls = req.starttls;
+			spec.starttls_required = req.starttls_required.unwrap_or(true);
+		}
+		let prepared = self.prepare(&spec).await?;
 
 		let mut rules = self.rules.lock().await;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
 				let host_changed = r.spec.remote_host != spec.remote_host || r.spec.remote_port != spec.remote_port;
-				r.target_tx.send_replace(addrs);
+				r.target_tx.send_replace(prepared.addrs);
 				r.idle_tx.send_replace(spec.udp_idle);
+				*r.rt.remote_host.write().unwrap() = spec.remote_host.clone();
 				if host_changed {
 					r.stop_resolver();
-					r.resolver = self.spawn_resolver(&spec, &r.target_tx);
+					r.resolver = self.spawn_resolver(*key, &spec.remote_host, spec.remote(), &r.target_tx);
+				}
+				if tls_changed {
+					*r.rt.tls.write().unwrap() = prepared.tls;
+					r.stop_route_resolvers();
+					let (routes, resolvers) = self.install_routes(*key, prepared.routes);
+					*r.rt.routes.write().unwrap() = routes;
+					r.route_resolvers = resolvers;
 				}
 				r.spec = spec;
 			}
@@ -255,7 +372,7 @@ impl Registry {
 					retry.abort();
 				}
 				f.spec = spec.clone();
-				match self.start(spec, addrs) {
+				match self.start(spec, prepared) {
 					Ok(running) => *entry = Entry::Running(running),
 					Err(e) => {
 						f.error = e.message.clone();
@@ -266,8 +383,32 @@ impl Registry {
 		}
 		let view = entry.view();
 		info!(event = "rule.update", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
-			udp_idle_secs = view.udp_idle_secs, resolved = ?view.resolved);
+			udp_idle_secs = view.udp_idle_secs, tls = ?view.tls.mode, resolved = ?view.resolved);
 		Ok(view)
+	}
+
+	/// Re-reads certificate files for every rule that uses them (SIGHUP).
+	/// A rule whose files are now broken keeps its current certificates.
+	pub async fn reload_tls(&self) -> (usize, usize) {
+		let rules = self.rules.lock().await;
+		let (mut ok, mut failed) = (0, 0);
+		for (key, entry) in rules.iter() {
+			let Entry::Running(r) = entry else { continue };
+			if r.spec.tls.mode != TlsMode::Terminate {
+				continue;
+			}
+			match TlsRuntime::build(key.protocol, &r.spec.tls, r.spec.starttls, r.spec.starttls_required) {
+				Ok(tls) => {
+					*r.rt.tls.write().unwrap() = Arc::new(tls);
+					ok += 1;
+				}
+				Err(e) => {
+					failed += 1;
+					warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
+				}
+			}
+		}
+		(ok, failed)
 	}
 
 	/// Stops a rule. Returns once the listener is closed and every connection has ended.
@@ -290,6 +431,7 @@ impl Registry {
 				if let Some(task) = r.stop_resolver() {
 					let _ = task.await;
 				}
+				r.stop_route_resolvers();
 				let _ = r.supervisor.await;
 			}
 		}
@@ -302,7 +444,7 @@ impl Registry {
 	pub async fn restore(self: &Arc<Self>, reqs: Vec<RuleRequest>) {
 		let (mut started, mut failed) = (0, 0);
 		for req in reqs {
-			let spec = match req.clone().validate(self.cfg.transparent) {
+			let spec = match req.clone().validate(&self.caps()) {
 				Ok(spec) => spec,
 				Err(e) => {
 					failed += 1;
@@ -350,17 +492,19 @@ impl Registry {
 		let _ = writeln!(out, "rproxy_rules{{state=\"running\"}} {running}");
 		let _ = writeln!(out, "rproxy_rules{{state=\"failed\"}} {}", rules.len() - running);
 
-		let mut lines: [(&str, &str, &str, Vec<String>); 4] = [
+		let mut lines: [(&str, &str, &str, Vec<String>); 5] = [
 			("rproxy_rule_up", "gauge", "1 if the rule is running.", vec![]),
 			("rproxy_connections", "gauge", "Open TCP connections or UDP sessions.", vec![]),
 			("rproxy_connections_total", "counter", "TCP connections or UDP sessions handled.", vec![]),
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
+			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
 		];
 		for (key, entry) in rules.iter() {
 			let labels = format!("protocol=\"{}\",listen=\"{}\"", key.protocol, key.listen);
 			match entry {
 				Entry::Running(r) => {
 					let s = &r.rt.stats;
+					lines[4].3.push(format!("{{{labels}}} {}", s.tls_failures.load(Ordering::Relaxed)));
 					lines[0].3.push(format!("{{{labels}}} 1"));
 					lines[1].3.push(format!("{{{labels}}} {}", s.active.load(Ordering::Relaxed)));
 					lines[2].3.push(format!("{{{labels}}} {}", s.total.load(Ordering::Relaxed)));
@@ -400,6 +544,7 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 	if let Some(Entry::Running(r)) = rules.get_mut(&key) {
 		if r.generation == generation {
 			r.stop_resolver();
+			r.stop_route_resolvers();
 			let spec = r.spec.clone();
 			rules.insert(key, Entry::Failed(Failed { generation, spec, error, retry: None }));
 		}
@@ -411,14 +556,25 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 		let Some(interval) = registry.upgrade().map(|r| r.cfg.dns_interval) else { return };
 		tokio::time::sleep(interval).await;
 		let Some(registry) = registry.upgrade() else { return };
-		let Ok(addrs) = resolve::resolve(&registry.cfg.lookup, &spec.remote()).await else { continue };
+		let prepared = match registry.prepare(&spec).await {
+			Ok(p) => p,
+			Err(e) if e.code == "resolve_failed" => continue,
+			Err(e) => {
+				error!(event = "rule.failed", rule = %spec.key, error = %e.message, phase = "retry");
+				if let Some(Entry::Failed(f)) = registry.rules.lock().await.get_mut(&spec.key) {
+					f.error = e.message;
+					f.retry = None;
+				}
+				return;
+			}
+		};
 
 		let mut rules = registry.rules.lock().await;
 		let current = matches!(rules.get(&spec.key), Some(Entry::Failed(f)) if f.generation == generation);
 		if !current {
 			return;
 		}
-		match registry.start(spec.clone(), addrs) {
+		match registry.start(spec.clone(), prepared) {
 			Ok(running) => {
 				info!(event = "rule.create", rule = %spec.key, phase = "retry");
 				rules.insert(spec.key, Entry::Running(running));
@@ -445,6 +601,7 @@ mod tests {
 			dns_interval: Duration::from_secs(30),
 			lookup: resolve::system_lookup(),
 			transparent: false,
+			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
 		})
 	}
 

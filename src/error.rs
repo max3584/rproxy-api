@@ -28,6 +28,10 @@ impl ApiError {
 		Self::new(StatusCode::BAD_REQUEST, "unsupported", message)
 	}
 
+	pub fn tls_config(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::BAD_REQUEST, "tls_config", message)
+	}
+
 	pub fn not_found(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::NOT_FOUND, "not_found", message)
 	}

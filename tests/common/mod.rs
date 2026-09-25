@@ -1,6 +1,8 @@
 //! Shared test harness: a real control API on loopback plus echo backends.
 #![allow(dead_code)]
 
+pub mod pki;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -52,6 +54,7 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 		dns_interval: Duration::from_millis(100),
 		lookup: fake_lookup(names.clone()),
 		transparent: false,
+		max_range_ports: rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS,
 	});
 	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens) }));
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

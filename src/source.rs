@@ -28,26 +28,72 @@ pub fn proxy_v1_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
 	}
 }
 
+/// What a terminated TLS session tells the backend (PROXY v2 TLVs).
+#[derive(Clone, Debug, Default)]
+pub struct TlsInfo {
+	pub server_name: Option<String>,
+	pub alpn: Option<String>,
+	pub version: Option<String>,
+	/// Common name of a verified client certificate.
+	pub client_cn: Option<String>,
+	/// The client sent a certificate (it was verified, or the handshake would have failed).
+	pub client_cert: bool,
+}
+
+const PP2_TYPE_ALPN: u8 = 0x01;
+const PP2_TYPE_AUTHORITY: u8 = 0x02;
+const PP2_TYPE_SSL: u8 = 0x20;
+const PP2_SUBTYPE_SSL_VERSION: u8 = 0x21;
+const PP2_SUBTYPE_SSL_CN: u8 = 0x22;
+const PP2_CLIENT_SSL: u8 = 0x01;
+const PP2_CLIENT_CERT_CONN: u8 = 0x02;
+
+fn tlv(out: &mut Vec<u8>, kind: u8, value: &[u8]) {
+	out.push(kind);
+	out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+	out.extend_from_slice(value);
+}
+
+fn tls_tlvs(info: &TlsInfo) -> Vec<u8> {
+	let mut out = vec![];
+	if let Some(alpn) = &info.alpn {
+		tlv(&mut out, PP2_TYPE_ALPN, alpn.as_bytes());
+	}
+	if let Some(name) = &info.server_name {
+		tlv(&mut out, PP2_TYPE_AUTHORITY, name.as_bytes());
+	}
+	let mut ssl = vec![PP2_CLIENT_SSL | if info.client_cert { PP2_CLIENT_CERT_CONN } else { 0 }];
+	ssl.extend_from_slice(&0u32.to_be_bytes()); // verify: 0 = verified (or no certificate)
+	if let Some(version) = &info.version {
+		tlv(&mut ssl, PP2_SUBTYPE_SSL_VERSION, version.as_bytes());
+	}
+	if let Some(cn) = &info.client_cn {
+		tlv(&mut ssl, PP2_SUBTYPE_SSL_CN, cn.as_bytes());
+	}
+	tlv(&mut out, PP2_TYPE_SSL, &ssl);
+	out
+}
+
 /// PROXY protocol v2 (binary) header for a TCP connection.
 pub fn proxy_v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+	proxy_v2_header_with(src, dst, None)
+}
+
+/// PROXY protocol v2 header, carrying TLS details when rproxy terminated TLS.
+pub fn proxy_v2_header_with(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>) -> Vec<u8> {
+	let tlvs = tls.map(tls_tlvs).unwrap_or_default();
 	let mut out = V2_SIGNATURE.to_vec();
 	out.push(0x21); // version 2, PROXY command
-	match (src.ip(), dst.ip()) {
-		(IpAddr::V4(s), IpAddr::V4(d)) => {
-			out.push(0x11); // AF_INET, STREAM
-			out.extend_from_slice(&12u16.to_be_bytes());
-			out.extend_from_slice(&s.octets());
-			out.extend_from_slice(&d.octets());
-		}
-		(s, d) => {
-			out.push(0x21); // AF_INET6, STREAM
-			out.extend_from_slice(&36u16.to_be_bytes());
-			out.extend_from_slice(&to_v6(s).octets());
-			out.extend_from_slice(&to_v6(d).octets());
-		}
-	}
+	let (family, addrs) = match (src.ip(), dst.ip()) {
+		(IpAddr::V4(s), IpAddr::V4(d)) => (0x11, [s.octets().to_vec(), d.octets().to_vec()].concat()),
+		(s, d) => (0x21, [to_v6(s).octets().to_vec(), to_v6(d).octets().to_vec()].concat()),
+	};
+	out.push(family); // AF_INET or AF_INET6, STREAM
+	out.extend_from_slice(&((addrs.len() + 4 + tlvs.len()) as u16).to_be_bytes());
+	out.extend_from_slice(&addrs);
 	out.extend_from_slice(&src.port().to_be_bytes());
 	out.extend_from_slice(&dst.port().to_be_bytes());
+	out.extend_from_slice(&tlvs);
 	out
 }
 
@@ -130,6 +176,26 @@ mod tests {
 		assert_eq!(&h[16..20], &[192, 0, 2, 1]);
 		assert_eq!(&h[20..24], &[198, 51, 100, 1]);
 		assert_eq!(&h[24..], &[0x13, 0x88, 0x00, 0x50]);
+	}
+
+	#[test]
+	fn v2_header_carries_tls_tlvs() {
+		let info = TlsInfo {
+			server_name: Some("mail.example".into()),
+			alpn: None,
+			version: Some("TLSv1_3".into()),
+			client_cn: Some("alice".into()),
+			client_cert: true,
+		};
+		let h = proxy_v2_header_with("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), Some(&info));
+		let len = u16::from_be_bytes([h[14], h[15]]) as usize;
+		assert_eq!(h.len(), 16 + len);
+		let tlvs = &h[28..];
+		assert_eq!(tlvs[0], PP2_TYPE_AUTHORITY);
+		assert_eq!(&tlvs[3..15], b"mail.example");
+		assert_eq!(tlvs[15], PP2_TYPE_SSL);
+		assert_eq!(tlvs[18], PP2_CLIENT_SSL | PP2_CLIENT_CERT_CONN);
+		assert!(h.windows(5).any(|w| w == b"alice"));
 	}
 
 	#[test]
