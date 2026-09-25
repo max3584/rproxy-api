@@ -113,6 +113,7 @@ async fn session(
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += data.len() as u64;
+					rt.stats.add_rx(data.len() as u64);
 					deadline = tokio::time::Instant::now() + idle;
 				}
 				None => break "closed",
@@ -123,6 +124,7 @@ async fn session(
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					tx_bytes += n as u64;
+					rt.stats.add_tx(n as u64);
 					deadline = tokio::time::Instant::now() + idle;
 				}
 				// ICMP unreachable from the backend surfaces here on a connected socket
@@ -154,7 +156,7 @@ async fn session(
 	};
 
 	remove(&sessions, client, id);
-	rt.stats.closed(rx_bytes, tx_bytes);
+	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
 }
@@ -266,6 +268,7 @@ async fn dtls_session(
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += n as u64;
+					rt.stats.add_rx(n as u64);
 					deadline = tokio::time::Instant::now() + idle;
 				}
 				Err(_) => break "closed",
@@ -276,6 +279,7 @@ async fn dtls_session(
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					tx_bytes += n as u64;
+					rt.stats.add_tx(n as u64);
 					deadline = tokio::time::Instant::now() + idle;
 				}
 				Err(e) => debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e),
@@ -294,7 +298,7 @@ async fn dtls_session(
 		let _ = up.close().await;
 	}
 	remove(&sessions, client, id);
-	rt.stats.closed(rx_bytes, tx_bytes);
+	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr, dtls = true,
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
 }

@@ -347,3 +347,30 @@ async fn futures_join(addr: String, n: usize) -> Vec<TcpStream> {
 	}
 	out
 }
+
+#[tokio::test]
+async fn bytes_are_counted_while_connections_are_open() {
+	let h = harness().await;
+	let tcp_port = free_port();
+	h.post(rule("tcp", tcp_port, tcp_echo().await)).await;
+	let udp_port = free_udp_port();
+	h.post(rule("udp", udp_port, udp_backend("U:").await)).await;
+
+	// a TCP connection that stays open
+	let mut conn = TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+	conn.write_all(b"12345").await.unwrap();
+	let mut buf = [0u8; 5];
+	conn.read_exact(&mut buf).await.unwrap();
+	let v = wait_for(&h, &format!("/rules/tcp/127.0.0.1/{tcp_port}"), |v| v["stats"]["rx_bytes"] == 5).await;
+	assert_eq!(v["stats"]["tx_bytes"], 5);
+	assert_eq!(v["connections"], 1, "still open");
+
+	// a UDP session that has not timed out yet
+	let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	client.connect(("127.0.0.1", udp_port)).await.unwrap();
+	udp_roundtrip(&client, "abc").await;
+	let v = wait_for(&h, &format!("/rules/udp/127.0.0.1/{udp_port}"), |v| v["stats"]["rx_bytes"] == 3).await;
+	assert_eq!(v["stats"]["tx_bytes"], 5, "reply is \"U:abc\"");
+	assert_eq!(v["connections"], 1, "session still active");
+	drop(conn);
+}
