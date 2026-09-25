@@ -89,6 +89,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `error` | `failed` の理由。`running` なら `null` |
 | `resolved` | 最後に名前解決できた転送先（`"ip:port"` の配列）。まだ解決できていなければ空 |
 | `connections` | 現在の接続数（UDP はセッション数） |
+| `stats` | ルールが開始してからの累計：`total_connections`、`rx_bytes`（クライアント → 転送先）、`tx_bytes`（転送先 → クライアント）、`tls_failures`（TLS / DTLS のハンドシェイクや STARTTLS の失敗） |
+| `started_at` | 待ち受けを始めた時刻（Unix 秒）。`failed` のときは `null` |
 
 ## エンドポイント
 

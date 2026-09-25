@@ -251,6 +251,15 @@ pub enum State {
 	Failed,
 }
 
+/// Counters since the rule started (for dashboards).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RuleStats {
+	pub total_connections: u64,
+	pub rx_bytes: u64,
+	pub tx_bytes: u64,
+	pub tls_failures: u64,
+}
+
 /// A rule as returned by the API.
 #[derive(Clone, Debug, Serialize)]
 pub struct RuleView {
@@ -269,6 +278,9 @@ pub struct RuleView {
 	pub error: Option<String>,
 	pub resolved: Vec<String>,
 	pub connections: u64,
+	pub stats: RuleStats,
+	/// When the listener started, in Unix seconds (null while failed).
+	pub started_at: Option<u64>,
 }
 
 impl RuleView {
@@ -289,6 +301,8 @@ impl RuleView {
 			error,
 			resolved: resolved.iter().map(|a| a.to_string()).collect(),
 			connections,
+			stats: RuleStats::default(),
+			started_at: None,
 		}
 	}
 }

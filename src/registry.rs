@@ -18,7 +18,8 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleView, State, UpdateRequest,
+	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, State,
+	UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
 use crate::{tcp, udp};
@@ -36,6 +37,7 @@ type Resolver = (CancellationToken, JoinHandle<()>);
 
 struct Running {
 	generation: u64,
+	started_at: u64,
 	spec: RuleSpec,
 	rt: Arc<Runtime>,
 	target_tx: Arc<watch::Sender<Vec<SocketAddr>>>,
@@ -82,13 +84,24 @@ impl Entry {
 
 	fn view(&self) -> RuleView {
 		match self {
-			Entry::Running(r) => RuleView::new(
-				&r.spec,
-				State::Running,
-				None,
-				&r.rt.target.borrow(),
-				r.rt.stats.active.load(Ordering::Relaxed),
-			),
+			Entry::Running(r) => {
+				let s = &r.rt.stats;
+				let mut view = RuleView::new(
+					&r.spec,
+					State::Running,
+					None,
+					&r.rt.target.borrow(),
+					s.active.load(Ordering::Relaxed),
+				);
+				view.stats = RuleStats {
+					total_connections: s.total.load(Ordering::Relaxed),
+					rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
+					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
+					tls_failures: s.tls_failures.load(Ordering::Relaxed),
+				};
+				view.started_at = Some(r.started_at);
+				view
+			}
 			Entry::Failed(f) => RuleView::new(&f.spec, State::Failed, Some(f.error.clone()), &[], 0),
 		}
 	}
@@ -282,7 +295,11 @@ impl Registry {
 		let generation = self.generation();
 		let supervisor = tokio::spawn(supervise(Arc::downgrade(self), key, generation, rt.clone(), serve));
 		let resolver = self.spawn_resolver(key, &spec.remote_host, spec.remote(), &target_tx);
-		Ok(Running { generation, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
+		let started_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		Ok(Running { generation, started_at, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {

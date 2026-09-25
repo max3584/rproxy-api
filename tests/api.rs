@@ -266,6 +266,12 @@ async fn metrics_and_capabilities() {
 	assert!(text.contains(&format!("rproxy_connections_total{{{labels}}} 1")), "{text}");
 	assert!(text.contains(&format!("rproxy_bytes_total{{{labels},direction=\"rx\"}} 3")), "{text}");
 
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(v["stats"]["total_connections"], 1);
+	assert_eq!(v["stats"]["rx_bytes"], 3);
+	assert_eq!(v["stats"]["tx_bytes"], 5);
+	assert!(v["started_at"].as_u64().unwrap() > 1_700_000_000);
+
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["transparent"], false);
 	assert_eq!(caps["source_ip"], json!(["proxy", "proxy_v1", "proxy_v2"]));
