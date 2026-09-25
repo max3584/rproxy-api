@@ -51,10 +51,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
-      # Ubuntu restricts unprivileged user namespaces, so run the script as root;
-      # it still builds its own isolated namespaces.
+      # Ubuntu blocks unprivileged user namespaces by default; allow them so the
+      # script can build its isolated namespaces as the normal runner user.
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: scripts/test-transparent.sh
-        run: sudo env "PATH=$PATH" scripts/test-transparent.sh
+        run: scripts/test-transparent.sh
 
   build:
     name: build (${{ matrix.os }})
