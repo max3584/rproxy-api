@@ -16,7 +16,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 設定項目は `src/main.rs` の `Options`（clap）。すべて `RPROXY_*` 環境変数でも指定でき、起動時に `.env` を読む。項目を増やすときは `.env.example` と README の表も更新する。
 
 - ring（rustls）のビルドには C コンパイラが要る。
-- リリースは `v*` タグの push で `.github/workflows/release.yml` が 9 ターゲット向けにクロスビルドする。
+- リリースは `v*` タグの push で `.github/workflows/release.yml` が 9 ターゲット向けにクロスビルドし、amd64 / arm64 / armhf の `.deb`（musl の静的リンク）を作って `gh-pages` の apt リポジトリに載せる。タグと `Cargo.toml` の `version` を揃えること。詳細は `docs/APT.md`。
+- パッケージ（`debian/`、`[package.metadata.deb]`）を変えたら `cargo deb` で作り、CI の `Debian package` ジョブ（`scripts/test-deb.sh`。sudo でインストールするので手元では実行しない）で確かめる。`debian/rproxy-api.service` は `contrib/rproxy-api.service` と `ExecStart` 以外を揃える。
 
 ## 構成
 

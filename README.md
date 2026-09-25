@@ -3,6 +3,21 @@
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。
 制御は HTTP API で行い、管理 UI は [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) にある。
 
+## インストール（Debian / Ubuntu）
+
+apt リポジトリから入れられる（amd64 / arm64 / armhf）。
+
+```shell
+sudo curl -fsSLo /usr/share/keyrings/rproxy-archive-keyring.gpg https://max3584.github.io/rproxy-api/rproxy-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/rproxy-archive-keyring.gpg] https://max3584.github.io/rproxy-api stable main" \
+  | sudo tee /etc/apt/sources.list.d/rproxy-api.list
+sudo apt update && sudo apt install rproxy-api
+```
+
+インストールしただけでは起動しない。`/etc/rproxy/rproxy.env` を書き換えてから `sudo systemctl enable --now rproxy-api` で起動する。
+API のトークンはインストール時に `/etc/rproxy/tokens` に生成される（UI の `RPROXY_API_TOKEN` に設定する）。
+パッケージの中身と、リポジトリの公開の仕組みは [docs/APT.md](docs/APT.md)。
+
 ## 起動
 
 設定は環境変数で行う。起動ディレクトリに `.env` があれば読み込む（例は [.env.example](.env.example)）。
