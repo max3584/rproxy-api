@@ -40,7 +40,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
-| `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須） |
+| `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
 
@@ -54,9 +54,12 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
     {"server_name": "*.example.com", "remote_addr": "10.0.0.6", "remote_port": 8443}
   ],
   "certificates": [
-    {"cert_file": "/etc/rproxy/certs/example.pem", "key_file": "/etc/rproxy/certs/example.key"}
+    {"cert_file": "/etc/rproxy/certs/example.pem",
+     "chain_file": "/etc/rproxy/certs/intermediates.pem",
+     "key_file": "/etc/rproxy/certs/example.key"}
   ],
-  "client_auth": {"mode": "required", "ca_file": "/etc/rproxy/clients-ca.pem"},
+  "client_auth": {"mode": "required", "ca_file": "/etc/rproxy/clients-root.pem",
+                  "chain_file": "/etc/rproxy/clients-intermediates.pem"},
   "alpn": ["h2", "http/1.1"],
   "upstream": {"tls": true, "server_name": "backend.internal", "ca_file": "/etc/rproxy/internal-ca.pem"}
 }
@@ -65,11 +68,11 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | フィールド | 説明 |
 |---|---|
 | `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（tcp のみ。ClientHello のサーバ名で転送先を選び、復号しない）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
-| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）。`*.example.com` は 1 階層だけ一致する。一致しない名前はルールの `remote_addr` / `remote_port` へ。ポート範囲では、ここの `remote_port` も同じだけずれる |
-| `certificates` | `terminate` で必須。PEM の証明書チェーン（先頭がサーバ証明書）と秘密鍵。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
-| `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required`。`optional` と `required` では `ca_file` が必須 |
+| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。`*.example.com` は 1 階層だけ一致する。一致しない名前はルールの `remote_addr` / `remote_port` へ。ポート範囲では、ここの `remote_port` も同じだけずれる |
+| `certificates` | `terminate` で必須。`cert_file` はサーバ証明書、`chain_file` は中間 CA の証明書（サーバ証明書を発行した CA から、ルートへ向かう順。ルートは入れなくてよい）、`key_file` は秘密鍵。`cert_file` にチェーンを連結しても使える。読み込むときに、チェーンの順番と、鍵がサーバ証明書と対になっていることを確かめる。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
+| `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required`。`optional` と `required` では `ca_file` が必須。`ca_file` はルート CA（信頼の起点）。`chain_file` はクライアント証明書の中間 CA で、中間 CA を送ってこないクライアントのために、検証の途中経路を補う（信頼の起点にはしない）。TLS と DTLS で同じ規則で検証する |
 | `alpn` | `terminate` でクライアントに提示する ALPN（tcp のみ） |
-| `upstream` | `terminate` の転送先側。`tls: true` で再暗号化する（tcp は TLS、udp は DTLS）。`server_name`（既定は転送先のホスト名）、`ca_file`（既定は Mozilla のルート証明書）、`insecure_skip_verify`（検証しない。テスト用）、`cert_file` / `key_file`（転送先へのクライアント証明書） |
+| `upstream` | `terminate` の転送先側。`tls: true` で再暗号化する（tcp は TLS、udp は DTLS）。`server_name`（既定は転送先のホスト名）、`ca_file`（既定は Mozilla のルート証明書）、`insecure_skip_verify`（検証しない。テスト用）、`cert_file` / `chain_file` / `key_file`（転送先へのクライアント証明書と、その中間 CA） |
 
 `terminate` と `source_ip: "proxy_v2"` を組み合わせると、PROXY v2 ヘッダに TLS の情報を TLV で付ける。
 - `PP2_TYPE_AUTHORITY`：SNI
@@ -86,6 +89,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `error` | `failed` の理由。`running` なら `null` |
 | `resolved` | 最後に名前解決できた転送先（`"ip:port"` の配列）。まだ解決できていなければ空 |
 | `connections` | 現在の接続数（UDP はセッション数） |
+| `stats` | ルールが開始してからの累計：`total_connections`、`rx_bytes`（クライアント → 転送先）、`tx_bytes`（転送先 → クライアント）、`tls_failures`（TLS / DTLS のハンドシェイクや STARTTLS の失敗） |
+| `started_at` | 待ち受けを始めた時刻（Unix 秒）。`failed` のときは `null` |
 
 ## エンドポイント
 
@@ -93,6 +98,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
 | `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000}`。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる |
+| `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
@@ -118,6 +124,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `unsupported` | 400 | この環境では使えない指定（`transparent` など）、または変更できない項目 |
 | `not_found` | 404 | ルールがない |
 | `already_exists` | 409 | 同じキーのルールが既にある |
+| `reserved` | 409 | rproxy 自身の制御 API のアドレスとポートに重なる（`0.0.0.0` / `::` とポート範囲も含めて判定する） |
 | `bind_failed` | 409 | 待ち受けポートを開けない |
 | `resolve_failed` | 502 | 転送先の名前解決に失敗し、キャッシュもない |
 | `internal` | 500 | その他 |

@@ -40,6 +40,10 @@ impl ApiError {
 		Self::new(StatusCode::CONFLICT, "already_exists", message)
 	}
 
+	pub fn reserved(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "reserved", message)
+	}
+
 	pub fn bind_failed(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::CONFLICT, "bind_failed", message)
 	}

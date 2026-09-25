@@ -201,7 +201,10 @@ impl RuleRequest {
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
 		let port_count = port_count(self.listen_port, self.listen_port_end, self.remote_port, caps)?;
 		let tls = self.tls.unwrap_or_default();
-		tlsconf::validate(self.protocol, &tls, self.starttls)?;
+		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
+		if self.starttls.is_none() && self.starttls_required == Some(false) {
+			return Err(ApiError::invalid("starttls_required needs starttls"));
+		}
 		match (self.protocol, self.source_ip) {
 			(Protocol::Udp, SourceIp::ProxyV1 | SourceIp::ProxyV2) => {
 				return Err(ApiError::unsupported("PROXY protocol is supported for tcp only"));
@@ -225,7 +228,8 @@ impl RuleRequest {
 			udp_idle,
 			tls,
 			starttls: self.starttls,
-			starttls_required: self.starttls_required.unwrap_or(true),
+			// only SMTP may continue without TLS
+			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
 		})
 	}
 }
@@ -251,6 +255,15 @@ pub enum State {
 	Failed,
 }
 
+/// Counters since the rule started (for dashboards).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RuleStats {
+	pub total_connections: u64,
+	pub rx_bytes: u64,
+	pub tx_bytes: u64,
+	pub tls_failures: u64,
+}
+
 /// A rule as returned by the API.
 #[derive(Clone, Debug, Serialize)]
 pub struct RuleView {
@@ -269,6 +282,9 @@ pub struct RuleView {
 	pub error: Option<String>,
 	pub resolved: Vec<String>,
 	pub connections: u64,
+	pub stats: RuleStats,
+	/// When the listener started, in Unix seconds (null while failed).
+	pub started_at: Option<u64>,
 }
 
 impl RuleView {
@@ -289,6 +305,8 @@ impl RuleView {
 			error,
 			resolved: resolved.iter().map(|a| a.to_string()).collect(),
 			connections,
+			stats: RuleStats::default(),
+			started_at: None,
 		}
 	}
 }
@@ -355,6 +373,26 @@ mod tests {
 		assert!(r.clone().validate(&Caps { transparent: true, ..Caps::default() }).is_ok());
 		r.listen_addr = "::1".into();
 		assert_eq!(r.validate(&Caps { transparent: true, ..Caps::default() }).unwrap_err().code, "unsupported");
+	}
+
+	#[test]
+	fn starttls_required_is_only_optional_for_smtp() {
+		let terminate = || {
+			Some(TlsSpec {
+				mode: crate::tlsconf::TlsMode::Terminate,
+				certificates: vec![crate::tlsconf::CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into() }],
+				..Default::default()
+			})
+		};
+		let mut r = req();
+		r.tls = terminate();
+		r.starttls = Some(StartTls::Imap);
+		r.starttls_required = Some(false);
+		assert!(r.clone().validate(&Caps::default()).unwrap().starttls_required, "IMAP always requires STARTTLS");
+		r.starttls = Some(StartTls::Smtp);
+		assert!(!r.clone().validate(&Caps::default()).unwrap().starttls_required);
+		r.starttls = None;
+		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "invalid", "starttls_required without starttls");
 	}
 
 	#[test]

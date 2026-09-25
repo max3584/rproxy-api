@@ -86,6 +86,18 @@
 | `bad_tls_settings_are_reported` | 読めないファイル、証明書なしの terminate、未知の mode、UDP の sni を拒否し、何も残らない |
 | `reload_picks_up_renewed_certificates_and_patch_changes_tls` | 証明書ファイルを差し替えて再読込すると新しい証明書が使われる。PATCH で passthrough に戻せる |
 
+## 結合テスト：多段の CA（`tests/chain.rs`）
+
+中間 CA が 1 段（3 層）と 2 段（4 層）の両方で確かめる。クライアントが信頼するのはルートだけ。
+
+| テスト | 確かめること |
+|---|---|
+| `server_certificates_need_their_intermediates` | `chain_file` がないとクライアントは検証できず、あれば検証できる |
+| `a_full_chain_in_cert_file_still_works` | `cert_file` にチェーンを連結した従来の指定でも動く |
+| `wrong_order_and_wrong_key_are_rejected` | 順番が逆のチェーンと、別の証明書の鍵を `tls_config` で拒否する |
+| `mtls_with_multi_tier_client_certificates` | `ca_file` がルートだけでも、中間 CA を送るクライアントは通る。証明書だけを送るクライアントは、`client_auth.chain_file` があれば通り、なければ通らない。別の PKI の証明書は通らない |
+| `dtls_mtls_with_multi_tier_client_certificates` | DTLS でも同じ規則。検証できないクライアントは、ハンドシェイクのあと何も転送せずに切る |
+
 ## 結合テスト：STARTTLS（`tests/starttls.rs`）
 
 | テスト | 確かめること |

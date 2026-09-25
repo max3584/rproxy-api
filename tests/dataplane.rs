@@ -293,21 +293,36 @@ async fn proxy_protocol_v1_header_carries_the_client() {
 async fn concurrent_creates_of_the_same_rule_yield_one_winner() {
 	let h = harness().await;
 	let backend = tcp_echo().await;
-	let port = free_port();
-	let body = rule("tcp", port, backend);
-	let attempts: Vec<_> = (0..10)
-		.map(|_| {
-			let (http, url, body) = (h.http.clone(), format!("{}/rules", h.base), body.clone());
-			tokio::spawn(async move { http.post(url).json(&body).send().await.unwrap().status() })
-		})
-		.collect();
+	// free_port() can race with other tests; retry on bind_failed, which is not what we test
 	let mut created = 0;
-	for a in attempts {
-		match a.await.unwrap() {
-			StatusCode::CREATED => created += 1,
-			StatusCode::CONFLICT => {}
-			other => panic!("unexpected {other}"),
+	for _ in 0..5 {
+		let body = rule("tcp", free_port(), backend);
+		let attempts: Vec<_> = (0..10)
+			.map(|_| {
+				let (http, url, body) = (h.http.clone(), format!("{}/rules", h.base), body.clone());
+				tokio::spawn(async move {
+					let r = http.post(url).json(&body).send().await.unwrap();
+					let status = r.status();
+					let v: serde_json::Value = r.json().await.unwrap_or_default();
+					(status, v["code"].as_str().unwrap_or("").to_string())
+				})
+			})
+			.collect();
+		let mut results = vec![];
+		for a in attempts {
+			results.push(a.await.unwrap());
 		}
+		if results.iter().all(|(_, code)| code == "bind_failed") {
+			continue;
+		}
+		for (status, code) in results {
+			match (status, code.as_str()) {
+				(StatusCode::CREATED, _) => created += 1,
+				(StatusCode::CONFLICT, "already_exists") => {}
+				other => panic!("unexpected {other:?}"),
+			}
+		}
+		break;
 	}
 	assert_eq!(created, 1);
 }
@@ -331,4 +346,31 @@ async fn futures_join(addr: String, n: usize) -> Vec<TcpStream> {
 		out.push(TcpStream::connect(&addr).await.unwrap());
 	}
 	out
+}
+
+#[tokio::test]
+async fn bytes_are_counted_while_connections_are_open() {
+	let h = harness().await;
+	let tcp_port = free_port();
+	h.post(rule("tcp", tcp_port, tcp_echo().await)).await;
+	let udp_port = free_udp_port();
+	h.post(rule("udp", udp_port, udp_backend("U:").await)).await;
+
+	// a TCP connection that stays open
+	let mut conn = TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+	conn.write_all(b"12345").await.unwrap();
+	let mut buf = [0u8; 5];
+	conn.read_exact(&mut buf).await.unwrap();
+	let v = wait_for(&h, &format!("/rules/tcp/127.0.0.1/{tcp_port}"), |v| v["stats"]["rx_bytes"] == 5).await;
+	assert_eq!(v["stats"]["tx_bytes"], 5);
+	assert_eq!(v["connections"], 1, "still open");
+
+	// a UDP session that has not timed out yet
+	let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	client.connect(("127.0.0.1", udp_port)).await.unwrap();
+	udp_roundtrip(&client, "abc").await;
+	let v = wait_for(&h, &format!("/rules/udp/127.0.0.1/{udp_port}"), |v| v["stats"]["rx_bytes"] == 3).await;
+	assert_eq!(v["stats"]["tx_bytes"], 5, "reply is \"U:abc\"");
+	assert_eq!(v["connections"], 1, "session still active");
+	drop(conn);
 }

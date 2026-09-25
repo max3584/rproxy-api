@@ -14,6 +14,8 @@ pub struct Issued {
 	pub key: KeyPair,
 	pub cert_file: String,
 	pub key_file: String,
+	/// Intermediate CA certificates between this certificate and the root (3-tier PKI).
+	pub intermediates: Vec<CertificateDer<'static>>,
 }
 
 impl Issued {
@@ -25,10 +27,15 @@ impl Issued {
 		PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key.serialize_der()))
 	}
 
+	/// The certificate followed by its intermediates.
+	pub fn full_chain(&self) -> Vec<CertificateDer<'static>> {
+		[vec![self.der()], self.intermediates.clone()].concat()
+	}
+
 	/// The same certificate for webrtc-dtls.
 	pub fn dtls(&self) -> webrtc_dtls::crypto::Certificate {
 		webrtc_dtls::crypto::Certificate {
-			certificate: vec![self.der()],
+			certificate: self.full_chain(),
 			private_key: webrtc_dtls::crypto::CryptoPrivateKey::try_from(&self.key).unwrap(),
 		}
 	}
@@ -38,7 +45,12 @@ pub struct Pki {
 	pub dir: PathBuf,
 	ca: Certificate,
 	ca_key: KeyPair,
+	/// The root only.
 	pub ca_file: String,
+	/// With `tiers`: intermediate CAs from the root downwards; the last one issues leaves.
+	intermediates: Vec<(Certificate, KeyPair)>,
+	/// The intermediates as a server would send them: nearest to the leaf first.
+	pub chain_file: Option<String>,
 }
 
 impl Pki {
@@ -53,7 +65,54 @@ impl Pki {
 		let ca = params.self_signed(&ca_key).unwrap();
 		let ca_file = dir.join("ca.pem").to_string_lossy().into_owned();
 		std::fs::write(&ca_file, ca.pem()).unwrap();
-		Pki { dir, ca, ca_key, ca_file }
+		Pki { dir, ca, ca_key, ca_file, intermediates: vec![], chain_file: None }
+	}
+
+	/// Root → intermediate → leaf; `ca_file` holds only the root.
+	pub fn three_tier(tag: &str) -> Pki {
+		Pki::tiers(tag, 1)
+	}
+
+	/// Root → `n` intermediates → leaf (`n = 2` is a 4-tier PKI).
+	pub fn tiers(tag: &str, n: usize) -> Pki {
+		let mut pki = Pki::new(tag);
+		for level in 0..n {
+			let key = KeyPair::generate().unwrap();
+			let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+			params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+			params.distinguished_name.push(DnType::CommonName, format!("rproxy test intermediate CA {}", level + 1));
+			params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+			let cert = match pki.intermediates.last() {
+				Some((parent, parent_key)) => params.signed_by(&key, parent, parent_key).unwrap(),
+				None => params.signed_by(&key, &pki.ca, &pki.ca_key).unwrap(),
+			};
+			pki.intermediates.push((cert, key));
+		}
+		if n > 0 {
+			let file = pki.dir.join("chain.pem").to_string_lossy().into_owned();
+			let pem: String = pki.intermediates.iter().rev().map(|(c, _)| c.pem()).collect();
+			std::fs::write(&file, pem).unwrap();
+			pki.chain_file = Some(file);
+		}
+		pki
+	}
+
+	/// Writes `pem` to a file in the PKI directory and returns its path.
+	pub fn write(&self, name: &str, pem: &str) -> String {
+		let file = self.dir.join(name).to_string_lossy().into_owned();
+		std::fs::write(&file, pem).unwrap();
+		file
+	}
+
+	/// Root and intermediate in one file (a CA bundle).
+	pub fn bundle_file(&self) -> String {
+		let file = self.dir.join("bundle.pem").to_string_lossy().into_owned();
+		let mut pem = self.ca.pem();
+		for (cert, _) in &self.intermediates {
+			pem.push_str(&cert.pem());
+		}
+		std::fs::write(&file, pem).unwrap();
+		file
 	}
 
 	fn issue(&self, name: &str, cn: &str, sans: &[&str], client: bool) -> Issued {
@@ -62,12 +121,17 @@ impl Pki {
 		params.distinguished_name.push(DnType::CommonName, cn);
 		params.extended_key_usages =
 			vec![if client { ExtendedKeyUsagePurpose::ClientAuth } else { ExtendedKeyUsagePurpose::ServerAuth }];
-		let cert = params.signed_by(&key, &self.ca, &self.ca_key).unwrap();
+		let (issuer, issuer_key) = match self.intermediates.last() {
+			Some((c, k)) => (c, k),
+			None => (&self.ca, &self.ca_key),
+		};
+		let cert = params.signed_by(&key, issuer, issuer_key).unwrap();
 		let cert_file = self.dir.join(format!("{name}.pem")).to_string_lossy().into_owned();
 		let key_file = self.dir.join(format!("{name}.key")).to_string_lossy().into_owned();
 		std::fs::write(&cert_file, cert.pem()).unwrap();
 		std::fs::write(&key_file, key.serialize_pem()).unwrap();
-		Issued { cert, key, cert_file, key_file }
+		let intermediates = self.intermediates.iter().rev().map(|(c, _)| c.der().clone()).collect();
+		Issued { cert, key, cert_file, key_file, intermediates }
 	}
 
 	pub fn server(&self, name: &str, sans: &[&str]) -> Issued {
@@ -84,6 +148,17 @@ impl Pki {
 		roots
 	}
 
+	/// A client presenting only its own certificate, without intermediates.
+	pub fn connector_leaf_only(&self, client: &Issued) -> tokio_rustls::TlsConnector {
+		let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.with_root_certificates(self.roots())
+			.with_client_auth_cert(vec![client.der()], client.key_der())
+			.unwrap();
+		tokio_rustls::TlsConnector::from(Arc::new(config))
+	}
+
 	/// A TLS client that trusts this CA, optionally presenting `client`.
 	pub fn connector(&self, client: Option<&Issued>) -> tokio_rustls::TlsConnector {
 		self.connector_alpn(client, &[])
@@ -96,7 +171,7 @@ impl Pki {
 			.unwrap()
 			.with_root_certificates(self.roots());
 		let mut config = match client {
-			Some(c) => builder.with_client_auth_cert(vec![c.der()], c.key_der()).unwrap(),
+			Some(c) => builder.with_client_auth_cert(c.full_chain(), c.key_der()).unwrap(),
 			None => builder.with_no_client_auth(),
 		};
 		config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
@@ -109,7 +184,7 @@ impl Pki {
 			.with_safe_default_protocol_versions()
 			.unwrap()
 			.with_no_client_auth()
-			.with_single_cert(vec![issued.der()], issued.key_der())
+			.with_single_cert(issued.full_chain(), issued.key_der())
 			.unwrap();
 		tokio_rustls::TlsAcceptor::from(Arc::new(config))
 	}

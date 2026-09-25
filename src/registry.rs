@@ -18,7 +18,8 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleView, State, UpdateRequest,
+	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, State,
+	UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
 use crate::{tcp, udp};
@@ -30,12 +31,15 @@ pub struct Config {
 	pub transparent: bool,
 	/// Largest port range one rule may open.
 	pub max_range_ports: u16,
+	/// Addresses rproxy itself listens on (the control API); rules may not take them.
+	pub reserved: Vec<SocketAddr>,
 }
 
 type Resolver = (CancellationToken, JoinHandle<()>);
 
 struct Running {
 	generation: u64,
+	started_at: u64,
 	spec: RuleSpec,
 	rt: Arc<Runtime>,
 	target_tx: Arc<watch::Sender<Vec<SocketAddr>>>,
@@ -82,13 +86,24 @@ impl Entry {
 
 	fn view(&self) -> RuleView {
 		match self {
-			Entry::Running(r) => RuleView::new(
-				&r.spec,
-				State::Running,
-				None,
-				&r.rt.target.borrow(),
-				r.rt.stats.active.load(Ordering::Relaxed),
-			),
+			Entry::Running(r) => {
+				let s = &r.rt.stats;
+				let mut view = RuleView::new(
+					&r.spec,
+					State::Running,
+					None,
+					&r.rt.target.borrow(),
+					s.active.load(Ordering::Relaxed),
+				);
+				view.stats = RuleStats {
+					total_connections: s.total.load(Ordering::Relaxed),
+					rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
+					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
+					tls_failures: s.tls_failures.load(Ordering::Relaxed),
+				};
+				view.started_at = Some(r.started_at);
+				view
+			}
 			Entry::Failed(f) => RuleView::new(&f.spec, State::Failed, Some(f.error.clone()), &[], 0),
 		}
 	}
@@ -108,6 +123,11 @@ pub struct Registry {
 }
 
 fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
+	if e.kind() == std::io::ErrorKind::PermissionDenied && addr.port() < 1024 {
+		return ApiError::bind_failed(format!(
+			"{addr}: {e}; ports below 1024 need CAP_NET_BIND_SERVICE (setcap cap_net_bind_service=+ep on the binary, or AmbientCapabilities in systemd)"
+		));
+	}
 	ApiError::bind_failed(format!("{addr}: {e}"))
 }
 
@@ -158,6 +178,23 @@ fn route_spec(route: &Route) -> String {
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
 		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1) })
+	}
+
+	pub fn reserved(&self) -> &[SocketAddr] {
+		&self.cfg.reserved
+	}
+
+	/// The control API's own address, if the rule would take it.
+	fn reserved_clash(&self, spec: &RuleSpec) -> Option<SocketAddr> {
+		if spec.key.protocol != Protocol::Tcp {
+			return None;
+		}
+		let (ip, start) = (spec.key.listen.ip(), u32::from(spec.key.listen.port()));
+		let end = start + u32::from(spec.port_count) - 1;
+		self.cfg.reserved.iter().copied().find(|r| {
+			let same_ip = r.ip() == ip || r.ip().is_unspecified() || ip.is_unspecified();
+			same_ip && (start..=end).contains(&u32::from(r.port()))
+		})
 	}
 
 	pub fn caps(&self) -> Caps {
@@ -282,10 +319,17 @@ impl Registry {
 		let generation = self.generation();
 		let supervisor = tokio::spawn(supervise(Arc::downgrade(self), key, generation, rt.clone(), serve));
 		let resolver = self.spawn_resolver(key, &spec.remote_host, spec.remote(), &target_tx);
-		Ok(Running { generation, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
+		let started_at = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		Ok(Running { generation, started_at, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
+		if let Some(api) = self.reserved_clash(&spec) {
+			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
+		}
 		let prepared = self.prepare(&spec).await?;
 		let mut rules = self.rules.lock().await;
 		if rules.contains_key(&spec.key) {
@@ -339,10 +383,13 @@ impl Registry {
 		}
 		let tls_changed = req.tls.is_some();
 		if let Some(tls) = req.tls {
-			tlsconf::validate(key.protocol, &tls, req.starttls)?;
+			tlsconf::validate_range(key.protocol, &tls, req.starttls, spec.port_count)?;
+			if req.starttls.is_none() && req.starttls_required == Some(false) {
+				return Err(ApiError::invalid("starttls_required needs starttls"));
+			}
 			spec.tls = tls;
 			spec.starttls = req.starttls;
-			spec.starttls_required = req.starttls_required.unwrap_or(true);
+			spec.starttls_required = req.starttls != Some(crate::tlsconf::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
 		}
 		let prepared = self.prepare(&spec).await?;
 
@@ -602,6 +649,7 @@ mod tests {
 			lookup: resolve::system_lookup(),
 			transparent: false,
 			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
+			reserved: vec![],
 		})
 	}
 

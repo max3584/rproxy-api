@@ -29,10 +29,18 @@ impl Stats {
 		self.total.fetch_add(1, Ordering::Relaxed);
 	}
 
-	pub fn closed(&self, rx: u64, tx: u64) {
+	pub fn closed(&self) {
 		self.active.fetch_sub(1, Ordering::Relaxed);
-		self.rx_bytes.fetch_add(rx, Ordering::Relaxed);
-		self.tx_bytes.fetch_add(tx, Ordering::Relaxed);
+	}
+
+	/// Bytes are counted as they flow, so dashboards see long-lived
+	/// connections and UDP sessions before they end.
+	pub fn add_rx(&self, n: u64) {
+		self.rx_bytes.fetch_add(n, Ordering::Relaxed);
+	}
+
+	pub fn add_tx(&self, n: u64) {
+		self.tx_bytes.fetch_add(n, Ordering::Relaxed);
 	}
 
 	pub fn tls_failed(&self) {
@@ -101,5 +109,58 @@ impl Runtime {
 			addrs: self.target.borrow().iter().map(|a| shifted(*a, offset)).collect(),
 			host: self.remote_host.read().unwrap().clone(),
 		}
+	}
+}
+
+/// Counts bytes read through a stream into this connection's total and a
+/// rule-wide counter. Writes pass through untouched.
+pub struct Counted<'a, S: ?Sized> {
+	inner: &'a mut S,
+	pub count: u64,
+	global: &'a AtomicU64,
+}
+
+impl<'a, S: ?Sized> Counted<'a, S> {
+	pub fn new(inner: &'a mut S, global: &'a AtomicU64) -> Self {
+		Counted { inner, count: 0, global }
+	}
+}
+
+impl<S: tokio::io::AsyncRead + Unpin + ?Sized> tokio::io::AsyncRead for Counted<'_, S> {
+	fn poll_read(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		let this = self.get_mut();
+		let before = buf.filled().len();
+		let poll = std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf);
+		let n = (buf.filled().len() - before) as u64;
+		if n > 0 {
+			this.count += n;
+			this.global.fetch_add(n, Ordering::Relaxed);
+		}
+		poll
+	}
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin + ?Sized> tokio::io::AsyncWrite for Counted<'_, S> {
+	fn poll_write(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		std::pin::Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
+	}
+
+	fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+		std::pin::Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+	}
+
+	fn poll_shutdown(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		std::pin::Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
 	}
 }

@@ -266,7 +266,37 @@ async fn metrics_and_capabilities() {
 	assert!(text.contains(&format!("rproxy_connections_total{{{labels}}} 1")), "{text}");
 	assert!(text.contains(&format!("rproxy_bytes_total{{{labels},direction=\"rx\"}} 3")), "{text}");
 
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(v["stats"]["total_connections"], 1);
+	assert_eq!(v["stats"]["rx_bytes"], 3);
+	assert_eq!(v["stats"]["tx_bytes"], 5);
+	assert!(v["started_at"].as_u64().unwrap() > 1_700_000_000);
+
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["transparent"], false);
 	assert_eq!(caps["source_ip"], json!(["proxy", "proxy_v1", "proxy_v2"]));
+}
+
+#[tokio::test]
+async fn interfaces_and_reserved_addresses() {
+	let h = harness().await;
+	let (status, v) = h.get("/interfaces").await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	let list = v["interfaces"].as_array().unwrap();
+	assert!(list.iter().any(|i| i["addr"] == "127.0.0.1" && i["loopback"] == true), "{v}");
+	assert!(list.iter().all(|i| i["name"].is_string() && (i["family"] == "ipv4" || i["family"] == "ipv6")));
+	assert_eq!(v["reserved"][0]["port"], 1);
+
+	// the harness reserves 127.0.0.1:1 as if the control API listened there
+	let backend = tcp_backend("A:").await;
+	let mut clash = rule("tcp", 1, backend);
+	clash["listen_addr"] = json!("0.0.0.0");
+	let (status, v) = h.post(clash).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("reserved")), "{v}");
+	// a range that covers the port clashes too; udp on the same port does not
+	let mut range = rule("tcp", 1, backend);
+	range["listen_port_end"] = json!(3);
+	assert_eq!(h.post(range).await.1["code"], "reserved");
+	let (_, v) = h.post(rule("udp", 1, backend)).await;
+	assert_ne!(v["code"], "reserved", "{v}");
 }

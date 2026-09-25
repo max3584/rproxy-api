@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-use crate::proxy::{Runtime, Target};
+use crate::proxy::{Counted, Runtime, Target};
 use crate::rule::SourceIp;
 use crate::source::{self, TlsInfo};
 use crate::starttls::{self, Outcome};
@@ -87,7 +87,7 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		r = run(&mut inbound, client, &rt, offset, &tls, &mut detail) => r,
 	};
 
-	rt.stats.closed(detail.rx, detail.tx);
+	rt.stats.closed();
 	let elapsed_ms = started.elapsed().as_millis() as u64;
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
@@ -116,7 +116,7 @@ async fn run(
 			detail.target = Some(addr);
 			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
-			finish(inbound, &mut out, detail).await
+			finish(rt, inbound, &mut out, detail).await
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
@@ -128,20 +128,26 @@ async fn run(
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			out.write_all(&hello).await?;
 			detail.rx += hello.len() as u64;
-			finish(inbound, &mut out, detail).await
+			rt.stats.add_rx(hello.len() as u64);
+			finish(rt, inbound, &mut out, detail).await
 		}
 		TlsMode::Terminate => terminate(inbound, client, local, rt, offset, tls, detail).await,
 	}
 }
 
+/// Relays until both sides close. `a` is the client side, `b` the backend.
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+	rt: &Runtime,
 	a: &mut A,
 	b: &mut B,
 	detail: &mut Detail,
 ) -> io::Result<()> {
-	let (rx, tx) = tokio::io::copy_bidirectional(a, b).await?;
-	detail.rx += rx;
-	detail.tx += tx;
+	let mut client = Counted::new(a, &rt.stats.rx_bytes);
+	let mut backend = Counted::new(b, &rt.stats.tx_bytes);
+	let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+	detail.rx += client.count;
+	detail.tx += backend.count;
+	result?;
 	detail.reason = "closed";
 	Ok(())
 }
@@ -217,7 +223,7 @@ async fn terminate(
 			session.write_all(&to_client).await?;
 		}
 	}
-	finish(&mut session, &mut upstream, detail).await
+	finish(rt, &mut session, &mut upstream, detail).await
 }
 
 /// SMTP client that carried on without STARTTLS (`starttls_required: false`).
@@ -241,5 +247,5 @@ async fn plain_smtp(
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;
 	inbound.write_all(&extra).await?;
 	inbound.write_all(&after).await?;
-	finish(inbound, &mut out, detail).await
+	finish(rt, inbound, &mut out, detail).await
 }
