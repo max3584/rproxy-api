@@ -27,7 +27,9 @@ sudo apt-get install -y "$deb"
 getent passwd rproxy >/dev/null || fail "no rproxy user"
 [ "$(sudo stat -c '%a %U:%G' /etc/rproxy/tokens)" = "640 root:rproxy" ] || fail "tokens file mode/owner"
 [ "$(sudo stat -c '%a %U:%G' /etc/rproxy)" = "750 root:rproxy" ] || fail "/etc/rproxy mode/owner"
-[ "$(sudo wc -c < /etc/rproxy/tokens)" = 65 ] || fail "token is not 64 hex characters"
+# read through sudo: the file is not readable by the runner user
+[ "$(sudo cat /etc/rproxy/tokens | wc -l)" = 1 ] || fail "expected one token line"
+sudo grep -Eqx '[0-9a-f]{64}' /etc/rproxy/tokens || fail "token is not 64 hex characters"
 ! systemctl is-active --quiet rproxy-api || fail "started before it was configured"
 ! systemctl is-enabled --quiet rproxy-api || fail "enabled before it was configured"
 token=$(sudo cat /etc/rproxy/tokens)
