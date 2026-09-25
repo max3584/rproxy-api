@@ -201,7 +201,10 @@ impl RuleRequest {
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
 		let port_count = port_count(self.listen_port, self.listen_port_end, self.remote_port, caps)?;
 		let tls = self.tls.unwrap_or_default();
-		tlsconf::validate(self.protocol, &tls, self.starttls)?;
+		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
+		if self.starttls.is_none() && self.starttls_required == Some(false) {
+			return Err(ApiError::invalid("starttls_required needs starttls"));
+		}
 		match (self.protocol, self.source_ip) {
 			(Protocol::Udp, SourceIp::ProxyV1 | SourceIp::ProxyV2) => {
 				return Err(ApiError::unsupported("PROXY protocol is supported for tcp only"));
@@ -225,7 +228,8 @@ impl RuleRequest {
 			udp_idle,
 			tls,
 			starttls: self.starttls,
-			starttls_required: self.starttls_required.unwrap_or(true),
+			// only SMTP may continue without TLS
+			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
 		})
 	}
 }

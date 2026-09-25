@@ -126,7 +126,12 @@ fn tls_error(message: impl Into<String>) -> ApiError {
 }
 
 /// Checks the combination of fields; files are read later by `build`.
+/// `port_count` is the size of the rule's port range (1 for a single port).
 pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -> Result<(), ApiError> {
+	validate_range(protocol, tls, starttls, 1)
+}
+
+pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>, port_count: u16) -> Result<(), ApiError> {
 	match (protocol, tls.mode) {
 		(Protocol::Udp, TlsMode::Sni) => {
 			return Err(ApiError::unsupported("sni routing is supported for tcp only; use terminate for DTLS"));
@@ -150,6 +155,9 @@ pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -
 	if tls.client_auth.mode != ClientAuthMode::None && tls.client_auth.ca_file.is_none() {
 		return Err(tls_error("client_auth needs ca_file"));
 	}
+	if protocol == Protocol::Udp && !tls.alpn.is_empty() {
+		return Err(tls_error("alpn is supported for tcp only"));
+	}
 	if tls.upstream.cert_file.is_some() != tls.upstream.key_file.is_some() {
 		return Err(tls_error("upstream cert_file and key_file must be given together"));
 	}
@@ -158,6 +166,12 @@ pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -
 			return Err(tls_error(format!("invalid server_name: {}", route.server_name)));
 		}
 		crate::rule::validate_remote(&route.remote_addr, route.remote_port)?;
+		if u32::from(route.remote_port) + u32::from(port_count) - 1 > 65_535 {
+			return Err(ApiError::invalid(format!(
+				"route {}: remote_port + range length exceeds 65535",
+				route.server_name
+			)));
+		}
 	}
 	if let Some(proto) = starttls {
 		if protocol != Protocol::Tcp || tls.mode != TlsMode::Terminate {
@@ -512,6 +526,20 @@ mod tests {
 		};
 		auth.client_auth.mode = ClientAuthMode::Required;
 		assert_eq!(validate(Protocol::Tcp, &auth, None).unwrap_err().code, "tls_config");
+		let mut dtls_alpn = TlsSpec {
+			mode: TlsMode::Terminate,
+			certificates: vec![CertFiles { cert_file: "a".into(), key_file: "b".into() }],
+			..Default::default()
+		};
+		dtls_alpn.alpn = vec!["h2".into()];
+		assert_eq!(validate(Protocol::Udp, &dtls_alpn, None).unwrap_err().code, "tls_config");
+		let routed = TlsSpec {
+			mode: TlsMode::Sni,
+			routes: vec![Route { server_name: "a.test".into(), remote_addr: "10.0.0.1".into(), remote_port: 65_530 }],
+			..Default::default()
+		};
+		assert!(validate_range(Protocol::Tcp, &routed, None, 6).is_ok());
+		assert_eq!(validate_range(Protocol::Tcp, &routed, None, 7).unwrap_err().code, "invalid");
 	}
 
 	#[test]

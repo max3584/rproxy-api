@@ -40,7 +40,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
-| `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須） |
+| `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
 
@@ -65,7 +65,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | フィールド | 説明 |
 |---|---|
 | `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（tcp のみ。ClientHello のサーバ名で転送先を選び、復号しない）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
-| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）。`*.example.com` は 1 階層だけ一致する。一致しない名前はルールの `remote_addr` / `remote_port` へ。ポート範囲では、ここの `remote_port` も同じだけずれる |
+| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。`*.example.com` は 1 階層だけ一致する。一致しない名前はルールの `remote_addr` / `remote_port` へ。ポート範囲では、ここの `remote_port` も同じだけずれる |
 | `certificates` | `terminate` で必須。PEM の証明書チェーン（先頭がサーバ証明書）と秘密鍵。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
 | `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required`。`optional` と `required` では `ca_file` が必須 |
 | `alpn` | `terminate` でクライアントに提示する ALPN（tcp のみ） |
