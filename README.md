@@ -26,6 +26,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
+| `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 
 `RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
@@ -51,6 +52,20 @@ curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/rules/tcp/
 # 停止（既存の接続も切断。?drain_secs=30 で終了を待つ）
 curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp/0.0.0.0/8888
 ```
+
+## TLS・DTLS・STARTTLS・ポート範囲
+
+ルールごとに、中身をどう扱うかを選べます（詳細は [docs/API.md](docs/API.md)、用途別の設定例は [docs/PROFILES.md](docs/PROFILES.md)）。
+
+| 設定 | 動作 |
+|---|---|
+| `tls.mode: passthrough`（既定） | 暗号化されたまま流す |
+| `tls.mode: sni` | ClientHello のサーバ名で転送先を振り分ける（復号しない。tcp のみ） |
+| `tls.mode: terminate` | rproxy で TLS（tcp）/ DTLS（udp）を終端する。SNI での証明書の選択、mTLS（`client_auth`）、ALPN、転送先への再暗号化（`upstream`）に対応 |
+| `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
+| `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
+
+証明書はファイルで指定し、SIGHUP で読み直します。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
 ## 送信元 IP の引き渡し
 

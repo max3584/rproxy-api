@@ -24,6 +24,16 @@
 | `auth.rs` | `rotates_tokens` | 複数トークンの同時有効、読み直し、不正なファイルでは現状維持 |
 | | `disabled_allows_all` | トークンファイルなしなら認証なし |
 | `source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | PROXY protocol ヘッダのバイト列 |
+| | `port_ranges` | 範囲の検証（逆順、上限超え、転送先のポートが 65535 を超える） |
+| `tlsconf.rs` | `wildcard_matches_one_label` | `*.example.com` は 1 階層だけに一致する |
+| | `validation_rules` | 証明書なしの terminate、UDP の sni、terminate なしの STARTTLS、CA なしの mTLS を拒否 |
+| | `missing_files_are_reported` | 読めない証明書ファイルは、パスを含めて `tls_config` で返す |
+| `sni.rs` | `reads_server_name` / `needs_the_whole_record` / `handles_a_hello_split_across_records` / `rejects_plain_text` | rustls が作る ClientHello からサーバ名を読む。途中までのデータ、複数レコードに分かれた ClientHello、TLS でないデータ |
+| `starttls.rs` | `smtp_ehlo_then_starttls` / `imap_capability_and_starttls` / `pop3_capa_and_stls` / `quit_closes` | 各プロトコルの STARTTLS 前のやり取り。TLS 前のメール送信・ログインは拒否する |
+| | `smtp_optional_tls_hands_over_plain_commands` | `starttls_required: false` では、平文のコマンドを転送先へ引き継ぐ |
+| | `data_before_the_handshake_is_refused` | STARTTLS の直後に紛れ込ませたコマンドを受け付けない |
+| | `ehlo_reply_loses_starttls` | TLS 後の EHLO の応答から `STARTTLS` を取り除く |
+| `source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
 | `registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | 古い世代の監視タスクは、作り直したルールに触らない |
 
@@ -60,11 +70,46 @@
 | `concurrent_creates_of_the_same_rule_yield_one_winner` | 同じルールを 10 本同時に追加しても、成功するのは 1 本だけ |
 | `a_silent_api_client_does_not_block_others` | 何も送らない接続があっても、ほかのリクエストは待たされない（元の実装の不具合の再発防止） |
 
+## 結合テスト：ポート範囲と TLS（`tests/tls.rs`）
+
+テスト用の CA とサーバ証明書・クライアント証明書は、実行のたびに作る（`tests/common/pki.rs`）。
+
+| テスト | 確かめること |
+|---|---|
+| `tcp_port_range_maps_one_to_one` / `udp_port_range_maps_one_to_one` | 範囲の各ポートが、転送先の対応するポートへ届く。削除すると全ポートが閉じる |
+| `overlapping_ranges_are_rejected` | 範囲が重なるルールは作れない（プロトコルが違えばよい） |
+| `sni_routes_without_decrypting` | SNI で転送先を選ぶ（ワイルドカードを含む）。転送先の証明書でクライアントと転送先の間の TLS が成立する（rproxy は復号しない）。平文は切断する |
+| `terminate_sends_plain_text_and_tls_details_in_proxy_v2` | 転送先には平文が届き、PROXY v2 の TLV に SNI と ALPN が入る |
+| `mtls_required_checks_client_certificates` | 正しい CA のクライアント証明書だけを受け付け、失敗は `rproxy_tls_failures_total` に数える |
+| `terminate_can_re_encrypt_towards_the_backend` | 転送先へ TLS で再暗号化する。転送先の証明書の名前が違えば失敗する |
+| `certificates_are_chosen_by_sni` | 複数の証明書から SNI で選ぶ |
+| `bad_tls_settings_are_reported` | 読めないファイル、証明書なしの terminate、未知の mode、UDP の sni を拒否し、何も残らない |
+| `reload_picks_up_renewed_certificates_and_patch_changes_tls` | 証明書ファイルを差し替えて再読込すると新しい証明書が使われる。PATCH で passthrough に戻せる |
+
+## 結合テスト：STARTTLS（`tests/starttls.rs`）
+
+| テスト | 確かめること |
+|---|---|
+| `smtp_starttls_is_terminated_by_rproxy` | 平文の EHLO → STARTTLS → TLS 上の EHLO（応答から STARTTLS が消える）→ MAIL。平文のコマンドは転送先に届かない |
+| `smtp_without_tls_is_allowed_when_not_required` | `starttls_required: false` では平文のまま通り、EHLO が転送先へ引き継がれる |
+| `imap_starttls_is_terminated_by_rproxy` | TLS 前の LOGIN は拒否し、パスワードは TLS 上でだけ流れる |
+| `pop3_stls_is_terminated_by_rproxy` | TLS 前の USER は拒否し、STLS のあとは転送先に届く |
+| `starttls_needs_terminate` | `tls.mode: terminate` なしの `starttls` は `tls_config` |
+
+## 結合テスト：DTLS（`tests/dtls.rs`）
+
+| テスト | 確かめること |
+|---|---|
+| `dtls_is_terminated_and_forwarded_as_plain_udp` | DTLS を終端し、転送先には平文の UDP を送る。クライアントごとに別のセッションになる |
+| `dtls_client_certificates_can_be_required` | クライアント証明書を必須にできる |
+| `dtls_can_be_re_encrypted_towards_the_backend` | 転送先へ DTLS で再暗号化する |
+| `dtls_needs_a_pkcs8_key` | PKCS#8 でない鍵は `tls_config` |
+
 ## DB からの復元（`tests/db_restore.rs`）
 
 | テスト | 確かめること |
 |---|---|
-| `loads_current_and_legacy_tables` | 現在のテーブルを読める。範囲外のポートの行は飛ばす。`source_ip` / `udp_idle_secs` 列がない古いテーブルも既定値で読める |
+| `loads_every_schema_version` | `src_port_end` / `options` 列を含む現在のテーブル（壊れた `options` の行は飛ばす）、その前のテーブル、`source_ip` / `udp_idle_secs` もない古いテーブルのどれからも読める |
 
 ## transparent の実経路（`scripts/test-transparent.sh`）
 
@@ -78,6 +123,8 @@
 | UDP / `transparent` | 転送先にはクライアントの IP とポートが見える |
 
 ## まだテストしていないこと
+
+- 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ
 
 - 長時間の負荷（数時間の連続転送、メモリの増え方）
 - TLS を有効にした制御 API（手動では確認済み、自動テストはない）
