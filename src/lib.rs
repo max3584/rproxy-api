@@ -1,18 +1,12 @@
-use serde::Deserialize;
-
-
-#[derive(Deserialize, Debug)]
-pub struct Command {
-	pub property: String,
-	pub parameter: Option<String>
-}
-
-#[derive(Deserialize, Debug)]
-pub struct APICommand {
-	pub property: String,
-	pub listen_addr: String,
-	pub listen_port: u16,
-	pub remote_addr: String,
-	pub remote_port: u16,
-	pub protocol: String
-}
+pub mod api;
+pub mod auth;
+pub mod db;
+pub mod error;
+pub mod logging;
+pub mod proxy;
+pub mod registry;
+pub mod resolve;
+pub mod rule;
+pub mod source;
+pub mod tcp;
+pub mod udp;

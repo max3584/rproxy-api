@@ -1,93 +1,193 @@
-﻿// This section is derived from the original rproxy project by glacierx.
-// Modifications have been made to handle additional logging features and API functionality.
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
-mod lib;
-mod api;
-mod dns;
-mod tcp;
-mod udp;
-
-use log::*;
-use tokio;
-use serde_json;
-use std::path::Path;
 use argh::FromArgs;
-use chrono::Local;
-use crate::api::APIServer;
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::Handle;
+use tracing::{error, info, warn};
 
-#[allow(dead_code)]
+use rproxy_api::api::{self, AppState};
+use rproxy_api::auth::Tokens;
+use rproxy_api::registry::{Config, Registry};
+use rproxy_api::{db, logging, resolve, source};
+
 #[derive(FromArgs)]
-#[argh(description = "TCP/UDP Forwarder")]
+/// TCP/UDP forwarder controlled over an HTTP API.
 struct Options {
-	// loglevel
-	#[argh(option, short='l', default="2", description = "log level")]
-	loglevel: u8,
-	// debug
-	#[argh(switch, short='d', description = "debug mode")]
-	debug: bool,
-	// logfile
-	#[argh(option, short='f', default="\"rproxy.log\".to_string()", description = "logging file")]
-	logfile: String,
-	// api address
-	#[argh(option, short='a', default="\"127.0.0.1\".to_string()", description = "api address")]
-	api_addr: String,
-	// server port
-	#[argh(option, short='p', default="8080", description = "server port")]
+	/// address for the control API; repeat to listen on several (default 127.0.0.1)
+	#[argh(option)]
+	api_addr: Vec<IpAddr>,
+	/// port for the control API
+	#[argh(option, default = "8080")]
 	api_port: u16,
-	// control_tcp_addr
-	#[argh(option, short='t', default="\"127.0.0.2\".to_string()", description = "control tcp address")]
-	control_tcp_addr: String,
-	// control_udp_addr
-	#[argh(option, short='u', default="\"127.0.0.3\".to_string()", description = "control udp address")]
-	control_udp_addr: String,
+	/// file of bearer tokens, one per line; re-read on SIGHUP
+	#[argh(option)]
+	token_file: Option<PathBuf>,
+	/// TLS certificate chain (PEM) for the control API; re-read on SIGHUP
+	#[argh(option)]
+	tls_cert: Option<PathBuf>,
+	/// TLS private key (PEM) for the control API
+	#[argh(option)]
+	tls_key: Option<PathBuf>,
+	/// log file; rotated daily as <stem>.<date>.<ext> (default: stdout)
+	#[argh(option)]
+	log_file: Option<PathBuf>,
+	/// number of rotated log files to keep
+	#[argh(option, default = "14")]
+	log_keep: usize,
+	/// log filter, e.g. info or debug
+	#[argh(option, default = "String::from(\"info\")")]
+	log_level: String,
+	/// mysql://user:pass@host:port/db to restore rules from at startup (or RPROXY_DATABASE_URL)
+	#[argh(option)]
+	database_url: Option<String>,
+	/// seconds between DNS re-resolutions of rule targets
+	#[argh(option, default = "30")]
+	dns_interval: u64,
 }
 
-pub static LOGGER: Logger = Logger;
-
-struct Logger;
-
-impl log::Log for Logger {
-	fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-		true
+fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
+	let exposed: Vec<String> = addrs.iter().filter(|a| !a.is_loopback()).map(|a| a.to_string()).collect();
+	if exposed.is_empty() {
+		return Ok(());
 	}
-
-	fn log(&self, record: &Record) {
-		println!("|{}| [{}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), record.level(), record.args());
+	let mut missing = vec![];
+	if opts.token_file.is_none() {
+		missing.push("--token-file");
 	}
-
-	fn flush(&self) { todo!() }
+	if opts.tls_cert.is_none() || opts.tls_key.is_none() {
+		missing.push("--tls-cert/--tls-key");
+	}
+	if missing.is_empty() {
+		Ok(())
+	} else {
+		Err(format!("listening on {} requires {}", exposed.join(", "), missing.join(" and ")))
+	}
 }
 
 #[tokio::main]
-async fn main() {
-    let options: Options = argh::from_env::<Options>();
+async fn main() -> ExitCode {
+	let opts: Options = argh::from_env();
 
-    if Path::new(&options.logfile).exists() {
-		std::fs::remove_file(&options.logfile)
-			.unwrap_or_else(|e| {
-				error!("Failed to remove log file: {}", e);
-				std::process::exit(1);
-			});
-	} else {
-		log::set_logger(&LOGGER).unwrap();
-		if options.debug {
-			log::set_max_level(LevelFilter::Debug);
-		} else {
-			log::set_max_level(LevelFilter::Info);
+	let _log_guard = match logging::init(&opts.log_level, opts.log_file.as_deref(), opts.log_keep) {
+		Ok(guard) => guard,
+		Err(e) => {
+			eprintln!("rproxy-api: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	match run(opts).await {
+		Ok(()) => ExitCode::SUCCESS,
+		Err(e) => {
+			error!(event = "fatal", error = %e);
+			ExitCode::FAILURE
+		}
+	}
+}
+
+async fn run(opts: Options) -> Result<(), String> {
+	let addrs = if opts.api_addr.is_empty() { vec![IpAddr::from([127, 0, 0, 1])] } else { opts.api_addr.clone() };
+	check_exposure(&opts, &addrs)?;
+	if opts.tls_cert.is_some() != opts.tls_key.is_some() {
+		return Err("--tls-cert and --tls-key must be given together".into());
+	}
+
+	let tokens = Arc::new(match &opts.token_file {
+		Some(path) => Tokens::from_file(path.clone()).map_err(|e| format!("token file: {e}"))?,
+		None => Tokens::disabled(),
+	});
+
+	let tls = match (&opts.tls_cert, &opts.tls_key) {
+		(Some(cert), Some(key)) => {
+			let _ = rustls::crypto::ring::default_provider().install_default();
+			Some(RustlsConfig::from_pem_file(cert, key).await.map_err(|e| format!("TLS: {e}"))?)
+		}
+		_ => None,
+	};
+
+	let transparent = source::transparent_available();
+	let registry = Registry::new(Config {
+		dns_interval: Duration::from_secs(opts.dns_interval.max(1)),
+		lookup: resolve::system_lookup(),
+		transparent,
+	});
+	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some());
+
+	let database_url = opts.database_url.clone().or_else(|| std::env::var("RPROXY_DATABASE_URL").ok());
+	if let Some(url) = database_url {
+		match db::load_rules(&url).await {
+			Ok(rules) => {
+				info!(event = "restore.start", rules = rules.len());
+				registry.restore(rules).await;
+			}
+			// keep serving the API so the UI can still add rules
+			Err(e) => error!(event = "restore.error", error = %e),
 		}
 	}
 
-    info!("Starting application...");
+	let app = api::router(Arc::new(AppState { registry: registry.clone(), tokens: tokens.clone() }));
+	let mut handles = vec![];
+	for ip in addrs {
+		let addr = SocketAddr::new(ip, opts.api_port);
+		let app = app.clone().into_make_service();
+		let handle = Handle::new();
+		let server = match &tls {
+			Some(tls) => tokio::spawn(axum_server::bind_rustls(addr, tls.clone()).handle(handle.clone()).serve(app)),
+			None => tokio::spawn(axum_server::bind(addr).handle(handle.clone()).serve(app)),
+		};
+		// a bind error makes `listening()` return None
+		if handle.listening().await.is_none() {
+			let reason = match server.await {
+				Ok(Err(e)) => e.to_string(),
+				_ => "server stopped".into(),
+			};
+			return Err(format!("control API on {addr}: {reason}"));
+		}
+		handles.push(handle);
+	}
+	info!(event = "api.listening", port = opts.api_port, tls = tls.is_some());
 
+	wait_for_shutdown(&tokens, tls.as_ref(), &opts).await?;
 
-    // IPC Controller Config
-    let config = APIServer {
-        server: options.api_addr,
-        port: options.api_port,
-        control_tcp_addr: options.control_tcp_addr,
-        control_udp_addr: options.control_udp_addr,
-    };
+	info!(event = "shutdown");
+	for handle in &handles {
+		handle.graceful_shutdown(Some(Duration::from_secs(5)));
+	}
+	registry.shutdown().await;
+	Ok(())
+}
 
-    config.start().await;
+/// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.
+#[cfg(unix)]
+async fn wait_for_shutdown(tokens: &Tokens, tls: Option<&RustlsConfig>, opts: &Options) -> Result<(), String> {
+	use tokio::signal::unix::{signal, SignalKind};
 
+	let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
+	let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
+	loop {
+		tokio::select! {
+			_ = hup.recv() => {
+				match tokens.reload() {
+					Ok(n) => info!(event = "reload.tokens", tokens = n),
+					Err(e) => warn!(event = "reload.tokens", error = %e, "keeping current tokens"),
+				}
+				if let (Some(tls), Some(cert), Some(key)) = (tls, &opts.tls_cert, &opts.tls_key) {
+					match tls.reload_from_pem_file(cert, key).await {
+						Ok(()) => info!(event = "reload.tls"),
+						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
+					}
+				}
+			}
+			_ = term.recv() => return Ok(()),
+			_ = tokio::signal::ctrl_c() => return Ok(()),
+		}
+	}
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown(_: &Tokens, _: Option<&RustlsConfig>, _: &Options) -> Result<(), String> {
+	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
 }

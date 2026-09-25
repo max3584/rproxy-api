@@ -1,150 +1,88 @@
-﻿// The following algorithm is derived from the original rproxy project by glacierx.
-// Some modifications have been made to integrate it into the rproxy-api project.
+// The forwarding loop descends from the original rproxy project by glacierx and
+// has been rewritten around cancellation tokens for rproxy-api.
 
-use log::*;
-use std::sync::{Arc, Mutex};
-use futures::future::try_join;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use tokio::io::AsyncWriteExt;
-use tokio::task::JoinHandle;
-use tokio::net::TcpStream;
-use tokio::net::TcpListener;
-use tokio::time;
-use serde_json;
-use crate::dns::DNSResolve;
-use crate::api::sync;
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{info, warn};
 
-struct TCPPeerPair {
-	client: TcpStream,
-	remote: String,
-}
+use crate::proxy::Runtime;
+use crate::rule::SourceIp;
+use crate::source;
 
-impl TCPPeerPair {
-	async fn run(mut self) -> Result<(), std::io::Error>{
-		// Algorithm implementation with necessary modifications
-		// let mut outbound = TcpStream::connect(self.remote.clone()).await?;
-
-		// let (mut ri, mut wi) = self.client.split();
-		// let (mut ro, mut wo) = outbound.split();
-
-		// let client_to_server = async {
-		//     tokio::io::copy(&mut ri, &mut wo).await?;
-		//     wo.shutdown().await
-		// };
-
-		// let server_to_client = async {
-		//     tokio::io::copy(&mut ro, &mut wi).await?;
-		//     wi.shutdown().await
-		// };
-		// try_join(client_to_server, server_to_client).await?;
-		let mut outbound = TcpStream::connect(self.remote.clone()).await?;
-		match tokio::io::copy_bidirectional(&mut self.client, &mut outbound).await {
-			Ok(tx) => {
-				info!("[TCP] [Proxy] Copy data: {:?}", tx);
-			},
-			Err(e) => {
-				error!("[TCP] [PROXY] Failed to copy data: {:?}", e);
-			}
-		}
-		outbound.shutdown().await?;
-		self.client.shutdown().await?;
-		Ok(())
-	}
-}
-pub struct TCPProxy {
-	pub signal_addr: String,
-	pub addr: String,
-	pub remote: Arc<Mutex<String>>,
-	pub stop: Arc<Mutex<bool>>,
-	pub dns: Vec<String>
-}
-
-impl DNSResolve for TCPProxy {
-	fn remote(&self) -> String {
-		let remote = format!("{}", self.remote.lock().unwrap());
-		return remote;
-	}
-	fn client(&self) -> &String{
-		&self.addr
-	}
-	fn dns(&self) -> &Vec<String>{
-		&self.dns
-	}
-	fn reset_dns(&mut self,d: &Vec<String>) -> usize {
-		self.dns = d.to_vec();
-		self.dns.len()
-	}
-}
-
-impl TCPProxy {
-	pub fn new(signal_addr: String, addr: String, remote: String) -> Self {
-		Self {
-			signal_addr: signal_addr,
-			addr: addr,
-			remote: Arc::new(Mutex::new(remote)),
-			stop: Arc::new(Mutex::new(false)),
-			dns: vec![]
-		}
-	}
-
-	pub async fn run(mut self) -> Result<(), std::io::Error> {
-		// Algorithm implementation with necessary modifications
-		self.resolve().await.unwrap();
-		let stop_signal = Arc::clone(&self.stop);
-		let remote_signal = Arc::clone(&self.remote);
-
-		let bind_addr = self.addr.clone();
-		let remote = self.remote.clone();
-		let signal_addr = self.signal_addr.clone();
-
-		info!("[TCP] Starting Proxy {} <-> {}", &bind_addr, &remote.lock().unwrap());
-		let main_task = async move {
-			let mut time_out1 = time::interval(tokio::time::Duration::from_secs(30));
-			let mut host = self.dns[0].clone();
-
-			match TcpListener::bind(&bind_addr).await {
-				Ok(listener) => {
-					info!("[TCP] Listening on {}", &listener.local_addr().unwrap());
-					loop{
-						tokio::select!{
-							x = listener.accept() => {
-								match x {
-									Ok((inbound, _)) => {
-										let client = TCPPeerPair{
-											client: inbound,
-											remote: host.clone()
-										};
-										tokio::spawn(client.run());
-									},
-									Err(e1) => {
-										error!("[TCP] Failed to accept new connection from {}, err={:?}", &bind_addr, e1);
-									}
-								}
-							},
-							_ = time_out1.tick() => {
-								debug!("Ressolve DNS update");
-								if *self.stop.lock().unwrap() {
-										break;
-								}
-								self.resolve().await.unwrap();
-								host = self.dns[0].clone();
-							}
-						}
-					}
-					Ok::<(),std::io::Error>(())
-				},
+pub async fn serve(listener: TcpListener, rt: Arc<Runtime>) {
+	loop {
+		tokio::select! {
+			biased;
+			_ = rt.stop.cancelled() => break,
+			accepted = listener.accept() => match accepted {
+				Ok((inbound, peer)) => {
+					rt.tracker.spawn(handle(inbound, peer, rt.clone()));
+				}
 				Err(e) => {
-					error!("[TCP] Failed to bind interface {}, err={:?}", &bind_addr, e);
-					Ok(())
+					// e.g. EMFILE: back off instead of spinning
+					warn!(event = "accept.error", rule = %rt.key, error = %e);
+					tokio::time::sleep(Duration::from_millis(100)).await;
 				}
 			}
-		};
+		}
+	}
+}
 
-		info!("[IPC] [TCP] Controller is running on port {}", signal_addr);
-		let control = async move {
-			sync(signal_addr, remote_signal, stop_signal).await;
-			Ok(())
+async fn connect(rt: &Runtime, client: SocketAddr) -> io::Result<(TcpStream, SocketAddr)> {
+	let targets = rt.target.borrow().clone();
+	let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no resolved target");
+	for target in targets {
+		match source::connect_tcp(target, rt.bind_as(client)).await {
+			Ok(stream) => return Ok((stream, target)),
+			Err(e) => last_err = e,
+		}
+	}
+	Err(last_err)
+}
+
+async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>) {
+	let started = Instant::now();
+	rt.stats.opened();
+
+	let result: io::Result<(SocketAddr, u64, u64, &str)> = async {
+		let (mut outbound, target) = tokio::select! {
+			_ = rt.kill.cancelled() => return Err(io::Error::other("stopped before connect")),
+			r = connect(&rt, client) => r?,
 		};
-		let _ = try_join(main_task, control).await.unwrap();
-		Ok(())
+		info!(event = "conn.open", rule = %rt.key, client = %client, target = %target);
+
+		let local = inbound.local_addr()?;
+		match rt.source_ip {
+			SourceIp::ProxyV1 => outbound.write_all(&source::proxy_v1_header(client, local)).await?,
+			SourceIp::ProxyV2 => outbound.write_all(&source::proxy_v2_header(client, local)).await?,
+			SourceIp::Proxy | SourceIp::Transparent => {}
+		}
+
+		tokio::select! {
+			_ = rt.kill.cancelled() => Ok((target, 0, 0, "stopped")),
+			r = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {
+				let (rx, tx) = r?;
+				Ok((target, rx, tx, "closed"))
+			}
+		}
+	}
+	.await;
+
+	let elapsed_ms = started.elapsed().as_millis() as u64;
+	match result {
+		Ok((target, rx, tx, reason)) => {
+			rt.stats.closed(rx, tx);
+			info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
+				rx_bytes = rx, tx_bytes = tx, duration_ms = elapsed_ms, reason);
+		}
+		Err(e) => {
+			rt.stats.closed(0, 0);
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, duration_ms = elapsed_ms);
+		}
 	}
 }

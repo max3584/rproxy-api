@@ -6,7 +6,6 @@ authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
 description = "Platform independent asynchronous UDP/TCP proxy"
 homepage = "https://github.com/max3584/rproxy-api"
 repository = "https://github.com/max3584/rproxy-api"
-fork_repositry = "https://github.com/glacierx/rproxy"
 readme = "README.md"
 keywords = ["proxy", "TCP", "UDP", "async","openvpn"]
 categories = ["command-line-utilities", "network-programming"]
@@ -17,15 +16,23 @@ exclude = [
     "Cargo.lock",
 ]
 
+[package.metadata]
+fork_repository = "https://github.com/glacierx/rproxy"
+
 [dependencies]
-tokio = { version = "1.39.2", features = ["full"] }
-log = "0.4.22"
-env_logger = "0.11.5"
-chrono = "0.4.38"
-async-trait = "0.1.81"
-sqlx = { version = "0.8.0", features = ["runtime-tokio", "mysql"] }
-serde = "1.0.207"
-serde_json = "1.0.124"
-argh = "0.1.12"
-futures-util = "0.3.30"
-futures = "0.3.30"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql"] }
+argh = "0.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
