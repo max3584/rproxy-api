@@ -16,29 +16,13 @@ use common::*;
 
 /// `n` consecutive free TCP ports on 127.0.0.1, bound (so they stay free).
 fn consecutive_tcp(n: u16) -> Vec<std::net::TcpListener> {
-	loop {
-		let base = free_port();
-		if base > 65_000 {
-			continue;
-		}
-		let bound: Vec<_> = (0..n).map_while(|i| std::net::TcpListener::bind(("127.0.0.1", base + i)).ok()).collect();
-		if bound.len() == n as usize {
-			return bound;
-		}
-	}
+	let base = free_tcp_block(n);
+	(0..n).map(|i| std::net::TcpListener::bind(("127.0.0.1", base + i)).unwrap()).collect()
 }
 
 fn consecutive_udp(n: u16) -> Vec<std::net::UdpSocket> {
-	loop {
-		let base = free_udp_port();
-		if base > 65_000 {
-			continue;
-		}
-		let bound: Vec<_> = (0..n).map_while(|i| std::net::UdpSocket::bind(("127.0.0.1", base + i)).ok()).collect();
-		if bound.len() == n as usize {
-			return bound;
-		}
-	}
+	let base = free_udp_block(n);
+	(0..n).map(|i| std::net::UdpSocket::bind(("127.0.0.1", base + i)).unwrap()).collect()
 }
 
 /// A plain backend answering `tag` + what it read, on an already bound listener.

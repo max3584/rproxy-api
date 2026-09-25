@@ -76,7 +76,22 @@ struct Detail {
 	reason: &'static str,
 }
 
+/// Refusal that is not an error: allow_from or `unmatched: reject`.
+fn denied(rt: &Runtime, client: SocketAddr, why: &str, sni: Option<&str>) -> io::Error {
+	rt.stats.denied();
+	info!(event = "conn.denied", rule = %rt.key, client = %client, reason = why, sni = sni.unwrap_or(""));
+	io::Error::new(io::ErrorKind::PermissionDenied, "denied")
+}
+
+fn is_denied(e: &io::Error) -> bool {
+	e.kind() == io::ErrorKind::PermissionDenied && e.to_string() == "denied"
+}
+
 async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+	if !rt.allowed(client.ip()) {
+		denied(&rt, client, "allow_from", None);
+		return;
+	}
 	let started = Instant::now();
 	rt.stats.opened();
 	let tls = rt.tls();
@@ -92,6 +107,7 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
 	match result {
+		Err(e) if is_denied(&e) => {}
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or("")),
@@ -111,7 +127,7 @@ async fn run(
 	let local = inbound.local_addr()?;
 	match tls.mode() {
 		TlsMode::Passthrough => {
-			let target = rt.select(None, offset);
+			let target = rt.select(None, offset).ok_or_else(|| denied(rt, client, "unmatched", None))?;
 			let (mut out, addr) = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
 			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr);
@@ -120,7 +136,7 @@ async fn run(
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
-			let target = rt.select(name.as_deref(), offset);
+			let target = rt.select(name.as_deref(), offset).ok_or_else(|| denied(rt, client, "unmatched", name.as_deref()))?;
 			let (mut out, addr) = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
 			detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
@@ -161,7 +177,7 @@ async fn terminate(
 	tls: &TlsRuntime,
 	detail: &mut Detail,
 ) -> io::Result<()> {
-	let acceptor = tls.acceptor.clone().ok_or_else(|| io::Error::other("TLS is not configured"))?;
+	let config = tls.server_config.clone().ok_or_else(|| io::Error::other("TLS is not configured"))?;
 
 	if let Some(proto) = tls.starttls {
 		let outcome = starttls::serve_client(proto, inbound, &tls.greeting_name, tls.starttls_required)
@@ -177,11 +193,23 @@ async fn terminate(
 		}
 	}
 
-	let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(&mut *inbound))
-		.await
-		.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
-		.and_then(|r| r)
-		.inspect_err(|_| rt.stats.tls_failed())?;
+	// read the ClientHello first so unmatched names are refused before any certificate is sent
+	let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), &mut *inbound).await?;
+		let name = start.client_hello().server_name().map(str::to_string);
+		if rt.select(name.as_deref(), offset).is_none() {
+			return Err(denied(rt, client, "unmatched", name.as_deref()));
+		}
+		start.into_stream(config).await
+	})
+	.await
+	.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
+	.and_then(|r| r)
+	.inspect_err(|e| {
+		if !is_denied(e) {
+			rt.stats.tls_failed()
+		}
+	})?;
 
 	let (_, conn) = session.get_ref();
 	let peer_cert = conn.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
@@ -192,7 +220,9 @@ async fn terminate(
 		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
 		client_cert: peer_cert.is_some(),
 	};
-	let target = rt.select(info.server_name.as_deref(), offset);
+	let target = rt
+		.select(info.server_name.as_deref(), offset)
+		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;
 	let (mut out, addr) = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr,
@@ -238,7 +268,7 @@ async fn plain_smtp(
 	pending: Vec<u8>,
 	detail: &mut Detail,
 ) -> io::Result<()> {
-	let target = rt.select(None, offset);
+	let target = rt.select(None, offset).ok_or_else(|| denied(rt, client, "unmatched", None))?;
 	let (mut out, addr) = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, starttls = "smtp", tls = "none");

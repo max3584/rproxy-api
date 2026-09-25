@@ -30,6 +30,17 @@ pub enum TlsMode {
 	Terminate,
 }
 
+/// What happens to server names that no route matches (and to clients sending no SNI).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unmatched {
+	/// Send them to the rule's own target.
+	#[default]
+	Default,
+	/// Close the connection (for terminate, before completing the handshake).
+	Reject,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -114,6 +125,8 @@ pub struct TlsSpec {
 	pub alpn: Vec<String>,
 	#[serde(default)]
 	pub upstream: Upstream,
+	#[serde(default)]
+	pub unmatched: Unmatched,
 }
 
 /// Mail protocols whose plain-text STARTTLS dialogue rproxy answers itself.
@@ -171,6 +184,11 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 	}
 	if tls.client_auth.mode == ClientAuthMode::None && tls.client_auth.chain_file.is_some() {
 		return Err(tls_error("client_auth chain_file needs mode optional or required"));
+	}
+	if tls.unmatched == Unmatched::Reject
+		&& (protocol != Protocol::Tcp || tls.mode == TlsMode::Passthrough || tls.routes.is_empty())
+	{
+		return Err(tls_error("unmatched: reject needs protocol tcp, mode sni or terminate, and at least one route"));
 	}
 	if protocol == Protocol::Udp && !tls.alpn.is_empty() {
 		return Err(tls_error("alpn is supported for tcp only"));
@@ -529,7 +547,8 @@ pub struct TlsRuntime {
 	pub starttls_required: bool,
 	/// Host name rproxy uses in its own STARTTLS greeting.
 	pub greeting_name: String,
-	pub acceptor: Option<tokio_rustls::TlsAcceptor>,
+	/// Server side of TLS termination (tcp).
+	pub server_config: Option<Arc<ServerConfig>>,
 	pub connector: Option<tokio_rustls::TlsConnector>,
 	dtls_certs: Vec<webrtc_dtls::crypto::Certificate>,
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
@@ -551,7 +570,7 @@ impl TlsRuntime {
 			starttls,
 			starttls_required,
 			greeting_name: "rproxy".to_string(),
-			acceptor: None,
+			server_config: None,
 			connector: None,
 			dtls_certs: vec![],
 			dtls_client_verifier: None,
@@ -563,7 +582,7 @@ impl TlsRuntime {
 		}
 		match protocol {
 			Protocol::Tcp => {
-				rt.acceptor = Some(tokio_rustls::TlsAcceptor::from(server_config(spec)?));
+				rt.server_config = Some(server_config(spec)?);
 				if let Some(name) = load_chain(&spec.certificates[0].cert_file)?
 					.first()
 					.and_then(|c| cert_names(c).into_iter().find(|n| !n.starts_with("*.")))
@@ -687,6 +706,8 @@ mod tests {
 		};
 		dtls_alpn.alpn = vec!["h2".into()];
 		assert_eq!(validate(Protocol::Udp, &dtls_alpn, None).unwrap_err().code, "tls_config");
+		let reject_without_routes = TlsSpec { mode: TlsMode::Sni, unmatched: Unmatched::Reject, ..Default::default() };
+		assert_eq!(validate(Protocol::Tcp, &reject_without_routes, None).unwrap_err().code, "tls_config");
 		let routed = TlsSpec {
 			mode: TlsMode::Sni,
 			routes: vec![Route { server_name: "a.test".into(), remote_addr: "10.0.0.1".into(), remote_port: 65_530 }],
