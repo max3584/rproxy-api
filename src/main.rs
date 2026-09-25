@@ -165,6 +165,7 @@ async fn run(opts: Options) -> Result<(), String> {
 		lookup: resolve::system_lookup(),
 		transparent,
 		max_range_ports: opts.max_range_ports.max(1),
+		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 	});
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some(),

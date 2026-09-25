@@ -31,6 +31,8 @@ pub struct Config {
 	pub transparent: bool,
 	/// Largest port range one rule may open.
 	pub max_range_ports: u16,
+	/// Addresses rproxy itself listens on (the control API); rules may not take them.
+	pub reserved: Vec<SocketAddr>,
 }
 
 type Resolver = (CancellationToken, JoinHandle<()>);
@@ -173,6 +175,23 @@ impl Registry {
 		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1) })
 	}
 
+	pub fn reserved(&self) -> &[SocketAddr] {
+		&self.cfg.reserved
+	}
+
+	/// The control API's own address, if the rule would take it.
+	fn reserved_clash(&self, spec: &RuleSpec) -> Option<SocketAddr> {
+		if spec.key.protocol != Protocol::Tcp {
+			return None;
+		}
+		let (ip, start) = (spec.key.listen.ip(), u32::from(spec.key.listen.port()));
+		let end = start + u32::from(spec.port_count) - 1;
+		self.cfg.reserved.iter().copied().find(|r| {
+			let same_ip = r.ip() == ip || r.ip().is_unspecified() || ip.is_unspecified();
+			same_ip && (start..=end).contains(&u32::from(r.port()))
+		})
+	}
+
 	pub fn caps(&self) -> Caps {
 		Caps { transparent: self.cfg.transparent, max_range_ports: self.cfg.max_range_ports }
 	}
@@ -303,6 +322,9 @@ impl Registry {
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
+		if let Some(api) = self.reserved_clash(&spec) {
+			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
+		}
 		let prepared = self.prepare(&spec).await?;
 		let mut rules = self.rules.lock().await;
 		if rules.contains_key(&spec.key) {
@@ -619,6 +641,7 @@ mod tests {
 			lookup: resolve::system_lookup(),
 			transparent: false,
 			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
+			reserved: vec![],
 		})
 	}
 

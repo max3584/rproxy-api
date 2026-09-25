@@ -98,6 +98,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
 | `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000}`。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる |
+| `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
@@ -123,6 +124,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `unsupported` | 400 | この環境では使えない指定（`transparent` など）、または変更できない項目 |
 | `not_found` | 404 | ルールがない |
 | `already_exists` | 409 | 同じキーのルールが既にある |
+| `reserved` | 409 | rproxy 自身の制御 API のアドレスとポートに重なる（`0.0.0.0` / `::` とポート範囲も含めて判定する） |
 | `bind_failed` | 409 | 待ち受けポートを開けない |
 | `resolve_failed` | 502 | 転送先の名前解決に失敗し、キャッシュもない |
 | `internal` | 500 | その他 |

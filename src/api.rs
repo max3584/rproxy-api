@@ -27,6 +27,7 @@ type AppResult<T> = Result<T, ApiError>;
 pub fn router(state: Arc<AppState>) -> Router {
 	let protected = Router::new()
 		.route("/capabilities", get(capabilities))
+		.route("/interfaces", get(interfaces))
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
 		.route("/metrics", get(metrics))
@@ -72,6 +73,33 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		"starttls": ["smtp", "imap", "pop3"],
 		"max_range_ports": state.registry.caps().max_range_ports,
 	}))
+}
+
+/// Addresses of this host that rules can listen on, and the ones rproxy keeps for itself.
+async fn interfaces(State(state): State<Arc<AppState>>) -> AppResult<impl IntoResponse> {
+	let mut list: Vec<serde_json::Value> = if_addrs::get_if_addrs()
+		.map_err(|e| ApiError::internal(format!("cannot list interfaces: {e}")))?
+		.into_iter()
+		.filter(|i| i.is_oper_up())
+		.map(|i| {
+			let ip = i.ip();
+			json!({
+				"name": i.name,
+				"addr": ip.to_string(),
+				"family": if ip.is_ipv4() { "ipv4" } else { "ipv6" },
+				"loopback": i.is_loopback(),
+				"link_local": i.is_link_local(),
+			})
+		})
+		.collect();
+	list.sort_by_key(|v| (v["loopback"].as_bool(), v["family"] != "ipv4", v["name"].as_str().map(String::from)));
+	let reserved: Vec<serde_json::Value> = state
+		.registry
+		.reserved()
+		.iter()
+		.map(|a| json!({"protocol": "tcp", "addr": a.ip().to_string(), "port": a.port(), "purpose": "control API"}))
+		.collect();
+	Ok(Json(json!({ "interfaces": list, "reserved": reserved })))
 }
 
 async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
