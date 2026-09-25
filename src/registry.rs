@@ -123,6 +123,11 @@ pub struct Registry {
 }
 
 fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
+	if e.kind() == std::io::ErrorKind::PermissionDenied && addr.port() < 1024 {
+		return ApiError::bind_failed(format!(
+			"{addr}: {e}; ports below 1024 need CAP_NET_BIND_SERVICE (setcap cap_net_bind_service=+ep on the binary, or AmbientCapabilities in systemd)"
+		));
+	}
 	ApiError::bind_failed(format!("{addr}: {e}"))
 }
 
