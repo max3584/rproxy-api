@@ -52,7 +52,10 @@ threading.Thread(target=tcp, daemon=True).start(); udp()
 ' & BE=$!
 
 (cd "$WORK" && RPROXY_API_PORT=18200 exec "$BIN" > "$WORK/rproxy.log" 2>&1) & RP=$!
-sleep 1
+for i in $(seq 1 50); do curl -sf localhost:18200/healthz >/dev/null && break; sleep 0.2; done
+if ! curl -sf localhost:18200/healthz >/dev/null; then
+  echo "rproxy did not start; log:"; cat "$WORK/rproxy.log"; exit 1
+fi
 echo "capabilities: $(curl -s localhost:18200/capabilities)"
 for proto in tcp udp; do
   port=$([ $proto = tcp ] && echo 9001 || echo 9002)
