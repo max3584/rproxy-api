@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use argh::FromArgs;
+use clap::Parser;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
 use tracing::{error, info, warn};
@@ -14,38 +14,42 @@ use rproxy_api::auth::Tokens;
 use rproxy_api::registry::{Config, Registry};
 use rproxy_api::{db, logging, resolve, source};
 
-#[derive(FromArgs)]
 /// TCP/UDP forwarder controlled over an HTTP API.
+///
+/// Every option can also be set with the environment variable shown, and a
+/// `.env` file in the working directory is loaded first. Flags win over both.
+#[derive(Parser)]
+#[command(version)]
 struct Options {
-	/// address for the control API; repeat to listen on several (default 127.0.0.1)
-	#[argh(option)]
+	/// Addresses for the control API, comma-separated or repeated
+	#[arg(long, env = "RPROXY_API_ADDR", value_delimiter = ',', default_value = "127.0.0.1")]
 	api_addr: Vec<IpAddr>,
-	/// port for the control API
-	#[argh(option, default = "8080")]
+	/// Port for the control API
+	#[arg(long, env = "RPROXY_API_PORT", default_value_t = 8080)]
 	api_port: u16,
-	/// file of bearer tokens, one per line; re-read on SIGHUP
-	#[argh(option)]
+	/// File of bearer tokens, one per line; re-read on SIGHUP
+	#[arg(long, env = "RPROXY_TOKEN_FILE")]
 	token_file: Option<PathBuf>,
 	/// TLS certificate chain (PEM) for the control API; re-read on SIGHUP
-	#[argh(option)]
+	#[arg(long, env = "RPROXY_TLS_CERT")]
 	tls_cert: Option<PathBuf>,
 	/// TLS private key (PEM) for the control API
-	#[argh(option)]
+	#[arg(long, env = "RPROXY_TLS_KEY")]
 	tls_key: Option<PathBuf>,
-	/// log file; rotated daily as <stem>.<date>.<ext> (default: stdout)
-	#[argh(option)]
+	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
+	#[arg(long, env = "RPROXY_LOG_FILE")]
 	log_file: Option<PathBuf>,
-	/// number of rotated log files to keep
-	#[argh(option, default = "14")]
+	/// Number of rotated log files to keep
+	#[arg(long, env = "RPROXY_LOG_KEEP", default_value_t = 14)]
 	log_keep: usize,
-	/// log filter, e.g. info or debug
-	#[argh(option, default = "String::from(\"info\")")]
+	/// Log filter, e.g. info or debug
+	#[arg(long, env = "RPROXY_LOG_LEVEL", default_value = "info")]
 	log_level: String,
-	/// mysql://user:pass@host:port/db to restore rules from at startup (or RPROXY_DATABASE_URL)
-	#[argh(option)]
+	/// mysql://user:pass@host:port/db to restore rules from at startup
+	#[arg(long, env = "RPROXY_DATABASE_URL", hide_env_values = true)]
 	database_url: Option<String>,
-	/// seconds between DNS re-resolutions of rule targets
-	#[argh(option, default = "30")]
+	/// Seconds between DNS re-resolutions of rule targets
+	#[arg(long, env = "RPROXY_DNS_INTERVAL", default_value_t = 30)]
 	dns_interval: u64,
 }
 
@@ -70,7 +74,14 @@ fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-	let opts: Options = argh::from_env();
+	// a missing .env is fine; a malformed one is reported
+	if let Err(e) = dotenvy::dotenv() {
+		if !e.not_found() {
+			eprintln!("rproxy-api: .env: {e}");
+			return ExitCode::FAILURE;
+		}
+	}
+	let opts = Options::parse();
 
 	let _log_guard = match logging::init(&opts.log_level, opts.log_file.as_deref(), opts.log_keep) {
 		Ok(guard) => guard,
@@ -89,7 +100,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(opts: Options) -> Result<(), String> {
-	let addrs = if opts.api_addr.is_empty() { vec![IpAddr::from([127, 0, 0, 1])] } else { opts.api_addr.clone() };
+	let addrs = opts.api_addr.clone();
 	check_exposure(&opts, &addrs)?;
 	if opts.tls_cert.is_some() != opts.tls_key.is_some() {
 		return Err("--tls-cert and --tls-key must be given together".into());
@@ -116,9 +127,8 @@ async fn run(opts: Options) -> Result<(), String> {
 	});
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some());
 
-	let database_url = opts.database_url.clone().or_else(|| std::env::var("RPROXY_DATABASE_URL").ok());
-	if let Some(url) = database_url {
-		match db::load_rules(&url).await {
+	if let Some(url) = &opts.database_url {
+		match db::load_rules(url).await {
 			Ok(rules) => {
 				info!(event = "restore.start", rules = rules.len());
 				registry.restore(rules).await;

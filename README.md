@@ -5,30 +5,30 @@
 
 ## 起動
 
+設定は環境変数で行う。起動ディレクトリに `.env` があれば読み込む（例は [.env.example](.env.example)）。
+同じ項目をコマンドライン引数（`--api-port` など）で指定した場合は、引数が優先される。
+
 ```shell
 cargo build --release
-
-./target/release/rproxy-api \
-    --api-addr 127.0.0.1 \
-    --api-port 8080 \
-    --token-file /etc/rproxy/tokens \
-    --log-file /var/log/rproxy/rproxy.log \
-    --database-url mysql://rproxy:password@127.0.0.1:3306/rproxy
+cp .env.example .env   # 値を環境に合わせて書き換える
+./target/release/rproxy-api
 ```
 
-| 引数 | 既定 | 説明 |
-|---|---|---|
-| `--api-addr` | `127.0.0.1` | 制御 API の待ち受けアドレス。複数回指定できる |
-| `--api-port` | `8080` | 制御 API のポート |
-| `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン）。指定すると認証が必須になる。SIGHUP で読み直す |
-| `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
-| `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
-| `--log-keep` | `14` | 残すログファイルの数 |
-| `--log-level` | `info` | `debug` などのフィルタ |
-| `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL。環境変数 `RPROXY_DATABASE_URL` でも指定できる |
-| `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
+systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ内容を渡せる。
 
-`--api-addr` に loopback 以外を含める場合は、`--token-file` と `--tls-cert` / `--tls-key` の指定が必須。どれかが欠けていると起動しない。
+| 環境変数 | 引数 | 既定 | 説明 |
+|---|---|---|---|
+| `RPROXY_API_ADDR` | `--api-addr` | `127.0.0.1` | 制御 API の待ち受けアドレス。カンマ区切りで複数指定できる |
+| `RPROXY_API_PORT` | `--api-port` | `8080` | 制御 API のポート |
+| `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン）。指定すると認証が必須になる。SIGHUP で読み直す |
+| `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
+| `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
+| `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
+| `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
+| `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
+| `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
+
+`RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
 
 ## 使い方
 

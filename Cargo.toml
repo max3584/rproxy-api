@@ -32,7 +32,8 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 socket2 = { version = "0.5", features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql"] }
-argh = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

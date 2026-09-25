@@ -9,8 +9,10 @@
 cargo build
 cargo test                    # 単体テスト + tests/api.rs（loopback で実ソケットを使う結合テスト）
 cargo clippy --all-targets
-cargo run -- --api-port 8080 --log-level debug
+cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.example を参照）
 ```
+
+- 設定項目は `src/main.rs` の `Options`（clap）。すべて `RPROXY_*` 環境変数でも指定でき、起動時に `.env` を読む。項目を増やすときは `.env.example` と README の表も更新する。
 
 - ring（rustls）のビルドには C コンパイラが要る。
 - リリースは `v*` タグの push で `.github/workflows/release.yml` が 9 ターゲット向けにクロスビルドする。
@@ -19,7 +21,7 @@ cargo run -- --api-port 8080 --log-level debug
 
 | ファイル | 役割 |
 |---|---|
-| `src/main.rs` | 引数、ログ初期化、TLS、起動時の DB 復元、制御 API の起動、SIGHUP（トークン・証明書の再読込）と終了処理 |
+| `src/main.rs` | 設定（環境変数・`.env`・引数）、ログ初期化、TLS、起動時の DB 復元、制御 API の起動、SIGHUP（トークン・証明書の再読込）と終了処理 |
 | `src/api.rs` | axum のルーター。Bearer 認証のミドルウェア。エラーは常に `ApiError` の JSON |
 | `src/registry.rs` | 稼働中ルールの唯一の持ち主。作成・変更・削除・一覧・metrics、listener の監視（panic したら `failed`）、名前解決できないルールの再試行 |
 | `src/tcp.rs` / `src/udp.rs` | データプレーン。停止は `CancellationToken`、転送先は `watch` で受け取る |
