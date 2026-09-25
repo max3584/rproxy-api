@@ -45,6 +45,9 @@ struct Options {
 	/// Log filter, e.g. info or debug
 	#[arg(long, env = "RPROXY_LOG_LEVEL", default_value = "info")]
 	log_level: String,
+	/// JSON file of rules started before the database ones; the API cannot change them
+	#[arg(long, env = "RPROXY_STATIC_RULES")]
+	static_rules: Option<PathBuf>,
 	/// mysql://user:pass@host:port/db to restore rules from at startup
 	#[arg(long, env = "RPROXY_DATABASE_URL", hide_env_values = true)]
 	database_url: Option<String>,
@@ -170,6 +173,13 @@ async fn run(opts: Options) -> Result<(), String> {
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some(),
 		max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
+
+	if let Some(path) = &opts.static_rules {
+		let text = std::fs::read_to_string(path).map_err(|e| format!("static rules {}: {e}", path.display()))?;
+		let rules: Vec<rproxy_api::rule::RuleRequest> =
+			serde_json::from_str(&text).map_err(|e| format!("static rules {}: {e}", path.display()))?;
+		registry.load_static(rules).await.map_err(|e| format!("static rules {}: {e}", path.display()))?;
+	}
 
 	if let Some(url) = &opts.database_url {
 		match db::load_rules(url).await {

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cidr::{self, Cidr};
 use crate::error::ApiError;
 use crate::tlsconf::{self, StartTls, TlsSpec};
 
@@ -122,6 +123,20 @@ pub struct RuleRequest {
 	pub tls: Option<TlsSpec>,
 	pub starttls: Option<StartTls>,
 	pub starttls_required: Option<bool>,
+	/// Client addresses allowed to connect (CIDR or single IP); empty means everyone.
+	#[serde(default)]
+	pub allow_from: Vec<String>,
+}
+
+/// Where a rule came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+	/// Created through the API or restored from the database.
+	#[default]
+	Dynamic,
+	/// From the static rules file; the API cannot change it.
+	Static,
 }
 
 /// A validated rule.
@@ -137,6 +152,8 @@ pub struct RuleSpec {
 	pub tls: TlsSpec,
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
+	pub allow_from: Vec<Cidr>,
+	pub origin: Origin,
 }
 
 impl RuleSpec {
@@ -200,6 +217,7 @@ impl RuleRequest {
 		let remote_host = validate_remote(&self.remote_addr, self.remote_port)?;
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
 		let port_count = port_count(self.listen_port, self.listen_port_end, self.remote_port, caps)?;
+		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
 		if self.starttls.is_none() && self.starttls_required == Some(false) {
@@ -230,6 +248,8 @@ impl RuleRequest {
 			starttls: self.starttls,
 			// only SMTP may continue without TLS
 			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
+			allow_from,
+			origin: Origin::Dynamic,
 		})
 	}
 }
@@ -246,6 +266,8 @@ pub struct UpdateRequest {
 	pub starttls_required: Option<bool>,
 	/// The range cannot change; accepted only if it matches.
 	pub listen_port_end: Option<u16>,
+	/// Replaces the allowed client addresses when present.
+	pub allow_from: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -262,6 +284,8 @@ pub struct RuleStats {
 	pub rx_bytes: u64,
 	pub tx_bytes: u64,
 	pub tls_failures: u64,
+	/// Refused by allow_from or `unmatched: reject` (UDP: datagrams).
+	pub denied: u64,
 }
 
 /// A rule as returned by the API.
@@ -278,6 +302,8 @@ pub struct RuleView {
 	pub tls: TlsSpec,
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
+	pub allow_from: Vec<String>,
+	pub origin: Origin,
 	pub state: State,
 	pub error: Option<String>,
 	pub resolved: Vec<String>,
@@ -301,6 +327,8 @@ impl RuleView {
 			tls: spec.tls.clone(),
 			starttls: spec.starttls,
 			starttls_required: spec.starttls_required,
+			allow_from: spec.allow_from.iter().map(|c| c.to_string()).collect(),
+			origin: spec.origin,
 			state,
 			error,
 			resolved: resolved.iter().map(|a| a.to_string()).collect(),
@@ -328,6 +356,7 @@ mod tests {
 			tls: None,
 			starttls: None,
 			starttls_required: None,
+			allow_from: vec![],
 		}
 	}
 
@@ -393,6 +422,16 @@ mod tests {
 		assert!(!r.clone().validate(&Caps::default()).unwrap().starttls_required);
 		r.starttls = None;
 		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "invalid", "starttls_required without starttls");
+	}
+
+	#[test]
+	fn allow_from_is_parsed() {
+		let mut r = req();
+		r.allow_from = vec!["172.16.0.0/16".into(), "10.0.0.5".into()];
+		let spec = r.clone().validate(&Caps::default()).unwrap();
+		assert_eq!(spec.allow_from.len(), 2);
+		r.allow_from = vec!["nope".into()];
+		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "invalid");
 	}
 
 	#[test]

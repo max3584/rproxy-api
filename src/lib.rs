@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod cidr;
 pub mod db;
 pub mod dtls;
 pub mod error;

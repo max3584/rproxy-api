@@ -18,7 +18,7 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Caps, Key, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, State,
+	validate_remote, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, State,
 	UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
@@ -100,6 +100,7 @@ impl Entry {
 					rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
 					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
+					denied: s.denied.load(Ordering::Relaxed),
 				};
 				view.started_at = Some(r.started_at);
 				view
@@ -273,6 +274,7 @@ impl Registry {
 			remote_host: RwLock::new(spec.remote_host.clone()),
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
+			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -365,6 +367,12 @@ impl Registry {
 			let rules = self.rules.lock().await;
 			rules.get(key).map(|e| e.spec().clone()).ok_or_else(|| ApiError::not_found(key.to_string()))?
 		};
+		if spec.origin == Origin::Static {
+			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the static rules file and restart rproxy")));
+		}
+		if let Some(list) = &req.allow_from {
+			spec.allow_from = crate::cidr::parse_list(list)?;
+		}
 		if req.source_ip.is_some_and(|s| s != spec.source_ip) {
 			return Err(ApiError::unsupported("source_ip cannot be changed; delete and re-create the rule"));
 		}
@@ -401,6 +409,7 @@ impl Registry {
 				r.target_tx.send_replace(prepared.addrs);
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.remote_host.write().unwrap() = spec.remote_host.clone();
+				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
 				if host_changed {
 					r.stop_resolver();
 					r.resolver = self.spawn_resolver(*key, &spec.remote_host, spec.remote(), &r.target_tx);
@@ -460,7 +469,23 @@ impl Registry {
 
 	/// Stops a rule. Returns once the listener is closed and every connection has ended.
 	pub async fn delete(&self, key: &Key, drain: Option<Duration>) -> Result<(), ApiError> {
-		let entry = self.rules.lock().await.remove(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
+		let entry = {
+			let mut rules = self.rules.lock().await;
+			match rules.get(key) {
+				None => return Err(ApiError::not_found(key.to_string())),
+				Some(e) if e.spec().origin == Origin::Static => {
+					return Err(ApiError::static_rule(format!("{key} is a static rule; edit the static rules file and restart rproxy")));
+				}
+				Some(_) => rules.remove(key).expect("checked above"),
+			}
+		};
+		self.stop_entry(key, entry, drain).await;
+		info!(event = "rule.delete", rule = %key, drain_secs = drain.map(|d| d.as_secs()));
+		Ok(())
+	}
+
+	/// Stops a rule already taken out of the table.
+	async fn stop_entry(&self, _key: &Key, entry: Entry, drain: Option<Duration>) {
 		match entry {
 			Entry::Failed(f) => {
 				if let Some(retry) = f.retry {
@@ -482,8 +507,6 @@ impl Registry {
 				let _ = r.supervisor.await;
 			}
 		}
-		info!(event = "rule.delete", rule = %key, drain_secs = drain.map(|d| d.as_secs()));
-		Ok(())
 	}
 
 	/// Starts rules loaded at boot. Rules whose target cannot be resolved yet are
@@ -524,10 +547,37 @@ impl Registry {
 	}
 
 	pub async fn shutdown(&self) {
-		let keys: Vec<Key> = self.rules.lock().await.keys().copied().collect();
-		for key in keys {
-			let _ = self.delete(&key, None).await;
+		let entries: Vec<(Key, Entry)> = self.rules.lock().await.drain().collect();
+		for (key, entry) in entries {
+			self.stop_entry(&key, entry, None).await;
 		}
+	}
+
+	/// Starts the rules from the static rules file. Every rule is validated
+	/// first so a broken file stops startup instead of half applying.
+	pub async fn load_static(self: &Arc<Self>, reqs: Vec<RuleRequest>) -> Result<usize, String> {
+		let mut specs = vec![];
+		for (i, req) in reqs.into_iter().enumerate() {
+			let mut spec = req.validate(&self.caps()).map_err(|e| format!("static rule #{}: {}", i + 1, e.message))?;
+			spec.origin = Origin::Static;
+			if let Some(other) = specs.iter().find(|s: &&RuleSpec| overlaps(s, &spec)) {
+				return Err(format!("static rule #{}: {} overlaps with {}", i + 1, spec.key, other.key));
+			}
+			if let Some(api) = self.reserved_clash(&spec) {
+				return Err(format!("static rule #{}: {} would take the control API ({api})", i + 1, spec.key));
+			}
+			specs.push(spec);
+		}
+		let count = specs.len();
+		for spec in specs {
+			let key = spec.key;
+			if let Err(e) = self.create_spec(spec.clone()).await {
+				error!(event = "rule.failed", rule = %key, error = %e.message, phase = "static");
+				self.insert_failed(spec, e.message, e.code == "resolve_failed").await;
+			}
+		}
+		info!(event = "static.loaded", rules = count);
+		Ok(count)
 	}
 
 	pub async fn metrics(&self) -> String {

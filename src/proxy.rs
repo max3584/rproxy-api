@@ -7,8 +7,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::cidr::{self, Cidr};
 use crate::rule::{Key, SourceIp};
-use crate::tlsconf::{name_matches, TlsRuntime};
+use crate::tlsconf::{name_matches, TlsRuntime, Unmatched};
 
 #[derive(Default)]
 pub struct Stats {
@@ -21,6 +22,8 @@ pub struct Stats {
 	pub tx_bytes: AtomicU64,
 	/// TLS / DTLS handshakes (or STARTTLS dialogues) that failed.
 	pub tls_failures: AtomicU64,
+	/// Refused by allow_from or `unmatched: reject`.
+	pub denied: AtomicU64,
 }
 
 impl Stats {
@@ -41,6 +44,10 @@ impl Stats {
 
 	pub fn add_tx(&self, n: u64) {
 		self.tx_bytes.fetch_add(n, Ordering::Relaxed);
+	}
+
+	pub fn denied(&self) {
+		self.denied.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn tls_failed(&self) {
@@ -71,6 +78,7 @@ pub struct Runtime {
 	pub remote_host: RwLock<String>,
 	pub routes: RwLock<Arc<Vec<RouteTarget>>>,
 	pub tls: RwLock<Arc<TlsRuntime>>,
+	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// Stops accepting new connections.
@@ -94,21 +102,30 @@ impl Runtime {
 		self.tls.read().unwrap().clone()
 	}
 
+	/// Whether `allow_from` lets this client in.
+	pub fn allowed(&self, client: std::net::IpAddr) -> bool {
+		cidr::allows(&self.allow_from.read().unwrap(), client)
+	}
+
 	/// The backend for a connection, by server name when routes are configured.
-	pub fn select(&self, server_name: Option<&str>, offset: u16) -> Target {
+	/// None when the name matches no route and the rule rejects unmatched names.
+	pub fn select(&self, server_name: Option<&str>, offset: u16) -> Option<Target> {
+		let routes = self.routes.read().unwrap().clone();
 		if let Some(name) = server_name {
-			let routes = self.routes.read().unwrap().clone();
 			if let Some(route) = routes.iter().find(|r| name_matches(&r.pattern, name)) {
-				return Target {
+				return Some(Target {
 					addrs: route.target.borrow().iter().map(|a| shifted(*a, offset)).collect(),
 					host: route.host.clone(),
-				};
+				});
 			}
 		}
-		Target {
+		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
+			return None;
+		}
+		Some(Target {
 			addrs: self.target.borrow().iter().map(|a| shifted(*a, offset)).collect(),
 			host: self.remote_host.read().unwrap().clone(),
-		}
+		})
 	}
 }
 

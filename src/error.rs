@@ -40,6 +40,10 @@ impl ApiError {
 		Self::new(StatusCode::CONFLICT, "already_exists", message)
 	}
 
+	pub fn static_rule(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "static", message)
+	}
+
 	pub fn reserved(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::CONFLICT, "reserved", message)
 	}
