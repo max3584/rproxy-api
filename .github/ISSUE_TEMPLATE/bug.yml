@@ -1,0 +1,41 @@
+name: 不具合の報告
+description: 期待どおりに動かないとき
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 起きたこと
+      description: 何をしたら、どうなったか。エラーメッセージやログ（JSON Lines の該当行）もあれば貼ってください。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した動作
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      placeholder: |
+        1. POST /rules に ... を送る
+        2. ...
+  - type: dropdown
+    id: area
+    attributes:
+      label: 範囲
+      options:
+        - 制御 API・レジストリ（area: control-plane）
+        - 転送（area: data-plane）
+        - 送信元 IP（area: source-ip）
+        - DB からの復元（area: db）
+        - CI・リリース（area: ci）
+        - 運用・デプロイ（area: ops）
+        - その他
+  - type: input
+    id: version
+    attributes:
+      label: バージョン・コミット
+      placeholder: 例：v0.1.0、または 1ac7847

@@ -1,0 +1,300 @@
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::ApiError;
+
+pub const DEFAULT_UDP_IDLE_SECS: u64 = 30;
+const MAX_UDP_IDLE_SECS: u64 = 86_400;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+	Tcp,
+	Udp,
+}
+
+impl FromStr for Protocol {
+	type Err = ApiError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s.to_ascii_lowercase().as_str() {
+			"tcp" => Ok(Protocol::Tcp),
+			"udp" => Ok(Protocol::Udp),
+			_ => Err(ApiError::invalid(format!("unknown protocol: {s}"))),
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for Protocol {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		let s = String::deserialize(d)?;
+		s.parse().map_err(|e: ApiError| serde::de::Error::custom(e.message))
+	}
+}
+
+impl fmt::Display for Protocol {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			Protocol::Tcp => "tcp",
+			Protocol::Udp => "udp",
+		})
+	}
+}
+
+/// How the client's address is passed on to the backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceIp {
+	/// Backend sees the proxy's own address.
+	#[default]
+	Proxy,
+	ProxyV1,
+	ProxyV2,
+	/// Connect from the client's own address (IP_TRANSPARENT).
+	Transparent,
+}
+
+impl SourceIp {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			SourceIp::Proxy => "proxy",
+			SourceIp::ProxyV1 => "proxy_v1",
+			SourceIp::ProxyV2 => "proxy_v2",
+			SourceIp::Transparent => "transparent",
+		}
+	}
+}
+
+impl FromStr for SourceIp {
+	type Err = ApiError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		serde_json::from_value(serde_json::Value::String(s.to_string()))
+			.map_err(|_| ApiError::invalid(format!("unknown source_ip: {s}")))
+	}
+}
+
+/// Identity of a rule: only one listener may exist per protocol and address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Key {
+	pub protocol: Protocol,
+	pub listen: SocketAddr,
+}
+
+impl fmt::Display for Key {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}/{}", self.protocol, self.listen)
+	}
+}
+
+/// A rule as accepted from the API or the database.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RuleRequest {
+	pub protocol: Protocol,
+	pub listen_addr: String,
+	pub listen_port: u16,
+	pub remote_addr: String,
+	pub remote_port: u16,
+	#[serde(default)]
+	pub source_ip: SourceIp,
+	pub udp_idle_secs: Option<u64>,
+}
+
+/// A validated rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleSpec {
+	pub key: Key,
+	pub remote_host: String,
+	pub remote_port: u16,
+	pub source_ip: SourceIp,
+	pub udp_idle: Duration,
+}
+
+impl RuleSpec {
+	pub fn remote(&self) -> String {
+		match self.remote_host.parse::<IpAddr>() {
+			Ok(IpAddr::V6(ip)) => SocketAddr::new(IpAddr::V6(ip), self.remote_port).to_string(),
+			_ => format!("{}:{}", self.remote_host, self.remote_port),
+		}
+	}
+}
+
+pub fn parse_listen(addr: &str, port: u16) -> Result<SocketAddr, ApiError> {
+	let ip: IpAddr = addr
+		.trim_matches(|c| c == '[' || c == ']')
+		.parse()
+		.map_err(|_| ApiError::invalid(format!("listen_addr must be an IP address: {addr}")))?;
+	if port == 0 {
+		return Err(ApiError::invalid("listen_port must be 1-65535"));
+	}
+	Ok(SocketAddr::new(ip, port))
+}
+
+pub fn validate_remote(host: &str, port: u16) -> Result<String, ApiError> {
+	let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+	if host.is_empty() || host.len() > 253 || host.contains(char::is_whitespace) || host.contains('/') {
+		return Err(ApiError::invalid(format!("invalid remote_addr: {host}")));
+	}
+	if port == 0 {
+		return Err(ApiError::invalid("remote_port must be 1-65535"));
+	}
+	Ok(host.to_string())
+}
+
+pub fn validate_udp_idle(secs: Option<u64>) -> Result<Duration, ApiError> {
+	let secs = secs.unwrap_or(DEFAULT_UDP_IDLE_SECS);
+	if secs == 0 || secs > MAX_UDP_IDLE_SECS {
+		return Err(ApiError::invalid(format!("udp_idle_secs must be 1-{MAX_UDP_IDLE_SECS}")));
+	}
+	Ok(Duration::from_secs(secs))
+}
+
+impl RuleRequest {
+	pub fn validate(self, transparent_available: bool) -> Result<RuleSpec, ApiError> {
+		let listen = parse_listen(&self.listen_addr, self.listen_port)?;
+		let remote_host = validate_remote(&self.remote_addr, self.remote_port)?;
+		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
+		match (self.protocol, self.source_ip) {
+			(Protocol::Udp, SourceIp::ProxyV1 | SourceIp::ProxyV2) => {
+				return Err(ApiError::unsupported("PROXY protocol is supported for tcp only"));
+			}
+			(_, SourceIp::Transparent) if !transparent_available => {
+				return Err(ApiError::unsupported(
+					"transparent is not available (needs Linux and CAP_NET_ADMIN)",
+				));
+			}
+			(_, SourceIp::Transparent) if !listen.is_ipv4() => {
+				return Err(ApiError::unsupported("transparent is supported for IPv4 only"));
+			}
+			_ => {}
+		}
+		Ok(RuleSpec {
+			key: Key { protocol: self.protocol, listen },
+			remote_host,
+			remote_port: self.remote_port,
+			source_ip: self.source_ip,
+			udp_idle,
+		})
+	}
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateRequest {
+	pub remote_addr: String,
+	pub remote_port: u16,
+	pub udp_idle_secs: Option<u64>,
+	pub source_ip: Option<SourceIp>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+	Running,
+	Failed,
+}
+
+/// A rule as returned by the API.
+#[derive(Clone, Debug, Serialize)]
+pub struct RuleView {
+	pub protocol: Protocol,
+	pub listen_addr: String,
+	pub listen_port: u16,
+	pub remote_addr: String,
+	pub remote_port: u16,
+	pub source_ip: &'static str,
+	pub udp_idle_secs: u64,
+	pub state: State,
+	pub error: Option<String>,
+	pub resolved: Vec<String>,
+	pub connections: u64,
+}
+
+impl RuleView {
+	pub fn new(spec: &RuleSpec, state: State, error: Option<String>, resolved: &[SocketAddr], connections: u64) -> Self {
+		RuleView {
+			protocol: spec.key.protocol,
+			listen_addr: spec.key.listen.ip().to_string(),
+			listen_port: spec.key.listen.port(),
+			remote_addr: spec.remote_host.clone(),
+			remote_port: spec.remote_port,
+			source_ip: spec.source_ip.as_str(),
+			udp_idle_secs: spec.udp_idle.as_secs(),
+			state,
+			error,
+			resolved: resolved.iter().map(|a| a.to_string()).collect(),
+			connections,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn req() -> RuleRequest {
+		RuleRequest {
+			protocol: Protocol::Tcp,
+			listen_addr: "127.0.0.1".into(),
+			listen_port: 8888,
+			remote_addr: "example.com".into(),
+			remote_port: 80,
+			source_ip: SourceIp::Proxy,
+			udp_idle_secs: None,
+		}
+	}
+
+	#[test]
+	fn protocol_is_case_insensitive() {
+		let r: RuleRequest = serde_json::from_str(
+			r#"{"protocol":"TCP","listen_addr":"0.0.0.0","listen_port":1,"remote_addr":"a","remote_port":2}"#,
+		)
+		.unwrap();
+		assert_eq!(r.protocol, Protocol::Tcp);
+		assert_eq!(r.source_ip, SourceIp::Proxy);
+	}
+
+	#[test]
+	fn defaults_udp_idle() {
+		let spec = req().validate(false).unwrap();
+		assert_eq!(spec.udp_idle, Duration::from_secs(DEFAULT_UDP_IDLE_SECS));
+	}
+
+	#[test]
+	fn rejects_hostname_listen_and_zero_ports() {
+		let mut r = req();
+		r.listen_addr = "localhost".into();
+		assert_eq!(r.validate(false).unwrap_err().code, "invalid");
+		let mut r = req();
+		r.remote_port = 0;
+		assert_eq!(r.validate(false).unwrap_err().code, "invalid");
+	}
+
+	#[test]
+	fn proxy_protocol_is_tcp_only() {
+		let mut r = req();
+		r.protocol = Protocol::Udp;
+		r.source_ip = SourceIp::ProxyV2;
+		assert_eq!(r.validate(false).unwrap_err().code, "unsupported");
+	}
+
+	#[test]
+	fn transparent_needs_capability_and_ipv4() {
+		let mut r = req();
+		r.source_ip = SourceIp::Transparent;
+		assert_eq!(r.clone().validate(false).unwrap_err().code, "unsupported");
+		assert!(r.clone().validate(true).is_ok());
+		r.listen_addr = "::1".into();
+		assert_eq!(r.validate(true).unwrap_err().code, "unsupported");
+	}
+
+	#[test]
+	fn ipv6_remote_is_bracketed() {
+		let mut r = req();
+		r.remote_addr = "::1".into();
+		assert_eq!(r.validate(false).unwrap().remote(), "[::1]:80");
+	}
+}

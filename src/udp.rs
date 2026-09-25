@@ -1,298 +1,159 @@
-﻿// The following algorithm is derived from the original rproxy project by glacierx.
-// Some modifications have been made to integrate it into the rproxy-api project.
+// The per-client session model descends from the original rproxy project by
+// glacierx and has been rewritten around cancellation tokens for rproxy-api.
 
-use std::sync::{Arc, Mutex};
-use futures::future::{try_join, try_join3};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::SystemTime;
-use std::io::ErrorKind::Other;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use tokio::net::UdpSocket;
-use tokio::net::TcpListener;
-use tokio::time;
-use log::*;
-use futures::StreamExt;
-use futures::{
-	channel::{
-		mpsc::{
-			UnboundedReceiver,
-			UnboundedSender,
-			unbounded
+use tokio::sync::mpsc;
+use tokio::time::sleep_until;
+use tracing::{debug, info, warn};
+
+use crate::proxy::Runtime;
+use crate::source;
+
+const MAX_DATAGRAM: usize = 65_535;
+const SESSION_QUEUE: usize = 1024;
+
+type Sessions = Arc<Mutex<HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)>>>;
+
+pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>) {
+	let socket = Arc::new(socket);
+	let sessions: Sessions = Arc::default();
+	let next_id = AtomicU64::new(0);
+	let mut buf = vec![0u8; MAX_DATAGRAM];
+
+	loop {
+		tokio::select! {
+			biased;
+			_ = rt.stop.cancelled() => break,
+			received = socket.recv_from(&mut buf) => match received {
+				Ok((n, client)) => {
+					let tx = {
+						let mut map = sessions.lock().unwrap();
+						match map.get(&client) {
+							Some((_, tx)) if !tx.is_closed() => tx.clone(),
+							_ => {
+								let id = next_id.fetch_add(1, Ordering::Relaxed);
+								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+								map.insert(client, (id, tx.clone()));
+								rt.tracker.spawn(session(id, client, rx, socket.clone(), rt.clone(), sessions.clone()));
+								tx
+							}
+						}
+					};
+					if tx.try_send(buf[..n].to_vec()).is_err() {
+						debug!(event = "udp.drop", rule = %rt.key, client = %client);
+					}
+				}
+				Err(e) => {
+					warn!(event = "recv.error", rule = %rt.key, error = %e);
+					tokio::time::sleep(Duration::from_millis(10)).await;
+				}
+			}
 		}
 	}
-};
-
-use crate::dns::DNSResolve;
-use crate::api::sync;
-
-#[allow(dead_code)]
-enum MessageType{
-	Data,
-	Terminate,
-	DNS
 }
 
-type Tx=UnboundedSender<(SocketAddr, Vec<u8>, MessageType)>;
-type Rx=UnboundedReceiver<(SocketAddr, Vec<u8>, MessageType)>;
-
-struct UDPPeerPair {
+async fn session(
+	id: u64,
 	client: SocketAddr,
-	remote: SocketAddr,
-	send: Tx,
-	recv: Rx
-}
+	mut from_client: mpsc::Receiver<Vec<u8>>,
+	listener: Arc<UdpSocket>,
+	rt: Arc<Runtime>,
+	sessions: Sessions,
+) {
+	let started = Instant::now();
+	let mut target_rx = rt.target.clone();
+	let mut idle_rx = rt.udp_idle.clone();
+	let mut target = target_rx.borrow_and_update().first().copied();
+	let mut idle = *idle_rx.borrow_and_update();
 
-impl UDPPeerPair {
-
-	async fn run(mut self) -> Result<(), std::io::Error>{
-
-		let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-		// let (mut socket_recv, mut socket_send) = socket.split();
-		let socket_recv = socket.clone();
-		let socket_send = socket.clone();
-		let client_peer = self.client;
-		let _tx = self.send.clone();
-		let remote_addr = self.remote;
-		let (ctrl_tx, mut ctrl_rx) = unbounded::<MessageType>();
-
-		info!("[UDP] [Proxy] Starting Proxy {}:{} <-> {}:{}",
-			client_peer.ip(),
-			client_peer.port(),
-			remote_addr.ip(),
-			remote_addr.port()
-		);
-
-		let client_to_remote_proc = async move {
-			// let mut buf: Vec<u8> = vec![0;1024*10];
-			loop{
-
-				if let Some((_peer, buf, msg_type)) = self.recv.next().await {
-
-					match msg_type {
-						MessageType::Terminate => {
-							debug!("[UDP] [Proxy] {}:{} sends TERMINATE signal", client_peer.ip(), client_peer.port());
-							ctrl_tx.unbounded_send(MessageType::Terminate).unwrap();
-							break;
-						},
-						_ => {}
-					}
-					// debug!("Forward {} bytes from {}", buf.len(), _peer);
-
-					match socket_send.send_to(&buf[..], &remote_addr).await {
-						Ok(_sz) => {
-						},
-						Err(_e) => {
-							panic!("{}", _e);
-						}
-					}
-				} else {
-					break;
-				}
-			}
-			Ok(())
-		};
-		let remote_to_client_proc = async move {
-			let mut buf: Vec<u8> = vec![0;1024*10];
-			loop{
-				tokio::select! {
-					x = socket_recv.recv_from(&mut buf) => {
-						if let Ok((_size, _peer)) = x {
-							// debug!("Recv {} bytes to {}", _size, client_peer);
-							match _tx.unbounded_send((client_peer, Vec::from(&buf[.._size]), MessageType::Data)) {
-								Ok(_sz) => {
-		
-								},
-								Err(_e) => {
-									return Err(std::io::Error::from(Other));
-								}
-							}
-						}
-					},
-					y = ctrl_rx.next() => {
-						if let Some(msg_type) = y{
-							match msg_type{
-								MessageType::Terminate => {
-									debug!("[UDP] [Proxy] {}:{} recvs TERMINATE signal", client_peer.ip(), client_peer.port());
-									break;
-								},
-								_ =>{
-
-								}
-							}
-						}
-					}
-				}                
-			}
-			Ok(())
-		};
-		try_join(client_to_remote_proc, remote_to_client_proc).await.unwrap();
-		debug!("{}:{} exits", client_peer.ip(), client_peer.port());
-		Ok(())        
-	}
-
-}
-pub struct UDPProxy {
-	pub signal_addr: String,
-	pub addr: String,
-	pub remote: Arc<Mutex<String>>,
-	pub stop: Arc<Mutex<bool>>,
-	pub dns: Vec<String>,
-	pub client_tunnels: HashMap<SocketAddr, (Tx, SystemTime)>
-}
-
-impl DNSResolve for UDPProxy{
-	fn remote(&self) -> String {
-		let remote = format!("{}", self.remote.lock().unwrap());
-		return remote;
-	}
-
-	fn client(&self) -> &String {
-		&self.addr
-	}
-
-	fn dns(&self) ->  &Vec<String>  {
-		&self.dns
-	}
-
-	fn reset_dns(&mut self,d: &Vec<String>) -> usize {
-		self.dns = d.clone();
-		d.len()
-	}
-
-}
-
-
-impl UDPProxy {
-
-	pub fn new(signal_addr: String, addr: String, remote: String) -> Self {
-		Self {
-			signal_addr: signal_addr,
-			addr: addr,
-			remote: Arc::new(Mutex::new(remote)),
-			stop: Arc::new(Mutex::new(false)),
-			dns: vec![],
-			client_tunnels: HashMap::new()
+	let upstream = match target {
+		Some(t) => source::udp_upstream(t, rt.bind_as(client)).await,
+		None => Err(std::io::Error::other("no resolved target")),
+	};
+	let upstream = match upstream {
+		Ok(s) => s,
+		Err(e) => {
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e);
+			remove(&sessions, client, id);
+			return;
 		}
-	}
+	};
 
-	pub async fn run(&mut self) -> Result<(), std::io::Error> {
-		let stop_signal_share = Arc::clone(&self.stop);
-		let stop_signal_mutex = Arc::clone(&self.stop);
-		let remote_signal_share = Arc::clone(&self.remote);
-		let remote_signal_mutex = Arc::clone(&self.remote);
-		let signal_addr = self.signal_addr.clone();
+	rt.stats.opened();
+	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr_or_empty(target));
 
-		let socket = Arc::new(UdpSocket::bind(&self.addr).await.unwrap());
-		info!("[UDP] Listening on {}", socket.local_addr().unwrap());
-
-		self.resolve().await.unwrap();
-		let mut dns_timeout = time::interval(tokio::time::Duration::from_secs(30));
-		let mut _remote = self.dns[0].clone();
-		// let (mut socket_recv, mut socket_send) = socket.split();
-		let socket_recv = socket.clone();
-		let socket_send = socket.clone();
-		let (tx, mut rx) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
-		let remote_to_client_proc = async move {
-			loop{
-				if let Some((peer, buf, _msg_type)) = rx.next().await {
-					// debug!("Forward {} bytes to {}", buf.len(), peer);
-					match socket_send.send_to(&buf[..], &peer).await {
-						Ok(_sz) => {
-
-						},
-						Err(e) => {
-							return Err(e);
-						}
+	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
+	let mut buf = vec![0u8; MAX_DATAGRAM];
+	let mut deadline = tokio::time::Instant::now() + idle;
+	let reason = loop {
+		tokio::select! {
+			_ = rt.kill.cancelled() => break "stopped",
+			_ = sleep_until(deadline) => break "idle",
+			datagram = from_client.recv() => match datagram {
+				Some(data) => {
+					if let Err(e) = upstream.send(&data).await {
+						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
-				} else {
-					break;
+					rx_bytes += data.len() as u64;
+					deadline = tokio::time::Instant::now() + idle;
 				}
-			}
-			Ok(())
-
-		};
-		// let mut client_run_procs: Vec<JoinHandle<Result<(), io::Error>> > = Vec::new();
-
-		let client_to_proxy_proc = async move {
-			let mut buf: Vec<u8> = vec![0;1024*256];
-			let empty: Vec<u8> = vec![0;0];
-			// let mut client_tunnels:HashMap<SocketAddr, (Tx, SystemTime)> = HashMap::new();
-			let mut time_out1 = time::interval(tokio::time::Duration::from_secs(5));
-			loop{
-				tokio::select! {
-					data = socket_recv.recv_from(&mut buf) => {
-						match data {
-							Ok((size, peer)) => {
-								// let _addr = format!("{}:{}", peer.ip(), peer.port());
-								match self.client_tunnels.get(&peer) {
-									Some((_tx, _active_time)) => {
-										// _tx.unbounded_send((peer, Vec::from(&buf[..size]), MessageType::Data)).unwrap();
-									},
-									_ => {
-										info!("[UDP] New client {}:{} is added", peer.ip(), peer.port());
-										let (mut _s,_r) = unbounded::<(SocketAddr, Vec<u8>,  MessageType)>();
-										// _s.unbounded_send((peer, buf.clone(), MessageType::Data)).unwrap();
-										self.client_tunnels.insert(peer, (_s, SystemTime::now()));
-										let c = UDPPeerPair {
-											client : peer,
-											remote: _remote.parse::<SocketAddr>().unwrap(),
-											send: tx.clone(),
-											recv: _r
-										};
-										tokio::spawn(c.run());
-									}
-								}
-								let (tx, tm) = &mut self.client_tunnels.get_mut(&peer).unwrap();
-								// debug!("Recv {} bytes from {}", size, peer);
-								tx.unbounded_send((peer, Vec::from(&buf[..size]), MessageType::Data)).unwrap();
-								*tm = SystemTime::now();
-							},
-							Err(e) => {
-								warn!("[UDP] recv_from {:?} returned error {}, {:?}", socket_recv, e, e);
-								break;
-							}
+				None => break "closed",
+			},
+			received = upstream.recv(&mut buf) => match received {
+				Ok(n) => {
+					if let Err(e) = listener.send_to(&buf[..n], client).await {
+						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
+					}
+					tx_bytes += n as u64;
+					deadline = tokio::time::Instant::now() + idle;
+				}
+				// ICMP unreachable from the backend surfaces here on a connected socket
+				Err(e) => debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e),
+			},
+			changed = target_rx.changed() => {
+				if changed.is_err() {
+					break "stopped";
+				}
+				let next = target_rx.borrow_and_update().first().copied();
+				if let Some(next) = next.filter(|n| Some(*n) != target) {
+					match upstream.connect(next).await {
+						Ok(()) => {
+							info!(event = "conn.retarget", rule = %rt.key, client = %client, from = %addr_or_empty(target), to = %next);
+							target = Some(next);
 						}
-					},
-					_ = dns_timeout.tick() => {
-						self.resolve().await.unwrap();
-						_remote = self.dns[0].clone();
-					},
-					_ = time_out1.tick() =>{
-						if *stop_signal_share.lock().unwrap(){
-							break;
-						}
-						debug!("Tick");
-						let mut tbd: Vec<SocketAddr> = Vec::new();
-						for (k, v) in (&mut self.client_tunnels).iter(){
-							let sec = v.1.elapsed().unwrap().as_secs();
-							if sec > 120{
-								info!("[UDP] Client {}:{} is timeout({}s)", k.ip(), k.port(), sec);
-								v.0.unbounded_send((k.clone(), empty.clone(), MessageType::Terminate)).unwrap();
-								tbd.push(k.to_owned());
-							} else {
-								debug!("[UDP] Client {}:{} is good. ({}s)", k.ip(), k.port(), sec);
-							}
-						}
-
-						for k in tbd{
-							self.client_tunnels.remove(&k);
-						}
-
+						Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e),
 					}
 				}
-			}
-			Ok(())
-		};
+			},
+			changed = idle_rx.changed() => {
+				if changed.is_err() {
+					break "stopped";
+				}
+				idle = *idle_rx.borrow_and_update();
+				deadline = tokio::time::Instant::now() + idle;
+			},
+		}
+	};
 
-		info!("[IPC] [UDP] Controller is running on port {}", &signal_addr);
-		let udp_controller = async move {
-			sync(signal_addr, remote_signal_mutex, stop_signal_mutex).await;
-			Ok(())
-		};
+	remove(&sessions, client, id);
+	rt.stats.closed(rx_bytes, tx_bytes);
+	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
+		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
+}
 
-		// client_to_proxy_proc.await;
-		let _ = try_join3(client_to_proxy_proc, remote_to_client_proc, udp_controller).await.unwrap();
+fn addr_or_empty(target: Option<SocketAddr>) -> String {
+	target.map(|t| t.to_string()).unwrap_or_default()
+}
 
-		Ok(())
+fn remove(sessions: &Sessions, client: SocketAddr, id: u64) {
+	let mut map = sessions.lock().unwrap();
+	if map.get(&client).is_some_and(|(current, _)| *current == id) {
+		map.remove(&client);
 	}
 }

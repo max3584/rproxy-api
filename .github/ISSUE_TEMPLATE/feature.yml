@@ -1,0 +1,32 @@
+name: 機能の要望
+description: 新しい機能や改善の提案
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 困っていること・やりたいこと
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する方法
+  - type: textarea
+    id: done
+    attributes:
+      label: 完了の条件
+      placeholder: |
+        - [ ] ...
+  - type: dropdown
+    id: area
+    attributes:
+      label: 範囲
+      options:
+        - 制御 API・レジストリ（area: control-plane）
+        - 転送（area: data-plane）
+        - 送信元 IP（area: source-ip）
+        - DB からの復元（area: db）
+        - CI・リリース（area: ci）
+        - 運用・デプロイ（area: ops）
+        - その他
