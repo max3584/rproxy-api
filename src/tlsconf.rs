@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::client::danger::HandshakeSignatureValid as SigValid;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
+use rustls::DistinguishedName;
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use serde::{Deserialize, Serialize};
@@ -39,8 +42,12 @@ pub struct Route {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertFiles {
-	/// PEM certificate chain, leaf first.
+	/// PEM server certificate. May also hold the chain after it (leaf first).
 	pub cert_file: String,
+	/// PEM intermediate CA certificates, sent after the server certificate.
+	/// The root may be left out; clients already trust it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub chain_file: Option<String>,
 	/// PEM private key (PKCS#8; for tcp also PKCS#1 / SEC1).
 	pub key_file: String,
 }
@@ -61,8 +68,12 @@ pub enum ClientAuthMode {
 pub struct ClientAuth {
 	#[serde(default)]
 	pub mode: ClientAuthMode,
-	/// PEM file of CA certificates that client certificates must chain to.
+	/// PEM file of the root CA(s) that client certificates must chain to.
 	pub ca_file: Option<String>,
+	/// PEM intermediate CAs of client certificates, for clients that send only
+	/// their own certificate. They help build the path; the root stays the anchor.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub chain_file: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +91,9 @@ pub struct Upstream {
 	pub insecure_skip_verify: bool,
 	/// Client certificate presented to the backend (mTLS towards the backend).
 	pub cert_file: Option<String>,
+	/// Intermediate CA certificates for `cert_file`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub chain_file: Option<String>,
 	pub key_file: Option<String>,
 }
 
@@ -150,8 +164,14 @@ pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -
 	if tls.client_auth.mode != ClientAuthMode::None && tls.client_auth.ca_file.is_none() {
 		return Err(tls_error("client_auth needs ca_file"));
 	}
+	if tls.client_auth.mode == ClientAuthMode::None && tls.client_auth.chain_file.is_some() {
+		return Err(tls_error("client_auth chain_file needs mode optional or required"));
+	}
 	if tls.upstream.cert_file.is_some() != tls.upstream.key_file.is_some() {
 		return Err(tls_error("upstream cert_file and key_file must be given together"));
+	}
+	if tls.upstream.chain_file.is_some() && tls.upstream.cert_file.is_none() {
+		return Err(tls_error("upstream chain_file needs cert_file"));
 	}
 	for route in &tls.routes {
 		if !valid_pattern(&route.server_name) {
@@ -196,6 +216,41 @@ fn load_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, ApiError> {
 		return Err(tls_error(format!("{path}: no CERTIFICATE block")));
 	}
 	Ok(certs)
+}
+
+/// Server (or client) certificate followed by its intermediates, checked for order.
+fn load_full_chain(cert_file: &str, chain_file: Option<&str>) -> Result<Vec<CertificateDer<'static>>, ApiError> {
+	let mut chain = load_chain(cert_file)?;
+	if let Some(extra) = chain_file {
+		for cert in load_chain(extra)? {
+			if !chain.contains(&cert) {
+				chain.push(cert);
+			}
+		}
+	}
+	check_order(&chain, chain_file.unwrap_or(cert_file))?;
+	Ok(chain)
+}
+
+/// Each certificate must be issued by the next one: leaf, intermediates, (root).
+fn check_order(chain: &[CertificateDer<'_>], file: &str) -> Result<(), ApiError> {
+	let parsed: Vec<_> = chain
+		.iter()
+		.map(|c| x509_parser::parse_x509_certificate(c.as_ref()).map(|(_, x)| x))
+		.collect::<Result<_, _>>()
+		.map_err(|e| tls_error(format!("{file}: {e}")))?;
+	for (i, pair) in parsed.windows(2).enumerate() {
+		if pair[0].issuer().as_raw() != pair[1].subject().as_raw() {
+			return Err(tls_error(format!(
+				"{file}: certificate {} ({}) was not issued by certificate {} ({}); put the server certificate first, then intermediates from the one that issued it up towards the root",
+				i + 1,
+				pair[0].subject(),
+				i + 2,
+				pair[1].subject()
+			)));
+		}
+	}
+	Ok(())
 }
 
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, ApiError> {
@@ -269,30 +324,106 @@ fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
 	let provider = provider();
 	let mut certs = vec![];
 	for files in &tls.certificates {
-		let chain = load_chain(&files.cert_file)?;
+		let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
 		let key = load_key(&files.key_file)?;
 		let signing = provider
 			.key_provider
 			.load_private_key(key)
 			.map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
 		let names = cert_names(&chain[0]);
-		certs.push((names, Arc::new(CertifiedKey::new(chain, signing))));
+		let certified = CertifiedKey::new(chain, signing);
+		certified
+			.keys_match()
+			.map_err(|e| tls_error(format!("{} does not belong to {}: {e}", files.key_file, files.cert_file)))?;
+		certs.push((names, Arc::new(certified)));
 	}
 
 	let builder = ServerConfig::builder_with_provider(provider.clone())
 		.with_safe_default_protocol_versions()
 		.map_err(|e| tls_error(e.to_string()))?;
-	let builder = match (tls.client_auth.mode, &tls.client_auth.ca_file) {
-		(ClientAuthMode::None, _) | (_, None) => builder.with_no_client_auth(),
-		(mode, Some(ca)) => {
-			let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider);
-			let verifier = if mode == ClientAuthMode::Optional { verifier.allow_unauthenticated() } else { verifier };
-			builder.with_client_cert_verifier(verifier.build().map_err(|e| tls_error(format!("{ca}: {e}")))?)
-		}
+	let builder = match client_verifier(&tls.client_auth)? {
+		Some(verifier) => builder.with_client_cert_verifier(verifier),
+		None => builder.with_no_client_auth(),
 	};
 	let mut config = builder.with_cert_resolver(Arc::new(SniCertResolver { certs }));
 	config.alpn_protocols = tls.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
 	Ok(Arc::new(config))
+}
+
+/// Adds the configured intermediate CAs to whatever the client sent, so
+/// clients that present only their own certificate still verify against the root.
+#[derive(Debug)]
+struct WithIntermediates {
+	inner: Arc<dyn ClientCertVerifier>,
+	extra: Vec<CertificateDer<'static>>,
+}
+
+impl ClientCertVerifier for WithIntermediates {
+	fn offer_client_auth(&self) -> bool {
+		self.inner.offer_client_auth()
+	}
+
+	fn client_auth_mandatory(&self) -> bool {
+		self.inner.client_auth_mandatory()
+	}
+
+	fn root_hint_subjects(&self) -> &[DistinguishedName] {
+		self.inner.root_hint_subjects()
+	}
+
+	fn verify_client_cert(
+		&self,
+		end_entity: &CertificateDer<'_>,
+		intermediates: &[CertificateDer<'_>],
+		now: UnixTime,
+	) -> Result<ClientCertVerified, rustls::Error> {
+		let mut all: Vec<CertificateDer<'_>> = intermediates.to_vec();
+		for cert in &self.extra {
+			if !all.iter().any(|c| c.as_ref() == cert.as_ref()) {
+				all.push(cert.clone());
+			}
+		}
+		self.inner.verify_client_cert(end_entity, &all, now)
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<SigValid, rustls::Error> {
+		self.inner.verify_tls12_signature(message, cert, dss)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<SigValid, rustls::Error> {
+		self.inner.verify_tls13_signature(message, cert, dss)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.inner.supported_verify_schemes()
+	}
+}
+
+/// Client certificate verification for TLS and DTLS alike: the root(s) in
+/// `ca_file` are the only trust anchors; `chain_file` fills in intermediates.
+fn client_verifier(auth: &ClientAuth) -> Result<Option<Arc<dyn ClientCertVerifier>>, ApiError> {
+	let (mode, Some(ca)) = (auth.mode, &auth.ca_file) else { return Ok(None) };
+	if mode == ClientAuthMode::None {
+		return Ok(None);
+	}
+	let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider());
+	let builder = if mode == ClientAuthMode::Optional { builder.allow_unauthenticated() } else { builder };
+	let inner = builder.build().map_err(|e| tls_error(format!("{ca}: {e}")))?;
+	let extra = match &auth.chain_file {
+		Some(file) => load_chain(file)?,
+		None => vec![],
+	};
+	Ok(Some(Arc::new(WithIntermediates { inner, extra })))
 }
 
 /// Accepts any backend certificate (`insecure_skip_verify`).
@@ -350,7 +481,7 @@ fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError> {
 	};
 	let config = match (&up.cert_file, &up.key_file) {
 		(Some(cert), Some(key)) => builder
-			.with_client_auth_cert(load_chain(cert)?, load_key(key)?)
+			.with_client_auth_cert(load_full_chain(cert, up.chain_file.as_deref())?, load_key(key)?)
 			.map_err(|e| tls_error(format!("{cert}: {e}")))?,
 		_ => builder.with_no_client_auth(),
 	};
@@ -358,7 +489,7 @@ fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError> {
 }
 
 fn dtls_certificate(files: &CertFiles) -> Result<webrtc_dtls::crypto::Certificate, ApiError> {
-	let chain = load_chain(&files.cert_file)?;
+	let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
 	let PrivateKeyDer::Pkcs8(key) = load_key(&files.key_file)? else {
 		return Err(tls_error(format!(
 			"{}: DTLS needs a PKCS#8 key (convert with: openssl pkcs8 -topk8 -nocrypt -in key.pem)",
@@ -366,6 +497,12 @@ fn dtls_certificate(files: &CertFiles) -> Result<webrtc_dtls::crypto::Certificat
 		)));
 	};
 	let pair = rcgen::KeyPair::try_from(key.secret_pkcs8_der()).map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
+	let leaf_spki = x509_parser::parse_x509_certificate(chain[0].as_ref())
+		.map(|(_, c)| c.public_key().raw.to_vec())
+		.map_err(|e| tls_error(format!("{}: {e}", files.cert_file)))?;
+	if leaf_spki != pair.public_key_der() {
+		return Err(tls_error(format!("{} does not belong to {}", files.key_file, files.cert_file)));
+	}
 	let private_key = webrtc_dtls::crypto::CryptoPrivateKey::try_from(&pair)
 		.map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
 	Ok(webrtc_dtls::crypto::Certificate { certificate: chain, private_key })
@@ -381,7 +518,7 @@ pub struct TlsRuntime {
 	pub acceptor: Option<tokio_rustls::TlsAcceptor>,
 	pub connector: Option<tokio_rustls::TlsConnector>,
 	dtls_certs: Vec<webrtc_dtls::crypto::Certificate>,
-	dtls_client_cas: Option<RootCertStore>,
+	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
 	dtls_upstream_cert: Option<webrtc_dtls::crypto::Certificate>,
 }
@@ -403,7 +540,7 @@ impl TlsRuntime {
 			acceptor: None,
 			connector: None,
 			dtls_certs: vec![],
-			dtls_client_cas: None,
+			dtls_client_verifier: None,
 			dtls_upstream_roots: None,
 			dtls_upstream_cert: None,
 		};
@@ -425,17 +562,18 @@ impl TlsRuntime {
 			}
 			Protocol::Udp => {
 				rt.dtls_certs = spec.certificates.iter().map(dtls_certificate).collect::<Result<_, _>>()?;
-				if let Some(ca) = &spec.client_auth.ca_file {
-					rt.dtls_client_cas = Some(load_roots(ca)?);
-				}
+				rt.dtls_client_verifier = client_verifier(&spec.client_auth)?;
 				if spec.upstream.tls {
 					rt.dtls_upstream_roots = Some(match &spec.upstream.ca_file {
 						Some(ca) => load_roots(ca)?,
 						None => RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() },
 					});
 					if let (Some(cert), Some(key)) = (&spec.upstream.cert_file, &spec.upstream.key_file) {
-						rt.dtls_upstream_cert =
-							Some(dtls_certificate(&CertFiles { cert_file: cert.clone(), key_file: key.clone() })?);
+						rt.dtls_upstream_cert = Some(dtls_certificate(&CertFiles {
+							cert_file: cert.clone(),
+							chain_file: spec.upstream.chain_file.clone(),
+							key_file: key.clone(),
+						})?);
 					}
 				}
 			}
@@ -447,21 +585,37 @@ impl TlsRuntime {
 		self.spec.mode
 	}
 
-	/// DTLS server settings for one client session.
+	/// DTLS server settings for one client session. webrtc-dtls proves the
+	/// client holds its key (CertificateVerify); the chain is checked by
+	/// `verify_dtls_client` right after the handshake, before any data flows.
 	pub fn dtls_server_config(&self) -> webrtc_dtls::config::Config {
 		use webrtc_dtls::config::ClientAuthType;
 		let client_auth = match self.spec.client_auth.mode {
 			ClientAuthMode::None => ClientAuthType::NoClientCert,
-			ClientAuthMode::Optional => ClientAuthType::VerifyClientCertIfGiven,
-			ClientAuthMode::Required => ClientAuthType::RequireAndVerifyClientCert,
+			ClientAuthMode::Optional => ClientAuthType::RequestClientCert,
+			ClientAuthMode::Required => ClientAuthType::RequireAnyClientCert,
 		};
 		webrtc_dtls::config::Config {
 			certificates: self.dtls_certs.clone(),
 			client_auth,
-			client_cas: self.dtls_client_cas.clone().unwrap_or_else(RootCertStore::empty),
 			extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require,
 			..Default::default()
 		}
+	}
+
+	/// Checks a DTLS client's certificate chain the same way TLS does.
+	pub fn verify_dtls_client(&self, peer: &[Vec<u8>]) -> Result<(), String> {
+		let Some(verifier) = &self.dtls_client_verifier else { return Ok(()) };
+		let Some((leaf, rest)) = peer.split_first() else {
+			return if self.spec.client_auth.mode == ClientAuthMode::Required {
+				Err("client certificate required".into())
+			} else {
+				Ok(())
+			};
+		};
+		let leaf = CertificateDer::from(leaf.clone());
+		let rest: Vec<CertificateDer<'_>> = rest.iter().map(|c| CertificateDer::from(c.clone())).collect();
+		verifier.verify_client_cert(&leaf, &rest, UnixTime::now()).map(|_| ()).map_err(|e| e.to_string())
 	}
 
 	/// DTLS client settings towards the backend.
@@ -507,7 +661,7 @@ mod tests {
 		assert_eq!(validate(Protocol::Tcp, &sni, Some(StartTls::Smtp)).unwrap_err().code, "tls_config");
 		let mut auth = TlsSpec {
 			mode: TlsMode::Terminate,
-			certificates: vec![CertFiles { cert_file: "a".into(), key_file: "b".into() }],
+			certificates: vec![CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into() }],
 			..Default::default()
 		};
 		auth.client_auth.mode = ClientAuthMode::Required;
@@ -518,7 +672,7 @@ mod tests {
 	fn missing_files_are_reported() {
 		let spec = TlsSpec {
 			mode: TlsMode::Terminate,
-			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), key_file: "/nonexistent.key".into() }],
+			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), chain_file: None, key_file: "/nonexistent.key".into() }],
 			..Default::default()
 		};
 		let err = TlsRuntime::build(Protocol::Tcp, &spec, None, true).err().unwrap();

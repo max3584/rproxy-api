@@ -213,6 +213,13 @@ async fn dtls_session(
 		}
 	};
 	let state = dtls.connection_state().await;
+	if let Err(e) = tls.verify_dtls_client(&state.peer_certificates) {
+		rt.stats.tls_failed();
+		warn!(event = "tls.error", rule = %rt.key, client = %client, error = %e, dtls = true);
+		let _ = dtls.close().await;
+		remove(&sessions, client, id);
+		return;
+	}
 	let client_cn = state.peer_certificates.first().and_then(|c| crate::tlsconf::common_name(c));
 
 	let target = rt.select(None, offset);
