@@ -51,6 +51,33 @@ struct Options {
 	/// Seconds between DNS re-resolutions of rule targets
 	#[arg(long, env = "RPROXY_DNS_INTERVAL", default_value_t = 30)]
 	dns_interval: u64,
+	/// Largest port range (listen_port..listen_port_end) one rule may open
+	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS)]
+	max_range_ports: u16,
+}
+
+/// Port ranges open one socket per port; lift the soft file limit to the hard one.
+#[cfg(unix)]
+fn raise_nofile_limit() -> Option<u64> {
+	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+	// SAFETY: plain syscalls on a local struct
+	unsafe {
+		if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+			return None;
+		}
+		if lim.rlim_cur < lim.rlim_max {
+			lim.rlim_cur = lim.rlim_max;
+			libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+			libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+		}
+	}
+	#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 everywhere
+	Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() -> Option<u64> {
+	None
 }
 
 fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
@@ -137,8 +164,11 @@ async fn run(opts: Options) -> Result<(), String> {
 		dns_interval: Duration::from_secs(opts.dns_interval.max(1)),
 		lookup: resolve::system_lookup(),
 		transparent,
+		max_range_ports: opts.max_range_ports.max(1),
 	});
-	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some());
+	let nofile = raise_nofile_limit();
+	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some(),
+		max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
 	if let Some(url) = &opts.database_url {
 		match db::load_rules(url).await {
@@ -173,7 +203,7 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 	info!(event = "api.listening", port = opts.api_port, tls = tls.is_some());
 
-	wait_for_shutdown(&tokens, tls.as_ref(), &opts).await?;
+	wait_for_shutdown(&tokens, tls.as_ref(), &opts, &registry).await?;
 
 	info!(event = "shutdown");
 	for handle in &handles {
@@ -185,7 +215,12 @@ async fn run(opts: Options) -> Result<(), String> {
 
 /// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.
 #[cfg(unix)]
-async fn wait_for_shutdown(tokens: &Tokens, tls: Option<&RustlsConfig>, opts: &Options) -> Result<(), String> {
+async fn wait_for_shutdown(
+	tokens: &Tokens,
+	tls: Option<&RustlsConfig>,
+	opts: &Options,
+	registry: &Registry,
+) -> Result<(), String> {
 	use tokio::signal::unix::{signal, SignalKind};
 
 	let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
@@ -203,6 +238,8 @@ async fn wait_for_shutdown(tokens: &Tokens, tls: Option<&RustlsConfig>, opts: &O
 						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
 					}
 				}
+				let (ok, failed) = registry.reload_tls().await;
+				info!(event = "reload.rules_tls", reloaded = ok, failed);
 			}
 			_ = term.recv() => return Ok(()),
 			_ = tokio::signal::ctrl_c() => return Ok(()),
@@ -211,6 +248,6 @@ async fn wait_for_shutdown(tokens: &Tokens, tls: Option<&RustlsConfig>, opts: &O
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(_: &Tokens, _: Option<&RustlsConfig>, _: &Options) -> Result<(), String> {
+async fn wait_for_shutdown(_: &Tokens, _: Option<&RustlsConfig>, _: &Options, _: &Registry) -> Result<(), String> {
 	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
 }

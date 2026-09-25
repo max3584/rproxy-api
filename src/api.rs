@@ -64,7 +64,14 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		source_ip.push(SourceIp::Transparent);
 	}
 	let names: Vec<&str> = source_ip.iter().map(SourceIp::as_str).collect();
-	Json(json!({ "source_ip": names, "transparent": transparent }))
+	Json(json!({
+		"source_ip": names,
+		"transparent": transparent,
+		"tls_modes": ["passthrough", "sni", "terminate"],
+		"dtls": true,
+		"starttls": ["smtp", "imap", "pop3"],
+		"max_range_ports": state.registry.caps().max_range_ports,
+	}))
 }
 
 async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
