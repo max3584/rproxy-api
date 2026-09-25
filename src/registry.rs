@@ -434,3 +434,71 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 		return;
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::rule::RuleRequest;
+
+	fn registry() -> Arc<Registry> {
+		Registry::new(Config {
+			dns_interval: Duration::from_secs(30),
+			lookup: resolve::system_lookup(),
+			transparent: false,
+		})
+	}
+
+	fn tcp_rule(port: u16) -> RuleRequest {
+		serde_json::from_value(serde_json::json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"remote_addr": "127.0.0.1", "remote_port": 9,
+		}))
+		.unwrap()
+	}
+
+	fn free_port() -> u16 {
+		std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+	}
+
+	#[tokio::test]
+	async fn a_panicking_listener_marks_only_its_rule_failed() {
+		let reg = registry();
+		let (a, b) = (free_port(), free_port());
+		reg.create(tcp_rule(a)).await.unwrap();
+		reg.create(tcp_rule(b)).await.unwrap();
+		let key_a = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{a}").parse().unwrap() };
+
+		let (generation, rt) = match reg.rules.lock().await.get(&key_a) {
+			Some(Entry::Running(r)) => (r.generation, r.rt.clone()),
+			_ => panic!("rule a should be running"),
+		};
+		let serve = tokio::spawn(async { panic!("boom") });
+		supervise(Arc::downgrade(&reg), key_a, generation, rt.clone(), serve).await;
+
+		let view = reg.get(&key_a).await.unwrap();
+		assert_eq!(view.state, State::Failed);
+		assert!(view.error.unwrap().contains("boom"));
+		assert!(rt.kill.is_cancelled(), "connections of the failed rule are closed");
+
+		let key_b = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{b}").parse().unwrap() };
+		assert_eq!(reg.get(&key_b).await.unwrap().state, State::Running, "the other rule keeps running");
+		reg.shutdown().await;
+	}
+
+	#[tokio::test]
+	async fn a_stale_supervisor_does_not_touch_a_recreated_rule() {
+		let reg = registry();
+		let port = free_port();
+		reg.create(tcp_rule(port)).await.unwrap();
+		let key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{port}").parse().unwrap() };
+		let rt = match reg.rules.lock().await.get(&key) {
+			Some(Entry::Running(r)) => r.rt.clone(),
+			_ => unreachable!(),
+		};
+
+		// a supervisor from an older generation reports a failure
+		supervise(Arc::downgrade(&reg), key, 0, rt, tokio::spawn(async { panic!("old") })).await;
+		assert_eq!(reg.get(&key).await.unwrap().state, State::Running);
+		reg.shutdown().await;
+	}
+}
