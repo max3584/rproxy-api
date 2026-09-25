@@ -98,6 +98,17 @@
 | `mtls_with_multi_tier_client_certificates` | `ca_file` がルートだけでも、中間 CA を送るクライアントは通る。証明書だけを送るクライアントは、`client_auth.chain_file` があれば通り、なければ通らない。別の PKI の証明書は通らない |
 | `dtls_mtls_with_multi_tier_client_certificates` | DTLS でも同じ規則。検証できないクライアントは、ハンドシェイクのあと何も転送せずに切る |
 
+## 結合テスト：アクセス制御と固定ルール（`tests/access.rs`）
+
+| テスト | 確かめること |
+|---|---|
+| `allow_from_limits_tcp_clients_and_can_change_live` | 範囲外の TCP クライアントは切断され（接続数には数えず `denied` に数える）、PATCH で範囲を変えるとすぐ反映される。不正な CIDR は `invalid` |
+| `allow_from_limits_udp_clients` | 範囲外の UDP の送信元にはセッションを作らない |
+| `unmatched_names_are_rejected_when_asked` | `terminate` で、証明書には含まれていてもどの `routes` にも一致しない名前は、ハンドシェイクを完了せずに切る（TLS の失敗には数えない）。`unmatched: default` なら通る。`routes` なしの `reject` は `tls_config` |
+| `sni_rules_reject_unmatched_names_before_forwarding` | `sni` でも、一致しない名前は転送せずに切る |
+| `static_rules_are_protected_from_the_api` | 固定ルールは `origin: static` で動き、PATCH / DELETE は `409 static`、同じキーの追加は `already_exists`。`shutdown` では止まる |
+| `a_broken_static_file_starts_nothing` | 不正なルールや重なりがあれば、1 件も開始せずにエラーを返す |
+
 ## 結合テスト：STARTTLS（`tests/starttls.rs`）
 
 | テスト | 確かめること |
@@ -121,7 +132,7 @@
 
 | テスト | 確かめること |
 |---|---|
-| `loads_every_schema_version` | `src_port_end` / `options` 列を含む現在のテーブル（壊れた `options` の行は飛ばす）、その前のテーブル、`source_ip` / `udp_idle_secs` もない古いテーブルのどれからも読める |
+| `loads_every_schema_version` | `src_port_end` / `options` 列（`allow_from` を含む）を含む現在のテーブル（壊れた `options` の行は飛ばす）、その前のテーブル、`source_ip` / `udp_idle_secs` もない古いテーブルのどれからも読める |
 
 ## transparent の実経路（`scripts/test-transparent.sh`）
 

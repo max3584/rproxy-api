@@ -29,6 +29,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/proxy.rs` | ルールごとの実行時状態 `Runtime`（トークン、watch、統計、`TaskTracker`） |
 | `src/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
 | `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
+| `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
 | `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / webrtc-dtls の設定の組み立て（`TlsRuntime`） |
 | `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni`。読んだバイトは転送先へそのまま送る） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
@@ -50,6 +51,13 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
+
+## アクセス制御と固定ルール
+
+- `allow_from` は受け付けた直後（TLS や PROXY ヘッダより前）に確かめる。UDP は範囲外のデータグラムを捨てる。拒否は `stats.denied` に数え、`conn.denied` をログに出す。
+- `tls.unmatched: reject` の `terminate` は、`LazyConfigAcceptor` で ClientHello を読んでから判断する（一致しない名前には証明書を返さない）。
+- 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作る。API からの変更・削除は `409 static`。`shutdown` だけは止める。
+- 文字列の置き換えでコードを編集するときは、置き換えの対象が 1 件見つかることを確かめる（見つからないまま空振りして、修正が入っていなかったことがある）。
 
 ## TLS まわりの約束
 
