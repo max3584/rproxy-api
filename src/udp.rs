@@ -38,6 +38,10 @@ pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16) {
 			biased;
 			_ = rt.stop.cancelled() => break,
 			received = socket.recv_from(&mut buf) => match received {
+				Ok((_, client)) if !rt.allowed(client.ip()) => {
+					rt.stats.denied();
+					debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "allow_from");
+				}
 				Ok((n, client)) => {
 					let tx = {
 						let mut map = sessions.lock().unwrap();
@@ -224,7 +228,11 @@ async fn dtls_session(
 	}
 	let client_cn = state.peer_certificates.first().and_then(|c| crate::tlsconf::common_name(c));
 
-	let target = rt.select(None, offset);
+	let Some(target) = rt.select(None, offset) else {
+		let _ = dtls.close().await;
+		remove(&sessions, client, id);
+		return;
+	};
 	let upstream = async {
 		let addr = *target.addrs.first().ok_or("no resolved target")?;
 		let socket = Arc::new(source::udp_upstream(addr, rt.bind_as(client)).await.map_err(|e| e.to_string())?);

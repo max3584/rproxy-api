@@ -1,0 +1,24 @@
+[
+  {
+    "protocol": "tcp",
+    "listen_addr": "0.0.0.0",
+    "listen_port": 443,
+    "remote_addr": "127.0.0.1",
+    "remote_port": 3001,
+    "allow_from": ["172.16.0.0/16"],
+    "tls": {
+      "mode": "terminate",
+      "certificates": [
+        {
+          "cert_file": "/etc/rproxy/certs/dashboard.pem",
+          "chain_file": "/etc/rproxy/certs/intermediates.pem",
+          "key_file": "/etc/rproxy/certs/dashboard.key"
+        }
+      ],
+      "routes": [
+        {"server_name": "dashboard.proxy.home", "remote_addr": "127.0.0.1", "remote_port": 3001}
+      ],
+      "unmatched": "reject"
+    }
+  }
+]

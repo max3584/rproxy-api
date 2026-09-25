@@ -25,6 +25,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
+| `RPROXY_STATIC_RULES` | `--static-rules` | なし | 固定ルールの JSON ファイル（下の「固定ルール」を参照）。中身が不正なら起動しない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
@@ -52,6 +53,20 @@ curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/rules/tcp/
 # 停止（既存の接続も切断。?drain_secs=30 で終了を待つ）
 curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp/0.0.0.0/8888
 ```
+
+## 固定ルールと、ダッシュボードの公開
+
+`RPROXY_STATIC_RULES` に JSON のファイルを指定すると、起動時にそのルールを開始します（DB からの復元より前）。API と画面からは変更・削除できないので、rproxy 経由で Web UI を公開するルールに向いています（誤って消して、画面に入れなくなることがありません）。
+
+例（[contrib/static-rules.example.json](contrib/static-rules.example.json)）：`dashboard.proxy.home` だけを、社内のネットワークから 443 で受け付けます。
+
+- `tls.routes` と `tls.unmatched: reject`：ほかの名前や SNI なしの接続は、証明書を返す前に切る（Traefik の `Host(...)` のルールにあたる）
+- `allow_from`：範囲外の送信元は TLS より前に切る
+- Web UI は `127.0.0.1:3001` だけで待ち受ける（`next start -H 127.0.0.1 -p 3001`）。`NEXTAUTH_URL` は `https://dashboard.proxy.home` にする
+
+SNI やサーバ名は、クライアントが自由に名乗れます。名前での振り分けだけではアクセス制限にならないので、`allow_from`、mTLS（`client_auth`）、Web UI のログインを組み合わせてください。
+
+systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.service) にあります（80 / 443 などのために `CAP_NET_BIND_SERVICE` を付ける）。
 
 ## TLS・DTLS・STARTTLS・ポート範囲
 

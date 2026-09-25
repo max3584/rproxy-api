@@ -41,6 +41,8 @@ struct Options {
 	tls: Option<TlsSpec>,
 	starttls: Option<StartTls>,
 	starttls_required: Option<bool>,
+	#[serde(default)]
+	allow_from: Vec<String>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -63,6 +65,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		tls: None,
 		starttls: None,
 		starttls_required: None,
+		allow_from: vec![],
 	};
 	if schema != Schema::Legacy {
 		req.source_ip = get_str("source_ip")?.parse().map_err(parse_err)?;
@@ -81,6 +84,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		req.tls = options.tls;
 		req.starttls = options.starttls;
 		req.starttls_required = options.starttls_required;
+		req.allow_from = options.allow_from;
 	}
 	Ok(req)
 }

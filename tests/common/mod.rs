@@ -68,12 +68,47 @@ pub async fn harness() -> Harness {
 	harness_with(Tokens::disabled()).await
 }
 
+/// Ports for listeners under test. Asking the OS for port 0 hands out
+/// ephemeral ports, which outgoing connections of other parallel tests can grab
+/// before the rule binds them; take ports below the ephemeral range instead
+/// (Linux: 32768-60999), each at most once per test binary.
+fn next_ports(n: u16, bindable: fn(u16) -> bool) -> u16 {
+	use std::sync::atomic::{AtomicU32, Ordering};
+	static NEXT: AtomicU32 = AtomicU32::new(0);
+	let base = 20_000 + (std::process::id() % 40) * 300;
+	loop {
+		// reserve n numbers at once so no other test is handed any of them
+		let first = NEXT.fetch_add(u32::from(n), Ordering::Relaxed) % 12_000;
+		if first + u32::from(n) > 12_000 {
+			continue;
+		}
+		let port = (base + first) as u16;
+		if (0..n).all(|i| bindable(port + i)) {
+			return port;
+		}
+	}
+}
+
+fn next_port(bindable: fn(u16) -> bool) -> u16 {
+	next_ports(1, bindable)
+}
+
+/// The first of `n` consecutive TCP ports that no other test will be given.
+pub fn free_tcp_block(n: u16) -> u16 {
+	next_ports(n, |p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
+}
+
+/// The first of `n` consecutive UDP ports that no other test will be given.
+pub fn free_udp_block(n: u16) -> u16 {
+	next_ports(n, |p| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok())
+}
+
 pub fn free_port() -> u16 {
-	std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+	next_port(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
 pub fn free_udp_port() -> u16 {
-	std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+	next_port(|p| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok())
 }
 
 /// TCP backend that answers every read with `tag` + the bytes read.
