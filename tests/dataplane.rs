@@ -293,21 +293,36 @@ async fn proxy_protocol_v1_header_carries_the_client() {
 async fn concurrent_creates_of_the_same_rule_yield_one_winner() {
 	let h = harness().await;
 	let backend = tcp_echo().await;
-	let port = free_port();
-	let body = rule("tcp", port, backend);
-	let attempts: Vec<_> = (0..10)
-		.map(|_| {
-			let (http, url, body) = (h.http.clone(), format!("{}/rules", h.base), body.clone());
-			tokio::spawn(async move { http.post(url).json(&body).send().await.unwrap().status() })
-		})
-		.collect();
+	// free_port() can race with other tests; retry on bind_failed, which is not what we test
 	let mut created = 0;
-	for a in attempts {
-		match a.await.unwrap() {
-			StatusCode::CREATED => created += 1,
-			StatusCode::CONFLICT => {}
-			other => panic!("unexpected {other}"),
+	for _ in 0..5 {
+		let body = rule("tcp", free_port(), backend);
+		let attempts: Vec<_> = (0..10)
+			.map(|_| {
+				let (http, url, body) = (h.http.clone(), format!("{}/rules", h.base), body.clone());
+				tokio::spawn(async move {
+					let r = http.post(url).json(&body).send().await.unwrap();
+					let status = r.status();
+					let v: serde_json::Value = r.json().await.unwrap_or_default();
+					(status, v["code"].as_str().unwrap_or("").to_string())
+				})
+			})
+			.collect();
+		let mut results = vec![];
+		for a in attempts {
+			results.push(a.await.unwrap());
 		}
+		if results.iter().all(|(_, code)| code == "bind_failed") {
+			continue;
+		}
+		for (status, code) in results {
+			match (status, code.as_str()) {
+				(StatusCode::CREATED, _) => created += 1,
+				(StatusCode::CONFLICT, "already_exists") => {}
+				other => panic!("unexpected {other:?}"),
+			}
+		}
+		break;
 	}
 	assert_eq!(created, 1);
 }
