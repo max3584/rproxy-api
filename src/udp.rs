@@ -86,7 +86,7 @@ async fn session(
 	};
 
 	rt.stats.opened();
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = ?target);
+	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr_or_empty(target));
 
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -124,7 +124,7 @@ async fn session(
 				if let Some(next) = next.filter(|n| Some(*n) != target) {
 					match upstream.connect(next).await {
 						Ok(()) => {
-							info!(event = "conn.retarget", rule = %rt.key, client = %client, from = ?target, to = %next);
+							info!(event = "conn.retarget", rule = %rt.key, client = %client, from = %addr_or_empty(target), to = %next);
 							target = Some(next);
 						}
 						Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e),
@@ -143,8 +143,12 @@ async fn session(
 
 	remove(&sessions, client, id);
 	rt.stats.closed(rx_bytes, tx_bytes);
-	info!(event = "conn.close", rule = %rt.key, client = %client, target = ?target,
+	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
+}
+
+fn addr_or_empty(target: Option<SocketAddr>) -> String {
+	target.map(|t| t.to_string()).unwrap_or_default()
 }
 
 fn remove(sessions: &Sessions, client: SocketAddr, id: u64) {

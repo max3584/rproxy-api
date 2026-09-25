@@ -72,13 +72,19 @@ fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
 	}
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
 	// a missing .env is fine; a malformed one is reported
 	if let Err(e) = dotenvy::dotenv() {
 		if !e.not_found() {
 			eprintln!("rproxy-api: .env: {e}");
 			return ExitCode::FAILURE;
+		}
+	}
+	// `RPROXY_DATABASE_URL=` and the like mean "not set", not an empty value.
+	// Done before the runtime starts so no other thread reads the environment.
+	for (key, value) in std::env::vars_os() {
+		if value.is_empty() && key.to_string_lossy().starts_with("RPROXY_") {
+			std::env::remove_var(key);
 		}
 	}
 	let opts = Options::parse();
@@ -90,7 +96,14 @@ async fn main() -> ExitCode {
 			return ExitCode::FAILURE;
 		}
 	};
-	match run(opts).await {
+	let runtime = match tokio::runtime::Runtime::new() {
+		Ok(rt) => rt,
+		Err(e) => {
+			error!(event = "fatal", error = %e);
+			return ExitCode::FAILURE;
+		}
+	};
+	match runtime.block_on(run(opts)) {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(e) => {
 			error!(event = "fatal", error = %e);

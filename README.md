@@ -62,21 +62,37 @@ curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp
 | `proxy_v1` / `proxy_v2` | 接続の先頭に PROXY protocol ヘッダを付ける | TCP のみ。転送先が PROXY protocol に対応していること |
 | `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT`） | Linux、IPv4、`CAP_NET_ADMIN`。転送先からの戻りパケットが rproxy のホストを通ること |
 
-`transparent` を使うには、rproxy に権限を与え、戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
+`transparent` を使うには、rproxy に権限を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
 
 ```bash
 # rproxy に権限を与える（root で動かさない場合）
 setcap cap_net_admin+ep ./target/release/rproxy-api
-
-# 転送先からの戻りパケットをローカルで受け取る
-ip rule add fwmark 1 lookup 100
-ip route add local 0.0.0.0/0 dev lo table 100
-iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
-iptables -t mangle -A PREROUTING -p udp -m socket --transparent -j MARK --set-mark 1
 ```
 
-さらに、転送先のデフォルトゲートウェイを rproxy のホストにする（または転送先側でクライアント宛ての経路を rproxy に向ける）必要がある。
+戻りパケットの受け取り方は2通りある。
+
+1. **クライアントのアドレス範囲が決まっている場合**（`scripts/test-transparent.sh` で動作確認済み）。
+   転送先側のインターフェースから届いた、クライアント宛てのパケットをローカル扱いにする。
+
+   ```bash
+   ip route add local 10.0.1.0/24 dev lo table 100   # クライアントのアドレス範囲
+   ip rule add iif <転送先側のインターフェース> lookup 100
+   ```
+
+2. **クライアントのアドレス範囲が決まっていない場合**（未検証）。
+   rproxy の transparent ソケット宛てのパケットだけに印を付けて、ローカル扱いにする。
+
+   ```bash
+   iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
+   iptables -t mangle -A PREROUTING -p udp -m socket --transparent -j MARK --set-mark 1
+   ip rule add fwmark 1 lookup 100
+   ip route add local 0.0.0.0/0 dev lo table 100
+   ```
+
+どちらの場合も、転送先のデフォルトゲートウェイを rproxy のホストにする（または転送先側でクライアント宛ての経路を rproxy に向ける）必要がある。
 使えるかどうかは `GET /capabilities` で確認できる。
+
+`scripts/test-transparent.sh` は、root 権限なしでユーザー名前空間とネットワーク名前空間の中に「クライアント・rproxy・転送先」の構成を作る。そのうえで、`proxy` と `transparent` のそれぞれについて、TCP と UDP で転送先から見える送信元アドレスを確かめる（`cargo build` のあとに実行）。
 
 ## ログ
 

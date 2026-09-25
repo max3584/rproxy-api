@@ -9,6 +9,7 @@
 cargo build
 cargo test                    # 単体テスト + tests/api.rs（loopback で実ソケットを使う結合テスト）
 cargo clippy --all-targets
+scripts/test-transparent.sh   # transparent の実経路テスト（root 不要、名前空間を使う。cargo build の後）
 cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.example を参照）
 ```
 
@@ -48,6 +49,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## 注意点
 
-- `transparent` は Linux・IPv4・`CAP_NET_ADMIN` が前提で、ポリシールーティングの設定も要る（README）。この環境では実際の経路での動作確認はしていない。
-- DB からの復元（`src/db.rs`）は実際の MariaDB に対しては未検証。テーブルが古く `source_ip` / `udp_idle_secs` 列がない場合は、既定値で読み込む。
+- `transparent` は Linux・IPv4・`CAP_NET_ADMIN` が前提で、ポリシールーティングの設定も要る（README）。`scripts/test-transparent.sh` で名前空間の中の実経路では確認済み。README の iptables を使う手順は未検証。
+- DB からの復元（`src/db.rs`）は MariaDB 11.4 で確認済み。テーブルが古く `source_ip` / `udp_idle_secs` 列がない場合は、既定値で読み込む。
+- 空の環境変数（`RPROXY_DATABASE_URL=` など）は未設定として扱う（`main` で clap に渡す前に取り除く）。
 - 派生元のコードに由来するファイルには帰属コメントが付いている。MIT ライセンスの表記は残すこと。
