@@ -73,6 +73,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		"dtls": true,
 		"starttls": ["smtp", "imap", "pop3"],
 		"max_range_ports": state.registry.caps().max_range_ports,
+		// v0.3 settings this build can run (docs/DESIGN-v0.3.md)
+		"features": state.registry.caps().features,
 	}))
 }
 

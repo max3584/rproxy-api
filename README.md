@@ -58,7 +58,8 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
-| `RPROXY_STATIC_RULES` | `--static-rules` | なし | 固定ルールの JSON ファイル（下の「固定ルール」を参照）。中身が不正なら起動しない |
+| `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）。ルールは固定ルールとして開始する（docs/API.md の「設定ファイル」）。中身が不正なら起動しない |
+| `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
@@ -104,13 +105,13 @@ curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp
 
 ## 固定ルールと、ダッシュボードの公開
 
-`RPROXY_STATIC_RULES` に JSON のファイルを指定すると、起動時にそのルールを開始します（DB からの復元より前）。API と画面からは変更・削除できないので、rproxy 経由で Web UI を公開するルールに向いています（誤って消して、画面に入れなくなることがありません）。
+`RPROXY_CONFIG` に設定ファイル（YAML か JSON）を指定すると、起動時にそのルールを開始します（DB からの復元より前）。API と画面からは変更・削除できないので、rproxy 経由で Web UI を公開するルールに向いています（誤って消して、画面に入れなくなることがありません）。
 
-例（[contrib/static-rules.example.json](contrib/static-rules.example.json)）：`dashboard.proxy.home` だけを、社内のネットワークから 443 で受け付けます。
+例（[contrib/rproxy.example.yaml](contrib/rproxy.example.yaml)）：`dashboard.proxy.home` だけを、社内のネットワークから 443 で受け付けます。
 
 - `tls.routes` と `tls.unmatched: reject`：ほかの名前や SNI なしの接続は、証明書を返す前に切る（Traefik の `Host(...)` のルールにあたる）
 - `allow_from`：範囲外の送信元は TLS より前に切る
-- Web UI は `127.0.0.1:3001` だけで待ち受ける（`next start -H 127.0.0.1 -p 3001`）。`NEXTAUTH_URL` は `https://dashboard.proxy.home` にする
+- Web UI（rproxy-ui のパッケージ）は既定で `127.0.0.1:3000` だけで待ち受ける。`NEXTAUTH_URL` は `https://dashboard.proxy.home` にする
 
 SNI やサーバ名は、クライアントが自由に名乗れます。名前での振り分けだけではアクセス制限にならないので、`allow_from`、mTLS（`client_auth`）、Web UI のログインを組み合わせてください。
 

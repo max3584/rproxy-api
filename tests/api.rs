@@ -302,3 +302,39 @@ async fn interfaces_and_reserved_addresses() {
 	let (_, v) = h.post(rule("udp", 1, backend)).await;
 	assert_ne!(v["code"], "reserved", "{v}");
 }
+
+/// v0.3 settings: the shape is checked, features this build cannot run are
+/// refused with `unsupported` and reported in `features`.
+#[tokio::test]
+async fn v0_3_settings_are_validated_and_refused_until_available() {
+	let h = harness().await;
+	let backend = tcp_backend("H:").await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["http"], false, "{caps}");
+	assert_eq!(caps["features"]["middlewares"], json!([]), "{caps}");
+
+	let mut body = rule("tcp", free_port(), backend);
+	body["http"] = json!({"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1"}]});
+	let (status, v) = h.post(body.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("http.services"), "remote_addr is not for http rules: {v}");
+
+	let obj = body.as_object_mut().unwrap();
+	obj.remove("remote_addr");
+	obj.remove("remote_port");
+	let (status, v) = h.post(body.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+
+	body["http"]["routes"][0]["match"] = json!("Hots(`x`)");
+	let (status, v) = h.post(body.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("unknown matcher"), "{v}");
+
+	body["http"] = json!({"routes": [], "teleport": true});
+	assert_eq!(h.post(body).await.0, StatusCode::BAD_REQUEST, "unknown fields are refused");
+
+	let mut acme = rule("tcp", free_port(), backend);
+	acme["tls"] = json!({"mode": "terminate", "certificates": [{"acme": "le", "domains": ["a.example"]}]});
+	let (status, v) = h.post(acme).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+}

@@ -50,17 +50,37 @@ pub struct Route {
 	pub remote_port: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One certificate: PEM files, or (v0.3) one obtained through an ACME resolver.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertFiles {
 	/// PEM server certificate. May also hold the chain after it (leaf first).
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	pub cert_file: String,
 	/// PEM intermediate CA certificates, sent after the server certificate.
 	/// The root may be left out; clients already trust it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub chain_file: Option<String>,
 	/// PEM private key (PKCS#8; for tcp also PKCS#1 / SEC1).
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	pub key_file: String,
+	/// Name of a `global.acme.resolvers` entry that obtains this certificate.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub acme: Option<String>,
+	/// Names the ACME certificate covers.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub domains: Vec<String>,
+}
+
+/// TLS protocol settings (v0.3; see GET /capabilities features.tls_options).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsOptions {
+	/// "1.2" or "1.3"
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub min_version: Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub cipher_suites: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +147,8 @@ pub struct TlsSpec {
 	pub upstream: Upstream,
 	#[serde(default)]
 	pub unmatched: Unmatched,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub options: Option<TlsOptions>,
 }
 
 /// Mail protocols whose plain-text STARTTLS dialogue rproxy answers itself.
@@ -173,6 +195,33 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 			return Err(tls_error("routes need mode sni or terminate"));
 		}
 		_ => {}
+	}
+	for c in &tls.certificates {
+		match &c.acme {
+			Some(resolver) => {
+				if resolver.is_empty() || c.domains.is_empty() {
+					return Err(tls_error("an acme certificate needs the resolver name and at least one domain"));
+				}
+				if !c.cert_file.is_empty() || !c.key_file.is_empty() || c.chain_file.is_some() {
+					return Err(tls_error("an acme certificate takes no cert_file, key_file or chain_file"));
+				}
+			}
+			None if c.cert_file.is_empty() || c.key_file.is_empty() => {
+				return Err(tls_error("a certificate needs cert_file and key_file (or acme and domains)"));
+			}
+			None if !c.domains.is_empty() => return Err(tls_error("domains is only used with acme")),
+			None => {}
+		}
+	}
+	if let Some(o) = &tls.options {
+		if tls.mode != TlsMode::Terminate {
+			return Err(tls_error("options are only used with mode terminate"));
+		}
+		if let Some(v) = &o.min_version {
+			if v != "1.2" && v != "1.3" {
+				return Err(tls_error(format!("options.min_version {v:?} must be 1.2 or 1.3")));
+			}
+		}
 	}
 	if tls.mode != TlsMode::Terminate
 		&& (tls.client_auth.mode != ClientAuthMode::None || tls.upstream != Upstream::default() || !tls.alpn.is_empty())
@@ -606,6 +655,7 @@ impl TlsRuntime {
 							cert_file: cert.clone(),
 							chain_file: spec.upstream.chain_file.clone(),
 							key_file: key.clone(),
+							..Default::default()
 						})?);
 					}
 				}
@@ -694,14 +744,14 @@ mod tests {
 		assert_eq!(validate(Protocol::Tcp, &sni, Some(StartTls::Smtp)).unwrap_err().code, "tls_config");
 		let mut auth = TlsSpec {
 			mode: TlsMode::Terminate,
-			certificates: vec![CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into() }],
+			certificates: vec![CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into(), ..Default::default() }],
 			..Default::default()
 		};
 		auth.client_auth.mode = ClientAuthMode::Required;
 		assert_eq!(validate(Protocol::Tcp, &auth, None).unwrap_err().code, "tls_config");
 		let mut dtls_alpn = TlsSpec {
 			mode: TlsMode::Terminate,
-			certificates: vec![CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into() }],
+			certificates: vec![CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into(), ..Default::default() }],
 			..Default::default()
 		};
 		dtls_alpn.alpn = vec!["h2".into()];
@@ -721,7 +771,7 @@ mod tests {
 	fn missing_files_are_reported() {
 		let spec = TlsSpec {
 			mode: TlsMode::Terminate,
-			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), chain_file: None, key_file: "/nonexistent.key".into() }],
+			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), chain_file: None, key_file: "/nonexistent.key".into(), ..Default::default() }],
 			..Default::default()
 		};
 		let err = TlsRuntime::build(Protocol::Tcp, &spec, None, true).err().unwrap();

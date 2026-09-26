@@ -18,7 +18,7 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, SourceIp,
+	validate_target, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView,
 	State, UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
@@ -205,23 +205,24 @@ impl Registry {
 			transparent: self.cfg.transparent,
 			transparent_ipv6: self.cfg.transparent_ipv6,
 			max_range_ports: self.cfg.max_range_ports,
+			features: crate::rule::Features::CURRENT,
 		}
 	}
 
 	/// Validates a rule loaded at startup (DB or static file). A rule that is
-	/// well-formed but needs a capability this process lacks (transparent
-	/// without CAP_NET_ADMIN) comes back with the reason, to be registered as
-	/// failed instead of being dropped or stopping the startup.
+	/// well-formed but needs something this process lacks (transparent without
+	/// CAP_NET_ADMIN, a v0.3 feature this build cannot run yet) comes back with
+	/// the reason, to be registered as failed instead of being dropped or
+	/// stopping the startup.
 	fn validate_at_startup(&self, req: RuleRequest) -> Result<(RuleSpec, Option<String>), ApiError> {
 		let caps = self.caps();
 		match req.clone().validate(&caps) {
 			Ok(spec) => Ok((spec, None)),
-			Err(e)
-				if e.code == "unsupported"
-					&& !(caps.transparent && caps.transparent_ipv6)
-					&& req.source_ip == SourceIp::Transparent =>
-			{
-				let spec = req.validate(&Caps { transparent: true, transparent_ipv6: true, ..caps })?;
+			Err(e) if e.code == "unsupported" => {
+				let everything =
+					Caps { transparent: true, transparent_ipv6: true, features: crate::rule::Features::ALL, ..caps };
+				// still unsupported with everything available: a real mistake (e.g. proxy_v1 on udp)
+				let spec = req.validate(&everything)?;
 				Ok((spec, Some(e.message)))
 			}
 			Err(e) => Err(e),
@@ -387,7 +388,6 @@ impl Registry {
 	}
 
 	pub async fn update(self: &Arc<Self>, key: &Key, req: UpdateRequest) -> Result<RuleView, ApiError> {
-		let remote_host = validate_remote(&req.remote_addr, req.remote_port)?;
 		let udp_idle = match req.udp_idle_secs {
 			Some(secs) => Some(validate_udp_idle(Some(secs))?),
 			None => None,
@@ -411,6 +411,7 @@ impl Registry {
 				return Err(ApiError::unsupported("the port range cannot be changed; delete and re-create the rule"));
 			}
 		}
+		let remote_host = validate_target(&req.remote_addr, req.remote_port, req.http.is_some() || spec.http.is_some())?;
 		if u32::from(req.remote_port) + u32::from(spec.port_count) - 1 > 65_535 {
 			return Err(ApiError::invalid("remote_port + range length exceeds 65535"));
 		}
@@ -429,6 +430,15 @@ impl Registry {
 			spec.starttls = req.starttls;
 			spec.starttls_required = req.starttls != Some(crate::tlsconf::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
 		}
+		if let Some(http) = req.http {
+			if key.protocol != crate::rule::Protocol::Tcp || spec.tls.mode == crate::tlsconf::TlsMode::Sni || spec.starttls.is_some() {
+				return Err(ApiError::invalid("http needs protocol tcp with tls mode terminate (or no TLS) and no starttls"));
+			}
+			http.validate()?;
+			spec.http = Some(http);
+		}
+		// whatever was replaced, the rule must stay within what this build can run
+		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
 		let prepared = self.prepare(&spec).await?;
 
 		let mut rules = self.rules.lock().await;
