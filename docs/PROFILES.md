@@ -63,6 +63,33 @@ Submission（587）の例。転送先には平文で送り、PROXY v2 で送信�
 - 転送先の SMTP サーバには、TLS を済ませたクライアントが平文で届きます。認証（AUTH）を平文で許す設定にするか、`upstream.tls` で再暗号化してください。
 - IMAP / POP3 では STARTTLS が必須です（TLS を使う前のログインは拒否します）。
 
+### 転送先の設定（Postfix / Dovecot で確認済み）
+
+`scripts/interop/mail.sh`（CI の Interop ワークフロー）で、Ubuntu 24.04 の Postfix 3.8 / Dovecot 2.3 を相手に、Submission・SMTP（`starttls_required: false`）・IMAP（STARTTLS）・IMAPS・POP3（STLS）が通ることを確かめています。rproxy からの接続を受けるリスナーは次のようにします。
+
+```text
+# Postfix: master.cf（rproxy からだけ届くアドレスで待ち受ける）
+10.0.0.20:587 inet n - n - - smtpd
+  -o smtpd_upstream_proxy_protocol=haproxy
+  -o smtpd_tls_security_level=none
+```
+
+```text
+# Dovecot: TLS は rproxy が終端するので、このリスナーは平文 + PROXY v2
+haproxy_trusted_networks = 10.0.0.10        # rproxy のアドレス
+service imap-login {
+  inet_listener imap-rproxy {
+    address = 10.0.0.20
+    port = 10143
+    haproxy = yes
+  }
+}
+```
+
+- 転送先から見える接続元は、PROXY v2 で渡したクライアントのアドレスになります（Postfix のログの `connect from`）。
+- **SMTP の AUTH**: Postfix は PROXY v2 の TLS の情報を読まないので、rproxy が TLS を終端した接続も「平文」として扱います。AUTH を使うなら、rproxy からのリスナーで `-o smtpd_tls_auth_only=no` にし、Dovecot の SASL が平文の認証を受け付けるようにする必要があります（その場合、このリスナーには rproxy 以外から届かないようにする）。それを避けたいときは `upstream.tls` で Postfix まで再暗号化してください。（AUTH の組み合わせは CI では確かめていません）
+- **Dovecot のログイン**: CI では 127.0.0.1 からの接続で、既定の `disable_plaintext_auth = yes` のままログインできることを確かめています（Dovecot は 127.0.0.1 を安全な接続として扱います）。ほかのアドレスからの場合は、Dovecot が PROXY v2 の TLS の情報をもとに TLS 済みとして扱うことを実機で確かめてください。
+
 ## RTSP / RTSPS
 
 | 用途 | 設定 |
