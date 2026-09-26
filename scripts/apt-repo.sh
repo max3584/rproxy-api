@@ -24,7 +24,6 @@ SUITE=stable
 COMPONENT=main
 ARCHES="amd64 arm64 armhf"
 pool="$repo/pool/$COMPONENT/r/rproxy-api"
-dist="$repo/dists/$SUITE"
 key=(${APT_GPG_KEY_ID:+--local-user "$APT_GPG_KEY_ID"})
 
 mkdir -p "$pool"

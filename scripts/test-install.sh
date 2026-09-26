@@ -57,7 +57,7 @@ echo "== binary: uninstall keeps the configuration, purge removes it"
 [ ! -e /usr/local/bin/rproxy-api ] || fail "binary left behind"
 [ -e /etc/rproxy/tokens ] || fail "uninstall removed the token"
 "$install" --uninstall --purge
-[ ! -e /etc/rproxy ] && [ ! -e /var/log/rproxy ] || fail "purge left files behind"
+if [ -e /etc/rproxy ] || [ -e /var/log/rproxy ]; then fail "purge left files behind"; fi
 
 echo "== apt: install the published package"
 "$install" --method apt

@@ -40,7 +40,7 @@ log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31mエラー:\033[0m %s\n' "$*" >&2; exit 1; }
 
-api_addr= api_port= database_url= static_rules= log_file= version= method= binary=
+api_addr='' api_port='' database_url='' static_rules='' log_file='' version='' method='' binary=''
 no_start=false uninstall=false purge=false
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -64,7 +64,7 @@ done
 [ -d /run/systemd/system ] || die "systemd で起動した Linux が必要です"
 if [ -n "$api_port" ]; then
 	case $api_port in '' | *[!0-9]*) die "--api-port は数字で指定してください" ;; esac
-	[ "$api_port" -ge 1 ] && [ "$api_port" -le 65535 ] || die "--api-port は 1〜65535 です"
+	if [ "$api_port" -lt 1 ] || [ "$api_port" -gt 65535 ]; then die "--api-port は 1〜65535 です"; fi
 fi
 if [ -n "$static_rules" ] && [ ! -r "$static_rules" ]; then
 	die "--static-rules のファイルが読めません: $static_rules"
