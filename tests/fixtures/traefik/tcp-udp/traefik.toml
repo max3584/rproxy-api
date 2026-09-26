@@ -1,0 +1,14 @@
+[entryPoints.tls]
+address = ":443"
+
+[entryPoints.ssh]
+address = "192.0.2.10:2222"
+
+[entryPoints.imaps]
+address = ":993"
+
+[entryPoints.dns]
+address = ":53/udp"
+
+[providers.file]
+filename = "dynamic.toml"

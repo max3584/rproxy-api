@@ -1,0 +1,30 @@
+http:
+  routers:
+    cdn-allowed:
+      entryPoints: [websecure]
+      rule: Host(`cdn.example.com`) && (PathPrefix(`/file/`) || PathPrefix(`/images/`) || PathPrefix(`/iso/`))
+      service: cdn
+      middlewares: [crowdsec]
+    cdn-block:
+      entryPoints: [websecure]
+      rule: Host(`cdn.example.com`)
+      service: cdn
+      middlewares: [block-all]
+    metrics:
+      entryPoints: [websecure]
+      rule: PathPrefix(`/metrics`)
+      service: metrics
+      middlewares: [internal-only]
+    dashboard:
+      entryPoints: [websecure]
+      rule: Host(`traefik.example.com`)
+      service: api@internal
+  services:
+    cdn:
+      loadBalancer:
+        servers:
+          - url: http://10.0.0.30:80
+    metrics:
+      loadBalancer:
+        servers:
+          - url: http://10.0.0.40:9100

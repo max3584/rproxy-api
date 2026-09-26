@@ -38,9 +38,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # tests/traefik_convert.rs runs contrib/traefik2rproxy.py
+      - name: python3-yaml
+        run: python3 -c 'import yaml, tomllib' || sudo apt-get install -y python3-yaml
       - name: unit + integration tests
         env:
           RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
+          RPROXY_TEST_REQUIRE_PYTHON: "1"
         run: cargo test --all-targets
 
   transparent:

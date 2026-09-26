@@ -1,0 +1,52 @@
+[
+  {
+    "Name": "/whoami",
+    "Config": {
+      "ExposedPorts": {"80/tcp": {}},
+      "Labels": {
+        "traefik.enable": "true",
+        "traefik.http.routers.whoami.entrypoints": "websecure",
+        "traefik.http.routers.whoami.rule": "Host(`whoami.example.com`) && Headers(`X-Env`, `prod`) || Host(`{sub:[a-z]+}.whoami.example.com`)",
+        "traefik.http.routers.whoami.tls": "true",
+        "traefik.http.routers.whoami.middlewares": "strip@docker,auth,api-guard",
+        "traefik.http.middlewares.strip.stripprefix.prefixes": "/whoami,/who",
+        "traefik.http.middlewares.auth.basicauth.users": "user:$apr1$abc$def",
+        "traefik.http.middlewares.api-guard.chain.middlewares": "forward,retry,breaker,errors,limit",
+        "traefik.http.middlewares.forward.forwardauth.address": "http://auth:9091/api/verify",
+        "traefik.http.middlewares.forward.forwardauth.trustForwardHeader": "true",
+        "traefik.http.middlewares.forward.forwardauth.authResponseHeaders": "Remote-User,Remote-Groups",
+        "traefik.http.middlewares.retry.retry.attempts": "3",
+        "traefik.http.middlewares.retry.retry.initialInterval": "100ms",
+        "traefik.http.middlewares.breaker.circuitbreaker.expression": "NetworkErrorRatio() > 0.30",
+        "traefik.http.middlewares.errors.errors.status": "500-599",
+        "traefik.http.middlewares.errors.errors.service": "error-pages",
+        "traefik.http.middlewares.errors.errors.query": "/{status}.html",
+        "traefik.http.middlewares.limit.buffering.maxRequestBodyBytes": "10485760",
+        "traefik.http.middlewares.compress.compress.minResponseBodyBytes": "1024",
+        "traefik.http.services.whoami.loadbalancer.server.port": "80",
+        "traefik.http.services.whoami.loadbalancer.healthcheck.path": "/health",
+        "traefik.http.services.whoami.loadbalancer.healthcheck.interval": "10s",
+        "traefik.http.services.whoami.loadbalancer.sticky.cookie.name": "whoami_sticky"
+      }
+    },
+    "NetworkSettings": {"Networks": {"proxy": {"IPAddress": "172.20.0.5"}}}
+  },
+  {
+    "Name": "/error-pages",
+    "Config": {
+      "Labels": {
+        "traefik.enable": "true",
+        "traefik.http.routers.errors.entrypoints": "web",
+        "traefik.http.routers.errors.rule": "Host(`errors.example.com`) && Query(`debug=1`) && PathPrefix(`/p/{id:[0-9]+}`)",
+        "traefik.http.services.error-pages.loadbalancer.server.port": "8080",
+        "traefik.http.services.error-pages.loadbalancer.server.scheme": "https"
+      }
+    },
+    "NetworkSettings": {"Networks": {"proxy": {"IPAddress": "172.20.0.6"}}}
+  },
+  {
+    "Name": "/ignored",
+    "Config": {"Labels": {"traefik.enable": "false", "traefik.http.routers.x.rule": "Host(`x`)"}},
+    "NetworkSettings": {"Networks": {}}
+  }
+]

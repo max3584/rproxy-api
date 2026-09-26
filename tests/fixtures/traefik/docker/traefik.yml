@@ -1,0 +1,12 @@
+entryPoints:
+  web:
+    address: ":8000"
+  websecure:
+    address: "[::]:8443"
+    http:
+      middlewares: [compress@docker]
+providers:
+  docker:
+    exposedByDefault: false
+serversTransport:
+  insecureSkipVerify: true
