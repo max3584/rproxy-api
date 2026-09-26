@@ -481,7 +481,13 @@ fn server_crypto(
 	Ok((Arc::new(provider), versions))
 }
 
-fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
+/// The server side of TLS termination: for TCP, and for QUIC (HTTP/3: TLS 1.3
+/// only, the same certificates and client authentication, ALPN `h3`). The QUIC
+/// side is an error text when `tls.options` leaves it without a TLS 1.3 suite.
+/// The QUIC server settings, or why QUIC cannot be used with these TLS settings.
+pub type QuicConfig = Result<Arc<ServerConfig>, String>;
+
+fn server_configs(tls: &TlsSpec) -> Result<(Arc<ServerConfig>, QuicConfig), ApiError> {
 	let (provider, versions) = server_crypto(tls.options.as_ref())?;
 	let mut certs = vec![];
 	for files in &tls.certificates {
@@ -499,16 +505,36 @@ fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
 		certs.push((names, Arc::new(certified)));
 	}
 
+	let verifier = client_verifier(&tls.client_auth)?;
+	let resolver = Arc::new(SniCertResolver { certs });
 	let builder = ServerConfig::builder_with_provider(provider.clone())
 		.with_protocol_versions(&versions)
 		.map_err(|e| tls_error(e.to_string()))?;
-	let builder = match client_verifier(&tls.client_auth)? {
-		Some(verifier) => builder.with_client_cert_verifier(verifier),
+	let builder = match &verifier {
+		Some(verifier) => builder.with_client_cert_verifier(verifier.clone()),
 		None => builder.with_no_client_auth(),
 	};
-	let mut config = builder.with_cert_resolver(Arc::new(SniCertResolver { certs }));
+	let mut config = builder.with_cert_resolver(resolver.clone());
 	config.alpn_protocols = tls.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
-	Ok(Arc::new(config))
+
+	let quic = (|| {
+		let mut quic_provider = (*provider).clone();
+		quic_provider.cipher_suites.retain(|s| s.version() == &rustls::version::TLS13);
+		if quic_provider.cipher_suites.is_empty() {
+			return Err("QUIC needs TLS 1.3, and tls.options.cipher_suites has no TLS 1.3 suite".to_string());
+		}
+		let builder = ServerConfig::builder_with_provider(Arc::new(quic_provider))
+			.with_protocol_versions(&[&rustls::version::TLS13])
+			.map_err(|e| e.to_string())?;
+		let builder = match &verifier {
+			Some(verifier) => builder.with_client_cert_verifier(verifier.clone()),
+			None => builder.with_no_client_auth(),
+		};
+		let mut quic = builder.with_cert_resolver(resolver);
+		quic.alpn_protocols = vec![b"h3".to_vec()];
+		Ok(Arc::new(quic))
+	})();
+	Ok((Arc::new(config), quic))
 }
 
 /// Adds the configured intermediate CAs to whatever the client sent, so
@@ -678,6 +704,8 @@ pub struct TlsRuntime {
 	pub greeting_name: String,
 	/// Server side of TLS termination (tcp).
 	pub server_config: Option<Arc<ServerConfig>>,
+	/// Server side of QUIC for HTTP/3 (tcp terminate); an error text when it cannot be used.
+	pub quic_config: Option<QuicConfig>,
 	pub connector: Option<tokio_rustls::TlsConnector>,
 	dtls_certs: Vec<webrtc_dtls::crypto::Certificate>,
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
@@ -700,6 +728,7 @@ impl TlsRuntime {
 			starttls_required,
 			greeting_name: "rproxy".to_string(),
 			server_config: None,
+			quic_config: None,
 			connector: None,
 			dtls_certs: vec![],
 			dtls_client_verifier: None,
@@ -711,7 +740,9 @@ impl TlsRuntime {
 		}
 		match protocol {
 			Protocol::Tcp => {
-				rt.server_config = Some(server_config(spec)?);
+				let (tcp, quic) = server_configs(spec)?;
+				rt.server_config = Some(tcp);
+				rt.quic_config = Some(quic);
 				if let Some(name) = load_chain(&spec.certificates[0].cert_file)?
 					.first()
 					.and_then(|c| cert_names(c).into_iter().find(|n| !n.starts_with("*.")))

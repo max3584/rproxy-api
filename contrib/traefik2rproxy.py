@@ -1205,7 +1205,7 @@ def main(argv=None):
         features = capabilities.get("features") or {}
         known_mws, known_opts, has_http3 = set(features.get("middlewares", [])), set(features.get("services", [])), bool(features.get("http3"))
     else:
-        known_mws, known_opts, has_http3 = KNOWN_MIDDLEWARES, KNOWN_SERVICE_OPTIONS, False
+        known_mws, known_opts, has_http3 = KNOWN_MIDDLEWARES, KNOWN_SERVICE_OPTIONS, True
     missing = sorted(mws - known_mws) + sorted(opts - known_opts) + (["http3"] if http3 and not has_http3 else [])
     if missing:
         source = "GET /capabilities" if capabilities is not None else "rproxy at the time of this converter"

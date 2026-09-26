@@ -270,6 +270,9 @@ pub struct HttpStatsView {
 	/// Servers of the services with `health_check`, and whether each is up.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub services: BTreeMap<String, Vec<super::backend::ServerHealth>>,
+	/// Rules with `http3`: whether HTTP/3 is answered, and why not.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub http3: Option<super::h3::H3View>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]

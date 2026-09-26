@@ -108,6 +108,7 @@ impl Entry {
 					http: r.spec.http.is_some().then(|| {
 						let mut v = crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats);
 						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
+						v.http3 = r.spec.http.as_ref().is_some_and(|h| h.http3).then(|| r.rt.h3.view());
 						v
 					}),
 				};
@@ -365,6 +366,7 @@ impl Registry {
 			http: RwLock::new(prepared.http),
 			global: self.cfg.http.clone(),
 			http_stats: Default::default(),
+			h3: Default::default(),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -395,6 +397,9 @@ impl Registry {
 					set.spawn(udp::serve(s, rt.clone(), offset as u16));
 				}
 			}
+		}
+		if spec.http.as_ref().is_some_and(|h| h.http3) {
+			crate::http::h3::start(&rt);
 		}
 		let stop = rt.stop.clone();
 		let serve = tokio::spawn(async move {
@@ -508,8 +513,8 @@ impl Registry {
 			http.validate()?;
 			spec.http = Some(http);
 		}
-		if spec.http.is_some() {
-			crate::rule::check_http_tls(&spec.tls, spec.source_ip)?;
+		if let Some(h) = &spec.http {
+			crate::rule::check_http_tls(&spec.tls, spec.source_ip, h)?;
 		}
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
@@ -544,6 +549,14 @@ impl Registry {
 					let (routes, resolvers) = self.install_routes(*key, prepared.routes);
 					*r.rt.routes.write().unwrap() = routes;
 					r.route_resolvers = resolvers;
+				}
+				// HTTP/3 turned on or off (new certificates are picked up per QUIC connection)
+				let h3_was = r.spec.http.as_ref().is_some_and(|h| h.http3);
+				let h3_now = spec.http.as_ref().is_some_and(|h| h.http3);
+				if h3_now && (!h3_was || r.rt.h3.port().is_none()) {
+					crate::http::h3::start(&r.rt);
+				} else if h3_was && !h3_now {
+					crate::http::h3::stop(&r.rt);
 				}
 				r.spec = spec;
 			}

@@ -38,7 +38,35 @@ use crate::resolve::Lookup;
 use crate::source::TlsInfo;
 use crate::tlsconf::Upstream;
 
-pub type Body = BoxBody<Bytes, hyper::Error>;
+/// An error of a request or response body: hyper's (HTTP/1.1, HTTP/2) or h3's
+/// (HTTP/3). A struct rather than `Box<dyn Error>` itself, which trips the
+/// compiler's `Send` checks of the handler's future.
+#[derive(Debug)]
+pub struct BoxError(Box<dyn std::error::Error + Send + Sync>);
+
+impl BoxError {
+	pub fn new(e: impl std::error::Error + Send + Sync + 'static) -> Self {
+		BoxError(Box::new(e))
+	}
+}
+
+impl std::fmt::Display for BoxError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl std::error::Error for BoxError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		self.0.source()
+	}
+}
+
+pub type Body = BoxBody<Bytes, BoxError>;
+
+fn boxed_error(e: hyper::Error) -> BoxError {
+	BoxError::new(e)
+}
 
 #[derive(Debug)]
 struct Route {
@@ -186,13 +214,21 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 }
 
 /// One client connection.
-struct Conn {
+pub(super) struct Conn {
 	rt: Arc<Runtime>,
 	client: SocketAddr,
 	local: SocketAddr,
 	https: bool,
 	/// The terminated TLS session (for the access log).
 	tls: Option<TlsInfo>,
+	/// Over QUIC (HTTP/3); others get `Alt-Svc` when the rule answers HTTP/3.
+	h3: bool,
+}
+
+impl Conn {
+	pub(super) fn new(rt: Arc<Runtime>, client: SocketAddr, local: SocketAddr, tls: Option<TlsInfo>, h3: bool) -> Self {
+		Conn { rt, client, local, https: tls.is_some(), tls, h3 }
+	}
 }
 
 /// Serves HTTP/1.1 and HTTP/2 (by preface) on an accepted, possibly decrypted, connection.
@@ -201,10 +237,10 @@ pub async fn serve<S>(stream: S, client: SocketAddr, local: SocketAddr, rt: Arc<
 where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-	let conn = Arc::new(Conn { rt, client, local, https: tls.is_some(), tls });
-	let service = hyper::service::service_fn(move |req| {
+	let conn = Arc::new(Conn::new(rt, client, local, tls, false));
+	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
 		let conn = conn.clone();
-		async move { Ok::<_, Infallible>(conn.handle(req).await) }
+		async move { Ok::<_, Infallible>(conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await) }
 	});
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 	builder.http1().timer(TokioTimer::new());
@@ -299,7 +335,7 @@ struct Sent {
 }
 
 impl Conn {
-	async fn handle(&self, req: Request<Incoming>) -> Response<Body> {
+	pub(super) async fn handle(&self, req: Request<Body>) -> Response<Body> {
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
@@ -359,8 +395,7 @@ impl Conn {
 			tickets: vec![],
 		};
 		// request side in the route's order, until one answers
-		let (mut parts, body) = req.into_parts();
-		let mut body: Body = body.boxed();
+		let (mut parts, mut body) = req.into_parts();
 		let mut ran = 0;
 		let mut answer = None;
 		let mut replay: Option<Bytes> = None;
@@ -425,6 +460,14 @@ impl Conn {
 			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
 		entry.status = resp.status().as_u16();
+		// tell HTTP/1.1 and HTTP/2 clients that HTTP/3 is answered on the same port
+		if !self.h3 && self.https && !resp.headers().contains_key(header::ALT_SVC) {
+			if let Some(port) = self.rt.h3.port() {
+				if let Ok(v) = HeaderValue::from_str(&format!("h3=\":{port}\"; ma=86400")) {
+					resp.headers_mut().insert(header::ALT_SVC, v);
+				}
+			}
+		}
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
 		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started, _holds: holds }.boxed())
@@ -715,7 +758,7 @@ impl Conn {
 
 	fn returning(&self, resp: Response<Incoming>, sender: SendRequest<Body>, service: &Arc<Service>, index: usize, keep: bool) -> Response<Body> {
 		if !keep || resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-			return resp.map(|b| b.boxed());
+			return resp.map(|b| b.map_err(boxed_error).boxed());
 		}
 		let service = service.clone();
 		resp.map(|inner| Pooled { inner, back: Some((sender, service, index)) }.boxed())
@@ -762,10 +805,10 @@ struct Pooled {
 
 impl hyper::body::Body for Pooled {
 	type Data = Bytes;
-	type Error = hyper::Error;
+	type Error = BoxError;
 
-	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
-		let poll = Pin::new(&mut self.inner).poll_frame(cx);
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+		let poll = Pin::new(&mut self.inner).poll_frame(cx).map_err(boxed_error);
 		if matches!(poll, Poll::Ready(None)) || self.inner.is_end_stream() {
 			if let Some((sender, service, index)) = self.back.take() {
 				service.servers[index].checkin(sender);
@@ -797,12 +840,12 @@ struct Logged {
 
 impl hyper::body::Body for Logged {
 	type Data = Bytes;
-	type Error = hyper::Error;
+	type Error = BoxError;
 
 	fn poll_frame(
 		mut self: Pin<&mut Self>,
 		cx: &mut Context<'_>,
-	) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+	) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
 		let poll = Pin::new(&mut self.inner).poll_frame(cx);
 		if let Poll::Ready(Some(Ok(frame))) = &poll {
 			if let Some(data) = frame.data_ref() {

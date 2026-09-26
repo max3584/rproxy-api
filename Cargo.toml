@@ -81,6 +81,9 @@ brotli = "8"
 zstd = "0.13"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

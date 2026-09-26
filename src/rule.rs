@@ -140,7 +140,7 @@ impl Features {
 	pub const CURRENT: Features =
 		Features {
 		http: true,
-		http3: false,
+		http3: true,
 		acme: false,
 		tls_options: true,
 		middlewares: &[
@@ -313,7 +313,13 @@ pub fn validate_target(host: &str, port: u16, http: bool) -> Result<String, ApiE
 }
 
 /// What an `http` rule cannot combine with: the backend is chosen per request.
-pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp) -> Result<(), ApiError> {
+pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp, http: &HttpSpec) -> Result<(), ApiError> {
+	if http.http3 && tls.mode != TlsMode::Terminate {
+		return Err(ApiError::tls_config("http3 needs tls mode terminate (QUIC is always encrypted)"));
+	}
+	if http.http3 && source_ip == SourceIp::Transparent {
+		return Err(ApiError::unsupported("http3 cannot be combined with source_ip transparent"));
+	}
 	if !tls.routes.is_empty() {
 		return Err(ApiError::tls_config("http rules route by match; tls.routes is not used (use Host(...) in http.routes)"));
 	}
@@ -375,7 +381,7 @@ impl RuleRequest {
 			if port_count > 1 {
 				return Err(ApiError::invalid("http rules take a single port"));
 			}
-			check_http_tls(&tls, self.source_ip)?;
+			check_http_tls(&tls, self.source_ip, http)?;
 			http.validate()?;
 		}
 		caps.features.check(&tls, self.http.as_ref())?;
