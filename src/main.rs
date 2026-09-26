@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use rproxy_api::api::{self, AppState};
 use rproxy_api::auth::Tokens;
 use rproxy_api::http::access::{AccessLogError, HttpGlobal};
+use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::registry::{Config, Registry};
 use rproxy_api::{db, logging, resolve, source};
 
@@ -254,6 +255,18 @@ async fn run(opts: Options) -> Result<(), String> {
 			}
 		}
 	};
+	// global.crowdsec: one bouncer for the process, pulling the LAPI's decisions
+	let crowdsec = match doc.as_ref().and_then(|(path, d)| d.global.crowdsec.as_ref().map(|c| (path, c))) {
+		Some((path, c)) => match Bouncer::new(c) {
+			Ok(b) => Some(b),
+			Err(CrowdsecError::Config(e)) => return Err(format!("{}: {e}", path.display())),
+		},
+		None => None,
+	};
+	if let Some(b) = &crowdsec {
+		b.spawn();
+	}
+	let http_global = http_global.with_crowdsec(crowdsec.clone());
 
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
@@ -335,6 +348,9 @@ async fn run(opts: Options) -> Result<(), String> {
 		let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
 		let _ = std::fs::remove_file(&socket.path);
 	}
+	if let Some(b) = &crowdsec {
+		b.stop();
+	}
 	registry.shutdown().await;
 	Ok(())
 }
@@ -366,6 +382,12 @@ async fn wait_for_shutdown(
 				}
 				let (ok, failed) = registry.reload_tls().await;
 				info!(event = "reload.rules_tls", reloaded = ok, failed);
+				if let Some(b) = registry.http_global().crowdsec() {
+					match b.reload_key() {
+						Ok(()) => info!(event = "reload.crowdsec"),
+						Err(e) => warn!(event = "reload.crowdsec", error = %e, "keeping the current CrowdSec key"),
+					}
+				}
 			}
 			_ = term.recv() => return Ok(()),
 			_ = tokio::signal::ctrl_c() => return Ok(()),

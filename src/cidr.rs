@@ -8,7 +8,7 @@ use crate::error::ApiError;
 
 pub const MAX_ALLOW_FROM: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cidr {
 	net: IpAddr,
 	prefix: u8,

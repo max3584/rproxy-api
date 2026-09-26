@@ -49,6 +49,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `/etc/rproxy/rproxy.env` | `root:root` 640 | 設定。DB のパスワードを含みうる。systemd（root）が読んで環境変数として渡すので、rproxy ユーザーが読める必要はない |
 | `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ、またはスコープ付きの YAML）。変えたら `systemctl reload rproxy-api` |
 | 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
+| CrowdSec の API キー（`global.crowdsec.api_key_file`、例 `/etc/rproxy/crowdsec.key`） | `root:rproxy` 640 | `cscli bouncers add rproxy` で作ったキー。rproxy ユーザーが読めること。変えたら `systemctl reload rproxy-api` |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
 | `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
