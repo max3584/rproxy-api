@@ -17,6 +17,21 @@ if [ "$1" = "configure" ]; then
 		chgrp rproxy /etc/rproxy/tokens
 		echo "rproxy-api: generated an API token in /etc/rproxy/tokens"
 	fi
+	# first install only: move the control API off a port that is already taken
+	# (CrowdSec's local API, for one, listens on 127.0.0.1:8080 by default)
+	if [ -z "$2" ] && command -v ss >/dev/null; then
+		port=$(sed -n 's/^RPROXY_API_PORT=//p' /etc/rproxy/rproxy.env | tail -n1)
+		port=${port:-8080}
+		if [ -n "$(ss -Hltn "sport = :$port")" ]; then
+			for p in $(seq 8081 8099); do
+				if [ -z "$(ss -Hltn "sport = :$p")" ]; then
+					sed -i "s/^RPROXY_API_PORT=.*/RPROXY_API_PORT=$p/" /etc/rproxy/rproxy.env
+					echo "rproxy-api: port $port is in use; the control API will listen on $p (RPROXY_API_PORT in /etc/rproxy/rproxy.env)"
+					break
+				fi
+			done
+		fi
+	fi
 fi
 
 #DEBHELPER#
