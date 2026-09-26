@@ -81,14 +81,25 @@ pub fn proxy_v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
 
 /// PROXY protocol v2 header, carrying TLS details when rproxy terminated TLS.
 pub fn proxy_v2_header_with(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>) -> Vec<u8> {
+	v2_header(src, dst, tls, false)
+}
+
+/// PROXY protocol v2 header for UDP (DGRAM). rproxy puts it in front of every
+/// datagram to the backend, as dnsdist, PowerDNS and Unbound expect; replies
+/// come back without one.
+pub fn proxy_v2_dgram_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+	v2_header(src, dst, None, true)
+}
+
+fn v2_header(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, dgram: bool) -> Vec<u8> {
 	let tlvs = tls.map(tls_tlvs).unwrap_or_default();
 	let mut out = V2_SIGNATURE.to_vec();
 	out.push(0x21); // version 2, PROXY command
 	let (family, addrs) = match (src.ip(), dst.ip()) {
-		(IpAddr::V4(s), IpAddr::V4(d)) => (0x11, [s.octets().to_vec(), d.octets().to_vec()].concat()),
-		(s, d) => (0x21, [to_v6(s).octets().to_vec(), to_v6(d).octets().to_vec()].concat()),
+		(IpAddr::V4(s), IpAddr::V4(d)) => (0x10, [s.octets().to_vec(), d.octets().to_vec()].concat()),
+		(s, d) => (0x20, [to_v6(s).octets().to_vec(), to_v6(d).octets().to_vec()].concat()),
 	};
-	out.push(family); // AF_INET or AF_INET6, STREAM
+	out.push(family | if dgram { 0x02 } else { 0x01 }); // AF_INET / AF_INET6, STREAM / DGRAM
 	out.extend_from_slice(&((addrs.len() + 4 + tlvs.len()) as u16).to_be_bytes());
 	out.extend_from_slice(&addrs);
 	out.extend_from_slice(&src.port().to_be_bytes());
@@ -248,6 +259,15 @@ mod tests {
 		assert_eq!(tlvs[15], PP2_TYPE_SSL);
 		assert_eq!(tlvs[18], PP2_CLIENT_SSL | PP2_CLIENT_CERT_CONN);
 		assert!(h.windows(5).any(|w| w == b"alice"));
+	}
+
+	#[test]
+	fn v2_dgram_header_marks_udp() {
+		let h = proxy_v2_dgram_header("192.0.2.1:5000".parse().unwrap(), "198.51.100.1:53".parse().unwrap());
+		assert_eq!(&h[..12], &V2_SIGNATURE);
+		assert_eq!(&h[12..16], &[0x21, 0x12, 0x00, 0x0c], "PROXY, AF_INET + DGRAM, 12 address bytes");
+		let h6 = proxy_v2_dgram_header("[2001:db8::1]:1".parse().unwrap(), "[2001:db8::2]:2".parse().unwrap());
+		assert_eq!(h6[13], 0x22, "AF_INET6 + DGRAM");
 	}
 
 	#[test]

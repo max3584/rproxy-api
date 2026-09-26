@@ -1,0 +1,40 @@
+name: Soak
+
+# 長時間の負荷テスト（scripts/soak.py、issue #8）。毎週 30 分、手動では時間を指定して動かす。
+# スクリプトやこのファイルを変えた PR では 2 分だけ動かして、ワークフローが壊れていないことを確かめる。
+on:
+  schedule:
+    - cron: "0 19 * * 0"   # 毎週月曜 4:00（JST）
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 負荷をかける秒数
+        default: "3600"
+  pull_request:
+    paths:
+      - scripts/soak.py
+      - .github/workflows/soak.yml
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      DURATION: ${{ inputs.duration || (github.event_name == 'pull_request' && '120') || '1800' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: scripts/soak.py (${{ env.DURATION }} s)
+        run: |
+          ulimit -n 65536
+          scripts/soak.py --duration "$DURATION" --bin target/release/rproxy-api --out soak.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ github.run_id }}
+          path: soak.csv

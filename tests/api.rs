@@ -83,9 +83,10 @@ async fn errors_use_the_api_format() {
 	let (status, v) = h.post(json!({"protocol": "tcp"})).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")));
 
-	let mut udp_v2 = rule("udp", free_udp_port(), backend);
-	udp_v2["source_ip"] = json!("proxy_v2");
-	let (status, v) = h.post(udp_v2).await;
+	// PROXY protocol v1 is text over tcp (udp takes proxy_v2)
+	let mut udp_v1 = rule("udp", free_udp_port(), backend);
+	udp_v1["source_ip"] = json!("proxy_v1");
+	let (status, v) = h.post(udp_v1).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")));
 
 	let mut unresolvable = rule("tcp", free_port(), backend);

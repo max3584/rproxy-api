@@ -374,3 +374,52 @@ async fn bytes_are_counted_while_connections_are_open() {
 	assert_eq!(v["connections"], 1, "session still active");
 	drop(conn);
 }
+
+/// `source_ip: proxy_v2` on UDP: every datagram to the backend starts with a
+/// PROXY v2 DGRAM header naming the client; replies come back without one.
+#[tokio::test]
+async fn udp_proxy_v2_prefixes_every_datagram() {
+	let h = harness().await;
+	let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let backend_addr = backend.local_addr().unwrap();
+	let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+	tokio::spawn(async move {
+		let mut buf = [0u8; 2048];
+		loop {
+			let Ok((n, from)) = backend.recv_from(&mut buf).await else { return };
+			let _ = seen_tx.send(buf[..n].to_vec());
+			// answer with the payload after the 28-byte IPv4 header
+			let payload = buf.get(28..n).unwrap_or_default();
+			let _ = backend.send_to(&[b"E:".as_slice(), payload].concat(), from).await;
+		}
+	});
+
+	let port = free_udp_port();
+	let mut body = rule("udp", port, backend_addr);
+	body["source_ip"] = json!("proxy_v2");
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	client.connect(("127.0.0.1", port)).await.unwrap();
+	let me = client.local_addr().unwrap();
+	for msg in [b"one".as_slice(), b"two"] {
+		client.send(msg).await.unwrap();
+		let mut buf = [0u8; 64];
+		let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await.unwrap().unwrap();
+		assert_eq!(&buf[..n], [b"E:".as_slice(), msg].concat(), "the reply carries no header");
+
+		let got = seen_rx.recv().await.unwrap();
+		assert_eq!(&got[..12], b"\r\n\r\n\0\r\nQUIT\n", "PROXY v2 signature");
+		assert_eq!(&got[12..16], &[0x21, 0x12, 0x00, 0x0c], "PROXY, AF_INET + DGRAM");
+		assert_eq!(&got[16..20], &[127, 0, 0, 1], "client address");
+		assert_eq!(u16::from_be_bytes([got[24], got[25]]), me.port(), "client port");
+		assert_eq!(u16::from_be_bytes([got[26], got[27]]), port, "rproxy's port");
+		assert_eq!(&got[28..], msg);
+	}
+
+	// v1 stays tcp-only
+	let mut v1 = rule("udp", free_udp_port(), backend_addr);
+	v1["source_ip"] = json!("proxy_v1");
+	assert_eq!(h.post(v1).await.1["code"], "unsupported");
+}
