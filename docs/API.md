@@ -257,6 +257,25 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - `retry`: 転送先に接続できない・応答がない（502 / 504 になるもの）ときに、次の転送先へ送り直す。`attempts` は最初の 1 回を含む回数、`initial_interval`（既定 `100ms`）は最初の待ち時間で、回ごとに倍になる。送り直すのは冪等なメソッド（GET・HEAD・OPTIONS・PUT・DELETE・TRACE）で、本文がないか、`buffering` で読み切った本文のときだけ（WebSocket などの Upgrade は送り直さない）。転送先が返した 5xx は送り直さない。
   - `circuit_breaker`: 応答のうち 5xx（502 / 504 を含む）の割合が `window` の中で `failure_percent` 以上になったら（10 件以上あるときに判定）、`recovery` のあいだ転送先へ送らずに 503 を返す。`recovery` を過ぎたら 1 件だけ通し、成功すれば元に戻し、失敗すればまた `recovery` だけ止める。状態は `event: "http.breaker"` のログ。数はルールの `http` を変えると最初からになる。
   - `errors`: 応答の状態コードが `status`（`"500-599"`・`"404"` のような範囲か値）に入れば、`service` の `path`（`{status}` は状態コードに置き換える）を GET し、その本文とヘッダで返す。状態コードは元のまま。ページを取れなければ元の応答を返す。メンテナンス表示には、`respond` のルートを `priority` を上げて一時的に足すか、`errors` のページを使う。
+- 認証のミドルウェア（v0.3.2、#59）。HTTP/1.1・HTTP/2・HTTP/3 のどのリクエストにも働く:
+  - `basic_auth`: `users_file`（htpasswd 形式。bcrypt `$2y$`（`htpasswd -B`）・`$apr1$`（`htpasswd` の既定）・`{SHA}` を読む。ほかの形式や平文の行があればファイル全体を誤りとして扱う）の利用者だけを通す。通らなければ 401 と `WWW-Authenticate: Basic realm="<realm>"`（`realm` の既定 `rproxy`）。
+    - 通ったリクエストの `Authorization` は転送先に渡さない（`keep_authorization: true` で渡す。Traefik の既定の `removeHeader: false` と同じにするならこちら）。`user_header`（例 `X-Forwarded-User`）を書くと、利用者の名前をそのヘッダで渡す（クライアントが送った同名のヘッダは取り除く）。
+    - bcrypt の照合は別のスレッドで行い、通った組み合わせは覚えておく（ファイルが変われば忘れる）。
+  - `forward_auth`: リクエストごとに `address` へ `GET` を送り、2xx なら通す（Traefik の forwardAuth と同じ）。
+    - 認証サーバへは、クライアントのヘッダ（`request_headers` を書けばその名前だけ。ホップごとのヘッダと `Host` は除く）と、`X-Forwarded-Method`・`X-Forwarded-Proto`・`X-Forwarded-Host`・`X-Forwarded-Uri`（パスとクエリ）・`X-Forwarded-For` を送る。`trust_forward_header: false`（既定）ならクライアントが送った `X-Forwarded-*` は捨てて付け直し、true なら受けた値を保つ（`X-Forwarded-For` は後ろに接続元を足す）。
+    - 2xx なら、認証サーバの応答のうち `response_headers` に書いたヘッダで、転送先へのリクエストの同名のヘッダを置き換える。2xx 以外（401・302 のサインイン画面へのリダイレクトなど）は、その応答をそのままクライアントに返す。
+    - 認証サーバに接続できなければ 502、`timeout`（既定 `10s`）以内に答えがなければ 504（`event: "http.error"`）。認証サーバへの接続は使い回す。
+  - `oidc`: OpenID Connect（Keycloak など）のサインイン（認可コードフロー + PKCE）。oauth2-proxy なしで保護できる。
+    - `issuer`（例 `https://sso.example.com/realms/main`）の `/.well-known/openid-configuration` を最初に使うときに読む（失敗したら 10 秒おいて試し直す）。HTTPS の証明書は `ca_file`（なければ Mozilla のルート）で検証する。
+    - プロバイダには、クライアント `client_id`（confidential。シークレットは `client_secret_file` の 1 行目、client_secret_basic で送る）と、リダイレクト URI `https://<ホスト><callback_path>`（`callback_path` の既定 `/_rproxy/oidc/callback`）を登録する。`scopes` は `openid` に足すスコープ（例 `[profile, email]`）。
+    - サインインしていない GET / HEAD はプロバイダのサインインへ 302（元の URL はサインイン後に戻る。戻り先は同じサイトのパスだけ）。それ以外のメソッドは 401。
+    - `callback_path` と `logout_path`（既定 `/_rproxy/oidc/logout`）はどのルートに一致したかにかかわらず、この `oidc` ミドルウェアが答える（ルートの `match` に含めなくてよい）。ログアウトはクッキーを消して、プロバイダの `end_session_endpoint` へ `client_id` と `post_logout_redirect_uri=<scheme>://<ホスト>/` を付けて送る（プロバイダ側に許可する URI として登録する）。
+    - ID トークンは JWKS（RS256/384/512・PS256/384/512・ES256/384。知らない `kid` なら 1 分に 1 回まで取り直す）で署名を確かめ、`iss`・`aud`（`client_id` を含む）・`exp`・`nonce` を確かめる。
+    - セッションはクッキー `cookie_name`（既定 `_rproxy_oidc`。`HttpOnly`・`SameSite=Lax`、HTTPS なら `Secure`）に AES-256-GCM で暗号化して持つ（中身は利用者の名前・メール・グループ・期限・リフレッシュトークン）。鍵は `cookie_secret_file` の 1 行目（16 文字以上。`openssl rand -base64 32` など）から作る。変えるとすべてのセッションが無効になる。
+    - ID トークンの期限の 30 秒前を過ぎたら、リフレッシュトークンで取り直してクッキーを付け直す。取り直せなければサインインし直す。
+    - 転送先へは `X-Forwarded-User`（`preferred_username`、なければ `email`、なければ `sub`）・`X-Forwarded-Sub`・`X-Forwarded-Email`・`X-Forwarded-Groups`（`groups_claim`（既定 `groups`、ドット区切りで `realm_access.roles` なども）の値をカンマ区切り）を付ける。クライアントが送った同名のヘッダと、rproxy のクッキーは取り除く。Keycloak ではクライアントに「Group Membership」のマッパーを足すと `groups` が入る。
+    - サインイン・ログアウト・失敗は `event: "oidc.login"` / `"oidc.error"` / `"oidc.refresh"`。
+  - 秘密のファイル（`users_file`・`client_secret_file`・`cookie_secret_file`）がない・中身が誤っていれば `invalid`（設定ファイルなら起動しない）。読めない（権限）なら起動は続け、そのミドルウェアを通るリクエストに 503 を返す。ファイルは変わったら（数秒以内に）読み直し、SIGHUP でも読み直す。読み直しに失敗したら今の中身を使い続ける（`reload.secret` の警告）。所有者とモードは docs/PERMISSIONS.md。
 - `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec"}`。`crowdsec` は v0.3.2 から）。

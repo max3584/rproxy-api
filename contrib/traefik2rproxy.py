@@ -33,7 +33,7 @@ except ImportError:  # JSON output still works
 KNOWN_MIDDLEWARES = {
     "redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix",
     "replace_path", "replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering",
-    "retry", "circuit_breaker", "errors",
+    "retry", "circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 }
 KNOWN_SERVICE_OPTIONS = {"health_check", "sticky"}
 
@@ -534,17 +534,24 @@ def convert_middleware(name, spec, where, ctx):
             users_file = f"/etc/rproxy/auth/{name}.htpasswd"
             if g(cfg, "users"):
                 NOTES.add(where, f"basicAuth.users are not copied; put them in {users_file} (htpasswd format)")
-        for opt in ("realm", "removeHeader", "headerField"):
-            if g(cfg, opt) is not None:
-                NOTES.add(where, f"basicAuth.{opt} is not converted")
-        return {"basic_auth": {"users_file": users_file}}, None
+        out = {"users_file": users_file}
+        if g(cfg, "realm"):
+            out["realm"] = g(cfg, "realm")
+        # Traefik passes Authorization on unless removeHeader; rproxy removes it unless keep_authorization
+        if not as_bool(g(cfg, "removeHeader")):
+            out["keep_authorization"] = True
+        if g(cfg, "headerField"):
+            out["user_header"] = g(cfg, "headerField")
+        return {"basic_auth": out}, None
     if k == "forwardauth":
         out = {"address": g(cfg, "address")}
         if g(cfg, "authResponseHeaders"):
             out["response_headers"] = as_list(g(cfg, "authResponseHeaders"))
         if as_bool(g(cfg, "trustForwardHeader")):
             out["trust_forward_header"] = True
-        for opt in ("tls", "authRequestHeaders", "authResponseHeadersRegex", "addAuthCookiesToResponse"):
+        if g(cfg, "authRequestHeaders"):
+            out["request_headers"] = as_list(g(cfg, "authRequestHeaders"))
+        for opt in ("tls", "authResponseHeadersRegex", "addAuthCookiesToResponse"):
             if g(cfg, opt) is not None:
                 NOTES.add(where, f"forwardAuth.{opt} is not converted")
         return {"forward_auth": out}, None

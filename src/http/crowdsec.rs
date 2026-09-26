@@ -433,8 +433,8 @@ fn empty() -> Body {
 trait Stream2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream2 for T {}
 
-/// One HTTP/1.1 request to the LAPI or AppSec; returns the status and body.
-async fn call(
+/// One HTTP/1.1 request to the LAPI or AppSec (and the OIDC provider); returns the status and body.
+pub(super) async fn call(
 	tls: &tokio_rustls::TlsConnector,
 	method: Method,
 	url: &str,

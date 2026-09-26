@@ -112,9 +112,9 @@ http:
 | `crowdsec` | `appsec`（true / false）、`on_error`（`allow` / `block`） | #55 |
 | `ip_allow` | `source_range`（CIDR の一覧） | #53 と一緒に v0.3.1 |
 | `headers` | `request` / `response` の `set`・`remove`、`hsts`、`frame_deny`、`content_type_nosniff`、`referrer_policy`、`csp`、`cors` | #60 |
-| `forward_auth` | `address`、`response_headers`、`trust_forward_header` | #59 |
-| `oidc` | `issuer`、`client_id`、`client_secret_file`、`scopes`、`cookie_secret_file` | #59 |
-| `basic_auth` | `users_file`（htpasswd） | #59 |
+| `forward_auth` | `address`、`response_headers`、`trust_forward_header`（v0.3.2 で `request_headers`・`timeout` を足した） | #59 |
+| `oidc` | `issuer`、`client_id`、`client_secret_file`、`scopes`、`cookie_secret_file`（v0.3.2 で `ca_file`・`callback_path`・`logout_path`・`cookie_name`・`groups_claim` を足した） | #59 |
+| `basic_auth` | `users_file`（htpasswd。bcrypt・APR1・{SHA}）（v0.3.2 で `realm`・`keep_authorization`・`user_header` を足した） | #59 |
 | `strip_prefix` / `add_prefix` / `replace_path` / `replace_path_regex` | `prefixes` / `prefix` / `path` / `regex`・`replacement` | #62 |
 | `compress` | `encodings`（gzip・br・zstd）、`min_size` | #63 |
 | `buffering` | `max_request_body`（413） | #64 |

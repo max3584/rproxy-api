@@ -13,7 +13,9 @@ use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode, Uri};
 use regex::Regex;
 
+use super::auth::{self, BasicAuth, ForwardAuth};
 use super::backend::Service;
+use super::oidc::{Oidc, OidcSettings};
 use super::compress::{self, Encoding};
 use super::limit::{Hold, InFlight, RateLimiter, Source};
 use super::resilience::{Breaker, RetryPolicy, DEFAULT_RETRY_INTERVAL};
@@ -77,6 +79,10 @@ pub enum Middleware {
 	Retry(RetryPolicy),
 	CircuitBreaker(Arc<Breaker>),
 	Errors { ranges: Vec<(u16, u16)>, service: Arc<Service>, path: String },
+	/// Authentication (#59, `auth.rs` / `oidc.rs`), run by the server.
+	BasicAuth(Arc<BasicAuth>),
+	ForwardAuth(Arc<ForwardAuth>),
+	Oidc(Arc<Oidc>),
 }
 
 fn value(v: &str, what: &str) -> Result<HeaderValue, ApiError> {
@@ -184,6 +190,60 @@ impl Middleware {
 				let d = |s: &str| parse_duration(s).map_err(|e| ApiError::invalid(format!("{what}: {e}")));
 				Middleware::CircuitBreaker(Breaker::new(label, *failure_percent, d(window)?, d(recovery)?))
 			}
+			MiddlewareSpec::BasicAuth { users_file, realm, keep_authorization, user_header } => Middleware::BasicAuth(Arc::new(
+				BasicAuth::new(label, users_file, realm.as_deref(), *keep_authorization, user_header.as_deref())?,
+			)),
+			MiddlewareSpec::ForwardAuth { address, response_headers, trust_forward_header, request_headers, timeout } => {
+				let spec = super::ServiceSpec {
+					servers: vec![super::ServerSpec { url: address.clone(), weight: None }],
+					health_check: None,
+					sticky: None,
+					pass_host_header: Some(false),
+					timeouts: Some(super::TimeoutsSpec {
+						connect: None,
+						response: Some(timeout.clone().unwrap_or_else(|| format!("{}s", auth::DEFAULT_FORWARD_AUTH_TIMEOUT.as_secs()))),
+					}),
+				};
+				let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
+				let path = match uri.path_and_query().map(|p| p.as_str()) {
+					Some(p) if !p.is_empty() => p.to_string(),
+					_ => "/".to_string(),
+				};
+				Middleware::ForwardAuth(Arc::new(ForwardAuth {
+					name: label.to_string(),
+					service: Arc::new(Service::compile(label, &spec)?),
+					path,
+					response_headers: auth::header_names(response_headers, &format!("{what}: response_headers"))?,
+					request_headers: auth::header_names(request_headers, &format!("{what}: request_headers"))?,
+					trust_forward_header: *trust_forward_header,
+				}))
+			}
+			MiddlewareSpec::Oidc {
+				issuer,
+				client_id,
+				client_secret_file,
+				scopes,
+				cookie_secret_file,
+				ca_file,
+				callback_path,
+				logout_path,
+				cookie_name,
+				groups_claim,
+			} => Middleware::Oidc(Arc::new(Oidc::new(
+				label,
+				OidcSettings {
+					issuer,
+					client_id,
+					client_secret_file,
+					cookie_secret_file,
+					scopes,
+					ca_file: ca_file.as_deref(),
+					callback_path: callback_path.as_deref(),
+					logout_path: logout_path.as_deref(),
+					cookie_name: cookie_name.as_deref(),
+					groups_claim: groups_claim.as_deref(),
+				},
+			)?)),
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
 	}
@@ -305,7 +365,10 @@ impl Middleware {
 			| Middleware::Buffering { .. }
 			| Middleware::Retry(_)
 			| Middleware::CircuitBreaker(_)
-			| Middleware::Errors { .. } => None,
+			| Middleware::Errors { .. }
+			| Middleware::BasicAuth(_)
+			| Middleware::ForwardAuth(_)
+			| Middleware::Oidc(_) => None,
 		}
 	}
 

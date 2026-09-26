@@ -367,7 +367,9 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["features"]["http"], true, "{caps}");
 	let kinds = caps["features"]["middlewares"].as_array().unwrap();
-	assert!(kinds.contains(&json!("compress")) && !kinds.contains(&json!("oidc")), "{caps}");
+	for kind in ["compress", "oidc", "forward_auth", "basic_auth"] {
+		assert!(kinds.contains(&json!(kind)), "every middleware kind works now: {caps}");
+	}
 	assert_eq!(caps["features"]["services"], json!(["health_check", "sticky"]), "{caps}");
 
 	let mut body = rule("tcp", free_port(), backend);
@@ -380,14 +382,14 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	obj.remove("remote_addr");
 	obj.remove("remote_port");
 
-	// the middlewares and service options still to come are refused
-	let mut later = body.clone();
-	later["http"]["middlewares"] = json!({"sso": {"oidc": {"issuer": "https://id.example", "client_id": "rproxy",
-		"client_secret_file": "/etc/rproxy/oidc.secret", "cookie_secret_file": "/etc/rproxy/oidc.cookie"}}});
-	later["http"]["routes"][0]["middlewares"] = json!(["sso"]);
-	let (status, v) = h.post(later).await;
-	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
-	assert!(v["error"].as_str().unwrap().contains("oidc"), "{v}");
+	// secret files that do not exist are a mistake in the settings
+	let mut missing = body.clone();
+	missing["http"]["middlewares"] = json!({"sso": {"oidc": {"issuer": "https://id.example", "client_id": "rproxy",
+		"client_secret_file": "/nonexistent/oidc.secret", "cookie_secret_file": "/nonexistent/oidc.cookie"}}});
+	missing["http"]["routes"][0]["middlewares"] = json!(["sso"]);
+	let (status, v) = h.post(missing).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("client_secret_file"), "{v}");
 	let mut later = body.clone();
 	later["source_ip"] = json!("proxy_v2");
 	assert_eq!(h.post(later).await.0, StatusCode::BAD_REQUEST, "PROXY headers are not for http rules");

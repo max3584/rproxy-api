@@ -223,3 +223,26 @@ async fn http3_needs_tls_and_a_free_udp_port() {
 	assert!(v["stats"]["http"]["http3"]["error"].as_str().unwrap().contains("udp"), "{v}");
 	assert!(https_head(&pki, port).await.get("alt-svc").is_none(), "no Alt-Svc while HTTP/3 is not answered");
 }
+
+/// The authentication middlewares run for HTTP/3 requests too (the same handler).
+#[tokio::test]
+async fn http3_requests_go_through_basic_auth() {
+	let pki = Pki::new("h3-auth");
+	let cert = pki.server("front", &["a.test"]);
+	let users = std::path::Path::new(&cert.cert_file).with_file_name("users");
+	std::fs::write(&users, format!("alice:{}\n", bcrypt::hash("pw", 4).unwrap())).unwrap();
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let mut rule = h3_rule(port, &cert, backend("A").await);
+	rule["http"]["routes"][0]["middlewares"] = json!(["auth"]);
+	rule["http"]["middlewares"] = json!({"auth": {"basic_auth": {"users_file": users}}});
+	let (status, v) = h.post(rule).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	assert_eq!(h3_request(&mut send, "GET", "https://a.test/x", b"").await.0, StatusCode::UNAUTHORIZED);
+	let auth = format!("Basic {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "alice:pw"));
+	let req = hyper::Request::get("https://a.test/x").header("authorization", auth).body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.finish().await.unwrap();
+	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 200);
+}

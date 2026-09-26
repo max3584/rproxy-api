@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
+use super::auth::{BasicVerdict, ForwardAuth};
+use super::oidc::{self, Oidc};
 use super::backend::{self, Dialer, ServerHealth, Service};
 use super::compress;
 use super::crowdsec::Verdict;
@@ -87,6 +89,10 @@ pub struct Router {
 	dialer: Dialer,
 	/// Stops the health checks when this version of the settings is dropped.
 	health_stop: CancellationToken,
+	/// `oidc` middlewares: their callback and logout paths are answered before routing.
+	oidc: Vec<Arc<Oidc>>,
+	/// Middlewares with secret files, re-read on SIGHUP.
+	secrets: Vec<Arc<Middleware>>,
 }
 
 impl Drop for Router {
@@ -151,7 +157,20 @@ impl Router {
 		for s in &all {
 			backend::start_health_checks(s.clone(), dialer.clone(), health_stop.clone());
 		}
-		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop })
+		let oidc = middlewares.values().filter_map(|m| if let Middleware::Oidc(o) = m.as_ref() { Some(o.clone()) } else { None }).collect();
+		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
+		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop, oidc, secrets })
+	}
+
+	/// SIGHUP: read the secret files of the authentication middlewares again.
+	pub fn reload_secrets(&self) {
+		for m in &self.secrets {
+			match m.as_ref() {
+				Middleware::BasicAuth(b) => b.users.reload(true),
+				Middleware::Oidc(o) => o.reload(),
+				_ => {}
+			}
+		}
 	}
 
 	/// Health of the servers of services with `health_check`.
@@ -257,6 +276,25 @@ fn full(status: StatusCode, text: &str) -> Response<Body> {
 
 fn error_response(status: StatusCode) -> Response<Body> {
 	full(status, &status.to_string())
+}
+
+/// An answer of the `oidc` middleware (sign-in redirect, callback, logout, errors).
+fn oidc_response(outcome: oidc::Outcome) -> Response<Body> {
+	match outcome {
+		oidc::Outcome::Respond { status, headers, body } => {
+			let mut resp = full(status, body.trim_end());
+			if body.is_empty() {
+				*resp.body_mut() = empty_body();
+				resp.headers_mut().remove(header::CONTENT_TYPE);
+			}
+			for (k, v) in headers {
+				resp.headers_mut().append(k, v);
+			}
+			resp
+		}
+		// a signed-in request goes on; only reached for callback / logout paths, which always answer
+		oidc::Outcome::Pass { .. } => error_response(StatusCode::NOT_FOUND),
+	}
 }
 
 /// Host of the request without the port (Host header, or :authority for HTTP/2).
@@ -400,9 +438,54 @@ impl Conn {
 		let mut answer = None;
 		let mut replay: Option<Bytes> = None;
 		let mut retry: Option<RetryPolicy> = None;
+		// cookies of the authentication middlewares for the response
+		let mut set_cookies: Vec<HeaderValue> = vec![];
+		let authority = parts
+			.headers
+			.get(header::HOST)
+			.and_then(|h| h.to_str().ok())
+			.map(str::to_string)
+			.or_else(|| parts.uri.authority().map(|a| a.to_string()))
+			.unwrap_or_else(|| host.clone());
+		// sign-in callbacks and logout of `oidc`, whichever route matched
+		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
+			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
+		}
 		for (i, m) in chain.iter().enumerate() {
+			if answer.is_some() {
+				break;
+			}
 			ran += 1;
 			let resp = match m.as_ref() {
+				Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
+					BasicVerdict::Allow(user) => {
+						if !b.keep_authorization {
+							parts.headers.remove(header::AUTHORIZATION);
+						}
+						if let Some(h) = &b.user_header {
+							parts.headers.remove(h);
+							if let Ok(v) = HeaderValue::from_str(&user) {
+								parts.headers.insert(h.clone(), v);
+							}
+						}
+						None
+					}
+					BasicVerdict::Deny => {
+						let mut resp = error_response(StatusCode::UNAUTHORIZED);
+						resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
+						Some(resp)
+					}
+					BasicVerdict::Unavailable => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+				},
+				Middleware::ForwardAuth(fa) => self.forward_auth(&router, fa, &mut parts, client_ip, &host).await,
+				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
+					oidc::Outcome::Pass { session, set_cookie } => {
+						o.pass_identity(&mut parts.headers, &session);
+						set_cookies.extend(set_cookie);
+						None
+					}
+					answer => Some(oidc_response(answer)),
+				},
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
 					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
@@ -455,6 +538,9 @@ impl Conn {
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
 		};
+		for c in set_cookies {
+			resp.headers_mut().append(header::SET_COOKIE, c);
+		}
 		// response side in reverse, also for answers of the middlewares
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
 			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
@@ -537,6 +623,39 @@ impl Conn {
 				warn!(event = "http.error", rule = %self.rt.key, service = %service.name, backend = %server.addr(), error = %error,
 					"error page not available; the original response is sent");
 				None
+			}
+		}
+	}
+
+	/// `forward_auth`: asks the auth server; `Some` is its refusal (or an error) for the client.
+	async fn forward_auth(
+		&self,
+		router: &Router,
+		fa: &ForwardAuth,
+		parts: &mut hyper::http::request::Parts,
+		client: IpAddr,
+		host: &str,
+	) -> Option<Response<Body>> {
+		let server = &fa.service.servers[0];
+		let mut req = Request::get(fa.path.as_str()).body(empty_body()).ok()?;
+		*req.headers_mut() = fa.request_headers(parts, client, self.https, host);
+		req.headers_mut().insert(header::HOST, HeaderValue::from_str(&server.authority).ok()?);
+		match self.send(router, &fa.service, 0, req).await {
+			Ok(resp) if resp.status().is_success() => {
+				let (answer, body) = resp.into_parts();
+				// read the rest so the connection can be used again
+				let _ = body.collect().await;
+				fa.copy_answer(&answer.headers, parts);
+				None
+			}
+			Ok(mut resp) => {
+				strip_hop_by_hop(resp.headers_mut());
+				Some(resp)
+			}
+			Err(Failure::Status(status, error)) => {
+				warn!(event = "http.error", rule = %self.rt.key, middleware = %fa.name, backend = %server.addr(), error = %error,
+					"the auth server did not answer");
+				Some(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }))
 			}
 		}
 	}

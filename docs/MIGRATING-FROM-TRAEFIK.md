@@ -69,8 +69,9 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `rateLimit` | `rate_limit`（`sourceCriterion.requestHeaderName` は `source: header:<名前>`。`ipStrategy` は変換せず、`global.trusted_proxies` でクライアントの IP を決める） |
 | `inFlightReq` | `in_flight`（クライアントの IP ごと） |
 | `ipAllowList` / `ipWhiteList` | `ip_allow` |
-| `basicAuth` | `basic_auth`。`users` はファイルに書き出さないので、一覧に出るパスに htpasswd 形式で置く |
-| `forwardAuth` | `forward_auth` |
+| `basicAuth` | `basic_auth`。`users` はファイルに書き出さないので、一覧に出るパスに htpasswd 形式で置く（`$apr1$`・bcrypt・`{SHA}` をそのまま使える）。`realm` → `realm`、`headerField` → `user_header`。Traefik は既定で `Authorization` を転送先に渡すので、`removeHeader` がなければ `keep_authorization: true` にする |
+| `forwardAuth` | `forward_auth`。`authResponseHeaders` → `response_headers`、`authRequestHeaders` → `request_headers`、`trustForwardHeader` → `trust_forward_header`。`authResponseHeadersRegex`・`addAuthCookiesToResponse`・`tls` は変換しない |
+| OIDC のプラグイン・oauth2-proxy | 変換しない。`oidc` ミドルウェア（docs/API.md）で書き直す。転送先には `X-Forwarded-User` / `-Email` / `-Groups` が届く |
 | `compress` | `compress` |
 | `retry` | `retry` |
 | `circuitBreaker` | `circuit_breaker`。`NetworkErrorRatio() > 0.30` / `ResponseCodeRatio(...) > x` を `failure_percent` にする（`LatencyAtQuantileMS` は変換しない） |
