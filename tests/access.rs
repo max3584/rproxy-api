@@ -213,3 +213,35 @@ async fn a_broken_static_file_starts_nothing() {
 	let (_, rules) = h.get("/rules").await;
 	assert_eq!(rules.as_array().unwrap().len(), 0, "validation happens before anything starts");
 }
+
+/// Without CAP_NET_ADMIN (the harness has no transparent), a transparent rule
+/// from the static file or the database becomes a failed rule with the reason;
+/// the rest keeps running and the startup goes on.
+#[tokio::test]
+async fn rules_needing_a_missing_capability_fail_with_the_reason() {
+	let h = harness().await;
+	let backend = tcp_backend("S:").await;
+	let (tp, ok, restored) = (free_port(), free_port(), free_port());
+	let mut transparent = static_rule(tp, backend);
+	transparent["source_ip"] = json!("transparent");
+	assert_eq!(h.registry.load_static(requests(json!([transparent, static_rule(ok, backend)]))).await, Ok(2));
+
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{tp}")).await;
+	assert_eq!((v["state"].as_str(), v["origin"].as_str()), (Some("failed"), Some("static")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("CAP_NET_ADMIN"), "{v}");
+	assert!(tcp_answers(ok, "x").await, "the other static rule runs");
+
+	let mut from_db = rule("tcp", restored, backend);
+	from_db["source_ip"] = json!("transparent");
+	h.registry.restore(requests(json!([from_db]))).await;
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{restored}")).await;
+	assert_eq!(v["state"], "failed", "{v}");
+	assert!(v["error"].as_str().unwrap().contains("CAP_NET_ADMIN"), "{v}");
+
+	// a mistake in the file still stops the startup (transparent is IPv4 only)
+	let mut v6 = static_rule(free_port(), backend);
+	v6["source_ip"] = json!("transparent");
+	v6["listen_addr"] = json!("::1");
+	let err = h.registry.load_static(requests(json!([v6]))).await.unwrap_err();
+	assert!(err.contains("IPv4"), "{err}");
+}
