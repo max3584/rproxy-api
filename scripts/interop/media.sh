@@ -130,11 +130,12 @@ rss() { awk '/VmRSS/ {print $2}' "/proc/$RP/status"; }
 before_fds=$(fds)
 before_rss=$(rss)
 start=$(date +%s%N)
-rule '{"protocol":"udp","listen_addr":"127.0.0.1","listen_port":30000,"listen_port_end":39999,"remote_addr":"127.0.0.1","remote_port":30000}'
+# below the ephemeral range (32768-60999) and away from the other ports of this script
+rule '{"protocol":"udp","listen_addr":"127.0.0.1","listen_port":2000,"listen_port_end":11999,"remote_addr":"127.0.0.1","remote_port":2000}'
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 during_fds=$(fds)
 during_rss=$(rss)
-curl -s -o /dev/null -X DELETE "$API/rules/udp/127.0.0.1/30000"
+curl -s -o /dev/null -X DELETE "$API/rules/udp/127.0.0.1/2000"
 sleep 1
 after_fds=$(fds)
 echo "range 10000 ports: created in ${ms} ms; fds ${before_fds} -> ${during_fds} -> ${after_fds}; RSS ${before_rss} -> ${during_rss} kB"
