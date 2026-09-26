@@ -5,7 +5,6 @@
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（MariaDB のサービスコンテナを使う） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
-| `cargo build`（macOS / Windows） | Linux 以外でビルドが通るか | `build` |
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
