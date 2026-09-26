@@ -148,7 +148,7 @@ async fn an_unwritable_log_directory_falls_back_to_stdout() {
 	let log_file = logs.join("rproxy.log");
 	let rp = Rproxy::start(&dir, port, &[("RPROXY_LOG_FILE", log_file.to_str().unwrap())]);
 	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
-	assert!(rp.log().contains(r#""part":"log""#), "{}", rp.log());
+	wait_for("the degraded log line", &rp, || async { rp.log().contains(r#""part":"log""#) }).await;
 	chmod(&logs, 0o755);
 }
 
@@ -164,7 +164,7 @@ async fn an_unreadable_token_file_locks_the_api_until_sighup() {
 	let port = free_port();
 	let rp = Rproxy::start(&dir, port, &[("RPROXY_TOKEN_FILE", tokens.to_str().unwrap())]);
 	wait_for("the locked API", &rp, || async { api_status(port, Some("secret-token")).await == Some(401) }).await;
-	assert!(rp.log().contains(r#""part":"tokens""#), "{}", rp.log());
+	wait_for("the degraded log line", &rp, || async { rp.log().contains(r#""part":"tokens""#) }).await;
 
 	chmod(&tokens, 0o600);
 	rp.hup();
@@ -184,7 +184,7 @@ async fn unreadable_static_rules_are_skipped() {
 	let port = free_port();
 	let rp = Rproxy::start(&dir, port, &[("RPROXY_STATIC_RULES", rules.to_str().unwrap())]);
 	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
-	assert!(rp.log().contains(r#""part":"static_rules""#), "{}", rp.log());
+	wait_for("the degraded log line", &rp, || async { rp.log().contains(r#""part":"static_rules""#) }).await;
 }
 
 #[tokio::test]
@@ -203,7 +203,8 @@ async fn a_busy_api_port_keeps_the_rules_running_and_is_retried() {
 		tokio::net::TcpStream::connect(("127.0.0.1", listen)).await.is_ok()
 	})
 	.await;
-	assert!(rp.log().contains(r#""part":"api""#), "{}", rp.log());
+	// the rules start before the API; the log is written asynchronously
+	wait_for("the degraded log line", &rp, || async { rp.log().contains(r#""part":"api""#) }).await;
 	assert!(rp.child.try_wait().unwrap().is_none(), "exited: {}", rp.log());
 
 	drop(blocker);
