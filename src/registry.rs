@@ -18,8 +18,8 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_remote, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, State,
-	UpdateRequest,
+	validate_remote, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView, SourceIp,
+	State, UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
 use crate::{tcp, udp};
@@ -200,6 +200,22 @@ impl Registry {
 
 	pub fn caps(&self) -> Caps {
 		Caps { transparent: self.cfg.transparent, max_range_ports: self.cfg.max_range_ports }
+	}
+
+	/// Validates a rule loaded at startup (DB or static file). A rule that is
+	/// well-formed but needs a capability this process lacks (transparent
+	/// without CAP_NET_ADMIN) comes back with the reason, to be registered as
+	/// failed instead of being dropped or stopping the startup.
+	fn validate_at_startup(&self, req: RuleRequest) -> Result<(RuleSpec, Option<String>), ApiError> {
+		let caps = self.caps();
+		match req.clone().validate(&caps) {
+			Ok(spec) => Ok((spec, None)),
+			Err(e) if e.code == "unsupported" && !caps.transparent && req.source_ip == SourceIp::Transparent => {
+				let spec = req.validate(&Caps { transparent: true, ..caps })?;
+				Ok((spec, Some(e.message)))
+			}
+			Err(e) => Err(e),
+		}
 	}
 
 	pub fn transparent_available(&self) -> bool {
@@ -514,8 +530,14 @@ impl Registry {
 	pub async fn restore(self: &Arc<Self>, reqs: Vec<RuleRequest>) {
 		let (mut started, mut failed) = (0, 0);
 		for req in reqs {
-			let spec = match req.clone().validate(&self.caps()) {
-				Ok(spec) => spec,
+			let spec = match self.validate_at_startup(req.clone()) {
+				Ok((spec, None)) => spec,
+				Ok((spec, Some(missing))) => {
+					failed += 1;
+					error!(event = "rule.failed", rule = %spec.key, error = %missing, phase = "restore");
+					self.insert_failed(spec, missing, false).await;
+					continue;
+				}
 				Err(e) => {
 					failed += 1;
 					error!(event = "rule.failed", rule = %format!("{}/{}:{}", req.protocol, req.listen_addr, req.listen_port),
@@ -556,21 +578,28 @@ impl Registry {
 	/// Starts the rules from the static rules file. Every rule is validated
 	/// first so a broken file stops startup instead of half applying.
 	pub async fn load_static(self: &Arc<Self>, reqs: Vec<RuleRequest>) -> Result<usize, String> {
-		let mut specs = vec![];
+		// (spec, reason it cannot run here); only mistakes in the file stop the startup
+		let mut specs: Vec<(RuleSpec, Option<String>)> = vec![];
 		for (i, req) in reqs.into_iter().enumerate() {
-			let mut spec = req.validate(&self.caps()).map_err(|e| format!("static rule #{}: {}", i + 1, e.message))?;
+			let (mut spec, missing) =
+				self.validate_at_startup(req).map_err(|e| format!("static rule #{}: {}", i + 1, e.message))?;
 			spec.origin = Origin::Static;
-			if let Some(other) = specs.iter().find(|s: &&RuleSpec| overlaps(s, &spec)) {
+			if let Some((other, _)) = specs.iter().find(|(s, _)| overlaps(s, &spec)) {
 				return Err(format!("static rule #{}: {} overlaps with {}", i + 1, spec.key, other.key));
 			}
 			if let Some(api) = self.reserved_clash(&spec) {
 				return Err(format!("static rule #{}: {} would take the control API ({api})", i + 1, spec.key));
 			}
-			specs.push(spec);
+			specs.push((spec, missing));
 		}
 		let count = specs.len();
-		for spec in specs {
+		for (spec, missing) in specs {
 			let key = spec.key;
+			if let Some(missing) = missing {
+				error!(event = "rule.failed", rule = %key, error = %missing, phase = "static");
+				self.insert_failed(spec, missing, false).await;
+				continue;
+			}
 			if let Err(e) = self.create_spec(spec.clone()).await {
 				error!(event = "rule.failed", rule = %key, error = %e.message, phase = "static");
 				self.insert_failed(spec, e.message, e.code == "resolve_failed").await;

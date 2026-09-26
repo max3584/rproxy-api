@@ -69,6 +69,27 @@ install -o root -g rproxy -m 0640 /dev/stdin /etc/rproxy/static-rules.json <<< '
 "$install" --method binary --binary "$bin" --static-rules /etc/rproxy/static-rules.json
 [ "$(env_of RPROXY_STATIC_RULES)" = /etc/rproxy/static-rules.json ] || fail "static rules not set"
 
+echo "== binary: keeps running with the capabilities taken away"
+dropin=/etc/systemd/system/rproxy-api.service.d/zz-no-caps.conf
+mkdir -p "$(dirname "$dropin")"
+printf '[Service]\nAmbientCapabilities=\nCapabilityBoundingSet=~CAP_NET_ADMIN CAP_NET_BIND_SERVICE\n' > "$dropin"
+systemctl daemon-reload && systemctl reset-failed rproxy-api && systemctl restart rproxy-api
+for _ in $(seq 50); do [ "$(api 18090)" = 200 ] && break; sleep 0.2; done
+[ "$(api 18090)" = 200 ] || fail "did not start without capabilities"
+! transparent 18090 || fail "transparent still reported without CAP_NET_ADMIN"
+post() { curl -s -H "Authorization: Bearer $(cat /etc/rproxy/tokens)" -H 'Content-Type: application/json' \
+	-d "{\"protocol\":\"tcp\",\"listen_addr\":\"127.0.0.1\",\"listen_port\":$1,\"remote_addr\":\"127.0.0.1\",\"remote_port\":9}" \
+	http://127.0.0.1:18090/rules; }
+post 25 | grep -q 'CAP_NET_BIND_SERVICE' || fail "port 25 without the capability does not explain why"
+post 18200 | grep -q '"state":"running"' || fail "an unprivileged port does not work without capabilities"
+# rerunning install.sh keeps what the administrator took away
+"$install" --method binary --binary "$bin"
+! transparent 18090 || fail "install.sh gave CAP_NET_ADMIN back"
+rm -f "$dropin"
+systemctl daemon-reload && systemctl reset-failed rproxy-api && systemctl restart rproxy-api
+for _ in $(seq 50); do [ "$(api 18090)" = 200 ] && break; sleep 0.2; done
+transparent 18090 || fail "transparent did not come back with the capability"
+
 echo "== binary: log to journald with --log-file -"
 "$install" --method binary --binary "$bin" --log-file -
 grep -q '^# RPROXY_LOG_FILE=' /etc/rproxy/rproxy.env || fail "log file line not commented out"

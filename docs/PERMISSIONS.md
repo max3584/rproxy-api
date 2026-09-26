@@ -7,11 +7,20 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 | capability | 使う機能 | なくした場合 |
 |---|---|---|
-| `CAP_NET_BIND_SERVICE` | 1024 未満のポート（25、443 など）で待ち受ける | 1024 未満のルールが `bind_failed`（Permission denied）になる |
-| `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える |
+| `CAP_NET_BIND_SERVICE` | 1024 未満のポート（25、443 など）で待ち受ける | 1024 未満のルールだけが使えない。API での作成は `bind_failed`（理由と必要な権限つき）、起動時に復元するルールと固定ルールは `failed` として残る |
+| `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える（理由を表示する）。API での作成は `unsupported`。DB から復元する transparent のルールと固定ルールは `failed`（`needs Linux and CAP_NET_ADMIN`）として残る |
+
+どちらの権限を外しても rproxy-api は起動し、ほかのルールはそのまま動く（CI の `install.sh` ジョブで、drop-in で両方を外した状態を確かめている）。固定ルールのファイルで起動を止めるのは書き方の誤り（アドレスが不正、ルール同士の重なりなど）だけで、権限が足りないだけのルールでは止めない。
 
 - どちらもユニット（`/usr/lib/systemd/system/rproxy-api.service`、install.sh のバイナリなら `/etc/systemd/system/`）の `AmbientCapabilities` と `CapabilityBoundingSet` で与えている。ほかの capability は持たない。
-- 使わない権限は `systemctl edit rproxy-api` で外せる（例: transparent を使わないなら `CAP_NET_ADMIN` を両方の行から消す）。
+- 使わない権限は `systemctl edit rproxy-api` で外せる。install.sh を実行し直しても、外した権限は戻さない。
+  ```ini
+  [Service]
+  # transparent を使わない
+  AmbientCapabilities=
+  AmbientCapabilities=CAP_NET_BIND_SERVICE
+  CapabilityBoundingSet=~CAP_NET_ADMIN
+  ```
 - ユニットは `NoNewPrivileges=yes` なので、バイナリに `setcap` で付けた権限は効かない。権限はユニットで与える。
 - 手で起動する場合（systemd を使わない場合）は、root で動かすか `setcap cap_net_bind_service,cap_net_admin+ep` をバイナリに付ける。
 
