@@ -84,6 +84,7 @@ http:
 - 転送先は `service`（名前）か、`to: http://host:port`（サービスを 1 つだけ書く省略形）で指定する。
 - `X-Forwarded-For` / `-Proto` / `-Host` / `X-Real-IP` は常に付ける（`global.trusted_proxies` からの値は引き継ぐ）。WebSocket はそのまま通す。
 - リダイレクトだけのルート（80 番の HTTP→HTTPS など）は `service` を書かず、ミドルウェアが応答を返す。
+- （v0.3.1 で決めたこと）`source_ip` は `proxy` / `transparent` だけ（PROXY ヘッダはリクエスト単位の転送に合わないので `X-Forwarded-For` で渡す）。`tls.routes` は使わず `Host(...)` で振り分ける。`https://` の転送先の検証には `tls.upstream` の `ca_file` などを使い、`tls.upstream.tls` は使わない。転送先への接続はまずリクエストごとに作り、再利用は後で足す。細かい動きは docs/API.md の「`http` のルールの動き」。
 
 ### match の書き方（Traefik と同じ）
 
@@ -142,8 +143,9 @@ tls:
 - `GET /capabilities` に、この版で使える機能を返す。
 
 ```json
-{"features": {"http": true, "http3": false, "acme": false, "crowdsec": false,
-              "middlewares": ["redirect_scheme", "redirect_regex", "ip_allow", "headers"]}}
+{"features": {"http": true, "http3": false, "acme": false, "tls_options": false,
+              "middlewares": ["redirect_scheme", "redirect_regex", "ip_allow", "headers"],
+              "services": ["health_check"]}}
 ```
 
 - `GET /rules/...` に L7 の統計（ルートごとのリクエスト数・状態コード別）を足す（#57）。

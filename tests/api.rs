@@ -365,8 +365,9 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	let h = harness().await;
 	let backend = tcp_backend("H:").await;
 	let (_, caps) = h.get("/capabilities").await;
-	assert_eq!(caps["features"]["http"], false, "{caps}");
+	assert_eq!(caps["features"]["http"], true, "{caps}");
 	assert_eq!(caps["features"]["middlewares"], json!([]), "{caps}");
+	assert_eq!(caps["features"]["services"], json!([]), "{caps}");
 
 	let mut body = rule("tcp", free_port(), backend);
 	body["http"] = json!({"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1"}]});
@@ -377,8 +378,23 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	let obj = body.as_object_mut().unwrap();
 	obj.remove("remote_addr");
 	obj.remove("remote_port");
-	let (status, v) = h.post(body.clone()).await;
+
+	// the middlewares and service options still to come are refused
+	let mut later = body.clone();
+	later["http"]["middlewares"] = json!({"ok": {"respond": {"status": 200}}});
+	later["http"]["routes"][0]["middlewares"] = json!(["ok"]);
+	let (status, v) = h.post(later).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("respond"), "{v}");
+	let mut later = body.clone();
+	later["http"]["routes"][0] = json!({"name": "all", "match": "PathPrefix(`/`)", "service": "s"});
+	later["http"]["services"] = json!({"s": {"servers": [{"url": "http://127.0.0.1:1"}], "sticky": {"cookie": "c"}}});
+	let (status, v) = h.post(later).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("sticky"), "{v}");
+	let mut later = body.clone();
+	later["source_ip"] = json!("proxy_v2");
+	assert_eq!(h.post(later).await.0, StatusCode::BAD_REQUEST, "PROXY headers are not for http rules");
 
 	body["http"]["routes"][0]["match"] = json!("Hots(`x`)");
 	let (status, v) = h.post(body.clone()).await;

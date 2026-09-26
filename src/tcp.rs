@@ -3,6 +3,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+use crate::http::server::{self as http, Metered};
 use crate::proxy::{Counted, Runtime, Target};
 use crate::rule::SourceIp;
 use crate::source::{self, TlsInfo};
@@ -92,6 +94,9 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		denied(&rt, client, "allow_from", None);
 		return;
 	}
+	if rt.http_router().is_some() {
+		return handle_http(inbound, client, rt, offset).await;
+	}
 	let started = Instant::now();
 	rt.stats.opened();
 	let tls = rt.tls();
@@ -168,6 +173,85 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	Ok(())
 }
 
+/// TLS handshake of a `terminate` rule. The ClientHello is read first so
+/// unmatched names are refused before any certificate is sent.
+async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
+	stream: S,
+	client: SocketAddr,
+	rt: &Runtime,
+	offset: u16,
+	config: Arc<rustls::ServerConfig>,
+) -> io::Result<(tokio_rustls::server::TlsStream<S>, TlsInfo)> {
+	let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+		let name = start.client_hello().server_name().map(str::to_string);
+		if rt.select(name.as_deref(), offset).is_none() {
+			return Err(denied(rt, client, "unmatched", name.as_deref()));
+		}
+		start.into_stream(config).await
+	})
+	.await
+	.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
+	.and_then(|r| r)
+	.inspect_err(|e| {
+		if !is_denied(e) {
+			rt.stats.tls_failed()
+		}
+	})?;
+
+	let (_, conn) = session.get_ref();
+	let peer_cert = conn.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+	let info = TlsInfo {
+		server_name: conn.server_name().map(str::to_string),
+		alpn: conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+		version: conn.protocol_version().map(|v| format!("{v:?}")),
+		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
+		client_cert: peer_cert.is_some(),
+	};
+	Ok((session, info))
+}
+
+/// A connection of an `http` rule: TLS (for `terminate`), then HTTP requests
+/// routed one by one (src/http/server.rs).
+async fn handle_http(inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+	let started = Instant::now();
+	rt.stats.opened();
+	let tls = rt.tls();
+	let local = inbound.local_addr().unwrap_or(rt.key.listen);
+	let (rx, tx) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+	let mut info = None;
+	let serving = async {
+		match (tls.mode(), tls.server_config.clone()) {
+			(TlsMode::Terminate, Some(config)) => {
+				let (session, i) = accept_tls(inbound, client, &rt, offset, config).await?;
+				info = Some(i);
+				let stream = Metered::new(session, rt.clone(), rx.clone(), tx.clone());
+				http::serve(stream, client, local, rt.clone(), true).await
+			}
+			(TlsMode::Terminate, None) => Err(io::Error::other("TLS is not configured")),
+			_ => {
+				let stream = Metered::new(inbound, rt.clone(), rx.clone(), tx.clone());
+				http::serve(stream, client, local, rt.clone(), false).await
+			}
+		}
+	};
+	let result = tokio::select! {
+		_ = rt.kill.cancelled() => Ok("stopped"),
+		r = serving => r.map(|()| "closed"),
+	};
+	rt.stats.closed();
+	let elapsed_ms = started.elapsed().as_millis() as u64;
+	let info = info.unwrap_or_default();
+	match result {
+		Err(e) if is_denied(&e) => {}
+		Ok(reason) => info!(event = "conn.close", rule = %rt.key, client = %client, target = "http",
+			rx_bytes = rx.load(Ordering::Relaxed), tx_bytes = tx.load(Ordering::Relaxed), duration_ms = elapsed_ms, reason,
+			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or("")),
+		Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, target = "http",
+			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or("")),
+	}
+}
+
 async fn terminate(
 	inbound: &mut TcpStream,
 	client: SocketAddr,
@@ -193,33 +277,7 @@ async fn terminate(
 		}
 	}
 
-	// read the ClientHello first so unmatched names are refused before any certificate is sent
-	let mut session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), &mut *inbound).await?;
-		let name = start.client_hello().server_name().map(str::to_string);
-		if rt.select(name.as_deref(), offset).is_none() {
-			return Err(denied(rt, client, "unmatched", name.as_deref()));
-		}
-		start.into_stream(config).await
-	})
-	.await
-	.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
-	.and_then(|r| r)
-	.inspect_err(|e| {
-		if !is_denied(e) {
-			rt.stats.tls_failed()
-		}
-	})?;
-
-	let (_, conn) = session.get_ref();
-	let peer_cert = conn.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
-	let info = TlsInfo {
-		server_name: conn.server_name().map(str::to_string),
-		alpn: conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
-		version: conn.protocol_version().map(|v| format!("{v:?}")),
-		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
-		client_cert: peer_cert.is_some(),
-	};
+	let (mut session, info) = accept_tls(&mut *inbound, client, rt, offset, config).await?;
 	let target = rt
 		.select(info.server_name.as_deref(), offset)
 		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;
