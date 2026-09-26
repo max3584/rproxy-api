@@ -315,6 +315,49 @@ async fn sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_fil
 }
 
 #[tokio::test]
+async fn the_access_log_goes_to_its_own_file() {
+	let dir = workdir("access");
+	let l7 = free_port();
+	let cfg = dir.join("rproxy.yaml");
+	let settings = |log: &str| {
+		format!(
+			"version: 1\nglobal:\n  access_log: {log}\nrules:\n  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: {l7}\n    http:\n      routes:\n        - {{name: hello, match: 'PathPrefix(`/`)', middlewares: [hi]}}\n      middlewares:\n        hi: {{respond: {{status: 200, body: hello}}}}\n"
+		)
+	};
+	fs::write(&cfg, settings(dir.join("logs/access.log").to_str().unwrap())).unwrap();
+	let (ok, log) = Rproxy::start(&dir, free_port(), &[("RPROXY_CONFIG", cfg.to_str().unwrap())]).exited();
+	assert!(!ok && log.contains("access log directory"), "a missing directory is a mistake: {log}");
+
+	fs::create_dir_all(dir.join("logs")).unwrap();
+	let port = free_port();
+	let rp = Rproxy::start(&dir, port, &[("RPROXY_CONFIG", cfg.to_str().unwrap())]);
+	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
+	let r = reqwest::Client::new()
+		.get(format!("http://127.0.0.1:{l7}/a/b?secret=1"))
+		.header("Host", "site.test")
+		.header("User-Agent", "rproxy-test")
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(r.text().await.unwrap(), "hello");
+	let read = || {
+		fs::read_dir(dir.join("logs"))
+			.unwrap()
+			.filter_map(|e| fs::read_to_string(e.unwrap().path()).ok())
+			.collect::<String>()
+	};
+	wait_for("the access log line", &rp, || async { read().contains("http.access") }).await;
+	let line: serde_json::Value = serde_json::from_str(read().lines().next().unwrap()).unwrap();
+	assert_eq!(
+		(&line["route"], &line["host"], &line["path"], &line["status"], &line["user_agent"], &line["bytes_out"]),
+		(&json!("hello"), &json!("site.test"), &json!("/a/b"), &json!(200), &json!("rproxy-test"), &json!(5)),
+		"{line}"
+	);
+	assert_eq!(line["client"], "127.0.0.1", "{line}");
+	assert!(!rp.log().contains("http.access"), "not in the main log:\n{}", rp.log());
+}
+
+#[tokio::test]
 async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
 	let dir = workdir("yaml");
 	let backend = tcp_backend("Y:").await;
@@ -328,6 +371,7 @@ async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
 version: 1
 global:
   trusted_proxies: [10.0.0.0/8]
+  crowdsec: {{lapi_url: "http://127.0.0.1:1", api_key_file: /nonexistent}}
 rules:
   - protocol: tcp
     listen_addr: 127.0.0.1
@@ -359,7 +403,8 @@ rules:
 	assert_eq!(v["state"], "failed", "{v}");
 	assert!(v["error"].as_str().unwrap().contains("crowdsec"), "{v}");
 	assert_eq!(v["http"]["routes"][0]["name"], "all", "the settings are kept and shown: {v}");
-	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.trusted_proxies""#) }).await;
+	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.crowdsec""#) }).await;
+	assert!(!rp.log().contains(r#""part":"global.trusted_proxies""#), "trusted_proxies works now:\n{}", rp.log());
 	let (_, caps) = get_json(port, "/capabilities").await;
 	let kinds = caps["features"]["middlewares"].as_array().unwrap();
 	assert!(kinds.contains(&serde_json::json!("respond")) && !kinds.contains(&serde_json::json!("crowdsec")), "{caps}");

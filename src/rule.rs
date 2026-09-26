@@ -447,6 +447,9 @@ pub struct RuleStats {
 	pub tls_failures: u64,
 	/// Refused by allow_from or `unmatched: reject` (UDP: datagrams).
 	pub denied: u64,
+	/// Requests of an `http` rule, in total and by route.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub http: Option<crate::http::access::HttpStatsView>,
 }
 
 /// A rule as returned by the API.

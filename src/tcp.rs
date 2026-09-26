@@ -224,14 +224,14 @@ async fn handle_http(inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, o
 		match (tls.mode(), tls.server_config.clone()) {
 			(TlsMode::Terminate, Some(config)) => {
 				let (session, i) = accept_tls(inbound, client, &rt, offset, config).await?;
-				info = Some(i);
+				info = Some(i.clone());
 				let stream = Metered::new(session, rt.clone(), rx.clone(), tx.clone());
-				http::serve(stream, client, local, rt.clone(), true).await
+				http::serve(stream, client, local, rt.clone(), Some(i)).await
 			}
 			(TlsMode::Terminate, None) => Err(io::Error::other("TLS is not configured")),
 			_ => {
 				let stream = Metered::new(inbound, rt.clone(), rx.clone(), tx.clone());
-				http::serve(stream, client, local, rt.clone(), false).await
+				http::serve(stream, client, local, rt.clone(), None).await
 			}
 		}
 	};

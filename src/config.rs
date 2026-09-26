@@ -139,12 +139,6 @@ impl ConfigDoc {
 	pub fn unsupported_globals(&self) -> Vec<&'static str> {
 		let g = &self.global;
 		let mut out = vec![];
-		if !g.trusted_proxies.is_empty() {
-			out.push("trusted_proxies");
-		}
-		if g.access_log.is_some() {
-			out.push("access_log");
-		}
 		if g.acme.is_some() {
 			out.push("acme");
 		}
@@ -186,7 +180,7 @@ rules:
 "#;
 		let doc = ConfigDoc::parse(Path::new("rproxy.yaml"), yaml).unwrap();
 		assert_eq!(doc.rules.len(), 1);
-		assert_eq!(doc.unsupported_globals(), ["trusted_proxies", "acme"]);
+		assert_eq!(doc.unsupported_globals(), ["acme"]);
 		assert!(doc.rules[0].http.is_some());
 	}
 

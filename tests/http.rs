@@ -485,3 +485,108 @@ async fn hsts_over_https() {
 	let resp = sender.send_request(req).await.unwrap();
 	assert_eq!(resp.headers()["strict-transport-security"], "max-age=60; includeSubDomains; preload");
 }
+
+async fn get_with(port: u16, host: &str, path: &str, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+	let mut r = reqwest::Client::new().get(format!("http://127.0.0.1:{port}{path}")).header("Host", host);
+	for (k, v) in headers {
+		r = r.header(*k, *v);
+	}
+	let r = r.timeout(Duration::from_secs(10)).send().await.unwrap();
+	let status = r.status();
+	let text = r.text().await.unwrap();
+	(status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+#[tokio::test]
+async fn trusted_proxies_pass_the_client_on() {
+	use rproxy_api::auth::Tokens;
+	use rproxy_api::http::access::HttpGlobal;
+	// the test client connects from 127.0.0.1, which is trusted here
+	let h = harness_with_global(Tokens::disabled(), HttpGlobal::without_file(&["127.0.0.0/8".to_string()])).await;
+	let a = echo_backend("A").await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [
+					{"name": "office", "match": "ClientIP(`198.51.100.0/24`)", "to": url(a)},
+					{"name": "guarded", "match": "Host(`g.test`)", "to": url(a), "middlewares": ["only-office"]},
+				],
+				"middlewares": {"only-office": {"ip_allow": {"source_range": ["198.51.100.0/24"]}}},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let office = [("X-Forwarded-For", "198.51.100.7"), ("X-Forwarded-Proto", "https")];
+	let (status, v) = get_with(port, "x.test", "/", &office).await;
+	assert_eq!(status, StatusCode::OK, "ClientIP sees the forwarded client: {v}");
+	assert_eq!(v["xff"], "198.51.100.7, 127.0.0.1", "the chain is extended: {v}");
+	assert_eq!(v["real"], "198.51.100.7", "{v}");
+	assert_eq!(v["proto"], "https", "a trusted proxy's X-Forwarded-Proto is kept: {v}");
+	// the rightmost untrusted hop counts; what the client put further left does not
+	let forged = [("X-Forwarded-For", "198.51.100.7, 203.0.113.9")];
+	assert_eq!(get_with(port, "x.test", "/", &forged).await.0, StatusCode::NOT_FOUND);
+	assert_eq!(get_with(port, "g.test", "/", &office).await.0, StatusCode::OK);
+	assert_eq!(get_with(port, "g.test", "/", &forged).await.0, StatusCode::FORBIDDEN);
+	assert_eq!(get_with(port, "g.test", "/", &[]).await.0, StatusCode::FORBIDDEN, "the proxy itself is not in the range");
+}
+
+#[tokio::test]
+async fn untrusted_clients_cannot_claim_an_address() {
+	let h = harness().await;
+	let a = echo_backend("A").await;
+	let port = free_port();
+	let rule = http_rule(port, json!({"routes": [{"name": "office", "match": "ClientIP(`198.51.100.0/24`)", "to": url(a)}]}));
+	assert_eq!(h.post(rule).await.0, StatusCode::CREATED);
+	let (status, _) = get_with(port, "x.test", "/", &[("X-Forwarded-For", "198.51.100.7")]).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn requests_are_counted_by_route_and_status() {
+	let h = harness().await;
+	let a = echo_backend("A").await;
+	let port = free_port();
+	let rule = http_rule(
+		port,
+		json!({
+			"routes": [
+				{"name": "site", "match": "Host(`a.test`)", "to": url(a)},
+				{"name": "gone", "match": "Host(`gone.test`)", "middlewares": ["410"]},
+			],
+			"middlewares": {"410": {"respond": {"status": 410}}},
+		}),
+	);
+	let (status, v) = h.post(rule).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	for _ in 0..3 {
+		assert_eq!(get(port, "a.test", "/").await.0, StatusCode::OK);
+	}
+	assert_eq!(get(port, "gone.test", "/").await.0, StatusCode::GONE);
+	assert_eq!(get(port, "nowhere.test", "/").await.0, StatusCode::NOT_FOUND);
+
+	// counted when the response body has been sent; allow the server a moment
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let mut stats = Value::Null;
+	for _ in 0..50 {
+		stats = h.get(&path).await.1["stats"]["http"].clone();
+		if stats["requests"] == 5 {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	assert_eq!(stats["requests"], 5, "{stats}");
+	assert_eq!(stats["by_status"], json!({"2xx": 3, "4xx": 2}), "{stats}");
+	assert_eq!(stats["routes"]["site"], json!({"requests": 3, "by_status": {"2xx": 3}}), "{stats}");
+	assert_eq!(stats["routes"]["gone"]["by_status"], json!({"4xx": 1}), "{stats}");
+	assert_eq!(stats["routes"]["(none)"]["requests"], 1, "{stats}");
+
+	let text = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	let labels = format!("protocol=\"tcp\",listen=\"127.0.0.1:{port}\",route=\"site\"");
+	assert!(text.contains(&format!("rproxy_http_requests_total{{{labels},code=\"2xx\"}} 3")), "{text}");
+	assert!(text.contains(&format!("rproxy_http_request_duration_seconds_count{{{labels}}} 3")), "{text}");
+	assert!(text.contains(&format!("rproxy_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 3")), "{text}");
+	assert!(text.contains("# TYPE rproxy_http_request_duration_seconds histogram"), "{text}");
+}

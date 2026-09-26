@@ -39,6 +39,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/rule.rs` | ルールの型と検証。`Features`（この版で動かせる v0.3 の設定。`GET /capabilities` の `features`。パッチで中身を入れたら true にする） |
 | `src/http/` | L7（ルールの `http`）の設定の型と検証、`match` の式（Traefik と同じ書き方）の解析と評価 |
 | `src/http/middleware.rs` | 状態を持たないミドルウェア（リダイレクト、`respond`、`ip_allow`、`headers`、パスの書き換え）。`Router::compile` で一度だけ組み立てる |
+| `src/http/access.rs` | `global.trusted_proxies`・`global.access_log`（`HttpGlobal`。`Registry` の `Config.http` から全ルールの `Runtime.global` へ）、X-Forwarded-For からクライアントの IP を決める、アクセスログ、ルートごとのリクエストの統計（`stats.http`・`/metrics`） |
 | `src/http/server.rs` | `http` のルールのデータプレーン（hyper）。クライアントとは HTTP/1.1・HTTP/2、転送先とは HTTP/1.1。`Router` はルールの `Runtime.http` に入れ、変更時は丸ごと差し替える |
 | `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように） |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |

@@ -81,6 +81,10 @@ pub struct Runtime {
 	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
 	/// L7 routing of an `http` rule; replaced as a whole on changes.
 	pub http: RwLock<Option<Arc<crate::http::server::Router>>>,
+	/// `global` settings of `http` rules (trusted proxies, access log).
+	pub global: Arc<crate::http::access::HttpGlobal>,
+	/// Requests of an `http` rule by route.
+	pub http_stats: crate::http::access::HttpStats,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// Stops accepting new connections.

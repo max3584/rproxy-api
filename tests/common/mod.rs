@@ -49,6 +49,11 @@ pub fn fake_lookup(names: Names) -> Lookup {
 }
 
 pub async fn harness_with(tokens: Tokens) -> Harness {
+	harness_with_global(tokens, Default::default()).await
+}
+
+/// With `global` settings of `http` rules (trusted proxies, access log).
+pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::http::access::HttpGlobal) -> Harness {
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_millis(100),
@@ -57,6 +62,7 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 		transparent_ipv6: false,
 		max_range_ports: rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS,
 		reserved: vec!["127.0.0.1:1".parse().unwrap()],
+		http: Arc::new(http),
 	});
 	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens) }));
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
