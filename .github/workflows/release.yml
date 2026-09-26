@@ -7,6 +7,14 @@ on:
   push:
     tags:
       - v*
+  # dry run of the builds and packages (nothing is published) when packaging changes
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - debian/**
+      - scripts/apt-repo.sh
 
 jobs:
   build:
@@ -16,11 +24,11 @@ jobs:
       matrix:
         job:
           - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu       , use-cross: false , extension: ""   }
-          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl      , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl      , use-cross: true  , extension: ""   , deb: amd64 }
           - { os: ubuntu-latest  , target: armv7-unknown-linux-gnueabihf  , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: armv7-unknown-linux-musleabihf , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: armv7-unknown-linux-musleabihf , use-cross: true  , extension: ""   , deb: armhf }
           - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu      , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl     , use-cross: true  , extension: ""   }
+          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl     , use-cross: true  , extension: ""   , deb: arm64 }
           - { os: macos-latest   , target: x86_64-apple-darwin            , use-cross: false , extension: ""   }
           - { os: macos-latest   , target: aarch64-apple-darwin           , use-cross: false , extension: ""   }
           - { os: windows-latest , target: x86_64-pc-windows-msvc         , use-cross: false , extension: .exe }
@@ -32,6 +40,13 @@ jobs:
         shell: bash
         run: |
           echo "PROJECT_NAME=$(sed -n 's/^name = "\(.*\)"/\1/p' Cargo.toml | head -n1)" >> $GITHUB_ENV
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "VERSION=v$version" >> $GITHUB_ENV
+          # the .deb version comes from Cargo.toml, so the tag has to match it
+          if [ "${{ github.ref_type }}" = tag ] && [ "v$version" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,13 +68,100 @@ jobs:
             cargo build --release --target ${{ matrix.job.target }}
           fi
 
+      - name: Install cargo-deb
+        if: matrix.job.deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      # static musl binaries, so one package works on every Debian / Ubuntu release
+      - name: Debian package
+        if: matrix.job.deb
+        shell: bash
+        run: |
+          deb=$(cargo deb --no-build --no-strip --target ${{ matrix.job.target }} --output target/deb/ | tail -n1)
+          [ "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.job.deb }}" ]
+          echo "DEB=$deb" >> $GITHUB_ENV
+
+      - name: Upload Debian package
+        if: matrix.job.deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.job.deb }}
+          path: ${{ env.DEB }}
+
       - name: Rename artifacts
         shell: bash
         run: |
-          mv target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}{,-${{ github.ref_name }}-${{ matrix.job.target }}${{ matrix.job.extension }}}
+          mv target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}{,-${{ env.VERSION }}-${{ matrix.job.target }}${{ matrix.job.extension }}}
 
       - name: Release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ github.ref_name }}-${{ matrix.job.target }}${{ matrix.job.extension }}
+            target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ env.VERSION }}-${{ matrix.job.target }}${{ matrix.job.extension }}
+            ${{ env.DEB }}
+
+  # Publishes the packages to the apt repository on the gh-pages branch
+  # (https://max3584.github.io/rproxy-api/). Needs the repository secrets
+  # APT_GPG_PRIVATE_KEY (ASCII-armored secret key without a passphrase) and
+  # APT_GPG_KEY_ID; skipped when they are not set. See docs/APT.md.
+  apt:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: apt-repository
+      cancel-in-progress: false
+    env:
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+      APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+    steps:
+      - name: Check signing key
+        id: key
+        run: |
+          if [ -n "$APT_GPG_PRIVATE_KEY" ] && [ -n "$APT_GPG_KEY_ID" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::APT_GPG_PRIVATE_KEY / APT_GPG_KEY_ID are not set; the apt repository is not updated"
+          fi
+
+      - name: Checkout
+        if: steps.key.outputs.ok
+        uses: actions/checkout@v4
+
+      - name: Checkout gh-pages
+        if: steps.key.outputs.ok
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add pages FETCH_HEAD
+          else
+            git worktree add --orphan -b gh-pages pages
+          fi
+
+      - name: Download packages
+        if: steps.key.outputs.ok
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+          merge-multiple: true
+
+      - name: Update the repository
+        if: steps.key.outputs.ok
+        run: |
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          scripts/apt-repo.sh pages debs/*.deb
+          cp docs/apt-index.html pages/index.html
+
+      - name: Push gh-pages
+        if: steps.key.outputs.ok
+        working-directory: pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "apt: ${{ github.ref_name }}"
+          git push origin HEAD:gh-pages

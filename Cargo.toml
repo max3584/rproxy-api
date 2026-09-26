@@ -19,6 +19,30 @@ exclude = [
 [package.metadata]
 fork_repository = "https://github.com/glacierx/rproxy"
 
+# Debian package (cargo deb). See debian/README.md.
+[package.metadata.deb]
+maintainer = "touka shiro / max3584 <max3584.work@gmail.com>"
+copyright = "2024 max3584 / touka shiro, 2017 glacierx - rproxy project"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Layer 4 TCP/UDP forwarder whose rules are added, changed and removed at run \
+time through an HTTP API. Supports TLS SNI routing and termination, mTLS, \
+DTLS termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol."""
+section = "net"
+priority = "optional"
+depends = "passwd"
+maintainer-scripts = "debian/"
+# not started on install: set /etc/rproxy/rproxy.env first, then systemctl enable --now rproxy-api
+systemd-units = { enable = false, start = false }
+assets = [
+    ["target/release/rproxy-api", "usr/bin/", "755"],
+    ["debian/rproxy.env", "etc/rproxy/rproxy.env", "640"],
+    ["contrib/static-rules.example.json", "usr/share/doc/rproxy-api/examples/", "644"],
+    ["README.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/API.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/PROFILES.md", "usr/share/doc/rproxy-api/", "644"],
+]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -49,3 +73,7 @@ libc = "0.2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[profile.release]
+# smaller release binaries and .deb packages (no separate debug symbols)
+strip = true

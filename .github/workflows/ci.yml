@@ -58,6 +58,20 @@ jobs:
       - name: scripts/test-transparent.sh
         run: scripts/test-transparent.sh
 
+  deb:
+    name: Debian package (install, apt repository, purge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb
+      - name: scripts/test-deb.sh
+        run: scripts/test-deb.sh target/debian/*.deb
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+	if ! getent passwd rproxy >/dev/null; then
+		useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy
+	fi
+	chgrp rproxy /etc/rproxy
+	chmod 0750 /etc/rproxy
+	# a first API token, only when there is none yet
+	if [ ! -e /etc/rproxy/tokens ]; then
+		umask 027
+		od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > /etc/rproxy/tokens
+		echo >> /etc/rproxy/tokens
+		chgrp rproxy /etc/rproxy/tokens
+		echo "rproxy-api: generated an API token in /etc/rproxy/tokens"
+	fi
+fi
+
+#DEBHELPER#
