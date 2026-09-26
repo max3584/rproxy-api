@@ -1055,6 +1055,10 @@
      },
      "http": {
       "$ref": "#/components/schemas/Http"
+     },
+     "crowdsec": {
+      "type": "boolean",
+      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
      }
     },
     "required": [
@@ -1106,6 +1110,10 @@
      },
      "http": {
       "$ref": "#/components/schemas/Http"
+     },
+     "crowdsec": {
+      "type": "boolean",
+      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
      }
     },
     "additionalProperties": false
@@ -1271,6 +1279,10 @@
      "started_at": {
       "type": "integer",
       "nullable": true
+     },
+     "crowdsec": {
+      "type": "boolean",
+      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
      }
     },
     "description": "Fields may be added in patch releases."
