@@ -366,7 +366,8 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	let backend = tcp_backend("H:").await;
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["features"]["http"], true, "{caps}");
-	assert_eq!(caps["features"]["middlewares"], json!([]), "{caps}");
+	let kinds = caps["features"]["middlewares"].as_array().unwrap();
+	assert!(kinds.contains(&json!("redirect_scheme")) && !kinds.contains(&json!("rate_limit")), "{caps}");
 	assert_eq!(caps["features"]["services"], json!([]), "{caps}");
 
 	let mut body = rule("tcp", free_port(), backend);
@@ -381,11 +382,11 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 
 	// the middlewares and service options still to come are refused
 	let mut later = body.clone();
-	later["http"]["middlewares"] = json!({"ok": {"respond": {"status": 200}}});
-	later["http"]["routes"][0]["middlewares"] = json!(["ok"]);
+	later["http"]["middlewares"] = json!({"limit": {"rate_limit": {"average": 5}}});
+	later["http"]["routes"][0]["middlewares"] = json!(["limit"]);
 	let (status, v) = h.post(later).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
-	assert!(v["error"].as_str().unwrap().contains("respond"), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("rate_limit"), "{v}");
 	let mut later = body.clone();
 	later["http"]["routes"][0] = json!({"name": "all", "match": "PathPrefix(`/`)", "service": "s"});
 	later["http"]["services"] = json!({"s": {"servers": [{"url": "http://127.0.0.1:1"}], "sticky": {"cookie": "c"}}});

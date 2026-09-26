@@ -108,7 +108,7 @@ http:
 | `rate_limit` | `average`、`period`、`burst`、`source`（`ip` / `header: X-Real-IP`） | #54 |
 | `in_flight` | `amount`（同時に処理するリクエスト数） | #54 |
 | `crowdsec` | `appsec`（true / false）、`on_error`（`allow` / `block`） | #55 |
-| `ip_allow` | `source_range`（CIDR の一覧） | #52 |
+| `ip_allow` | `source_range`（CIDR の一覧） | #53 と一緒に v0.3.1 |
 | `headers` | `request` / `response` の `set`・`remove`、`hsts`、`frame_deny`、`content_type_nosniff`、`referrer_policy`、`csp`、`cors` | #60 |
 | `forward_auth` | `address`、`response_headers`、`trust_forward_header` | #59 |
 | `oidc` | `issuer`、`client_id`、`client_secret_file`、`scopes`、`cookie_secret_file` | #59 |

@@ -3,6 +3,7 @@
 //! parts that can already run are listed in `GET /capabilities` `features`.
 
 pub mod matcher;
+pub mod middleware;
 pub mod server;
 
 use std::collections::BTreeMap;
