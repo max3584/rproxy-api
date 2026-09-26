@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -20,14 +20,16 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, warn};
+use tracing::warn;
 
+use super::access::{AccessEntry, NO_ROUTE};
 use super::middleware::{Ctx, Middleware};
 use super::{parse_duration, HttpSpec, Matcher, ServiceSpec};
 use crate::error::ApiError;
 use crate::http::matcher::RequestInfo;
 use crate::proxy::Runtime;
 use crate::resolve::{self, Lookup};
+use crate::source::TlsInfo;
 use crate::tlsconf::Upstream;
 
 pub type Body = BoxBody<Bytes, hyper::Error>;
@@ -256,14 +258,17 @@ struct Conn {
 	client: SocketAddr,
 	local: SocketAddr,
 	https: bool,
+	/// The terminated TLS session (for the access log).
+	tls: Option<TlsInfo>,
 }
 
 /// Serves HTTP/1.1 and HTTP/2 (by preface) on an accepted, possibly decrypted, connection.
-pub async fn serve<S>(stream: S, client: SocketAddr, local: SocketAddr, rt: Arc<Runtime>, https: bool) -> io::Result<()>
+/// `tls` is the terminated session; None for plain HTTP.
+pub async fn serve<S>(stream: S, client: SocketAddr, local: SocketAddr, rt: Arc<Runtime>, tls: Option<TlsInfo>) -> io::Result<()>
 where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-	let conn = Arc::new(Conn { rt, client, local, https });
+	let conn = Arc::new(Conn { rt, client, local, https: tls.is_some(), tls });
 	let service = hyper::service::service_fn(move |req| {
 		let conn = conn.clone();
 		async move { Ok::<_, Infallible>(conn.handle(req).await) }
@@ -359,7 +364,12 @@ impl Conn {
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
+		let started = Instant::now();
 		let host = request_host(&req).unwrap_or_default();
+		// the client: the peer, or what a trusted proxy in front says (global.trusted_proxies)
+		let peer = canonical(self.client.ip());
+		let global = &self.rt.global;
+		let client_ip = global.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
 		let headers: Vec<(String, String)> = req
 			.headers()
 			.iter()
@@ -371,16 +381,29 @@ impl Conn {
 			query: req.uri().query().unwrap_or(""),
 			method: req.method().as_str(),
 			headers: &headers,
-			client: canonical(self.client.ip()),
+			client: client_ip,
 		};
 		let (route_name, service, chain) = match router.route(&info) {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice()),
 			None => ("", router.default_service.clone(), &[][..]),
 		};
-		let method = req.method().clone();
-		let path = req.uri().path().to_string();
+		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+		let mut entry = AccessEntry {
+			rule: self.rt.key.to_string(),
+			route: if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() },
+			client: client_ip.to_string(),
+			method: req.method().to_string(),
+			host: host.clone(),
+			path: req.uri().path().to_string(),
+			protocol: format!("{:?}", req.version()),
+			bytes_in: header_text(header::CONTENT_LENGTH).parse().unwrap_or(0),
+			user_agent: header_text(header::USER_AGENT),
+			sni: self.tls.as_ref().and_then(|t| t.server_name.clone()).unwrap_or_default(),
+			tls_version: self.tls.as_ref().and_then(|t| t.version.clone()).unwrap_or_default(),
+			..Default::default()
+		};
 		let ctx = Ctx {
-			client: canonical(self.client.ip()),
+			client: client_ip,
 			https: self.https,
 			host: host.clone(),
 			origin: req.headers().get(header::ORIGIN).cloned(),
@@ -399,7 +422,10 @@ impl Conn {
 		let req = Request::from_parts(parts, body);
 		let mut resp = match (answer, service) {
 			(Some(resp), _) => resp,
-			(None, Some(service)) => self.forward(&router, &service, route_name, req, &host).await,
+			(None, Some(service)) => {
+				entry.service = service.name.clone();
+				self.forward(&router, &service, route_name, req, &host, client_ip, &mut entry.backend).await
+			}
 			(None, None) if route_name.is_empty() => error_response(router.default_status),
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
@@ -408,13 +434,25 @@ impl Conn {
 		for m in chain[..ran].iter().rev() {
 			m.on_response(resp.headers_mut(), &ctx);
 		}
-		debug!(event = "http.request", rule = %self.rt.key, client = %self.client, host = %host, method = %method,
-			path = %path, route = route_name, status = resp.status().as_u16());
-		resp
+		entry.status = resp.status().as_u16();
+		// logged and counted when the response body ends
+		let rt = self.rt.clone();
+		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started }.boxed())
 	}
 
-	async fn forward(&self, router: &Router, service: &Service, route: &str, mut req: Request<Incoming>, host: &str) -> Response<Body> {
+	#[allow(clippy::too_many_arguments)]
+	async fn forward(
+		&self,
+		router: &Router,
+		service: &Service,
+		route: &str,
+		mut req: Request<Incoming>,
+		host: &str,
+		client_ip: IpAddr,
+		backend: &mut String,
+	) -> Response<Body> {
 		let server = service.pick();
+		*backend = format!("{}:{}", server.host, server.port);
 		let path_and_query = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
 		let uri: Uri = match format!("{}{}", server.prefix, path_and_query).parse() {
 			Ok(u) => u,
@@ -437,15 +475,31 @@ impl Conn {
 			_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
 		};
 		parts.headers.insert(header::HOST, host_value);
-		// without trusted proxies (#67) the client's own X-Forwarded-* are not believed
-		let client_ip = canonical(self.client.ip()).to_string();
+		// X-Forwarded-* from the client are believed only from trusted proxies (global.trusted_proxies):
+		// then the chain is extended and their Proto / Host / Port are kept
+		let peer = canonical(self.client.ip());
+		let trusted = self.rt.global.trusts(peer);
 		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
+			let name = HeaderName::from_static(name);
+			if trusted && headers.contains_key(&name) {
+				return;
+			}
 			if let Ok(v) = HeaderValue::from_str(value) {
-				headers.insert(HeaderName::from_static(name), v);
+				headers.insert(name, v);
 			}
 		};
-		set(&mut parts.headers, "x-forwarded-for", &client_ip);
-		set(&mut parts.headers, "x-real-ip", &client_ip);
+		let chain: Vec<&str> = if trusted {
+			parts.headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).collect()
+		} else {
+			vec![]
+		};
+		let forwarded_for = chain.iter().copied().chain([peer.to_string().as_str()]).collect::<Vec<_>>().join(", ");
+		if let Ok(v) = HeaderValue::from_str(&forwarded_for) {
+			parts.headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+		}
+		if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
+			parts.headers.insert(HeaderName::from_static("x-real-ip"), v);
+		}
 		set(&mut parts.headers, "x-forwarded-proto", if self.https { "https" } else { "http" });
 		set(&mut parts.headers, "x-forwarded-port", &self.local.port().to_string());
 		if let Some(h) = original_host.as_ref().and_then(|h| h.to_str().ok()) {
@@ -547,6 +601,52 @@ impl Conn {
 			}
 		});
 		Ok(sender)
+	}
+}
+
+/// A response body that writes the access log line and counts the request once
+/// it has been sent completely (or the client went away).
+struct Logged {
+	inner: Body,
+	bytes: u64,
+	entry: AccessEntry,
+	rt: Arc<Runtime>,
+	started: Instant,
+}
+
+impl hyper::body::Body for Logged {
+	type Data = Bytes;
+	type Error = hyper::Error;
+
+	fn poll_frame(
+		mut self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+	) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+		let poll = Pin::new(&mut self.inner).poll_frame(cx);
+		if let Poll::Ready(Some(Ok(frame))) = &poll {
+			if let Some(data) = frame.data_ref() {
+				self.bytes += data.len() as u64;
+			}
+		}
+		poll
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
+	}
+}
+
+impl Drop for Logged {
+	fn drop(&mut self) {
+		let elapsed = self.started.elapsed();
+		self.entry.duration_ms = elapsed.as_millis() as u64;
+		self.entry.bytes_out = self.bytes;
+		self.rt.http_stats.record(&self.entry.route, self.entry.status, elapsed);
+		self.rt.global.log(&self.entry);
 	}
 }
 

@@ -68,10 +68,11 @@ serde_yaml_ng = "0.10.0"
 regex = "1.13.1"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 sha2 = "0.10"
-time = "0.3"
+time = { version = "0.3", features = ["formatting"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

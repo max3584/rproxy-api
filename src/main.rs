@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use rproxy_api::api::{self, AppState};
 use rproxy_api::auth::Tokens;
+use rproxy_api::http::access::{AccessLogError, HttpGlobal};
 use rproxy_api::registry::{Config, Registry};
 use rproxy_api::{db, logging, resolve, source};
 
@@ -219,6 +220,41 @@ async fn run(opts: Options) -> Result<(), String> {
 		}
 	}
 
+	// the settings file: its `global` shapes the registry, its rules start below
+	if opts.config.is_some() && opts.static_rules.is_some() {
+		return Err("give --config (RPROXY_CONFIG) or --static-rules (RPROXY_STATIC_RULES), not both".into());
+	}
+	let mut doc = None;
+	if let Some(path) = opts.config.as_ref().or(opts.static_rules.as_ref()) {
+		match std::fs::read_to_string(path) {
+			Ok(text) => {
+				let parsed = rproxy_api::config::ConfigDoc::parse(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+				for part in parsed.unsupported_globals() {
+					warn!(event = "degraded", part = %format!("global.{part}"),
+						"not available in this version yet; ignored (see GET /capabilities features)");
+				}
+				doc = Some((path.clone(), parsed));
+			}
+			Err(e) if config_error(&e) => return Err(format!("settings file {}: {e}", path.display())),
+			Err(e) => error!(event = "degraded", part = "static_rules", error = %format!("{}: {e}", path.display()),
+				"running without the rules of the settings file"),
+		}
+	}
+	let http_global = match &doc {
+		None => HttpGlobal::default(),
+		Some((path, d)) => {
+			let access_log = d.global.access_log.as_deref().map(Path::new);
+			match HttpGlobal::new(&d.global.trusted_proxies, access_log, opts.log_keep) {
+				Ok(g) => g,
+				Err(AccessLogError::Config(e)) => return Err(format!("{}: global.access_log: {e}", path.display())),
+				Err(AccessLogError::Unavailable(e)) => {
+					warn!(event = "degraded", part = "global.access_log", error = %e, "access log lines go to the main log");
+					HttpGlobal::without_file(&d.global.trusted_proxies)
+				}
+			}
+		}
+	};
+
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
 	let registry = Registry::new(Config {
@@ -228,28 +264,14 @@ async fn run(opts: Options) -> Result<(), String> {
 		transparent_ipv6,
 		max_range_ports: opts.max_range_ports.max(1),
 		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
+		http: Arc::new(http_global),
 	});
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
-	if opts.config.is_some() && opts.static_rules.is_some() {
-		return Err("give --config (RPROXY_CONFIG) or --static-rules (RPROXY_STATIC_RULES), not both".into());
-	}
-	if let Some(path) = opts.config.as_ref().or(opts.static_rules.as_ref()) {
-		match std::fs::read_to_string(path) {
-			Ok(text) => {
-				let doc = rproxy_api::config::ConfigDoc::parse(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
-				for part in doc.unsupported_globals() {
-					warn!(event = "degraded", part = %format!("global.{part}"),
-						"not available in this version yet; ignored (see GET /capabilities features)");
-				}
-				registry.load_static(doc.rules).await.map_err(|e| format!("{}: {e}", path.display()))?;
-			}
-			Err(e) if config_error(&e) => return Err(format!("settings file {}: {e}", path.display())),
-			Err(e) => error!(event = "degraded", part = "static_rules", error = %format!("{}: {e}", path.display()),
-				"running without the rules of the settings file"),
-		}
+	if let Some((path, d)) = doc {
+		registry.load_static(d.rules).await.map_err(|e| format!("{}: {e}", path.display()))?;
 	}
 
 	if let Some(url) = &opts.database_url {

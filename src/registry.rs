@@ -35,6 +35,8 @@ pub struct Config {
 	pub max_range_ports: u16,
 	/// Addresses rproxy itself listens on (the control API); rules may not take them.
 	pub reserved: Vec<SocketAddr>,
+	/// `global` settings of `http` rules (trusted proxies, access log).
+	pub http: Arc<crate::http::access::HttpGlobal>,
 }
 
 type Resolver = (CancellationToken, JoinHandle<()>);
@@ -103,6 +105,7 @@ impl Entry {
 					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
 					denied: s.denied.load(Ordering::Relaxed),
+					http: r.spec.http.is_some().then(|| crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats)),
 				};
 				view.started_at = Some(r.started_at);
 				view
@@ -313,6 +316,8 @@ impl Registry {
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
 			http: RwLock::new(prepared.http),
+			global: self.cfg.http.clone(),
+			http_stats: Default::default(),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -689,7 +694,50 @@ impl Registry {
 				let _ = writeln!(out, "{name}{sample}");
 			}
 		}
+		http_metrics(&mut out, &rules);
 		out
+	}
+}
+
+/// Requests of `http` rules: a counter by route and status class, and a duration
+/// histogram by route. Routes are named in the settings, so the labels stay few.
+fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
+	use crate::http::access::{BUCKETS, CLASSES};
+	let mut requests = vec![];
+	let mut durations = vec![];
+	let mut keys: Vec<&Key> = rules.keys().collect();
+	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
+	for key in keys {
+		let Some(Entry::Running(r)) = rules.get(key) else { continue };
+		if r.spec.http.is_none() {
+			continue;
+		}
+		for (route, c) in r.rt.http_stats.snapshot() {
+			let route = route.replace('\\', "\\\\").replace('"', "\\\"");
+			let labels = format!("protocol=\"{}\",listen=\"{}\",route=\"{route}\"", key.protocol, key.listen);
+			for (class, n) in CLASSES.iter().zip(c.by_class) {
+				if n > 0 {
+					requests.push(format!("rproxy_http_requests_total{{{labels},code=\"{class}\"}} {n}"));
+				}
+			}
+			for (bound, n) in BUCKETS.iter().zip(c.buckets) {
+				durations.push(format!("rproxy_http_request_duration_seconds_bucket{{{labels},le=\"{bound}\"}} {n}"));
+			}
+			let total = c.requests();
+			durations.push(format!("rproxy_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {total}"));
+			durations.push(format!("rproxy_http_request_duration_seconds_sum{{{labels}}} {}", c.duration_sum));
+			durations.push(format!("rproxy_http_request_duration_seconds_count{{{labels}}} {total}"));
+		}
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_requests_total HTTP requests of http rules by route and status class.");
+	let _ = writeln!(out, "# TYPE rproxy_http_requests_total counter");
+	for line in requests {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
+	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
+	for line in durations {
+		let _ = writeln!(out, "{line}");
 	}
 }
 
@@ -771,6 +819,7 @@ mod tests {
 			transparent_ipv6: false,
 			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
 			reserved: vec![],
+			http: Default::default(),
 		})
 	}
 

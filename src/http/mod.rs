@@ -2,6 +2,7 @@
 //! (docs/DESIGN-v0.3.md). v0.3.0 settles their shape and validates them; the
 //! parts that can already run are listed in `GET /capabilities` `features`.
 
+pub mod access;
 pub mod matcher;
 pub mod middleware;
 pub mod server;
