@@ -183,18 +183,10 @@ cargo test     # 単体テストと、実際にソケットを使う結合テス
 cargo clippy --all-targets
 ```
 
----
-### About rproxy-api
-rproxy-api is a derivative of the rproxy project by glacierx. The project utilizes core functionalities from the original rproxy implementation and introduces additional features, including API server capabilities and enhanced logging.
+## 由来とライセンス
 
-### Original Project
-- **Project Name:** rproxy
-- **Original Author:** glacierx
-- **License:** MIT License
+rproxy-api は glacierx の [rproxy](https://github.com/glacierx/rproxy)（MIT License）を出発点に始めた。
+今は制御 API・TLS・DTLS・STARTTLS・送信元 IP の引き渡しなどを含め、コードはすべて作り直した独立したプロジェクトで、元のプロジェクトとは別に開発している。
+TCP の双方向の転送ループと、UDP のクライアントごとのセッションという設計は元のプロジェクトに由来する（`src/tcp.rs` と `src/udp.rs` の先頭に記載）。
 
-### Modifications
-- Added API server functionality for control and monitoring.
-- Enhanced logging and configuration options.
-
-### License
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT License。元のプロジェクトの著作権表示も含めて [LICENSE](LICENSE) を参照。

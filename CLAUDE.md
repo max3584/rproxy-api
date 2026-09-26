@@ -1,6 +1,6 @@
 # CLAUDE.md — rproxy-api
 
-稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ（Rust / tokio / axum）。glacierx/rproxy のフォーク。
+稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ（Rust / tokio / axum）。glacierx/rproxy を出発点にしたが、すべて作り直した独立したプロジェクト（帰属の表記は LICENSE と README の末尾）。
 管理 UI は別リポジトリ `../TCP-UDP-rproxy-ui`（Next.js）で、HTTP API で操作する。
 
 ## コマンド
