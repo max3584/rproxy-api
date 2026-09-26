@@ -24,7 +24,8 @@ use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
 use super::limit::Hold;
-use super::middleware::{Ctx, Limited, Middleware};
+use super::crowdsec::Verdict;
+use super::middleware::{self, Blocked, Ctx, Limited, Middleware};
 use super::{parse_duration, HttpSpec, Matcher, ServiceSpec};
 use crate::error::ApiError;
 use crate::http::matcher::RequestInfo;
@@ -412,11 +413,18 @@ impl Conn {
 		};
 		// request side in the route's order, until one answers
 		let (mut parts, body) = req.into_parts();
+		let mut body: Body = body.boxed();
 		let mut ran = 0;
 		let mut answer = None;
 		for m in chain {
 			ran += 1;
-			if let Some(resp) = m.on_request(&mut parts, &ctx) {
+			let resp = match m.as_ref() {
+				Middleware::Crowdsec { name, appsec, block_on_error } => {
+					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
+				}
+				m => m.on_request(&mut parts, &ctx),
+			};
+			if let Some(resp) = resp {
 				answer = Some(resp);
 				break;
 			}
@@ -424,6 +432,9 @@ impl Conn {
 		let req = Request::from_parts(parts, body);
 		if let Some(limited) = answer.as_ref().and_then(|r| r.extensions().get::<Limited>()) {
 			self.rt.http_stats.limited(route_name, &limited.0);
+		}
+		if let Some(blocked) = answer.as_ref().and_then(|r| r.extensions().get::<Blocked>()) {
+			self.rt.http_stats.blocked(route_name, &blocked.0);
 		}
 		let mut holds = std::mem::take(&mut *ctx.holds.lock().unwrap());
 		let mut resp = match (answer, service) {
@@ -446,13 +457,50 @@ impl Conn {
 		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started, _holds: holds }.boxed())
 	}
 
+	/// The `crowdsec` middleware: the LAPI's decisions, then AppSec. `Some` refuses the request.
+	#[allow(clippy::too_many_arguments)]
+	async fn crowdsec(
+		&self,
+		name: &str,
+		appsec: bool,
+		block_on_error: bool,
+		parts: &hyper::http::request::Parts,
+		body: &mut Body,
+		client: IpAddr,
+		host: &str,
+	) -> Option<Response<Body>> {
+		let Some(bouncer) = self.rt.global.crowdsec() else {
+			// validation requires global.crowdsec; a rule restored without it fails closed or open as asked
+			return block_on_error.then(|| middleware::blocked(name));
+		};
+		let fail = || block_on_error.then(|| middleware::blocked(name));
+		match bouncer.check_ip(client) {
+			Verdict::Block => return Some(middleware::blocked(name)),
+			// the LAPI has not answered yet; the pulling task logs why
+			Verdict::Error(_) => return fail(),
+			Verdict::Allow => {}
+		}
+		if !appsec {
+			return None;
+		}
+		match bouncer.check_appsec(parts, body, client, host).await {
+			Verdict::Allow => None,
+			Verdict::Block => Some(middleware::blocked(name)),
+			Verdict::Error(e) => {
+				warn!(event = "crowdsec.error", rule = %self.rt.key, middleware = name, client = %client, error = %e,
+					action = if block_on_error { "block" } else { "allow" });
+				fail()
+			}
+		}
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	async fn forward(
 		&self,
 		router: &Router,
 		service: &Service,
 		route: &str,
-		mut req: Request<Incoming>,
+		mut req: Request<Body>,
 		host: &str,
 		client_ip: IpAddr,
 		backend: &mut String,
@@ -565,7 +613,7 @@ impl Conn {
 		router: &Router,
 		service: &Service,
 		server: &Server,
-	) -> Result<hyper::client::conn::http1::SendRequest<Incoming>, Failure> {
+	) -> Result<hyper::client::conn::http1::SendRequest<Body>, Failure> {
 		let bad = |e: String| Failure::Status(StatusCode::BAD_GATEWAY, e);
 		let connecting = async {
 			let addrs = match server.host.parse::<IpAddr>() {
@@ -600,7 +648,7 @@ impl Conn {
 			.await
 			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "connect timed out".into()))??;
 		let (sender, conn) = hyper::client::conn::http1::Builder::new()
-			.handshake::<_, Incoming>(TokioIo::new(stream))
+			.handshake::<_, Body>(TokioIo::new(stream))
 			.await
 			.map_err(|e| bad(e.to_string()))?;
 		let kill = self.rt.kill.clone();

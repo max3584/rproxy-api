@@ -37,6 +37,10 @@ pub struct Ctx {
 #[derive(Clone, Debug)]
 pub struct Limited(pub String);
 
+/// Marks a response refused by `crowdsec`, with the middleware's name (metrics).
+#[derive(Clone, Debug)]
+pub struct Blocked(pub String);
+
 #[derive(Debug)]
 pub struct Headers {
 	request: HeaderOps,
@@ -61,6 +65,8 @@ pub enum Middleware {
 	ReplacePathRegex { regex: Regex, replacement: String },
 	RateLimit { name: String, limiter: RateLimiter },
 	InFlight { name: String, limiter: Arc<InFlight> },
+	/// Asked asynchronously by the server (`crowdsec.rs`); `on_request` passes it by.
+	Crowdsec { name: String, appsec: bool, block_on_error: bool },
 }
 
 fn value(v: &str, what: &str) -> Result<HeaderValue, ApiError> {
@@ -149,6 +155,9 @@ impl Middleware {
 				),
 			},
 			MiddlewareSpec::InFlight { amount } => Middleware::InFlight { name: label.to_string(), limiter: InFlight::new(*amount) },
+			MiddlewareSpec::Crowdsec { appsec, on_error } => {
+				Middleware::Crowdsec { name: label.to_string(), appsec: *appsec, block_on_error: on_error == "block" }
+			}
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
 	}
@@ -248,6 +257,7 @@ impl Middleware {
 				}
 				None
 			}
+			Middleware::Crowdsec { .. } => None,
 		}
 	}
 
@@ -356,6 +366,13 @@ fn text(status: StatusCode, body: &str) -> Response<Body> {
 	let mut resp = Response::new(full(format!("{body}\n")));
 	*resp.status_mut() = status;
 	resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+	resp
+}
+
+/// 403 from `crowdsec`.
+pub fn blocked(name: &str) -> Response<Body> {
+	let mut resp = text(StatusCode::FORBIDDEN, "403 Forbidden");
+	resp.extensions_mut().insert(Blocked(name.to_string()));
 	resp
 }
 

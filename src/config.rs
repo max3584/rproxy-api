@@ -121,6 +121,20 @@ impl ConfigDoc {
 				crate::http::parse_duration(i).map_err(|e| format!("global.crowdsec.update_interval: {e}"))?;
 			}
 		}
+		// crowdsec middlewares need global.crowdsec (and appsec_url for appsec)
+		for (i, r) in self.rules.iter().enumerate() {
+			for (name, m) in r.http.iter().flat_map(|h| &h.middlewares) {
+				if let crate::http::MiddlewareSpec::Crowdsec { appsec, .. } = m {
+					match &self.global.crowdsec {
+						None => return Err(format!("rule #{}: middleware {name}: crowdsec needs global.crowdsec", i + 1)),
+						Some(cs) if *appsec && cs.appsec_url.is_none() => {
+							return Err(format!("rule #{}: middleware {name}: appsec needs global.crowdsec.appsec_url", i + 1))
+						}
+						_ => {}
+					}
+				}
+			}
+		}
 		// acme certificates must name a resolver defined here
 		let resolvers: Vec<&String> = self.global.acme.iter().flat_map(|a| a.resolvers.keys()).collect();
 		for (i, r) in self.rules.iter().enumerate() {
@@ -141,9 +155,6 @@ impl ConfigDoc {
 		let mut out = vec![];
 		if g.acme.is_some() {
 			out.push("acme");
-		}
-		if g.crowdsec.is_some() {
-			out.push("crowdsec");
 		}
 		out
 	}
@@ -197,7 +208,7 @@ rules:
 		let section = &design[design.find("## 7.").unwrap()..];
 		let yaml = section.split("```yaml").nth(1).unwrap().split("```").next().unwrap();
 		// the example refers to a resolver defined elsewhere in the document
-		let yaml = yaml.replacen("version: 1", "version: 1\nglobal: {acme: {resolvers: {letsencrypt: {email: a@example.com, challenge: tls-alpn-01}}}}", 1);
+		let yaml = yaml.replacen("version: 1", "version: 1\nglobal: {acme: {resolvers: {letsencrypt: {email: a@example.com, challenge: tls-alpn-01}}}, crowdsec: {lapi_url: 'http://127.0.0.1:8080', api_key_file: /etc/rproxy/crowdsec.key, appsec_url: 'http://127.0.0.1:7422'}}", 1);
 		let doc = ConfigDoc::parse(Path::new("design.yaml"), &yaml).unwrap();
 		assert_eq!(doc.rules.len(), 2);
 		for r in doc.rules {
@@ -215,6 +226,14 @@ rules:
 			(
 				"version: 1\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 443, remote_addr: a, remote_port: 1, tls: {mode: terminate, certificates: [{acme: le, domains: [a]}]}}]",
 				"not defined in global.acme",
+			),
+			(
+				"version: 1\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 80, http: {routes: [{name: a, match: 'PathPrefix(`/`)', to: 'http://a', middlewares: [cs]}], middlewares: {cs: {crowdsec: {}}}}}]",
+				"crowdsec needs global.crowdsec",
+			),
+			(
+				"version: 1\nglobal: {crowdsec: {lapi_url: 'http://a', api_key_file: k}}\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 80, http: {routes: [{name: a, match: 'PathPrefix(`/`)', to: 'http://a', middlewares: [cs]}], middlewares: {cs: {crowdsec: {appsec: true}}}}}]",
+				"appsec needs global.crowdsec.appsec_url",
 			),
 		] {
 			let err = ConfigDoc::parse(Path::new("x.yaml"), text).unwrap_err();

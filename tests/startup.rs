@@ -371,7 +371,7 @@ async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
 version: 1
 global:
   trusted_proxies: [10.0.0.0/8]
-  crowdsec: {{lapi_url: "http://127.0.0.1:1", api_key_file: /nonexistent}}
+  acme: {{resolvers: {{le: {{email: a@example.com, challenge: tls-alpn-01}}}}}}
 rules:
   - protocol: tcp
     listen_addr: 127.0.0.1
@@ -388,7 +388,7 @@ rules:
           to: http://127.0.0.1:{bp}
           middlewares: [cs]
       middlewares:
-        cs: {{crowdsec: {{}}}}
+        cs: {{compress: {{}}}}
 "#,
 			bp = backend.port()
 		),
@@ -401,13 +401,13 @@ rules:
 	assert_eq!((v["state"].as_str(), v["origin"].as_str()), (Some("running"), Some("static")), "{v}");
 	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{l7}")).await;
 	assert_eq!(v["state"], "failed", "{v}");
-	assert!(v["error"].as_str().unwrap().contains("crowdsec"), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("compress"), "{v}");
 	assert_eq!(v["http"]["routes"][0]["name"], "all", "the settings are kept and shown: {v}");
-	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.crowdsec""#) }).await;
+	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.acme""#) }).await;
 	assert!(!rp.log().contains(r#""part":"global.trusted_proxies""#), "trusted_proxies works now:\n{}", rp.log());
 	let (_, caps) = get_json(port, "/capabilities").await;
 	let kinds = caps["features"]["middlewares"].as_array().unwrap();
-	assert!(kinds.contains(&serde_json::json!("respond")) && !kinds.contains(&serde_json::json!("crowdsec")), "{caps}");
+	assert!(kinds.contains(&serde_json::json!("respond")) && !kinds.contains(&serde_json::json!("compress")), "{caps}");
 
 	// an unknown version is a mistake
 	fs::write(&cfg, "version: 9\n").unwrap();

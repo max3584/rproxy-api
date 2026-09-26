@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -13,6 +13,7 @@ use tracing::info;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
+use super::crowdsec::Bouncer;
 use crate::cidr::{self, Cidr};
 
 /// Route label for requests that matched no route.
@@ -32,11 +33,13 @@ enum Sink {
 pub struct HttpGlobal {
 	trusted_proxies: Vec<Cidr>,
 	sink: Sink,
+	/// `global.crowdsec`: the bouncer the `crowdsec` middleware asks.
+	crowdsec: Option<Arc<Bouncer>>,
 }
 
 impl Default for HttpGlobal {
 	fn default() -> Self {
-		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log }
+		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None }
 	}
 }
 
@@ -54,7 +57,7 @@ impl HttpGlobal {
 	pub fn new(trusted_proxies: &[String], access_log: Option<&Path>, keep_files: usize) -> Result<Self, AccessLogError> {
 		let trusted_proxies = cidr::parse_list(trusted_proxies).map_err(|e| AccessLogError::Config(e.message))?;
 		let Some(path) = access_log else {
-			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log });
+			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, crowdsec: None });
 		};
 		let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
 		if !dir.is_dir() {
@@ -70,12 +73,22 @@ impl HttpGlobal {
 			.build(dir)
 			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
 		let (writer, guard) = tracing_appender::non_blocking(appender);
-		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard } })
+		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, crowdsec: None })
 	}
 
 	/// Same as `new` without an access log file, for when it cannot be written.
 	pub fn without_file(trusted_proxies: &[String]) -> Self {
-		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), sink: Sink::Log }
+		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), sink: Sink::Log, crowdsec: None }
+	}
+
+	/// Attaches the CrowdSec bouncer of `global.crowdsec`.
+	pub fn with_crowdsec(mut self, bouncer: Option<Arc<Bouncer>>) -> Self {
+		self.crowdsec = bouncer;
+		self
+	}
+
+	pub fn crowdsec(&self) -> Option<&Arc<Bouncer>> {
+		self.crowdsec.as_ref()
 	}
 
 	pub fn trusts(&self, peer: IpAddr) -> bool {
@@ -205,6 +218,8 @@ pub struct HttpStats {
 	routes: Mutex<BTreeMap<String, RouteCounters>>,
 	/// Requests refused by `rate_limit` / `in_flight`, by (route, middleware).
 	limited: Mutex<BTreeMap<(String, String), u64>>,
+	/// Requests refused by `crowdsec`, by (route, middleware).
+	blocked: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl HttpStats {
@@ -229,6 +244,15 @@ impl HttpStats {
 	pub fn limited_snapshot(&self) -> BTreeMap<(String, String), u64> {
 		self.limited.lock().unwrap().clone()
 	}
+
+	pub fn blocked(&self, route: &str, middleware: &str) {
+		let route = if route.is_empty() { NO_ROUTE } else { route };
+		*self.blocked.lock().unwrap().entry((route.to_string(), middleware.to_string())).or_default() += 1;
+	}
+
+	pub fn blocked_snapshot(&self) -> BTreeMap<(String, String), u64> {
+		self.blocked.lock().unwrap().clone()
+	}
 }
 
 /// `stats.http` of a rule in the API.
@@ -239,6 +263,9 @@ pub struct HttpStatsView {
 	/// Refused by `rate_limit` / `in_flight` (also counted in `by_status` as 4xx).
 	#[serde(skip_serializing_if = "is_zero")]
 	pub limited: u64,
+	/// Refused by `crowdsec` (also counted in `by_status` as 4xx).
+	#[serde(skip_serializing_if = "is_zero")]
+	pub blocked: u64,
 	pub routes: BTreeMap<String, RouteStatsView>,
 }
 
@@ -249,6 +276,9 @@ pub struct RouteStatsView {
 	/// Refused by each limit middleware of the route.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub limited: BTreeMap<String, u64>,
+	/// Refused by each `crowdsec` middleware of the route.
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub blocked: BTreeMap<String, u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -274,6 +304,10 @@ impl HttpStatsView {
 		for ((route, middleware), n) in stats.limited_snapshot() {
 			view.limited += n;
 			view.routes.entry(route).or_default().limited.insert(middleware, n);
+		}
+		for ((route, middleware), n) in stats.blocked_snapshot() {
+			view.blocked += n;
+			view.routes.entry(route).or_default().blocked.insert(middleware, n);
 		}
 		view.requests = total.iter().sum();
 		view.by_status = by_status(&total);

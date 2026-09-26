@@ -276,7 +276,10 @@ impl Registry {
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
 		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required)?);
 		let http = match &spec.http {
-			Some(h) => Some(Arc::new(crate::http::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?)),
+			Some(h) => {
+				crate::http::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
+				Some(Arc::new(crate::http::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
+			}
 			None => None,
 		};
 		let addrs = if http.is_some() { vec![] } else { resolve::resolve(&self.cfg.lookup, &spec.remote()).await? };
@@ -392,6 +395,11 @@ impl Registry {
 			source_ip = view.source_ip, tls = ?view.tls.mode, starttls = view.starttls.map(|s| s.as_str()).unwrap_or(""),
 			resolved = ?view.resolved);
 		Ok(view)
+	}
+
+	/// The `global` settings of `http` rules.
+	pub fn http_global(&self) -> Arc<crate::http::access::HttpGlobal> {
+		self.cfg.http.clone()
 	}
 
 	pub async fn create(self: &Arc<Self>, req: RuleRequest) -> Result<RuleView, ApiError> {
@@ -695,6 +703,14 @@ impl Registry {
 			}
 		}
 		http_metrics(&mut out, &rules);
+		if let Some(b) = self.cfg.http.crowdsec() {
+			let _ = writeln!(out, "# HELP rproxy_crowdsec_decisions Addresses and ranges blocked by the CrowdSec LAPI decisions.");
+			let _ = writeln!(out, "# TYPE rproxy_crowdsec_decisions gauge");
+			let _ = writeln!(out, "rproxy_crowdsec_decisions {}", b.decision_count());
+			let _ = writeln!(out, "# HELP rproxy_crowdsec_synced Whether the decisions have been pulled from the LAPI at least once.");
+			let _ = writeln!(out, "# TYPE rproxy_crowdsec_synced gauge");
+			let _ = writeln!(out, "rproxy_crowdsec_synced {}", u8::from(b.synced()));
+		}
 		out
 	}
 }
@@ -706,6 +722,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut requests = vec![];
 	let mut durations = vec![];
 	let mut limited = vec![];
+	let mut blocked = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
 	for key in keys {
@@ -729,10 +746,19 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 			durations.push(format!("rproxy_http_request_duration_seconds_sum{{{labels}}} {}", c.duration_sum));
 			durations.push(format!("rproxy_http_request_duration_seconds_count{{{labels}}} {total}"));
 		}
+		let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
 		for ((route, middleware), n) in r.rt.http_stats.limited_snapshot() {
-			let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
 			limited.push(format!(
 				"rproxy_http_limited_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",
+				key.protocol,
+				key.listen,
+				esc(&route),
+				esc(&middleware)
+			));
+		}
+		for ((route, middleware), n) in r.rt.http_stats.blocked_snapshot() {
+			blocked.push(format!(
+				"rproxy_http_blocked_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",
 				key.protocol,
 				key.listen,
 				esc(&route),
@@ -748,6 +774,11 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_limited_total HTTP requests of http rules refused by rate_limit / in_flight.");
 	let _ = writeln!(out, "# TYPE rproxy_http_limited_total counter");
 	for line in limited {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_blocked_total HTTP requests of http rules refused by crowdsec.");
+	let _ = writeln!(out, "# TYPE rproxy_http_blocked_total counter");
+	for line in blocked {
 		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
