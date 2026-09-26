@@ -1,0 +1,31 @@
+name: Interop
+
+# 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX）を rproxy の後ろに置いて通す（scripts/interop/）。
+# 時間がかかるので必須のチェックにはしない。データプレーンや試験を変えた PR、毎週、手動で動かす。
+on:
+  pull_request:
+    paths:
+      - src/**
+      - scripts/interop/**
+      - .github/workflows/interop.yml
+  schedule:
+    - cron: "0 18 * * 0"   # 毎週月曜 3:00（JST）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mail:
+    name: mail (Postfix / Dovecot behind STARTTLS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: scripts/interop/mail.sh
