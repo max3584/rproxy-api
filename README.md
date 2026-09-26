@@ -164,15 +164,23 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
    ip rule add iif <転送先側のインターフェース> lookup 100
    ```
 
-2. **クライアントのアドレス範囲が決まっていない場合**（未検証）。
+2. **クライアントのアドレス範囲が決まっていない場合**（`ROUTING=iptables` / `ROUTING=nft` の `scripts/test-transparent.sh` で動作確認済み）。
    rproxy の transparent ソケット宛てのパケットだけに印を付けて、ローカル扱いにする。
 
    ```bash
+   # iptables
    iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
    iptables -t mangle -A PREROUTING -p udp -m socket --transparent -j MARK --set-mark 1
+   # または nftables
+   nft add table ip rproxy
+   nft add chain ip rproxy prerouting '{ type filter hook prerouting priority mangle; }'
+   nft add rule ip rproxy prerouting socket transparent 1 meta mark set 1
+
    ip rule add fwmark 1 lookup 100
    ip route add local 0.0.0.0/0 dev lo table 100
    ```
+
+   再起動後も残すには、nftables なら `/etc/nftables.conf` に、`ip rule` / `ip route` は `rproxy-transparent-routing` と同じように起動時に設定する。
 
 どちらの場合も、転送先のデフォルトゲートウェイを rproxy のホストにする（または転送先側でクライアント宛ての経路を rproxy に向ける）必要がある。
 使えるかどうかは `GET /capabilities` で確認できる。
