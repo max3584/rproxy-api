@@ -76,7 +76,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## TLS まわりの約束
 
-- 証明書ファイルは作成・変更・SIGHUP のときだけ読む。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う。
+- 証明書ファイルは作成・変更・SIGHUP と、`RPROXY_CERT_CHECK_SECS` ごとの確認で変わっていたときだけ読む（`Registry::reload_changed_tls`、`tlsconf::fingerprint`）。ACME は内蔵しない方針（証明書は外部のツールで取る）。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う。
 - STARTTLS では、STARTTLS への応答より前に届いた余分なデータを受け付けない（コマンドの紛れ込み対策）。
 - WebRTC のメディア（DTLS-SRTP）は終端できない（SDP のフィンガープリントに結びついているため）。docs/PROFILES.md に書いてあるとおり passthrough で流す。
 - 設定の例と用途別の推奨は `docs/PROFILES.md`。UI のプロファイルもこれに合わせる。

@@ -367,3 +367,49 @@ async fn reload_picks_up_renewed_certificates_and_patch_changes_tls() {
 	let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
 	assert_eq!(roundtrip(&mut s, "plain").await, "R:plain");
 }
+
+#[tokio::test]
+async fn changed_certificate_files_are_noticed() {
+	use std::collections::HashMap;
+	let pki = Pki::new("watch");
+	let first = pki.server("front", &["one.test"]);
+	// cert-manager / Kubernetes secrets: the path is a symbolic link that gets swapped
+	let dir = std::path::Path::new(&first.cert_file).parent().unwrap().join("live");
+	std::fs::create_dir_all(&dir).unwrap();
+	let (cert, key) = (dir.join("tls.crt"), dir.join("tls.key"));
+	std::os::unix::fs::symlink(&first.cert_file, &cert).unwrap();
+	std::os::unix::fs::symlink(&first.key_file, &key).unwrap();
+
+	let h = harness().await;
+	let port = free_port();
+	let backend = tcp_backend("W:").await;
+	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]});
+	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let mut seen = HashMap::new();
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0), "the first check only records");
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0), "nothing changed");
+	assert!(tls_roundtrip(&pki, port, "one.test", None, "1").await.is_ok());
+
+	// renewed in place (certbot)
+	let second = pki.server("front", &["two.test"]);
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (1, 0));
+	assert_eq!(tls_roundtrip(&pki, port, "two.test", None, "2").await.unwrap(), "W:2");
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0));
+
+	// half-written: the key no longer matches; the current certificate stays
+	std::fs::write(&second.key_file, "not a key").unwrap();
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 1));
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 1), "tried again on the next check");
+	assert_eq!(tls_roundtrip(&pki, port, "two.test", None, "3").await.unwrap(), "W:3");
+
+	// the links are swapped to a new pair
+	let third = pki.server("other", &["three.test"]);
+	for (link, target) in [(&cert, &third.cert_file), (&key, &third.key_file)] {
+		let tmp = link.with_extension("new");
+		std::os::unix::fs::symlink(target, &tmp).unwrap();
+		std::fs::rename(&tmp, link).unwrap();
+	}
+	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (1, 0));
+	assert_eq!(tls_roundtrip(&pki, port, "three.test", None, "4").await.unwrap(), "W:4");
+}

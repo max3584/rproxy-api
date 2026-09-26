@@ -123,6 +123,13 @@ struct Prepared {
 	http: Option<Arc<crate::http::server::Router>>,
 }
 
+/// What `Registry::reload_changed_tls` last saw of a rule's certificate files.
+#[derive(Debug, Clone, Copy)]
+pub struct FileState {
+	loaded: u64,
+	failed: Option<u64>,
+}
+
 pub struct Registry {
 	cfg: Config,
 	rules: Mutex<HashMap<Key, Entry>>,
@@ -531,6 +538,52 @@ impl Registry {
 				Err(e) => {
 					failed += 1;
 					warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
+				}
+			}
+		}
+		(ok, failed)
+	}
+
+	/// Re-reads the certificate files of rules whose files changed since the last
+	/// call (renewed by certbot, cert-manager, ...). `seen` holds each rule's
+	/// fingerprint between calls; a rule seen for the first time is only recorded.
+	/// Files that do not load (a half-written renewal) keep the current
+	/// certificates and are tried again on the next call.
+	pub async fn reload_changed_tls(&self, seen: &mut HashMap<Key, FileState>) -> (usize, usize) {
+		let rules = self.rules.lock().await;
+		seen.retain(|k, _| matches!(rules.get(k), Some(Entry::Running(_))));
+		let (mut ok, mut failed) = (0, 0);
+		for (key, entry) in rules.iter() {
+			let Entry::Running(r) = entry else { continue };
+			let tls = r.spec.runtime_tls();
+			let files = tls.files();
+			if files.is_empty() {
+				seen.remove(key);
+				continue;
+			}
+			let now = tlsconf::fingerprint(files.iter().copied());
+			let state = match seen.get_mut(key) {
+				None => {
+					seen.insert(*key, FileState { loaded: now, failed: None });
+					continue;
+				}
+				Some(s) if s.loaded == now => continue,
+				Some(s) => s,
+			};
+			match TlsRuntime::build(key.protocol, &tls, r.spec.starttls, r.spec.starttls_required) {
+				Ok(built) => {
+					*r.rt.tls.write().unwrap() = Arc::new(built);
+					*state = FileState { loaded: now, failed: None };
+					ok += 1;
+					info!(event = "reload.tls", rule = %key, reason = "files changed");
+				}
+				Err(e) => {
+					failed += 1;
+					// once per version of the files, not on every check
+					if state.failed != Some(now) {
+						warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
+						state.failed = Some(now);
+					}
 				}
 			}
 		}

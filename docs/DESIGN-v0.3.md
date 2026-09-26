@@ -123,6 +123,8 @@ http:
 
 ## 4. TLS の追加（#17、#66）
 
+> ACME（#17）は v0.3.2 の時点で**内蔵しない**ことにした。証明書の取得・更新は certbot / cert-manager などに任せ、rproxy はファイルの変更を検知して読み直す（`RPROXY_CERT_CHECK_SECS`）。下の `acme` の形は v0.3.0 で決めたので残すが、`features.acme` は false のままで、指定すると `unsupported` になる。
+
 ```yaml
 tls:
   mode: terminate
