@@ -13,7 +13,8 @@ work=$(mktemp -d)
 trap 'kill "$http" 2>/dev/null || true; rm -rf "$work"' EXIT
 
 fail() { echo "FAIL: $*" >&2; sudo journalctl -u rproxy-api --no-pager -n 50 >&2 || true; exit 1; }
-api() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(sudo cat /etc/rproxy/tokens)" "http://127.0.0.1:8080$1"; }
+PORT=8080 # read from rproxy.env after the install
+api() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(sudo cat /etc/rproxy/tokens)" "http://127.0.0.1:$PORT$1"; }
 wait_api() {
 	for _ in $(seq 50); do
 		[ "$(api /rules)" = 200 ] && return 0
@@ -22,8 +23,14 @@ wait_api() {
 	fail "API did not answer with the generated token"
 }
 
-echo "== install from the file"
+echo "== install from the file, with 8080 taken (as by CrowdSec's local API)"
+python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
+blocker=$!
+sleep 0.5
 sudo apt-get install -y "$deb"
+kill $blocker
+PORT=$(sudo sed -n 's/^RPROXY_API_PORT=//p' /etc/rproxy/rproxy.env)
+[ "$PORT" = 8081 ] || fail "the control API did not move off the busy port 8080 (RPROXY_API_PORT=$PORT)"
 getent passwd rproxy >/dev/null || fail "no rproxy user"
 [ "$(sudo stat -c '%a %U:%G' /etc/rproxy/tokens)" = "640 root:rproxy" ] || fail "tokens file mode/owner"
 [ "$(sudo stat -c '%a %U:%G' /etc/rproxy)" = "750 root:rproxy" ] || fail "/etc/rproxy mode/owner"
@@ -37,16 +44,16 @@ token=$(sudo cat /etc/rproxy/tokens)
 echo "== start"
 sudo systemctl enable --now rproxy-api
 wait_api
-[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/rules)" = 401 ] || fail "API answered without a token"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/rules")" = 401 ] || fail "API answered without a token"
 # the unit's capability lets it listen below 1024 as the rproxy user
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
 	-d '{"protocol":"tcp","listen_addr":"127.0.0.1","listen_port":25,"remote_addr":"127.0.0.1","remote_port":2525}' \
-	http://127.0.0.1:8080/rules)
+	"http://127.0.0.1:$PORT/rules")
 [ "$code" = 201 ] || fail "could not open port 25 (HTTP $code)"
 [ "$(ps -o user= -C rproxy-api | tr -d ' ')" = rproxy ] || fail "not running as rproxy"
 # the default configuration logs to /var/log/rproxy (JSON Lines, rotated by rproxy itself)
 sudo sh -c 'head -n1 /var/log/rproxy/rproxy.*.log' | grep -q '"event"' || fail "no JSON log in /var/log/rproxy"
-curl -s -H "Authorization: Bearer $token" http://127.0.0.1:8080/capabilities | grep -q '"transparent":true' ||
+curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/capabilities" | grep -q '"transparent":true' ||
 	fail "source_ip transparent is not available (CAP_NET_ADMIN)"
 sudo systemctl reload rproxy-api
 sleep 0.5

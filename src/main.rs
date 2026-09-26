@@ -381,16 +381,46 @@ impl ApiListener {
 		Ok(())
 	}
 
-	async fn retry(self, every: Duration, stop: CancellationToken) {
+	/// Tries again after `first`, then doubles the wait up to five minutes, so
+	/// a port that stays taken does not fill the log.
+	async fn retry(self, first: Duration, stop: CancellationToken) {
+		let mut wait = first;
 		loop {
 			tokio::select! {
 				_ = stop.cancelled() => return,
-				_ = tokio::time::sleep(every) => {}
+				_ = tokio::time::sleep(wait) => {}
 			}
 			match self.start().await {
 				Ok(()) => return,
-				Err(e) => warn!(event = "api.retry", addr = %self.addr, error = %e),
+				Err(e) => {
+					wait = next_retry(wait, first);
+					warn!(event = "api.retry", addr = %self.addr, error = %e, next_retry_secs = wait.as_secs());
+				}
 			}
 		}
+	}
+}
+
+const MAX_API_RETRY: Duration = Duration::from_secs(300);
+
+/// The next wait between attempts: doubled, at most five minutes (or `first` if that is longer).
+fn next_retry(wait: Duration, first: Duration) -> Duration {
+	(wait * 2).min(MAX_API_RETRY.max(first))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn api_retries_back_off_to_five_minutes() {
+		let first = Duration::from_secs(10);
+		let mut wait = first;
+		let mut waits = vec![];
+		for _ in 0..8 {
+			wait = next_retry(wait, first);
+			waits.push(wait.as_secs());
+		}
+		assert_eq!(waits, [20, 40, 80, 160, 300, 300, 300, 300]);
 	}
 }
