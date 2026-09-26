@@ -48,6 +48,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## 設計上の約束
 
+- 起動時に止めるのは設定のエラー（値の誤り、存在しないパス、ファイルの中身の誤り）だけ。権限・使用中のポート・DB など環境の問題では、使えない部分だけを止めて起動を続け、`event = "degraded"`（`part` で箇所）をログに出す（README の「起動できないものがあるとき」、`tests/startup.rs`）。トークンが読めないときに認証なしにはしない（API を閉じる）。
+
 - ルールの状態は `Registry` だけが持つ。タスクの `JoinHandle` を捨てない。
 - 停止は `stop`（受け付け停止）→ 任意の drain → `kill`（既存接続の切断）の順。`delete` は listener が閉じ、全接続が終わってから返る。
 - 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。
@@ -59,6 +61,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - `allow_from` は受け付けた直後（TLS や PROXY ヘッダより前）に確かめる。UDP は範囲外のデータグラムを捨てる。拒否は `stats.denied` に数え、`conn.denied` をログに出す。
 - `tls.unmatched: reject` の `terminate` は、`LazyConfigAcceptor` で ClientHello を読んでから判断する（一致しない名前には証明書を返さない）。
 - 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作る。API からの変更・削除は `409 static`。`shutdown` だけは止める。
+- PR のブランチに追加で push する前に、その PR がまだ開いているか（`gh pr view <n> --json state`）を確かめる。マージ後に push したコミットは master に入らない（#20/#22、#32 で起きた）。
 - 文字列の置き換えでコードを編集するときは、置き換えの対象が 1 件見つかることを確かめる（見つからないまま空振りして、修正が入っていなかったことがある）。
 
 ## TLS まわりの約束
