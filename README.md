@@ -74,7 +74,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 |---|---|
 | ログのディレクトリに書けない | 標準出力にログを出す（`part: log`） |
 | トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP すると解除（`part: tokens`） |
-| 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを 10 秒ごとに開き直す（`part: api_tls` / `part: api`） |
+| 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを開き直す（10 秒後から間隔を倍々に延ばし、最大 5 分）（`part: api_tls` / `part: api`） |
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |

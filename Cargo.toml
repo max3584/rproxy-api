@@ -1,6 +1,6 @@
 [package]
 name = "rproxy-api"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
 description = "L4 TCP/UDP forwarder managed through an HTTP API"
