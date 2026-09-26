@@ -82,6 +82,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP すると解除（`part: tokens`） |
 | 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを開き直す（10 秒後から間隔を倍々に延ばし、最大 5 分）（`part: api_tls` / `part: api`） |
 | 制御 API の Unix ソケットを作れない（権限、別のプロセスが使用中） | ソケットなしで起動する（`part: api_socket`） |
+| `http.http3` のルールの UDP のポートを使えない（使用中、権限） | そのルールは TCP（HTTP/1.1・HTTP/2）だけで動く。`stats.http.http3` に理由が出る（`part: http3`） |
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | `global.access_log` のディレクトリに書き込めない | アクセスログをメインのログに出す（`part: global.access_log`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
@@ -206,7 +207,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止 |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `audit` | 制御 API での変更（トークンの名前、操作、ルール、結果）と、権限不足で断ったリクエスト |
-| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など |
+| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic` |
+| `http3.listening` | `http.http3` のルールが UDP で HTTP/3 を受け始めた |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |

@@ -87,6 +87,8 @@ pub struct Runtime {
 	pub global: Arc<crate::http::access::HttpGlobal>,
 	/// Requests of an `http` rule by route.
 	pub http_stats: crate::http::access::HttpStats,
+	/// HTTP/3 of an `http` rule with `http3` (QUIC over UDP on the same address and port).
+	pub h3: crate::http::h3::H3State,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// Stops accepting new connections.

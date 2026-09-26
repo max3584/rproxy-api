@@ -198,7 +198,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 
 | 項目 | 場所 | 形 | features |
 |---|---|---|---|
-| L7 のルーティング | ルールの `http` | `routes`（`name`、`match`、`priority`、`service` か `to`、`middlewares`）、`default`、`services`、`middlewares`、`http3` | `http`（v0.3.1 から）、`http3`、`middlewares` |
+| L7 のルーティング | ルールの `http` | `routes`（`name`、`match`、`priority`、`service` か `to`、`middlewares`）、`default`、`services`、`middlewares`、`http3` | `http`（v0.3.1 から）、`http3`（v0.3.2 から）、`middlewares` |
 | サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky` | `http`。`health_check` / `sticky` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
@@ -211,6 +211,15 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - 鍵交換の曲線と、一致しない SNI を断る設定（Traefik の sniStrict。rproxy では `tls.unmatched: reject`）は `options` にはない。
   - 決まった版と暗号スイートは `conn.open` の `tls_version` / `tls_cipher` に出る。
 - `http` は `protocol: tcp` で、`tls.mode` が `terminate`（HTTPS）か、TLS なし（平文の HTTP）のときだけ。`sni`・`starttls`・ポート範囲とは組み合わせられない。`remote_addr` / `remote_port` は書かない（書くと `400 invalid`）。
+- `http.http3: true`（v0.3.2）で、同じアドレス・ポートの UDP でも QUIC + HTTP/3 を受ける。
+  - `tls.mode: terminate` のときだけ（TLS なしなら `400 tls_config`）。`source_ip: transparent` とは組み合わせられない（`unsupported`）。
+  - 証明書・クライアント認証（`client_auth`）は TCP と同じもの。QUIC は TLS 1.3 だけなので、`tls.options.cipher_suites` に TLS 1.3 の暗号スイートが要る（`TLS13_AES_128_GCM_SHA256` がないと QUIC の初期化に使えない）。証明書の読み直し（SIGHUP、`RPROXY_CERT_CHECK_SECS`）は新しい QUIC 接続から効く。
+  - リクエストは HTTP/1.1・HTTP/2 と同じルート・ミドルウェア・転送先に渡る（転送先へは HTTP/1.1）。本文は流しながら送る。アクセスログの `protocol` は `HTTP/3.0`。
+  - `allow_from` とルールの `crowdsec` は QUIC の接続を受ける前に確かめる（`conn.denied`、`transport: quic`）。
+  - TCP 側（HTTP/1.1・HTTP/2）の応答には `Alt-Svc: h3=":<ポート>"; ma=86400` を付ける（転送先が `Alt-Svc` を返したときはそのまま）。HTTP/3 を受けていないあいだは付けない。
+  - UDP のポートを使えない（使用中・権限）、または TLS の設定が QUIC に使えないときは、ルールは TCP だけで動き、`stats.http.http3` に `{"listening": false, "error": "..."}` と出る（ログは `event: degraded`、`part: http3`）。受けているときは `{"listening": true}`。`http3` のないルールには `http3` の項目がない。
+  - `PATCH` で `http3` を付け外しすると、UDP の待ち受けを始める・止める（止めると開いている QUIC 接続は切る）。受けられなかったルールは、`http3: true` のまま `http` を PATCH するともう一度試す。ルールを削除すると UDP のポートも閉じる。
+  - ファイアウォールでは TCP と同じポートの UDP も開ける。
 - `PATCH` で `http` を付けると、L7 の設定を丸ごと置き換える（次のリクエストから）。`http` のないルールに `PATCH` で `http` を付けることはできない（`unsupported`。作り直す）。
 
 ### `http` のルールの動き（v0.3.1）
@@ -257,7 +266,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`rules:read` |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |

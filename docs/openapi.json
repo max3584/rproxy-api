@@ -1170,6 +1170,22 @@
        },
        "additionalProperties": false
       }
+     },
+     "http3": {
+      "type": "object",
+      "description": "Rules with http.http3: whether HTTP/3 (QUIC) is answered on the UDP port, and why not.",
+      "properties": {
+       "listening": {
+        "type": "boolean"
+       },
+       "error": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "listening"
+      ],
+      "additionalProperties": false
      }
     }
    },

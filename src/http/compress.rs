@@ -200,9 +200,9 @@ struct Compressed {
 
 impl hyper::body::Body for Compressed {
 	type Data = Bytes;
-	type Error = hyper::Error;
+	type Error = super::server::BoxError;
 
-	fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+	fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, super::server::BoxError>>> {
 		let this = self.get_mut();
 		loop {
 			let Some(encoder) = this.encoder.as_mut() else {

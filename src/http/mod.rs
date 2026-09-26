@@ -7,6 +7,7 @@ pub mod crowdsec;
 pub mod limit;
 pub mod backend;
 pub mod compress;
+pub mod h3;
 pub mod matcher;
 pub mod resilience;
 pub mod middleware;
