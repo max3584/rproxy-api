@@ -1,0 +1,1985 @@
+{
+ "openapi": "3.0.3",
+ "info": {
+  "title": "rproxy-api control API",
+  "version": "see GET /capabilities and the release",
+  "description": "The contract is docs/API.md; this document follows it."
+ },
+ "servers": [
+  {
+   "url": "http://127.0.0.1:8080"
+  }
+ ],
+ "security": [
+  {
+   "bearer": []
+  }
+ ],
+ "components": {
+  "securitySchemes": {
+   "bearer": {
+    "type": "http",
+    "scheme": "bearer"
+   }
+  },
+  "schemas": {
+   "Error": {
+    "type": "object",
+    "properties": {
+     "error": {
+      "type": "string"
+     },
+     "code": {
+      "type": "string",
+      "enum": [
+       "invalid",
+       "tls_config",
+       "unsupported",
+       "not_found",
+       "already_exists",
+       "static",
+       "reserved",
+       "bind_failed",
+       "resolve_failed",
+       "unauthorized",
+       "forbidden",
+       "internal"
+      ]
+     }
+    },
+    "description": "Every error response. `code` is stable; `error` is for people.",
+    "required": [
+     "error",
+     "code"
+    ],
+    "additionalProperties": false
+   },
+   "Protocol": {
+    "type": "string",
+    "enum": [
+     "tcp",
+     "udp"
+    ],
+    "description": "Case-insensitive on input."
+   },
+   "SourceIp": {
+    "type": "string",
+    "enum": [
+     "proxy",
+     "proxy_v1",
+     "proxy_v2",
+     "transparent"
+    ]
+   },
+   "StartTls": {
+    "type": "string",
+    "enum": [
+     "smtp",
+     "imap",
+     "pop3"
+    ]
+   },
+   "TlsRoute": {
+    "type": "object",
+    "properties": {
+     "server_name": {
+      "type": "string"
+     },
+     "remote_addr": {
+      "type": "string"
+     },
+     "remote_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     }
+    },
+    "required": [
+     "server_name",
+     "remote_addr",
+     "remote_port"
+    ],
+    "additionalProperties": false
+   },
+   "Certificate": {
+    "type": "object",
+    "properties": {
+     "cert_file": {
+      "type": "string"
+     },
+     "chain_file": {
+      "type": "string"
+     },
+     "key_file": {
+      "type": "string"
+     },
+     "acme": {
+      "type": "string",
+      "description": "Not built in (always unsupported); use files from certbot / cert-manager."
+     },
+     "domains": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "additionalProperties": false
+   },
+   "ClientAuth": {
+    "type": "object",
+    "properties": {
+     "mode": {
+      "type": "string",
+      "enum": [
+       "none",
+       "optional",
+       "required"
+      ]
+     },
+     "ca_file": {
+      "type": "string"
+     },
+     "chain_file": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   },
+   "Upstream": {
+    "type": "object",
+    "properties": {
+     "tls": {
+      "type": "boolean"
+     },
+     "server_name": {
+      "type": "string"
+     },
+     "ca_file": {
+      "type": "string"
+     },
+     "insecure_skip_verify": {
+      "type": "boolean"
+     },
+     "cert_file": {
+      "type": "string"
+     },
+     "chain_file": {
+      "type": "string"
+     },
+     "key_file": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   },
+   "TlsOptions": {
+    "type": "object",
+    "properties": {
+     "min_version": {
+      "type": "string",
+      "enum": [
+       "1.2",
+       "1.3"
+      ]
+     },
+     "cipher_suites": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "additionalProperties": false
+   },
+   "Tls": {
+    "type": "object",
+    "properties": {
+     "mode": {
+      "type": "string",
+      "enum": [
+       "passthrough",
+       "sni",
+       "terminate"
+      ]
+     },
+     "routes": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/TlsRoute"
+      }
+     },
+     "certificates": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Certificate"
+      }
+     },
+     "client_auth": {
+      "$ref": "#/components/schemas/ClientAuth"
+     },
+     "alpn": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "upstream": {
+      "$ref": "#/components/schemas/Upstream"
+     },
+     "unmatched": {
+      "type": "string",
+      "enum": [
+       "default",
+       "reject"
+      ]
+     },
+     "options": {
+      "$ref": "#/components/schemas/TlsOptions"
+     }
+    },
+    "additionalProperties": false
+   },
+   "HttpRoute": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "match": {
+      "type": "string",
+      "description": "Traefik rule syntax: Host, HostRegexp, Path, PathPrefix, PathRegexp, Method, Header, HeaderRegexp, Query, QueryRegexp, ClientIP with &&, ||, ! and parentheses."
+     },
+     "priority": {
+      "type": "integer"
+     },
+     "service": {
+      "type": "string"
+     },
+     "to": {
+      "type": "string",
+      "format": "uri"
+     },
+     "middlewares": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "name",
+     "match"
+    ],
+    "additionalProperties": false
+   },
+   "HttpDefault": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 599
+     },
+     "service": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   },
+   "HttpService": {
+    "type": "object",
+    "properties": {
+     "servers": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "url": {
+         "type": "string",
+         "format": "uri"
+        },
+        "weight": {
+         "type": "integer",
+         "minimum": 0
+        }
+       },
+       "required": [
+        "url"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "health_check": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "interval": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ],
+      "additionalProperties": false
+     },
+     "sticky": {
+      "type": "object",
+      "properties": {
+       "cookie": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "cookie"
+      ],
+      "additionalProperties": false
+     },
+     "pass_host_header": {
+      "type": "boolean"
+     },
+     "timeouts": {
+      "type": "object",
+      "properties": {
+       "connect": {
+        "type": "string"
+       },
+       "response": {
+        "type": "string"
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "servers"
+    ],
+    "additionalProperties": false
+   },
+   "HeaderOps": {
+    "type": "object",
+    "properties": {
+     "set": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "type": "string"
+      }
+     },
+     "remove": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "additionalProperties": false
+   },
+   "Middleware": {
+    "description": "Exactly one kind: `{kind: {settings}}`. Kinds this build runs: GET /capabilities features.middlewares.",
+    "oneOf": [
+     {
+      "type": "object",
+      "properties": {
+       "redirect_scheme": {
+        "type": "object",
+        "properties": {
+         "scheme": {
+          "type": "string"
+         },
+         "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+         },
+         "permanent": {
+          "type": "boolean"
+         }
+        },
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "redirect_scheme"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "redirect_regex": {
+        "type": "object",
+        "properties": {
+         "regex": {
+          "type": "string"
+         },
+         "replacement": {
+          "type": "string"
+         },
+         "permanent": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "regex",
+         "replacement"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "redirect_regex"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "rate_limit": {
+        "type": "object",
+        "properties": {
+         "average": {
+          "type": "integer",
+          "minimum": 1
+         },
+         "period": {
+          "type": "string"
+         },
+         "burst": {
+          "type": "integer"
+         },
+         "source": {
+          "type": "string",
+          "description": "ip or header:<name>"
+         }
+        },
+        "required": [
+         "average"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "rate_limit"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "in_flight": {
+        "type": "object",
+        "properties": {
+         "amount": {
+          "type": "integer",
+          "minimum": 1
+         }
+        },
+        "required": [
+         "amount"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "in_flight"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "crowdsec": {
+        "type": "object",
+        "properties": {
+         "appsec": {
+          "type": "boolean"
+         },
+         "on_error": {
+          "type": "string",
+          "enum": [
+           "allow",
+           "block"
+          ]
+         }
+        },
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "crowdsec"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "ip_allow": {
+        "type": "object",
+        "properties": {
+         "source_range": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "source_range"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "ip_allow"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "headers": {
+        "type": "object",
+        "properties": {
+         "request": {
+          "$ref": "#/components/schemas/HeaderOps"
+         },
+         "response": {
+          "$ref": "#/components/schemas/HeaderOps"
+         },
+         "hsts": {
+          "type": "object",
+          "properties": {
+           "max_age": {
+            "type": "integer"
+           },
+           "include_subdomains": {
+            "type": "boolean"
+           },
+           "preload": {
+            "type": "boolean"
+           }
+          },
+          "required": [
+           "max_age"
+          ],
+          "additionalProperties": false
+         },
+         "frame_deny": {
+          "type": "boolean"
+         },
+         "content_type_nosniff": {
+          "type": "boolean"
+         },
+         "referrer_policy": {
+          "type": "string"
+         },
+         "csp": {
+          "type": "string"
+         },
+         "cors": {
+          "type": "object",
+          "properties": {
+           "allow_origins": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            }
+           },
+           "allow_methods": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            }
+           },
+           "allow_headers": {
+            "type": "array",
+            "items": {
+             "type": "string"
+            }
+           },
+           "allow_credentials": {
+            "type": "boolean"
+           },
+           "max_age": {
+            "type": "integer"
+           }
+          },
+          "required": [
+           "allow_origins"
+          ],
+          "additionalProperties": false
+         }
+        },
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "headers"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "forward_auth": {
+        "type": "object",
+        "properties": {
+         "address": {
+          "type": "string"
+         },
+         "response_headers": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "trust_forward_header": {
+          "type": "boolean"
+         }
+        },
+        "required": [
+         "address"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "forward_auth"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "oidc": {
+        "type": "object",
+        "properties": {
+         "issuer": {
+          "type": "string"
+         },
+         "client_id": {
+          "type": "string"
+         },
+         "client_secret_file": {
+          "type": "string"
+         },
+         "scopes": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "cookie_secret_file": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "issuer",
+         "client_id",
+         "client_secret_file",
+         "cookie_secret_file"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "oidc"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "basic_auth": {
+        "type": "object",
+        "properties": {
+         "users_file": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "users_file"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "basic_auth"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "strip_prefix": {
+        "type": "object",
+        "properties": {
+         "prefixes": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "prefixes"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "strip_prefix"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "add_prefix": {
+        "type": "object",
+        "properties": {
+         "prefix": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "prefix"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "add_prefix"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "replace_path": {
+        "type": "object",
+        "properties": {
+         "path": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "path"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "replace_path"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "replace_path_regex": {
+        "type": "object",
+        "properties": {
+         "regex": {
+          "type": "string"
+         },
+         "replacement": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "regex",
+         "replacement"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "replace_path_regex"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "compress": {
+        "type": "object",
+        "properties": {
+         "encodings": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "min_size": {
+          "type": "integer"
+         }
+        },
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "compress"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "buffering": {
+        "type": "object",
+        "properties": {
+         "max_request_body": {
+          "type": "integer"
+         }
+        },
+        "required": [
+         "max_request_body"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "buffering"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "retry": {
+        "type": "object",
+        "properties": {
+         "attempts": {
+          "type": "integer"
+         },
+         "initial_interval": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "attempts"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "retry"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "circuit_breaker": {
+        "type": "object",
+        "properties": {
+         "failure_percent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+         },
+         "window": {
+          "type": "string"
+         },
+         "recovery": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "failure_percent",
+         "window",
+         "recovery"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "circuit_breaker"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "errors": {
+        "type": "object",
+        "properties": {
+         "status": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "service": {
+          "type": "string"
+         },
+         "path": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "status",
+         "service",
+         "path"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "errors"
+      ],
+      "additionalProperties": false
+     },
+     {
+      "type": "object",
+      "properties": {
+       "respond": {
+        "type": "object",
+        "properties": {
+         "status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+         },
+         "body": {
+          "type": "string"
+         },
+         "content_type": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "status"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "required": [
+       "respond"
+      ],
+      "additionalProperties": false
+     }
+    ]
+   },
+   "Http": {
+    "type": "object",
+    "properties": {
+     "http3": {
+      "type": "boolean"
+     },
+     "routes": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/HttpRoute"
+      }
+     },
+     "default": {
+      "$ref": "#/components/schemas/HttpDefault"
+     },
+     "services": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "$ref": "#/components/schemas/HttpService"
+      }
+     },
+     "middlewares": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "$ref": "#/components/schemas/Middleware"
+      }
+     }
+    },
+    "description": "L7 routing of a tcp rule (plain HTTP or tls.mode terminate).",
+    "additionalProperties": false
+   },
+   "RuleRequest": {
+    "type": "object",
+    "properties": {
+     "protocol": {
+      "$ref": "#/components/schemas/Protocol"
+     },
+     "listen_addr": {
+      "type": "string"
+     },
+     "listen_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "listen_port_end": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "remote_addr": {
+      "type": "string",
+      "description": "Left out on http rules."
+     },
+     "remote_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "source_ip": {
+      "$ref": "#/components/schemas/SourceIp"
+     },
+     "udp_idle_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+     },
+     "tls": {
+      "$ref": "#/components/schemas/Tls"
+     },
+     "starttls": {
+      "$ref": "#/components/schemas/StartTls"
+     },
+     "starttls_required": {
+      "type": "boolean"
+     },
+     "allow_from": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 64
+     },
+     "http": {
+      "$ref": "#/components/schemas/Http"
+     }
+    },
+    "required": [
+     "protocol",
+     "listen_addr",
+     "listen_port"
+    ],
+    "additionalProperties": false
+   },
+   "RulePatch": {
+    "type": "object",
+    "properties": {
+     "remote_addr": {
+      "type": "string"
+     },
+     "remote_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "udp_idle_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+     },
+     "source_ip": {
+      "$ref": "#/components/schemas/SourceIp"
+     },
+     "tls": {
+      "$ref": "#/components/schemas/Tls"
+     },
+     "starttls": {
+      "$ref": "#/components/schemas/StartTls"
+     },
+     "starttls_required": {
+      "type": "boolean"
+     },
+     "listen_port_end": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "allow_from": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 64
+     },
+     "http": {
+      "$ref": "#/components/schemas/Http"
+     }
+    },
+    "additionalProperties": false
+   },
+   "HttpStats": {
+    "type": "object",
+    "properties": {
+     "requests": {
+      "type": "integer"
+     },
+     "by_status": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "type": "integer"
+      }
+     },
+     "limited": {
+      "type": "integer"
+     },
+     "blocked": {
+      "type": "integer"
+     },
+     "routes": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "type": "object",
+       "properties": {
+        "requests": {
+         "type": "integer"
+        },
+        "by_status": {
+         "type": "object",
+         "properties": {},
+         "additionalProperties": {
+          "type": "integer"
+         }
+        },
+        "limited": {
+         "type": "object",
+         "properties": {},
+         "additionalProperties": {
+          "type": "integer"
+         }
+        },
+        "blocked": {
+         "type": "object",
+         "properties": {},
+         "additionalProperties": {
+          "type": "integer"
+         }
+        }
+       },
+       "additionalProperties": false
+      }
+     }
+    }
+   },
+   "RuleStats": {
+    "type": "object",
+    "properties": {
+     "total_connections": {
+      "type": "integer"
+     },
+     "rx_bytes": {
+      "type": "integer"
+     },
+     "tx_bytes": {
+      "type": "integer"
+     },
+     "tls_failures": {
+      "type": "integer"
+     },
+     "denied": {
+      "type": "integer"
+     },
+     "http": {
+      "$ref": "#/components/schemas/HttpStats"
+     }
+    }
+   },
+   "Rule": {
+    "type": "object",
+    "properties": {
+     "protocol": {
+      "$ref": "#/components/schemas/Protocol"
+     },
+     "listen_addr": {
+      "type": "string"
+     },
+     "listen_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "listen_port_end": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "nullable": true
+     },
+     "remote_addr": {
+      "type": "string"
+     },
+     "remote_port": {
+      "type": "integer"
+     },
+     "source_ip": {
+      "$ref": "#/components/schemas/SourceIp"
+     },
+     "udp_idle_secs": {
+      "type": "integer"
+     },
+     "tls": {
+      "$ref": "#/components/schemas/Tls"
+     },
+     "starttls": {
+      "$ref": "#/components/schemas/StartTls"
+     },
+     "starttls_required": {
+      "type": "boolean"
+     },
+     "allow_from": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "http": {
+      "$ref": "#/components/schemas/Http"
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "dynamic",
+       "static"
+      ]
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "running",
+       "failed"
+      ]
+     },
+     "error": {
+      "type": "string",
+      "nullable": true
+     },
+     "resolved": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "connections": {
+      "type": "integer"
+     },
+     "stats": {
+      "$ref": "#/components/schemas/RuleStats"
+     },
+     "started_at": {
+      "type": "integer",
+      "nullable": true
+     }
+    },
+    "description": "Fields may be added in patch releases."
+   },
+   "Capabilities": {
+    "type": "object",
+    "properties": {
+     "source_ip": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/SourceIp"
+      }
+     },
+     "transparent": {
+      "type": "boolean"
+     },
+     "transparent_ipv6": {
+      "type": "boolean"
+     },
+     "tls_modes": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "dtls": {
+      "type": "boolean"
+     },
+     "starttls": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/StartTls"
+      }
+     },
+     "max_range_ports": {
+      "type": "integer"
+     },
+     "features": {
+      "type": "object",
+      "properties": {
+       "http": {
+        "type": "boolean"
+       },
+       "http3": {
+        "type": "boolean"
+       },
+       "acme": {
+        "type": "boolean"
+       },
+       "tls_options": {
+        "type": "boolean"
+       },
+       "middlewares": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "services": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   "Interfaces": {
+    "type": "object",
+    "properties": {
+     "interfaces": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "addr": {
+         "type": "string"
+        },
+        "family": {
+         "type": "string",
+         "enum": [
+          "ipv4",
+          "ipv6"
+         ]
+        },
+        "loopback": {
+         "type": "boolean"
+        },
+        "link_local": {
+         "type": "boolean"
+        }
+       }
+      }
+     },
+     "reserved": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "protocol": {
+         "type": "string"
+        },
+        "addr": {
+         "type": "string"
+        },
+        "port": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 65535
+        },
+        "purpose": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   },
+   "ConfigStatus": {
+    "type": "object",
+    "properties": {
+     "configured": {
+      "type": "boolean"
+     },
+     "path": {
+      "type": "string"
+     },
+     "files": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "loaded_at": {
+      "type": "integer",
+      "nullable": true
+     },
+     "rules": {
+      "type": "integer"
+     },
+     "last_reload": {
+      "type": "object",
+      "properties": {
+       "added": {
+        "type": "integer"
+       },
+       "removed": {
+        "type": "integer"
+       },
+       "changed": {
+        "type": "integer"
+       },
+       "unchanged": {
+        "type": "integer"
+       },
+       "failed": {
+        "type": "integer"
+       }
+      },
+      "nullable": true,
+      "additionalProperties": false
+     },
+     "error": {
+      "type": "string",
+      "nullable": true
+     },
+     "restart_needed": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  }
+ },
+ "paths": {
+  "/healthz": {
+   "get": {
+    "summary": "Liveness (no token)",
+    "security": [],
+    "responses": {
+     "200": {
+      "description": "ok",
+      "content": {
+       "text/plain": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/capabilities": {
+   "get": {
+    "summary": "What this build and host can do (any valid token)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Capabilities"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/openapi.json": {
+   "get": {
+    "summary": "This document (any valid token)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "object",
+         "properties": {}
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/interfaces": {
+   "get": {
+    "summary": "Addresses rules can listen on (rules:read)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Interfaces"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/config": {
+   "get": {
+    "summary": "State of the settings file RPROXY_CONFIG (rules:read)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ConfigStatus"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/rules": {
+   "get": {
+    "summary": "All rules (rules:read)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "type": "array",
+         "items": {
+          "$ref": "#/components/schemas/Rule"
+         }
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "post": {
+    "summary": "Create a rule (rules:write)",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RuleRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Rule"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "invalid / tls_config / unsupported",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "already_exists / reserved",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "502": {
+      "description": "resolve_failed / bind_failed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/rules/{protocol}/{listen_addr}/{listen_port}": {
+   "parameters": [
+    {
+     "name": "protocol",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "$ref": "#/components/schemas/Protocol"
+     }
+    },
+    {
+     "name": "listen_addr",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "string"
+     },
+     "description": "IP address; IPv6 without brackets"
+    },
+    {
+     "name": "listen_port",
+     "in": "path",
+     "required": true,
+     "schema": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     }
+    }
+   ],
+   "get": {
+    "summary": "One rule (rules:read)",
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Rule"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "not_found",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "patch": {
+    "summary": "Change a rule; new connections use it at once (rules:write)",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RulePatch"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "OK",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Rule"
+        }
+       }
+      }
+     },
+     "400": {
+      "description": "invalid / tls_config / unsupported",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "not_found",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "static",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "summary": "Delete a rule (rules:write)",
+    "parameters": [
+     {
+      "name": "drain_secs",
+      "in": "query",
+      "schema": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "description": "Wait this long for connections to finish before closing them"
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Deleted"
+     },
+     "404": {
+      "description": "not_found",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "static",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/metrics": {
+   "get": {
+    "summary": "Prometheus metrics (metrics:read)",
+    "responses": {
+     "200": {
+      "description": "Prometheus text format",
+      "content": {
+       "text/plain": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing, unknown or expired token",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     },
+     "403": {
+      "description": "The token lacks a scope or the listen port",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Error"
+        }
+       }
+      }
+     }
+    }
+   }
+  }
+ }
+}

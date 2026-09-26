@@ -123,6 +123,34 @@ struct Prepared {
 	http: Option<Arc<crate::http::server::Router>>,
 }
 
+/// What a reload of the settings file did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ReloadCounts {
+	pub added: usize,
+	pub removed: usize,
+	pub changed: usize,
+	pub unchanged: usize,
+	/// Of the added and changed rules: those registered as failed.
+	pub failed: usize,
+}
+
+/// The settings file as last read (`GET /config`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigStatus {
+	/// The file or directory.
+	pub path: String,
+	/// Files read, in order.
+	pub files: Vec<String>,
+	/// Unix seconds of the last successful read.
+	pub loaded_at: Option<u64>,
+	pub rules: usize,
+	pub last_reload: Option<ReloadCounts>,
+	/// Why the latest version could not be applied (the previous one stays in effect).
+	pub error: Option<String>,
+	/// `global` settings changed in the file that take effect only after a restart.
+	pub restart_needed: Vec<String>,
+}
+
 /// What `Registry::reload_changed_tls` last saw of a rule's certificate files.
 #[derive(Debug, Clone, Copy)]
 pub struct FileState {
@@ -134,6 +162,7 @@ pub struct Registry {
 	cfg: Config,
 	rules: Mutex<HashMap<Key, Entry>>,
 	next_generation: AtomicU64,
+	config_status: RwLock<Option<ConfigStatus>>,
 }
 
 fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
@@ -191,7 +220,7 @@ fn route_spec(route: &Route) -> String {
 
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
-		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1) })
+		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1), config_status: RwLock::default() })
 	}
 
 	pub fn reserved(&self) -> &[SocketAddr] {
@@ -429,7 +458,7 @@ impl Registry {
 			rules.get(key).map(|e| e.spec().clone()).ok_or_else(|| ApiError::not_found(key.to_string()))?
 		};
 		if spec.origin == Origin::Static {
-			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the static rules file and restart rproxy")));
+			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 		}
 		if let Some(list) = &req.allow_from {
 			spec.allow_from = crate::cidr::parse_list(list)?;
@@ -480,6 +509,12 @@ impl Registry {
 		}
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
+		self.apply(key, spec, tls_changed, http_changed).await
+	}
+
+	/// Puts a changed spec into effect on an existing rule, keeping its
+	/// connections (the fields PATCH can change: target, timeouts, TLS, allow_from, http).
+	async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
 		let prepared = self.prepare(&spec).await?;
 
 		let mut rules = self.rules.lock().await;
@@ -605,7 +640,7 @@ impl Registry {
 			match rules.get(key) {
 				None => return Err(ApiError::not_found(key.to_string())),
 				Some(e) if e.spec().origin == Origin::Static => {
-					return Err(ApiError::static_rule(format!("{key} is a static rule; edit the static rules file and restart rproxy")));
+					return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 				}
 				Some(_) => rules.remove(key).expect("checked above"),
 			}
@@ -693,35 +728,133 @@ impl Registry {
 	/// Starts the rules from the static rules file. Every rule is validated
 	/// first so a broken file stops startup instead of half applying.
 	pub async fn load_static(self: &Arc<Self>, reqs: Vec<RuleRequest>) -> Result<usize, String> {
-		// (spec, reason it cannot run here); only mistakes in the file stop the startup
-		let mut specs: Vec<(RuleSpec, Option<String>)> = vec![];
-		for (i, req) in reqs.into_iter().enumerate() {
-			let (mut spec, missing) =
-				self.validate_at_startup(req).map_err(|e| format!("static rule #{}: {}", i + 1, e.message))?;
-			spec.origin = Origin::Static;
-			if let Some((other, _)) = specs.iter().find(|(s, _)| overlaps(s, &spec)) {
-				return Err(format!("static rule #{}: {} overlaps with {}", i + 1, spec.key, other.key));
-			}
-			if let Some(api) = self.reserved_clash(&spec) {
-				return Err(format!("static rule #{}: {} would take the control API ({api})", i + 1, spec.key));
-			}
-			specs.push((spec, missing));
-		}
+		let labeled = reqs.into_iter().enumerate().map(|(i, r)| (format!("static rule #{}", i + 1), r)).collect();
+		self.load_static_labeled(labeled).await
+	}
+
+	/// `load_static` with a label per rule for messages (file and position).
+	pub async fn load_static_labeled(self: &Arc<Self>, reqs: Vec<(String, RuleRequest)>) -> Result<usize, String> {
+		let specs = self.validate_static(reqs)?;
 		let count = specs.len();
 		for (spec, missing) in specs {
-			let key = spec.key;
-			if let Some(missing) = missing {
-				error!(event = "rule.failed", rule = %key, error = %missing, phase = "static");
-				self.insert_failed(spec, missing, false).await;
-				continue;
-			}
-			if let Err(e) = self.create_spec(spec.clone()).await {
-				error!(event = "rule.failed", rule = %key, error = %e.message, phase = "static");
-				self.insert_failed(spec, e.message, e.code == "resolve_failed").await;
-			}
+			self.start_static(spec, missing, "static").await;
 		}
 		info!(event = "static.loaded", rules = count);
 		Ok(count)
+	}
+
+	/// Validates the rules of the settings file as a whole: (spec, reason it
+	/// cannot run here). Only mistakes in the file are errors.
+	fn validate_static(&self, reqs: Vec<(String, RuleRequest)>) -> Result<Vec<(RuleSpec, Option<String>)>, String> {
+		let mut specs: Vec<(RuleSpec, Option<String>, String)> = vec![];
+		for (label, req) in reqs {
+			let (mut spec, missing) = self.validate_at_startup(req).map_err(|e| format!("{label}: {}", e.message))?;
+			spec.origin = Origin::Static;
+			if let Some((other, _, other_label)) = specs.iter().find(|(s, _, _)| overlaps(s, &spec)) {
+				return Err(format!("{label}: {} overlaps with {} ({other_label})", spec.key, other.key));
+			}
+			if let Some(api) = self.reserved_clash(&spec) {
+				return Err(format!("{label}: {} would take the control API ({api})", spec.key));
+			}
+			specs.push((spec, missing, label));
+		}
+		Ok(specs.into_iter().map(|(s, m, _)| (s, m)).collect())
+	}
+
+	/// Starts one rule of the settings file; false if it ended up failed.
+	async fn start_static(self: &Arc<Self>, spec: RuleSpec, missing: Option<String>, phase: &'static str) -> bool {
+		let key = spec.key;
+		if let Some(missing) = missing {
+			error!(event = "rule.failed", rule = %key, error = %missing, phase);
+			self.insert_failed(spec, missing, false).await;
+			return false;
+		}
+		match self.create_spec(spec.clone()).await {
+			Ok(_) => true,
+			Err(e) => {
+				error!(event = "rule.failed", rule = %key, error = %e.message, phase);
+				// a rule made through the API already holds the key: leave it alone
+				if e.code != "already_exists" {
+					self.insert_failed(spec, e.message, e.code == "resolve_failed").await;
+				}
+				false
+			}
+		}
+	}
+
+	/// Applies a changed settings file: validates all of its rules first (a
+	/// mistake changes nothing), then stops removed rules, starts new ones,
+	/// changes the rest in place where PATCH could (keeping connections) or
+	/// re-creates them, and leaves unchanged rules alone.
+	pub async fn reload_static(self: &Arc<Self>, reqs: Vec<(String, RuleRequest)>) -> Result<ReloadCounts, String> {
+		let specs = self.validate_static(reqs)?;
+		let current: HashMap<Key, (RuleSpec, bool)> = self
+			.rules
+			.lock()
+			.await
+			.iter()
+			.filter(|(_, e)| e.spec().origin == Origin::Static)
+			.map(|(k, e)| (*k, (e.spec().clone(), matches!(e, Entry::Running(_)))))
+			.collect();
+		let mut counts = ReloadCounts::default();
+
+		// removed first, so a rule that moved to another key or range does not overlap itself
+		let wanted: std::collections::HashSet<Key> = specs.iter().map(|(s, _)| s.key).collect();
+		for key in current.keys().filter(|k| !wanted.contains(k)) {
+			let entry = self.rules.lock().await.remove(key);
+			if let Some(entry) = entry {
+				self.stop_entry(key, entry, None).await;
+				info!(event = "rule.delete", rule = %key, phase = "reload");
+				counts.removed += 1;
+			}
+		}
+		for (spec, missing) in specs {
+			let key = spec.key;
+			match current.get(&key) {
+				None => {
+					counts.added += 1;
+					if !self.start_static(spec, missing, "reload").await {
+						counts.failed += 1;
+					}
+				}
+				Some((old, _)) if *old == spec => counts.unchanged += 1,
+				Some((old, running)) => {
+					counts.changed += 1;
+					let in_place = *running
+						&& missing.is_none()
+						&& old.port_count == spec.port_count
+						&& old.source_ip == spec.source_ip
+						&& old.http.is_some() == spec.http.is_some();
+					if in_place {
+						let tls_changed =
+							old.tls != spec.tls || old.starttls != spec.starttls || old.starttls_required != spec.starttls_required;
+						let http_changed = old.http != spec.http;
+						match self.apply(&key, spec.clone(), tls_changed, http_changed).await {
+							Ok(_) => continue,
+							Err(e) => warn!(event = "rule.update", rule = %key, error = %e.message, phase = "reload",
+								"could not change in place; re-creating"),
+						}
+					}
+					let entry = self.rules.lock().await.remove(&key);
+					if let Some(entry) = entry {
+						self.stop_entry(&key, entry, None).await;
+					}
+					if !self.start_static(spec, missing, "reload").await {
+						counts.failed += 1;
+					}
+				}
+			}
+		}
+		Ok(counts)
+	}
+
+	/// Remembers how the settings file was last read, for `GET /config`.
+	pub fn set_config_status(&self, status: ConfigStatus) {
+		*self.config_status.write().unwrap() = Some(status);
+	}
+
+	pub fn config_status(&self) -> Option<ConfigStatus> {
+		self.config_status.read().unwrap().clone()
 	}
 
 	pub async fn metrics(&self) -> String {

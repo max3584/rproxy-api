@@ -62,7 +62,8 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
-| `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）。ルールは固定ルールとして開始する（docs/API.md の「設定ファイル」）。中身が不正なら起動しない |
+| `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
+| `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
@@ -111,7 +112,7 @@ curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp
 
 ## 固定ルールと、ダッシュボードの公開
 
-`RPROXY_CONFIG` に設定ファイル（YAML か JSON）を指定すると、起動時にそのルールを開始します（DB からの復元より前）。API と画面からは変更・削除できないので、rproxy 経由で Web UI を公開するルールに向いています（誤って消して、画面に入れなくなることがありません）。
+`RPROXY_CONFIG` に設定ファイル（YAML か JSON）かそのディレクトリを指定すると、起動時にそのルールを開始します（DB からの復元より前）。ファイルを書き換えると、再起動なしで差分だけを反映します（変わっていないルールの接続は切りません。誤りがあれば反映せず、`GET /config` とログで知らせます）。API と画面からは変更・削除できないので、rproxy 経由で Web UI を公開するルールに向いています（誤って消して、画面に入れなくなることがありません）。
 
 例（[contrib/rproxy.example.yaml](contrib/rproxy.example.yaml)）：`dashboard.proxy.home` だけを、社内のネットワークから 443 で受け付けます。
 
@@ -201,6 +202,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `event` | 内容 |
 |---|---|
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止 |
+| `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `audit` | 制御 API での変更（トークンの名前、操作、ルール、結果）と、権限不足で断ったリクエスト |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（`route`、`service`、`backend`、`status`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |

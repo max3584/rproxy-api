@@ -28,6 +28,8 @@ type AppResult<T> = Result<T, ApiError>;
 pub fn router(state: Arc<AppState>) -> Router {
 	let protected = Router::new()
 		.route("/capabilities", get(capabilities))
+		.route("/openapi.json", get(openapi))
+		.route("/config", get(config_status))
 		.route("/interfaces", get(interfaces))
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
@@ -44,7 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// The scope an endpoint needs; `None` for those any accepted token may use.
 fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 	match path {
-		"/capabilities" => None,
+		"/capabilities" | "/openapi.json" => None,
 		"/metrics" => Some(Scope::MetricsRead),
 		_ if method == Method::GET => Some(Scope::RulesRead),
 		_ => Some(Scope::RulesWrite),
@@ -113,6 +115,25 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		// v0.3 settings this build can run (docs/DESIGN-v0.3.md)
 		"features": state.registry.caps().features,
 	}))
+}
+
+/// The OpenAPI definition of this API (docs/openapi.json).
+const OPENAPI: &str = include_str!("../docs/openapi.json");
+
+async fn openapi() -> impl IntoResponse {
+	([(header::CONTENT_TYPE, "application/json")], OPENAPI)
+}
+
+/// How the settings file (`RPROXY_CONFIG`) was last read.
+async fn config_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+	match state.registry.config_status() {
+		Some(status) => {
+			let mut v = serde_json::to_value(status).unwrap_or_default();
+			v["configured"] = json!(true);
+			Json(v)
+		}
+		None => Json(json!({"configured": false})),
+	}
 }
 
 /// Addresses of this host that rules can listen on, and the ones rproxy keeps for itself.
@@ -226,4 +247,44 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		[(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
 		state.registry.metrics().await,
 	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Every route of the router, with its methods, is in docs/openapi.json and
+	/// the document lists nothing else.
+	#[test]
+	fn openapi_covers_every_route() {
+		let doc: serde_json::Value = serde_json::from_str(OPENAPI).unwrap();
+		let mut documented: Vec<String> = vec![];
+		for (path, item) in doc["paths"].as_object().unwrap() {
+			for method in ["get", "post", "patch", "delete", "put"] {
+				if item.get(method).is_some() {
+					documented.push(format!("{method} {path}"));
+				}
+			}
+		}
+		let source = include_str!("api.rs");
+		let mut routed: Vec<String> = vec![];
+		for line in source.lines().map(str::trim).filter(|l| l.starts_with(".route(\"")) {
+			let path = line.split('"').nth(1).unwrap();
+			for method in ["get", "post", "patch", "delete", "put"] {
+				if line.contains(&format!("{method}(")) {
+					routed.push(format!("{method} {path}"));
+				}
+			}
+		}
+		documented.sort();
+		routed.sort();
+		assert!(!routed.is_empty());
+		assert_eq!(documented, routed);
+		// every $ref points to a schema that exists
+		let schemas = doc["components"]["schemas"].as_object().unwrap();
+		for r in OPENAPI.split("\"$ref\": \"#/components/schemas/").skip(1) {
+			let name = r.split('"').next().unwrap();
+			assert!(schemas.contains_key(name), "missing schema {name}");
+		}
+	}
 }
