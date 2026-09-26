@@ -28,6 +28,7 @@ ProtectHome=yes
 PrivateTmp=yes
 ReadOnlyPaths=/etc/rproxy
 LogsDirectory=rproxy
+LogsDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target

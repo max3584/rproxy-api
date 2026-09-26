@@ -44,6 +44,8 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" 
 	http://127.0.0.1:8080/rules)
 [ "$code" = 201 ] || fail "could not open port 25 (HTTP $code)"
 [ "$(ps -o user= -C rproxy-api | tr -d ' ')" = rproxy ] || fail "not running as rproxy"
+# the default configuration logs to /var/log/rproxy (JSON Lines, rotated by rproxy itself)
+sudo sh -c 'head -n1 /var/log/rproxy/rproxy.*.log' | grep -q '"event"' || fail "no JSON log in /var/log/rproxy"
 sudo systemctl reload rproxy-api
 sleep 0.5
 systemctl is-active --quiet rproxy-api || fail "reload stopped the service"
@@ -70,5 +72,6 @@ echo "== purge"
 sudo apt-get purge -y rproxy-api
 ! systemctl is-active --quiet rproxy-api || fail "still running after purge"
 [ ! -e /etc/rproxy ] || fail "/etc/rproxy left behind after purge"
+[ ! -e /var/log/rproxy ] || fail "/var/log/rproxy left behind after purge"
 sudo rm -f /etc/apt/sources.list.d/rproxy-api.list /usr/share/keyrings/rproxy-archive-keyring.gpg
 echo "OK"

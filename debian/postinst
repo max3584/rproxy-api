@@ -7,6 +7,8 @@ if [ "$1" = "configure" ]; then
 	fi
 	chgrp rproxy /etc/rproxy
 	chmod 0750 /etc/rproxy
+	# RPROXY_LOG_FILE の既定の置き場所（systemd の LogsDirectory も同じ場所を使う）
+	install -d -o rproxy -g rproxy -m 0750 /var/log/rproxy
 	# a first API token, only when there is none yet
 	if [ ! -e /etc/rproxy/tokens ]; then
 		umask 027
