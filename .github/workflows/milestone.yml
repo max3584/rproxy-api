@@ -1,0 +1,32 @@
+name: Milestone
+
+# マイルストーンのない PR（Renovate の PR を含む）に、一番近いバージョンのマイルストーン（vX.Y.Z）を付ける。
+# 付け方の決まりは docs/RELEASING.md。
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign:
+    if: github.event.pull_request.milestone == null && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set the nearest open vX.Y.Z milestone
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          ms=$(gh api "repos/$REPO/milestones?state=open&per_page=100" --jq '
+            [.[] | select(.title | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+            | sort_by(.title | ltrimstr("v") | split(".") | map(tonumber))
+            | .[0].number // empty')
+          if [ -z "$ms" ]; then
+            echo "::warning::no open vX.Y.Z milestone"
+            exit 0
+          fi
+          gh api -X PATCH "repos/$REPO/issues/$PR" -F milestone="$ms" --jq '"milestone: " + .milestone.title'
