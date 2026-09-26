@@ -242,3 +242,68 @@ async fn get_json(port: u16, path: &str) -> (u16, serde_json::Value) {
 	let r = reqwest::get(format!("http://127.0.0.1:{port}{path}")).await.unwrap();
 	(r.status().as_u16(), r.json().await.unwrap_or_default())
 }
+
+/// GET over TLS to the control API: (status, DER of the certificate the server presented).
+async fn https_get(pki: &Pki, port: u16, path: &str, token: &str) -> Option<(u16, Vec<u8>)> {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+	let mut tls = pki.connector(None).connect("localhost".try_into().unwrap(), tcp).await.ok()?;
+	let served = tls.get_ref().1.peer_certificates()?.first()?.as_ref().to_vec();
+	let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n");
+	tls.write_all(req.as_bytes()).await.ok()?;
+	let mut resp = Vec::new();
+	let _ = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut resp)).await;
+	let status = String::from_utf8_lossy(&resp).split_whitespace().nth(1)?.parse().ok()?;
+	Some((status, served))
+}
+
+#[tokio::test]
+async fn sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_files() {
+	let dir = workdir("reload");
+	let pki = Pki::new("startup-reload");
+	let (first, second) = (pki.server("api-1", &["localhost"]), pki.server("api-2", &["localhost"]));
+	let (cert, key, tokens) = (dir.join("api.pem"), dir.join("api.key"), dir.join("tokens"));
+	fs::copy(&first.cert_file, &cert).unwrap();
+	fs::copy(&first.key_file, &key).unwrap();
+	fs::write(&tokens, "old-token\n").unwrap();
+	let port = free_port();
+	let rp = Rproxy::start(
+		&dir,
+		port,
+		&[
+			("RPROXY_TLS_CERT", cert.to_str().unwrap()),
+			("RPROXY_TLS_KEY", key.to_str().unwrap()),
+			("RPROXY_TOKEN_FILE", tokens.to_str().unwrap()),
+		],
+	);
+	let first_der = first.der().as_ref().to_vec();
+	let second_der = second.der().as_ref().to_vec();
+
+	// HTTPS with the first certificate and the old token
+	wait_for("the HTTPS API", &rp, || async { https_get(&pki, port, "/rules", "old-token").await.map(|r| r.0) == Some(200) }).await;
+	assert_eq!(https_get(&pki, port, "/rules", "old-token").await, Some((200, first_der.clone())));
+	assert_eq!(https_get(&pki, port, "/rules", "new-token").await.map(|r| r.0), Some(401));
+
+	// rotate the token and renew the certificate in place, then SIGHUP
+	fs::write(&tokens, "new-token\n").unwrap();
+	fs::copy(&second.cert_file, &cert).unwrap();
+	fs::copy(&second.key_file, &key).unwrap();
+	rp.hup();
+	wait_for("the new token and certificate", &rp, || async {
+		https_get(&pki, port, "/rules", "new-token").await == Some((200, second_der.clone()))
+	})
+	.await;
+	assert_eq!(https_get(&pki, port, "/rules", "old-token").await.map(|r| r.0), Some(401), "the old token is gone");
+
+	// broken files: the current token and certificate stay in effect
+	fs::write(&tokens, "# no tokens\n").unwrap();
+	fs::write(&cert, "not a certificate").unwrap();
+	rp.hup();
+	wait_for("the reload warnings", &rp, || async {
+		let log = rp.log();
+		log.contains(r#""event":"reload.tokens""#) && log.contains("keeping current tokens")
+			&& log.contains(r#""event":"reload.tls""#) && log.contains("keeping current certificate")
+	})
+	.await;
+	assert_eq!(https_get(&pki, port, "/rules", "new-token").await, Some((200, second_der)));
+}
