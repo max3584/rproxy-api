@@ -167,3 +167,13 @@
 
 sudo でパッケージを入れるので、手元では実行しない。
 
+## 長時間の負荷テスト（Soak ワークフロー）
+
+`scripts/soak.py` が rproxy-api（release ビルド）に TCP と UDP の負荷をかけ続け、10 秒ごとに RSS・fd の数・接続数を CSV に書く。
+
+- TCP: 接続の開け閉めを繰り返すワーカー 200 と、つなぎっぱなしで送り続ける接続 20
+- UDP: 送信元ポートを変えながら送る 100 クライアント（`udp_idle_secs: 5` でセッションの作成と破棄を繰り返す）
+- 合格の条件: 負荷を止めた後に fd の数が元に戻る（+20 以内）、後半の RSS が前半の 1.5 倍を超えない、転送の失敗が 0.1% 以下
+
+`.github/workflows/soak.yml` が毎週 30 分動かし、CSV を artifact に残す。何時間も回すときは Actions の画面から `duration`（秒）を指定して手動で動かす。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
+
