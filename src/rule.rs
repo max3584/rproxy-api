@@ -145,7 +145,7 @@ impl Features {
 		tls_options: false,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
-			"replace_path_regex", "respond",
+			"replace_path_regex", "respond", "rate_limit", "in_flight",
 		],
 		services: &[],
 	};

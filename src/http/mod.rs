@@ -3,6 +3,7 @@
 //! parts that can already run are listed in `GET /capabilities` `features`.
 
 pub mod access;
+pub mod limit;
 pub mod matcher;
 pub mod middleware;
 pub mod server;

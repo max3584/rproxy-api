@@ -705,6 +705,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	use crate::http::access::{BUCKETS, CLASSES};
 	let mut requests = vec![];
 	let mut durations = vec![];
+	let mut limited = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
 	for key in keys {
@@ -728,10 +729,25 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 			durations.push(format!("rproxy_http_request_duration_seconds_sum{{{labels}}} {}", c.duration_sum));
 			durations.push(format!("rproxy_http_request_duration_seconds_count{{{labels}}} {total}"));
 		}
+		for ((route, middleware), n) in r.rt.http_stats.limited_snapshot() {
+			let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+			limited.push(format!(
+				"rproxy_http_limited_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",
+				key.protocol,
+				key.listen,
+				esc(&route),
+				esc(&middleware)
+			));
+		}
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_requests_total HTTP requests of http rules by route and status class.");
 	let _ = writeln!(out, "# TYPE rproxy_http_requests_total counter");
 	for line in requests {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_limited_total HTTP requests of http rules refused by rate_limit / in_flight.");
+	let _ = writeln!(out, "# TYPE rproxy_http_limited_total counter");
+	for line in limited {
 		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");

@@ -122,6 +122,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
          "routes": {"site": {"requests": 3, "by_status": {"2xx": 3}}, "(none)": {"requests": 1, "by_status": {"4xx": 1}}}}
 ```
 
+`rate_limit` / `in_flight` で断ったリクエストがあれば、`limited`（合計）とルートごとの `limited`（ミドルウェアの名前ごと）も入る（断ったリクエストは `by_status` の `4xx` にも数える）。
+
 - `by_status` は状態コードの百の位ごと（`1xx`〜`5xx`。0 件の区分は省く）。`routes` はルートの名前ごとで、どのルートにも一致しなかったリクエストは `(none)`。
 - 応答の本文を送り終えた（またはクライアントが切断した）ときに数える。
 
@@ -194,7 +196,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - `Connection: Upgrade`（WebSocket など）は、転送先が 101 を返せばそのまま中継する。ルールを削除すると切れる。
 - 転送先に接続できなければ 502、`timeouts.connect`（既定 5 秒）・`timeouts.response`（既定 60 秒。応答ヘッダまで）を過ぎると 504。`event: "http.error"` のログを出す。
 - アクセスログ（`event: "http.access"`）はリクエストごとに 1 行：`rule`、`route`（一致しなければ `(none)`）、`service`、`backend`、`client`、`method`、`host`、`path`（クエリは含めない）、`protocol`（`HTTP/1.1` / `HTTP/2.0`）、`status`、`duration_ms`（応答の本文を送り終えるまで）、`bytes_in`（`Content-Length`）、`bytes_out`（応答の本文）、`user_agent`、`sni`、`tls_version`。出す先は `global.access_log`。
-- `GET /metrics` の `rproxy_http_requests_total{protocol,listen,route,code}`（`code` は `2xx` など）と `rproxy_http_request_duration_seconds{protocol,listen,route}`（ヒストグラム。境界は 5ms〜10s）。ラベルにパスは入れない。
+- `GET /metrics` の `rproxy_http_requests_total{protocol,listen,route,code}`（`code` は `2xx` など）と `rproxy_http_request_duration_seconds{protocol,listen,route}`（ヒストグラム。境界は 5ms〜10s）、`rproxy_http_limited_total{protocol,listen,route,middleware}`（`rate_limit` / `in_flight` で断った数）。ラベルにパスは入れない。
 - ミドルウェアはルートの `middlewares` に書いた順にリクエストへ働き、応答へは逆の順に働く（Traefik と同じ）。途中のミドルウェアが応答を返したら（リダイレクト・`respond`・拒否）、その先へは進まない。その応答にも、それまでに通ったミドルウェアの応答側（`headers` など）が働く。
 - 使えるミドルウェア（v0.3.1。`features.middlewares`）:
   - `redirect_scheme`: `scheme` と違う方式で受けたリクエストを、同じホスト・パス・クエリの `scheme://` へリダイレクトする。`port` は既定のポート（80 / 443）なら省く。
@@ -203,6 +205,9 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - `respond`: `status`・`body`・`content_type`（既定 `text/plain; charset=utf-8`）で応答する。`service` のないルート（ブロックやメンテナンス表示）に使う。
   - `ip_allow`: 接続元の IP が `source_range` になければ 403。
   - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）と `Vary: Origin` を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。
+  - `rate_limit`: トークンバケット。`period`（既定 `1s`）あたり平均 `average` 件、一度に `burst` 件まで（既定 1。Traefik と同じく、省くと 1 件ずつしか通さない）。超えたら 429 と `Retry-After`（秒）。`source` は `ip`（既定。`global.trusted_proxies` を反映したクライアントの IP）か `header:<名前>`（そのヘッダの値ごと。ヘッダがなければクライアントの IP）。
+  - `in_flight`: クライアントの IP ごとに、同時に処理するリクエストを `amount` 件まで（超えたら 429）。応答の本文を送り終えたとき（WebSocket なら接続が終わったとき）に空く。
+  - `rate_limit` / `in_flight` の数はルールの `http` を変えると最初からになる。覚えておく送信元は 1 つのミドルウェアで 10 万件まで（超えたら長く使っていない方から半分を忘れる）で、満杯に戻ったバケットは定期的に捨てる。
   - `strip_prefix`: パスが `prefixes` のどれか（先に書いたもの優先）で始まれば取り除き、`X-Forwarded-Prefix` を付ける。`add_prefix`: パスの前に付ける。`replace_path`: パスを置き換え、元のパスを `X-Replaced-Path` に入れる。`replace_path_regex`: 一致したときだけ置き換える（`X-Replaced-Path` も）。クエリは保つ。
 - `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
@@ -213,14 +218,14 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":false,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":false,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port","udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?}` | 200 | 転送先を変える。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`source_ip` とポート範囲は変更できない |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
-| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total` と `rproxy_http_request_duration_seconds`（上の「v0.3 の設定」） |
+| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`（上の「v0.3 の設定」） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
 
