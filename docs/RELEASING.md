@@ -23,9 +23,10 @@ UI の vX.Y.Z は rproxy-api の vX.Y.Z と組み合わせて使う。片方だ�
 1. **バージョンを上げる PR**（ブランチ `release/vX.Y.Z`、両方のリポジトリで同じ名前にする。UI の e2e は同じ名前の rproxy-api のブランチでテストする）
    - rproxy-api: `Cargo.toml` の `version`
    - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）
-2. **マージされたらタグを打つ**（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
+2. **マージされたら、UI → rproxy-api の順にリリースする**（rproxy-api の apt の公開が、同じ番号の UI のリリースから `rproxy-ui` の .deb を取るため）（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
    - rproxy-api: タグの push で `release.yml` がバイナリ・.deb を作り、GitHub Release に添付し、apt リポジトリを更新する。タグと `Cargo.toml` の `version` が違うと止まる
-   - UI: `gh release create vX.Y.Z --target <マージコミット>` でタグとリリースを作る
+   - UI: `gh release create vX.Y.Z --target <マージコミットの完全な ID>` でタグとリリースを作る。公開すると `release.yml` が `rproxy-ui_X.Y.Z-1_all.deb` を作って添付するので、終わるのを待つ
+   - rproxy-api: 上の UI の .deb が添付されてからタグを push する（なければ apt ジョブは警告を出して rproxy-api だけを載せる。後から載せるときは apt ジョブを再実行する）
 3. **リリースノート**: そのマイルストーンでマージした PR から、日本語で「主な変更」を書き、組み合わせるもう片方のリリースへのリンクを付ける
 4. **マイルストーンを閉じ**、次のパッチのマイルストーンを作る
 5. apt で公開されたこと（`apt-cache policy rproxy-api` で新しいバージョンが見える）を確かめる

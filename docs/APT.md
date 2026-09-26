@@ -30,10 +30,10 @@ CI の `Debian package` ジョブ（`scripts/test-deb.sh`）が、実際にイ�
 1. 各ターゲットのバイナリと、amd64 / arm64 / armhf の `.deb` を作って GitHub Release に添付する（タグと `Cargo.toml` の `version` が違うと止まる）
 2. `scripts/apt-repo.sh` で `.deb` を `gh-pages` ブランチの apt リポジトリに足し、索引（`dists/stable/`）を署名し直して push する
 
-`https://max3584.github.io/rproxy-api/` を GitHub Pages が配る。構成は次のとおり。
+`https://max3584.github.io/rproxy-api/` を GitHub Pages が配る。管理 UI の `rproxy-ui`（Architecture: all）も同じリポジトリに載せる。apt ジョブが、同じ番号の [TCP-UDP-rproxy-ui のリリース](https://github.com/max3584/TCP-UDP-rproxy-ui/releases) から `rproxy-ui_X.Y.Z-1_all.deb` を取ってくる（UI を先にリリースする。docs/RELEASING.md）。構成は次のとおり。
 
 ```
-pool/main/r/rproxy-api/rproxy-api_<version>_<arch>.deb   過去のバージョンも残す
+pool/main/r/<パッケージ>/<パッケージ>_<version>_<arch>.deb   rproxy-api と rproxy-ui。過去のバージョンも残す
 dists/stable/main/binary-{amd64,arm64,armhf}/Packages{,.gz}
 dists/stable/{Release,InRelease,Release.gpg}
 rproxy-archive-keyring.gpg                                signed-by= に使う公開鍵
