@@ -21,6 +21,12 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          # the event says what the PR had when it was opened; whoever opened it may have set one since
+          current=$(gh api "repos/$REPO/issues/$PR" --jq '.milestone.title // empty')
+          if [ -n "$current" ]; then
+            echo "already in $current"
+            exit 0
+          fi
           ms=$(gh api "repos/$REPO/milestones?state=open&per_page=100" --jq '
             [.[] | select(.title | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))]
             | sort_by(.title | ltrimstr("v") | split(".") | map(tonumber))
