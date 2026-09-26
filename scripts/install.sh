@@ -154,9 +154,9 @@ arch_target() {
 }
 
 install_binary() {
-	local tmp
+	# スクリプトの終了時に消すので、関数の local にしない
 	tmp=$(mktemp -d)
-	trap 'rm -rf "$tmp"' EXIT
+	trap 'rm -rf "${tmp:-}"' EXIT
 	if [ -n "$binary" ]; then
 		[ -f "$binary" ] || die "--binary のファイルがありません: $binary"
 		cp "$binary" "$tmp/rproxy-api"
