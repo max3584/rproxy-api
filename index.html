@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rproxy-api apt repository</title>
+<style>
+  :root { color-scheme: light dark; --bg: #ffffff; --fg: #1f2328; --code-bg: #f6f8fa; --link: #0969da; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --code-bg: #161b22; --link: #4493f8; } }
+  body { background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; max-width: 48rem; margin: 2rem auto; padding: 0 16px; }
+  pre { background: var(--code-bg); color: var(--fg); padding: 1rem; overflow-x: auto; border-radius: 6px; }
+  a { color: var(--link); }
+</style>
+</head>
+<body>
+<h1>rproxy-api apt repository</h1>
+<p><a href="https://github.com/max3584/rproxy-api">rproxy-api</a> の Debian / Ubuntu 向けパッケージ（amd64 / arm64 / armhf）。</p>
+<pre>sudo curl -fsSLo /usr/share/keyrings/rproxy-archive-keyring.gpg https://max3584.github.io/rproxy-api/rproxy-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/rproxy-archive-keyring.gpg] https://max3584.github.io/rproxy-api stable main" \
+  | sudo tee /etc/apt/sources.list.d/rproxy-api.list
+sudo apt update && sudo apt install rproxy-api</pre>
+<p>インストール後に <code>/etc/rproxy/rproxy.env</code> を設定し、<code>sudo systemctl enable --now rproxy-api</code> で起動します。
+詳しくは <a href="https://github.com/max3584/rproxy-api/blob/master/docs/APT.md">docs/APT.md</a>。</p>
+</body>
+</html>
