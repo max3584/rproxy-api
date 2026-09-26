@@ -153,3 +153,14 @@
 - TLS を有効にした制御 API（手動では確認済み、自動テストはない）
 - SIGHUP によるトークン・証明書の再読込（手動では確認済み）
 - iptables（`-m socket`）を使う transparent のルーティング手順
+
+## 実際のサーバとの組み合わせ（Interop ワークフロー）
+
+`.github/workflows/interop.yml` が、実際のサーバを rproxy の後ろに置いて通す。時間がかかるので必須のチェックにはせず、`src/` や `scripts/interop/` を変えた PR、毎週、手動（Actions の画面から）で動かす。
+
+| スクリプト | 相手 | 確かめること |
+|---|---|---|
+| `scripts/interop/mail.sh` | Postfix / Dovecot | STARTTLS の終端 + PROXY v2 で、Submission・SMTP（STARTTLS 任意）・IMAP・IMAPS・POP3 が通る。STARTTLS 前の送信・ログインを拒否する |
+
+sudo でパッケージを入れるので、手元では実行しない。
+
