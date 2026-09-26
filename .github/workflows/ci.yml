@@ -91,16 +91,3 @@ jobs:
       - run: cargo build --release
       - name: scripts/test-install.sh
         run: sudo scripts/test-install.sh target/release/rproxy-api
-
-  build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build
