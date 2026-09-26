@@ -42,7 +42,10 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/limit.rs` | `rate_limit`（送信元ごとのトークンバケット。覚える送信元は上限つき）と `in_flight`（`Hold` を応答の本文が終わるまで持つ）。状態は組み立てた `Router` にあり、`http` を変えると最初からになる |
 | `src/http/crowdsec.rs` | `global.crowdsec` の bouncer（`Bouncer`。LAPI の stream を 1 つのタスクで取り、判定を ID ごとに覚える。API キーは SIGHUP で読み直す）と AppSec への問い合わせ。`crowdsec` ミドルウェアは非同期なので `server.rs` が直接呼ぶ |
 | `src/http/access.rs` | `global.trusted_proxies`・`global.access_log`（`HttpGlobal`。`Registry` の `Config.http` から全ルールの `Runtime.global` へ）、X-Forwarded-For からクライアントの IP を決める、アクセスログ、ルートごとのリクエストの統計（`stats.http`・`/metrics`） |
-| `src/http/server.rs` | `http` のルールのデータプレーン（hyper）。クライアントとは HTTP/1.1・HTTP/2、転送先とは HTTP/1.1。`Router` はルールの `Runtime.http` に入れ、変更時は丸ごと差し替える |
+| `src/http/server.rs` | `http` のルールのデータプレーン（hyper）。クライアントとは HTTP/1.1・HTTP/2、転送先とは HTTP/1.1。`Router` はルールの `Runtime.http` に入れ、変更時は丸ごと差し替える（古い `Router` が drop されるとヘルスチェックも止まる）。本文・応答・転送先が要るミドルウェア（`buffering`・`retry`・`circuit_breaker`・`errors`・`compress`・`crowdsec`）はここで動かす |
+| `src/http/backend.rs` | サービスと転送先：重みつきラウンドロビン（down を除く）、ヘルスチェック、`sticky` のクッキー、転送先ごとの待機中の接続（応答の本文を読み終えたら戻す）、接続（`Dialer`） |
+| `src/http/resilience.rs` | `buffering`（本文を上限つきで読み切る）、`retry` の待ち時間、`circuit_breaker`（`Breaker` と、結果を必ず返す `Ticket`） |
+| `src/http/compress.rs` | `compress`：`Accept-Encoding` の交渉、圧縮しない応答の判定、流れてきた分ずつ圧縮する本文（gzip・br・zstd） |
 | `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `main.rs` の `watch_config` → `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |

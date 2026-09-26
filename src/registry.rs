@@ -105,7 +105,11 @@ impl Entry {
 					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
 					denied: s.denied.load(Ordering::Relaxed),
-					http: r.spec.http.is_some().then(|| crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats)),
+					http: r.spec.http.is_some().then(|| {
+						let mut v = crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats);
+						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
+						v
+					}),
 				};
 				view.started_at = Some(r.started_at);
 				view
@@ -917,6 +921,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut durations = vec![];
 	let mut limited = vec![];
 	let mut blocked = vec![];
+	let mut up = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
 	for key in keys {
@@ -959,6 +964,25 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 				esc(&middleware)
 			));
 		}
+		if let Some(router) = r.rt.http_router() {
+			for (service, servers) in router.health() {
+				for s in servers {
+					up.push(format!(
+						"rproxy_http_server_up{{protocol=\"{}\",listen=\"{}\",service=\"{}\",server=\"{}\"}} {}",
+						key.protocol,
+						key.listen,
+						esc(&service),
+						esc(&s.url),
+						u8::from(s.up)
+					));
+				}
+			}
+		}
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_server_up Servers of http services with health_check: 1 up, 0 down.");
+	let _ = writeln!(out, "# TYPE rproxy_http_server_up gauge");
+	for line in up {
+		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_requests_total HTTP requests of http rules by route and status class.");
 	let _ = writeln!(out, "# TYPE rproxy_http_requests_total counter");

@@ -267,6 +267,9 @@ pub struct HttpStatsView {
 	#[serde(skip_serializing_if = "is_zero")]
 	pub blocked: u64,
 	pub routes: BTreeMap<String, RouteStatsView>,
+	/// Servers of the services with `health_check`, and whether each is up.
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub services: BTreeMap<String, Vec<super::backend::ServerHealth>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]

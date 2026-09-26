@@ -5,7 +5,10 @@
 pub mod access;
 pub mod crowdsec;
 pub mod limit;
+pub mod backend;
+pub mod compress;
 pub mod matcher;
+pub mod resilience;
 pub mod middleware;
 pub mod server;
 
@@ -374,14 +377,25 @@ impl MiddlewareSpec {
 				}
 				Ok(())
 			}
-			MiddlewareSpec::Errors { status, service, .. } => {
+			MiddlewareSpec::Errors { status, service, path } => {
+				if status.is_empty() {
+					return bad("status is empty".into());
+				}
 				for s in status {
 					parse_status_range(s).map_err(|e| invalid(format!("middleware {name}: {e}")))?;
 				}
 				if !services.contains_key(service) {
 					return bad(format!("service {service:?} is not defined"));
 				}
+				if !path.starts_with('/') {
+					return bad(format!("path {path:?} must start with /"));
+				}
 				Ok(())
+			}
+			MiddlewareSpec::Compress { encodings, .. } => compress::encodings(encodings).map(|_| ()).or_else(bad),
+			MiddlewareSpec::Buffering { max_request_body: 0 } => bad("max_request_body must be at least 1".into()),
+			MiddlewareSpec::Retry { initial_interval: Some(d), .. } => {
+				parse_duration(d).map(|_| ()).map_err(|e| invalid(format!("middleware {name}: initial_interval: {e}")))
 			}
 			MiddlewareSpec::Respond { status, .. } if !(100..=599).contains(status) => bad(format!("status {status} is not an HTTP status")),
 			_ => Ok(()),
@@ -403,7 +417,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 	})
 }
 
-fn parse_status_range(s: &str) -> Result<(u16, u16), String> {
+pub(crate) fn parse_status_range(s: &str) -> Result<(u16, u16), String> {
 	let (a, b) = s.split_once('-').unwrap_or((s, s));
 	let parse = |v: &str| v.trim().parse::<u16>().ok().filter(|n| (100..=599).contains(n));
 	match (parse(a), parse(b)) {
@@ -439,6 +453,11 @@ impl HttpSpec {
 				}
 				for d in [&h.interval, &h.timeout].into_iter().flatten() {
 					parse_duration(d).map_err(|e| invalid(format!("service {name}: {e}")))?;
+				}
+			}
+			if let Some(s) = &svc.sticky {
+				if s.cookie.is_empty() || !s.cookie.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+					return Err(invalid(format!("service {name}: sticky.cookie {:?} is not a cookie name", s.cookie)));
 				}
 			}
 			if let Some(t) = &svc.timeouts {

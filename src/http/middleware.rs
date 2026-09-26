@@ -13,9 +13,12 @@ use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode, Uri};
 use regex::Regex;
 
-use super::server::Body;
+use super::backend::Service;
+use super::compress::{self, Encoding};
 use super::limit::{Hold, InFlight, RateLimiter, Source};
-use super::{parse_duration, CorsSpec, HeaderOps, HstsSpec, MiddlewareSpec};
+use super::resilience::{Breaker, RetryPolicy, DEFAULT_RETRY_INTERVAL};
+use super::server::Body;
+use super::{parse_duration, parse_status_range, CorsSpec, HeaderOps, HstsSpec, MiddlewareSpec};
 use crate::cidr::{self, Cidr};
 use crate::error::ApiError;
 
@@ -67,6 +70,13 @@ pub enum Middleware {
 	InFlight { name: String, limiter: Arc<InFlight> },
 	/// Asked asynchronously by the server (`crowdsec.rs`); `on_request` passes it by.
 	Crowdsec { name: String, appsec: bool, block_on_error: bool },
+	/// The ones below are run by the server (they need the body, the response
+	/// or the backend); `on_request` / `on_response` pass them by.
+	Compress { encodings: Vec<Encoding>, min_size: u64 },
+	Buffering { max: u64 },
+	Retry(RetryPolicy),
+	CircuitBreaker(Arc<Breaker>),
+	Errors { ranges: Vec<(u16, u16)>, service: Arc<Service>, path: String },
 }
 
 fn value(v: &str, what: &str) -> Result<HeaderValue, ApiError> {
@@ -158,8 +168,41 @@ impl Middleware {
 			MiddlewareSpec::Crowdsec { appsec, on_error } => {
 				Middleware::Crowdsec { name: label.to_string(), appsec: *appsec, block_on_error: on_error == "block" }
 			}
+			MiddlewareSpec::Compress { encodings, min_size } => Middleware::Compress {
+				encodings: compress::encodings(encodings).map_err(|e| ApiError::invalid(format!("{what}: {e}")))?,
+				min_size: min_size.unwrap_or(compress::DEFAULT_MIN_SIZE),
+			},
+			MiddlewareSpec::Buffering { max_request_body } => Middleware::Buffering { max: *max_request_body },
+			MiddlewareSpec::Retry { attempts, initial_interval } => Middleware::Retry(RetryPolicy {
+				attempts: (*attempts).max(1),
+				interval: match initial_interval {
+					Some(d) => parse_duration(d).map_err(|e| ApiError::invalid(format!("{what}: {e}")))?,
+					None => DEFAULT_RETRY_INTERVAL,
+				},
+			}),
+			MiddlewareSpec::CircuitBreaker { failure_percent, window, recovery } => {
+				let d = |s: &str| parse_duration(s).map_err(|e| ApiError::invalid(format!("{what}: {e}")));
+				Middleware::CircuitBreaker(Breaker::new(label, *failure_percent, d(window)?, d(recovery)?))
+			}
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
+	}
+
+	/// `errors`: pages from `service`, which must be compiled already.
+	pub fn errors(label: &str, spec: &MiddlewareSpec, services: &std::collections::HashMap<String, Arc<Service>>) -> Result<Middleware, ApiError> {
+		let MiddlewareSpec::Errors { status, service, path } = spec else {
+			return Middleware::compile(label, spec);
+		};
+		let what = format!("middleware {label}");
+		let ranges = status
+			.iter()
+			.map(|s| parse_status_range(s).map_err(|e| ApiError::invalid(format!("{what}: {e}"))))
+			.collect::<Result<Vec<_>, _>>()?;
+		let service = services.get(service).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {service:?} is not defined")))?;
+		if !path.starts_with('/') {
+			return Err(ApiError::invalid(format!("{what}: path {path:?} must start with /")));
+		}
+		Ok(Middleware::Errors { ranges, service, path: path.clone() })
 	}
 
 	/// Runs the request side. `Some` answers the request without going further.
@@ -257,7 +300,12 @@ impl Middleware {
 				}
 				None
 			}
-			Middleware::Crowdsec { .. } => None,
+			Middleware::Crowdsec { .. }
+			| Middleware::Compress { .. }
+			| Middleware::Buffering { .. }
+			| Middleware::Retry(_)
+			| Middleware::CircuitBreaker(_)
+			| Middleware::Errors { .. } => None,
 		}
 	}
 
