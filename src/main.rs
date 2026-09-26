@@ -48,7 +48,11 @@ struct Options {
 	/// Log filter, e.g. info or debug
 	#[arg(long, env = "RPROXY_LOG_LEVEL", default_value = "info")]
 	log_level: String,
-	/// JSON file of rules started before the database ones; the API cannot change them
+	/// Settings file (YAML or JSON): `version`, `global` and `rules` started before
+	/// the database ones; the API cannot change those rules
+	#[arg(long, env = "RPROXY_CONFIG")]
+	config: Option<PathBuf>,
+	/// The same as --config (the 0.2 name; a plain array of rules also works)
 	#[arg(long, env = "RPROXY_STATIC_RULES")]
 	static_rules: Option<PathBuf>,
 	/// mysql://user:pass@host:port/db to restore rules from at startup
@@ -204,16 +208,22 @@ async fn run(opts: Options) -> Result<(), String> {
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
-	if let Some(path) = &opts.static_rules {
+	if opts.config.is_some() && opts.static_rules.is_some() {
+		return Err("give --config (RPROXY_CONFIG) or --static-rules (RPROXY_STATIC_RULES), not both".into());
+	}
+	if let Some(path) = opts.config.as_ref().or(opts.static_rules.as_ref()) {
 		match std::fs::read_to_string(path) {
 			Ok(text) => {
-				let rules: Vec<rproxy_api::rule::RuleRequest> =
-					serde_json::from_str(&text).map_err(|e| format!("static rules {}: {e}", path.display()))?;
-				registry.load_static(rules).await.map_err(|e| format!("static rules {}: {e}", path.display()))?;
+				let doc = rproxy_api::config::ConfigDoc::parse(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+				for part in doc.unsupported_globals() {
+					warn!(event = "degraded", part = %format!("global.{part}"),
+						"not available in this version yet; ignored (see GET /capabilities features)");
+				}
+				registry.load_static(doc.rules).await.map_err(|e| format!("{}: {e}", path.display()))?;
 			}
-			Err(e) if config_error(&e) => return Err(format!("static rules {}: {e}", path.display())),
+			Err(e) if config_error(&e) => return Err(format!("settings file {}: {e}", path.display())),
 			Err(e) => error!(event = "degraded", part = "static_rules", error = %format!("{}: {e}", path.display()),
-				"running without the static rules"),
+				"running without the rules of the settings file"),
 		}
 	}
 

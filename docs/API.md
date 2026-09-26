@@ -33,8 +33,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `protocol` | `"tcp"` \| `"udp"` | ○ | 大文字・小文字は区別しない。応答では常に小文字で返す |
 | `listen_addr` | string | ○ | IP アドレス（ホスト名は不可） |
 | `listen_port` | 1–65535 | ○ | |
-| `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する |
-| `remote_port` | 1–65535 | ○ | |
+| `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する。`http` のルールでは書かない（転送先は `http.services`。一覧では `""` / `0`） |
+| `remote_port` | 1–65535 | ○ | `http` のルールでは書かない |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスは待ち受けのアドレスで、`0.0.0.0` で待ち受けていれば `0.0.0.0`）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
@@ -98,37 +98,67 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 
 `stats` には `denied`（`allow_from` の範囲外、または `unmatched: reject` で切断した接続の数）も含む。
 
-## 固定ルール
+## 設定ファイル（固定ルール）
 
-`RPROXY_STATIC_RULES`（`--static-rules`）に JSON のファイルを指定すると、起動時にそのルールを開始する。中身は、`POST /rules` の本文と同じ形のルールの配列。
+`RPROXY_CONFIG`（`--config`）に設定ファイルを指定すると、起動時にそのルールを開始する。0.2 の `RPROXY_STATIC_RULES`（`--static-rules`）も同じ意味で使える（両方は指定できない）。
 
+- 形式は拡張子で決まる: `.yaml` / `.yml` は YAML（コメント、アンカー `&name` / `*name` が使える）、それ以外は JSON。YAML と JSON は同じ形で、同じ意味になる。
+- 中身は次のどちらか。
+  - `{"version": 1, "global": {...}, "rules": [...]}`（v0.3）
+  - ルールの配列（0.2 の形）
+- `rules` の各要素は `POST /rules` の本文と同じ形。
+- `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。この版で動かせない項目は、ログに `"event":"degraded"`（`part: global.<項目>`）を出して読み飛ばす。
 - DB からの復元より前に開始する。DB に接続できなくても動く。
 - API からは変更・削除できない（`409 static`）。変えるときは、ファイルを書き換えて rproxy を再起動する。
 - 同じキーや重なるポートのルールを API や DB から作ろうとすると、`already_exists` になる。
-- ファイルを読めない、または内容が不正な場合は、rproxy は起動しない。名前解決や bind の失敗はほかのルールと同じ扱いになる（`failed` にして、名前解決は再試行する）。
+- ファイルが存在しない、書式や形が不正（知らないキー、`version` が 1 以外、存在しない ACME の resolver の参照など）の場合は、rproxy は起動しない。読めない（権限）ときは、固定ルールなしで起動する。
+- この版で動かせない機能（`GET /capabilities` の `features` が false）を使うルールは、`failed`（理由つき）として登録し、設定の内容は `GET /rules` で見える。名前解決や bind の失敗はほかのルールと同じ扱いになる。
 
 例：ダッシュボード（Web UI）を `dashboard.proxy.home` だけで、社内から公開する。
 
-```json
-[
-  {"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443,
-   "remote_addr": "127.0.0.1", "remote_port": 3001,
-   "allow_from": ["172.16.0.0/16"],
-   "tls": {"mode": "terminate",
-           "certificates": [{"cert_file": "/etc/rproxy/certs/dashboard.pem",
-                             "chain_file": "/etc/rproxy/certs/intermediates.pem",
-                             "key_file": "/etc/rproxy/certs/dashboard.key"}],
-           "routes": [{"server_name": "dashboard.proxy.home", "remote_addr": "127.0.0.1", "remote_port": 3001}],
-           "unmatched": "reject"}}
-]
+```yaml
+# /etc/rproxy/rproxy.yaml
+version: 1
+rules:
+  - protocol: tcp
+    listen_addr: 0.0.0.0
+    listen_port: 443
+    remote_addr: 127.0.0.1
+    remote_port: 3001
+    allow_from: [172.16.0.0/16]
+    tls:
+      mode: terminate
+      certificates:
+        - cert_file: /etc/rproxy/certs/dashboard.pem
+          chain_file: /etc/rproxy/certs/intermediates.pem
+          key_file: /etc/rproxy/certs/dashboard.key
+      routes:
+        - {server_name: dashboard.proxy.home, remote_addr: 127.0.0.1, remote_port: 3001}
+      unmatched: reject
 ```
+
+## v0.3 の設定（L7・ACME・TLS のオプション）
+
+v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるようにする（docs/RELEASING.md）。この版で動かせるかは `GET /capabilities` の `features` で分かる。動かせない設定を使うルールは、形を検証したうえで `400 unsupported` で断る（形が不正なら `400 invalid` / `tls_config`）。設計の全体と例は docs/DESIGN-v0.3.md。
+
+| 項目 | 場所 | 形 | features |
+|---|---|---|---|
+| L7 のルーティング | ルールの `http` | `routes`（`name`、`match`、`priority`、`service` か `to`、`middlewares`）、`default`、`services`、`middlewares`、`http3` | `http`、`http3`、`middlewares` |
+| `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
+| ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
+| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり） | `acme` |
+| TLS のオプション | `tls.options` | `min_version`（`"1.2"` / `"1.3"`）、`cipher_suites` | `tls_options` |
+
+- `http` は `protocol: tcp` で、`tls.mode` が `terminate`（HTTPS）か、TLS なし（平文の HTTP）のときだけ。`sni`・`starttls`・ポート範囲とは組み合わせられない。`remote_addr` / `remote_port` は書かない（書くと `400 invalid`）。
+- `PATCH` で `http` を付けると、L7 の設定を丸ごと置き換える。
+- DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http"}`）。
 
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000}`。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":false,"http3":false,"acme":false,"tls_options":false,"middlewares":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |

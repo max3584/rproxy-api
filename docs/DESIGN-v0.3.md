@@ -80,6 +80,7 @@ http:
     crowdsec: {crowdsec: {appsec: true}}
 ```
 
+- `http` のルールには `remote_addr` / `remote_port` を書かない（転送先はすべて `services`。書くと `invalid`）。
 - 転送先は `service`（名前）か、`to: http://host:port`（サービスを 1 つだけ書く省略形）で指定する。
 - `X-Forwarded-For` / `-Proto` / `-Host` / `X-Real-IP` は常に付ける（`global.trusted_proxies` からの値は引き継ぐ）。WebSocket はそのまま通す。
 - リダイレクトだけのルート（80 番の HTTP→HTTPS など）は `service` を書かず、ミドルウェアが応答を返す。
@@ -115,7 +116,7 @@ http:
 | `compress` | `encodings`（gzip・br・zstd）、`min_size` | #63 |
 | `buffering` | `max_request_body`（413） | #64 |
 | `retry` | `attempts`、`initial_interval`（冪等なメソッドだけ） | #64 |
-| `circuit_breaker` | `failure_ratio`、`window`、`recovery` | #64 |
+| `circuit_breaker` | `failure_percent`（1〜100）、`window`、`recovery` | #64 |
 | `errors` | `status`（`500-599` など）、`service`、`path` | #65 |
 | `respond` | `status`、`body`、`content_type`（メンテナンス表示や拒否） | #65 |
 

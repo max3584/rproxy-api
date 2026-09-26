@@ -115,7 +115,13 @@ async fn configuration_mistakes_stop_the_startup() {
 		("log level", vec![("RPROXY_LOG_LEVEL", "no-such=level=x".into())], "log level"),
 		("log directory", vec![("RPROXY_LOG_FILE", dir.join("missing/rproxy.log").display().to_string())], "does not exist"),
 		("token file path", vec![("RPROXY_TOKEN_FILE", dir.join("missing-tokens").display().to_string())], "token file"),
-		("static rules path", vec![("RPROXY_STATIC_RULES", dir.join("missing.json").display().to_string())], "static rules"),
+		("static rules path", vec![("RPROXY_STATIC_RULES", dir.join("missing.json").display().to_string())], "settings file"),
+		("config path", vec![("RPROXY_CONFIG", dir.join("missing.yaml").display().to_string())], "settings file"),
+		(
+			"config and static rules together",
+			vec![("RPROXY_CONFIG", "/a.yaml".into()), ("RPROXY_STATIC_RULES", "/b.json".into())],
+			"not both",
+		),
 	];
 	for (name, env, expect) in cases {
 		let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -306,4 +312,56 @@ async fn sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_fil
 	})
 	.await;
 	assert_eq!(https_get(&pki, port, "/rules", "new-token").await, Some((200, second_der)));
+}
+
+#[tokio::test]
+async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
+	let dir = workdir("yaml");
+	let backend = tcp_backend("Y:").await;
+	let (plain, l7) = (free_port(), free_port());
+	let cfg = dir.join("rproxy.yaml");
+	fs::write(
+		&cfg,
+		format!(
+			r#"
+# comments are fine in YAML
+version: 1
+global:
+  trusted_proxies: [10.0.0.0/8]
+rules:
+  - protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: {plain}
+    remote_addr: 127.0.0.1
+    remote_port: {bp}
+  - protocol: tcp
+    listen_addr: 127.0.0.1
+    listen_port: {l7}
+    http:
+      routes:
+        - name: all
+          match: PathPrefix(`/`)
+          to: http://127.0.0.1:{bp}
+"#,
+			bp = backend.port()
+		),
+	)
+	.unwrap();
+	let port = free_port();
+	let rp = Rproxy::start(&dir, port, &[("RPROXY_CONFIG", cfg.to_str().unwrap())]);
+	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
+	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{plain}")).await;
+	assert_eq!((v["state"].as_str(), v["origin"].as_str()), (Some("running"), Some("static")), "{v}");
+	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{l7}")).await;
+	assert_eq!(v["state"], "failed", "{v}");
+	assert!(v["error"].as_str().unwrap().contains("http"), "{v}");
+	assert_eq!(v["http"]["routes"][0]["name"], "all", "the settings are kept and shown: {v}");
+	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.trusted_proxies""#) }).await;
+	let (_, caps) = get_json(port, "/capabilities").await;
+	assert_eq!(caps["features"]["http"], false, "{caps}");
+
+	// an unknown version is a mistake
+	fs::write(&cfg, "version: 9\n").unwrap();
+	let (ok, out) = Rproxy::start(&dir, free_port(), &[("RPROXY_CONFIG", cfg.to_str().unwrap())]).exited();
+	assert!(!ok && out.contains("version 9"), "{out}");
 }

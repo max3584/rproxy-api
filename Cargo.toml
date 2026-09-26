@@ -34,7 +34,7 @@ systemd-units = { enable = false, start = false }
 assets = [
     ["target/release/rproxy-api", "usr/bin/", "755"],
     ["debian/rproxy.env", "etc/rproxy/rproxy.env", "640"],
-    ["contrib/static-rules.example.json", "usr/share/doc/rproxy-api/examples/", "644"],
+    ["contrib/rproxy.example.yaml", "usr/share/doc/rproxy-api/examples/", "644"],
     ["README.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/API.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/PROFILES.md", "usr/share/doc/rproxy-api/", "644"],
@@ -64,6 +64,8 @@ x509-parser = "0.16"
 async-trait = "0.1"
 rcgen = "0.13"
 if-addrs = "0.15"
+serde_yaml_ng = "0.10.0"
+regex = "1.13.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

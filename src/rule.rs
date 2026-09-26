@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cidr::{self, Cidr};
 use crate::error::ApiError;
-use crate::tlsconf::{self, StartTls, TlsSpec};
+use crate::http::HttpSpec;
+use crate::tlsconf::{self, StartTls, TlsMode, TlsSpec};
 
 pub const DEFAULT_UDP_IDLE_SECS: u64 = 30;
 pub const DEFAULT_MAX_RANGE_PORTS: u16 = 20_000;
@@ -102,11 +103,77 @@ pub struct Caps {
 	/// IPV6_TRANSPARENT
 	pub transparent_ipv6: bool,
 	pub max_range_ports: u16,
+	/// Settings whose shape exists (v0.3) and which this build can run.
+	pub features: Features,
 }
 
 impl Default for Caps {
 	fn default() -> Self {
-		Caps { transparent: false, transparent_ipv6: false, max_range_ports: DEFAULT_MAX_RANGE_PORTS }
+		Caps {
+			transparent: false,
+			transparent_ipv6: false,
+			max_range_ports: DEFAULT_MAX_RANGE_PORTS,
+			features: Features::CURRENT,
+		}
+	}
+}
+
+/// Which of the v0.3 settings (docs/DESIGN-v0.3.md) this build can run.
+/// Reported in `GET /capabilities` as `features`; a rule that uses anything
+/// else is refused with `unsupported`. Patch releases turn these on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Features {
+	/// L7 routing (`http` in a rule)
+	pub http: bool,
+	pub http3: bool,
+	/// `acme` certificates
+	pub acme: bool,
+	/// `tls.options`
+	pub tls_options: bool,
+	/// Middleware kinds (`http.middlewares`) that can run
+	pub middlewares: &'static [&'static str],
+}
+
+impl Features {
+	pub const CURRENT: Features = Features { http: false, http3: false, acme: false, tls_options: false, middlewares: &[] };
+
+	/// Everything the settings can describe; for registering a startup rule
+	/// that this build cannot run as failed, with the reason.
+	pub const ALL: Features = Features {
+		http: true,
+		http3: true,
+		acme: true,
+		tls_options: true,
+		middlewares: &[
+			"redirect_scheme", "redirect_regex", "rate_limit", "in_flight", "crowdsec", "ip_allow", "headers",
+			"forward_auth", "oidc", "basic_auth", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
+			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond",
+		],
+	};
+
+	/// The first setting in `tls` / `http` that this build cannot run.
+	pub fn check(&self, tls: &TlsSpec, http: Option<&HttpSpec>) -> Result<(), ApiError> {
+		let missing = |what: &str| {
+			Err(ApiError::unsupported(format!("{what} is not available in this version (see GET /capabilities features)")))
+		};
+		if !self.acme && tls.certificates.iter().any(|c| c.acme.is_some()) {
+			return missing("an acme certificate");
+		}
+		if !self.tls_options && tls.options.is_some() {
+			return missing("tls.options");
+		}
+		if let Some(h) = http {
+			if !self.http {
+				return missing("http (L7 routing)");
+			}
+			if h.http3 && !self.http3 {
+				return missing("http3");
+			}
+			if let Some(kind) = h.middleware_kinds().find(|k| !self.middlewares.contains(k)) {
+				return missing(&format!("the {kind} middleware"));
+			}
+		}
+		Ok(())
 	}
 }
 
@@ -118,7 +185,10 @@ pub struct RuleRequest {
 	pub listen_port: u16,
 	/// Last port of a range; ports map one to one onto `remote_port` upwards.
 	pub listen_port_end: Option<u16>,
+	/// The backend; left out on `http` rules, whose backends are `http.services`.
+	#[serde(default)]
 	pub remote_addr: String,
+	#[serde(default)]
 	pub remote_port: u16,
 	#[serde(default)]
 	pub source_ip: SourceIp,
@@ -129,6 +199,9 @@ pub struct RuleRequest {
 	/// Client addresses allowed to connect (CIDR or single IP); empty means everyone.
 	#[serde(default)]
 	pub allow_from: Vec<String>,
+	/// L7 routing (v0.3): routes, services and middlewares.
+	#[serde(default)]
+	pub http: Option<HttpSpec>,
 }
 
 /// Where a rule came from.
@@ -156,6 +229,7 @@ pub struct RuleSpec {
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
 	pub allow_from: Vec<Cidr>,
+	pub http: Option<HttpSpec>,
 	pub origin: Origin,
 }
 
@@ -190,6 +264,17 @@ pub fn validate_remote(host: &str, port: u16) -> Result<String, ApiError> {
 	Ok(host.to_string())
 }
 
+/// The backend of a rule: `remote_addr` / `remote_port`, or nothing for `http` rules.
+pub fn validate_target(host: &str, port: u16, http: bool) -> Result<String, ApiError> {
+	if !http {
+		return validate_remote(host, port);
+	}
+	if !host.trim().is_empty() || port != 0 {
+		return Err(ApiError::invalid("remote_addr / remote_port are not used with http; put the backends in http.services"));
+	}
+	Ok(String::new())
+}
+
 pub fn validate_udp_idle(secs: Option<u64>) -> Result<Duration, ApiError> {
 	let secs = secs.unwrap_or(DEFAULT_UDP_IDLE_SECS);
 	if secs == 0 || secs > MAX_UDP_IDLE_SECS {
@@ -217,7 +302,7 @@ impl RuleRequest {
 	pub fn validate(self, caps: &Caps) -> Result<RuleSpec, ApiError> {
 		let transparent_available = caps.transparent;
 		let listen = parse_listen(&self.listen_addr, self.listen_port)?;
-		let remote_host = validate_remote(&self.remote_addr, self.remote_port)?;
+		let remote_host = validate_target(&self.remote_addr, self.remote_port, self.http.is_some())?;
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
 		let port_count = port_count(self.listen_port, self.listen_port_end, self.remote_port, caps)?;
 		let allow_from = cidr::parse_list(&self.allow_from)?;
@@ -226,6 +311,22 @@ impl RuleRequest {
 		if self.starttls.is_none() && self.starttls_required == Some(false) {
 			return Err(ApiError::invalid("starttls_required needs starttls"));
 		}
+		if let Some(http) = &self.http {
+			if self.protocol != Protocol::Tcp {
+				return Err(ApiError::invalid("http needs protocol tcp (HTTP/3 is http.http3 on the same rule)"));
+			}
+			if tls.mode == TlsMode::Sni {
+				return Err(ApiError::tls_config("http needs tls mode terminate (or no TLS for plain HTTP)"));
+			}
+			if self.starttls.is_some() {
+				return Err(ApiError::invalid("http and starttls cannot be combined"));
+			}
+			if port_count > 1 {
+				return Err(ApiError::invalid("http rules take a single port"));
+			}
+			http.validate()?;
+		}
+		caps.features.check(&tls, self.http.as_ref())?;
 		match (self.protocol, self.source_ip) {
 			(Protocol::Udp, SourceIp::ProxyV1) => {
 				return Err(ApiError::unsupported("PROXY protocol v1 is text over tcp; use proxy_v2 for udp"));
@@ -258,6 +359,7 @@ impl RuleRequest {
 			// only SMTP may continue without TLS
 			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
 			allow_from,
+			http: self.http,
 			origin: Origin::Dynamic,
 		})
 	}
@@ -265,7 +367,9 @@ impl RuleRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct UpdateRequest {
+	#[serde(default)]
 	pub remote_addr: String,
+	#[serde(default)]
 	pub remote_port: u16,
 	pub udp_idle_secs: Option<u64>,
 	pub source_ip: Option<SourceIp>,
@@ -277,6 +381,8 @@ pub struct UpdateRequest {
 	pub listen_port_end: Option<u16>,
 	/// Replaces the allowed client addresses when present.
 	pub allow_from: Option<Vec<String>>,
+	/// Replaces the L7 routing when present (v0.3).
+	pub http: Option<HttpSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -312,6 +418,8 @@ pub struct RuleView {
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
 	pub allow_from: Vec<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub http: Option<HttpSpec>,
 	pub origin: Origin,
 	pub state: State,
 	pub error: Option<String>,
@@ -337,6 +445,7 @@ impl RuleView {
 			starttls: spec.starttls,
 			starttls_required: spec.starttls_required,
 			allow_from: spec.allow_from.iter().map(|c| c.to_string()).collect(),
+			http: spec.http.clone(),
 			origin: spec.origin,
 			state,
 			error,
@@ -366,6 +475,7 @@ mod tests {
 			starttls: None,
 			starttls_required: None,
 			allow_from: vec![],
+			http: None,
 		}
 	}
 
@@ -393,6 +503,28 @@ mod tests {
 		let mut r = req();
 		r.remote_port = 0;
 		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "invalid");
+	}
+
+	#[test]
+	fn http_rules_take_their_backends_from_services() {
+		let caps = Caps { features: Features::ALL, ..Default::default() };
+		let http = || -> HttpSpec {
+			serde_json::from_value(serde_json::json!({
+				"routes": [{"name": "a", "match": "PathPrefix(`/`)", "service": "s"}],
+				"services": {"s": {"servers": [{"url": "http://10.0.0.1"}]}}
+			}))
+			.unwrap()
+		};
+		let mut r = req();
+		r.remote_addr = String::new();
+		r.remote_port = 0;
+		assert_eq!(r.clone().validate(&caps).unwrap_err().code, "invalid");
+		r.http = Some(http());
+		assert_eq!(r.clone().validate(&caps).unwrap().remote_host, "");
+		let mut r = req();
+		r.http = Some(http());
+		let e = r.validate(&caps).unwrap_err();
+		assert!(e.message.contains("http.services"), "{}", e.message);
 	}
 
 	#[test]
@@ -427,7 +559,7 @@ mod tests {
 		let terminate = || {
 			Some(TlsSpec {
 				mode: crate::tlsconf::TlsMode::Terminate,
-				certificates: vec![crate::tlsconf::CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into() }],
+				certificates: vec![crate::tlsconf::CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into(), ..Default::default() }],
 				..Default::default()
 			})
 		};

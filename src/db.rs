@@ -43,6 +43,8 @@ struct Options {
 	starttls_required: Option<bool>,
 	#[serde(default)]
 	allow_from: Vec<String>,
+	/// L7 routing (v0.3)
+	http: Option<crate::http::HttpSpec>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -66,6 +68,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		starttls: None,
 		starttls_required: None,
 		allow_from: vec![],
+		http: None,
 	};
 	if schema != Schema::Legacy {
 		req.source_ip = get_str("source_ip")?.parse().map_err(parse_err)?;
@@ -85,6 +88,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		req.starttls = options.starttls;
 		req.starttls_required = options.starttls_required;
 		req.allow_from = options.allow_from;
+		req.http = options.http;
 	}
 	Ok(req)
 }
