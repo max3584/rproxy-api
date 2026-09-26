@@ -7,7 +7,24 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 - HTTP/1.1、JSON（UTF-8）。`GET /metrics` だけは Prometheus のテキスト形式。
 - 待ち受けアドレスは `--api-addr` で指定する（複数回指定できる）。ポートは `--api-port` で指定する（既定 8080）。
 - 認証：`--token-file` を指定した場合、`/healthz` 以外のエンドポイントは `Authorization: Bearer <token>` が必須になる。
-  - トークンファイルには 1 行に 1 つトークンを書く。空行と `#` で始まる行は無視する。
+  - トークンファイルは 2 つの書き方がある。
+    - 1 行に 1 つトークンを書く（すべての権限。ログでの名前は `token-1`、`token-2`…）。空行と `#` で始まる行は無視する。
+    - YAML で `tokens:` に名前・SHA-256・スコープを書く（トークンそのものはファイルに置かない）。
+
+      ```yaml
+      tokens:
+        - name: ui
+          sha256: 9f86d081...        # printf %s "$TOKEN" | sha256sum
+          scopes: [rules:read, rules:write, metrics:read]
+        - name: ci-deploy
+          sha256: 2c26b46b...
+          scopes: [rules:write]
+          allow_listen_ports: 20000-29999   # 作成・変更・削除できる待ち受けポート（範囲ルールは全体が収まること）
+          expires: 2027-03-31               # この日（UTC）まで有効
+      ```
+
+    - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
+    - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`action`、`rule`、`outcome`、失敗時の `code`）。権限不足で断ったリクエストも残る。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
   - SIGHUP を受けるとトークンファイルを読み直す。
 - `--api-addr` に loopback 以外のアドレスを含める場合は、`--token-file`、`--tls-cert`、`--tls-key` の指定が必須。どれかが欠けていると起動を拒否する。
@@ -179,7 +196,8 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 
 | `code` | HTTP | 意味 |
 |---|---|---|
-| `unauthorized` | 401 | トークンがない、または一致しない |
+| `unauthorized` | 401 | トークンがない、一致しない、または期限切れ |
+| `forbidden` | 403 | トークンのスコープ、または `allow_listen_ports` の外 |
 | `invalid` | 400 | 本文やパスが不正 |
 | `tls_config` | 400 | TLS の設定の組み合わせが不正、または証明書・鍵・CA のファイルを読めない |
 | `unsupported` | 400 | この環境では使えない指定（`transparent` など）、または変更できない項目 |

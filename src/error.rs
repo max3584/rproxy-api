@@ -20,6 +20,10 @@ impl ApiError {
 		Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid bearer token")
 	}
 
+	pub fn forbidden(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::FORBIDDEN, "forbidden", message)
+	}
+
 	pub fn invalid(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::BAD_REQUEST, "invalid", message)
 	}
