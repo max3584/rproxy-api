@@ -38,3 +38,43 @@ Description: L4 TCP/UDP forwarder managed through an HTTP API
  time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
  termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
 
+Package: rproxy-api
+Architecture: armhf
+Version: 0.2.2-1
+Priority: optional
+Section: net
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 8310
+Depends: passwd
+Filename: pool/main/r/rproxy-api/rproxy-api_0.2.2-1_armhf.deb
+Size: 2616648
+MD5sum: 4d56aef5295014dee1133717bd0f4432
+SHA1: 9df39f5858869771a7789150cb1fbdb547b9776d
+SHA256: 82c8da70c49a8bbad599d5783bf7d62c8fc83f20c5eb63ba95659742abf99954
+SHA512: d7017b6ece165e2a760760b3ef5166e5eb4872a896ed76d3a15e88a43f0793378667aaf531fe4406aa2bfc0974aeafd36963e158a58279c2a09b52860b7821fc
+Homepage: https://github.com/max3584/rproxy-api
+Description: L4 TCP/UDP forwarder managed through an HTTP API
+ Layer 4 TCP/UDP forwarder whose rules are added, changed and removed at run
+ time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
+ termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
+
+Package: rproxy-ui
+Architecture: all
+Version: 0.2.2-1
+Priority: optional
+Section: web
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 26608
+Depends: nodejs (>= 20.9), passwd
+Recommends: rproxy-api (= 0.2.2-1)
+Filename: pool/main/r/rproxy-ui/rproxy-ui_0.2.2-1_all.deb
+Size: 2455852
+MD5sum: 6b998f858b37ff64452a504455ed7f3b
+SHA1: 26782a94d4c7de395be52f3bef55a0b4d163504f
+SHA256: 7485274e34437faf7be9669d87ac92d6f89f4762df1b56634778d5ba1b173fc1
+SHA512: 022f7fa955744cf024e8ba69528d48d19e702859682361fb2729f5cf9027b8fe818f7a34f3acd974fbc766ce0d1896fba2b4770fdc24cc0d0f5862538a2557ce
+Homepage: https://github.com/max3584/TCP-UDP-rproxy-ui
+Description: web UI for rproxy-api
+ Dashboard and rule editor for rproxy-api, the L4 TCP/UDP forwarder managed
+ through an HTTP API. Sign-in with Keycloak; rules are stored in MariaDB.
+
