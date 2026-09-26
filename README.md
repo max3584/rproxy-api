@@ -137,7 +137,7 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 | 値 | 動作 | 前提 |
 |---|---|---|
 | `proxy`（既定） | 転送先からは rproxy の IP に見える | なし |
-| `proxy_v1` / `proxy_v2` | 接続の先頭に PROXY protocol ヘッダを付ける | TCP のみ。転送先が PROXY protocol に対応していること |
+| `proxy_v1` / `proxy_v2` | TCP は接続の先頭に、UDP（`proxy_v2` のみ）はデータグラムごとに PROXY protocol ヘッダを付ける | 転送先が PROXY protocol に対応していること。UDP は dnsdist・PowerDNS・Unbound と同じく、毎回のデータグラムにヘッダを付け、応答にはヘッダを付けない |
 | `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT`） | Linux、IPv4、`CAP_NET_ADMIN`。転送先からの戻りパケットが rproxy のホストを通ること |
 
 `transparent` を使うには、rproxy に `CAP_NET_ADMIN` を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。

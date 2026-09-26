@@ -17,6 +17,7 @@ use webrtc_util::conn::Conn;
 
 use crate::dtls::SessionConn;
 use crate::proxy::{shifted, Runtime};
+use crate::rule::SourceIp;
 use crate::source;
 use crate::tlsconf::{TlsMode, TlsRuntime};
 
@@ -103,6 +104,7 @@ async fn session(
 
 	rt.stats.opened();
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr_or_empty(target));
+	let header = proxy_header(&rt, client, &listener);
 
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	let mut buf = vec![0u8; MAX_DATAGRAM];
@@ -113,7 +115,7 @@ async fn session(
 			_ = sleep_until(deadline) => break "idle",
 			datagram = from_client.recv() => match datagram {
 				Some(data) => {
-					if let Err(e) = upstream.send(&data).await {
+					if let Err(e) = upstream.send(&with_header(&header, &data)).await {
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += data.len() as u64;
@@ -165,6 +167,23 @@ async fn session(
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
 }
 
+/// `source_ip: proxy_v2`: the PROXY v2 (DGRAM) header sent in front of every
+/// datagram to the backend. The destination is the listening socket's address
+/// (0.0.0.0 / :: for a wildcard listener).
+fn proxy_header(rt: &Runtime, client: SocketAddr, listener: &UdpSocket) -> Option<Vec<u8>> {
+	(rt.source_ip == SourceIp::ProxyV2).then(|| {
+		let local = listener.local_addr().unwrap_or_else(|_| SocketAddr::new(client.ip(), 0));
+		source::proxy_v2_dgram_header(client, local)
+	})
+}
+
+fn with_header<'a>(header: &Option<Vec<u8>>, data: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+	match header {
+		Some(h) => [h.as_slice(), data].concat().into(),
+		None => data.into(),
+	}
+}
+
 /// The backend side of a DTLS session: plain UDP, or DTLS again.
 enum Upstream {
 	Plain(Arc<UdpSocket>),
@@ -200,6 +219,8 @@ async fn dtls_session(
 	tls: Arc<TlsRuntime>,
 ) {
 	let started = Instant::now();
+	// before `listener` moves into the DTLS connection
+	let header = proxy_header(&rt, client, &listener);
 	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, client));
 	let handshake = tokio::select! {
 		_ = rt.kill.cancelled() => { remove(&sessions, client, id); return; }
@@ -272,7 +293,7 @@ async fn dtls_session(
 			_ = sleep_until(deadline) => break "idle",
 			read = dtls.read(&mut buf, None) => match read {
 				Ok(n) => {
-					if let Err(e) = upstream.send(&buf[..n]).await {
+					if let Err(e) = upstream.send(&with_header(&header, &buf[..n])).await {
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += n as u64;
