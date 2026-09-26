@@ -151,6 +151,45 @@ pub struct TlsSpec {
 	pub options: Option<TlsOptions>,
 }
 
+impl TlsSpec {
+	/// Every file these settings read (certificates, keys, CAs), for noticing changes.
+	pub fn files(&self) -> Vec<&str> {
+		let mut files: Vec<&str> = vec![];
+		for c in &self.certificates {
+			files.extend([c.cert_file.as_str(), c.key_file.as_str()].into_iter().filter(|f| !f.is_empty()));
+			files.extend(c.chain_file.as_deref());
+		}
+		files.extend(self.client_auth.ca_file.as_deref());
+		files.extend(self.client_auth.chain_file.as_deref());
+		let u = &self.upstream;
+		files.extend([&u.ca_file, &u.cert_file, &u.chain_file, &u.key_file].into_iter().filter_map(|f| f.as_deref()));
+		files
+	}
+}
+
+/// Size, modification time and inode of files: changes when a file is rewritten or,
+/// as Kubernetes does with mounted secrets, replaced through a symbolic link.
+pub fn fingerprint<'a>(files: impl IntoIterator<Item = &'a str>) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	for f in files {
+		f.hash(&mut h);
+		match std::fs::metadata(f) {
+			Ok(m) => {
+				m.len().hash(&mut h);
+				m.modified().ok().hash(&mut h);
+				#[cfg(unix)]
+				{
+					use std::os::unix::fs::MetadataExt;
+					(m.dev(), m.ino()).hash(&mut h);
+				}
+			}
+			Err(e) => e.kind().hash(&mut h),
+		}
+	}
+	h.finish()
+}
+
 /// Mail protocols whose plain-text STARTTLS dialogue rproxy answers itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

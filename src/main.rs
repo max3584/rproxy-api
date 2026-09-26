@@ -50,6 +50,10 @@ struct Options {
 	/// TLS private key (PEM) for the control API
 	#[arg(long, env = "RPROXY_TLS_KEY")]
 	tls_key: Option<PathBuf>,
+	/// Seconds between checks for changed certificate files (renewed by certbot,
+	/// cert-manager, ...), which are then re-read; 0 turns the checks off
+	#[arg(long, env = "RPROXY_CERT_CHECK_SECS", default_value_t = 60)]
+	cert_check_secs: u64,
 	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
 	#[arg(long, env = "RPROXY_LOG_FILE")]
 	log_file: Option<PathBuf>,
@@ -336,6 +340,11 @@ async fn run(opts: Options) -> Result<(), String> {
 		None => None,
 	};
 
+	if opts.cert_check_secs > 0 {
+		let every = Duration::from_secs(opts.cert_check_secs);
+		tokio::spawn(watch_certificates(every, registry.clone(), tls.clone(), opts.tls_cert.clone().zip(opts.tls_key.clone()), stop.clone()));
+	}
+
 	wait_for_shutdown(&tokens, &tls, &opts, &registry).await?;
 
 	info!(event = "shutdown");
@@ -353,6 +362,41 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 	registry.shutdown().await;
 	Ok(())
+}
+
+/// Re-reads certificate files that changed: the rules' and the control API's.
+async fn watch_certificates(
+	every: Duration,
+	registry: Arc<Registry>,
+	api_tls: Arc<OnceCell<RustlsConfig>>,
+	api_files: Option<(PathBuf, PathBuf)>,
+	stop: CancellationToken,
+) {
+	use rproxy_api::tlsconf::fingerprint;
+	let mut seen = std::collections::HashMap::new();
+	let api_print = |(c, k): &(PathBuf, PathBuf)| fingerprint([c.to_str().unwrap_or(""), k.to_str().unwrap_or("")]);
+	let mut api_seen = api_files.as_ref().map(api_print);
+	let mut ticks = tokio::time::interval(every);
+	ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		tokio::select! {
+			_ = stop.cancelled() => return,
+			_ = ticks.tick() => {}
+		}
+		registry.reload_changed_tls(&mut seen).await;
+		if let (Some(files), Some(config)) = (&api_files, api_tls.get()) {
+			let now = api_print(files);
+			if api_seen != Some(now) {
+				match config.reload_from_pem_file(&files.0, &files.1).await {
+					Ok(()) => {
+						info!(event = "reload.tls", part = "api", reason = "files changed");
+						api_seen = Some(now);
+					}
+					Err(e) => warn!(event = "reload.tls", part = "api", error = %e, "keeping current certificate"),
+				}
+			}
+		}
+	}
 }
 
 /// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.

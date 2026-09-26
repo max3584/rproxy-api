@@ -100,7 +100,12 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 - `PP2_TYPE_ALPN`：ALPN
 - `PP2_TYPE_SSL`：TLS であること、クライアント証明書の有無、`PP2_SUBTYPE_SSL_VERSION`、クライアント証明書の CN（`PP2_SUBTYPE_SSL_CN`）
 
-証明書ファイルは、ルールの作成・変更のときに読み込む。ファイルを差し替えたあとで SIGHUP を送ると、全ルールの証明書を読み直す（読めなかったルールは今の証明書のまま）。
+証明書ファイルは、ルールの作成・変更のときに読み込む。そのあとは：
+- `RPROXY_CERT_CHECK_SECS`（既定 60 秒、`0` で止める）ごとに、ルールが使うファイル（証明書・鍵・中間 CA・CA）の大きさ・更新時刻・inode を確かめ、変わったルールだけ読み直す。certbot などでの上書きも、Kubernetes の Secret のようにシンボリックリンクを差し替える方式も検知する。制御 API の証明書（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）も同じ。
+- 読み直せなかったとき（書き込み途中で鍵と証明書が合わないなど）は今の証明書のまま使い、次の確認でもう一度試す（`reload.tls` の警告はファイルの版ごとに 1 回）。
+- SIGHUP を送ると、変わったかどうかにかかわらず全ルールの証明書をすぐに読み直す。
+
+ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・acme.sh・cert-manager などに任せ、そのファイルを `cert_file` / `key_file` に指定する（更新は上のとおり自動で反映される）。certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。
 
 応答で返すルールには、次の稼働情報が加わる（`allow_from` は正規化した CIDR の形で返す。例：`10.0.0.5` → `10.0.0.5/32`）。
 
@@ -184,7 +189,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky` | `http`。`health_check` / `sticky` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
-| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり） | `acme` |
+| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。**内蔵しない方針にしたため使えない**（常に `unsupported`）。外部のツールで取ったファイルを使う（上の「TLS」） | `acme`（常に false） |
 | TLS のオプション | `tls.options` | `min_version`（`"1.2"` / `"1.3"`）、`cipher_suites` | `tls_options` |
 
 - `http` は `protocol: tcp` で、`tls.mode` が `terminate`（HTTPS）か、TLS なし（平文の HTTP）のときだけ。`sni`・`starttls`・ポート範囲とは組み合わせられない。`remote_addr` / `remote_port` は書かない（書くと `400 invalid`）。
