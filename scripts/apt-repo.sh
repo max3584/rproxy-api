@@ -4,7 +4,7 @@
 #   scripts/apt-repo.sh <repo-dir> <file.deb>...
 #
 # Layout (served as-is by GitHub Pages from the gh-pages branch):
-#   pool/main/r/rproxy-api/*.deb
+#   pool/main/r/<package>/*.deb   (rproxy-api, rproxy-ui)
 #   dists/stable/main/binary-<arch>/Packages{,.gz}
 #   dists/stable/{Release,Release.gpg,InRelease}
 #   rproxy-archive-keyring.gpg   (binary public key for signed-by=)
@@ -23,7 +23,7 @@ shift
 SUITE=stable
 COMPONENT=main
 ARCHES="amd64 arm64 armhf"
-pool="$repo/pool/$COMPONENT/r/rproxy-api"
+pool="$repo/pool/$COMPONENT/r"
 key=(${APT_GPG_KEY_ID:+--local-user "$APT_GPG_KEY_ID"})
 
 mkdir -p "$pool"
@@ -31,7 +31,8 @@ for deb in "$@"; do
 	name=$(dpkg-deb --field "$deb" Package)
 	version=$(dpkg-deb --field "$deb" Version)
 	arch=$(dpkg-deb --field "$deb" Architecture)
-	dest="$pool/${name}_${version}_${arch}.deb"
+	mkdir -p "$pool/$name"
+	dest="$pool/$name/${name}_${version}_${arch}.deb"
 	# a published version must never change under the same name (apt caches it by hash)
 	if [ -e "$dest" ] && ! cmp -s "$deb" "$dest"; then
 		echo "$dest already exists with different contents; bump the version" >&2

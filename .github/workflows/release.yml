@@ -149,6 +149,18 @@ jobs:
           path: debs
           merge-multiple: true
 
+      # the UI is released with the same version first (docs/RELEASING.md)
+      - name: Download rproxy-ui
+        if: steps.key.outputs.ok
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download "${{ github.ref_name }}" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
+            ls debs
+          else
+            echo "::warning::no rproxy-ui .deb in TCP-UDP-rproxy-ui ${{ github.ref_name }}; publishing rproxy-api only (re-run this job once the UI release has it)"
+          fi
+
       - name: Update the repository
         if: steps.key.outputs.ok
         run: |
