@@ -353,3 +353,78 @@ async fn crowdsec_needs_its_global_settings() {
 	assert!(v["error"].as_str().unwrap().contains("appsec_url"), "{v}");
 	b.stop();
 }
+
+/// Whether a plain TCP connection to `port` gets an answer through the rule.
+async fn tcp_passes(port: u16) -> bool {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let Ok(mut s) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else { return false };
+	if s.write_all(b"x").await.is_err() {
+		return false;
+	}
+	let mut buf = [0u8; 64];
+	matches!(tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await, Ok(Ok(n)) if n > 0)
+}
+
+async fn udp_passes(sock: &tokio::net::UdpSocket) -> bool {
+	let _ = sock.send(b"x").await;
+	let mut buf = [0u8; 64];
+	matches!(tokio::time::timeout(Duration::from_millis(500), sock.recv(&mut buf)).await, Ok(Ok(n)) if n > 0)
+}
+
+#[tokio::test]
+async fn l4_rules_with_crowdsec_refuse_banned_clients() {
+	let lapi = Shared::default();
+	{
+		let mut l = lapi.lock().unwrap();
+		l.key = "l4-key".into();
+		// the test client connects from 127.0.0.1
+		l.all = vec![decision(1, "Range", "127.0.0.0/8", "ban")];
+	}
+	let lapi_addr = fake_lapi(lapi.clone()).await;
+	let key = key_file("l4", "l4-key");
+	let b = bouncer(&format!("http://{lapi_addr}"), &key, None);
+	let h = harness_for(&b).await;
+	let (tcp_backend, udp_backend) = (tcp_backend("T:").await, udp_backend("U:").await);
+	let (guarded, open, udp) = (free_port(), free_port(), free_udp_port());
+	let mut r = rule("tcp", guarded, tcp_backend);
+	r["crowdsec"] = json!(true);
+	let (status, v) = h.post(r).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["crowdsec"], true, "{v}");
+	let (status, v) = h.post(rule("tcp", open, tcp_backend)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert!(v.get("crowdsec").is_none(), "left out when off: {v}");
+	let mut r = rule("udp", udp, udp_backend);
+	r["crowdsec"] = json!(true);
+	assert_eq!(h.post(r).await.0, StatusCode::CREATED);
+	eventually("the first pull", || async { b.synced() }).await;
+
+	assert!(!tcp_passes(guarded).await, "banned client is cut before anything is forwarded");
+	assert!(tcp_passes(open).await, "rules without crowdsec are not affected");
+	let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	client.connect(("127.0.0.1", udp)).await.unwrap();
+	assert!(!udp_passes(&client).await, "datagrams of banned clients are dropped");
+	let (_, view) = h.get(&format!("/rules/tcp/127.0.0.1/{guarded}")).await;
+	assert!(view["stats"]["denied"].as_u64().unwrap() >= 1, "{view}");
+
+	// PATCH turns it off; then the ban is lifted for the UDP rule
+	let (status, v) = h
+		.patch(&format!("tcp/127.0.0.1/{guarded}"), json!({"remote_addr": "127.0.0.1", "remote_port": tcp_backend.port(), "crowdsec": false}))
+		.await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert!(tcp_passes(guarded).await);
+	lapi.lock().unwrap().deltas.push_back(json!({"new": null, "deleted": [decision(1, "Range", "127.0.0.0/8", "ban")]}));
+	eventually("the ban to be lifted", || async { udp_passes(&client).await }).await;
+	b.stop();
+}
+
+#[tokio::test]
+async fn crowdsec_on_a_rule_needs_global_crowdsec() {
+	let h = harness().await;
+	let backend = tcp_backend("N:").await;
+	let mut r = rule("tcp", free_port(), backend);
+	r["crowdsec"] = json!(true);
+	let (status, v) = h.post(r).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("global.crowdsec"), "{v}");
+}

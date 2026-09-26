@@ -413,3 +413,76 @@ async fn changed_certificate_files_are_noticed() {
 	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (1, 0));
 	assert_eq!(tls_roundtrip(&pki, port, "three.test", None, "4").await.unwrap(), "W:4");
 }
+
+/// Handshakes with `connector` and returns the negotiated (version, cipher suite).
+async fn negotiate(port: u16, name: &str, connector: tokio_rustls::TlsConnector) -> std::io::Result<(String, String)> {
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+	let mut s = connector.connect(name.to_string().try_into().unwrap(), tcp).await?;
+	s.write_all(b"x").await?;
+	let mut buf = [0u8; 64];
+	tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf)).await??;
+	let (_, conn) = s.get_ref();
+	Ok((format!("{:?}", conn.protocol_version().unwrap()), format!("{:?}", conn.negotiated_cipher_suite().unwrap().suite())))
+}
+
+fn client_with(pki: &Pki, versions: &[&'static rustls::SupportedProtocolVersion]) -> tokio_rustls::TlsConnector {
+	let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+		.with_protocol_versions(versions)
+		.unwrap()
+		.with_root_certificates(pki.roots())
+		.with_no_client_auth();
+	tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+}
+
+#[tokio::test]
+async fn tls_options_limit_versions_and_cipher_suites() {
+	let pki = Pki::new("opts");
+	let cert = pki.server("front", &["opts.test"]);
+	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["tls_options"], true, "{caps}");
+	let backend = tcp_backend("O:").await;
+	let files = json!([{"cert_file": cert.cert_file, "key_file": cert.key_file}]);
+	let (tls12, tls13) = (&rustls::version::TLS12, &rustls::version::TLS13);
+
+	let only13 = free_port();
+	let (status, v) = h
+		.post(tcp_rule(only13, backend, json!({"mode": "terminate", "certificates": files, "options": {"min_version": "1.3"}})))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert!(negotiate(only13, "opts.test", client_with(&pki, &[tls12])).await.is_err(), "TLS 1.2 clients are refused");
+	assert_eq!(negotiate(only13, "opts.test", client_with(&pki, &[tls13, tls12])).await.unwrap().0, "TLSv1_3");
+
+	let chacha = free_port();
+	let suites = json!([
+		"TLS13_CHACHA20_POLY1305_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+	]);
+	let (status, v) = h
+		.post(tcp_rule(chacha, backend, json!({"mode": "terminate", "certificates": files, "options": {"cipher_suites": suites}})))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["tls"]["options"]["cipher_suites"], suites, "{v}");
+	let (version, suite) = negotiate(chacha, "opts.test", client_with(&pki, &[tls13, tls12])).await.unwrap();
+	assert_eq!((version.as_str(), suite.as_str()), ("TLSv1_3", "TLS13_CHACHA20_POLY1305_SHA256"));
+	let (version, suite) = negotiate(chacha, "opts.test", client_with(&pki, &[tls12])).await.unwrap();
+	assert_eq!(version, "TLSv1_2");
+	assert!(suite.contains("CHACHA20_POLY1305"), "{suite}");
+
+	// mistakes
+	for (options, code, text) in [
+		(json!({"cipher_suites": ["TLS_RSA_WITH_RC4_128_MD5"]}), "tls_config", "known:"),
+		(json!({"min_version": "1.3", "cipher_suites": ["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"]}), "tls_config", "min_version 1.3"),
+		(json!({"min_version": "1.1"}), "tls_config", "1.2 or 1.3"),
+	] {
+		let (status, v) = h
+			.post(tcp_rule(free_port(), backend, json!({"mode": "terminate", "certificates": files, "options": options})))
+			.await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some(code)), "{options}: {v}");
+		assert!(v["error"].as_str().unwrap().contains(text), "{options}: {v}");
+	}
+	let mut dtls = rule("udp", free_udp_port(), backend);
+	dtls["tls"] = json!({"mode": "terminate", "certificates": files, "options": {"min_version": "1.3"}});
+	assert_eq!(h.post(dtls).await.1["code"], "unsupported", "no options for DTLS");
+}

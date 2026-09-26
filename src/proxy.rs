@@ -79,6 +79,8 @@ pub struct Runtime {
 	pub routes: RwLock<Arc<Vec<RouteTarget>>>,
 	pub tls: RwLock<Arc<TlsRuntime>>,
 	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
+	/// The rule's `crowdsec`: refuse clients blocked by the CrowdSec decisions.
+	pub crowdsec: std::sync::atomic::AtomicBool,
 	/// L7 routing of an `http` rule; replaced as a whole on changes.
 	pub http: RwLock<Option<Arc<crate::http::server::Router>>>,
 	/// `global` settings of `http` rules (trusted proxies, access log).
@@ -115,6 +117,13 @@ impl Runtime {
 	/// Whether `allow_from` lets this client in.
 	pub fn allowed(&self, client: std::net::IpAddr) -> bool {
 		cidr::allows(&self.allow_from.read().unwrap(), client)
+	}
+
+	/// Whether the CrowdSec decisions refuse this client (rules with `crowdsec`).
+	/// Until the LAPI has answered once, clients pass.
+	pub fn crowdsec_blocks(&self, client: std::net::IpAddr) -> bool {
+		self.crowdsec.load(Ordering::Relaxed)
+			&& self.global.crowdsec().is_some_and(|b| b.check_ip(client) == crate::http::crowdsec::Verdict::Block)
 	}
 
 	/// The backend for a connection, by server name when routes are configured.

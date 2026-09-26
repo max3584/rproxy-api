@@ -34,6 +34,8 @@ pub struct TlsInfo {
 	pub server_name: Option<String>,
 	pub alpn: Option<String>,
 	pub version: Option<String>,
+	/// Negotiated cipher suite (logs only), e.g. `TLS13_AES_128_GCM_SHA256`.
+	pub cipher: Option<String>,
 	/// Common name of a verified client certificate.
 	pub client_cn: Option<String>,
 	/// The client sent a certificate (it was verified, or the handshake would have failed).
@@ -247,6 +249,7 @@ mod tests {
 			server_name: Some("mail.example".into()),
 			alpn: None,
 			version: Some("TLSv1_3".into()),
+			cipher: None,
 			client_cn: Some("alice".into()),
 			client_cert: true,
 		};

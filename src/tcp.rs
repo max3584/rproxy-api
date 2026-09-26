@@ -94,6 +94,10 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		denied(&rt, client, "allow_from", None);
 		return;
 	}
+	if rt.crowdsec_blocks(client.ip()) {
+		denied(&rt, client, "crowdsec", None);
+		return;
+	}
 	if rt.http_router().is_some() {
 		return handle_http(inbound, client, rt, offset).await;
 	}
@@ -205,6 +209,7 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 		server_name: conn.server_name().map(str::to_string),
 		alpn: conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
 		version: conn.protocol_version().map(|v| format!("{v:?}")),
+		cipher: conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())),
 		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
 		client_cert: peer_cert.is_some(),
 	};
@@ -285,8 +290,8 @@ async fn terminate(
 	detail.target = Some(addr);
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr,
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
-		tls_version = info.version.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""),
-		starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""));
+		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
+		client_cn = info.client_cn.as_deref().unwrap_or(""), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""));
 	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);
 

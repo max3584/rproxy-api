@@ -261,6 +261,10 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 				return Err(tls_error(format!("options.min_version {v:?} must be 1.2 or 1.3")));
 			}
 		}
+		if protocol == Protocol::Udp {
+			return Err(ApiError::unsupported("tls.options are not available for DTLS (udp); they apply to tcp only"));
+		}
+		server_crypto(Some(o))?;
 	}
 	if tls.mode != TlsMode::Terminate
 		&& (tls.client_auth.mode != ClientAuthMode::None || tls.upstream != Upstream::default() || !tls.alpn.is_empty())
@@ -440,8 +444,45 @@ impl ResolvesServerCert for SniCertResolver {
 	}
 }
 
+/// Name of a cipher suite as written in `tls.options.cipher_suites`
+/// (rustls / IANA style, e.g. `TLS13_AES_128_GCM_SHA256`).
+fn suite_name(suite: &rustls::SupportedCipherSuite) -> String {
+	format!("{:?}", suite.suite())
+}
+
+/// Cipher suites and protocol versions for terminating TLS, narrowed by `tls.options`.
+/// A version left without any of the chosen suites is not offered.
+fn server_crypto(
+	options: Option<&TlsOptions>,
+) -> Result<(Arc<rustls::crypto::CryptoProvider>, Vec<&'static rustls::SupportedProtocolVersion>), ApiError> {
+	let mut provider = rustls::crypto::ring::default_provider();
+	let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = vec![&rustls::version::TLS13, &rustls::version::TLS12];
+	let Some(o) = options else { return Ok((Arc::new(provider), versions)) };
+	if o.min_version.as_deref() == Some("1.3") {
+		versions.retain(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
+	}
+	if !o.cipher_suites.is_empty() {
+		let mut chosen = vec![];
+		for name in &o.cipher_suites {
+			let suite = provider.cipher_suites.iter().find(|s| suite_name(s) == *name).ok_or_else(|| {
+				let known: Vec<String> = provider.cipher_suites.iter().map(suite_name).collect();
+				tls_error(format!("options.cipher_suites: unknown {name:?} (known: {})", known.join(", ")))
+			})?;
+			if !chosen.contains(suite) {
+				chosen.push(*suite);
+			}
+		}
+		provider.cipher_suites = chosen;
+	}
+	versions.retain(|v| provider.cipher_suites.iter().any(|s| s.version() == *v));
+	if versions.is_empty() {
+		return Err(tls_error("options: none of cipher_suites can be used with min_version 1.3"));
+	}
+	Ok((Arc::new(provider), versions))
+}
+
 fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
-	let provider = provider();
+	let (provider, versions) = server_crypto(tls.options.as_ref())?;
 	let mut certs = vec![];
 	for files in &tls.certificates {
 		let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
@@ -459,7 +500,7 @@ fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
 	}
 
 	let builder = ServerConfig::builder_with_provider(provider.clone())
-		.with_safe_default_protocol_versions()
+		.with_protocol_versions(&versions)
 		.map_err(|e| tls_error(e.to_string()))?;
 	let builder = match client_verifier(&tls.client_auth)? {
 		Some(verifier) => builder.with_client_cert_verifier(verifier),
