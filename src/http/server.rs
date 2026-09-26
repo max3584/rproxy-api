@@ -22,6 +22,7 @@ use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
 
+use super::middleware::{Ctx, Middleware};
 use super::{parse_duration, HttpSpec, Matcher, ServiceSpec};
 use crate::error::ApiError;
 use crate::http::matcher::RequestInfo;
@@ -127,6 +128,7 @@ struct Route {
 	name: String,
 	matcher: Matcher,
 	service: Option<Arc<Service>>,
+	middlewares: Vec<Arc<Middleware>>,
 }
 
 /// The compiled `http` of a rule. Replaced as a whole when the rule changes,
@@ -153,8 +155,17 @@ impl Router {
 		for (name, s) in &spec.services {
 			services.insert(name.clone(), Arc::new(Service::compile(name, s)?));
 		}
+		let mut middlewares = std::collections::HashMap::new();
+		for (name, m) in &spec.middlewares {
+			middlewares.insert(name.clone(), Arc::new(Middleware::compile(name, m)?));
+		}
 		let mut routes = vec![];
 		for (i, r) in spec.routes.iter().enumerate() {
+			let chain = r
+				.middlewares
+				.iter()
+				.map(|m| middlewares.get(m).cloned().ok_or_else(|| ApiError::invalid(format!("middleware {m:?} is not defined"))))
+				.collect::<Result<Vec<_>, _>>()?;
 			let matcher = Matcher::parse(&r.rule).map_err(|e| ApiError::invalid(format!("route {}: match: {e}", r.name)))?;
 			let service = match (&r.service, &r.to) {
 				(Some(s), _) => Some(services.get(s).cloned().ok_or_else(|| ApiError::invalid(format!("service {s:?} is not defined")))?),
@@ -162,7 +173,7 @@ impl Router {
 				(None, None) => None,
 			};
 			let priority = r.priority.unwrap_or_else(|| Matcher::default_priority(&r.rule));
-			routes.push((priority, i, Route { name: r.name.clone(), matcher, service }));
+			routes.push((priority, i, Route { name: r.name.clone(), matcher, service, middlewares: chain }));
 		}
 		// higher priority first; the order in the settings breaks ties
 		routes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -362,18 +373,41 @@ impl Conn {
 			headers: &headers,
 			client: canonical(self.client.ip()),
 		};
-		let (route_name, service) = match router.route(&info) {
-			Some(r) => (r.name.as_str(), r.service.clone()),
-			None => ("", router.default_service.clone()),
+		let (route_name, service, chain) = match router.route(&info) {
+			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice()),
+			None => ("", router.default_service.clone(), &[][..]),
 		};
 		let method = req.method().clone();
 		let path = req.uri().path().to_string();
-		let resp = match service {
-			Some(service) => self.forward(&router, &service, route_name, req, &host).await,
-			None if route_name.is_empty() => error_response(router.default_status),
-			// a route answered only by middlewares, which this build cannot run yet
-			None => error_response(StatusCode::NOT_IMPLEMENTED),
+		let ctx = Ctx {
+			client: canonical(self.client.ip()),
+			https: self.https,
+			host: host.clone(),
+			origin: req.headers().get(header::ORIGIN).cloned(),
 		};
+		// request side in the route's order, until one answers
+		let (mut parts, body) = req.into_parts();
+		let mut ran = 0;
+		let mut answer = None;
+		for m in chain {
+			ran += 1;
+			if let Some(resp) = m.on_request(&mut parts, &ctx) {
+				answer = Some(resp);
+				break;
+			}
+		}
+		let req = Request::from_parts(parts, body);
+		let mut resp = match (answer, service) {
+			(Some(resp), _) => resp,
+			(None, Some(service)) => self.forward(&router, &service, route_name, req, &host).await,
+			(None, None) if route_name.is_empty() => error_response(router.default_status),
+			// validation makes such a route end in an answering middleware
+			(None, None) => error_response(StatusCode::NOT_FOUND),
+		};
+		// response side in reverse, also for answers of the middlewares
+		for m in chain[..ran].iter().rev() {
+			m.on_response(resp.headers_mut(), &ctx);
+		}
 		debug!(event = "http.request", rule = %self.rt.key, client = %self.client, host = %host, method = %method,
 			path = %path, route = route_name, status = resp.status().as_u16());
 		resp

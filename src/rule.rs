@@ -138,7 +138,17 @@ pub struct Features {
 
 impl Features {
 	pub const CURRENT: Features =
-		Features { http: true, http3: false, acme: false, tls_options: false, middlewares: &[], services: &[] };
+		Features {
+		http: true,
+		http3: false,
+		acme: false,
+		tls_options: false,
+		middlewares: &[
+			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
+			"replace_path_regex", "respond",
+		],
+		services: &[],
+	};
 
 	/// Everything the settings can describe; for registering a startup rule
 	/// that this build cannot run as failed, with the reason.

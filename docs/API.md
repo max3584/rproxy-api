@@ -182,6 +182,15 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - 転送先へは `X-Forwarded-For`・`X-Real-IP`（接続元の IP）、`X-Forwarded-Proto`（`http` / `https`）、`X-Forwarded-Host`、`X-Forwarded-Port` を付ける。クライアントが送ってきた同名のヘッダは置き換える（信頼するプロキシは #67）。ホップごとのヘッダ（`Connection` とそこに書かれたもの、`Keep-Alive`、`TE`、`Transfer-Encoding` など）は取り除く。
 - `Connection: Upgrade`（WebSocket など）は、転送先が 101 を返せばそのまま中継する。ルールを削除すると切れる。
 - 転送先に接続できなければ 502、`timeouts.connect`（既定 5 秒）・`timeouts.response`（既定 60 秒。応答ヘッダまで）を過ぎると 504。`event: "http.error"` のログを出す。リクエストごとのログ（`event: "http.request"`）は debug レベル。アクセスログとメトリクスは #57。
+- ミドルウェアはルートの `middlewares` に書いた順にリクエストへ働き、応答へは逆の順に働く（Traefik と同じ）。途中のミドルウェアが応答を返したら（リダイレクト・`respond`・拒否）、その先へは進まない。その応答にも、それまでに通ったミドルウェアの応答側（`headers` など）が働く。
+- 使えるミドルウェア（v0.3.1。`features.middlewares`）:
+  - `redirect_scheme`: `scheme` と違う方式で受けたリクエストを、同じホスト・パス・クエリの `scheme://` へリダイレクトする。`port` は既定のポート（80 / 443）なら省く。
+  - `redirect_regex`: `http://host[:port]/path?query`（受けた URL）が `regex` に一致すれば、`replacement`（`$1`・`${name}` が使える）へリダイレクトする。一致しなければ次へ進む。
+  - リダイレクトの状態コードは、`permanent` なら 301、そうでなければ 302。GET / HEAD 以外は 308 / 307（メソッドと本文を保つ）。
+  - `respond`: `status`・`body`・`content_type`（既定 `text/plain; charset=utf-8`）で応答する。`service` のないルート（ブロックやメンテナンス表示）に使う。
+  - `ip_allow`: 接続元の IP が `source_range` になければ 403。
+  - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）と `Vary: Origin` を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。
+  - `strip_prefix`: パスが `prefixes` のどれか（先に書いたもの優先）で始まれば取り除き、`X-Forwarded-Prefix` を付ける。`add_prefix`: パスの前に付ける。`replace_path`: パスを置き換え、元のパスを `X-Replaced-Path` に入れる。`replace_path_regex`: 一致したときだけ置き換える（`X-Replaced-Path` も）。クエリは保つ。
 - `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http"}`）。
@@ -191,7 +200,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":false,"middlewares":[],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":false,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |

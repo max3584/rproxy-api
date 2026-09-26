@@ -27,7 +27,8 @@ async fn echo_backend(tag: &'static str) -> SocketAddr {
 		axum::Json(json!({
 			"tag": tag, "uri": req.uri().to_string(), "host": h("host"), "xff": h("x-forwarded-for"),
 			"proto": h("x-forwarded-proto"), "xhost": h("x-forwarded-host"), "real": h("x-real-ip"),
-			"xport": h("x-forwarded-port"), "secret": h("x-secret"),
+			"xport": h("x-forwarded-port"), "secret": h("x-secret"), "prefix": h("x-forwarded-prefix"),
+			"replaced": h("x-replaced-path"), "xa": h("x-a"), "xb": h("x-b"),
 		}))
 	});
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -347,4 +348,140 @@ async fn http_rules_refuse_what_does_not_fit() {
 	assert_eq!(h.post(rule("tcp", port, a)).await.0, StatusCode::CREATED);
 	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{port}"), json!({"http": routes})).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+}
+
+/// A request without following redirects; returns the response.
+async fn raw(port: u16, method: reqwest::Method, host: &str, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
+	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+	let mut req = client.request(method, format!("http://127.0.0.1:{port}{path}")).header("Host", host);
+	for (k, v) in headers {
+		req = req.header(*k, *v);
+	}
+	req.timeout(Duration::from_secs(10)).send().await.unwrap()
+}
+
+#[tokio::test]
+async fn redirects_and_fixed_answers() {
+	let h = harness().await;
+	let cdn = echo_backend("CDN").await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [
+					{"name": "www", "match": "HostRegexp(`^www\\.`)", "middlewares": ["no-www"]},
+					{"name": "to-https", "match": "Host(`secure.test`)", "middlewares": ["to-https"]},
+					{"name": "cdn-allowed", "match": "Host(`cdn.test`) && PathPrefix(`/file/`)", "to": url(cdn)},
+					{"name": "cdn-block", "match": "Host(`cdn.test`)", "middlewares": ["forbidden"]},
+				],
+				"middlewares": {
+					"no-www": {"redirect_regex": {"regex": "^http://www\\.([^/]+)(.*)$", "replacement": "https://$1$2", "permanent": true}},
+					"to-https": {"redirect_scheme": {"scheme": "https"}},
+					"forbidden": {"respond": {"status": 403, "body": "blocked"}},
+				},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let r = raw(port, reqwest::Method::GET, "secure.test:8080", "/a?b=1", &[]).await;
+	assert_eq!((r.status(), r.headers()["location"].to_str().unwrap()), (StatusCode::FOUND, "https://secure.test/a?b=1"));
+	let r = raw(port, reqwest::Method::POST, "secure.test", "/", &[]).await;
+	assert_eq!(r.status(), StatusCode::TEMPORARY_REDIRECT, "other methods keep method and body");
+	let r = raw(port, reqwest::Method::GET, "www.site.test", "/p?q", &[]).await;
+	assert_eq!((r.status(), r.headers()["location"].to_str().unwrap()), (StatusCode::MOVED_PERMANENTLY, "https://site.test/p?q"));
+
+	assert_eq!(get(port, "cdn.test", "/file/x").await.1["tag"], "CDN");
+	let r = raw(port, reqwest::Method::GET, "cdn.test", "/admin", &[]).await;
+	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	assert_eq!(r.text().await.unwrap(), "blocked");
+}
+
+#[tokio::test]
+async fn ip_allow_headers_and_paths() {
+	let h = harness().await;
+	let a = echo_backend("A").await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [
+					{"name": "internal", "match": "PathPrefix(`/internal`)", "to": url(a), "middlewares": ["lan"]},
+					{"name": "api", "match": "PathPrefix(`/api/`)", "to": url(a), "middlewares": ["sec", "strip"]},
+					{"name": "files", "match": "PathPrefix(`/files/`)", "to": url(a), "middlewares": ["rewrite"]},
+				],
+				"middlewares": {
+					"lan": {"ip_allow": {"source_range": ["10.0.0.0/8"]}},
+					"sec": {"headers": {
+						"request": {"set": {"X-A": "1"}, "remove": ["X-B"]},
+						"response": {"set": {"X-Served-By": "rproxy"}},
+						"hsts": {"max_age": 31536000},
+						"frame_deny": true,
+						"cors": {"allow_origins": ["https://app.test"], "allow_methods": ["GET", "POST"], "max_age": 60},
+					}},
+					"strip": {"strip_prefix": {"prefixes": ["/api"]}},
+					"rewrite": {"replace_path_regex": {"regex": "^/files/(.*)$", "replacement": "/storage/$1"}},
+				},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let (status, _) = get(port, "x.test", "/internal/x").await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "127.0.0.1 is outside 10.0.0.0/8");
+
+	let r = raw(port, reqwest::Method::GET, "x.test", "/api/users?id=1", &[("x-b", "drop me"), ("origin", "https://app.test")]).await;
+	assert_eq!(r.headers()["x-served-by"], "rproxy");
+	assert_eq!(r.headers()["x-frame-options"], "DENY");
+	assert_eq!(r.headers()["access-control-allow-origin"], "https://app.test");
+	assert!(r.headers().get("strict-transport-security").is_none(), "HSTS only over https");
+	let v: Value = r.json().await.unwrap();
+	assert_eq!((v["uri"].as_str(), v["prefix"].as_str()), (Some("/users?id=1"), Some("/api")), "{v}");
+	assert_eq!((v["xa"].as_str(), v["xb"].as_str()), (Some("1"), Some("")), "{v}");
+
+	// CORS preflight from an allowed origin is answered by rproxy
+	let r = raw(
+		port,
+		reqwest::Method::OPTIONS,
+		"x.test",
+		"/api/users",
+		&[("origin", "https://app.test"), ("access-control-request-method", "POST")],
+	)
+	.await;
+	assert_eq!(r.status(), StatusCode::NO_CONTENT);
+	assert_eq!(r.headers()["access-control-allow-methods"], "GET, POST");
+	assert_eq!(r.headers()["access-control-allow-origin"], "https://app.test");
+	assert_eq!(r.headers()["access-control-max-age"], "60");
+
+	let (_, v) = get(port, "x.test", "/files/a/b.iso").await;
+	assert_eq!((v["uri"].as_str(), v["replaced"].as_str()), (Some("/storage/a/b.iso"), Some("/files/a/b.iso")), "{v}");
+}
+
+#[tokio::test]
+async fn hsts_over_https() {
+	let pki = Pki::new("hsts");
+	let front = pki.server("front", &["a.test"]);
+	let a = echo_backend("A").await;
+	let h = harness().await;
+	let port = free_port();
+	let mut body = http_rule(
+		port,
+		json!({
+			"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": url(a), "middlewares": ["hsts"]}],
+			"middlewares": {"hsts": {"headers": {"hsts": {"max_age": 60, "include_subdomains": true, "preload": true}}}},
+		}),
+	);
+	body["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}]});
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let tls = pki.connector_alpn(None, &["http/1.1"]).connect(ServerName::try_from("a.test").unwrap(), tcp).await.unwrap();
+	let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+	tokio::spawn(conn);
+	let req = hyper::Request::get("/").header("host", "a.test").body(Empty::<Bytes>::new()).unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	assert_eq!(resp.headers()["strict-transport-security"], "max-age=60; includeSubDomains; preload");
 }
