@@ -475,3 +475,109 @@ async fn unix_socket_mistakes_stop_the_startup() {
 		assert!(!ok && log.contains(want), "{env:?}: {log}");
 	}
 }
+
+/// Rewrites a file so its size or modification time changes for the watcher.
+fn rewrite(path: &Path, text: &str) {
+	fs::write(path, text).unwrap();
+}
+
+fn static_rule(port: u16, backend: u16, extra: &str) -> String {
+	format!("  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {port}, remote_addr: 127.0.0.1, remote_port: {backend}{extra}}}\n")
+}
+
+async fn roundtrip_port(port: u16, msg: &str) -> Option<String> {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+	s.write_all(msg.as_bytes()).await.ok()?;
+	let mut buf = vec![0; 64];
+	let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await.ok()?.ok()?;
+	Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+#[tokio::test]
+async fn the_settings_file_is_applied_again_when_it_changes() {
+	let dir = workdir("config-reload");
+	let (a, b) = (tcp_backend("A:").await, tcp_backend("B:").await);
+	let (keep, change, remove, add) = (free_port(), free_port(), free_port(), free_port());
+	let cfg = dir.join("rproxy.yaml");
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}{}{}", static_rule(keep, a.port(), ""), static_rule(change, a.port(), ""), static_rule(remove, a.port(), "")));
+	let port = free_port();
+	let rp = Rproxy::start(&dir, port, &[("RPROXY_CONFIG", cfg.to_str().unwrap()), ("RPROXY_CONFIG_CHECK_SECS", "1")]);
+	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
+	let (_, status) = get_json(port, "/config").await;
+	assert_eq!((status["configured"].as_bool(), status["rules"].as_u64()), (Some(true), Some(3)), "{status}");
+
+	// a connection on the unchanged rule must survive the reload
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let mut held = tokio::net::TcpStream::connect(("127.0.0.1", keep)).await.unwrap();
+	held.write_all(b"1").await.unwrap();
+	let mut buf = [0u8; 16];
+	let n = held.read(&mut buf).await.unwrap();
+	assert_eq!(&buf[..n], b"A:1");
+
+	rewrite(&cfg, &format!(
+		"version: 1\nrules:\n{}{}{}",
+		static_rule(keep, a.port(), ""),
+		static_rule(change, b.port(), ", allow_from: [127.0.0.1]"),
+		static_rule(add, b.port(), "")
+	));
+	wait_for("the reload", &rp, || async { rp.log().contains(r#""event":"config.reload""#) }).await;
+	assert!(rp.log().contains(r#""added":1,"removed":1,"changed":1,"unchanged":1"#), "{}", rp.log());
+	assert_eq!(roundtrip_port(change, "2").await.as_deref(), Some("B:2"), "changed in place");
+	assert_eq!(roundtrip_port(add, "3").await.as_deref(), Some("B:3"), "added");
+	assert_eq!(roundtrip_port(remove, "4").await, None, "removed");
+	held.write_all(b"5").await.unwrap();
+	let n = held.read(&mut buf).await.unwrap();
+	assert_eq!(&buf[..n], b"A:5", "the unchanged rule kept its connection");
+	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{change}")).await;
+	assert_eq!((v["origin"].as_str(), v["remote_port"].as_u64()), (Some("static"), Some(u64::from(b.port()))), "{v}");
+
+	// a broken version changes nothing and is reported
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}{}", static_rule(keep, a.port(), ""), static_rule(keep, b.port(), "")));
+	wait_for("the error", &rp, || async { rp.log().contains(r#""event":"config.error""#) }).await;
+	let (_, status) = get_json(port, "/config").await;
+	assert!(status["error"].as_str().unwrap().contains("both listen on"), "{status}");
+	assert_eq!(roundtrip_port(add, "6").await.as_deref(), Some("B:6"), "the last good rules keep running");
+
+	// a changed global is reported as needing a restart
+	rewrite(&cfg, &format!("version: 1\nglobal: {{trusted_proxies: [10.0.0.0/8]}}\nrules:\n{}", static_rule(keep, a.port(), "")));
+	wait_for("the second reload", &rp, || async { rp.log().contains("restart_needed") }).await;
+	let (_, status) = get_json(port, "/config").await;
+	assert_eq!((status["error"].as_str(), status["restart_needed"][0].as_str()), (None, Some("global.trusted_proxies")), "{status}");
+	assert_eq!(roundtrip_port(add, "7").await, None);
+}
+
+#[tokio::test]
+async fn a_settings_directory_follows_a_swapped_link_and_sighup() {
+	let dir = workdir("reload-dir");
+	let a = tcp_backend("D:").await;
+	let (one, two) = (free_port(), free_port());
+	// like a mounted Kubernetes ConfigMap: files are links into a directory that gets swapped
+	let conf = dir.join("conf");
+	let v1 = dir.join("v1");
+	let v2 = dir.join("v2");
+	fs::create_dir_all(&conf).unwrap();
+	fs::create_dir_all(&v1).unwrap();
+	fs::create_dir_all(&v2).unwrap();
+	rewrite(&v1.join("rules.yaml"), &format!("version: 1\nrules:\n{}", static_rule(one, a.port(), "")));
+	rewrite(&v2.join("rules.yaml"), &format!("version: 1\nrules:\n{}", static_rule(two, a.port(), "")));
+	std::os::unix::fs::symlink(&v1, conf.join("..data")).unwrap();
+	std::os::unix::fs::symlink("..data/rules.yaml", conf.join("rules.yaml")).unwrap();
+	let port = free_port();
+	// checks off: only SIGHUP applies the change
+	let rp = Rproxy::start(&dir, port, &[("RPROXY_CONFIG", conf.to_str().unwrap()), ("RPROXY_CONFIG_CHECK_SECS", "0")]);
+	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
+	assert_eq!(roundtrip_port(one, "1").await.as_deref(), Some("D:1"));
+
+	let tmp = conf.join("..data_tmp");
+	std::os::unix::fs::symlink(&v2, &tmp).unwrap();
+	fs::rename(&tmp, conf.join("..data")).unwrap();
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert_eq!(roundtrip_port(one, "2").await.as_deref(), Some("D:2"), "not before SIGHUP");
+	rp.hup();
+	wait_for("the reload", &rp, || async { rp.log().contains(r#""event":"config.reload""#) }).await;
+	assert_eq!(roundtrip_port(two, "3").await.as_deref(), Some("D:3"));
+	assert_eq!(roundtrip_port(one, "4").await, None);
+	let (_, status) = get_json(port, "/config").await;
+	assert!(status["files"][0].as_str().unwrap().ends_with("rules.yaml"), "{status}");
+}

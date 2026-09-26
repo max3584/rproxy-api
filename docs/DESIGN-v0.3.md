@@ -20,6 +20,8 @@ v0.3.0 では、これから入れる機能の**設定と API の形**をまと�
 
 `RPROXY_CONFIG` にファイルかディレクトリ（`*.yaml` を名前順に読む）を指定する。書き換えたら再起動なしで差分を反映する。`RPROXY_STATIC_RULES` はこれの別名として残す（中身がルールの配列でも、下の形でもよい）。
 
+> v0.3.2 で実装：ディレクトリは `*.yaml` / `*.yml` / `*.json`（`.` で始まるものは除く）、`global` は 1 つのファイルだけ。確認の間隔は `RPROXY_CONFIG_CHECK_SECS`（既定 10 秒）と SIGHUP。誤りのある版は反映せず、`GET /config` の `error` で知らせる。`global` の変更は再起動まで効かない（`restart_needed`）。
+
 ```yaml
 # /etc/rproxy/rproxy.yaml
 version: 1
@@ -171,7 +173,9 @@ tokens:
 
 - スコープ: `rules:read`、`rules:write`、`metrics:read`、`admin`（すべて）
 - 変更の監査ログ: `event: "audit"`、トークンの名前、操作、ルール
-- `GET /openapi.json` で API の定義を返す
+- `GET /openapi.json` で API の定義を返す（v0.3.2。手で書いた `docs/openapi.json`。ルーターとの食い違いはテストで見つける）
+- CLI（`rproxyctl`）は作らない。`curl` と OpenAPI の定義から作るクライアントで足りるため（バイナリを増やさない）
+- API・設定ファイル・UI（DB）のルールの関係は docs/API.md の「API・設定ファイル・UI（DB）の関係」
 
 Unix ソケット: `RPROXY_API_SOCKET=/run/rproxy/api.sock`（`RPROXY_API_SOCKET_MODE`、`RPROXY_API_SOCKET_GROUP`）。TCP の待ち受けと併用できる。UI は `RPROXY_API_URL=unix:/run/rproxy/api.sock`。
 

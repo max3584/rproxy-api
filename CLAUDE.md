@@ -43,7 +43,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/crowdsec.rs` | `global.crowdsec` の bouncer（`Bouncer`。LAPI の stream を 1 つのタスクで取り、判定を ID ごとに覚える。API キーは SIGHUP で読み直す）と AppSec への問い合わせ。`crowdsec` ミドルウェアは非同期なので `server.rs` が直接呼ぶ |
 | `src/http/access.rs` | `global.trusted_proxies`・`global.access_log`（`HttpGlobal`。`Registry` の `Config.http` から全ルールの `Runtime.global` へ）、X-Forwarded-For からクライアントの IP を決める、アクセスログ、ルートごとのリクエストの統計（`stats.http`・`/metrics`） |
 | `src/http/server.rs` | `http` のルールのデータプレーン（hyper）。クライアントとは HTTP/1.1・HTTP/2、転送先とは HTTP/1.1。`Router` はルールの `Runtime.http` に入れ、変更時は丸ごと差し替える |
-| `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように） |
+| `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `main.rs` の `watch_config` → `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |
 | `src/logging.rs` | tracing の JSON Lines 出力（日次ローテーション） |
@@ -69,7 +69,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 - `allow_from` は受け付けた直後（TLS や PROXY ヘッダより前）に確かめる。UDP は範囲外のデータグラムを捨てる。拒否は `stats.denied` に数え、`conn.denied` をログに出す。
 - `tls.unmatched: reject` の `terminate` は、`LazyConfigAcceptor` で ClientHello を読んでから判断する（一致しない名前には証明書を返さない）。
-- 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作る。API からの変更・削除は `409 static`。`shutdown` だけは止める。
+- 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作り、ファイルが変わったら `Registry::reload_static` で差分を反映する（誤りがあれば何も変えない）。API からの変更・削除は `409 static`。`global` の変更は再起動まで効かない（`GET /config` の `restart_needed`）。
+- API の定義は `docs/openapi.json`（`GET /openapi.json`）。エンドポイントを足したら、ここにも足す（`api.rs` のテストがルーターとの食い違いを見つける）。
 - バージョン管理とリリースは docs/RELEASING.md の決まりで、確認を取らずに進める（UI と同じ番号で一緒に出す。PR・issue を作るときにパッチ／マイナーのマイルストーンを付ける。マージ後のタグ・リリースノート・マイルストーンの片付けまで行う）。
 - PR のブランチに追加で push する前に、その PR がまだ開いているか（`gh pr view <n> --json state`）を確かめる。マージ後に push したコミットは master に入らない（#20/#22、#32 で起きた）。
 - 文字列の置き換えでコードを編集するときは、置き換えの対象が 1 件見つかることを確かめる（見つからないまま空振りして、修正が入っていなかったことがある）。

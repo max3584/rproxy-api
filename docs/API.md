@@ -135,7 +135,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
 
 ## 設定ファイル（固定ルール）
 
-`RPROXY_CONFIG`（`--config`）に設定ファイルを指定すると、起動時にそのルールを開始する。0.2 の `RPROXY_STATIC_RULES`（`--static-rules`）も同じ意味で使える（両方は指定できない）。
+`RPROXY_CONFIG`（`--config`）に設定ファイル（またはそのディレクトリ）を指定すると、起動時にそのルールを開始し、ファイルが変わると再起動なしで反映する。0.2 の `RPROXY_STATIC_RULES`（`--static-rules`）も同じ意味で使える（両方は指定できない）。
 
 - 形式は拡張子で決まる: `.yaml` / `.yml` は YAML（コメント、アンカー `&name` / `*name` が使える）、それ以外は JSON。YAML と JSON は同じ形で、同じ意味になる。
 - 中身は次のどちらか。
@@ -151,8 +151,20 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
     - `appsec_url`（例 `http://127.0.0.1:7422`）: AppSec に問い合わせる（ミドルウェアの `appsec: true`。書かずに `appsec: true` を使うと `invalid`）。
     - `api_key_file` がないか空なら起動しない。読めない（権限）なら、読めるようになって SIGHUP するまで判定なしで動く（`part: global.crowdsec`）。
   - `access_log`: `http` のルールのアクセスログのファイル（JSON Lines。`RPROXY_LOG_FILE` と同じく日ごとに `<名前>.<日付>.<拡張子>` へローテーションし、`RPROXY_LOG_KEEP` 個残す）。省略するとアクセスログはメインのログ（`event: "http.access"`）に出す。ディレクトリがなければ起動しない。書き込めなければメインのログに出す（`part: global.access_log`）。
+- ディレクトリを指定すると、その中の `*.yaml` / `*.yml` / `*.json` を名前の順に読み、1 つの設定としてまとめる（`.` で始まるものは読まない。Kubernetes の ConfigMap をそのままマウントできる）。
+  - 各ファイルは上のどちらかの形。`rules` はつなげる。`global` を書けるのは 1 つのファイルだけ（2 つにあるとエラー）。
+  - 同じキー（プロトコル・アドレス・ポート）のルールが 2 つあると、両方のファイル名と位置（`web.yaml rule #2` など）を示してエラーにする。
 - DB からの復元より前に開始する。DB に接続できなくても動く。
-- API からは変更・削除できない（`409 static`）。変えるときは、ファイルを書き換えて rproxy を再起動する。
+- API からは変更・削除できない（`409 static`）。変えるときはファイルを書き換える。
+- **再起動なしの反映**：`RPROXY_CONFIG_CHECK_SECS`（既定 10 秒。`0` なら SIGHUP のときだけ）ごとに、ファイルの大きさ・更新時刻・inode（ディレクトリならファイルの増減も）を確かめ、変わっていれば読み直す。SIGHUP を送ると、変わっていなくても読み直す。シンボリックリンクの差し替え（ConfigMap の更新）も検知する。
+  - 読み直した設定は、まず全体を検証する。誤りがあれば何も変えず、それまでのルールを使い続ける（`event: "config.error"`。同じ内容では 1 回だけ）。読めない（権限）ときも同じで、読めるようになるまで確認のたびに試す。
+  - 正しければ差分だけを反映する（`event: "config.reload"`。`added`・`removed`・`changed`・`unchanged`・`failed` の件数）。
+    - 増えたルールは開始し、なくなったルールは停止する（既存の接続は切る）。
+    - 変わったルールは、PATCH で変えられる項目（転送先、`udp_idle_secs`、`tls`、`starttls`、`allow_from`、`http`）だけの違いなら、そのまま変える（既存の接続は切らない。TCP は新しい接続から）。ポート範囲・`source_ip` などが変わったときは、停止してから作り直す。
+    - 変わっていないルールには触らない（接続も切らない）。
+    - 同じキーのルールが API（DB）から作られていれば、そちらを残してファイルのルールを `rule.failed` としてログに出す。
+  - `global` の変更は再起動するまで効かない（`trusted_proxies`・`access_log`・`crowdsec`。起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
+  - 状態は `GET /config` で見える：`{"configured":true,"path":"/etc/rproxy/conf.d","files":[...],"loaded_at":1790000000,"rules":5,"last_reload":{"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0},"error":null,"restart_needed":[]}`（設定ファイルを使っていなければ `{"configured":false}`）。`error` は最新の版を反映できなかった理由（それまでの版が動いている）。
 - 同じキーや重なるポートのルールを API や DB から作ろうとすると、`already_exists` になる。
 - ファイルが存在しない、書式や形が不正（知らないキー、`version` が 1 以外、存在しない ACME の resolver の参照など）の場合は、rproxy は起動しない。読めない（権限）ときは、固定ルールなしで起動する。
 - この版で動かせない機能（`GET /capabilities` の `features` が false）を使うルールは、`failed`（理由つき）として登録し、設定の内容は `GET /rules` で見える。名前解決や bind の失敗はほかのルールと同じ扱いになる。
@@ -237,6 +249,8 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
 | `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
+| `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`rules:read` |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
@@ -269,6 +283,20 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `bind_failed` | 409 | 待ち受けポートを開けない |
 | `resolve_failed` | 502 | 転送先の名前解決に失敗し、キャッシュもない |
 | `internal` | 500 | その他 |
+
+## API・設定ファイル・UI（DB）の関係
+
+rproxy のルールには 3 つの出どころがある。どれも `GET /rules` に出る。
+
+| 出どころ | `origin` | 正はどこか | 変え方 |
+|---|---|---|---|
+| 設定ファイル（`RPROXY_CONFIG`） | `static` | ファイル | ファイルを書き換える（自動で反映）。API からは `409 static` |
+| UI（TCP-UDP-rproxy-ui） | `dynamic` | UI の DB（`forward_rules`） | UI から。UI は DB に書いてから rproxy の API を呼ぶ。rproxy は起動時に DB から復元する |
+| API を直接呼ぶ（CI・スクリプト） | `dynamic` | rproxy のメモリだけ | API から。DB には書かれないので、rproxy を再起動すると消える |
+
+- 長く残すルールは、設定ファイルか UI（DB）で作る。API を直接呼んで作ったルールは一時的なもの（CI のプレビュー環境など）として扱う。
+- UI は DB にないルールを編集しない。API で作ったルールは UI の一覧に出ず、DB にあるが rproxy にないルールは UI で「未登録」（missing）になる。
+- API を直接使うときは、スコープと `allow_listen_ports` で UI のルールと範囲を分けたトークンを使う（「基本」の認証）。
 
 ## 起動時の復元
 

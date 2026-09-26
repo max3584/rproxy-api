@@ -8,7 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
-use tokio::sync::OnceCell;
+use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -16,7 +16,8 @@ use rproxy_api::api::{self, AppState};
 use rproxy_api::auth::Tokens;
 use rproxy_api::http::access::{AccessLogError, HttpGlobal};
 use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
-use rproxy_api::registry::{Config, Registry};
+use rproxy_api::config::{ConfigDoc, LoadError};
+use rproxy_api::registry::{Config, ConfigStatus, Registry};
 use rproxy_api::{db, logging, resolve, source};
 
 /// TCP/UDP forwarder controlled over an HTTP API.
@@ -63,10 +64,14 @@ struct Options {
 	/// Log filter, e.g. info or debug
 	#[arg(long, env = "RPROXY_LOG_LEVEL", default_value = "info")]
 	log_level: String,
-	/// Settings file (YAML or JSON): `version`, `global` and `rules` started before
-	/// the database ones; the API cannot change those rules
+	/// Settings file (YAML or JSON) or a directory of them: `version`, `global` and
+	/// `rules` started before the database ones; the API cannot change those rules
 	#[arg(long, env = "RPROXY_CONFIG")]
 	config: Option<PathBuf>,
+	/// Seconds between checks of the settings file for changes, which are then
+	/// applied without a restart; 0: only on SIGHUP
+	#[arg(long, env = "RPROXY_CONFIG_CHECK_SECS", default_value_t = 10)]
+	config_check_secs: u64,
 	/// The same as --config (the 0.2 name; a plain array of rules also works)
 	#[arg(long, env = "RPROXY_STATIC_RULES")]
 	static_rules: Option<PathBuf>,
@@ -229,20 +234,25 @@ async fn run(opts: Options) -> Result<(), String> {
 	if opts.config.is_some() && opts.static_rules.is_some() {
 		return Err("give --config (RPROXY_CONFIG) or --static-rules (RPROXY_STATIC_RULES), not both".into());
 	}
+	let config_path = opts.config.as_ref().or(opts.static_rules.as_ref()).cloned();
 	let mut doc = None;
-	if let Some(path) = opts.config.as_ref().or(opts.static_rules.as_ref()) {
-		match std::fs::read_to_string(path) {
-			Ok(text) => {
-				let parsed = rproxy_api::config::ConfigDoc::parse(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+	let mut config_unread = None;
+	if let Some(path) = &config_path {
+		match ConfigDoc::load(path) {
+			Ok(parsed) => {
 				for part in parsed.unsupported_globals() {
 					warn!(event = "degraded", part = %format!("global.{part}"),
 						"not available in this version yet; ignored (see GET /capabilities features)");
 				}
 				doc = Some((path.clone(), parsed));
 			}
-			Err(e) if config_error(&e) => return Err(format!("settings file {}: {e}", path.display())),
-			Err(e) => error!(event = "degraded", part = "static_rules", error = %format!("{}: {e}", path.display()),
-				"running without the rules of the settings file"),
+			Err(LoadError::Invalid(e)) => return Err(e),
+			Err(LoadError::Read(file, e)) if config_error(&e) => return Err(format!("settings file {}: {e}", file.display())),
+			Err(e) => {
+				error!(event = "degraded", part = "static_rules", error = %e,
+					"running without the rules of the settings file until it can be read");
+				config_unread = Some(e.to_string());
+			}
 		}
 	}
 	let http_global = match &doc {
@@ -287,8 +297,18 @@ async fn run(opts: Options) -> Result<(), String> {
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
-	if let Some((path, d)) = doc {
-		registry.load_static(d.rules).await.map_err(|e| format!("{}: {e}", path.display()))?;
+	if let Some((path, d)) = &doc {
+		let rules = registry.load_static_labeled(d.labeled_rules()).await.map_err(|e| format!("{}: {e}", path.display()))?;
+		registry.set_config_status(ConfigStatus {
+			path: path.display().to_string(),
+			files: d.files.iter().map(|f| f.display().to_string()).collect(),
+			loaded_at: Some(unix_now()),
+			rules,
+			..Default::default()
+		});
+	}
+	if let (Some(path), Some(error)) = (&config_path, config_unread) {
+		registry.set_config_status(ConfigStatus { path: path.display().to_string(), error: Some(error), ..Default::default() });
 	}
 
 	if let Some(url) = &opts.database_url {
@@ -345,7 +365,15 @@ async fn run(opts: Options) -> Result<(), String> {
 		tokio::spawn(watch_certificates(every, registry.clone(), tls.clone(), opts.tls_cert.clone().zip(opts.tls_key.clone()), stop.clone()));
 	}
 
-	wait_for_shutdown(&tokens, &tls, &opts, &registry).await?;
+	// the settings file: applied again when it changes, or on SIGHUP
+	let config_hup = Arc::new(Notify::new());
+	if let Some(path) = config_path {
+		let every = (opts.config_check_secs > 0).then(|| Duration::from_secs(opts.config_check_secs));
+		let base = doc.map(|(_, d)| d).unwrap_or_default();
+		tokio::spawn(watch_config(path, every, registry.clone(), base, config_hup.clone(), stop.clone()));
+	}
+
+	wait_for_shutdown(&tokens, &tls, &opts, &registry, &config_hup).await?;
 
 	info!(event = "shutdown");
 	stop.cancel();
@@ -399,6 +427,89 @@ async fn watch_certificates(
 	}
 }
 
+fn unix_now() -> u64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Applies the settings file again when it changes (checked every `every`) or on
+/// SIGHUP (`hup`). A version with a mistake, or one that cannot be read, changes
+/// nothing: the rules of the last good version keep running. `base` is the
+/// version the process started with; `global` changes against it need a restart.
+async fn watch_config(
+	path: PathBuf,
+	every: Option<Duration>,
+	registry: Arc<Registry>,
+	base: ConfigDoc,
+	hup: Arc<Notify>,
+	stop: CancellationToken,
+) {
+	let started_ok = registry.config_status().is_some_and(|s| s.error.is_none());
+	// what was last applied (or found broken); None: try again on every check
+	let mut seen = started_ok.then(|| rproxy_api::config::fingerprint(&path));
+	let mut last_error: Option<String> = None;
+	let mut ticks = every.map(|every| {
+		let mut t = tokio::time::interval(every);
+		t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		t
+	});
+	loop {
+		let forced = tokio::select! {
+			_ = stop.cancelled() => return,
+			_ = hup.notified() => true,
+			_ = async { match ticks.as_mut() { Some(t) => { t.tick().await; } None => std::future::pending().await } } => false,
+		};
+		let now = rproxy_api::config::fingerprint(&path);
+		if !forced && seen == Some(now) {
+			continue;
+		}
+		let mut status = registry.config_status().unwrap_or_default();
+		status.path = path.display().to_string();
+		let result = match ConfigDoc::load(&path) {
+			Ok(doc) => {
+				let restart: Vec<String> = doc.restart_needed(&base).into_iter().map(String::from).collect();
+				let files: Vec<String> = doc.files.iter().map(|f| f.display().to_string()).collect();
+				let rules = doc.rules.len();
+				match registry.reload_static(doc.labeled_rules()).await {
+					Ok(counts) => {
+						info!(event = "config.reload", added = counts.added, removed = counts.removed, changed = counts.changed,
+							unchanged = counts.unchanged, failed = counts.failed, files = files.len());
+						if !restart.is_empty() {
+							warn!(event = "config.reload", restart_needed = ?restart, "these settings take effect after a restart");
+						}
+						status = ConfigStatus {
+							path: status.path,
+							files,
+							loaded_at: Some(unix_now()),
+							rules,
+							last_reload: Some(counts),
+							error: None,
+							restart_needed: restart,
+						};
+						seen = Some(now);
+						last_error = None;
+						Ok(())
+					}
+					Err(e) => Err((format!("{}: {e}", path.display()), true)),
+				}
+			}
+			Err(LoadError::Invalid(e)) => Err((e, true)),
+			// e.g. permissions: the fingerprint may not change when fixed, so keep trying
+			Err(e @ LoadError::Read(..)) => Err((e.to_string(), false)),
+		};
+		if let Err((error, settled)) = result {
+			if last_error.as_deref() != Some(error.as_str()) {
+				error!(event = "config.error", error = %error, "keeping the rules of the last good settings");
+			}
+			if settled {
+				seen = Some(now);
+			}
+			status.error = Some(error.clone());
+			last_error = Some(error);
+		}
+		registry.set_config_status(status);
+	}
+}
+
 /// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.
 #[cfg(unix)]
 async fn wait_for_shutdown(
@@ -406,6 +517,7 @@ async fn wait_for_shutdown(
 	tls: &OnceCell<RustlsConfig>,
 	opts: &Options,
 	registry: &Registry,
+	config_hup: &Notify,
 ) -> Result<(), String> {
 	use tokio::signal::unix::{signal, SignalKind};
 
@@ -424,6 +536,7 @@ async fn wait_for_shutdown(
 						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
 					}
 				}
+				config_hup.notify_one();
 				let (ok, failed) = registry.reload_tls().await;
 				info!(event = "reload.rules_tls", reloaded = ok, failed);
 				if let Some(b) = registry.http_global().crowdsec() {
@@ -440,7 +553,7 @@ async fn wait_for_shutdown(
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Registry) -> Result<(), String> {
+async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Registry, _: &Notify) -> Result<(), String> {
 	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
 }
 
