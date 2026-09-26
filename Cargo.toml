@@ -1,6 +1,6 @@
 [package]
 name = "rproxy-api"
-version = "0.0.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
 description = "Platform independent asynchronous UDP/TCP proxy"
