@@ -8,6 +8,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | capability | 使う機能 | なくした場合 |
 |---|---|---|
 | `CAP_NET_BIND_SERVICE` | 1024 未満のポート（25、443 など）で待ち受ける | 1024 未満のルールだけが使えない。API での作成は `bind_failed`（理由と必要な権限つき）、起動時に復元するルールと固定ルールは `failed` として残る |
+| `CAP_NET_BIND_SERVICE`（ACME） | ACME のチャレンジは CA がドメインの 443 番（`tls-alpn-01`）か 80 番（`http-01`）に接続するので、rproxy がそのポートで待ち受ける必要がある | 443 / 80 のルールが `failed` になり、証明書も取れない |
 | `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える（理由を表示する）。API での作成は `unsupported`。DB から復元する transparent のルールと固定ルールは `failed`（`needs Linux and CAP_NET_ADMIN`）として残る |
 
 どちらの権限を外しても rproxy-api は起動し、ほかのルールはそのまま動く（CI の `install.sh` ジョブで、drop-in で両方を外した状態を確かめている）。固定ルールのファイルで起動を止めるのは書き方の誤り（アドレスが不正、ルール同士の重なりなど）だけで、権限が足りないだけのルールでは止めない。
@@ -28,7 +29,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 | 設定 | 影響 |
 |---|---|
-| `ProtectSystem=strict` | `/usr`・`/etc` などは読み取りだけ。書けるのは `/var/log/rproxy`（`LogsDirectory`）だけ |
+| `ProtectSystem=strict` | `/usr`・`/etc` などは読み取りだけ。書けるのは `/var/log/rproxy`（`LogsDirectory`）と `/var/lib/rproxy`（`StateDirectory`。ACME の証明書）、`/run/rproxy`（`RuntimeDirectory`）だけ。`global.acme.storage` をほかの場所にするなら `ReadWritePaths=` を足す |
 | `ProtectHome=yes` | `/home`・`/root` が見えない。証明書・鍵・固定ルールのファイルをここに置くと読めない |
 | `PrivateTmp=yes` | `/tmp` はサービス専用。ホストの `/tmp` のファイルは見えない |
 | `LimitNOFILE=65536` | ポート範囲のルールは 1 ポートに 1 つのソケットを使う（起動時に上限まで引き上げる） |
@@ -52,6 +53,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | CrowdSec の API キー（`global.crowdsec.api_key_file`、例 `/etc/rproxy/crowdsec.key`） | `root:rproxy` 640 | `cscli bouncers add rproxy` で作ったキー。rproxy ユーザーが読めること。変えたら `systemctl reload rproxy-api` |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
 | `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
+| `/var/lib/rproxy/acme/`（`global.acme.storage`） | `rproxy:rproxy` 700（ファイルは 600） | ACME のアカウントの鍵（`accounts/`）と、取得した証明書・秘密鍵（`certs/<resolver>/<ドメイン>-<ハッシュ>/`）。rproxy が作る。ユニットの `StateDirectory=rproxy` が `/var/lib/rproxy` を作る（systemd を使わないときは、rproxy ユーザーが書ける場所を自分で用意する）。バックアップに含めると、移したホストでも取り直さずに使える |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
 

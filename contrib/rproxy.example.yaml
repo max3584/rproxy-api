@@ -1,6 +1,14 @@
 # rproxy-api の設定ファイルの例（RPROXY_CONFIG=/etc/rproxy/rproxy.yaml）。docs/API.md の「設定ファイル」
 version: 1
 
+# 証明書を ACME（Let's Encrypt など）で取るとき（docs/API.md の「ACME の証明書」）。
+# ルールの tls.certificates に {acme: letsencrypt, domains: [...]} と書く。80 / 443 番に CA が届くこと
+# global:
+#   acme:
+#     storage: /var/lib/rproxy/acme
+#     resolvers:
+#       letsencrypt: {email: admin@example.com, challenge: tls-alpn-01}
+
 rules:
   # ダッシュボード（Web UI）を dashboard.proxy.home だけで、社内のネットワークから 443 で受け付ける
   - protocol: tcp

@@ -5,6 +5,8 @@ if [ "$1" = "purge" ]; then
 	rm -f /etc/rproxy/tokens
 	rmdir /etc/rproxy 2>/dev/null || true
 	rm -rf /var/log/rproxy
+	# ACME certificates, keys and account keys (StateDirectory)
+	rm -rf /var/lib/rproxy
 fi
 
 #DEBHELPER#

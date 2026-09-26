@@ -66,6 +66,7 @@ rcgen = "0.13"
 if-addrs = "0.15"
 serde_yaml_ng = "0.10.0"
 regex = "1.13.1"
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "http1", "http2"] }
 http-body = "1"

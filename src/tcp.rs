@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::http::server::{self as http, Metered};
 use crate::proxy::{Counted, Runtime, Target};
@@ -173,6 +173,16 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	Ok(())
 }
 
+/// The TLS settings that answer an open tls-alpn-01 challenge (RFC 8737): the
+/// client offers only `acme-tls/1` for a name rproxy is obtaining a certificate for.
+fn acme_challenge(hello: &rustls::server::ClientHello<'_>, name: Option<&str>) -> Option<Arc<rustls::ServerConfig>> {
+	let mut alpn = hello.alpn()?;
+	if alpn.next() != Some(crate::acme::ACME_TLS_ALPN) || alpn.next().is_some() {
+		return None;
+	}
+	crate::acme::tls_alpn_config(name?)
+}
+
 /// TLS handshake of a `terminate` rule. The ClientHello is read first so
 /// unmatched names are refused before any certificate is sent.
 async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
@@ -185,6 +195,13 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 	let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
 		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
 		let name = start.client_hello().server_name().map(str::to_string);
+		// an ACME CA validating tls-alpn-01: answer with the challenge certificate and close
+		if let Some(config) = acme_challenge(&start.client_hello(), name.as_deref()) {
+			let mut session = start.into_stream(config).await?;
+			let _ = session.shutdown().await;
+			debug!(event = "acme.answer", rule = %rt.key, client = %client, sni = name.as_deref().unwrap_or(""));
+			return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+		}
 		if rt.select(name.as_deref(), offset).is_none() {
 			return Err(denied(rt, client, "unmatched", name.as_deref()));
 		}

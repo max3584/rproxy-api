@@ -43,6 +43,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/crowdsec.rs` | `global.crowdsec` の bouncer（`Bouncer`。LAPI の stream を 1 つのタスクで取り、判定を ID ごとに覚える。API キーは SIGHUP で読み直す）と AppSec への問い合わせ。`crowdsec` ミドルウェアは非同期なので `server.rs` が直接呼ぶ |
 | `src/http/access.rs` | `global.trusted_proxies`・`global.access_log`（`HttpGlobal`。`Registry` の `Config.http` から全ルールの `Runtime.global` へ）、X-Forwarded-For からクライアントの IP を決める、アクセスログ、ルートごとのリクエストの統計（`stats.http`・`/metrics`） |
 | `src/http/server.rs` | `http` のルールのデータプレーン（hyper）。クライアントとは HTTP/1.1・HTTP/2、転送先とは HTTP/1.1。`Router` はルールの `Runtime.http` に入れ、変更時は丸ごと差し替える |
+| `src/acme.rs` | `global.acme`（`AcmeManager`。`Registry` の `Config.acme`）。resolver と `domains` ごとに 1 つの `ManagedCert` を共有し、タスクが取得・保存（`storage`、700 / 600）・30 日前の更新を行う。チャレンジの答え（tls-alpn-01 は `tcp.rs` の `accept_tls`、http-01 は `http/server.rs`）はプロセス全体の表に置く。`tests/acme.rs` は Pebble で実際に取る（`RPROXY_TEST_PEBBLE` / `RPROXY_TEST_CHALLTESTSRV`。CI の Interop の `acme`） |
 | `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように） |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |

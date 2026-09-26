@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod api;
 pub mod auth;
 pub mod cidr;

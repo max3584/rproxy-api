@@ -137,13 +137,21 @@ tls:
     alpn: [h2, http/1.1]                   # 今の alpn の置き場所をここにも
 ```
 
+ACME の実装（v0.3.2）で決めたこと（詳しくは docs/API.md の「ACME の証明書」）：
+
+- ACME のクライアントは `instant-acme`（ring と rustls で動き、aws-lc を持ち込まない）。
+- 証明書は resolver と `domains` の組ごとに 1 つを、ルールをまたいで共有する。取得できるまでは自己署名の仮の証明書を出し、ルールは止めない。更新は期限の 30 日前、取得・更新した証明書は TLS の設定を作り直さずに差し替える（証明書の選択がハンドシェイクごとに読む）。
+- `tls-alpn-01` はどの `terminate` の listener でも、ClientHello の ALPN が `acme-tls/1` だけなら答える（`LazyConfigAcceptor` で読んだ後、通常の証明書を出す前）。`http-01` はどの `http` のルールでも、ルートとミドルウェアより前に答える。
+- `dns-01` はプロバイダごとの API が要るので後回し（`features.acme_challenges` に出ない。resolver は `degraded`、使うルールは `unsupported`）。
+- 私設の ACME サーバ（step-ca・Pebble）のために、resolver に `ca_file` を足した（ACME サーバの HTTPS の CA。追加の項目なのでパッチで足した）。
+
 ## 5. 制御 API
 
 - `POST /rules`・`PATCH /rules/...` の本文に `http` と、`tls` の `acme` / `options` を足す（ファイルと同じ形）。
 - `GET /capabilities` に、この版で使える機能を返す。
 
 ```json
-{"features": {"http": true, "http3": false, "acme": false, "tls_options": false,
+{"features": {"http": true, "http3": false, "acme": true, "acme_challenges": ["http-01", "tls-alpn-01"], "tls_options": false,
               "middlewares": ["redirect_scheme", "redirect_regex", "ip_allow", "headers"],
               "services": ["health_check"]}}
 ```

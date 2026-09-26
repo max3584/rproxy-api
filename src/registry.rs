@@ -37,6 +37,8 @@ pub struct Config {
 	pub reserved: Vec<SocketAddr>,
 	/// `global` settings of `http` rules (trusted proxies, access log).
 	pub http: Arc<crate::http::access::HttpGlobal>,
+	/// `global.acme`: certificates of `tls.certificates[].acme`.
+	pub acme: Option<Arc<crate::acme::AcmeManager>>,
 }
 
 type Resolver = (CancellationToken, JoinHandle<()>);
@@ -108,6 +110,7 @@ impl Entry {
 					http: r.spec.http.is_some().then(|| crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats)),
 				};
 				view.started_at = Some(r.started_at);
+				view.acme = r.rt.tls().acme_status();
 				view
 			}
 			Entry::Failed(f) => RuleView::new(&f.spec, State::Failed, Some(f.error.clone()), &[], 0),
@@ -274,7 +277,7 @@ impl Registry {
 
 	/// Resolves targets and reads certificates, without holding the rules lock.
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
-		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required)?);
+		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required, self.cfg.acme.as_ref())?);
 		let http = match &spec.http {
 			Some(h) => {
 				crate::http::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
@@ -523,7 +526,7 @@ impl Registry {
 			if r.spec.tls.mode != TlsMode::Terminate {
 				continue;
 			}
-			match TlsRuntime::build(key.protocol, &r.spec.runtime_tls(), r.spec.starttls, r.spec.starttls_required) {
+			match TlsRuntime::build(key.protocol, &r.spec.runtime_tls(), r.spec.starttls, r.spec.starttls_required, self.cfg.acme.as_ref()) {
 				Ok(tls) => {
 					*r.rt.tls.write().unwrap() = Arc::new(tls);
 					ok += 1;
@@ -867,6 +870,7 @@ mod tests {
 			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
 			reserved: vec![],
 			http: Default::default(),
+			acme: None,
 		})
 	}
 

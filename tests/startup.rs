@@ -371,7 +371,11 @@ async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
 version: 1
 global:
   trusted_proxies: [10.0.0.0/8]
-  acme: {{resolvers: {{le: {{email: a@example.com, challenge: tls-alpn-01}}}}}}
+  acme:
+    storage: {storage}
+    resolvers:
+      le: {{email: a@example.com, challenge: tls-alpn-01}}
+      dns: {{email: a@example.com, challenge: dns-01, dns: {{provider: cloudflare, credentials_file: /nonexistent}}}}
 rules:
   - protocol: tcp
     listen_addr: 127.0.0.1
@@ -390,7 +394,8 @@ rules:
       middlewares:
         cs: {{compress: {{}}}}
 "#,
-			bp = backend.port()
+			bp = backend.port(),
+			storage = dir.join("acme").display()
 		),
 	)
 	.unwrap();
@@ -403,7 +408,9 @@ rules:
 	assert_eq!(v["state"], "failed", "{v}");
 	assert!(v["error"].as_str().unwrap().contains("compress"), "{v}");
 	assert_eq!(v["http"]["routes"][0]["name"], "all", "the settings are kept and shown: {v}");
-	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.acme""#) }).await;
+	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.acme.resolvers.dns""#) }).await;
+	assert!(!rp.log().contains(r#""part":"global.acme.resolvers.le""#), "tls-alpn-01 works now:\n{}", rp.log());
+	assert!(!rp.log().contains(r#""part":"global.acme.storage""#), "{}", rp.log());
 	assert!(!rp.log().contains(r#""part":"global.trusted_proxies""#), "trusted_proxies works now:\n{}", rp.log());
 	let (_, caps) = get_json(port, "/capabilities").await;
 	let kinds = caps["features"]["middlewares"].as_array().unwrap();

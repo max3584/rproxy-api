@@ -64,6 +64,9 @@ pub struct AcmeResolver {
 	/// http-01, tls-alpn-01 or dns-01
 	pub challenge: String,
 	pub dns: Option<AcmeDns>,
+	/// CA certificate (PEM) the ACME server's own HTTPS certificate chains to, for a
+	/// private CA (step-ca, Pebble); the system's roots otherwise.
+	pub ca_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,11 +153,12 @@ impl ConfigDoc {
 	}
 
 	/// Global settings present in the file that this build cannot run yet.
-	pub fn unsupported_globals(&self) -> Vec<&'static str> {
-		let g = &self.global;
+	pub fn unsupported_globals(&self) -> Vec<String> {
 		let mut out = vec![];
-		if g.acme.is_some() {
-			out.push("acme");
+		for (name, r) in self.global.acme.iter().flat_map(|a| &a.resolvers) {
+			if !crate::acme::CHALLENGES.contains(&r.challenge.as_str()) {
+				out.push(format!("acme.resolvers.{name}"));
+			}
 		}
 		out
 	}
@@ -191,8 +195,11 @@ rules:
 "#;
 		let doc = ConfigDoc::parse(Path::new("rproxy.yaml"), yaml).unwrap();
 		assert_eq!(doc.rules.len(), 1);
-		assert_eq!(doc.unsupported_globals(), ["acme"]);
+		assert!(doc.unsupported_globals().is_empty());
 		assert!(doc.rules[0].http.is_some());
+		let dns = "version: 1\nglobal: {acme: {resolvers: {d: {email: a@b, challenge: dns-01, dns: {provider: x, credentials_file: /x}}}}}";
+		let doc = ConfigDoc::parse(Path::new("rproxy.yaml"), dns).unwrap();
+		assert_eq!(doc.unsupported_globals(), ["acme.resolvers.d"], "dns-01 is not available yet");
 	}
 
 	/// The examples people copy must stay valid.

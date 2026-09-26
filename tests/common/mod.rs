@@ -63,6 +63,7 @@ pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::http::access:
 		max_range_ports: rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS,
 		reserved: vec!["127.0.0.1:1".parse().unwrap()],
 		http: Arc::new(http),
+		acme: None,
 	});
 	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens) }));
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

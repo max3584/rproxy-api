@@ -82,6 +82,8 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | 制御 API の Unix ソケットを作れない（権限、別のプロセスが使用中） | ソケットなしで起動する（`part: api_socket`） |
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | `global.access_log` のディレクトリに書き込めない | アクセスログをメインのログに出す（`part: global.access_log`） |
+| `global.acme.storage` に書き込めない | 証明書をメモリにだけ持つ。再起動すると取り直す（`part: global.acme.storage`） |
+| ACME の CA に届かない・チャレンジに失敗する | 仮の証明書（または取得済みの証明書）で動かし続け、間隔を延ばしてやり直す（`acme.error`。ルールの `acme` に状態） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
 
@@ -134,7 +136,7 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 | `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
 | `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
 
-証明書はファイルで指定し、SIGHUP で読み直します。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
+証明書はファイルで指定し、SIGHUP で読み直します（certbot などで更新するなら、deploy hook で `systemctl reload rproxy-api` を実行する）。rproxy 自身に ACME（Let's Encrypt など。`http-01` / `tls-alpn-01`）で取得・更新させることもできます（設定ファイルの `global.acme` と `tls.certificates[].acme`。docs/API.md の「ACME の証明書」）。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
 ## 送信元 IP の引き渡し
 
@@ -203,6 +205,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `audit` | 制御 API での変更（トークンの名前、操作、ルール、結果）と、権限不足で断ったリクエスト |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason` |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（`route`、`service`、`backend`、`status`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
+| `acme.issue` / `acme.renew` / `acme.load` / `acme.error` / `acme.account` | ACME の証明書を取得した / 更新した / 保存から読んだ / 失敗した（`retry_secs` 後にやり直す）/ アカウントを作った（`resolver`、`domains`、`not_after`） |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |
 | `conn.retarget` | UDP セッションの転送先の切り替え |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |

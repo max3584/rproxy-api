@@ -136,7 +136,11 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
   - `{"version": 1, "global": {...}, "rules": [...]}`（v0.3）
   - ルールの配列（0.2 の形）
 - `rules` の各要素は `POST /rules` の本文と同じ形。
-- `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。この版で動かせない項目（`acme`）は、ログに `"event":"degraded"`（`part: global.<項目>`）を出して読み飛ばす。
+- `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。この版で動かせない項目（`acme` の `dns-01` の resolver）は、ログに `"event":"degraded"`（`part: global.acme.resolvers.<名前>`）を出して読み飛ばす。
+  - `acme`: ACME で証明書を取る（v0.3.2 から。下の「ACME の証明書」）。
+    - `resolvers.<名前>`: `email`（アカウントの連絡先）、`directory`（省略時は Let's Encrypt の本番 `https://acme-v02.api.letsencrypt.org/directory`。ステージングは `https://acme-staging-v02.api.letsencrypt.org/directory`）、`challenge`（`http-01` / `tls-alpn-01`。`dns-01` はまだ使えない）、`ca_file`（ACME サーバ自身の HTTPS の証明書の CA。step-ca・Pebble などの私設 CA のときだけ。省略時はシステムのルート証明書）。
+    - `storage`: アカウントの鍵と証明書・秘密鍵の置き場所（省略時は `/var/lib/rproxy/acme`。ディレクトリ 700、ファイル 600 で作る）。書き込めなければ起動は続け、証明書をメモリにだけ持つ（`part: global.acme.storage`。再起動すると取り直す）。
+    - `ca_file` のファイルがなければ起動しない。
   - `trusted_proxies`: CIDR の配列。`http` のルールで、接続元がこの範囲なら `X-Forwarded-For` を信用する（API で作ったルールにも効く）。
   - `crowdsec`: CrowdSec の bouncer（`crowdsec` ミドルウェアが使う。書かずにミドルウェアを使うと `invalid`、設定ファイルなら起動しない）。
     - `lapi_url`（例 `http://127.0.0.1:8080`）の `GET /v1/decisions/stream` を `update_interval`（既定 `10s`）ごとに呼び、判定を覚えておく（最初と、失敗した後は `startup=true` で全部を取り直す）。`X-Api-Key` は `api_key_file` の中身（`cscli bouncers add rproxy` で作ったキー。SIGHUP で読み直す）。
@@ -184,7 +188,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky` | `http`。`health_check` / `sticky` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
-| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり） | `acme` |
+| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり） | `acme`（v0.3.2 から）、`acme_challenges` |
 | TLS のオプション | `tls.options` | `min_version`（`"1.2"` / `"1.3"`）、`cipher_suites` | `tls_options` |
 
 - `http` は `protocol: tcp` で、`tls.mode` が `terminate`（HTTPS）か、TLS なし（平文の HTTP）のときだけ。`sni`・`starttls`・ポート範囲とは組み合わせられない。`remote_addr` / `remote_port` は書かない（書くと `400 invalid`）。
@@ -220,12 +224,41 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http"}`）。
 
+### ACME の証明書（v0.3.2）
+
+```yaml
+global:
+  acme:
+    storage: /var/lib/rproxy/acme
+    resolvers:
+      letsencrypt: {email: admin@example.com, challenge: tls-alpn-01}
+rules:
+  - protocol: tcp
+    listen_addr: 0.0.0.0
+    listen_port: 443
+    tls:
+      mode: terminate
+      certificates:
+        - {acme: letsencrypt, domains: [gitlab.example.com, cdn.example.com]}
+    http: {...}
+```
+
+- `tls.mode: terminate` の tcp のルールで使える（`http` のルールでも L4 のルールでも）。UDP（DTLS）では使えない（`unsupported`）。`global.acme` がない（API で作ったルールで設定ファイルに書いていない）、または知らない resolver なら `invalid`。ワイルドカード（`*.example.com`）は `dns-01` が要るので、まだ使えない（`tls_config`）。
+- 同じ resolver と同じ `domains`（順番と大文字小文字は問わない）の証明書は、ルールをまたいで 1 つを共有する。`domains` が 1 枚の証明書の SAN になる。
+- 取得はバックグラウンドで行い、ルールはすぐに `running` になる。取得できるまでは自己署名の仮の証明書を出す。取得・更新した証明書は、ルールを止めずに次の TLS のハンドシェイクから使う。
+- 期限の 30 日前に更新する。失敗したら 1 分後から倍々に間隔を延ばして（最大 6 時間）やり直し、それまでの証明書を使い続ける。`storage` にある有効な証明書は、再起動後にそのまま使う（CA には問い合わせない）。
+- 状態はルールの `acme`（`GET /rules`）：`[{"resolver", "domains", "state": "pending" | "valid" | "error", "not_after": <Unix 秒>, "error": <最後の失敗>}]`。ログは `acme.issue`（初回）・`acme.renew`・`acme.load`（保存から）・`acme.error`・`acme.account`（アカウントの作成）。
+- チャレンジ（どちらも CA がドメインの 80 / 443 番に届く必要がある）：
+  - `tls-alpn-01`: 443 番（`tls.mode: terminate` の tcp のルール）で、CA が ALPN `acme-tls/1` だけを出してきた接続に、チャレンジの証明書で答えて切る。どの `terminate` のルールでも答える（証明書を使うルールでなくてよい）。`allow_from` で CA を締め出していると答えられない。
+  - `http-01`: 80 番の `http` のルールが `/.well-known/acme-challenge/<token>` に答える。ルートやミドルウェア（HTTPS へのリダイレクト、`ip_allow` など）より前に答えるので、80 番は HTTPS へのリダイレクトだけのルールでよい。80 番に `http` のルールがなければ使えない。
+- `GET /capabilities` の `features.acme_challenges` に、この版で答えられるチャレンジ（`["http-01", "tls-alpn-01"]`）が並ぶ。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":false,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":true,"acme_challenges":["http-01","tls-alpn-01"],"tls_options":false,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |

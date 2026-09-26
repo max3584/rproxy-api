@@ -42,7 +42,7 @@ usage() {
   --binary PATH          ダウンロードせずに手元のバイナリを使う（--method binary と一緒に使う）
   --no-start             起動しない（有効化もしない）
   --uninstall            アンインストールする（設定・トークン・ログは残す）
-  --purge                --uninstall と一緒に使うと、設定・トークン・ログも消す
+  --purge                --uninstall と一緒に使うと、設定・トークン・ログ・ACME の証明書（/var/lib/rproxy）も消す
   -h, --help             この説明
 EOF
 }
@@ -134,7 +134,7 @@ if $uninstall; then
 		systemctl daemon-reload
 	fi
 	if $purge; then
-		rm -rf "$ETC" "$LOG_DIR"
+		rm -rf "$ETC" "$LOG_DIR" /var/lib/rproxy
 		log "設定・トークン・ログも削除しました（rproxy ユーザーは残しています）"
 	else
 		log "設定（$ETC）とログ（$LOG_DIR）は残しています。消すときは --uninstall --purge"

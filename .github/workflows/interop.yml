@@ -1,12 +1,14 @@
 name: Interop
 
 # 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX）を rproxy の後ろに置いて通す（scripts/interop/）。
+# acme は Pebble（Let's Encrypt のテスト用 CA）から実際に証明書を取る（tests/acme.rs）。
 # 時間がかかるので必須のチェックにはしない。データプレーンや試験を変えた PR、毎週、手動で動かす。
 on:
   pull_request:
     paths:
       - src/**
       - scripts/interop/**
+      - tests/acme.rs
       - .github/workflows/interop.yml
   schedule:
     - cron: "0 18 * * 0"   # 毎週月曜 3:00（JST）
@@ -39,3 +41,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
       - run: scripts/interop/media.sh
+
+  acme:
+    name: acme (Pebble, tls-alpn-01 and http-01)
+    runs-on: ubuntu-latest
+    env:
+      PEBBLE_VERSION: v2.10.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pebble（Let's Encrypt のテスト用 CA）
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/pebble" && cd "$RUNNER_TEMP/pebble"
+          base="https://github.com/letsencrypt/pebble/releases/download/$PEBBLE_VERSION"
+          curl -fsSLO "$base/pebble-linux-amd64.tar.gz"
+          curl -fsSLO "$base/pebble-challtestsrv-linux-amd64.tar.gz"
+          sha256sum -c - <<'SUMS'
+          4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed  pebble-linux-amd64.tar.gz
+          e93a5aa25ecdf3af2f9fbb2de32b0173e64a2eae81002a4ccfe35fa6f4f60b92  pebble-challtestsrv-linux-amd64.tar.gz
+          SUMS
+          tar xzf pebble-linux-amd64.tar.gz
+          tar xzf pebble-challtestsrv-linux-amd64.tar.gz
+          echo "RPROXY_TEST_PEBBLE=$PWD/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
+          echo "RPROXY_TEST_CHALLTESTSRV=$PWD/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
+      - run: cargo test --test acme -- --nocapture

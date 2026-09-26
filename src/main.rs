@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use rproxy_api::api::{self, AppState};
 use rproxy_api::auth::Tokens;
 use rproxy_api::http::access::{AccessLogError, HttpGlobal};
+use rproxy_api::acme::{AcmeError, AcmeManager};
 use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::registry::{Config, Registry};
 use rproxy_api::{db, logging, resolve, source};
@@ -267,6 +268,20 @@ async fn run(opts: Options) -> Result<(), String> {
 		b.spawn();
 	}
 	let http_global = http_global.with_crowdsec(crowdsec.clone());
+	// global.acme: certificates for `tls.certificates[].acme`, obtained and renewed in the background
+	let acme = match doc.as_ref().and_then(|(path, d)| d.global.acme.as_ref().map(|a| (path, a))) {
+		Some((path, a)) => match AcmeManager::new(a) {
+			Ok(m) => {
+				if let Some(e) = m.storage_problem() {
+					warn!(event = "degraded", part = "global.acme.storage", error = %e,
+						"certificates are kept in memory only and obtained again after a restart");
+				}
+				Some(m)
+			}
+			Err(AcmeError::Config(e)) => return Err(format!("{}: {e}", path.display())),
+		},
+		None => None,
+	};
 
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
@@ -278,6 +293,7 @@ async fn run(opts: Options) -> Result<(), String> {
 		max_range_ports: opts.max_range_ports.max(1),
 		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 		http: Arc::new(http_global),
+		acme,
 	});
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),

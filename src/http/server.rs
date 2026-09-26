@@ -20,7 +20,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::access::{AccessEntry, NO_ROUTE};
 use super::limit::Hold;
@@ -366,6 +366,14 @@ impl Conn {
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
+		// an ACME CA validating http-01 (global.acme); before routes and middlewares, so
+		// a redirect to HTTPS or an ip_allow does not get in the way
+		if let Some(answer) = crate::acme::http_answer(req.uri().path()) {
+			debug!(event = "acme.answer", rule = %self.rt.key, client = %self.client, path = req.uri().path());
+			let mut resp = full(StatusCode::OK, "");
+			*resp.body_mut() = Full::new(Bytes::from(answer)).map_err(|never| match never {}).boxed();
+			return resp;
+		}
 		let started = Instant::now();
 		let host = request_host(&req).unwrap_or_default();
 		// the client: the peer, or what a trusted proxy in front says (global.trusted_proxies)

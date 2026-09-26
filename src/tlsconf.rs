@@ -15,6 +15,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use serde::{Deserialize, Serialize};
 
+use crate::acme::{AcmeManager, AcmeStatus, ManagedCert};
 use crate::error::ApiError;
 use crate::rule::Protocol;
 
@@ -384,27 +385,63 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 	Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// A certificate of a rule: read from files, or kept up to date by ACME.
+#[derive(Debug)]
+enum CertSource {
+	Files(Arc<CertifiedKey>),
+	Acme(Arc<ManagedCert>),
+}
+
+impl CertSource {
+	fn key(&self) -> Arc<CertifiedKey> {
+		match self {
+			CertSource::Files(k) => k.clone(),
+			// read per handshake, so a renewed certificate is used at once
+			CertSource::Acme(m) => m.current(),
+		}
+	}
+}
+
 /// Picks a certificate by SNI; the first certificate is the fallback.
 #[derive(Debug)]
 struct SniCertResolver {
-	certs: Vec<(Vec<String>, Arc<CertifiedKey>)>,
+	certs: Vec<(Vec<String>, CertSource)>,
 }
 
 impl ResolvesServerCert for SniCertResolver {
 	fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
 		if let Some(name) = hello.server_name() {
-			if let Some((_, key)) = self.certs.iter().find(|(names, _)| names.iter().any(|p| name_matches(p, name))) {
-				return Some(key.clone());
+			if let Some((_, source)) = self.certs.iter().find(|(names, _)| names.iter().any(|p| name_matches(p, name))) {
+				return Some(source.key());
 			}
 		}
-		self.certs.first().map(|(_, key)| key.clone())
+		self.certs.first().map(|(_, source)| source.key())
 	}
 }
 
-fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
+/// The ACME certificates of a spec; an error when `global.acme` is missing.
+fn acme_certs(tls: &TlsSpec, acme: Option<&Arc<AcmeManager>>) -> Result<Vec<Arc<ManagedCert>>, ApiError> {
+	let mut out = vec![];
+	for c in &tls.certificates {
+		let Some(resolver) = &c.acme else { continue };
+		let manager = acme.ok_or_else(|| {
+			ApiError::invalid(format!("acme resolver {resolver:?}: global.acme is not configured (settings file RPROXY_CONFIG)"))
+		})?;
+		out.push(manager.certificate(resolver, &c.domains)?);
+	}
+	Ok(out)
+}
+
+fn server_config(tls: &TlsSpec, acme: &[Arc<ManagedCert>]) -> Result<Arc<ServerConfig>, ApiError> {
 	let provider = provider();
 	let mut certs = vec![];
+	let mut managed = acme.iter();
 	for files in &tls.certificates {
+		if files.acme.is_some() {
+			let m = managed.next().expect("one managed certificate per acme entry");
+			certs.push((m.domains().to_vec(), CertSource::Acme(m.clone())));
+			continue;
+		}
 		let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
 		let key = load_key(&files.key_file)?;
 		let signing = provider
@@ -416,7 +453,7 @@ fn server_config(tls: &TlsSpec) -> Result<Arc<ServerConfig>, ApiError> {
 		certified
 			.keys_match()
 			.map_err(|e| tls_error(format!("{} does not belong to {}: {e}", files.key_file, files.cert_file)))?;
-		certs.push((names, Arc::new(certified)));
+		certs.push((names, CertSource::Files(Arc::new(certified))));
 	}
 
 	let builder = ServerConfig::builder_with_provider(provider.clone())
@@ -603,17 +640,25 @@ pub struct TlsRuntime {
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
 	dtls_upstream_cert: Option<webrtc_dtls::crypto::Certificate>,
+	/// Certificates obtained by ACME (shared with other rules).
+	acme: Vec<Arc<ManagedCert>>,
 }
 
 impl TlsRuntime {
 	/// Reads every file the spec names; fails if any is missing or invalid.
+	/// ACME certificates come from `acme` (placeholders until they are issued).
 	pub fn build(
 		protocol: Protocol,
 		spec: &TlsSpec,
 		starttls: Option<StartTls>,
 		starttls_required: bool,
+		acme: Option<&Arc<AcmeManager>>,
 	) -> Result<Self, ApiError> {
 		validate(protocol, spec, starttls)?;
+		if protocol == Protocol::Udp && spec.certificates.iter().any(|c| c.acme.is_some()) {
+			return Err(ApiError::unsupported("acme certificates are for tcp only; DTLS takes cert_file / key_file"));
+		}
+		let managed = acme_certs(spec, acme)?;
 		let mut rt = TlsRuntime {
 			spec: spec.clone(),
 			starttls,
@@ -625,17 +670,20 @@ impl TlsRuntime {
 			dtls_client_verifier: None,
 			dtls_upstream_roots: None,
 			dtls_upstream_cert: None,
+			acme: managed,
 		};
 		if spec.mode != TlsMode::Terminate {
 			return Ok(rt);
 		}
 		match protocol {
 			Protocol::Tcp => {
-				rt.server_config = Some(server_config(spec)?);
-				if let Some(name) = load_chain(&spec.certificates[0].cert_file)?
-					.first()
-					.and_then(|c| cert_names(c).into_iter().find(|n| !n.starts_with("*.")))
-				{
+				rt.server_config = Some(server_config(spec, &rt.acme)?);
+				let first = &spec.certificates[0];
+				let names = match &first.acme {
+					Some(_) => first.domains.clone(),
+					None => load_chain(&first.cert_file)?.first().map(cert_names).unwrap_or_default(),
+				};
+				if let Some(name) = names.into_iter().find(|n| !n.starts_with("*.")) {
 					rt.greeting_name = name;
 				}
 				if spec.upstream.tls {
@@ -662,6 +710,11 @@ impl TlsRuntime {
 			}
 		}
 		Ok(rt)
+	}
+
+	/// State of the rule's ACME certificates (the rule view's `acme`).
+	pub fn acme_status(&self) -> Vec<AcmeStatus> {
+		self.acme.iter().map(|m| m.status()).collect()
 	}
 
 	pub fn mode(&self) -> TlsMode {
@@ -774,7 +827,7 @@ mod tests {
 			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), chain_file: None, key_file: "/nonexistent.key".into(), ..Default::default() }],
 			..Default::default()
 		};
-		let err = TlsRuntime::build(Protocol::Tcp, &spec, None, true).err().unwrap();
+		let err = TlsRuntime::build(Protocol::Tcp, &spec, None, true, None).err().unwrap();
 		assert_eq!(err.code, "tls_config");
 		assert!(err.message.contains("/nonexistent.pem"));
 	}

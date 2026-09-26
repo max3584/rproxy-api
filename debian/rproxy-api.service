@@ -34,6 +34,9 @@ LogsDirectoryMode=0750
 # /run/rproxy for RPROXY_API_SOCKET (the socket's own mode and group limit access)
 RuntimeDirectory=rproxy
 RuntimeDirectoryMode=0755
+# /var/lib/rproxy for ACME certificates and account keys (global.acme.storage, default /var/lib/rproxy/acme)
+StateDirectory=rproxy
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

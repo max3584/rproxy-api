@@ -128,6 +128,8 @@ pub struct Features {
 	pub http3: bool,
 	/// `acme` certificates
 	pub acme: bool,
+	/// ACME challenges this build can answer (`global.acme.resolvers.*.challenge`)
+	pub acme_challenges: &'static [&'static str],
 	/// `tls.options`
 	pub tls_options: bool,
 	/// Middleware kinds (`http.middlewares`) that can run
@@ -141,7 +143,8 @@ impl Features {
 		Features {
 		http: true,
 		http3: false,
-		acme: false,
+		acme: true,
+		acme_challenges: crate::acme::CHALLENGES,
 		tls_options: false,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
@@ -156,6 +159,7 @@ impl Features {
 		http: true,
 		http3: true,
 		acme: true,
+		acme_challenges: &["http-01", "tls-alpn-01", "dns-01"],
 		tls_options: true,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "rate_limit", "in_flight", "crowdsec", "ip_allow", "headers",
@@ -477,6 +481,9 @@ pub struct RuleView {
 	pub stats: RuleStats,
 	/// When the listener started, in Unix seconds (null while failed).
 	pub started_at: Option<u64>,
+	/// State of the ACME certificates of `tls.certificates` (left out without them).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub acme: Vec<crate::acme::AcmeStatus>,
 }
 
 impl RuleView {
@@ -502,6 +509,7 @@ impl RuleView {
 			connections,
 			stats: RuleStats::default(),
 			started_at: None,
+			acme: vec![],
 		}
 	}
 }

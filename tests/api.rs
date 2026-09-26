@@ -405,8 +405,18 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	body["http"] = json!({"routes": [], "teleport": true});
 	assert_eq!(h.post(body).await.0, StatusCode::BAD_REQUEST, "unknown fields are refused");
 
+	// acme works (tests/acme.rs), but needs global.acme in the settings file
+	assert_eq!(caps["features"]["acme"], true, "{caps}");
+	assert_eq!(caps["features"]["acme_challenges"], json!(["http-01", "tls-alpn-01"]), "{caps}");
 	let mut acme = rule("tcp", free_port(), backend);
 	acme["tls"] = json!({"mode": "terminate", "certificates": [{"acme": "le", "domains": ["a.example"]}]});
-	let (status, v) = h.post(acme).await;
+	let (status, v) = h.post(acme.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("global.acme"), "{v}");
+
+	let mut options = rule("tcp", free_port(), backend);
+	options["tls"] = json!({"mode": "terminate", "certificates": [{"acme": "le", "domains": ["a.example"]}], "options": {"min_version": "1.3"}});
+	let (status, v) = h.post(options).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("tls.options"), "{v}");
 }
