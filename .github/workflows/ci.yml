@@ -72,6 +72,19 @@ jobs:
       - name: scripts/test-deb.sh
         run: scripts/test-deb.sh target/debian/*.deb
 
+  install:
+    name: install.sh (binary and apt, on a systemd VM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - run: cargo build --release
+      - name: scripts/test-install.sh
+        run: sudo scripts/test-install.sh target/release/rproxy-api
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

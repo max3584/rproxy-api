@@ -4,6 +4,7 @@ set -e
 if [ "$1" = "purge" ]; then
 	rm -f /etc/rproxy/tokens
 	rmdir /etc/rproxy 2>/dev/null || true
+	rm -rf /var/log/rproxy
 fi
 
 #DEBHELPER#

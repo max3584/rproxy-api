@@ -3,7 +3,24 @@
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。
 制御は HTTP API で行い、管理 UI は [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) にある。
 
-## インストール（Debian / Ubuntu）
+## インストール
+
+### install.sh（VM 向け）
+
+systemd で動く Linux に、root で実行する。Debian / Ubuntu では apt リポジトリから、それ以外では GitHub Release の静的リンクのバイナリ（x86_64 / aarch64 / armv7）を入れ、ユーザー・設定・ユニットを作って起動する。
+
+```shell
+curl -fsSL https://raw.githubusercontent.com/max3584/rproxy-api/master/scripts/install.sh | bash -s -- \
+  --api-addr 127.0.0.1 --database-url 'mysql://rproxy:password@db.example:3306/rproxy'
+```
+
+- 最後に UI の `.env.local` に設定する `RPROXY_API_URL` と `RPROXY_API_TOKEN` の取り出し方を表示する
+- 制御 API の既定のポート 8080 が使われていれば、初回だけ 8081〜8099 の空きを選ぶ
+- ログは `/var/log/rproxy/rproxy.<日付>.log`（rproxy が日ごとに分けて古いものを消すので logrotate は不要）。`--log-file -` で journald に出す
+- もう一度実行するとアップグレード（設定とトークンは残し、指定したオプションだけを書き換える）
+- `--uninstall`（`--purge` で設定・トークン・ログも消す）。オプションの一覧は `install.sh --help`
+
+### apt（Debian / Ubuntu）
 
 apt リポジトリから入れられる（amd64 / arm64 / armhf）。
 

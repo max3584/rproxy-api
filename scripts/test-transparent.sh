@@ -52,15 +52,15 @@ threading.Thread(target=tcp, daemon=True).start(); udp()
 ' & BE=$!
 
 (cd "$WORK" && RPROXY_API_PORT=18200 exec "$BIN" > "$WORK/rproxy.log" 2>&1) & RP=$!
-for i in $(seq 1 50); do curl -sf localhost:18200/healthz >/dev/null && break; sleep 0.2; done
+for _ in $(seq 1 50); do curl -sf localhost:18200/healthz >/dev/null && break; sleep 0.2; done
 if ! curl -sf localhost:18200/healthz >/dev/null; then
   echo "rproxy did not start; log:"; cat "$WORK/rproxy.log"; exit 1
 fi
 echo "capabilities: $(curl -s localhost:18200/capabilities)"
 for proto in tcp udp; do
-  port=$([ $proto = tcp ] && echo 9001 || echo 9002)
+  if [ "$proto" = tcp ]; then port=9001; else port=9002; fi
   for mode in proxy transparent; do
-    lport=$([ $mode = proxy ] && echo 7${port:1} || echo 8${port:1})
+    if [ "$mode" = proxy ]; then lport="7${port:1}"; else lport="8${port:1}"; fi
     code=$(curl -s -o "$WORK/resp" -w '%{http_code}' -X POST localhost:18200/rules \
       -d "{\"protocol\":\"$proto\",\"listen_addr\":\"10.0.1.1\",\"listen_port\":$lport,\"remote_addr\":\"10.0.2.2\",\"remote_port\":$port,\"source_ip\":\"$mode\"}")
     [ "$code" = 201 ] || { echo "create $proto/$mode failed: $code $(cat "$WORK/resp")"; continue; }
@@ -82,4 +82,8 @@ print('client=%s:%d backend-saw %s' % (me[0], me[1], r.decode()))
   done
 done
 kill $RP $BE $C $B 2>/dev/null; wait 2>/dev/null
-[ -z "$FAIL" ] && echo "OK: transparent passes the client address, proxy does not" || { echo "rproxy log: $WORK/rproxy.log"; exit 1; }
+if [ -z "$FAIL" ]; then
+  echo "OK: transparent passes the client address, proxy does not"
+else
+  echo "rproxy log: $WORK/rproxy.log"; exit 1
+fi
