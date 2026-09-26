@@ -14,7 +14,7 @@ CONF=${RPROXY_TRANSPARENT_CONF:-/etc/rproxy/transparent-routing.conf}
 CLIENTS='' IFACES='' TABLE=100
 # shellcheck disable=SC1090
 . "$CONF"
-[ -n "$CLIENTS" ] && [ -n "$IFACES" ] || { echo "$CONF に CLIENTS と IFACES を書いてください" >&2; exit 1; }
+if [ -z "$CLIENTS" ] || [ -z "$IFACES" ]; then echo "$CONF に CLIENTS と IFACES を書いてください" >&2; exit 1; fi
 
 has_rule() { ip rule show | grep -q "iif $1 lookup $TABLE\b"; }
 

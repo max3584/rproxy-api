@@ -88,7 +88,7 @@ if [ -n "$version" ]; then
 	case $version in v*) ;; *) version=v$version ;; esac
 fi
 if [ -n "$t_clients$t_ifaces" ]; then
-	[ -n "$t_clients" ] && [ -n "$t_ifaces" ] || die "--transparent-clients と --transparent-iface は両方指定してください"
+	if [ -z "$t_clients" ] || [ -z "$t_ifaces" ]; then die "--transparent-clients と --transparent-iface は両方指定してください"; fi
 	$no_routing && die "--no-transparent-routing と --transparent-* は同時に使えません"
 	t_clients=${t_clients//,/ } t_ifaces=${t_ifaces//,/ }
 	for c in $t_clients; do
