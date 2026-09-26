@@ -125,6 +125,9 @@ echo "rtsps: $out"
 [[ $out == h264,320,240* ]] || fail "rtsps: no stream through rproxy's TLS termination"
 
 echo "== a 10000-port range rule"
+# stop the servers above so none of their ports (MediaMTX also listens on 8892, ...) is inside the range
+kill "${PIDS[@]:1}" 2>/dev/null || true
+sleep 1
 fds() { sudo ls "/proc/$RP/fd" | wc -l; }
 rss() { awk '/VmRSS/ {print $2}' "/proc/$RP/status"; }
 before_fds=$(fds)
