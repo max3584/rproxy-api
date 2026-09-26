@@ -15,7 +15,7 @@ API=http://127.0.0.1:18400
 MEDIAMTX_VERSION=${MEDIAMTX_VERSION:-v1.21.1}
 PIDS=()
 
-fail() { echo "FAIL: $*" >&2; tail -n 30 "$WORK"/*.log >&2 || true; exit 1; }
+fail() { echo "FAIL: $*" >&2; tail -n 30 "$WORK"/*.log >&2 || true; ss -ltnup >&2 || true; exit 1; }
 cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -23,7 +23,7 @@ echo "== packages"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q coturn ffmpeg openssl >/dev/null
 sudo systemctl stop coturn 2>/dev/null || true
 curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" \
-	| tar -xz -C "$WORK" mediamtx
+	| tar -xz -C "$WORK" mediamtx mediamtx.yml
 
 echo "== test CA and the media.test certificate"
 grep -q ' media.test$' /etc/hosts || echo '127.0.0.1 media.test' | sudo tee -a /etc/hosts >/dev/null
@@ -105,7 +105,8 @@ echo "== RTSP (MediaMTX)"
 (cd "$WORK" && MTX_RTSPADDRESS=127.0.0.1:18554 MTX_RTSPTRANSPORTS=tcp MTX_RTMP=no MTX_HLS=no MTX_WEBRTC=no MTX_SRT=no \
 	MTX_API=no MTX_METRICS=no MTX_PPROF=no MTX_PLAYBACK=no exec ./mediamtx > "$WORK/mediamtx.log" 2>&1) &
 PIDS+=($!)
-sleep 1
+for _ in $(seq 50); do grep -q 'RTSP\] started' "$WORK/mediamtx.log" && break; sleep 0.2; done
+grep -q 'RTSP\] started' "$WORK/mediamtx.log" || fail "MediaMTX did not start"
 rule '{"protocol":"tcp","listen_addr":"127.0.0.1","listen_port":28554,"remote_addr":"127.0.0.1","remote_port":18554}'
 rule "{\"protocol\":\"tcp\",\"listen_addr\":\"127.0.0.1\",\"listen_port\":28322,\"remote_addr\":\"127.0.0.1\",\"remote_port\":18554,\"tls\":$tls}"
 
