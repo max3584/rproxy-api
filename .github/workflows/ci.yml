@@ -55,8 +55,15 @@ jobs:
       # script can build its isolated namespaces as the normal runner user.
       - name: allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: scripts/test-transparent.sh
-        run: scripts/test-transparent.sh
+      - name: iptables and nftables
+        run: sudo apt-get install -y iptables nftables
+      # the three ways of routing the return traffic in the README
+      - name: scripts/test-transparent.sh (ip rule iif)
+        run: ROUTING=iif scripts/test-transparent.sh
+      - name: scripts/test-transparent.sh (iptables -m socket)
+        run: ROUTING=iptables scripts/test-transparent.sh
+      - name: scripts/test-transparent.sh (nftables socket transparent)
+        run: ROUTING=nft scripts/test-transparent.sh
 
   deb:
     name: Debian package (install, apt repository, purge)

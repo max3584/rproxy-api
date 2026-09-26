@@ -8,8 +8,13 @@
 # client 宛てのパケット」をローカル扱いにする（table 100）ので、transparent の
 # 戻りパケットが rproxy のソケットに届く。本番のポリシールーティングと同じ考え方。
 #
-# 使い方: cargo build && scripts/test-transparent.sh
-# 必要なもの: unshare / nsenter / ip（util-linux, iproute2）, python3, curl
+# 戻りパケットの受け取り方は ROUTING で選ぶ（README の「送信元 IP の引き渡し」）:
+#   iif       転送先側のインターフェースから届いた client 宛てをローカル扱い（既定。ip rule iif）
+#   iptables  rproxy の transparent ソケット宛てのパケットに印（-m socket --transparent）を付けてローカル扱い
+#   nft       同じことを nftables で行う
+#
+# 使い方: cargo build && [ROUTING=iptables] scripts/test-transparent.sh
+# 必要なもの: unshare / nsenter / ip（util-linux, iproute2）, python3, curl。iptables / nft はそれぞれの方法で
 if [ "$(id -u)" != 0 ] || [ -z "$RPROXY_NETNS" ]; then
   exec env RPROXY_NETNS=1 unshare -rn bash "$0" "$@"
 fi
@@ -34,8 +39,28 @@ ip addr add 10.0.2.1/24 dev pb && ip link set pb up
 ns $C ip link set lo up; ns $C ip addr add 10.0.1.2/24 dev vc; ns $C ip link set vc up; ns $C ip route add default via 10.0.1.1
 ns $B ip link set lo up; ns $B ip addr add 10.0.2.2/24 dev vb; ns $B ip link set vb up; ns $B ip route add default via 10.0.2.1
 
-ip route add local 10.0.1.0/24 dev lo table 100
-ip rule add iif pb lookup 100
+ROUTING=${ROUTING:-iif}
+echo "routing: $ROUTING"
+case $ROUTING in
+  iif)
+    ip route add local 10.0.1.0/24 dev lo table 100
+    ip rule add iif pb lookup 100
+    ;;
+  iptables)
+    iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
+    iptables -t mangle -A PREROUTING -p udp -m socket --transparent -j MARK --set-mark 1
+    ip rule add fwmark 1 lookup 100
+    ip route add local 0.0.0.0/0 dev lo table 100
+    ;;
+  nft)
+    nft add table ip rproxy
+    nft add chain ip rproxy prerouting '{ type filter hook prerouting priority mangle; }'
+    nft add rule ip rproxy prerouting socket transparent 1 meta mark set 1
+    ip rule add fwmark 1 lookup 100
+    ip route add local 0.0.0.0/0 dev lo table 100
+    ;;
+  *) echo "unknown ROUTING=$ROUTING"; exit 2 ;;
+esac
 
 # backend: TCP and UDP echo that answer with the peer address they saw
 nsenter -n -t $B python3 -c '
@@ -83,7 +108,7 @@ print('client=%s:%d backend-saw %s' % (me[0], me[1], r.decode()))
 done
 kill $RP $BE $C $B 2>/dev/null; wait 2>/dev/null
 if [ -z "$FAIL" ]; then
-  echo "OK: transparent passes the client address, proxy does not"
+  echo "OK ($ROUTING): transparent passes the client address, proxy does not"
 else
   echo "rproxy log: $WORK/rproxy.log"; exit 1
 fi
