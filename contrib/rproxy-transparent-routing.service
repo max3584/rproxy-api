@@ -1,0 +1,17 @@
+# source_ip: transparent 用のポリシールーティング（/etc/rproxy/transparent-routing.conf）
+[Unit]
+Description=rproxy-api policy routing for source_ip transparent
+ConditionPathExists=/etc/rproxy/transparent-routing.conf
+After=network-online.target
+Wants=network-online.target
+Before=rproxy-api.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/rproxy-transparent-routing up
+ExecStop=/usr/local/sbin/rproxy-transparent-routing down
+ExecReload=/usr/local/sbin/rproxy-transparent-routing up
+
+[Install]
+WantedBy=multi-user.target

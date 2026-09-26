@@ -1,0 +1,35 @@
+#!/bin/sh
+# source_ip: transparent の戻りのパケットを、rproxy のホスト自身で受け取るためのポリシールーティング。
+# 設定は /etc/rproxy/transparent-routing.conf（rproxy-transparent-routing.service が起動時に up を実行する）。
+#
+#   CLIENTS="10.0.1.0/24 10.0.2.0/24"   クライアントのアドレス範囲（転送先から見える送信元）
+#   IFACES="eth1"                       転送先側のインターフェース（戻りのパケットが届くところ）
+#   TABLE=100                           使うルーティングテーブルの番号
+#
+#   rproxy-transparent-routing up|down|status
+set -eu
+
+CONF=${RPROXY_TRANSPARENT_CONF:-/etc/rproxy/transparent-routing.conf}
+[ -r "$CONF" ] || { echo "$CONF がありません" >&2; exit 1; }
+CLIENTS='' IFACES='' TABLE=100
+# shellcheck disable=SC1090
+. "$CONF"
+[ -n "$CLIENTS" ] && [ -n "$IFACES" ] || { echo "$CONF に CLIENTS と IFACES を書いてください" >&2; exit 1; }
+
+has_rule() { ip rule show | grep -q "iif $1 lookup $TABLE\b"; }
+
+case ${1:-} in
+	up)
+		for c in $CLIENTS; do ip route replace local "$c" dev lo table "$TABLE"; done
+		for i in $IFACES; do has_rule "$i" || ip rule add iif "$i" lookup "$TABLE"; done
+		;;
+	down)
+		for i in $IFACES; do while has_rule "$i"; do ip rule del iif "$i" lookup "$TABLE"; done; done
+		ip route flush table "$TABLE" 2>/dev/null || true
+		;;
+	status)
+		ip rule show | grep "lookup $TABLE\b" || true
+		ip route show table "$TABLE" 2>/dev/null || true
+		;;
+	*) echo "使い方: $0 up|down|status" >&2; exit 2 ;;
+esac

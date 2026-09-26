@@ -16,9 +16,11 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 
-# ports below 1024; add CAP_NET_ADMIN for source_ip: transparent
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# CAP_NET_BIND_SERVICE: ports below 1024
+# CAP_NET_ADMIN: source_ip transparent (IP_TRANSPARENT). Drop it with systemctl edit if unused.
+# See docs/PERMISSIONS.md.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 # port ranges open one socket per port
 LimitNOFILE=65536
 

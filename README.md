@@ -18,7 +18,8 @@ curl -fsSL https://raw.githubusercontent.com/max3584/rproxy-api/master/scripts/i
 - 制御 API の既定のポート 8080 が使われていれば、初回だけ 8081〜8099 の空きを選ぶ
 - ログは `/var/log/rproxy/rproxy.<日付>.log`（rproxy が日ごとに分けて古いものを消すので logrotate は不要）。`--log-file -` で journald に出す
 - もう一度実行するとアップグレード（設定とトークンは残し、指定したオプションだけを書き換える）
-- `--uninstall`（`--purge` で設定・トークン・ログも消す）。オプションの一覧は `install.sh --help`
+- `source_ip: transparent` の権限（`CAP_NET_ADMIN`）はユニットで与える。戻りのパケットのポリシールーティングは `--transparent-clients <CIDR> --transparent-iface <IF>` で入れる（下の「送信元 IP の引き渡し」）
+- `--uninstall`（`--purge` で設定・トークン・ログも消す）。オプションの一覧は `install.sh --help`。必要な権限は [docs/PERMISSIONS.md](docs/PERMISSIONS.md)
 
 ### apt（Debian / Ubuntu）
 
@@ -124,11 +125,18 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 | `proxy_v1` / `proxy_v2` | 接続の先頭に PROXY protocol ヘッダを付ける | TCP のみ。転送先が PROXY protocol に対応していること |
 | `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT`） | Linux、IPv4、`CAP_NET_ADMIN`。転送先からの戻りパケットが rproxy のホストを通ること |
 
-`transparent` を使うには、rproxy に権限を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
+`transparent` を使うには、rproxy に `CAP_NET_ADMIN` を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
+apt・install.sh で入れた場合は、ユニットが `CAP_NET_ADMIN` を与えているので権限の設定は要らない。ポリシールーティング（下の 1）は install.sh でまとめて入れられる（起動時に毎回設定する `rproxy-transparent-routing.service` を作る）。
 
 ```bash
-# rproxy に権限を与える（root で動かさない場合）
-setcap cap_net_admin+ep ./target/release/rproxy-api
+install.sh --transparent-clients 10.0.1.0/24 --transparent-iface eth1
+rproxy-transparent-routing status   # 入っている ip rule / ip route を見る
+```
+
+手で起動する場合（systemd を使わない場合）は、root で動かすかバイナリに権限を付ける。権限の一覧は [docs/PERMISSIONS.md](docs/PERMISSIONS.md)。
+
+```bash
+setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 ```
 
 戻りパケットの受け取り方は2通りある。

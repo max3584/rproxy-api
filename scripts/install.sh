@@ -16,6 +16,9 @@ ENV_FILE=$ETC/rproxy.env
 TOKENS=$ETC/tokens
 LOG_DIR=/var/log/rproxy
 UNIT=rproxy-api.service
+ROUTING_UNIT=rproxy-transparent-routing.service
+ROUTING_CONF=$ETC/transparent-routing.conf
+ROUTING_BIN=/usr/local/sbin/rproxy-transparent-routing
 
 usage() {
 	cat <<'EOF'
@@ -26,6 +29,13 @@ usage() {
   --database-url URL     起動時にルールを復元する DB（mysql://user:pass@host:3306/db）
   --static-rules FILE    固定ルールの JSON ファイル
   --log-file PATH        ログファイル（既定 /var/log/rproxy/rproxy.log。- で標準出力 = journald）
+  --transparent-clients CIDR[,CIDR...]
+                         source_ip: transparent を使うクライアントのアドレス範囲（戻りのパケットのポリシールーティングを入れる）
+  --transparent-iface IF[,IF...]
+                         転送先側のインターフェース（--transparent-clients と一緒に指定する）
+  --transparent-table N  ポリシールーティングに使うテーブルの番号（既定 100）
+  --no-transparent-routing
+                         transparent 用のポリシールーティングを外す
   --version vX.Y.Z       入れるバージョン（バイナリで入れる場合。既定は最新のリリース）
   --method apt|binary    入れ方（既定は apt-get があれば apt、なければ binary）
   --binary PATH          ダウンロードせずに手元のバイナリを使う（--method binary と一緒に使う）
@@ -41,6 +51,7 @@ warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31mエラー:\033[0m %s\n' "$*" >&2; exit 1; }
 
 api_addr='' api_port='' database_url='' static_rules='' log_file='' version='' method='' binary=''
+t_clients='' t_ifaces='' t_table=100 no_routing=false
 no_start=false uninstall=false purge=false
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -49,6 +60,10 @@ while [ $# -gt 0 ]; do
 		--database-url) database_url=${2:?}; shift 2 ;;
 		--static-rules) static_rules=${2:?}; shift 2 ;;
 		--log-file) log_file=${2:?}; shift 2 ;;
+		--transparent-clients) t_clients=${2:?}; shift 2 ;;
+		--transparent-iface) t_ifaces=${2:?}; shift 2 ;;
+		--transparent-table) t_table=${2:?}; shift 2 ;;
+		--no-transparent-routing) no_routing=true; shift ;;
 		--version) version=${2:?}; shift 2 ;;
 		--method) method=${2:?}; shift 2 ;;
 		--binary) binary=${2:?}; shift 2 ;;
@@ -72,12 +87,37 @@ fi
 if [ -n "$version" ]; then
 	case $version in v*) ;; *) version=v$version ;; esac
 fi
+if [ -n "$t_clients$t_ifaces" ]; then
+	[ -n "$t_clients" ] && [ -n "$t_ifaces" ] || die "--transparent-clients と --transparent-iface は両方指定してください"
+	$no_routing && die "--no-transparent-routing と --transparent-* は同時に使えません"
+	t_clients=${t_clients//,/ } t_ifaces=${t_ifaces//,/ }
+	for c in $t_clients; do
+		case $c in
+			*:*) die "transparent は IPv4 だけです: $c" ;;
+			*/*) ;;
+			*) die "--transparent-clients は CIDR（例 10.0.1.0/24）で指定してください: $c" ;;
+		esac
+	done
+	for i in $t_ifaces; do ip link show "$i" >/dev/null 2>&1 || die "インターフェースがありません: $i"; done
+	case $t_table in '' | *[!0-9]*) die "--transparent-table は数字で指定してください" ;; esac
+fi
 
 installed_by_apt() { dpkg-query -W -f='${Status}' rproxy-api 2>/dev/null | grep -q 'install ok installed'; }
 
 # ---------------------------------------------------------------- uninstall
 
+remove_routing() {
+	if [ -e "/etc/systemd/system/$ROUTING_UNIT" ]; then
+		systemctl disable --now "$ROUTING_UNIT" 2>/dev/null || true
+		rm -f "/etc/systemd/system/$ROUTING_UNIT" "$ROUTING_BIN" "$ROUTING_CONF"
+		systemctl daemon-reload
+	fi
+}
+
 if $uninstall; then
+	remove_routing
+	rm -rf "/etc/systemd/system/$UNIT.d/capabilities.conf"
+	rmdir "/etc/systemd/system/$UNIT.d" 2>/dev/null || true
 	if installed_by_apt; then
 		log "apt で削除します"
 		if $purge; then apt-get purge -y rproxy-api; else apt-get remove -y rproxy-api; fi
@@ -243,6 +283,43 @@ elif $fresh; then
 	fi
 fi
 [ -z "$database_url" ] || set_env RPROXY_DATABASE_URL "$database_url"
+
+# transparent: 権限（古いパッケージのユニットには CAP_NET_ADMIN がないので drop-in で足す）
+if ! systemctl cat "$UNIT" 2>/dev/null | grep -q '^AmbientCapabilities=.*CAP_NET_ADMIN'; then
+	log "source_ip: transparent のために CAP_NET_ADMIN を与えます（$UNIT.d/capabilities.conf）"
+	install -d "/etc/systemd/system/$UNIT.d"
+	cat > "/etc/systemd/system/$UNIT.d/capabilities.conf" <<'CONF'
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CONF
+	systemctl daemon-reload
+fi
+
+# transparent: 戻りのパケットのポリシールーティング
+if $no_routing; then
+	log "transparent 用のポリシールーティングを外します"
+	remove_routing
+elif [ -n "$t_clients" ]; then
+	log "transparent 用のポリシールーティングを設定します（$t_clients ← $t_ifaces、テーブル $t_table）"
+	# 前の設定で入れたルールを先に外す
+	systemctl stop "$ROUTING_UNIT" 2>/dev/null || true
+	rtmp=$(mktemp -d)
+	template contrib/rproxy-transparent-routing "$rtmp/routing"
+	template contrib/rproxy-transparent-routing.service "$rtmp/routing.service"
+	install -m 0755 "$rtmp/routing" "$ROUTING_BIN"
+	install -m 0644 "$rtmp/routing.service" "/etc/systemd/system/$ROUTING_UNIT"
+	rm -rf "$rtmp"
+	cat > "$ROUTING_CONF" <<CONF
+# rproxy-transparent-routing の設定（install.sh が書いた。変えたら systemctl restart $ROUTING_UNIT）
+CLIENTS="$t_clients"
+IFACES="$t_ifaces"
+TABLE=$t_table
+CONF
+	chmod 0644 "$ROUTING_CONF"
+	systemctl daemon-reload
+	systemctl enable --now "$ROUTING_UNIT"
+fi
 if [ -n "$static_rules" ]; then
 	static_rules=$(readlink -f "$static_rules")
 	case $static_rules in
@@ -293,6 +370,12 @@ else
 	done
 	if $ok; then
 		log "起動しました（$scheme://$host:$port）"
+		caps=$(curl -fsk -H "Authorization: Bearer $(head -n1 "$TOKENS")" "$scheme://$host:$port/capabilities" 2>/dev/null || true)
+		case $caps in
+			*'"transparent":true'*) transparent=使える ;;
+			*'"transparent":false'*) transparent=使えない; warn "source_ip: transparent が使えません（CAP_NET_ADMIN を確認してください）" ;;
+			*) transparent=不明 ;;
+		esac
 	else
 		journalctl -u "$UNIT" --no-pager -n 20 >&2 || true
 		die "起動を確認できませんでした（journalctl -u rproxy-api で確認してください）"
@@ -307,6 +390,7 @@ rproxy-api $(rproxy-api --version 2>/dev/null | awk '{print $2}') をインス�
   トークン    $TOKENS（変えたら systemctl reload rproxy-api）
   ログ        $(get_env RPROXY_LOG_FILE | sed 's/^$/journalctl -u rproxy-api/')
   状態        systemctl status rproxy-api
+  transparent ${transparent:-未確認}$( [ -e "$ROUTING_CONF" ] && echo "（ルーティング: $ROUTING_BIN status）" )
 
 UI（TCP-UDP-rproxy-ui）の .env.local に設定する値:
   RPROXY_API_URL=${scheme:-http}://$host:$port

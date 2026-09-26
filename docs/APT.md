@@ -14,12 +14,12 @@
 | `/var/log/rproxy/` | ログ（`rproxy.<日付>.log`、JSON Lines）。rproxy が日ごとに分け、`RPROXY_LOG_KEEP` を超えた古いものを消すので logrotate は不要 |
 | `/usr/share/doc/rproxy-api/` | README、API.md、PROFILES.md、固定ルールの例 |
 
-- インストール時に `rproxy` システムユーザーを作る。サービスはこのユーザーで動き、1024 未満のポートは `AmbientCapabilities=CAP_NET_BIND_SERVICE` で開ける。
+- インストール時に `rproxy` システムユーザーを作る。サービスはこのユーザーで動き、ユニットが `CAP_NET_BIND_SERVICE`（1024 未満のポート）と `CAP_NET_ADMIN`（`source_ip: transparent`）を与える（docs/PERMISSIONS.md）。
 - インストールしただけでは有効にも起動にもしない（設定前に API が上がらないように）。`systemctl enable --now rproxy-api` で起動する。
 - アップグレードでは、動いていれば再起動する（`try-restart`）。トークンと設定は変えない。
 - `apt purge` で `/etc/rproxy/tokens`、`/etc/rproxy/`、`/var/log/rproxy/` を消す。`rproxy` ユーザーは残す。
 - ログを journald（`journalctl -u rproxy-api`）に出すなら、`rproxy.env` の `RPROXY_LOG_FILE` の行をコメントにする。
-- `source_ip: transparent` を使う場合は `systemctl edit rproxy-api` で `CAP_NET_ADMIN` を足す（README の「送信元 IP の引き渡し」）。
+- `source_ip: transparent` の戻りのパケットのポリシールーティングは、`scripts/install.sh --transparent-clients ... --transparent-iface ...` で入れられる（README の「送信元 IP の引き渡し」）。
 
 CI の `Debian package` ジョブ（`scripts/test-deb.sh`）が、実際にインストール・起動・署名つきリポジトリからの再インストール・purge までを確かめる。
 

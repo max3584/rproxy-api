@@ -70,7 +70,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## 注意点
 
-- `transparent` は Linux・IPv4・`CAP_NET_ADMIN` が前提で、ポリシールーティングの設定も要る（README）。`scripts/test-transparent.sh` で名前空間の中の実経路では確認済み。README の iptables を使う手順は未検証。
+- `transparent` は Linux・IPv4・`CAP_NET_ADMIN` が前提で、ポリシールーティングの設定も要る（README）。ユニットは `CAP_NET_ADMIN` を既定で与え、ポリシールーティングは `contrib/rproxy-transparent-routing`（install.sh の `--transparent-*`）で入れる。権限を足したり外したりしたら docs/PERMISSIONS.md も直す。`scripts/test-transparent.sh` で名前空間の中の実経路では確認済み。README の iptables を使う手順は未検証。
 - DB からの復元（`src/db.rs`）は MariaDB 11.4 で確認済み。テーブルが古く `source_ip` / `udp_idle_secs` 列がない場合は、既定値で読み込む。
 - 空の環境変数（`RPROXY_DATABASE_URL=` など）は未設定として扱う（`main` で clap に渡す前に取り除く）。
 - 派生元のコードに由来するファイルには帰属コメントが付いている。MIT ライセンスの表記は残すこと。
