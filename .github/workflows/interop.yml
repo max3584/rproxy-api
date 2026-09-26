@@ -64,6 +64,8 @@ jobs:
           SUMS
           tar xzf pebble-linux-amd64.tar.gz
           tar xzf pebble-challtestsrv-linux-amd64.tar.gz
+          # the release archives do not keep the executable bit
+          chmod +x pebble-linux-amd64/linux/amd64/pebble pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
           echo "RPROXY_TEST_PEBBLE=$PWD/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
           echo "RPROXY_TEST_CHALLTESTSRV=$PWD/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
       - run: cargo test --test acme -- --nocapture

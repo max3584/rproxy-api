@@ -138,7 +138,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 - `rules` の各要素は `POST /rules` の本文と同じ形。
 - `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。この版で動かせない項目（`acme` の `dns-01` の resolver）は、ログに `"event":"degraded"`（`part: global.acme.resolvers.<名前>`）を出して読み飛ばす。
   - `acme`: ACME で証明書を取る（v0.3.2 から。下の「ACME の証明書」）。
-    - `resolvers.<名前>`: `email`（アカウントの連絡先）、`directory`（省略時は Let's Encrypt の本番 `https://acme-v02.api.letsencrypt.org/directory`。ステージングは `https://acme-staging-v02.api.letsencrypt.org/directory`）、`challenge`（`http-01` / `tls-alpn-01`。`dns-01` はまだ使えない）、`ca_file`（ACME サーバ自身の HTTPS の証明書の CA。step-ca・Pebble などの私設 CA のときだけ。省略時はシステムのルート証明書）。
+    - `resolvers.<名前>`: `email`（アカウントの連絡先）、`directory`（省略時は Let's Encrypt の本番 `https://acme-v02.api.letsencrypt.org/directory`。ステージングは `https://acme-staging-v02.api.letsencrypt.org/directory`）、`challenge`（`http-01` / `tls-alpn-01`。`dns-01` はまだ使えない）、`ca_file`（ACME サーバ自身の HTTPS の証明書の CA。step-ca・Pebble などの私設 CA のときだけ。省略時はシステムのルート証明書。Debian / Ubuntu では `ca-certificates`（.deb の依存に入れてある）、コンテナではその CA バンドルを入れておく）。
     - `storage`: アカウントの鍵と証明書・秘密鍵の置き場所（省略時は `/var/lib/rproxy/acme`。ディレクトリ 700、ファイル 600 で作る）。書き込めなければ起動は続け、証明書をメモリにだけ持つ（`part: global.acme.storage`。再起動すると取り直す）。
     - `ca_file` のファイルがなければ起動しない。
   - `trusted_proxies`: CIDR の配列。`http` のルールで、接続元がこの範囲なら `X-Forwarded-For` を信用する（API で作ったルールにも効く）。
