@@ -46,6 +46,8 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" 
 [ "$(ps -o user= -C rproxy-api | tr -d ' ')" = rproxy ] || fail "not running as rproxy"
 # the default configuration logs to /var/log/rproxy (JSON Lines, rotated by rproxy itself)
 sudo sh -c 'head -n1 /var/log/rproxy/rproxy.*.log' | grep -q '"event"' || fail "no JSON log in /var/log/rproxy"
+curl -s -H "Authorization: Bearer $token" http://127.0.0.1:8080/capabilities | grep -q '"transparent":true' ||
+	fail "source_ip transparent is not available (CAP_NET_ADMIN)"
 sudo systemctl reload rproxy-api
 sleep 0.5
 systemctl is-active --quiet rproxy-api || fail "reload stopped the service"

@@ -80,7 +80,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: shellcheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh contrib/rproxy-transparent-routing
       - run: cargo build --release
       - name: scripts/test-install.sh
         run: sudo scripts/test-install.sh target/release/rproxy-api
