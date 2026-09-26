@@ -580,13 +580,17 @@ impl Registry {
 		Ok(view)
 	}
 
-	/// Re-reads certificate files for every rule that uses them (SIGHUP).
+	/// Re-reads certificate files for every rule that uses them (SIGHUP), and
+	/// the secret files of authentication middlewares.
 	/// A rule whose files are now broken keeps its current certificates.
 	pub async fn reload_tls(&self) -> (usize, usize) {
 		let rules = self.rules.lock().await;
 		let (mut ok, mut failed) = (0, 0);
 		for (key, entry) in rules.iter() {
 			let Entry::Running(r) = entry else { continue };
+			if let Some(router) = r.rt.http_router() {
+				router.reload_secrets();
+			}
 			if r.spec.tls.mode != TlsMode::Terminate {
 				continue;
 			}

@@ -99,7 +99,7 @@ fn tcp_and_udp_routers_from_toml() {
 }
 
 #[test]
-fn docker_labels_with_middlewares_not_in_every_version() {
+fn docker_labels_with_middlewares() {
 	if !python_ready() {
 		return;
 	}
@@ -122,6 +122,10 @@ fn docker_labels_with_middlewares_not_in_every_version() {
 	);
 	assert!(http.services.contains_key("error-pages"), "the errors middleware's service comes along");
 	assert!(http.services["whoami"].health_check.is_some());
-	assert!(notes.contains("needs features"), "{notes}");
+	assert!(!notes.contains("needs features"), "authentication works now too: {notes}");
+	let MiddlewareSpec::ForwardAuth { response_headers, trust_forward_header, .. } = &http.middlewares["forward"] else { panic!() };
+	assert_eq!((response_headers.len(), *trust_forward_header), (2, true));
+	let MiddlewareSpec::BasicAuth { keep_authorization, .. } = &http.middlewares["auth"] else { panic!() };
+	assert!(*keep_authorization, "Traefik passes Authorization on unless removeHeader");
 	assert!(!notes.contains("$apr1$"), "password hashes are not copied");
 }

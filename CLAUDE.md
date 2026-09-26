@@ -46,6 +46,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/backend.rs` | サービスと転送先：重みつきラウンドロビン（down を除く）、ヘルスチェック、`sticky` のクッキー、転送先ごとの待機中の接続（応答の本文を読み終えたら戻す）、接続（`Dialer`） |
 | `src/http/resilience.rs` | `buffering`（本文を上限つきで読み切る）、`retry` の待ち時間、`circuit_breaker`（`Breaker` と、結果を必ず返す `Ticket`） |
 | `src/http/h3.rs` | HTTP/3（`http.http3`）：ルールと同じアドレス・ポートの UDP の quinn の Endpoint、h3 のリクエストを `server.rs` の `Conn::handle` に渡す。QUIC の TLS は `TlsRuntime.quic_config`（TCP と同じ証明書・クライアント認証、TLS 1.3、ALPN h3）を接続ごとに読むので、証明書の読み直しもそのまま効く。UDP を使えなければ TCP だけで動き、`Runtime.h3` に理由を持つ。本文の型 `Body` の誤りは `BoxError`（hyper と h3 の両方） |
+| `src/http/auth.rs` | 認証のミドルウェア（#59）：`basic_auth`（htpasswd の bcrypt / APR1 / {SHA}、通った組み合わせのキャッシュ）、`forward_auth` の問い合わせのヘッダと応答の写し（送るのは `server.rs` が転送先の接続で）、秘密のファイル（`SecretFile`。変わったら数秒以内に読み直す、SIGHUP で `Router::reload_secrets`） |
+| `src/http/oidc.rs` | `oidc`：認可コード + PKCE、discovery と JWKS のキャッシュ、ID トークンの検証（ring。RS/PS/ES）、AES-256-GCM で暗号化したセッションのクッキー、リフレッシュ、ログアウト。コールバックとログアウトのパスは `server.rs` がルーティングの前に渡す。プロバイダへの HTTP は `crowdsec::call` |
 | `src/http/compress.rs` | `compress`：`Accept-Encoding` の交渉、圧縮しない応答の判定、流れてきた分ずつ圧縮する本文（gzip・br・zstd） |
 | `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `main.rs` の `watch_config` → `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |

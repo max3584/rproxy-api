@@ -80,6 +80,11 @@ flate2 = "1"
 brotli = "8"
 zstd = "0.13"
 sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+bcrypt = { version = "0.17", default-features = false, features = ["std"] }
+base64 = "0.22"
+ring = "0.17"
 time = { version = "0.3", features = ["formatting"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"

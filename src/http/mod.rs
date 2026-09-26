@@ -8,7 +8,9 @@ pub mod limit;
 pub mod backend;
 pub mod compress;
 pub mod h3;
+pub mod auth;
 pub mod matcher;
+pub mod oidc;
 pub mod resilience;
 pub mod middleware;
 pub mod server;
@@ -190,6 +192,12 @@ pub enum MiddlewareSpec {
 		response_headers: Vec<String>,
 		#[serde(default)]
 		trust_forward_header: bool,
+		/// Headers of the request sent to the auth server (default: all).
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		request_headers: Vec<String>,
+		/// Time for the auth server to answer (default 10s).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		timeout: Option<String>,
 	},
 	Oidc {
 		issuer: String,
@@ -198,9 +206,33 @@ pub enum MiddlewareSpec {
 		#[serde(default)]
 		scopes: Vec<String>,
 		cookie_secret_file: String,
+		/// CA of the provider's HTTPS certificate (default: the Mozilla roots).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		ca_file: Option<String>,
+		/// Default /_rproxy/oidc/callback; register it at the provider.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		callback_path: Option<String>,
+		/// Default /_rproxy/oidc/logout.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		logout_path: Option<String>,
+		/// Default _rproxy_oidc.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		cookie_name: Option<String>,
+		/// Claim (dot path) sent as X-Forwarded-Groups; default groups.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		groups_claim: Option<String>,
 	},
 	BasicAuth {
 		users_file: String,
+		/// Default rproxy.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		realm: Option<String>,
+		/// Pass Authorization on to the backend (default: removed).
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		keep_authorization: bool,
+		/// Header that tells the backend the user name (e.g. X-Forwarded-User).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		user_header: Option<String>,
 	},
 	StripPrefix {
 		prefixes: Vec<String>,
@@ -399,6 +431,29 @@ impl MiddlewareSpec {
 				parse_duration(d).map(|_| ()).map_err(|e| invalid(format!("middleware {name}: initial_interval: {e}")))
 			}
 			MiddlewareSpec::Respond { status, .. } if !(100..=599).contains(status) => bad(format!("status {status} is not an HTTP status")),
+			MiddlewareSpec::ForwardAuth { address, timeout, .. } => {
+				check_url(address, &format!("middleware {name}"))?;
+				if let Some(t) = timeout {
+					parse_duration(t).map_err(|e| invalid(format!("middleware {name}: timeout: {e}")))?;
+				}
+				Ok(())
+			}
+			MiddlewareSpec::Oidc { issuer, client_id, callback_path, logout_path, cookie_name, .. } => {
+				check_url(issuer, &format!("middleware {name}: issuer"))?;
+				if client_id.is_empty() {
+					return bad("client_id is empty".into());
+				}
+				let paths = [callback_path.as_deref().unwrap_or(oidc::DEFAULT_CALLBACK), logout_path.as_deref().unwrap_or(oidc::DEFAULT_LOGOUT)];
+				if paths.iter().any(|p| !p.starts_with('/')) || paths[0] == paths[1] {
+					return bad("callback_path and logout_path must start with / and differ".into());
+				}
+				if let Some(c) = cookie_name {
+					if c.is_empty() || !c.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+						return bad(format!("cookie_name {c:?} is not a cookie name"));
+					}
+				}
+				Ok(())
+			}
 			_ => Ok(()),
 		}
 	}

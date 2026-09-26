@@ -641,6 +641,16 @@
          },
          "trust_forward_header": {
           "type": "boolean"
+         },
+         "request_headers": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "timeout": {
+          "type": "string",
+          "description": "default 10s"
          }
         },
         "required": [
@@ -677,6 +687,21 @@
          },
          "cookie_secret_file": {
           "type": "string"
+         },
+         "ca_file": {
+          "type": "string"
+         },
+         "callback_path": {
+          "type": "string"
+         },
+         "logout_path": {
+          "type": "string"
+         },
+         "cookie_name": {
+          "type": "string"
+         },
+         "groups_claim": {
+          "type": "string"
          }
         },
         "required": [
@@ -700,6 +725,15 @@
         "type": "object",
         "properties": {
          "users_file": {
+          "type": "string"
+         },
+         "realm": {
+          "type": "string"
+         },
+         "keep_authorization": {
+          "type": "boolean"
+         },
+         "user_header": {
           "type": "string"
          }
         },

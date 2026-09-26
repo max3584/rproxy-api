@@ -50,6 +50,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ、またはスコープ付きの YAML）。変えたら `systemctl reload rproxy-api` |
 | 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
 | CrowdSec の API キー（`global.crowdsec.api_key_file`、例 `/etc/rproxy/crowdsec.key`） | `root:rproxy` 640 | `cscli bouncers add rproxy` で作ったキー。rproxy ユーザーが読めること。変えたら `systemctl reload rproxy-api` |
+| 認証のミドルウェアの秘密（`basic_auth` の `users_file`、`oidc` の `client_secret_file` / `cookie_secret_file`。例 `/etc/rproxy/auth/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（`cookie_secret_file` が漏れるとセッションのクッキーを作れる、`client_secret_file` はプロバイダのクライアントの秘密）。読めないとそのミドルウェアは 503 を返す。変えると数秒以内に読み直す（SIGHUP でもすぐ）。`cookie_secret_file` を変えるとすべてのサインインが切れる |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
 | `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |

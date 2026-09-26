@@ -146,7 +146,7 @@ impl Features {
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
 			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "retry",
-			"circuit_breaker", "errors",
+			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 		],
 		services: &["health_check", "sticky"],
 	};
