@@ -32,9 +32,10 @@ except ImportError:  # JSON output still works
 # `unsupported` until a newer version adds it. GET /capabilities tells for sure.
 KNOWN_MIDDLEWARES = {
     "redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix",
-    "replace_path", "replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec",
+    "replace_path", "replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering",
+    "retry", "circuit_breaker", "errors",
 }
-KNOWN_SERVICE_OPTIONS = set()
+KNOWN_SERVICE_OPTIONS = {"health_check", "sticky"}
 
 INTERNAL_SERVICES = {"api", "dashboard", "prometheus", "ping", "rest", "noop", "acme-http"}
 
