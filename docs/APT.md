@@ -41,7 +41,6 @@ rproxy-archive-keyring.gpg                                signed-by= に使う�
 
 同じバージョンのパッケージを中身を変えて出し直すことはできない（`apt-repo.sh` が止める）。直すときはバージョンを上げる。
 
-packaging のファイル（`debian/`、`Cargo.toml`、`release.yml`、`apt-repo.sh`）を変える PR では、release.yml が公開せずにビルドとパッケージの作成だけを行う。
 
 ## 初回の準備（リポジトリの管理者が 1 回だけ）
 
