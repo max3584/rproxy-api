@@ -37,6 +37,12 @@ impl Tokens {
 		Ok(Tokens { path: Some(path), tokens: RwLock::new(tokens) })
 	}
 
+	/// Authentication is on but no token is known yet (the file could not be
+	/// read): every request is refused until a reload succeeds.
+	pub fn locked(path: PathBuf) -> Self {
+		Tokens { path: Some(path), tokens: RwLock::default() }
+	}
+
 	pub fn enabled(&self) -> bool {
 		self.path.is_some()
 	}

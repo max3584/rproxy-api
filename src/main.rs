@@ -1,12 +1,15 @@
+use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
 use axum_server::tls_rustls::RustlsConfig;
 use axum_server::Handle;
+use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use rproxy_api::api::{self, AppState};
@@ -57,6 +60,9 @@ struct Options {
 	/// Largest port range (listen_port..listen_port_end) one rule may open
 	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS)]
 	max_range_ports: u16,
+	/// Seconds between attempts to open a control API listener that could not start
+	#[arg(long, env = "RPROXY_API_RETRY_SECS", default_value_t = 10, hide = true)]
+	api_retry_secs: u64,
 }
 
 /// Port ranges open one socket per port; lift the soft file limit to the hard one.
@@ -120,7 +126,12 @@ fn main() -> ExitCode {
 	let opts = Options::parse();
 
 	let _log_guard = match logging::init(&opts.log_level, opts.log_file.as_deref(), opts.log_keep) {
-		Ok(guard) => guard,
+		Ok((guard, fallback)) => {
+			if let Some(why) = fallback {
+				warn!(event = "degraded", part = "log", error = %why);
+			}
+			guard
+		}
 		Err(e) => {
 			eprintln!("rproxy-api: {e}");
 			return ExitCode::FAILURE;
@@ -150,17 +161,34 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 
 	let tokens = Arc::new(match &opts.token_file {
-		Some(path) => Tokens::from_file(path.clone()).map_err(|e| format!("token file: {e}"))?,
 		None => Tokens::disabled(),
+		Some(path) => match Tokens::from_file(path.clone()) {
+			Ok(tokens) => tokens,
+			// a wrong path or a file without tokens is a configuration error
+			Err(e) if config_error(&e) => return Err(format!("token file {}: {e}", path.display())),
+			// unreadable (permissions): keep the API closed until SIGHUP reads it
+			Err(e) => {
+				warn!(event = "degraded", part = "tokens", error = %format!("{}: {e}", path.display()),
+					"control API refuses every request until the token file can be read (SIGHUP)");
+				Tokens::locked(path.clone())
+			}
+		},
 	});
 
-	let tls = match (&opts.tls_cert, &opts.tls_key) {
-		(Some(cert), Some(key)) => {
-			let _ = rustls::crypto::ring::default_provider().install_default();
-			Some(RustlsConfig::from_pem_file(cert, key).await.map_err(|e| format!("TLS: {e}"))?)
+	// the control API certificate; loaded later by the listener task when it cannot be read yet
+	let tls: Arc<OnceCell<RustlsConfig>> = Arc::default();
+	if let (Some(cert), Some(key)) = (&opts.tls_cert, &opts.tls_key) {
+		let _ = rustls::crypto::ring::default_provider().install_default();
+		match load_api_tls(cert, key).await {
+			Ok(config) => {
+				let _ = tls.set(config);
+			}
+			Err(ApiTlsError::Config(e)) => return Err(e),
+			Err(ApiTlsError::Unreadable(e)) => {
+				warn!(event = "degraded", part = "api_tls", error = %e, "control API waits for its certificate");
+			}
 		}
-		_ => None,
-	};
+	}
 
 	let transparent = source::transparent_available();
 	let registry = Registry::new(Config {
@@ -171,14 +199,20 @@ async fn run(opts: Options) -> Result<(), String> {
 		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 	});
 	let nofile = raise_nofile_limit();
-	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(), tls = tls.is_some(),
-		max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
+	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, auth = tokens.enabled(),
+		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
 	if let Some(path) = &opts.static_rules {
-		let text = std::fs::read_to_string(path).map_err(|e| format!("static rules {}: {e}", path.display()))?;
-		let rules: Vec<rproxy_api::rule::RuleRequest> =
-			serde_json::from_str(&text).map_err(|e| format!("static rules {}: {e}", path.display()))?;
-		registry.load_static(rules).await.map_err(|e| format!("static rules {}: {e}", path.display()))?;
+		match std::fs::read_to_string(path) {
+			Ok(text) => {
+				let rules: Vec<rproxy_api::rule::RuleRequest> =
+					serde_json::from_str(&text).map_err(|e| format!("static rules {}: {e}", path.display()))?;
+				registry.load_static(rules).await.map_err(|e| format!("static rules {}: {e}", path.display()))?;
+			}
+			Err(e) if config_error(&e) => return Err(format!("static rules {}: {e}", path.display())),
+			Err(e) => error!(event = "degraded", part = "static_rules", error = %format!("{}: {e}", path.display()),
+				"running without the static rules"),
+		}
 	}
 
 	if let Some(url) = &opts.database_url {
@@ -193,31 +227,31 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 
 	let app = api::router(Arc::new(AppState { registry: registry.clone(), tokens: tokens.clone() }));
-	let mut handles = vec![];
+	let handles: Arc<Mutex<Vec<Handle>>> = Arc::default();
+	let stop = CancellationToken::new();
+	let retry = Duration::from_secs(opts.api_retry_secs.max(1));
 	for ip in addrs {
 		let addr = SocketAddr::new(ip, opts.api_port);
-		let app = app.clone().into_make_service();
-		let handle = Handle::new();
-		let server = match &tls {
-			Some(tls) => tokio::spawn(axum_server::bind_rustls(addr, tls.clone()).handle(handle.clone()).serve(app)),
-			None => tokio::spawn(axum_server::bind(addr).handle(handle.clone()).serve(app)),
+		let listener = ApiListener {
+			addr,
+			app: app.clone(),
+			tls: tls.clone(),
+			files: opts.tls_cert.clone().zip(opts.tls_key.clone()),
+			handles: handles.clone(),
 		};
-		// a bind error makes `listening()` return None
-		if handle.listening().await.is_none() {
-			let reason = match server.await {
-				Ok(Err(e)) => e.to_string(),
-				_ => "server stopped".into(),
-			};
-			return Err(format!("control API on {addr}: {reason}"));
+		// the rules keep running while a listener that cannot start is retried
+		if let Err(e) = listener.start().await {
+			error!(event = "degraded", part = "api", addr = %addr, error = %e, retry_secs = retry.as_secs(),
+				"control API is not listening here yet; retrying");
+			tokio::spawn(listener.retry(retry, stop.clone()));
 		}
-		handles.push(handle);
 	}
-	info!(event = "api.listening", port = opts.api_port, tls = tls.is_some());
 
-	wait_for_shutdown(&tokens, tls.as_ref(), &opts, &registry).await?;
+	wait_for_shutdown(&tokens, &tls, &opts, &registry).await?;
 
 	info!(event = "shutdown");
-	for handle in &handles {
+	stop.cancel();
+	for handle in handles.lock().unwrap().iter() {
 		handle.graceful_shutdown(Some(Duration::from_secs(5)));
 	}
 	registry.shutdown().await;
@@ -228,7 +262,7 @@ async fn run(opts: Options) -> Result<(), String> {
 #[cfg(unix)]
 async fn wait_for_shutdown(
 	tokens: &Tokens,
-	tls: Option<&RustlsConfig>,
+	tls: &OnceCell<RustlsConfig>,
 	opts: &Options,
 	registry: &Registry,
 ) -> Result<(), String> {
@@ -243,7 +277,7 @@ async fn wait_for_shutdown(
 					Ok(n) => info!(event = "reload.tokens", tokens = n),
 					Err(e) => warn!(event = "reload.tokens", error = %e, "keeping current tokens"),
 				}
-				if let (Some(tls), Some(cert), Some(key)) = (tls, &opts.tls_cert, &opts.tls_key) {
+				if let (Some(tls), Some(cert), Some(key)) = (tls.get(), &opts.tls_cert, &opts.tls_key) {
 					match tls.reload_from_pem_file(cert, key).await {
 						Ok(()) => info!(event = "reload.tls"),
 						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
@@ -259,6 +293,92 @@ async fn wait_for_shutdown(
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(_: &Tokens, _: Option<&RustlsConfig>, _: &Options, _: &Registry) -> Result<(), String> {
+async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Registry) -> Result<(), String> {
 	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
+}
+
+/// A missing file or unusable content is a mistake in the configuration;
+/// anything else (permissions, ...) is the environment, which rproxy-api runs
+/// around in a restricted mode.
+fn config_error(e: &io::Error) -> bool {
+	matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput)
+}
+
+enum ApiTlsError {
+	/// Wrong path or not a certificate / key: stop the startup.
+	Config(String),
+	/// Exists but cannot be read now: retry.
+	Unreadable(String),
+}
+
+async fn load_api_tls(cert: &Path, key: &Path) -> Result<RustlsConfig, ApiTlsError> {
+	let read = |path: &Path| {
+		std::fs::read(path).map_err(|e| {
+			let msg = format!("TLS {}: {e}", path.display());
+			if config_error(&e) {
+				ApiTlsError::Config(msg)
+			} else {
+				ApiTlsError::Unreadable(msg)
+			}
+		})
+	};
+	let (cert_pem, key_pem) = (read(cert)?, read(key)?);
+	RustlsConfig::from_pem(cert_pem, key_pem).await.map_err(|e| ApiTlsError::Config(format!("TLS: {e}")))
+}
+
+/// One address of the control API.
+struct ApiListener {
+	addr: SocketAddr,
+	app: axum::Router,
+	tls: Arc<OnceCell<RustlsConfig>>,
+	/// (cert, key) when the API is served over TLS
+	files: Option<(PathBuf, PathBuf)>,
+	handles: Arc<Mutex<Vec<Handle>>>,
+}
+
+impl ApiListener {
+	async fn start(&self) -> Result<(), String> {
+		let tls = match &self.files {
+			None => None,
+			Some((cert, key)) => match self.tls.get() {
+				Some(config) => Some(config.clone()),
+				None => {
+					let config = load_api_tls(cert, key).await.map_err(|e| match e {
+						ApiTlsError::Config(e) | ApiTlsError::Unreadable(e) => e,
+					})?;
+					let _ = self.tls.set(config);
+					self.tls.get().cloned()
+				}
+			},
+		};
+		let app = self.app.clone().into_make_service();
+		let handle = Handle::new();
+		let server = match tls {
+			Some(tls) => tokio::spawn(axum_server::bind_rustls(self.addr, tls).handle(handle.clone()).serve(app)),
+			None => tokio::spawn(axum_server::bind(self.addr).handle(handle.clone()).serve(app)),
+		};
+		// a bind error makes `listening()` return None
+		if handle.listening().await.is_none() {
+			return Err(match server.await {
+				Ok(Err(e)) => e.to_string(),
+				_ => "server stopped".into(),
+			});
+		}
+		info!(event = "api.listening", addr = %self.addr, tls = self.files.is_some());
+		self.handles.lock().unwrap().push(handle);
+		Ok(())
+	}
+
+	async fn retry(self, every: Duration, stop: CancellationToken) {
+		loop {
+			tokio::select! {
+				_ = stop.cancelled() => return,
+				_ = tokio::time::sleep(every) => {}
+			}
+			match self.start().await {
+				Ok(()) => return,
+				Err(e) => warn!(event = "api.retry", addr = %self.addr, error = %e),
+			}
+		}
+	}
 }

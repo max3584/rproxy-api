@@ -65,6 +65,21 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 
 `RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
 
+### 起動できないものがあるとき
+
+設定のエラー（値の誤り、存在しないパス、ファイルの中身の誤り）では起動しない。
+それ以外の環境の問題では、使えない部分だけを止めて起動を続ける（ログに `"event":"degraded"` と `part` を出す）。
+
+| 状況 | 動作 |
+|---|---|
+| ログのディレクトリに書けない | 標準出力にログを出す（`part: log`） |
+| トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP すると解除（`part: tokens`） |
+| 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを 10 秒ごとに開き直す（`part: api_tls` / `part: api`） |
+| 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
+| DB に接続できない | DB のルールなしで起動する（`restore.error`） |
+| 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
+
+
 ## 使い方
 
 API の詳細は [docs/API.md](docs/API.md) を参照。
