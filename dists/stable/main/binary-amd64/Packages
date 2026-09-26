@@ -58,6 +58,26 @@ Description: L4 TCP/UDP forwarder managed through an HTTP API
  time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
  termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
 
+Package: rproxy-api
+Architecture: amd64
+Version: 0.2.3-1
+Priority: optional
+Section: net
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 10145
+Depends: passwd
+Filename: pool/main/r/rproxy-api/rproxy-api_0.2.3-1_amd64.deb
+Size: 3152096
+MD5sum: 6af166383e4302431044d9a83e1e1f7c
+SHA1: 992072605e734e1e5456ad8d2db0c3675013020e
+SHA256: 20b05e7b2b40f6ffbfe7dfbc39649cf1a885b9692df1cb4d9de8397d36317b2f
+SHA512: 82eaa337a914ce2c63f48be2c1d53e34a7a20972c455f5499c963c82040302547a815e89ccb54ffd0181dd98fa61ec87e3294371c7c97c4ae5342b04e7c16d47
+Homepage: https://github.com/max3584/rproxy-api
+Description: L4 TCP/UDP forwarder managed through an HTTP API
+ Layer 4 TCP/UDP forwarder whose rules are added, changed and removed at run
+ time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
+ termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
+
 Package: rproxy-ui
 Architecture: all
 Version: 0.2.2-1
@@ -73,6 +93,26 @@ MD5sum: 6b998f858b37ff64452a504455ed7f3b
 SHA1: 26782a94d4c7de395be52f3bef55a0b4d163504f
 SHA256: 7485274e34437faf7be9669d87ac92d6f89f4762df1b56634778d5ba1b173fc1
 SHA512: 022f7fa955744cf024e8ba69528d48d19e702859682361fb2729f5cf9027b8fe818f7a34f3acd974fbc766ce0d1896fba2b4770fdc24cc0d0f5862538a2557ce
+Homepage: https://github.com/max3584/TCP-UDP-rproxy-ui
+Description: web UI for rproxy-api
+ Dashboard and rule editor for rproxy-api, the L4 TCP/UDP forwarder managed
+ through an HTTP API. Sign-in with Keycloak; rules are stored in MariaDB.
+
+Package: rproxy-ui
+Architecture: all
+Version: 0.2.3-1
+Priority: optional
+Section: web
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 26608
+Depends: nodejs (>= 20.9), passwd
+Suggests: rproxy-api (= 0.2.3-1)
+Filename: pool/main/r/rproxy-ui/rproxy-ui_0.2.3-1_all.deb
+Size: 2455988
+MD5sum: 4fdc1b4822bf26c748895755d8df72df
+SHA1: 472cb85f9f63657deaa031dcc9a8c1bef922230b
+SHA256: 109c96220f6bff8a9df6360ea6287d59207078ecd97da565dff60e273fd71643
+SHA512: 9f6c1dfce5ab203338dff64f039f4ae5dea3aaa3e03849838a8797987d77f90c37ea94d2b271f292781641f39580f46aa65c3dfcfa860e4efc12c7802621eed3
 Homepage: https://github.com/max3584/TCP-UDP-rproxy-ui
 Description: web UI for rproxy-api
  Dashboard and rule editor for rproxy-api, the L4 TCP/UDP forwarder managed
