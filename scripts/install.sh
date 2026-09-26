@@ -353,12 +353,18 @@ case $addr in 0.0.0.0) host=127.0.0.1 ;; ::) host='[::1]' ;; *:*) host="[$addr]"
 if $no_start; then
 	log "起動はしていません。sudo systemctl enable --now rproxy-api で起動します"
 else
+	start_failed() {
+		journalctl -u "$UNIT" --no-pager -n 20 >&2 || true
+		die "起動できませんでした（journalctl -u rproxy-api で確認してください）"
+	}
+	# 続けて何度も実行したときに systemd の起動回数の上限（StartLimitBurst）に当たらないようにする
+	systemctl reset-failed "$UNIT" 2>/dev/null || true
 	if $was_active; then
 		log "再起動します"
-		systemctl restart "$UNIT"
+		systemctl restart "$UNIT" || start_failed
 	else
 		log "有効にして起動します"
-		systemctl enable --now "$UNIT"
+		systemctl enable --now "$UNIT" || start_failed
 	fi
 	scheme=http
 	[ -z "$(get_env RPROXY_TLS_CERT)" ] || scheme=https
