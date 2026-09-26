@@ -72,7 +72,9 @@ ip rule show | grep -q 'iif rpxt0 lookup 100' || fail "ip rule missing for the I
 nft list table inet rproxy_transparent | grep -q 'socket transparent 1' || fail "nft table missing"
 ip rule show | grep -q 'fwmark 0x1 lookup 100' || fail "IPv4 fwmark rule missing"
 ip -6 rule show | grep -q 'fwmark 0x1 lookup 100' || fail "IPv6 fwmark rule missing"
-ip -6 route show table 100 | grep -q 'local ::/0' || fail "IPv6 local default missing"
+# ip shows ::/0 and 0.0.0.0/0 as "default"
+ip -6 route show table 100 | grep -q '^local default' || fail "IPv6 local default missing"
+ip -4 route show table 100 | grep -q '^local default' || fail "IPv4 local default missing"
 ! ip -6 rule show | grep -q 'iif rpxt0' || fail "the previous iif rules were left behind"
 "$install" --method binary --binary "$bin" --transparent-clients 10.96.0.0/24 --transparent-iface rpxt0
 ! nft list table inet rproxy_transparent >/dev/null 2>&1 || fail "nft table left behind after leaving any"
