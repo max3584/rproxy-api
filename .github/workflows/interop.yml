@@ -29,3 +29,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
       - run: scripts/interop/mail.sh
+
+  media:
+    name: media (coturn, MediaMTX, 10000-port range)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: scripts/interop/media.sh
