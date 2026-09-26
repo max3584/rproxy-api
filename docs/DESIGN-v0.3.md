@@ -263,3 +263,12 @@ rules:
 - HTTP/2 で転送先へ送るか（まずは HTTP/1.1。gRPC が要るなら h2c を足す）
 - Kubernetes の CRD（#28）は、このルールの形を `spec` にそのまま使う（`apiVersion: rproxy.max3584.net/v1alpha1`、`kind: RproxyRule`）
 - source_ip の名前の変更（#49）は止めている。形を変えるなら v0.3.0 が機会
+
+## 9. v0.3.2 で決めたこと（負荷分散・耐障害・圧縮・エラーページ）
+
+- `circuit_breaker` の「失敗」は 5xx（rproxy が返す 502 / 504 を含む）。`window` に 10 件以上あるときだけ判定し、開いたあとは `recovery` ごとに 1 件だけ通して確かめる（Traefik の `ResponseCodeRatio(500, 600, 0, 600) > failure_percent/100` 相当を、式を書かずに使える形にした）
+- `retry` は、接続できない・応答がない（502 / 504）ときだけ。転送先が返した 5xx は送り直さない（Traefik と同じ）。本文のあるリクエストは `buffering` で読み切ったときだけ送り直す
+- `errors` の `path` の `{status}` は状態コードに置き換える（Traefik の `query` と同じ）
+- `compress` は流れてきた分ずつ圧縮して送る（圧縮率より、長く続く応答を止めないことを優先）
+- `sticky` のクッキーの値は転送先の URL から作る（再起動や転送先の追加で変わらない）
+- 転送先への HTTP/1.1 の接続は使い回す（`source_ip: transparent` を除く）

@@ -71,6 +71,10 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "h
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
+futures-util = "0.3"
+flate2 = "1"
+brotli = "8"
+zstd = "0.13"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 

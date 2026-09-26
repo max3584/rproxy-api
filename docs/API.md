@@ -128,7 +128,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
          "routes": {"site": {"requests": 3, "by_status": {"2xx": 3}}, "(none)": {"requests": 1, "by_status": {"4xx": 1}}}}
 ```
 
-`rate_limit` / `in_flight` で断ったリクエストがあれば、`limited`（合計）とルートごとの `limited`（ミドルウェアの名前ごと）も入る。`crowdsec` で断ったリクエストは同じ形で `blocked` に入る（どちらも `by_status` の `4xx` にも数える）。
+`health_check` のあるサービスがあれば、`services` に転送先ごとの状態が入る（`{"app": [{"url": "http://10.0.0.20:80", "up": true}, ...]}`）。`rate_limit` / `in_flight` で断ったリクエストがあれば、`limited`（合計）とルートごとの `limited`（ミドルウェアの名前ごと）も入る。`crowdsec` で断ったリクエストは同じ形で `blocked` に入る（どちらも `by_status` の `4xx` にも数える）。
 
 - `by_status` は状態コードの百の位ごと（`1xx`〜`5xx`。0 件の区分は省く）。`routes` はルートの名前ごとで、どのルートにも一致しなかったリクエストは `(none)`。
 - 応答の本文を送り終えた（またはクライアントが切断した）ときに数える。
@@ -219,7 +219,10 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - ルートは `priority` の大きい順（省略時は `match` の文字数。Traefik と同じ）、同じなら書いた順に試し、最初に一致したものを使う。どれにも一致しなければ `default`（`service` か `status`。省略時は 404）。
 - `Host` はポートを除き、大文字小文字を区別しない。HTTP/2 では `:authority` を使う。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
 - 転送先とは HTTP/1.1 で話す。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。
-- 転送先への接続はリクエストごとに作る（接続の再利用はまだしない）。
+- 転送先への接続は、応答の本文を読み終えたあと、次のリクエストに使い回す（転送先ごとに待機中の接続は 32 本まで。`source_ip: transparent` のルールでは、送信元がクライアントごとに違うので使い回さない）。使い回そうとした接続を転送先が閉じていたら、新しい接続で送り直す。
+- `health_check`（v0.3.2）: `interval`（既定 `10s`）ごとに各 `servers` へ `GET <URLのパス><path>`（`Host` は転送先のホスト）を送り、`timeout`（既定 `3s`）以内に 2xx / 3xx が返れば up、そうでなければ down。down の転送先はラウンドロビンから外し、戻れば入れる。最初の確認までは up として扱う。すべて down なら 503。状態が変わると `event: "http.health"` のログ（`service`、`server`、`up`、down の理由の `error`）。ルールの `stats.http.services.<サービス名>` に `[{"url","up"}]`、`/metrics` に `rproxy_http_server_up{protocol,listen,service,server}`（1 / 0）。
+- `sticky`（v0.3.2）: 初めてのクライアントには、選んだ転送先を示すクッキー（`<cookie>=<URL から作った 16 桁の値>; Path=/; HttpOnly; SameSite=Lax`、HTTPS なら `Secure` も）を付け、以後そのクッキーの転送先へ送る。その転送先が down か、知らない値なら選び直してクッキーを付け直す。値は URL から作るので、rproxy を再起動してもほかの転送先を足しても変わらない。
+- `weight` で転送先を切り替えられる（例：新しい版を `weight: 1`、今の版を `weight: 9` にして 1 割だけ流す）。
 - `pass_host_header`（既定 true）が false なら、`Host` は転送先の URL のホスト（とポート）にする。
 - 転送先へは `X-Forwarded-For`・`X-Real-IP`（クライアントの IP）、`X-Forwarded-Proto`（`http` / `https`）、`X-Forwarded-Host`、`X-Forwarded-Port` を付ける。クライアントが送ってきた同名のヘッダは置き換える。ただし接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` は受けた値の後ろに接続元を足し、`X-Forwarded-Proto` / `-Host` / `-Port` は受けた値を保つ。ホップごとのヘッダ（`Connection` とそこに書かれたもの、`Keep-Alive`、`TE`、`Transfer-Encoding` など）は取り除く。
 - `Connection: Upgrade`（WebSocket など）は、転送先が 101 を返せばそのまま中継する。ルールを削除すると切れる。
@@ -239,6 +242,12 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - `crowdsec`: クライアントの IP（`global.trusted_proxies` を反映）が LAPI の判定にあれば 403。`appsec: true` なら、続けて AppSec にリクエストを問い合わせ、403 が返れば 403（`X-Crowdsec-Appsec-Ip` / `-Uri` / `-Host` / `-Verb` / `-Api-Key` / `-User-Agent` / `-Http-Version` と元のヘッダを送る。本文は `Content-Length` が 1 MiB 以下のときだけ送り、それより大きいか長さのない本文はヘッダだけで問い合わせる）。`on_error`（既定 `allow`）は、LAPI から一度も取得できていないときと AppSec に問い合わせできないとき（時間切れ 3 秒、200 / 403 以外の応答）に通すか 403 にするか。
   - `rate_limit` / `in_flight` の数はルールの `http` を変えると最初からになる。覚えておく送信元は 1 つのミドルウェアで 10 万件まで（超えたら長く使っていない方から半分を忘れる）で、満杯に戻ったバケットは定期的に捨てる。
   - `strip_prefix`: パスが `prefixes` のどれか（先に書いたもの優先）で始まれば取り除き、`X-Forwarded-Prefix` を付ける。`add_prefix`: パスの前に付ける。`replace_path`: パスを置き換え、元のパスを `X-Replaced-Path` に入れる。`replace_path_regex`: 一致したときだけ置き換える（`X-Replaced-Path` も）。クエリは保つ。
+- v0.3.2 で使えるようになったミドルウェア:
+  - `compress`: クライアントの `Accept-Encoding` に合わせて応答を `br`・`zstd`・`gzip` で圧縮する。`encodings`（既定 `[br, zstd, gzip]`）は使う形式と優先順（`q` 値が同じときの順）。`min_size`（既定 1024 バイト）より `Content-Length` が小さい応答、すでに `Content-Encoding` のある応答、画像（SVG を除く）・動画・音声・`font/woff*`・圧縮済みの形式（zip・gzip・zstd・pdf など）・`text/event-stream`・gRPC、`Cache-Control: no-transform`、HEAD・204・206・304 はそのまま。圧縮したら `Content-Length` を外し、`Vary: Accept-Encoding` を足し、強い `ETag` を弱い `W/` にする。本文は流れてきた分ずつ圧縮して送る（長く続く応答も止めない）。
+  - `buffering`: リクエストの本文を先に読み切る。`max_request_body`（バイト）を超えたら 413（`Content-Length` で分かればすぐに、分からなければ読みながら）で、転送先には送らない。読み切った本文は `retry` で送り直せる。
+  - `retry`: 転送先に接続できない・応答がない（502 / 504 になるもの）ときに、次の転送先へ送り直す。`attempts` は最初の 1 回を含む回数、`initial_interval`（既定 `100ms`）は最初の待ち時間で、回ごとに倍になる。送り直すのは冪等なメソッド（GET・HEAD・OPTIONS・PUT・DELETE・TRACE）で、本文がないか、`buffering` で読み切った本文のときだけ（WebSocket などの Upgrade は送り直さない）。転送先が返した 5xx は送り直さない。
+  - `circuit_breaker`: 応答のうち 5xx（502 / 504 を含む）の割合が `window` の中で `failure_percent` 以上になったら（10 件以上あるときに判定）、`recovery` のあいだ転送先へ送らずに 503 を返す。`recovery` を過ぎたら 1 件だけ通し、成功すれば元に戻し、失敗すればまた `recovery` だけ止める。状態は `event: "http.breaker"` のログ。数はルールの `http` を変えると最初からになる。
+  - `errors`: 応答の状態コードが `status`（`"500-599"`・`"404"` のような範囲か値）に入れば、`service` の `path`（`{status}` は状態コードに置き換える）を GET し、その本文とヘッダで返す。状態コードは元のまま。ページを取れなければ元の応答を返す。メンテナンス表示には、`respond` のルートを `priority` を上げて一時的に足すか、`errors` のページを使う。
 - `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec"}`。`crowdsec` は v0.3.2 から）。
@@ -248,7 +257,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec"],"services":[]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":false,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`rules:read` |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
@@ -257,7 +266,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port","udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"crowdsec"?}` | 200 | 転送先を変える。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`source_ip` とポート範囲は変更できない |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
-| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`（上の「v0.3 の設定」） |
+| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`（上の「v0.3 の設定」） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
 

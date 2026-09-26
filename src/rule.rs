@@ -145,9 +145,10 @@ impl Features {
 		tls_options: true,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
-			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec",
+			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "retry",
+			"circuit_breaker", "errors",
 		],
-		services: &[],
+		services: &["health_check", "sticky"],
 	};
 
 	/// Everything the settings can describe; for registering a startup rule

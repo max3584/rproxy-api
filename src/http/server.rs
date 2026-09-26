@@ -8,124 +8,37 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body as _, Incoming};
+use hyper::client::conn::http1::SendRequest;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
-use super::limit::Hold;
+use super::backend::{self, Dialer, ServerHealth, Service};
+use super::compress;
 use super::crowdsec::Verdict;
+use super::limit::Hold;
 use super::middleware::{self, Blocked, Ctx, Limited, Middleware};
-use super::{parse_duration, HttpSpec, Matcher, ServiceSpec};
+use super::resilience::{self, RetryPolicy, Ticket};
+use super::{HttpSpec, Matcher};
 use crate::error::ApiError;
 use crate::http::matcher::RequestInfo;
 use crate::proxy::Runtime;
-use crate::resolve::{self, Lookup};
+use crate::resolve::Lookup;
 use crate::source::TlsInfo;
 use crate::tlsconf::Upstream;
 
 pub type Body = BoxBody<Bytes, hyper::Error>;
-
-const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
-const DEFAULT_RESPONSE: Duration = Duration::from_secs(60);
-
-/// One backend of a service.
-#[derive(Debug)]
-struct Server {
-	https: bool,
-	host: String,
-	port: u16,
-	/// `host[:port]` as written, for the Host header when `pass_host_header` is false.
-	authority: String,
-	/// Path of the URL without the trailing slash; prepended to request paths.
-	prefix: String,
-	weight: u64,
-}
-
-impl Server {
-	fn parse(url: &str, weight: u32) -> Result<Server, ApiError> {
-		let uri: Uri = url.parse().map_err(|e| ApiError::invalid(format!("{url:?}: {e}")))?;
-		let https = uri.scheme_str() == Some("https");
-		let authority = uri.authority().ok_or_else(|| ApiError::invalid(format!("{url:?} has no host")))?;
-		let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
-		Ok(Server {
-			https,
-			port: authority.port_u16().unwrap_or(if https { 443 } else { 80 }),
-			host,
-			authority: authority.as_str().to_string(),
-			prefix: uri.path().trim_end_matches('/').to_string(),
-			weight: u64::from(weight.max(1)),
-		})
-	}
-}
-
-/// A service: weighted round robin over its servers.
-#[derive(Debug)]
-struct Service {
-	name: String,
-	servers: Vec<Server>,
-	total_weight: u64,
-	next: AtomicU64,
-	pass_host: bool,
-	connect: Duration,
-	response: Duration,
-}
-
-impl Service {
-	fn compile(name: &str, spec: &ServiceSpec) -> Result<Service, ApiError> {
-		let servers = spec
-			.servers
-			.iter()
-			.map(|s| Server::parse(&s.url, s.weight.unwrap_or(1)))
-			.collect::<Result<Vec<_>, _>>()?;
-		let duration = |d: Option<&String>, default| match d {
-			Some(d) => parse_duration(d).map_err(ApiError::invalid),
-			None => Ok(default),
-		};
-		let timeouts = spec.timeouts.as_ref();
-		Ok(Service {
-			name: name.to_string(),
-			total_weight: servers.iter().map(|s| s.weight).sum(),
-			servers,
-			next: AtomicU64::new(0),
-			pass_host: spec.pass_host_header.unwrap_or(true),
-			connect: duration(timeouts.and_then(|t| t.connect.as_ref()), DEFAULT_CONNECT)?,
-			response: duration(timeouts.and_then(|t| t.response.as_ref()), DEFAULT_RESPONSE)?,
-		})
-	}
-
-	fn single(url: &str) -> Result<Service, ApiError> {
-		let spec = ServiceSpec {
-			servers: vec![super::ServerSpec { url: url.to_string(), weight: None }],
-			health_check: None,
-			sticky: None,
-			pass_host_header: None,
-			timeouts: None,
-		};
-		Service::compile(url, &spec)
-	}
-
-	fn pick(&self) -> &Server {
-		let mut n = self.next.fetch_add(1, Ordering::Relaxed) % self.total_weight;
-		for s in &self.servers {
-			if n < s.weight {
-				return s;
-			}
-			n -= s.weight;
-		}
-		&self.servers[0]
-	}
-}
 
 #[derive(Debug)]
 struct Route {
@@ -141,10 +54,17 @@ pub struct Router {
 	routes: Vec<Route>,
 	default_status: StatusCode,
 	default_service: Option<Arc<Service>>,
-	lookup: Lookup,
-	/// For https:// backends: `tls.upstream` of the rule, or the Mozilla roots.
-	backend_tls: tokio_rustls::TlsConnector,
-	backend_server_name: Option<String>,
+	/// Every service, for health reports.
+	services: Vec<Arc<Service>>,
+	dialer: Dialer,
+	/// Stops the health checks when this version of the settings is dropped.
+	health_stop: CancellationToken,
+}
+
+impl Drop for Router {
+	fn drop(&mut self) {
+		self.health_stop.cancel();
+	}
 }
 
 impl std::fmt::Debug for Router {
@@ -161,7 +81,7 @@ impl Router {
 		}
 		let mut middlewares = std::collections::HashMap::new();
 		for (name, m) in &spec.middlewares {
-			middlewares.insert(name.clone(), Arc::new(Middleware::compile(name, m)?));
+			middlewares.insert(name.clone(), Arc::new(Middleware::errors(name, m, &services)?));
 		}
 		let mut routes = vec![];
 		for (i, r) in spec.routes.iter().enumerate() {
@@ -190,14 +110,25 @@ impl Router {
 			.map_err(|e| ApiError::invalid(format!("default: {e}")))?;
 		let mut config: ClientConfig = (*crate::tlsconf::client_config(upstream)?).clone();
 		config.alpn_protocols = vec![b"http/1.1".to_vec()];
-		Ok(Router {
-			routes: routes.into_iter().map(|(_, _, r)| r).collect(),
-			default_status,
-			default_service,
+		let dialer = Dialer {
 			lookup,
-			backend_tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
-			backend_server_name: upstream.server_name.clone(),
-		})
+			tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+			server_name: upstream.server_name.clone(),
+		};
+		let routes: Vec<Route> = routes.into_iter().map(|(_, _, r)| r).collect();
+		// services named in settings, plus the single ones of `to`
+		let mut all: Vec<Arc<Service>> = services.into_values().collect();
+		all.sort_by(|a, b| a.name.cmp(&b.name));
+		let health_stop = CancellationToken::new();
+		for s in &all {
+			backend::start_health_checks(s.clone(), dialer.clone(), health_stop.clone());
+		}
+		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop })
+	}
+
+	/// Health of the servers of services with `health_check`.
+	pub fn health(&self) -> std::collections::BTreeMap<String, Vec<ServerHealth>> {
+		backend::health_view(self.services.iter())
 	}
 
 	fn route(&self, info: &RequestInfo) -> Option<&Route> {
@@ -353,12 +284,18 @@ fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 	}
 }
 
-trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
-
 enum Failure {
 	/// Could not connect (502) or timed out (504).
 	Status(StatusCode, String),
+}
+
+/// What the response side of the chain needs to know about the request.
+struct Sent {
+	accept_encoding: String,
+	head: bool,
+	host: HeaderValue,
+	/// Admissions through circuit breakers, by position in the chain.
+	tickets: Vec<(usize, Ticket)>,
 }
 
 impl Conn {
@@ -411,17 +348,52 @@ impl Conn {
 			origin: req.headers().get(header::ORIGIN).cloned(),
 			holds: Default::default(),
 		};
+		let mut sent = Sent {
+			accept_encoding: header_text(header::ACCEPT_ENCODING),
+			head: req.method() == hyper::Method::HEAD,
+			host: req
+				.headers()
+				.get(header::HOST)
+				.cloned()
+				.unwrap_or_else(|| HeaderValue::from_str(&host).unwrap_or(HeaderValue::from_static("localhost"))),
+			tickets: vec![],
+		};
 		// request side in the route's order, until one answers
 		let (mut parts, body) = req.into_parts();
 		let mut body: Body = body.boxed();
 		let mut ran = 0;
 		let mut answer = None;
-		for m in chain {
+		let mut replay: Option<Bytes> = None;
+		let mut retry: Option<RetryPolicy> = None;
+		for (i, m) in chain.iter().enumerate() {
 			ran += 1;
 			let resp = match m.as_ref() {
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
 					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
+				Middleware::Buffering { max } => {
+					let taken = std::mem::replace(&mut body, empty_body());
+					match resilience::buffer(&parts.headers, taken, *max).await {
+						Ok(bytes) => {
+							body = full_body(bytes.clone());
+							replay = Some(bytes);
+							None
+						}
+						Err(true) => Some(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
+						Err(false) => Some(error_response(StatusCode::BAD_REQUEST)),
+					}
+				}
+				Middleware::Retry(policy) => {
+					retry = Some(*policy);
+					None
+				}
+				Middleware::CircuitBreaker(breaker) => match breaker.admit() {
+					Some(ticket) => {
+						sent.tickets.push((i, ticket));
+						None
+					}
+					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+				},
 				m => m.on_request(&mut parts, &ctx),
 			};
 			if let Some(resp) = resp {
@@ -441,20 +413,89 @@ impl Conn {
 			(Some(resp), _) => resp,
 			(None, Some(service)) => {
 				entry.service = service.name.clone();
-				self.forward(&router, &service, route_name, req, &host, client_ip, &mut entry.backend, &mut holds).await
+				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip };
+				self.forward(target, req, replay, retry, &mut entry.backend, &mut holds).await
 			}
 			(None, None) if route_name.is_empty() => error_response(router.default_status),
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
 		};
 		// response side in reverse, also for answers of the middlewares
-		for m in chain[..ran].iter().rev() {
-			m.on_response(resp.headers_mut(), &ctx);
+		for (i, m) in chain[..ran].iter().enumerate().rev() {
+			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
 		entry.status = resp.status().as_u16();
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
 		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started, _holds: holds }.boxed())
+	}
+
+	/// The response side of one middleware.
+	async fn on_response(
+		&self,
+		router: &Router,
+		m: &Middleware,
+		i: usize,
+		mut resp: Response<Body>,
+		ctx: &Ctx,
+		sent: &mut Sent,
+	) -> Response<Body> {
+		match m {
+			Middleware::CircuitBreaker(_) => {
+				if let Some(pos) = sent.tickets.iter().position(|(at, _)| *at == i) {
+					let (_, ticket) = sent.tickets.swap_remove(pos);
+					ticket.record(resp.status().is_server_error());
+				}
+				resp
+			}
+			Middleware::Errors { ranges, service, path } => {
+				let status = resp.status().as_u16();
+				if resp.status() == StatusCode::SWITCHING_PROTOCOLS || !ranges.iter().any(|(a, b)| (*a..=*b).contains(&status)) {
+					return resp;
+				}
+				match self.error_page(router, service, &path.replace("{status}", &status.to_string()), &sent.host).await {
+					Some(page) => {
+						let (mut parts, body) = page.into_parts();
+						parts.status = resp.status();
+						Response::from_parts(parts, body)
+					}
+					None => resp,
+				}
+			}
+			Middleware::Compress { encodings, min_size } => {
+				if !compress::compressible(resp.status(), resp.headers(), *min_size, sent.head) {
+					return resp;
+				}
+				match compress::negotiate(&sent.accept_encoding, encodings) {
+					Some(e) => compress::compress(resp, e),
+					None => resp,
+				}
+			}
+			m => {
+				m.on_response(resp.headers_mut(), ctx);
+				resp
+			}
+		}
+	}
+
+	/// The page of an `errors` middleware; None keeps the original response.
+	async fn error_page(&self, router: &Router, service: &Arc<Service>, path: &str, host: &HeaderValue) -> Option<Response<Body>> {
+		let index = service.pick(None)?;
+		let server = &service.servers[index];
+		let host = if service.pass_host { host.clone() } else { HeaderValue::from_str(&server.authority).ok()? };
+		let req = Request::get(format!("{}{path}", server.prefix)).header(header::HOST, host).body(empty_body()).ok()?;
+		match self.send(router, service, index, req).await {
+			Ok(resp) => {
+				let mut resp = resp;
+				strip_hop_by_hop(resp.headers_mut());
+				Some(resp)
+			}
+			Err(Failure::Status(_, error)) => {
+				warn!(event = "http.error", rule = %self.rt.key, service = %service.name, backend = %server.addr(), error = %error,
+					"error page not available; the original response is sent");
+				None
+			}
+		}
 	}
 
 	/// The `crowdsec` middleware: the LAPI's decisions, then AppSec. `Some` refuses the request.
@@ -494,30 +535,30 @@ impl Conn {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
+	/// Sends the request to a server of the service: again on another server
+	/// (as `retry` allows) when a backend cannot be reached or does not answer.
 	async fn forward(
 		&self,
-		router: &Router,
-		service: &Service,
-		route: &str,
+		target: Target<'_>,
 		mut req: Request<Body>,
-		host: &str,
-		client_ip: IpAddr,
+		replay: Option<Bytes>,
+		retry: Option<RetryPolicy>,
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
-		let server = service.pick();
-		*backend = format!("{}:{}", server.host, server.port);
-		let path_and_query = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
-		let uri: Uri = match format!("{}{}", server.prefix, path_and_query).parse() {
-			Ok(u) => u,
-			Err(_) => return error_response(StatusCode::BAD_REQUEST),
-		};
+		let Target { router, service, route, host, client_ip } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
 		let original_host = req.headers().get(header::HOST).cloned().or_else(|| {
 			req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok())
 		});
+		let sticky = service.sticky_value(req.headers());
+		// a body can be sent again when it was buffered or there is none
+		let replayable = replay.is_some() || req.body().is_end_stream();
+		let attempts = match retry {
+			Some(p) if upgrade.is_none() && replayable && resilience::idempotent(req.method()) => p.attempts,
+			_ => 1,
+		};
 
 		let (mut parts, body) = req.into_parts();
 		strip_hop_by_hop(&mut parts.headers);
@@ -525,11 +566,6 @@ impl Conn {
 			parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
 			parts.headers.insert(header::UPGRADE, u.clone());
 		}
-		let host_value = match (&original_host, service.pass_host) {
-			(Some(h), true) => h.clone(),
-			_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
-		};
-		parts.headers.insert(header::HOST, host_value);
 		// X-Forwarded-* from the client are believed only from trusted proxies (global.trusted_proxies):
 		// then the chain is extended and their Proto / Host / Port are kept
 		let peer = canonical(self.client.ip());
@@ -562,26 +598,68 @@ impl Conn {
 		} else if !host.is_empty() {
 			set(&mut parts.headers, "x-forwarded-host", host);
 		}
-		parts.uri = uri;
-		parts.version = Version::HTTP_11;
-		let req = Request::from_parts(parts, body);
+		let path_and_query = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+		let method = parts.method.clone();
+		let headers = parts.headers.clone();
+		let mut first = Some((parts, body));
 
-		let result = async {
-			let mut sender = self.connect(router, service, server).await?;
-			tokio::time::timeout(service.response, sender.send_request(req))
-				.await
-				.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))?
-				.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))
-		}
-		.await;
-		let mut resp = match result {
-			Ok(resp) => resp,
-			Err(Failure::Status(status, error)) => {
-				warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name,
-					backend = %format!("{}:{}", server.host, server.port), status = status.as_u16(), error = %error);
-				return error_response(status);
+		let mut attempt = 0;
+		let (mut resp, index) = loop {
+			attempt += 1;
+			let Some(index) = service.pick(sticky.as_deref()) else {
+				warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, status = 503, error = "no server is up");
+				return error_response(StatusCode::SERVICE_UNAVAILABLE);
+			};
+			let server = &service.servers[index];
+			*backend = server.addr();
+			let uri: Uri = match format!("{}{}", server.prefix, path_and_query).parse() {
+				Ok(u) => u,
+				Err(_) => return error_response(StatusCode::BAD_REQUEST),
+			};
+			let host_value = match (&original_host, service.pass_host) {
+				(Some(h), true) => h.clone(),
+				_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
+			};
+			let req = match first.take() {
+				Some((mut parts, body)) => {
+					parts.uri = uri;
+					parts.version = Version::HTTP_11;
+					parts.headers.insert(header::HOST, host_value);
+					let body = match &replay {
+						Some(bytes) => full_body(bytes.clone()),
+						None => body,
+					};
+					Request::from_parts(parts, body)
+				}
+				None => {
+					let mut req = Request::new(replay.clone().map(full_body).unwrap_or_else(empty_body));
+					*req.method_mut() = method.clone();
+					*req.uri_mut() = uri;
+					*req.headers_mut() = headers.clone();
+					req.headers_mut().insert(header::HOST, host_value);
+					req
+				}
+			};
+			match self.send(router, service, index, req).await {
+				Ok(resp) => break (resp, index),
+				Err(Failure::Status(status, error)) => {
+					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
+						status = status.as_u16(), error = %error, attempt, attempts);
+					if attempt >= attempts {
+						return error_response(status);
+					}
+					if let Some(p) = retry {
+						tokio::time::sleep(p.wait(attempt + 1)).await;
+					}
+				}
 			}
 		};
+		let server = &service.servers[index];
+		if sticky.as_deref() != Some(server.id.as_str()) {
+			if let Some(cookie) = service.sticky_cookie(server, self.https) {
+				resp.headers_mut().append(header::SET_COOKIE, cookie);
+			}
+		}
 
 		if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
 			if let Some(client_upgrade) = client_upgrade {
@@ -601,64 +679,107 @@ impl Conn {
 						_ = relay => {}
 					}
 				});
-				return resp.map(|b| b.boxed());
+				return resp;
 			}
 		}
 		strip_hop_by_hop(resp.headers_mut());
-		resp.map(|b| b.boxed())
+		resp
 	}
 
-	async fn connect(
-		&self,
-		router: &Router,
-		service: &Service,
-		server: &Server,
-	) -> Result<hyper::client::conn::http1::SendRequest<Body>, Failure> {
-		let bad = |e: String| Failure::Status(StatusCode::BAD_GATEWAY, e);
-		let connecting = async {
-			let addrs = match server.host.parse::<IpAddr>() {
-				Ok(ip) => vec![SocketAddr::new(ip, server.port)],
-				Err(_) => resolve::resolve(&router.lookup, &format!("{}:{}", server.host, server.port))
-					.await
-					.map_err(|e| bad(e.message))?,
-			};
-			let mut last = String::from("no addresses");
-			let mut tcp = None;
-			for addr in addrs {
-				match crate::source::connect_tcp(addr, self.rt.bind_as(self.client)).await {
-					Ok(s) => {
-						tcp = Some(s);
-						break;
-					}
-					Err(e) => last = format!("{addr}: {e}"),
-				}
+	/// One request to one server, on a kept connection when there is one. The
+	/// connection goes back to the server's pool once the response body has been read.
+	async fn send(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>) -> Result<Response<Body>, Failure> {
+		let server = &service.servers[index];
+		// connections from the client's address (transparent) are not shared
+		let pooled = self.rt.bind_as(self.client).is_none();
+		let keep = pooled && !req.headers().contains_key(header::UPGRADE);
+		let mut req = req;
+		if let Some(mut sender) = pooled.then(|| server.checkout()).flatten() {
+			match tokio::time::timeout(service.response, sender.try_send_request(req)).await {
+				Err(_) => return Err(Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into())),
+				Ok(Ok(resp)) => return Ok(self.returning(resp, sender, service, index, keep)),
+				// the kept connection closed before the request went out: use a new one
+				Ok(Err(mut e)) => match e.take_message() {
+					Some(r) => req = r,
+					None => return Err(Failure::Status(StatusCode::BAD_GATEWAY, e.into_error().to_string())),
+				},
 			}
-			let tcp = tcp.ok_or_else(|| bad(last))?;
-			let _ = tcp.set_nodelay(true);
-			let stream: Box<dyn Stream> = if server.https {
-				let name = router.backend_server_name.clone().unwrap_or_else(|| server.host.clone());
-				let name = ServerName::try_from(name).map_err(|e| bad(e.to_string()))?;
-				Box::new(router.backend_tls.connect(name, tcp).await.map_err(|e| bad(format!("TLS: {e}")))?)
-			} else {
-				Box::new(tcp)
-			};
-			Ok(stream)
-		};
-		let stream = tokio::time::timeout(service.connect, connecting)
+		}
+		let mut sender = self.connect(router, service, index).await?;
+		let resp = tokio::time::timeout(service.response, sender.send_request(req))
 			.await
-			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "connect timed out".into()))??;
-		let (sender, conn) = hyper::client::conn::http1::Builder::new()
-			.handshake::<_, Body>(TokioIo::new(stream))
+			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))?
+			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
+		Ok(self.returning(resp, sender, service, index, keep))
+	}
+
+	fn returning(&self, resp: Response<Incoming>, sender: SendRequest<Body>, service: &Arc<Service>, index: usize, keep: bool) -> Response<Body> {
+		if !keep || resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+			return resp.map(|b| b.boxed());
+		}
+		let service = service.clone();
+		resp.map(|inner| Pooled { inner, back: Some((sender, service, index)) }.boxed())
+	}
+
+	async fn connect(&self, router: &Router, service: &Service, index: usize) -> Result<SendRequest<Body>, Failure> {
+		let server = &service.servers[index];
+		let stream = tokio::time::timeout(service.connect, router.dialer.dial(server, self.rt.bind_as(self.client)))
 			.await
-			.map_err(|e| bad(e.to_string()))?;
-		let kill = self.rt.kill.clone();
-		self.rt.tracker.spawn(async move {
-			tokio::select! {
-				_ = kill.cancelled() => {}
-				_ = conn.with_upgrades() => {}
+			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "connect timed out".into()))?
+			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e))?;
+		let tracker = self.rt.tracker.clone();
+		backend::handshake(stream, self.rt.kill.clone(), move |f| {
+			tracker.spawn(f);
+		})
+		.await
+		.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))
+	}
+}
+
+/// Where `forward` sends a request.
+struct Target<'a> {
+	router: &'a Router,
+	service: &'a Arc<Service>,
+	route: &'a str,
+	host: &'a str,
+	client_ip: IpAddr,
+}
+
+fn empty_body() -> Body {
+	http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+}
+
+fn full_body(bytes: Bytes) -> Body {
+	Full::new(bytes).map_err(|never| match never {}).boxed()
+}
+
+/// A backend's response body; its connection is kept for the next request once
+/// the body has been read to the end.
+struct Pooled {
+	inner: Incoming,
+	back: Option<(SendRequest<Body>, Arc<Service>, usize)>,
+}
+
+impl hyper::body::Body for Pooled {
+	type Data = Bytes;
+	type Error = hyper::Error;
+
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+		let poll = Pin::new(&mut self.inner).poll_frame(cx);
+		if matches!(poll, Poll::Ready(None)) || self.inner.is_end_stream() {
+			if let Some((sender, service, index)) = self.back.take() {
+				service.servers[index].checkin(sender);
 			}
-		});
-		Ok(sender)
+		}
+		poll
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
 	}
 }
 
@@ -725,7 +846,7 @@ mod tests {
 	fn router(yaml: &str) -> Router {
 		let spec: HttpSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
 		spec.validate().unwrap();
-		Router::compile(&spec, &Upstream::default(), resolve::system_lookup()).unwrap()
+		Router::compile(&spec, &Upstream::default(), crate::resolve::system_lookup()).unwrap()
 	}
 
 	fn route<'a>(r: &'a Router, host: &str, path: &str) -> &'a str {
@@ -745,14 +866,12 @@ mod tests {
 	}
 
 	#[test]
-	fn weighted_round_robin() {
-		let r = router("routes: []\nservices:\n  s: {servers: [{url: 'http://10.0.0.1', weight: 3}, {url: 'https://b.example:8443/base/', weight: 1}]}\ndefault: {service: s}\n");
-		let s = r.default_service.as_ref().unwrap();
-		let picks: Vec<&str> = (0..8).map(|_| s.pick().host.as_str()).collect();
-		assert_eq!(picks.iter().filter(|h| **h == "10.0.0.1").count(), 6);
-		let b = &s.servers[1];
-		assert_eq!((b.https, b.port, b.prefix.as_str(), b.authority.as_str()), (true, 8443, "/base", "b.example:8443"));
-		assert_eq!((s.servers[0].port, s.servers[0].prefix.as_str()), (80, ""));
+	fn default_service_and_health_report() {
+		let r = router("routes: []\nservices:\n  s: {servers: [{url: 'http://10.0.0.1'}], health_check: {path: /health}}\n  t: {servers: [{url: 'http://10.0.0.2'}]}\ndefault: {service: s}\n");
+		assert_eq!(r.default_service.as_ref().unwrap().name, "s");
+		let health = r.health();
+		assert_eq!(health.keys().collect::<Vec<_>>(), ["s"], "only services with health_check");
+		assert_eq!(health["s"], [ServerHealth { url: "http://10.0.0.1".into(), up: true }], "up until a check fails");
 	}
 
 	#[test]
