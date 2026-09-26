@@ -47,7 +47,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 |---|---|---|
 | `/etc/rproxy/` | `root:rproxy` 750 | 設定の置き場所。rproxy ユーザーは読むだけ |
 | `/etc/rproxy/rproxy.env` | `root:root` 640 | 設定。DB のパスワードを含みうる。systemd（root）が読んで環境変数として渡すので、rproxy ユーザーが読める必要はない |
-| `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ）。変えたら `systemctl reload rproxy-api` |
+| `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ、またはスコープ付きの YAML）。変えたら `systemctl reload rproxy-api` |
 | 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
@@ -56,7 +56,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 ## 制御 API
 
 - 既定の待ち受けは `127.0.0.1`。loopback 以外で待ち受けるには、トークンファイルと TLS 証明書の両方が必須（どちらかがなければ起動しない）。
-- トークンは今のところ全権限（ルールの作成・変更・削除、一覧）。権限を分けたトークンは #30 で検討している。
+- 1 行に 1 つ書いたトークンは全権限。YAML の書き方では、トークンごとにスコープ（`rules:read` / `rules:write` / `metrics:read` / `admin`）・変更できる待ち受けポート・有効期限を決められ、ファイルには SHA-256 だけを置く（docs/API.md）。変更は `event: "audit"` のログに残る。
 - 複数のトークンを同時に有効にできるので、新しいトークンを足して reload し、UI を切り替えてから古いトークンを消せば止めずに入れ替えられる。
 
 ## DB（MariaDB）

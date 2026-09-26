@@ -30,7 +30,7 @@ struct Options {
 	/// Port for the control API
 	#[arg(long, env = "RPROXY_API_PORT", default_value_t = 8080)]
 	api_port: u16,
-	/// File of bearer tokens, one per line; re-read on SIGHUP
+	/// File of bearer tokens (one per line, or YAML with scopes); re-read on SIGHUP
 	#[arg(long, env = "RPROXY_TOKEN_FILE")]
 	token_file: Option<PathBuf>,
 	/// TLS certificate chain (PEM) for the control API; re-read on SIGHUP

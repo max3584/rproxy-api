@@ -117,6 +117,61 @@ async fn bearer_token_is_required_when_configured() {
 }
 
 #[tokio::test]
+async fn token_scopes_and_ports_are_enforced() {
+	use sha2::{Digest, Sha256};
+	let hex = |t: &str| Sha256::digest(t.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+	let dir = std::env::temp_dir().join(format!("rproxy-it-scopes-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let file = dir.join("tokens.yaml");
+	let (mine, other) = (free_port(), free_port());
+	std::fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: reader, sha256: {}, scopes: [rules:read]}}\n  - {{name: deploy, sha256: {}, scopes: [rules:write], allow_listen_ports: '{mine}'}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+			hex("r"),
+			hex("d"),
+			hex("a")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(file).unwrap()).await;
+	let backend = tcp_backend("S:").await;
+	let call = |method: reqwest::Method, path: &str, token: &str, body: Option<serde_json::Value>| {
+		let mut r = h.http.request(method, format!("{}{path}", h.base)).bearer_auth(token);
+		if let Some(b) = body {
+			r = r.json(&b);
+		}
+		async move {
+			let r = r.send().await.unwrap();
+			let status = r.status();
+			(status, r.json::<serde_json::Value>().await.unwrap_or_default())
+		}
+	};
+	use reqwest::Method as M;
+
+	assert_eq!(call(M::GET, "/rules", "r", None).await.0, StatusCode::OK);
+	assert_eq!(call(M::GET, "/capabilities", "d", None).await.0, StatusCode::OK, "any token reads capabilities");
+	let (status, v) = call(M::POST, "/rules", "r", Some(rule("tcp", mine, backend))).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("rules:write"), "{v}");
+	assert_eq!(call(M::GET, "/metrics", "r", None).await.0, StatusCode::FORBIDDEN);
+	assert_eq!(call(M::GET, "/rules", "d", None).await.0, StatusCode::FORBIDDEN, "write does not include read");
+
+	let (status, v) = call(M::POST, "/rules", "d", Some(rule("tcp", other, backend))).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "outside allow_listen_ports: {v}");
+	let (status, v) = call(M::POST, "/rules", "d", Some(rule("tcp", mine, backend))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let (status, _) = call(M::POST, "/rules", "a", Some(rule("tcp", other, backend))).await;
+	assert_eq!(status, StatusCode::CREATED);
+	let (status, _) = call(M::DELETE, &format!("/rules/tcp/127.0.0.1/{other}"), "d", None).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "cannot delete another port's rule");
+	let (status, _) = call(M::DELETE, &format!("/rules/tcp/127.0.0.1/{mine}"), "d", None).await;
+	assert_eq!(status, StatusCode::NO_CONTENT);
+	assert_eq!(call(M::GET, "/metrics", "a", None).await.0, StatusCode::OK);
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn udp_sessions_follow_updates_and_port_is_reusable() {
 	let h = harness().await;
 	let (a, b) = (udp_backend("A:").await, udp_backend("B:").await);

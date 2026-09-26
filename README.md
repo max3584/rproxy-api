@@ -53,7 +53,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 |---|---|---|---|
 | `RPROXY_API_ADDR` | `--api-addr` | `127.0.0.1` | 制御 API の待ち受けアドレス。カンマ区切りで複数指定できる |
 | `RPROXY_API_PORT` | `--api-port` | `8080` | 制御 API のポート |
-| `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン）。指定すると認証が必須になる。SIGHUP で読み直す |
+| `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP で読み直す |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
@@ -195,6 +195,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `event` | 内容 |
 |---|---|
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止 |
+| `audit` | 制御 API での変更（トークンの名前、操作、ルール、結果）と、権限不足で断ったリクエスト |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason` |
 | `conn.retarget` | UDP セッションの転送先の切り替え |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
