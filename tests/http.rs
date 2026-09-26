@@ -590,3 +590,80 @@ async fn requests_are_counted_by_route_and_status() {
 	assert!(text.contains(&format!("rproxy_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} 3")), "{text}");
 	assert!(text.contains("# TYPE rproxy_http_request_duration_seconds histogram"), "{text}");
 }
+
+#[tokio::test]
+async fn rate_limits_and_in_flight() {
+	let h = harness().await;
+	let a = echo_backend("A").await;
+	let port = free_port();
+	let rule = http_rule(
+		port,
+		json!({
+			"routes": [
+				{"name": "login", "match": "Path(`/login`)", "to": url(a), "middlewares": ["per-ip"]},
+				{"name": "api", "match": "PathPrefix(`/api/`)", "to": url(a), "middlewares": ["per-key"]},
+				{"name": "slow", "match": "Path(`/slow`)", "to": url(a), "middlewares": ["one-at-a-time"]},
+			],
+			"middlewares": {
+				"per-ip": {"rate_limit": {"average": 1, "period": "1m", "burst": 2}},
+				"per-key": {"rate_limit": {"average": 1, "period": "1m", "source": "header:X-Api-Key"}},
+				"one-at-a-time": {"in_flight": {"amount": 1}},
+			},
+		}),
+	);
+	let (status, v) = h.post(rule).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	// the burst, then 429 with Retry-After (a token every 60 s)
+	for _ in 0..2 {
+		assert_eq!(get(port, "a.test", "/login").await.0, StatusCode::OK);
+	}
+	let r = raw(port, reqwest::Method::GET, "a.test", "/login", &[]).await;
+	assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+	let retry: u64 = r.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+	assert!((1..=60).contains(&retry), "{retry}");
+
+	// each key has its own bucket (no burst: one request)
+	for key in ["k1", "k2"] {
+		assert_eq!(raw(port, reqwest::Method::GET, "a.test", "/api/x", &[("X-Api-Key", key)]).await.status(), StatusCode::OK);
+	}
+	let r = raw(port, reqwest::Method::GET, "a.test", "/api/x", &[("X-Api-Key", "k1")]).await;
+	assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+	// in_flight: a second request while the first (2 s) runs is refused; the place comes back after
+	let first = tokio::spawn(async move { get(port, "a.test", "/slow").await.0 });
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(get(port, "a.test", "/slow").await.0, StatusCode::TOO_MANY_REQUESTS);
+	assert_eq!(first.await.unwrap(), StatusCode::OK);
+	let mut again = StatusCode::TOO_MANY_REQUESTS;
+	for _ in 0..50 {
+		again = get(port, "a.test", "/slow").await.0;
+		if again == StatusCode::OK {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	assert_eq!(again, StatusCode::OK, "the place is freed when the response has been sent");
+
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	let stats = &v["stats"]["http"];
+	assert_eq!(stats["limited"], 3, "{stats}");
+	assert_eq!(stats["routes"]["login"]["limited"], json!({"per-ip": 1}), "{stats}");
+	assert_eq!(stats["routes"]["slow"]["limited"], json!({"one-at-a-time": 1}), "{stats}");
+	let text = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	let labels = format!("protocol=\"tcp\",listen=\"127.0.0.1:{port}\",route=\"api\",middleware=\"per-key\"");
+	assert!(text.contains(&format!("rproxy_http_limited_total{{{labels}}} 1")), "{text}");
+
+	// bad settings are refused when the rule is written
+	let mut bad = http_rule(
+		free_port(),
+		json!({
+			"routes": [{"name": "x", "match": "PathPrefix(`/`)", "to": url(a), "middlewares": ["l"]}],
+			"middlewares": {"l": {"rate_limit": {"average": 1, "source": "header:bad name"}}},
+		}),
+	);
+	let (status, v) = h.post(bad.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	bad["http"]["middlewares"]["l"] = json!({"in_flight": {"amount": 0}});
+	assert_eq!(h.post(bad).await.0, StatusCode::BAD_REQUEST);
+}

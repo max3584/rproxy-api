@@ -23,7 +23,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
-use super::middleware::{Ctx, Middleware};
+use super::limit::Hold;
+use super::middleware::{Ctx, Limited, Middleware};
 use super::{parse_duration, HttpSpec, Matcher, ServiceSpec};
 use crate::error::ApiError;
 use crate::http::matcher::RequestInfo;
@@ -407,6 +408,7 @@ impl Conn {
 			https: self.https,
 			host: host.clone(),
 			origin: req.headers().get(header::ORIGIN).cloned(),
+			holds: Default::default(),
 		};
 		// request side in the route's order, until one answers
 		let (mut parts, body) = req.into_parts();
@@ -420,11 +422,15 @@ impl Conn {
 			}
 		}
 		let req = Request::from_parts(parts, body);
+		if let Some(limited) = answer.as_ref().and_then(|r| r.extensions().get::<Limited>()) {
+			self.rt.http_stats.limited(route_name, &limited.0);
+		}
+		let mut holds = std::mem::take(&mut *ctx.holds.lock().unwrap());
 		let mut resp = match (answer, service) {
 			(Some(resp), _) => resp,
 			(None, Some(service)) => {
 				entry.service = service.name.clone();
-				self.forward(&router, &service, route_name, req, &host, client_ip, &mut entry.backend).await
+				self.forward(&router, &service, route_name, req, &host, client_ip, &mut entry.backend, &mut holds).await
 			}
 			(None, None) if route_name.is_empty() => error_response(router.default_status),
 			// validation makes such a route end in an answering middleware
@@ -437,7 +443,7 @@ impl Conn {
 		entry.status = resp.status().as_u16();
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
-		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started }.boxed())
+		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started, _holds: holds }.boxed())
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -450,6 +456,7 @@ impl Conn {
 		host: &str,
 		client_ip: IpAddr,
 		backend: &mut String,
+		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
 		let server = service.pick();
 		*backend = format!("{}:{}", server.host, server.port);
@@ -532,7 +539,10 @@ impl Conn {
 			if let Some(client_upgrade) = client_upgrade {
 				let backend_upgrade = hyper::upgrade::on(&mut resp);
 				let rt = self.rt.clone();
+				// an upgraded connection keeps its in_flight places until it ends
+				let holds = std::mem::take(holds);
 				self.rt.tracker.spawn(async move {
+					let _holds = holds;
 					let relay = async {
 						let (client, backend) = tokio::try_join!(client_upgrade, backend_upgrade).ok()?;
 						let (mut client, mut backend) = (TokioIo::new(client), TokioIo::new(backend));
@@ -612,6 +622,8 @@ struct Logged {
 	entry: AccessEntry,
 	rt: Arc<Runtime>,
 	started: Instant,
+	/// `in_flight` places, freed with the response.
+	_holds: Vec<Hold>,
 }
 
 impl hyper::body::Body for Logged {

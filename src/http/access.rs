@@ -203,6 +203,8 @@ impl RouteCounters {
 #[derive(Default)]
 pub struct HttpStats {
 	routes: Mutex<BTreeMap<String, RouteCounters>>,
+	/// Requests refused by `rate_limit` / `in_flight`, by (route, middleware).
+	limited: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl HttpStats {
@@ -218,6 +220,15 @@ impl HttpStats {
 	pub fn snapshot(&self) -> BTreeMap<String, RouteCounters> {
 		self.routes.lock().unwrap().clone()
 	}
+
+	pub fn limited(&self, route: &str, middleware: &str) {
+		let route = if route.is_empty() { NO_ROUTE } else { route };
+		*self.limited.lock().unwrap().entry((route.to_string(), middleware.to_string())).or_default() += 1;
+	}
+
+	pub fn limited_snapshot(&self) -> BTreeMap<(String, String), u64> {
+		self.limited.lock().unwrap().clone()
+	}
 }
 
 /// `stats.http` of a rule in the API.
@@ -225,6 +236,9 @@ impl HttpStats {
 pub struct HttpStatsView {
 	pub requests: u64,
 	pub by_status: BTreeMap<&'static str, u64>,
+	/// Refused by `rate_limit` / `in_flight` (also counted in `by_status` as 4xx).
+	#[serde(skip_serializing_if = "is_zero")]
+	pub limited: u64,
 	pub routes: BTreeMap<String, RouteStatsView>,
 }
 
@@ -232,6 +246,13 @@ pub struct HttpStatsView {
 pub struct RouteStatsView {
 	pub requests: u64,
 	pub by_status: BTreeMap<&'static str, u64>,
+	/// Refused by each limit middleware of the route.
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub limited: BTreeMap<String, u64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+	*n == 0
 }
 
 pub const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
@@ -248,7 +269,11 @@ impl HttpStatsView {
 			for (t, n) in total.iter_mut().zip(c.by_class) {
 				*t += n;
 			}
-			view.routes.insert(name, RouteStatsView { requests: c.requests(), by_status: by_status(&c.by_class) });
+			view.routes.insert(name, RouteStatsView { requests: c.requests(), by_status: by_status(&c.by_class), ..Default::default() });
+		}
+		for ((route, middleware), n) in stats.limited_snapshot() {
+			view.limited += n;
+			view.routes.entry(route).or_default().limited.insert(middleware, n);
 		}
 		view.requests = total.iter().sum();
 		view.by_status = by_status(&total);

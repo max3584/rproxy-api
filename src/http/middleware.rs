@@ -1,9 +1,10 @@
-//! Middlewares that need no state across requests: redirects, fixed answers,
-//! client address checks, headers and path rewriting (#53, #60, #62). The
+//! Middlewares: redirects, fixed answers, client address checks, headers and
+//! path rewriting (#53, #60, #62), and the limits of `limit.rs` (#54). The
 //! request side runs in the route's order; the response side in reverse, as in
 //! Traefik.
 
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -13,7 +14,8 @@ use hyper::{Method, Response, StatusCode, Uri};
 use regex::Regex;
 
 use super::server::Body;
-use super::{CorsSpec, HeaderOps, HstsSpec, MiddlewareSpec};
+use super::limit::{Hold, InFlight, RateLimiter, Source};
+use super::{parse_duration, CorsSpec, HeaderOps, HstsSpec, MiddlewareSpec};
 use crate::cidr::{self, Cidr};
 use crate::error::ApiError;
 
@@ -27,7 +29,13 @@ pub struct Ctx {
 	pub host: String,
 	/// `Origin` of the request as received (CORS).
 	pub origin: Option<HeaderValue>,
+	/// Places taken by `in_flight`; kept until the response has been sent.
+	pub holds: Mutex<Vec<Hold>>,
 }
+
+/// Marks a response refused by `rate_limit` / `in_flight`, with the middleware's name (metrics).
+#[derive(Clone, Debug)]
+pub struct Limited(pub String);
 
 #[derive(Debug)]
 pub struct Headers {
@@ -51,6 +59,8 @@ pub enum Middleware {
 	AddPrefix(String),
 	ReplacePath(String),
 	ReplacePathRegex { regex: Regex, replacement: String },
+	RateLimit { name: String, limiter: RateLimiter },
+	InFlight { name: String, limiter: Arc<InFlight> },
 }
 
 fn value(v: &str, what: &str) -> Result<HeaderValue, ApiError> {
@@ -129,6 +139,16 @@ impl Middleware {
 			MiddlewareSpec::ReplacePathRegex { regex: r, replacement } => {
 				Middleware::ReplacePathRegex { regex: regex(r)?, replacement: replacement.clone() }
 			}
+			MiddlewareSpec::RateLimit { average, period, burst, source } => Middleware::RateLimit {
+				name: label.to_string(),
+				limiter: RateLimiter::new(
+					*average,
+					parse_duration(period).map_err(|e| ApiError::invalid(format!("{what}: period: {e}")))?,
+					*burst,
+					Source::parse(source).map_err(|e| ApiError::invalid(format!("{what}: {}", e.message)))?,
+				),
+			},
+			MiddlewareSpec::InFlight { amount } => Middleware::InFlight { name: label.to_string(), limiter: InFlight::new(*amount) },
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
 	}
@@ -160,6 +180,19 @@ impl Middleware {
 				resp.headers_mut().insert(header::CONTENT_TYPE, content_type.clone());
 				Some(resp)
 			}
+			Middleware::RateLimit { name, limiter } => {
+				let wait = limiter.check(&limiter.source.key(&parts.headers, ctx.client)).err()?;
+				let mut resp = limited(name);
+				insert(resp.headers_mut(), header::RETRY_AFTER, &wait.as_secs_f64().ceil().max(1.0).to_string());
+				Some(resp)
+			}
+			Middleware::InFlight { name, limiter } => match limiter.acquire(&ctx.client.to_string()) {
+				Some(hold) => {
+					ctx.holds.lock().unwrap().push(hold);
+					None
+				}
+				None => Some(limited(name)),
+			},
 			Middleware::IpAllow(list) => {
 				(!cidr::allows(list, ctx.client)).then(|| text(StatusCode::FORBIDDEN, "403 Forbidden"))
 			}
@@ -326,6 +359,13 @@ fn text(status: StatusCode, body: &str) -> Response<Body> {
 	resp
 }
 
+/// 429 from a limit middleware.
+fn limited(name: &str) -> Response<Body> {
+	let mut resp = text(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests");
+	resp.extensions_mut().insert(Limited(name.to_string()));
+	resp
+}
+
 /// 301/302 for GET and HEAD; 308/307 keep the method and body of others.
 fn redirect(location: &str, permanent: bool, method: &Method) -> Response<Body> {
 	let simple = method == Method::GET || method == Method::HEAD;
@@ -364,7 +404,7 @@ mod tests {
 	}
 
 	fn ctx(https: bool) -> Ctx {
-		Ctx { client: "10.0.0.5".parse().unwrap(), https, host: "a.example".into(), origin: None }
+		Ctx { client: "10.0.0.5".parse().unwrap(), https, host: "a.example".into(), origin: None, holds: Default::default() }
 	}
 
 	fn location(r: &Response<Body>) -> &str {
