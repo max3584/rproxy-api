@@ -79,6 +79,8 @@ pub struct Runtime {
 	pub routes: RwLock<Arc<Vec<RouteTarget>>>,
 	pub tls: RwLock<Arc<TlsRuntime>>,
 	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
+	/// L7 routing of an `http` rule; replaced as a whole on changes.
+	pub http: RwLock<Option<Arc<crate::http::server::Router>>>,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// Stops accepting new connections.
@@ -96,6 +98,10 @@ pub fn shifted(addr: SocketAddr, offset: u16) -> SocketAddr {
 impl Runtime {
 	pub fn bind_as(&self, client: SocketAddr) -> Option<SocketAddr> {
 		(self.source_ip == SourceIp::Transparent).then_some(client)
+	}
+
+	pub fn http_router(&self) -> Option<Arc<crate::http::server::Router>> {
+		self.http.read().unwrap().clone()
 	}
 
 	pub fn tls(&self) -> Arc<TlsRuntime> {

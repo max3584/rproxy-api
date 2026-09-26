@@ -117,6 +117,7 @@ struct Prepared {
 	addrs: Vec<SocketAddr>,
 	routes: Vec<(Route, Vec<SocketAddr>)>,
 	tls: Arc<TlsRuntime>,
+	http: Option<Arc<crate::http::server::Router>>,
 }
 
 pub struct Registry {
@@ -259,7 +260,8 @@ impl Registry {
 		target: String,
 		tx: &Arc<watch::Sender<Vec<SocketAddr>>>,
 	) -> Option<Resolver> {
-		if resolve::is_ip_literal(host) {
+		// http rules have no remote_addr; their backends are resolved per request
+		if host.is_empty() || resolve::is_ip_literal(host) {
 			return None;
 		}
 		let cancel = CancellationToken::new();
@@ -269,13 +271,17 @@ impl Registry {
 
 	/// Resolves targets and reads certificates, without holding the rules lock.
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
-		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.tls, spec.starttls, spec.starttls_required)?);
-		let addrs = resolve::resolve(&self.cfg.lookup, &spec.remote()).await?;
+		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required)?);
+		let http = match &spec.http {
+			Some(h) => Some(Arc::new(crate::http::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?)),
+			None => None,
+		};
+		let addrs = if http.is_some() { vec![] } else { resolve::resolve(&self.cfg.lookup, &spec.remote()).await? };
 		let mut routes = vec![];
 		for route in &spec.tls.routes {
 			routes.push((route.clone(), resolve::resolve(&self.cfg.lookup, &route_spec(route)).await?));
 		}
-		Ok(Prepared { addrs, routes, tls })
+		Ok(Prepared { addrs, routes, tls, http })
 	}
 
 	fn install_routes(&self, key: Key, routes: Vec<(Route, Vec<SocketAddr>)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
@@ -306,6 +312,7 @@ impl Registry {
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
+			http: RwLock::new(prepared.http),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -430,12 +437,19 @@ impl Registry {
 			spec.starttls = req.starttls;
 			spec.starttls_required = req.starttls != Some(crate::tlsconf::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
 		}
+		let http_changed = req.http.is_some();
 		if let Some(http) = req.http {
+			if spec.http.is_none() {
+				return Err(ApiError::unsupported("a rule cannot be turned into an http rule; delete and re-create it"));
+			}
 			if key.protocol != crate::rule::Protocol::Tcp || spec.tls.mode == crate::tlsconf::TlsMode::Sni || spec.starttls.is_some() {
 				return Err(ApiError::invalid("http needs protocol tcp with tls mode terminate (or no TLS) and no starttls"));
 			}
 			http.validate()?;
 			spec.http = Some(http);
+		}
+		if spec.http.is_some() {
+			crate::rule::check_http_tls(&spec.tls, spec.source_ip)?;
 		}
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
@@ -453,6 +467,9 @@ impl Registry {
 				if host_changed {
 					r.stop_resolver();
 					r.resolver = self.spawn_resolver(*key, &spec.remote_host, spec.remote(), &r.target_tx);
+				}
+				if http_changed {
+					*r.rt.http.write().unwrap() = prepared.http;
 				}
 				if tls_changed {
 					*r.rt.tls.write().unwrap() = prepared.tls;
@@ -493,7 +510,7 @@ impl Registry {
 			if r.spec.tls.mode != TlsMode::Terminate {
 				continue;
 			}
-			match TlsRuntime::build(key.protocol, &r.spec.tls, r.spec.starttls, r.spec.starttls_required) {
+			match TlsRuntime::build(key.protocol, &r.spec.runtime_tls(), r.spec.starttls, r.spec.starttls_required) {
 				Ok(tls) => {
 					*r.rt.tls.write().unwrap() = Arc::new(tls);
 					ok += 1;

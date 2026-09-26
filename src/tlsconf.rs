@@ -546,7 +546,7 @@ impl ServerCertVerifier for NoVerify {
 	}
 }
 
-fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError> {
+pub(crate) fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError> {
 	let provider = provider();
 	let builder = ClientConfig::builder_with_provider(provider.clone())
 		.with_safe_default_protocol_versions()

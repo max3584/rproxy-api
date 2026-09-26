@@ -132,10 +132,13 @@ pub struct Features {
 	pub tls_options: bool,
 	/// Middleware kinds (`http.middlewares`) that can run
 	pub middlewares: &'static [&'static str],
+	/// Options of `http.services` that can run (`health_check`, `sticky`)
+	pub services: &'static [&'static str],
 }
 
 impl Features {
-	pub const CURRENT: Features = Features { http: false, http3: false, acme: false, tls_options: false, middlewares: &[] };
+	pub const CURRENT: Features =
+		Features { http: true, http3: false, acme: false, tls_options: false, middlewares: &[], services: &[] };
 
 	/// Everything the settings can describe; for registering a startup rule
 	/// that this build cannot run as failed, with the reason.
@@ -149,6 +152,7 @@ impl Features {
 			"forward_auth", "oidc", "basic_auth", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
 			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond",
 		],
+		services: &["health_check", "sticky"],
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -171,6 +175,13 @@ impl Features {
 			}
 			if let Some(kind) = h.middleware_kinds().find(|k| !self.middlewares.contains(k)) {
 				return missing(&format!("the {kind} middleware"));
+			}
+			for (name, s) in &h.services {
+				for (option, used) in [("health_check", s.health_check.is_some()), ("sticky", s.sticky.is_some())] {
+					if used && !self.services.contains(&option) {
+						return missing(&format!("service {name}: {option}"));
+					}
+				}
 			}
 		}
 		Ok(())
@@ -234,6 +245,16 @@ pub struct RuleSpec {
 }
 
 impl RuleSpec {
+	/// The TLS settings to run with: an `http` rule that terminates TLS offers
+	/// HTTP/2 and HTTP/1.1 by ALPN unless `alpn` says otherwise.
+	pub fn runtime_tls(&self) -> TlsSpec {
+		let mut tls = self.tls.clone();
+		if self.http.is_some() && tls.mode == TlsMode::Terminate && tls.alpn.is_empty() {
+			tls.alpn = vec!["h2".into(), "http/1.1".into()];
+		}
+		tls
+	}
+
 	pub fn remote(&self) -> String {
 		match self.remote_host.parse::<IpAddr>() {
 			Ok(IpAddr::V6(ip)) => SocketAddr::new(IpAddr::V6(ip), self.remote_port).to_string(),
@@ -273,6 +294,20 @@ pub fn validate_target(host: &str, port: u16, http: bool) -> Result<String, ApiE
 		return Err(ApiError::invalid("remote_addr / remote_port are not used with http; put the backends in http.services"));
 	}
 	Ok(String::new())
+}
+
+/// What an `http` rule cannot combine with: the backend is chosen per request.
+pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp) -> Result<(), ApiError> {
+	if !tls.routes.is_empty() {
+		return Err(ApiError::tls_config("http rules route by match; tls.routes is not used (use Host(...) in http.routes)"));
+	}
+	if tls.upstream.tls {
+		return Err(ApiError::tls_config("http rules pick TLS towards a backend by its URL (https://); tls.upstream.tls is not used"));
+	}
+	if matches!(source_ip, SourceIp::ProxyV1 | SourceIp::ProxyV2) {
+		return Err(ApiError::invalid("http rules send the client address in X-Forwarded-For; source_ip proxy_v1 / proxy_v2 is not used"));
+	}
+	Ok(())
 }
 
 pub fn validate_udp_idle(secs: Option<u64>) -> Result<Duration, ApiError> {
@@ -324,6 +359,7 @@ impl RuleRequest {
 			if port_count > 1 {
 				return Err(ApiError::invalid("http rules take a single port"));
 			}
+			check_http_tls(&tls, self.source_ip)?;
 			http.validate()?;
 		}
 		caps.features.check(&tls, self.http.as_ref())?;
