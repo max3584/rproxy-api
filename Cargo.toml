@@ -28,6 +28,8 @@ DTLS termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.""
 section = "net"
 priority = "optional"
 depends = "passwd"
+# rproxy-traefik-convert (the Traefik configuration converter) runs on python3; YAML needs python3-yaml
+suggests = "python3, python3-yaml"
 maintainer-scripts = "debian/"
 # not started on install: set /etc/rproxy/rproxy.env first, then systemctl enable --now rproxy-api
 systemd-units = { enable = false, start = false }
@@ -38,6 +40,8 @@ assets = [
     ["README.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/API.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/PROFILES.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/MIGRATING-FROM-TRAEFIK.md", "usr/share/doc/rproxy-api/", "644"],
+    ["contrib/traefik2rproxy.py", "usr/bin/rproxy-traefik-convert", "755"],
 ]
 
 [dependencies]

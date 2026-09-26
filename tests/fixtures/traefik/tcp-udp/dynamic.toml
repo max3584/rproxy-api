@@ -1,0 +1,60 @@
+[tcp.routers.app]
+entryPoints = ["tls"]
+rule = "HostSNI(`app.example.com`, `www.example.com`)"
+service = "app"
+[tcp.routers.app.tls]
+passthrough = true
+
+[tcp.routers.fallback]
+entryPoints = ["tls"]
+rule = "HostSNI(`*`)"
+service = "fallback"
+[tcp.routers.fallback.tls]
+passthrough = true
+
+[tcp.routers.ssh]
+entryPoints = ["ssh"]
+rule = "HostSNI(`*`)"
+service = "ssh"
+
+[tcp.routers.mail]
+entryPoints = ["imaps"]
+rule = "HostSNI(`mail.example.com`)"
+service = "dovecot"
+[tcp.routers.mail.tls]
+options = "modern"
+[[tcp.routers.mail.tls.domains]]
+main = "mail.example.com"
+
+[tcp.services.app.loadBalancer]
+[[tcp.services.app.loadBalancer.servers]]
+address = "10.0.1.10:443"
+
+[tcp.services.fallback.loadBalancer]
+[[tcp.services.fallback.loadBalancer.servers]]
+address = "10.0.1.11:443"
+
+[tcp.services.ssh.loadBalancer]
+proxyProtocol = { version = 2 }
+[[tcp.services.ssh.loadBalancer.servers]]
+address = "10.0.1.20:22"
+
+[tcp.services.dovecot.loadBalancer]
+[[tcp.services.dovecot.loadBalancer.servers]]
+address = "10.0.1.30:143"
+
+[udp.routers.dns]
+entryPoints = ["dns"]
+service = "dns"
+
+[udp.services.dns.loadBalancer]
+[[udp.services.dns.loadBalancer.servers]]
+address = "10.0.1.53:53"
+
+[[tls.certificates]]
+certFile = "/etc/ssl/mail.pem"
+keyFile = "/etc/ssl/mail.key"
+
+[tls.options.modern]
+minVersion = "VersionTLS13"
+cipherSuites = ["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256"]

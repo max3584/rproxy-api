@@ -1,0 +1,39 @@
+http:
+  middlewares:
+    crowdsec:
+      plugin:
+        bouncer:
+          enabled: true
+          crowdsecMode: stream
+          crowdsecLapiScheme: http
+          crowdsecLapiHost: 127.0.0.1:8080
+          crowdsecLapiKey: not-a-real-key
+          crowdsecAppsecEnabled: true
+          crowdsecAppsecHost: 127.0.0.1:7422
+          updateIntervalSeconds: 15
+          forwardedHeadersTrustedIPs: ["192.0.2.0/24"]
+    rate-limit-login:
+      rateLimit:
+        average: 5
+        period: 1m
+        burst: 10
+    rate-limit-assets:
+      rateLimit:
+        average: 100
+        burst: 200
+    internal-only:
+      ipAllowList:
+        sourceRange: ["10.0.0.0/8"]
+    block-all:
+      ipAllowList:
+        sourceRange: ["127.0.0.1/32"]
+    secure-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+        customResponseHeaders:
+          Server: ""
+          X-Robots-Tag: noindex

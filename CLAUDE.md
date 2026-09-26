@@ -89,5 +89,6 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 - `transparent` は Linux・`CAP_NET_ADMIN` が前提（IPv4 は `IP_TRANSPARENT`、IPv6 は `IPV6_TRANSPARENT`。socket2 0.6 の `set_ip_transparent_v4` / `_v6`）で、ポリシールーティングの設定も要る（README）。ユニットは `CAP_NET_ADMIN` を既定で与え、ポリシールーティングは `contrib/rproxy-transparent-routing`（install.sh の `--transparent-*`）で入れる。権限を足したり外したりしたら docs/PERMISSIONS.md も直す。`scripts/test-transparent.sh` で名前空間の中の実経路では確認済み。`FAMILY=4|6`・`ROUTING=iif|iptables|nft`・`RETURN=rproxy|gateway`（転送先の出口が別のルータで、転送先で connmark を使う構成）の組み合わせを CI で確かめている。利用者向けの説明は docs/TRANSPARENT.md。
 - DB からの復元（`src/db.rs`）は MariaDB 11.4 で確認済み。テーブルが古く `source_ip` / `udp_idle_secs` 列がない場合は、既定値で読み込む。
+- `contrib/traefik2rproxy.py`（.deb では `/usr/bin/rproxy-traefik-convert`）は Traefik の設定からの変換ツール（Python 3、YAML は PyYAML）。サーバのバイナリには入れない。設定の形やミドルウェアを足したら、変換の対応（docs/MIGRATING-FROM-TRAEFIK.md の表と `KNOWN_MIDDLEWARES`）も直す。`tests/traefik_convert.rs` が `tests/fixtures/traefik/` を変換して rproxy の検証に通す（CI は `RPROXY_TEST_REQUIRE_PYTHON=1`）。
 - 空の環境変数（`RPROXY_DATABASE_URL=` など）は未設定として扱う（`main` で clap に渡す前に取り除く）。
 - 派生元のコードに由来するファイルには帰属コメントが付いている。MIT ライセンスの表記は残すこと。

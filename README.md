@@ -122,6 +122,8 @@ curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp
 
 SNI やサーバ名は、クライアントが自由に名乗れます。名前での振り分けだけではアクセス制限にならないので、`allow_from`、mTLS（`client_auth`）、Web UI のログインを組み合わせてください。
 
+Traefik から移るときは、`rproxy-traefik-convert`（[contrib/traefik2rproxy.py](contrib/traefik2rproxy.py)。.deb に入っている）で Traefik の設定（静的・動的な設定、Docker のラベル）をこの設定ファイルに変換できます。変換できなかった設定は出力の先頭と標準エラーに一覧されます（[docs/MIGRATING-FROM-TRAEFIK.md](docs/MIGRATING-FROM-TRAEFIK.md)）。
+
 systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.service) にあります（80 / 443 などのために `CAP_NET_BIND_SERVICE` を付ける）。
 
 ## TLS・DTLS・STARTTLS・ポート範囲

@@ -1,0 +1,40 @@
+# Like the Traefik setup in docs/DESIGN-v0.3.md section 7
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    forwardedHeaders:
+      trustedIPs: ["10.0.0.0/8"]
+    http3: {}
+    http:
+      tls:
+        certResolver: letsencrypt
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /letsencrypt/acme.json
+      tlsChallenge: {}
+
+accessLog:
+  filePath: /var/log/traefik/access.log
+
+api:
+  dashboard: true
+
+experimental:
+  plugins:
+    bouncer:
+      moduleName: github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin
+      version: v1.3.5
+
+providers:
+  file:
+    directory: dynamic

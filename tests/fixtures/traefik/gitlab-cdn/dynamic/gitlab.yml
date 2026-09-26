@@ -1,0 +1,37 @@
+http:
+  routers:
+    gitlab-login:
+      entryPoints: [websecure]
+      rule: Host(`gitlab.example.com`) && Method(`POST`) && Path(`/users/sign_in`)
+      service: gitlab
+      middlewares: [crowdsec, rate-limit-login]
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: gitlab.example.com
+            sans: [cdn.example.com]
+    gitlab-api:
+      entryPoints: [websecure]
+      rule: Host(`gitlab.example.com`) && PathPrefix(`/api/`)
+      service: gitlab
+      middlewares: [crowdsec]
+    gitlab-assets:
+      entryPoints: [websecure]
+      rule: Host(`gitlab.example.com`) && (PathPrefix(`/assets/`) || PathPrefix(`/uploads/`))
+      service: gitlab
+      middlewares: [crowdsec, rate-limit-assets]
+    gitlab-internal:
+      entryPoints: [websecure]
+      rule: Host(`gitlab.example.com`) && ClientIP(`10.0.0.0/8`)
+      service: gitlab
+    gitlab:
+      entryPoints: [websecure]
+      rule: Host(`gitlab.example.com`)
+      service: gitlab
+      middlewares: [secure-headers@file, crowdsec]
+  services:
+    gitlab:
+      loadBalancer:
+        servers:
+          - url: http://10.0.0.20:80
+        passHostHeader: true
