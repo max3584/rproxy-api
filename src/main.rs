@@ -351,18 +351,30 @@ impl ApiListener {
 				}
 			},
 		};
+		// Bind here so a busy port fails right away. Waiting on `Handle::listening()` for a bind
+		// error can hang: axum-server notifies only the waiters present at that moment.
+		let listener = std::net::TcpListener::bind(self.addr).map_err(|e| e.to_string())?;
+		listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 		let app = self.app.clone().into_make_service();
 		let handle = Handle::new();
-		let server = match tls {
-			Some(tls) => tokio::spawn(axum_server::bind_rustls(self.addr, tls).handle(handle.clone()).serve(app)),
-			None => tokio::spawn(axum_server::bind(self.addr).handle(handle.clone()).serve(app)),
-		};
-		// a bind error makes `listening()` return None
-		if handle.listening().await.is_none() {
-			return Err(match server.await {
-				Ok(Err(e)) => e.to_string(),
-				_ => "server stopped".into(),
-			});
+		let addr = self.addr;
+		match tls {
+			Some(tls) => {
+				let server = axum_server::from_tcp_rustls(listener, tls).handle(handle.clone());
+				tokio::spawn(async move {
+					if let Err(e) = server.serve(app).await {
+						error!(event = "api.stopped", addr = %addr, error = %e);
+					}
+				});
+			}
+			None => {
+				let server = axum_server::from_tcp(listener).handle(handle.clone());
+				tokio::spawn(async move {
+					if let Err(e) = server.serve(app).await {
+						error!(event = "api.stopped", addr = %addr, error = %e);
+					}
+				});
+			}
 		}
 		info!(event = "api.listening", addr = %self.addr, tls = self.files.is_some());
 		self.handles.lock().unwrap().push(handle);
