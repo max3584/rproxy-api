@@ -16,4 +16,6 @@ pub mod source;
 pub mod starttls;
 pub mod tcp;
 pub mod tlsconf;
+#[cfg(unix)]
+pub mod unix_api;
 pub mod udp;
