@@ -57,13 +57,16 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: iptables and nftables
         run: sudo apt-get install -y iptables nftables
-      # the three ways of routing the return traffic in the README
-      - name: scripts/test-transparent.sh (ip rule iif)
-        run: ROUTING=iif scripts/test-transparent.sh
-      - name: scripts/test-transparent.sh (iptables -m socket)
-        run: ROUTING=iptables scripts/test-transparent.sh
-      - name: scripts/test-transparent.sh (nftables socket transparent)
-        run: ROUTING=nft scripts/test-transparent.sh
+      # IPv4 and IPv6 (a GUA client with a ULA inside), the three ways of routing the return traffic
+      # on rproxy, and a backend whose default route is another egress (docs/TRANSPARENT.md)
+      - name: scripts/test-transparent.sh
+        run: |
+          for family in 4 6; do
+            for routing in iif iptables nft; do
+              FAMILY=$family ROUTING=$routing scripts/test-transparent.sh
+            done
+            FAMILY=$family ROUTING=nft RETURN=gateway scripts/test-transparent.sh
+          done
 
   deb:
     name: Debian package (install, apt repository, purge)

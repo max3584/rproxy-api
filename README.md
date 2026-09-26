@@ -138,7 +138,7 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 |---|---|---|
 | `proxy`（既定） | 転送先からは rproxy の IP に見える | なし |
 | `proxy_v1` / `proxy_v2` | 接続の先頭に PROXY protocol ヘッダを付ける | TCP のみ。転送先が PROXY protocol に対応していること |
-| `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT`） | Linux、IPv4、`CAP_NET_ADMIN`。転送先からの戻りパケットが rproxy のホストを通ること |
+| `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT` / `IPV6_TRANSPARENT`） | Linux、`CAP_NET_ADMIN`。IPv4 と IPv6。転送先からの戻りパケットが rproxy のホストを通ること（[docs/TRANSPARENT.md](docs/TRANSPARENT.md)） |
 
 `transparent` を使うには、rproxy に `CAP_NET_ADMIN` を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
 apt・install.sh で入れた場合は、ユニットが `CAP_NET_ADMIN` を与えているので権限の設定は要らない。ポリシールーティング（下の 1）は install.sh でまとめて入れられる（起動時に毎回設定する `rproxy-transparent-routing.service` を作る）。

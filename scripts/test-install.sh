@@ -34,6 +34,8 @@ grep -Eqx '[0-9a-f]{64}' /etc/rproxy/tokens || fail "token format"
 [ "$(log_lines)" -gt 0 ] || fail "nothing in /var/log/rproxy"
 head -n1 /var/log/rproxy/rproxy.*.log | grep -q '"event"' || fail "log is not JSON Lines"
 transparent 8081 || fail "source_ip transparent is not available (CAP_NET_ADMIN)"
+curl -s -H "Authorization: Bearer $(cat /etc/rproxy/tokens)" http://127.0.0.1:8081/capabilities | grep -q '"transparent_ipv6":true' ||
+	fail "transparent over IPv6 is not available (IPV6_TRANSPARENT)"
 token=$(cat /etc/rproxy/tokens)
 
 echo "== binary: rerun changes only what is given"
@@ -60,7 +62,20 @@ ip route show table 101 | grep -q 'local 10.97.0.0/24' || fail "new route missin
 "$install" --method binary --binary "$bin" --no-transparent-routing
 ! ip rule show | grep -q 'lookup 101' || fail "rule left after --no-transparent-routing"
 [ ! -e /etc/rproxy/transparent-routing.conf ] || fail "routing conf left behind"
+# IPv6 ranges (a GUA client range, as when the inside is ULA)
+"$install" --method binary --binary "$bin" --transparent-clients 2001:db8:99::/64,10.95.0.0/24 --transparent-iface rpxt0
+ip -6 rule show | grep -q 'iif rpxt0 lookup 100' || fail "ip -6 rule missing"
+ip -6 route show table 100 | grep -q 'local 2001:db8:99::/64' || fail "IPv6 local route missing"
+ip rule show | grep -q 'iif rpxt0 lookup 100' || fail "ip rule missing for the IPv4 range"
+# any client: nftables marks what goes to rproxy's transparent sockets
+"$install" --method binary --binary "$bin" --transparent-clients any
+nft list table inet rproxy_transparent | grep -q 'socket transparent 1' || fail "nft table missing"
+ip rule show | grep -q 'fwmark 0x1 lookup 100' || fail "IPv4 fwmark rule missing"
+ip -6 rule show | grep -q 'fwmark 0x1 lookup 100' || fail "IPv6 fwmark rule missing"
+ip -6 route show table 100 | grep -q 'local ::/0' || fail "IPv6 local default missing"
+! ip -6 rule show | grep -q 'iif rpxt0' || fail "the previous iif rules were left behind"
 "$install" --method binary --binary "$bin" --transparent-clients 10.96.0.0/24 --transparent-iface rpxt0
+! nft list table inet rproxy_transparent >/dev/null 2>&1 || fail "nft table left behind after leaving any"
 
 echo "== binary: static rules must be readable by the service"
 echo '[]' > /root/rules.json

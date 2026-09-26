@@ -54,6 +54,7 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 		dns_interval: Duration::from_millis(100),
 		lookup: fake_lookup(names.clone()),
 		transparent: false,
+		transparent_ipv6: false,
 		max_range_ports: rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS,
 		reserved: vec!["127.0.0.1:1".parse().unwrap()],
 	});
