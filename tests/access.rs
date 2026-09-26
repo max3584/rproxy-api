@@ -238,10 +238,19 @@ async fn rules_needing_a_missing_capability_fail_with_the_reason() {
 	assert_eq!(v["state"], "failed", "{v}");
 	assert!(v["error"].as_str().unwrap().contains("CAP_NET_ADMIN"), "{v}");
 
-	// a mistake in the file still stops the startup (transparent is IPv4 only)
-	let mut v6 = static_rule(free_port(), backend);
+	// IPv6 without IPV6_TRANSPARENT: failed with the reason as well
+	let v6_port = free_port();
+	let mut v6 = static_rule(v6_port, backend);
 	v6["source_ip"] = json!("transparent");
 	v6["listen_addr"] = json!("::1");
-	let err = h.registry.load_static(requests(json!([v6]))).await.unwrap_err();
-	assert!(err.contains("IPv4"), "{err}");
+	assert_eq!(h.registry.load_static(requests(json!([v6]))).await, Ok(1));
+	let (_, v) = h.get(&format!("/rules/tcp/::1/{v6_port}")).await;
+	assert_eq!(v["state"], "failed", "{v}");
+
+	// a mistake in the file still stops the startup
+	let mut bad = static_rule(free_port(), backend);
+	bad["source_ip"] = json!("transparent");
+	bad["listen_addr"] = json!("not-an-address");
+	let err = h.registry.load_static(requests(json!([bad]))).await.unwrap_err();
+	assert!(err.contains("static rule #1"), "{err}");
 }

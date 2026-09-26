@@ -97,13 +97,16 @@ impl fmt::Display for Key {
 /// What this process can do; limits checked while validating rules.
 #[derive(Clone, Copy, Debug)]
 pub struct Caps {
+	/// IP_TRANSPARENT (IPv4 and IPv4-mapped clients)
 	pub transparent: bool,
+	/// IPV6_TRANSPARENT
+	pub transparent_ipv6: bool,
 	pub max_range_ports: u16,
 }
 
 impl Default for Caps {
 	fn default() -> Self {
-		Caps { transparent: false, max_range_ports: DEFAULT_MAX_RANGE_PORTS }
+		Caps { transparent: false, transparent_ipv6: false, max_range_ports: DEFAULT_MAX_RANGE_PORTS }
 	}
 }
 
@@ -236,8 +239,10 @@ impl RuleRequest {
 					"transparent is not available (needs Linux and CAP_NET_ADMIN)",
 				));
 			}
-			(_, SourceIp::Transparent) if !listen.is_ipv4() => {
-				return Err(ApiError::unsupported("transparent is supported for IPv4 only"));
+			(_, SourceIp::Transparent) if !listen.is_ipv4() && !caps.transparent_ipv6 => {
+				return Err(ApiError::unsupported(
+					"transparent over IPv6 is not available (needs IPV6_TRANSPARENT: Linux, CAP_NET_ADMIN and IPv6)",
+				));
 			}
 			_ => {}
 		}
@@ -406,13 +411,15 @@ mod tests {
 	}
 
 	#[test]
-	fn transparent_needs_capability_and_ipv4() {
+	fn transparent_needs_the_capability_of_the_family() {
 		let mut r = req();
 		r.source_ip = SourceIp::Transparent;
 		assert_eq!(r.clone().validate(&Caps::default()).unwrap_err().code, "unsupported");
 		assert!(r.clone().validate(&Caps { transparent: true, ..Caps::default() }).is_ok());
 		r.listen_addr = "::1".into();
-		assert_eq!(r.validate(&Caps { transparent: true, ..Caps::default() }).unwrap_err().code, "unsupported");
+		assert_eq!(r.clone().validate(&Caps { transparent: true, ..Caps::default() }).unwrap_err().code, "unsupported");
+		let both = Caps { transparent: true, transparent_ipv6: true, ..Caps::default() };
+		assert!(r.validate(&both).is_ok(), "IPv6 with IPV6_TRANSPARENT");
 	}
 
 	#[test]

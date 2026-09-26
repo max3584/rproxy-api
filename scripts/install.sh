@@ -29,10 +29,11 @@ usage() {
   --database-url URL     起動時にルールを復元する DB（mysql://user:pass@host:3306/db）
   --static-rules FILE    固定ルールの JSON ファイル
   --log-file PATH        ログファイル（既定 /var/log/rproxy/rproxy.log。- で標準出力 = journald）
-  --transparent-clients CIDR[,CIDR...]
-                         source_ip: transparent を使うクライアントのアドレス範囲（戻りのパケットのポリシールーティングを入れる）
+  --transparent-clients CIDR[,CIDR...] | any
+                         source_ip: transparent を使うクライアントのアドレス範囲（IPv4 / IPv6。戻りのパケットのポリシールーティングを入れる）。
+                         any はクライアントの範囲を決めず、rproxy の transparent ソケット宛てだけを nftables で選ぶ（nft が要る）
   --transparent-iface IF[,IF...]
-                         転送先側のインターフェース（--transparent-clients と一緒に指定する）
+                         転送先側のインターフェース（--transparent-clients が範囲のとき、一緒に指定する）
   --transparent-table N  ポリシールーティングに使うテーブルの番号（既定 100）
   --no-transparent-routing
                          transparent 用のポリシールーティングを外す
@@ -88,16 +89,20 @@ if [ -n "$version" ]; then
 	case $version in v*) ;; *) version=v$version ;; esac
 fi
 if [ -n "$t_clients$t_ifaces" ]; then
-	if [ -z "$t_clients" ] || [ -z "$t_ifaces" ]; then die "--transparent-clients と --transparent-iface は両方指定してください"; fi
+	[ -n "$t_clients" ] || die "--transparent-iface は --transparent-clients と一緒に指定してください"
 	$no_routing && die "--no-transparent-routing と --transparent-* は同時に使えません"
 	t_clients=${t_clients//,/ } t_ifaces=${t_ifaces//,/ }
-	for c in $t_clients; do
-		case $c in
-			*:*) die "transparent は IPv4 だけです: $c" ;;
-			*/*) ;;
-			*) die "--transparent-clients は CIDR（例 10.0.1.0/24）で指定してください: $c" ;;
-		esac
-	done
+	if [ "$t_clients" = any ]; then
+		command -v nft >/dev/null || die "--transparent-clients any には nft（nftables）が要ります（apt install nftables）"
+	else
+		[ -n "$t_ifaces" ] || die "--transparent-clients に範囲を書くときは --transparent-iface も指定してください（範囲を決めないなら any）"
+		for c in $t_clients; do
+			case $c in
+				*/*) ;;
+				*) die "--transparent-clients は CIDR（例 10.0.1.0/24、2001:db8::/32）か any で指定してください: $c" ;;
+			esac
+		done
+	fi
 	for i in $t_ifaces; do ip link show "$i" >/dev/null 2>&1 || die "インターフェースがありません: $i"; done
 	case $t_table in '' | *[!0-9]*) die "--transparent-table は数字で指定してください" ;; esac
 fi
@@ -301,7 +306,7 @@ if $no_routing; then
 	log "transparent 用のポリシールーティングを外します"
 	remove_routing
 elif [ -n "$t_clients" ]; then
-	log "transparent 用のポリシールーティングを設定します（$t_clients ← $t_ifaces、テーブル $t_table）"
+	log "transparent 用のポリシールーティングを設定します（$t_clients${t_ifaces:+ ← $t_ifaces}、テーブル $t_table）"
 	# 前の設定で入れたルールを先に外す
 	systemctl stop "$ROUTING_UNIT" 2>/dev/null || true
 	rtmp=$(mktemp -d)
@@ -381,6 +386,10 @@ else
 			*'"transparent":true'*) transparent=使える ;;
 			*'"transparent":false'*) transparent=使えない; warn "source_ip: transparent が使えません（CAP_NET_ADMIN を確認してください）" ;;
 			*) transparent=不明 ;;
+		esac
+		case $caps in
+			*'"transparent_ipv6":true'*) transparent="$transparent（IPv6 も）" ;;
+			*'"transparent_ipv6":false'*) transparent="$transparent（IPv6 は使えない）" ;;
 		esac
 	else
 		journalctl -u "$UNIT" --no-pager -n 20 >&2 || true

@@ -1,35 +1,72 @@
 #!/bin/sh
-# source_ip: transparent の戻りのパケットを、rproxy のホスト自身で受け取るためのポリシールーティング。
+# source_ip: transparent の戻りのパケットを、rproxy のホスト自身で受け取るためのポリシールーティング（IPv4 / IPv6）。
 # 設定は /etc/rproxy/transparent-routing.conf（rproxy-transparent-routing.service が起動時に up を実行する）。
 #
-#   CLIENTS="10.0.1.0/24 10.0.2.0/24"   クライアントのアドレス範囲（転送先から見える送信元）
-#   IFACES="eth1"                       転送先側のインターフェース（戻りのパケットが届くところ）
-#   TABLE=100                           使うルーティングテーブルの番号
+#   CLIENTS="10.0.1.0/24 2001:db8:1::/64"   クライアントのアドレス範囲（転送先から見える送信元）。
+#                                          "any" にすると範囲を決めず、rproxy の transparent ソケット宛てのパケットだけを
+#                                          nftables の socket transparent で選ぶ（nft が要る。IFACES は使わない）
+#   IFACES="eth1"                          転送先側のインターフェース（CLIENTS が範囲のとき。戻りのパケットが届くところ）
+#   TABLE=100                              使うルーティングテーブルの番号
+#   MARK=0x1                               "any" のときに付ける印
 #
 #   rproxy-transparent-routing up|down|status
 set -eu
 
 CONF=${RPROXY_TRANSPARENT_CONF:-/etc/rproxy/transparent-routing.conf}
 [ -r "$CONF" ] || { echo "$CONF がありません" >&2; exit 1; }
-CLIENTS='' IFACES='' TABLE=100
+CLIENTS='' IFACES='' TABLE=100 MARK=0x1
 # shellcheck disable=SC1090
 . "$CONF"
-if [ -z "$CLIENTS" ] || [ -z "$IFACES" ]; then echo "$CONF に CLIENTS と IFACES を書いてください" >&2; exit 1; fi
+if [ -z "$CLIENTS" ]; then echo "$CONF に CLIENTS を書いてください" >&2; exit 1; fi
+if [ "$CLIENTS" != any ] && [ -z "$IFACES" ]; then echo "$CONF に IFACES を書いてください（CLIENTS が範囲のとき）" >&2; exit 1; fi
 
-has_rule() { ip rule show | grep -q "iif $1 lookup $TABLE\b"; }
+family() { case $1 in *:*) echo -6 ;; *) echo -4 ;; esac; }
+families() { # the families used by CLIENTS
+	if [ "$CLIENTS" = any ]; then echo "-4 -6"; return; fi
+	for c in $CLIENTS; do family "$c"; done | sort -u | tr '\n' ' '
+}
+has_rule() { ip "$1" rule show | grep -q "$2 lookup $TABLE\b"; }
 
 case ${1:-} in
 	up)
-		for c in $CLIENTS; do ip route replace local "$c" dev lo table "$TABLE"; done
-		for i in $IFACES; do has_rule "$i" || ip rule add iif "$i" lookup "$TABLE"; done
+		if [ "$CLIENTS" = any ]; then
+			command -v nft >/dev/null || { echo "CLIENTS=any には nft（nftables）が要ります" >&2; exit 1; }
+			nft delete table inet rproxy_transparent 2>/dev/null || true
+			nft -f - <<EOF
+table inet rproxy_transparent {
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+		socket transparent 1 meta mark set $MARK
+	}
+}
+EOF
+			for f in -4 -6; do
+				has_rule "$f" "fwmark $MARK" || ip "$f" rule add fwmark "$MARK" lookup "$TABLE"
+			done
+			ip -4 route replace local 0.0.0.0/0 dev lo table "$TABLE"
+			ip -6 route replace local ::/0 dev lo table "$TABLE"
+		else
+			for c in $CLIENTS; do ip "$(family "$c")" route replace local "$c" dev lo table "$TABLE"; done
+			for f in $(families); do
+				for i in $IFACES; do has_rule "$f" "iif $i" || ip "$f" rule add iif "$i" lookup "$TABLE"; done
+			done
+		fi
 		;;
 	down)
-		for i in $IFACES; do while has_rule "$i"; do ip rule del iif "$i" lookup "$TABLE"; done; done
-		ip route flush table "$TABLE" 2>/dev/null || true
+		for f in -4 -6; do
+			while ip "$f" rule show | grep -q "lookup $TABLE\b"; do
+				ip "$f" rule del lookup "$TABLE" 2>/dev/null || break
+			done
+			ip "$f" route flush table "$TABLE" 2>/dev/null || true
+		done
+		if command -v nft >/dev/null; then nft delete table inet rproxy_transparent 2>/dev/null || true; fi
 		;;
 	status)
-		ip rule show | grep "lookup $TABLE\b" || true
-		ip route show table "$TABLE" 2>/dev/null || true
+		for f in -4 -6; do
+			ip "$f" rule show | grep "lookup $TABLE\b" || true
+			ip "$f" route show table "$TABLE" 2>/dev/null || true
+		done
+		if command -v nft >/dev/null; then nft list table inet rproxy_transparent 2>/dev/null || true; fi
 		;;
 	*) echo "使い方: $0 up|down|status" >&2; exit 2 ;;
 esac

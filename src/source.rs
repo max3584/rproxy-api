@@ -108,10 +108,34 @@ fn v2_header(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, dgram: boo
 	out
 }
 
+/// The client address as the source for a connection to `target`: an
+/// IPv4-mapped client (a dual-stack listener) becomes plain IPv4 for an IPv4
+/// target. The client and the target must end up in the same family.
+fn source_for(target: SocketAddr, client: SocketAddr) -> io::Result<SocketAddr> {
+	let ip = match (target.ip(), client.ip()) {
+		(IpAddr::V4(_), IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+			Some(v4) => IpAddr::V4(v4),
+			None => client.ip(),
+		},
+		_ => client.ip(),
+	};
+	if ip.is_ipv4() != target.is_ipv4() {
+		return Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			format!("transparent: client {client} and target {target} are in different address families"),
+		));
+	}
+	Ok(SocketAddr::new(ip, client.port()))
+}
+
 #[cfg(target_os = "linux")]
 fn transparent_socket(domain: Domain, ty: Type, protocol: Protocol, bind_as: SocketAddr) -> io::Result<Socket> {
 	let sock = Socket::new(domain, ty, Some(protocol))?;
-	sock.set_ip_transparent(true)?;
+	if domain == Domain::IPV6 {
+		sock.set_ip_transparent_v6(true)?;
+	} else {
+		sock.set_ip_transparent_v4(true)?;
+	}
 	sock.set_reuse_address(true)?;
 	sock.set_nonblocking(true)?;
 	sock.bind(&bind_as.into())?;
@@ -128,7 +152,21 @@ pub fn transparent_available() -> bool {
 	#[cfg(target_os = "linux")]
 	{
 		Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-			.and_then(|s| s.set_ip_transparent(true))
+			.and_then(|s| s.set_ip_transparent_v4(true))
+			.is_ok()
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		false
+	}
+}
+
+/// Whether this process may use IPV6_TRANSPARENT (and the host has IPv6).
+pub fn transparent_v6_available() -> bool {
+	#[cfg(target_os = "linux")]
+	{
+		Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+			.and_then(|s| s.set_ip_transparent_v6(true))
 			.is_ok()
 	}
 	#[cfg(not(target_os = "linux"))]
@@ -141,7 +179,8 @@ pub fn transparent_available() -> bool {
 pub async fn connect_tcp(target: SocketAddr, bind_as: Option<SocketAddr>) -> io::Result<TcpStream> {
 	match bind_as {
 		None => TcpStream::connect(target).await,
-		Some(src) => {
+		Some(client) => {
+			let src = source_for(target, client)?;
 			let sock = transparent_socket(Domain::for_address(target), Type::STREAM, Protocol::TCP, src)?;
 			TcpSocket::from_std_stream(sock.into()).connect(target).await
 		}
@@ -158,7 +197,8 @@ pub async fn udp_upstream(target: SocketAddr, bind_as: Option<SocketAddr>) -> io
 			};
 			UdpSocket::bind(any).await?
 		}
-		Some(src) => {
+		Some(client) => {
+			let src = source_for(target, client)?;
 			let sock = transparent_socket(Domain::for_address(target), Type::DGRAM, Protocol::UDP, src)?;
 			UdpSocket::from_std(sock.into())?
 		}
@@ -170,6 +210,18 @@ pub async fn udp_upstream(target: SocketAddr, bind_as: Option<SocketAddr>) -> io
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn transparent_source_matches_the_target_family() {
+		let v4: SocketAddr = "192.0.2.10:80".parse().unwrap();
+		let v6: SocketAddr = "[fd00:2::2]:80".parse().unwrap();
+		let mapped: SocketAddr = "[::ffff:198.51.100.7]:5000".parse().unwrap();
+		let gua: SocketAddr = "[2001:db8:1::2]:5000".parse().unwrap();
+		assert_eq!(source_for(v4, mapped).unwrap(), "198.51.100.7:5000".parse().unwrap());
+		assert_eq!(source_for(v6, gua).unwrap(), gua);
+		assert!(source_for(v4, gua).is_err(), "IPv6 client to an IPv4 target");
+		assert!(source_for(v6, "198.51.100.7:1".parse().unwrap()).is_err(), "IPv4 client to an IPv6 target");
+	}
 
 	#[test]
 	fn v1_header() {

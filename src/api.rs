@@ -68,6 +68,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	Json(json!({
 		"source_ip": names,
 		"transparent": transparent,
+		"transparent_ipv6": state.registry.transparent_ipv6_available(),
 		"tls_modes": ["passthrough", "sni", "terminate"],
 		"dtls": true,
 		"starttls": ["smtp", "imap", "pop3"],

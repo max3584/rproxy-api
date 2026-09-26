@@ -29,6 +29,8 @@ pub struct Config {
 	pub lookup: Lookup,
 	/// Whether `source_ip: transparent` may be used.
 	pub transparent: bool,
+	/// Whether it may be used with IPv6 clients (IPV6_TRANSPARENT).
+	pub transparent_ipv6: bool,
 	/// Largest port range one rule may open.
 	pub max_range_ports: u16,
 	/// Addresses rproxy itself listens on (the control API); rules may not take them.
@@ -199,7 +201,11 @@ impl Registry {
 	}
 
 	pub fn caps(&self) -> Caps {
-		Caps { transparent: self.cfg.transparent, max_range_ports: self.cfg.max_range_ports }
+		Caps {
+			transparent: self.cfg.transparent,
+			transparent_ipv6: self.cfg.transparent_ipv6,
+			max_range_ports: self.cfg.max_range_ports,
+		}
 	}
 
 	/// Validates a rule loaded at startup (DB or static file). A rule that is
@@ -210,8 +216,12 @@ impl Registry {
 		let caps = self.caps();
 		match req.clone().validate(&caps) {
 			Ok(spec) => Ok((spec, None)),
-			Err(e) if e.code == "unsupported" && !caps.transparent && req.source_ip == SourceIp::Transparent => {
-				let spec = req.validate(&Caps { transparent: true, ..caps })?;
+			Err(e)
+				if e.code == "unsupported"
+					&& !(caps.transparent && caps.transparent_ipv6)
+					&& req.source_ip == SourceIp::Transparent =>
+			{
+				let spec = req.validate(&Caps { transparent: true, transparent_ipv6: true, ..caps })?;
 				Ok((spec, Some(e.message)))
 			}
 			Err(e) => Err(e),
@@ -220,6 +230,10 @@ impl Registry {
 
 	pub fn transparent_available(&self) -> bool {
 		self.cfg.transparent
+	}
+
+	pub fn transparent_ipv6_available(&self) -> bool {
+		self.cfg.transparent_ipv6
 	}
 
 	fn generation(&self) -> u64 {
@@ -727,6 +741,7 @@ mod tests {
 			dns_interval: Duration::from_secs(30),
 			lookup: resolve::system_lookup(),
 			transparent: false,
+			transparent_ipv6: false,
 			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
 			reserved: vec![],
 		})

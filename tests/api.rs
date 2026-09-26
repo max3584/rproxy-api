@@ -275,6 +275,7 @@ async fn metrics_and_capabilities() {
 
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["transparent"], false);
+	assert_eq!(caps["transparent_ipv6"], false);
 	assert_eq!(caps["source_ip"], json!(["proxy", "proxy_v1", "proxy_v2"]));
 }
 

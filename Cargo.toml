@@ -51,7 +51,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
