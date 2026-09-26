@@ -145,7 +145,7 @@ tls:
 - `GET /capabilities` に、この版で使える機能を返す。
 
 ```json
-{"features": {"http": true, "http3": false, "acme": false, "tls_options": false,
+{"features": {"http": true, "http3": false, "acme": false, "tls_options": true,
               "middlewares": ["redirect_scheme", "redirect_regex", "ip_allow", "headers"],
               "services": ["health_check"]}}
 ```

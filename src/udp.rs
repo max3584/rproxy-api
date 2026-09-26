@@ -43,6 +43,11 @@ pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16) {
 					rt.stats.denied();
 					debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "allow_from");
 				}
+				// also datagrams of sessions that were open before the ban
+				Ok((_, client)) if rt.crowdsec_blocks(client.ip()) => {
+					rt.stats.denied();
+					debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "crowdsec");
+				}
 				Ok((n, client)) => {
 					let tx = {
 						let mut map = sessions.lock().unwrap();

@@ -142,7 +142,7 @@ impl Features {
 		http: true,
 		http3: false,
 		acme: false,
-		tls_options: false,
+		tls_options: true,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
 			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec",
@@ -223,6 +223,10 @@ pub struct RuleRequest {
 	/// L7 routing (v0.3): routes, services and middlewares.
 	#[serde(default)]
 	pub http: Option<HttpSpec>,
+	/// Refuse clients blocked by the CrowdSec decisions (`global.crowdsec`) right
+	/// after accepting them, before TLS (UDP: drop their datagrams).
+	#[serde(default)]
+	pub crowdsec: bool,
 }
 
 /// Where a rule came from.
@@ -251,6 +255,7 @@ pub struct RuleSpec {
 	pub starttls_required: bool,
 	pub allow_from: Vec<Cidr>,
 	pub http: Option<HttpSpec>,
+	pub crowdsec: bool,
 	pub origin: Origin,
 }
 
@@ -406,6 +411,7 @@ impl RuleRequest {
 			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
 			allow_from,
 			http: self.http,
+			crowdsec: self.crowdsec,
 			origin: Origin::Dynamic,
 		})
 	}
@@ -429,6 +435,8 @@ pub struct UpdateRequest {
 	pub allow_from: Option<Vec<String>>,
 	/// Replaces the L7 routing when present (v0.3).
 	pub http: Option<HttpSpec>,
+	/// Turns the CrowdSec check at accept time on or off when present.
+	pub crowdsec: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -445,7 +453,7 @@ pub struct RuleStats {
 	pub rx_bytes: u64,
 	pub tx_bytes: u64,
 	pub tls_failures: u64,
-	/// Refused by allow_from or `unmatched: reject` (UDP: datagrams).
+	/// Refused by allow_from, `crowdsec` or `unmatched: reject` (UDP: datagrams).
 	pub denied: u64,
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -469,6 +477,8 @@ pub struct RuleView {
 	pub allow_from: Vec<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<HttpSpec>,
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub crowdsec: bool,
 	pub origin: Origin,
 	pub state: State,
 	pub error: Option<String>,
@@ -495,6 +505,7 @@ impl RuleView {
 			starttls_required: spec.starttls_required,
 			allow_from: spec.allow_from.iter().map(|c| c.to_string()).collect(),
 			http: spec.http.clone(),
+			crowdsec: spec.crowdsec,
 			origin: spec.origin,
 			state,
 			error,
@@ -525,6 +536,7 @@ mod tests {
 			starttls_required: None,
 			allow_from: vec![],
 			http: None,
+			crowdsec: false,
 		}
 	}
 

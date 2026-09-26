@@ -282,6 +282,9 @@ impl Registry {
 	/// Resolves targets and reads certificates, without holding the rules lock.
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
 		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required)?);
+		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
+			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
+		}
 		let http = match &spec.http {
 			Some(h) => {
 				crate::http::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
@@ -325,6 +328,7 @@ impl Registry {
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
+			crowdsec: spec.crowdsec.into(),
 			http: RwLock::new(prepared.http),
 			global: self.cfg.http.clone(),
 			http_stats: Default::default(),
@@ -430,6 +434,9 @@ impl Registry {
 		if let Some(list) = &req.allow_from {
 			spec.allow_from = crate::cidr::parse_list(list)?;
 		}
+		if let Some(on) = req.crowdsec {
+			spec.crowdsec = on;
+		}
 		if req.source_ip.is_some_and(|s| s != spec.source_ip) {
 			return Err(ApiError::unsupported("source_ip cannot be changed; delete and re-create the rule"));
 		}
@@ -484,6 +491,7 @@ impl Registry {
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.remote_host.write().unwrap() = spec.remote_host.clone();
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
+				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				if host_changed {
 					r.stop_resolver();
 					r.resolver = self.spawn_resolver(*key, &spec.remote_host, spec.remote(), &r.target_tx);
