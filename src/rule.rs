@@ -224,8 +224,12 @@ impl RuleRequest {
 			return Err(ApiError::invalid("starttls_required needs starttls"));
 		}
 		match (self.protocol, self.source_ip) {
-			(Protocol::Udp, SourceIp::ProxyV1 | SourceIp::ProxyV2) => {
-				return Err(ApiError::unsupported("PROXY protocol is supported for tcp only"));
+			(Protocol::Udp, SourceIp::ProxyV1) => {
+				return Err(ApiError::unsupported("PROXY protocol v1 is text over tcp; use proxy_v2 for udp"));
+			}
+			// the header would end up inside the backend's DTLS
+			(Protocol::Udp, SourceIp::ProxyV2) if tls.upstream.tls => {
+				return Err(ApiError::unsupported("proxy_v2 over udp cannot be combined with upstream.tls (DTLS to the backend)"));
 			}
 			(_, SourceIp::Transparent) if !transparent_available => {
 				return Err(ApiError::unsupported(
@@ -387,10 +391,17 @@ mod tests {
 	}
 
 	#[test]
-	fn proxy_protocol_is_tcp_only() {
+	fn udp_takes_proxy_v2_but_not_v1() {
 		let mut r = req();
 		r.protocol = Protocol::Udp;
+		r.source_ip = SourceIp::ProxyV1;
+		assert_eq!(r.clone().validate(&Caps::default()).unwrap_err().code, "unsupported");
 		r.source_ip = SourceIp::ProxyV2;
+		assert!(r.clone().validate(&Caps::default()).is_ok());
+		// the header would end up inside the DTLS to the backend
+		let tls = serde_json::from_value(serde_json::json!({"mode": "terminate",
+			"certificates": [{"cert_file": "/c.pem", "key_file": "/c.key"}], "upstream": {"tls": true}})).unwrap();
+		r.tls = Some(tls);
 		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "unsupported");
 	}
 

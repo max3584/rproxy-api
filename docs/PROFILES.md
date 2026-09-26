@@ -17,7 +17,7 @@ mTLS も同じ考え方です。`client_auth.ca_file` にはルートだけを�
 
 | やりたいこと | `tls.mode` | 補足 |
 |---|---|---|
-| 中身に触れずに流す | `passthrough`（既定） | 送信元 IP が必要なら `source_ip: proxy_v2`（転送先の対応が必要） |
+| 中身に触れずに流す | `passthrough`（既定） | 送信元 IP が必要なら `source_ip: proxy_v2`（転送先の対応が必要）。UDP でも使える（DNS なら dnsdist・PowerDNS Recursor・Unbound の proxy protocol の設定。データグラムごとに 16〜52 バイト大きくなるので、MTU に近い大きさのデータグラムに注意） |
 | 1 つのポートで、ホスト名ごとに転送先を分ける（証明書は転送先が持つ） | `sni` | tcp のみ |
 | rproxy で証明書を持ち、転送先には平文（または別の TLS）で送る | `terminate` | mTLS、ALPN、再暗号化もここ |
 | メールの STARTTLS を rproxy で受ける | `terminate` + `starttls` | SMTP / IMAP / POP3 |
