@@ -18,3 +18,23 @@ Description: Platform independent asynchronous UDP/TCP proxy
  time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
  termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
 
+Package: rproxy-api
+Architecture: arm64
+Version: 0.2.1-1
+Priority: optional
+Section: net
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 8842
+Depends: passwd
+Filename: pool/main/r/rproxy-api/rproxy-api_0.2.1-1_arm64.deb
+Size: 2764040
+MD5sum: 7dc7a9d17fb07e0238bd74f3f0a3762d
+SHA1: 30f1c7ab9fe6c293e799e7a5ab56b34198abcbf7
+SHA256: c376cda3aed5338d863188dc1787184ac6bb4e8d38adc8d0ad477acd994341df
+SHA512: 5b457e7d787c6a43f646b26722aa8aba35e0b81a08aa292e638bc458cc8bd3957aa87e9f6dee76d97d85f52e0fa9c3a7ab03018b31eeaf7ec07509212f12a761
+Homepage: https://github.com/max3584/rproxy-api
+Description: L4 TCP/UDP forwarder managed through an HTTP API
+ Layer 4 TCP/UDP forwarder whose rules are added, changed and removed at run
+ time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
+ termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
+
