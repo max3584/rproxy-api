@@ -52,7 +52,10 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | 環境変数 | 引数 | 既定 | 説明 |
 |---|---|---|---|
 | `RPROXY_API_ADDR` | `--api-addr` | `127.0.0.1` | 制御 API の待ち受けアドレス。カンマ区切りで複数指定できる |
-| `RPROXY_API_PORT` | `--api-port` | `8080` | 制御 API のポート |
+| `RPROXY_API_PORT` | `--api-port` | `8080` | 制御 API のポート。`0` で TCP では待ち受けない（`RPROXY_API_SOCKET` が必須） |
+| `RPROXY_API_SOCKET` | `--api-socket` | なし | 制御 API の Unix ソケット（例 `/run/rproxy/api.sock`）。TCP と併用できる。トークンは TCP と同じく要る。親ディレクトリがないと起動しない。前回の残りのソケットは置き換える |
+| `RPROXY_API_SOCKET_MODE` | `--api-socket-mode` | `660` | ソケットファイルのモード（8 進数） |
+| `RPROXY_API_SOCKET_GROUP` | `--api-socket-group` | なし | ソケットファイルのグループ（名前か ID）。UI を動かすユーザーが入っているグループにする |
 | `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP で読み直す |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
@@ -76,6 +79,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | ログのディレクトリに書けない | 標準出力にログを出す（`part: log`） |
 | トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP すると解除（`part: tokens`） |
 | 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを開き直す（10 秒後から間隔を倍々に延ばし、最大 5 分）（`part: api_tls` / `part: api`） |
+| 制御 API の Unix ソケットを作れない（権限、別のプロセスが使用中） | ソケットなしで起動する（`part: api_socket`） |
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |

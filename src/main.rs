@@ -27,9 +27,18 @@ struct Options {
 	/// Addresses for the control API, comma-separated or repeated
 	#[arg(long, env = "RPROXY_API_ADDR", value_delimiter = ',', default_value = "127.0.0.1")]
 	api_addr: Vec<IpAddr>,
-	/// Port for the control API
+	/// Port for the control API (0: no TCP listener, only --api-socket)
 	#[arg(long, env = "RPROXY_API_PORT", default_value_t = 8080)]
 	api_port: u16,
+	/// Unix socket for the control API, in addition to TCP (e.g. /run/rproxy/api.sock)
+	#[arg(long, env = "RPROXY_API_SOCKET")]
+	api_socket: Option<PathBuf>,
+	/// Mode of the socket file (octal)
+	#[arg(long, env = "RPROXY_API_SOCKET_MODE", default_value = "660")]
+	api_socket_mode: String,
+	/// Group of the socket file (name or id), e.g. the UI's user group
+	#[arg(long, env = "RPROXY_API_SOCKET_GROUP")]
+	api_socket_group: Option<String>,
 	/// File of bearer tokens (one per line, or YAML with scopes); re-read on SIGHUP
 	#[arg(long, env = "RPROXY_TOKEN_FILE")]
 	token_file: Option<PathBuf>,
@@ -158,8 +167,24 @@ fn main() -> ExitCode {
 }
 
 async fn run(opts: Options) -> Result<(), String> {
-	let addrs = opts.api_addr.clone();
+	let addrs = if opts.api_port == 0 { vec![] } else { opts.api_addr.clone() };
+	if addrs.is_empty() && opts.api_socket.is_none() {
+		return Err("--api-port 0 turns TCP off; give --api-socket (RPROXY_API_SOCKET) for the control API".into());
+	}
 	check_exposure(&opts, &addrs)?;
+	#[cfg(unix)]
+	let socket = match &opts.api_socket {
+		Some(path) => Some(rproxy_api::unix_api::SocketOptions {
+			path: path.clone(),
+			mode: rproxy_api::unix_api::parse_mode(&opts.api_socket_mode)?,
+			group: opts.api_socket_group.clone(),
+		}),
+		None => None,
+	};
+	#[cfg(not(unix))]
+	if opts.api_socket.is_some() {
+		return Err("--api-socket needs a Unix system".into());
+	}
 	if opts.tls_cert.is_some() != opts.tls_key.is_some() {
 		return Err("--tls-cert and --tls-key must be given together".into());
 	}
@@ -259,12 +284,34 @@ async fn run(opts: Options) -> Result<(), String> {
 		}
 	}
 
+	#[cfg(unix)]
+	let unix_server = match &socket {
+		Some(socket) => match rproxy_api::unix_api::bind(socket).await {
+			Ok(listener) => {
+				info!(event = "api.listening", socket = %socket.path.display());
+				let serve = axum::serve(listener, app.clone()).with_graceful_shutdown(stop.clone().cancelled_owned());
+				Some(tokio::spawn(async move { serve.await }))
+			}
+			Err(rproxy_api::unix_api::SocketError::Config(e)) => return Err(e),
+			Err(rproxy_api::unix_api::SocketError::Unavailable(e)) => {
+				error!(event = "degraded", part = "api_socket", error = %e, "control API is not on the Unix socket");
+				None
+			}
+		},
+		None => None,
+	};
+
 	wait_for_shutdown(&tokens, &tls, &opts, &registry).await?;
 
 	info!(event = "shutdown");
 	stop.cancel();
 	for handle in handles.lock().unwrap().iter() {
 		handle.graceful_shutdown(Some(Duration::from_secs(5)));
+	}
+	#[cfg(unix)]
+	if let (Some(server), Some(socket)) = (unix_server, &socket) {
+		let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+		let _ = std::fs::remove_file(&socket.path);
 	}
 	registry.shutdown().await;
 	Ok(())

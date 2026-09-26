@@ -50,11 +50,13 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ、またはスコープ付きの YAML）。変えたら `systemctl reload rproxy-api` |
 | 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
+| `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
 
 ## 制御 API
 
+- Unix ソケット（`RPROXY_API_SOCKET`）を使うと、ファイルのモードとグループで接続できる利用者を絞れる（loopback の TCP は同じホストの誰でも接続できる）。`RPROXY_API_PORT=0` で TCP を閉じられる。
 - 既定の待ち受けは `127.0.0.1`。loopback 以外で待ち受けるには、トークンファイルと TLS 証明書の両方が必須（どちらかがなければ起動しない）。
 - 1 行に 1 つ書いたトークンは全権限。YAML の書き方では、トークンごとにスコープ（`rules:read` / `rules:write` / `metrics:read` / `admin`）・変更できる待ち受けポート・有効期限を決められ、ファイルには SHA-256 だけを置く（docs/API.md）。変更は `event: "audit"` のログに残る。
 - 複数のトークンを同時に有効にできるので、新しいトークンを足して reload し、UI を切り替えてから古いトークンを消せば止めずに入れ替えられる。

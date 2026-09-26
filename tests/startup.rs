@@ -365,3 +365,64 @@ rules:
 	let (ok, out) = Rproxy::start(&dir, free_port(), &[("RPROXY_CONFIG", cfg.to_str().unwrap())]).exited();
 	assert!(!ok && out.contains("version 9"), "{out}");
 }
+
+/// One HTTP/1.1 request over a Unix socket; returns the whole response.
+async fn unix_get(socket: &Path, path: &str, token: Option<&str>) -> Option<String> {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let mut s = tokio::net::UnixStream::connect(socket).await.ok()?;
+	let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+	s.write_all(format!("GET {path} HTTP/1.1\r\nHost: rproxy\r\n{auth}Connection: close\r\n\r\n").as_bytes()).await.ok()?;
+	let mut out = String::new();
+	s.read_to_string(&mut out).await.ok()?;
+	Some(out)
+}
+
+#[tokio::test]
+async fn the_api_on_a_unix_socket() {
+	let dir = workdir("socket");
+	let socket = dir.join("api.sock");
+	fs::write(dir.join("tokens"), "sock-secret\n").unwrap();
+	// a stale socket from an earlier run is replaced
+	drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+	let rp = Rproxy::start(
+		&dir,
+		0,
+		&[
+			("RPROXY_API_SOCKET", socket.to_str().unwrap()),
+			("RPROXY_API_SOCKET_MODE", "600"),
+			("RPROXY_TOKEN_FILE", dir.join("tokens").to_str().unwrap()),
+		],
+	);
+	wait_for("the socket", &rp, || async { unix_get(&socket, "/healthz", None).await.is_some_and(|r| r.ends_with("ok")) }).await;
+	assert_eq!(fs::metadata(&socket).unwrap().permissions().mode() & 0o777, 0o600);
+	let r = unix_get(&socket, "/rules", None).await.unwrap();
+	assert!(r.starts_with("HTTP/1.1 401"), "tokens apply on the socket too: {r}");
+	let r = unix_get(&socket, "/rules", Some("sock-secret")).await.unwrap();
+	assert!(r.starts_with("HTTP/1.1 200") && r.ends_with("[]"), "{r}");
+	assert!(!rp.log().contains(r#""event":"api.listening","addr""#), "--api-port 0 means no TCP listener:\n{}", rp.log());
+
+	// SIGTERM removes the socket file
+	// SAFETY: signalling our own child
+	unsafe { libc::kill(rp.child.id() as i32, libc::SIGTERM) };
+	let (ok, log) = rp.exited();
+	assert!(ok, "{log}");
+	assert!(!socket.exists(), "{log}");
+}
+
+#[tokio::test]
+async fn unix_socket_mistakes_stop_the_startup() {
+	let dir = workdir("socket-bad");
+	fs::write(dir.join("plain"), "").unwrap();
+	let plain = dir.join("plain");
+	let missing = dir.join("nope/api.sock");
+	for (env, want) in [
+		(vec![], "give --api-socket"),
+		(vec![("RPROXY_API_SOCKET", plain.to_str().unwrap())], "not a socket"),
+		(vec![("RPROXY_API_SOCKET", missing.to_str().unwrap())], "does not exist"),
+		(vec![("RPROXY_API_SOCKET", "s.sock"), ("RPROXY_API_SOCKET_MODE", "999")], "octal"),
+		(vec![("RPROXY_API_SOCKET", "s.sock"), ("RPROXY_API_SOCKET_GROUP", "no-such-group-rproxy")], "no such group"),
+	] {
+		let (ok, log) = Rproxy::start(&dir, 0, &env).exited();
+		assert!(!ok && log.contains(want), "{env:?}: {log}");
+	}
+}

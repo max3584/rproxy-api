@@ -5,7 +5,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 ## 基本
 
 - HTTP/1.1、JSON（UTF-8）。`GET /metrics` だけは Prometheus のテキスト形式。
-- 待ち受けアドレスは `--api-addr` で指定する（複数回指定できる）。ポートは `--api-port` で指定する（既定 8080）。
+- 待ち受けアドレスは `--api-addr` で指定する（複数回指定できる）。ポートは `--api-port` で指定する（既定 8080。`0` で TCP を使わない）。
+- Unix ソケットでも受けられる（`--api-socket`、`--api-socket-mode`、`--api-socket-group`）。中身は TCP と同じ HTTP/1.1 で、トークンも同じく要る。
 - 認証：`--token-file` を指定した場合、`/healthz` 以外のエンドポイントは `Authorization: Bearer <token>` が必須になる。
   - トークンファイルは 2 つの書き方がある。
     - 1 行に 1 つトークンを書く（すべての権限。ログでの名前は `token-1`、`token-2`…）。空行と `#` で始まる行は無視する。
