@@ -199,3 +199,57 @@ async fn a_port_range_on_both_addresses() {
 	}
 	assert_eq!(tcp_says(&format!("[::1]:{port}"), "x").await.unwrap(), "R0:x");
 }
+
+/// `passthrough` routes of a terminating rule (#100) work on every address.
+#[tokio::test]
+async fn passthrough_names_on_an_extra_address() {
+	use common::pki::Pki;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	if !has_ipv6() {
+		return;
+	}
+	let pki = Pki::new("listen-pass");
+	let own = pki.server("k8s", &["registry.test", "a.b.tenant.test"]);
+	let front = pki.server("front", &["front.test"]);
+	// the passthrough backend terminates TLS with its own certificate
+	let acceptor = pki.acceptor(&own);
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let passed = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		while let Ok((s, _)) = listener.accept().await {
+			let acceptor = acceptor.clone();
+			tokio::spawn(async move {
+				let Ok(mut s) = acceptor.accept(s).await else { return };
+				let mut buf = [0u8; 64];
+				if let Ok(n) = s.read(&mut buf).await {
+					let _ = s.write_all(&[b"P:", &buf[..n]].concat()).await;
+				}
+			});
+		}
+	});
+	let plain = tcp_backend("R:").await;
+	let h = harness().await;
+	let port = dual_port();
+	let mut body = rule("tcp", port, plain);
+	body["extra_listen_addrs"] = json!(["::1"]);
+	body["tls"] = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"routes": [{"server_names": ["registry.test", "**.tenant.test"], "remote_addr": "127.0.0.1", "remote_port": passed.port(), "passthrough": true}],
+	});
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	for (addr, name, want) in [
+		(format!("[::1]:{port}"), "registry.test", "P:1"),
+		(format!("[::1]:{port}"), "a.b.tenant.test", "P:1"),
+		(format!("127.0.0.1:{port}"), "registry.test", "P:1"),
+		(format!("[::1]:{port}"), "front.test", "R:1"),
+	] {
+		let tcp = TcpStream::connect(&addr).await.unwrap();
+		let mut s = pki.connector(None).connect(name.to_string().try_into().unwrap(), tcp).await.unwrap();
+		s.write_all(b"1").await.unwrap();
+		let mut buf = [0u8; 64];
+		let n = tokio::time::timeout(std::time::Duration::from_secs(3), s.read(&mut buf)).await.unwrap().unwrap();
+		assert_eq!(String::from_utf8_lossy(&buf[..n]), want, "{addr} {name}");
+	}
+}
