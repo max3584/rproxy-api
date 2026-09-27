@@ -1,5 +1,5 @@
 //! TLS / DTLS settings of a rule: what the API accepts, and the rustls /
-//! webrtc-dtls configurations built from it.
+//! the dtls crate configurations built from it.
 
 use std::fs;
 use std::io::BufReader;
@@ -735,7 +735,7 @@ pub(crate) fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError
 	Ok(Arc::new(config))
 }
 
-fn dtls_certificate(files: &CertFiles) -> Result<webrtc_dtls::crypto::Certificate, ApiError> {
+fn dtls_certificate(files: &CertFiles) -> Result<dtls::crypto::Certificate, ApiError> {
 	let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
 	let PrivateKeyDer::Pkcs8(key) = load_key(&files.key_file)? else {
 		return Err(tls_error(format!(
@@ -743,16 +743,43 @@ fn dtls_certificate(files: &CertFiles) -> Result<webrtc_dtls::crypto::Certificat
 			files.key_file
 		)));
 	};
-	let pair = rcgen::KeyPair::try_from(key.secret_pkcs8_der()).map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
-	let leaf_spki = x509_parser::parse_x509_certificate(chain[0].as_ref())
-		.map(|(_, c)| c.public_key().raw.to_vec())
+	let private_key = dtls_private_key(key.secret_pkcs8_der()).map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
+	let leaf_key = x509_parser::parse_x509_certificate(chain[0].as_ref())
+		.map(|(_, c)| c.public_key().subject_public_key.data.to_vec())
 		.map_err(|e| tls_error(format!("{}: {e}", files.cert_file)))?;
-	if leaf_spki != pair.public_key_der() {
+	if leaf_key != dtls_public_key(&private_key) {
 		return Err(tls_error(format!("{} does not belong to {}", files.key_file, files.cert_file)));
 	}
-	let private_key = webrtc_dtls::crypto::CryptoPrivateKey::try_from(&pair)
-		.map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
-	Ok(webrtc_dtls::crypto::Certificate { certificate: chain, private_key })
+	Ok(dtls::crypto::Certificate { certificate: chain, private_key })
+}
+
+/// A DTLS private key from PKCS#8 DER: ECDSA P-256, Ed25519 or RSA (what the
+/// dtls crate can sign with). Built with ring directly, so no rcgen type has to
+/// cross into the dtls crate (which uses an older rcgen).
+pub fn dtls_private_key(pkcs8: &[u8]) -> Result<dtls::crypto::CryptoPrivateKey, String> {
+	use dtls::crypto::{CryptoPrivateKey, CryptoPrivateKeyKind};
+	use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+	let kind = if let Ok(k) = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &ring::rand::SystemRandom::new()) {
+		CryptoPrivateKeyKind::Ecdsa256(k)
+	} else if let Ok(k) = Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8) {
+		CryptoPrivateKeyKind::Ed25519(k)
+	} else if let Ok(k) = ring::rsa::KeyPair::from_pkcs8(pkcs8) {
+		CryptoPrivateKeyKind::Rsa256(k)
+	} else {
+		return Err("DTLS needs an ECDSA P-256, Ed25519 or RSA key".into());
+	};
+	Ok(CryptoPrivateKey { kind, serialized_der: pkcs8.to_vec() })
+}
+
+/// The public key as it appears in a certificate's subjectPublicKey.
+fn dtls_public_key(key: &dtls::crypto::CryptoPrivateKey) -> Vec<u8> {
+	use dtls::crypto::CryptoPrivateKeyKind;
+	use ring::signature::KeyPair;
+	match &key.kind {
+		CryptoPrivateKeyKind::Ecdsa256(k) => k.public_key().as_ref().to_vec(),
+		CryptoPrivateKeyKind::Ed25519(k) => k.public_key().as_ref().to_vec(),
+		CryptoPrivateKeyKind::Rsa256(k) => k.public_key().as_ref().to_vec(),
+	}
 }
 
 /// Everything needed per connection, rebuilt when the rule changes or on SIGHUP.
@@ -767,10 +794,10 @@ pub struct TlsRuntime {
 	/// Server side of QUIC for HTTP/3 (tcp terminate); an error text when it cannot be used.
 	pub quic_config: Option<QuicConfig>,
 	pub connector: Option<tokio_rustls::TlsConnector>,
-	dtls_certs: Vec<webrtc_dtls::crypto::Certificate>,
+	dtls_certs: Vec<dtls::crypto::Certificate>,
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
-	dtls_upstream_cert: Option<webrtc_dtls::crypto::Certificate>,
+	dtls_upstream_cert: Option<dtls::crypto::Certificate>,
 }
 
 impl TlsRuntime {
@@ -839,20 +866,20 @@ impl TlsRuntime {
 		self.spec.mode
 	}
 
-	/// DTLS server settings for one client session. webrtc-dtls proves the
+	/// DTLS server settings for one client session. the dtls crate proves the
 	/// client holds its key (CertificateVerify); the chain is checked by
 	/// `verify_dtls_client` right after the handshake, before any data flows.
-	pub fn dtls_server_config(&self) -> webrtc_dtls::config::Config {
-		use webrtc_dtls::config::ClientAuthType;
+	pub fn dtls_server_config(&self) -> dtls::config::Config {
+		use dtls::config::ClientAuthType;
 		let client_auth = match self.spec.client_auth.mode {
 			ClientAuthMode::None => ClientAuthType::NoClientCert,
 			ClientAuthMode::Optional => ClientAuthType::RequestClientCert,
 			ClientAuthMode::Required => ClientAuthType::RequireAnyClientCert,
 		};
-		webrtc_dtls::config::Config {
+		dtls::config::Config {
 			certificates: self.dtls_certs.clone(),
 			client_auth,
-			extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require,
+			extended_master_secret: dtls::config::ExtendedMasterSecretType::Require,
 			..Default::default()
 		}
 	}
@@ -873,14 +900,14 @@ impl TlsRuntime {
 	}
 
 	/// DTLS client settings towards the backend.
-	pub fn dtls_client_config(&self, target_host: &str) -> webrtc_dtls::config::Config {
+	pub fn dtls_client_config(&self, target_host: &str) -> dtls::config::Config {
 		let up = &self.spec.upstream;
-		webrtc_dtls::config::Config {
+		dtls::config::Config {
 			certificates: self.dtls_upstream_cert.clone().into_iter().collect(),
 			roots_cas: self.dtls_upstream_roots.clone().unwrap_or_else(RootCertStore::empty),
 			server_name: up.server_name.clone().unwrap_or_else(|| target_host.to_string()),
 			insecure_skip_verify: up.insecure_skip_verify,
-			extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require,
+			extended_master_secret: dtls::config::ExtendedMasterSecretType::Require,
 			..Default::default()
 		}
 	}

@@ -238,7 +238,7 @@ mod tests {
 		let v6: SocketAddr = "[fd00:2::2]:80".parse().unwrap();
 		let mapped: SocketAddr = "[::ffff:198.51.100.7]:5000".parse().unwrap();
 		let gua: SocketAddr = "[2001:db8:1::2]:5000".parse().unwrap();
-		assert_eq!(source_for(v4, mapped).unwrap(), "198.51.100.7:5000".parse().unwrap());
+		assert_eq!(source_for(v4, mapped).unwrap(), "198.51.100.7:5000".parse::<SocketAddr>().unwrap());
 		assert_eq!(source_for(v6, gua).unwrap(), gua);
 		assert!(source_for(v4, gua).is_err(), "IPv6 client to an IPv4 target");
 		assert!(source_for(v6, "198.51.100.7:1".parse().unwrap()).is_err(), "IPv4 client to an IPv6 target");
