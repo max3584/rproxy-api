@@ -60,7 +60,7 @@ async fn loads_every_schema_version() {
 		r#"INSERT INTO forward_rules (auth_id, protocol, src_addr, src_port, src_port_end, dist_addr, dist_port, source_ip, options) VALUES
 		 ('u1', 'udp', '0.0.0.0', 10000, 10099, 'media.local', 10000, 'proxy', NULL),
 		 ('u2', 'tcp', '0.0.0.0', 993, NULL, 'imap.local', 143, 'proxy_v2',
-		  '{"tls": {"mode": "terminate", "certificates": [{"cert_file": "/c.pem", "key_file": "/k.pem"}]}, "starttls": null}'),
+		  '{"tls": {"mode": "terminate", "certificates": [{"cert_file": "/c.pem", "key_file": "/k.pem"}]}, "starttls": null, "extra_listen_addrs": ["::"]}'),
 		 ('u3', 'tcp', '0.0.0.0', 25, NULL, 'mx.local', 25, 'proxy', '{"tls": {"mode": "terminate", "certificates": [{"cert_file": "/c", "key_file": "/k"}]}, "starttls": "smtp", "starttls_required": false, "allow_from": ["10.0.0.0/8"]}'),
 		 ('u4', 'tcp', '0.0.0.0', 26, NULL, 'x', 1, 'proxy', '{"tls": {"mode": "nonsense"}}'),
 		 ('u5', 'tcp', '0.0.0.0', 5432, NULL, 'db1.local', 5432, 'proxy',
@@ -73,6 +73,8 @@ async fn loads_every_schema_version() {
 	assert_eq!(rules[0].listen_port_end, Some(10099));
 	assert_eq!(rules[1].tls.as_ref().unwrap().mode, TlsMode::Terminate);
 	assert_eq!(rules[1].starttls, None);
+	// more listen addresses (#99)
+	assert_eq!(rules[1].extra_listen_addrs, vec!["::".to_string()]);
 	assert_eq!((rules[2].starttls, rules[2].starttls_required), (Some(StartTls::Smtp), Some(false)));
 	assert_eq!(rules[2].allow_from, vec!["10.0.0.0/8".to_string()]);
 	// several targets (#98): dist_addr / dist_port are left to the targets

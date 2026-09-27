@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::balance::Lease;
@@ -27,11 +28,12 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 /// Accepts connections on one port of the rule; `offset` is its place in a range.
-pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16) {
+/// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
+pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
 	loop {
 		tokio::select! {
 			biased;
-			_ = rt.stop.cancelled() => break,
+			_ = stop.cancelled() => break,
 			accepted = listener.accept() => match accepted {
 				Ok((inbound, peer)) => {
 					rt.tracker.spawn(handle(inbound, peer, rt.clone(), offset));
@@ -60,10 +62,14 @@ struct Connected {
 /// a target that refuses is marked down for a while and the next one is tried.
 async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Result<Connected> {
 	let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no resolved target");
-	let fallback = target.candidates.iter().filter(|c| !c.addrs.is_empty()).count() > 1;
-	for c in target.candidates.iter().filter(|c| !c.addrs.is_empty()) {
+	let bind_as = rt.bind_as(client);
+	// transparent: only backends of the client's address family (an IPv6 client
+	// of a rule that also listens on IPv4 goes to an IPv6 target)
+	let usable = |c: &&crate::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
+	let fallback = target.candidates.iter().filter(usable).count() > 1;
+	for c in target.candidates.iter().filter(usable) {
 		let lease = c.lease();
-		for addr in &c.addrs {
+		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
 			let attempt = source::connect_tcp(*addr, rt.bind_as(client));
 			let result = if fallback {
 				tokio::time::timeout(FAILOVER_CONNECT_TIMEOUT, attempt)
@@ -201,7 +207,7 @@ async fn run(
 			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
 			detail.lease = lease;
-			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr);
+			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			finish(rt, inbound, &mut out, detail).await
 		}
@@ -232,7 +238,7 @@ async fn relay_hello(
 	detail.target = Some(addr);
 	detail.lease = lease;
 	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough);
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough);
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
@@ -416,7 +422,7 @@ async fn terminate(
 	let Connected { stream: mut out, addr, host, lease } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	detail.lease = lease;
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr,
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr,
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
 		client_cn = info.client_cn.as_deref().unwrap_or(""), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""));
@@ -463,7 +469,7 @@ async fn plain_smtp(
 	let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	detail.lease = lease;
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, starttls = "smtp", tls = "none");
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, starttls = "smtp", tls = "none");
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	let extra = starttls::skip_greeting(StartTls::Smtp, &mut out).await?;
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;

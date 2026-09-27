@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep_until;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use webrtc_dtls::conn::DTLSConn;
@@ -29,7 +30,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 type Sessions = Arc<Mutex<HashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)>>>;
 
 /// Serves one port of the rule; `offset` is its place in a range.
-pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16) {
+/// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
+pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
 	let socket = Arc::new(socket);
 	let sessions: Sessions = Arc::default();
 	let next_id = AtomicU64::new(0);
@@ -38,7 +40,7 @@ pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16) {
 	loop {
 		tokio::select! {
 			biased;
-			_ = rt.stop.cancelled() => break,
+			_ = stop.cancelled() => break,
 			received = socket.recv_from(&mut buf) => match received {
 				Ok((_, client)) if !rt.allowed(client.ip()) => {
 					rt.stats.denied();
@@ -93,7 +95,8 @@ async fn session(
 	let mut events = rt.pool_events.subscribe();
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
-	let Some(Picked { mut lease, addrs: mut target_rx, addr }) = pick(&rt, offset) else {
+	let bind_as = rt.bind_as(client);
+	let Some(Picked { mut lease, addrs: mut target_rx, addr }) = pick(&rt, offset, bind_as) else {
 		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target");
 		remove(&sessions, client, id);
 		return;
@@ -110,7 +113,8 @@ async fn session(
 	};
 
 	rt.stats.opened();
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr_or_empty(target));
+	let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr_or_empty(target));
 	let header = proxy_header(&rt, client, &listener);
 
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
@@ -160,7 +164,7 @@ async fn session(
 				if rt.pool().contains(&member) && member.is_up() {
 					continue;
 				}
-				let Some(next) = pick(&rt, offset).filter(|p| !Arc::ptr_eq(p.lease.member(), &member)) else { continue };
+				let Some(next) = pick(&rt, offset, bind_as).filter(|p| !Arc::ptr_eq(p.lease.member(), &member)) else { continue };
 				match upstream.connect(next.addr).await {
 					Ok(()) => {
 						info!(event = "conn.retarget", rule = %rt.key, client = %client, from = %addr_or_empty(target), to = %next.addr,
@@ -176,7 +180,7 @@ async fn session(
 				if changed.is_err() {
 					break "stopped";
 				}
-				let next = target_rx.borrow_and_update().first().map(|a| shifted(*a, offset));
+				let next = target_rx.borrow_and_update().iter().map(|a| shifted(*a, offset)).find(|a| source::usable(*a, bind_as));
 				if let Some(next) = next.filter(|n| Some(*n) != target) {
 					match upstream.connect(next).await {
 						Ok(()) => {
@@ -213,9 +217,11 @@ struct Picked {
 
 /// The target for a new session, or for one whose target went down: the best
 /// one (by `balance`) that has addresses.
-fn pick(rt: &Runtime, offset: u16) -> Option<Picked> {
+/// The best target for a new session; with `transparent` (`bind_as`), only one
+/// of the client's address family.
+fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Option<Picked> {
 	rt.pool().order().into_iter().find_map(|m: Arc<Member>| {
-		let addr = *m.addrs(offset).first()?;
+		let addr = m.addrs(offset).into_iter().find(|a| source::usable(*a, bind_as))?;
 		let mut addrs = m.addrs.clone();
 		addrs.borrow_and_update();
 		Some(Picked { lease: Lease::new(m), addrs, addr })
@@ -276,6 +282,7 @@ async fn dtls_session(
 	let started = Instant::now();
 	// before `listener` moves into the DTLS connection
 	let header = proxy_header(&rt, client, &listener);
+	let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
 	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, client));
 	let handshake = tokio::select! {
 		_ = rt.kill.cancelled() => { remove(&sessions, client, id); return; }
@@ -341,7 +348,7 @@ async fn dtls_session(
 	};
 
 	rt.stats.opened();
-	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, dtls = true,
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, dtls = true,
 		client_cn = client_cn.as_deref().unwrap_or(""), upstream_dtls = tls.spec.upstream.tls);
 
 	let mut idle_rx = rt.udp_idle.clone();

@@ -110,6 +110,13 @@ fn v2_header(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, dgram: boo
 	out
 }
 
+/// Whether a connection to `target` can be made from `bind_as` (`transparent`:
+/// the client and the target must be in the same address family). Without
+/// `bind_as` every target will do.
+pub fn usable(target: SocketAddr, bind_as: Option<SocketAddr>) -> bool {
+	bind_as.is_none_or(|client| source_for(target, client).is_ok())
+}
+
 /// The client address as the source for a connection to `target`: an
 /// IPv4-mapped client (a dual-stack listener) becomes plain IPv4 for an IPv4
 /// target. The client and the target must end up in the same family.
@@ -212,6 +219,18 @@ pub async fn udp_upstream(target: SocketAddr, bind_as: Option<SocketAddr>) -> io
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn transparent_needs_the_clients_family() {
+		let (v4, v6): (SocketAddr, SocketAddr) = ("10.0.0.1:80".parse().unwrap(), "[2001:db8::1]:80".parse().unwrap());
+		assert!(usable(v4, None) && usable(v6, None));
+		let c4: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+		let c6: SocketAddr = "[2001:db8::9]:5000".parse().unwrap();
+		let mapped: SocketAddr = "[::ffff:192.0.2.1]:5000".parse().unwrap();
+		assert!(usable(v4, Some(c4)) && !usable(v6, Some(c4)));
+		assert!(usable(v6, Some(c6)) && !usable(v4, Some(c6)));
+		assert!(usable(v4, Some(mapped)), "a dual-stack listener's IPv4 client");
+	}
 
 	#[test]
 	fn transparent_source_matches_the_target_family() {
