@@ -83,7 +83,15 @@
     "type": "object",
     "properties": {
      "server_name": {
-      "type": "string"
+      "type": "string",
+      "description": "name, *.suffix (one label) or **.suffix (any depth)"
+     },
+     "server_names": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "several names instead of server_name"
      },
      "remote_addr": {
       "type": "string"
@@ -92,10 +100,13 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 65535
+     },
+     "passthrough": {
+      "type": "boolean",
+      "description": "terminate rules: relay TLS of these names untouched"
      }
     },
     "required": [
-     "server_name",
      "remote_addr",
      "remote_port"
     ],

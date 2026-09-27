@@ -372,8 +372,13 @@ pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp, http: &HttpSpec) -> Re
 	if http.http3 && source_ip == SourceIp::Transparent {
 		return Err(ApiError::unsupported("http3 cannot be combined with source_ip transparent"));
 	}
-	if !tls.routes.is_empty() {
-		return Err(ApiError::tls_config("http rules route by match; tls.routes is not used (use Host(...) in http.routes)"));
+	if tls.routes.iter().any(|r| !r.passthrough) {
+		return Err(ApiError::tls_config(
+			"http rules route by match; only passthrough tls.routes are used (use Host(...) in http.routes)",
+		));
+	}
+	if tls.unmatched == crate::tlsconf::Unmatched::Reject {
+		return Err(ApiError::tls_config("http rules answer unmatched names with http.default; unmatched: reject is not used"));
 	}
 	if tls.upstream.tls {
 		return Err(ApiError::tls_config("http rules pick TLS towards a backend by its URL (https://); tls.upstream.tls is not used"));

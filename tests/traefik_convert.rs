@@ -65,6 +65,17 @@ fn gitlab_and_cdn_behind_crowdsec() {
 		assert!(names.contains(&want), "{want} missing: {names:?}");
 	}
 	assert!(!names.contains(&"dashboard"), "api@internal has no equivalent");
+	// the Kubernetes routers on the same port pass TLS through by name (dynamic/k8s.yml)
+	let pass: Vec<(Vec<String>, bool)> = tls.routes.iter().map(|r| (r.patterns(), r.passthrough)).collect();
+	assert_eq!(
+		pass,
+		[
+			(vec!["registry.example.com".to_string()], true),
+			(vec!["**.tenant.example.com".to_string()], true),
+			(vec!["*.apps.example.com".to_string()], true),
+		]
+	);
+	assert!(!notes.contains("left out: registry"), "{notes}");
 	assert!(http.http3);
 	assert!(matches!(http.middlewares["crowdsec"], MiddlewareSpec::Crowdsec { appsec: true, .. }));
 	assert!(matches!(&http.middlewares["rate-limit-login"], MiddlewareSpec::RateLimit { average: 5, period, burst: Some(10), .. } if period == "1m"));
@@ -88,7 +99,8 @@ fn tcp_and_udp_routers_from_toml() {
 	assert_eq!(doc.rules.len(), 4);
 	let sni = rule(&doc, 443);
 	let tls = sni.tls.as_ref().unwrap();
-	assert_eq!(tls.routes.len(), 2);
+	// one route per router; a router with several HostSNI names lists them in server_names
+	assert_eq!(tls.routes.iter().map(|r| r.patterns().len()).sum::<usize>(), 2);
 	// HostSNI(`*`) is the default: a weighted service becomes targets with weights
 	let weights: Vec<(&str, Option<u32>)> = sni.targets.iter().map(|t| (t.addr.as_str(), t.weight)).collect();
 	assert_eq!(weights, [("10.0.1.11", Some(3)), ("10.0.1.12", None)]);

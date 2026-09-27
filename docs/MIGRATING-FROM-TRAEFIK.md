@@ -41,7 +41,9 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `entryPoints.<名前>.http3` | `http.http3: true` |
 | `entryPoints.<名前>.forwardedHeaders.trustedIPs` | `global.trusted_proxies` |
 | `accessLog.filePath` | `global.access_log`（書式は rproxy の JSON Lines。Traefik の書式やフィルタは変換しない） |
-| TCP のルーター（`HostSNI`、`tls.passthrough: true`） | `tls.mode: sni` の `tls.routes`。`HostSNI(`*`)` がルールの転送先（なければ `unmatched: reject`） |
+| TCP のルーター（`HostSNI`、`tls.passthrough: true`） | `tls.mode: sni` の `tls.routes`（ルーターごとに 1 つ。名前が複数なら `server_names`）。`HostSNI(`*`)` がルールの転送先（なければ `unmatched: reject`） |
+| `HostSNIRegexp` の単純な接尾辞（`^.+\.example\.com$` / `^[^.]+\.example\.com$`） | `**.example.com`（何階層でも）/ `*.example.com`（1 階層） |
+| HTTP のルーターと同じエントリポイントの TCP の passthrough のルーター | 同じルールの `tls.routes` に `passthrough: true` で入れる（その名前だけ終端せずに流す） |
 | TCP のルーター（TLS を終端する） | `tls.mode: terminate` の `tls.routes` |
 | TCP のサービスの `proxyProtocol.version` | `source_ip: proxy_v1` / `proxy_v2` |
 | UDP のルーター | `protocol: udp` のルール |
@@ -119,8 +121,8 @@ rproxy のバージョンによって、まだ動かせないミドルウェア�
 - Traefik 自身のサービス（`api@internal` のダッシュボード、`ping@internal` など）：ルーターごと外す。管理画面は rproxy の UI（TCP-UDP-rproxy-ui）を使う
 - `metrics`：rproxy は制御 API の `GET /metrics` で Prometheus の形式を返す
 - 受け取る PROXY protocol（`entryPoints.<名前>.proxyProtocol`）：rproxy は読まない（前段が付ける `X-Forwarded-For` は `global.trusted_proxies` で信用できる）
-- HTTP と TCP のルーターが同じエントリポイントにあるとき：rproxy は 1 つのポートで両方を混ぜられないので、TCP のルーターを外す
-- TLS を通すもの（passthrough）と終端するものが同じエントリポイントにあるとき：終端する方を外す
-- `HostSNIRegexp`、`ALPN()`、ラベルだけの `defaultRule`、Kubernetes の IngressRoute（CRD）
+- HTTP と TCP のルーターが同じエントリポイントにあるとき：名前を指定した passthrough のルーターはまとめる。それ以外の TCP のルーター（TLS を終端する TCP のルーター、`HostSNI(`*`)`）は外す
+- `HostSNI(`*`)` の passthrough と、TLS を終端するルーターが同じエントリポイントにあるとき：終端する方を外す
+- 単純な接尾辞でない `HostSNIRegexp`、`ALPN()`、ラベルだけの `defaultRule`、Kubernetes の IngressRoute（CRD）
 - ミドルウェアの `digestAuth`、`contentType`、`passTLSClientCert`、`grpcWeb`、`stripPrefixRegex`、CrowdSec 以外のプラグイン
 - 各設定の細かな項目（一覧に `... is not converted` として出る）

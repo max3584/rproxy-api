@@ -130,17 +130,45 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		denied(&rt, client, "crowdsec", None);
 		return;
 	}
-	if rt.http_router().is_some() {
-		return handle_http(inbound, client, rt, offset).await;
+	let tls = rt.tls();
+	// a `terminate` rule with passthrough routes reads the ClientHello first:
+	// passthrough names are relayed as they are, the others are terminated
+	// from the bytes already read
+	let mut prefix = Vec::new();
+	let mut pass = None;
+	if tls.mode() == TlsMode::Terminate && tls.starttls.is_none() && rt.has_passthrough() {
+		match crate::sni::read_client_hello(&mut inbound).await {
+			Ok((name, hello)) => match rt.select(name.as_deref(), offset) {
+				Some(target) if target.passthrough => pass = Some((name, hello, target)),
+				// no match with `unmatched: reject` is refused by the TLS handshake below
+				_ => prefix = hello,
+			},
+			Err(e) => {
+				rt.stats.tls_failed();
+				warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, "reading the ClientHello");
+				return;
+			}
+		}
+	}
+	if pass.is_none() && rt.http_router().is_some() {
+		return handle_http(inbound, prefix, client, rt, offset).await;
 	}
 	let started = Instant::now();
 	rt.stats.opened();
-	let tls = rt.tls();
 	let mut detail = Detail::default();
 
+	let serving = async {
+		match pass {
+			Some((name, hello, target)) => {
+				let local = inbound.local_addr()?;
+				relay_hello(&mut inbound, client, local, &rt, &target, name, hello, true, &mut detail).await
+			}
+			None => run(&mut inbound, prefix, client, &rt, offset, &tls, &mut detail).await,
+		}
+	};
 	let result = tokio::select! {
 		_ = rt.kill.cancelled() => { detail.reason = "stopped"; Ok(()) }
-		r = run(&mut inbound, client, &rt, offset, &tls, &mut detail) => r,
+		r = serving => r,
 	};
 
 	rt.stats.closed();
@@ -159,6 +187,7 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 
 async fn run(
 	inbound: &mut TcpStream,
+	prefix: Vec<u8>,
 	client: SocketAddr,
 	rt: &Runtime,
 	offset: u16,
@@ -179,18 +208,80 @@ async fn run(
 		TlsMode::Sni => {
 			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
 			let target = rt.select(name.as_deref(), offset).ok_or_else(|| denied(rt, client, "unmatched", name.as_deref()))?;
-			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
-			detail.target = Some(addr);
-			detail.lease = lease;
-			detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
-			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""));
-			send_proxy_header(rt, &mut out, client, local, None).await?;
-			out.write_all(&hello).await?;
-			detail.rx += hello.len() as u64;
-			rt.stats.add_rx(hello.len() as u64);
-			finish(rt, inbound, &mut out, detail).await
+			relay_hello(inbound, client, local, rt, &target, name, hello, false, detail).await
 		}
-		TlsMode::Terminate => terminate(inbound, client, local, rt, offset, tls, detail).await,
+		TlsMode::Terminate => terminate(inbound, prefix, client, local, rt, offset, tls, detail).await,
+	}
+}
+
+/// Relays a connection without terminating TLS: the ClientHello already read,
+/// then everything else (mode `sni`, and `passthrough` routes of `terminate`).
+#[allow(clippy::too_many_arguments)]
+async fn relay_hello(
+	inbound: &mut TcpStream,
+	client: SocketAddr,
+	local: SocketAddr,
+	rt: &Runtime,
+	target: &Target,
+	name: Option<String>,
+	hello: Vec<u8>,
+	passthrough: bool,
+	detail: &mut Detail,
+) -> io::Result<()> {
+	let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, target).await?;
+	detail.target = Some(addr);
+	detail.lease = lease;
+	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
+	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough);
+	send_proxy_header(rt, &mut out, client, local, None).await?;
+	out.write_all(&hello).await?;
+	detail.rx += hello.len() as u64;
+	rt.stats.add_rx(hello.len() as u64);
+	finish(rt, inbound, &mut out, detail).await
+}
+
+/// A stream that first yields bytes already read from it (the ClientHello read
+/// to look at the server name), then the rest.
+struct Prefixed<S> {
+	prefix: Vec<u8>,
+	pos: usize,
+	inner: S,
+}
+
+impl<S> Prefixed<S> {
+	fn new(prefix: Vec<u8>, inner: S) -> Self {
+		Prefixed { prefix, pos: 0, inner }
+	}
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
+	fn poll_read(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> std::task::Poll<io::Result<()>> {
+		let this = self.get_mut();
+		if this.pos < this.prefix.len() {
+			let n = (this.prefix.len() - this.pos).min(buf.remaining());
+			buf.put_slice(&this.prefix[this.pos..this.pos + n]);
+			this.pos += n;
+			return std::task::Poll::Ready(Ok(()));
+		}
+		std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
+	fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+		std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+	}
+
+	fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+	}
+
+	fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
 	}
 }
 
@@ -252,7 +343,7 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// A connection of an `http` rule: TLS (for `terminate`), then HTTP requests
 /// routed one by one (src/http/server.rs).
-async fn handle_http(inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
 	let started = Instant::now();
 	rt.stats.opened();
 	let tls = rt.tls();
@@ -262,7 +353,7 @@ async fn handle_http(inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, o
 	let serving = async {
 		match (tls.mode(), tls.server_config.clone()) {
 			(TlsMode::Terminate, Some(config)) => {
-				let (session, i) = accept_tls(inbound, client, &rt, offset, config).await?;
+				let (session, i) = accept_tls(Prefixed::new(prefix, inbound), client, &rt, offset, config).await?;
 				info = Some(i.clone());
 				let stream = Metered::new(session, rt.clone(), rx.clone(), tx.clone());
 				http::serve(stream, client, local, rt.clone(), Some(i)).await
@@ -291,8 +382,10 @@ async fn handle_http(inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, o
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn terminate(
 	inbound: &mut TcpStream,
+	prefix: Vec<u8>,
 	client: SocketAddr,
 	local: SocketAddr,
 	rt: &Runtime,
@@ -316,7 +409,7 @@ async fn terminate(
 		}
 	}
 
-	let (mut session, info) = accept_tls(&mut *inbound, client, rt, offset, config).await?;
+	let (mut session, info) = accept_tls(Prefixed::new(prefix, &mut *inbound), client, rt, offset, config).await?;
 	let target = rt
 		.select(info.server_name.as_deref(), offset)
 		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;

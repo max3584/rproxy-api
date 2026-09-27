@@ -486,3 +486,118 @@ async fn tls_options_limit_versions_and_cipher_suites() {
 	dtls["tls"] = json!({"mode": "terminate", "certificates": files, "options": {"min_version": "1.3"}});
 	assert_eq!(h.post(dtls).await.1["code"], "unsupported", "no options for DTLS");
 }
+
+/// One HTTP/1.1 request over TLS (`name` as SNI and Host); returns the response.
+async fn https_get(pki: &Pki, port: u16, name: &str) -> std::io::Result<String> {
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
+	let mut s = pki.connector(None).connect(name.to_string().try_into().unwrap(), tcp).await?;
+	s.write_all(format!("GET / HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+	let mut out = Vec::new();
+	let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await?;
+	Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+#[tokio::test]
+async fn terminate_passes_some_names_through() {
+	let pki = Pki::new("pass");
+	// the backend's certificate covers the passthrough names; rproxy's does not
+	let own = pki.server("k8s", &["registry.test", "a.tenant.test", "x.y.tenant.test"]);
+	let passed = tls_backend(&pki, &own, "P:").await;
+	let front = pki.server("front", &["front.test", "nope.test"]);
+	let plain = tcp_backend("R:").await;
+	let h = harness().await;
+	let port = free_port();
+	let tls = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"routes": [
+			{"server_names": ["registry.test", "**.tenant.test"], "remote_addr": "127.0.0.1", "remote_port": passed.port(), "passthrough": true},
+			{"server_name": "front.test", "remote_addr": "127.0.0.1", "remote_port": plain.port()},
+		],
+		"unmatched": "reject",
+	});
+	let (status, v) = h.post(tcp_rule(port, plain, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["tls"]["routes"][0]["passthrough"], true, "{v}");
+	assert_eq!(v["tls"]["routes"][0]["server_names"][1], "**.tenant.test", "{v}");
+
+	// end to end with the backend's own certificate: rproxy did not terminate
+	assert_eq!(tls_roundtrip(&pki, port, "registry.test", None, "1").await.unwrap(), "P:1");
+	assert_eq!(tls_roundtrip(&pki, port, "a.tenant.test", None, "2").await.unwrap(), "P:2");
+	assert_eq!(tls_roundtrip(&pki, port, "x.y.tenant.test", None, "3").await.unwrap(), "P:3", "**. matches any depth");
+	// other names are terminated by rproxy and routed as before
+	assert_eq!(tls_roundtrip(&pki, port, "front.test", None, "4").await.unwrap(), "R:4");
+	assert!(tls_roundtrip(&pki, port, "nope.test", None, "5").await.is_err(), "unmatched: reject still refuses");
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert!(v["stats"]["total_connections"].as_u64().unwrap() >= 4, "{v}");
+
+	// allow_from also applies to passthrough connections
+	let port2 = free_port();
+	let mut limited = tcp_rule(
+		port2,
+		plain,
+		json!({
+			"mode": "terminate",
+			"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+			"routes": [{"server_name": "registry.test", "remote_addr": "127.0.0.1", "remote_port": passed.port(), "passthrough": true}],
+		}),
+	);
+	limited["allow_from"] = json!(["10.9.9.9"]);
+	assert_eq!(h.post(limited).await.0, StatusCode::CREATED);
+	assert!(tls_roundtrip(&pki, port2, "registry.test", None, "6").await.is_err());
+
+	// mistakes in the routes
+	let mut bad = tcp_rule(
+		free_port(),
+		plain,
+		json!({
+			"mode": "sni",
+			"routes": [{"server_name": "registry.test", "remote_addr": "127.0.0.1", "remote_port": passed.port(), "passthrough": true}],
+		}),
+	);
+	let (status, v) = h.post(bad.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+	bad["tls"] = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"routes": [{"server_name": "a.test", "server_names": ["b.test"], "remote_addr": "127.0.0.1", "remote_port": 1}],
+	});
+	let (status, v) = h.post(bad).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+}
+
+#[tokio::test]
+async fn http_rules_pass_some_names_through_on_the_same_port() {
+	let pki = Pki::new("passhttp");
+	let own = pki.server("k8s", &["registry.test", "deep.a.tenant.test"]);
+	let passed = tls_backend(&pki, &own, "P:").await;
+	let front = pki.server("front", &["cdn.test"]);
+	let h = harness().await;
+	let port = free_port();
+	let mut body = rule("tcp", port, passed);
+	let obj = body.as_object_mut().unwrap();
+	obj.remove("remote_addr");
+	obj.remove("remote_port");
+	body["tls"] = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"routes": [{"server_names": ["registry.test", "**.tenant.test"], "remote_addr": "127.0.0.1", "remote_port": passed.port(), "passthrough": true}],
+	});
+	body["http"] = json!({
+		"routes": [{"name": "cdn", "match": "Host(`cdn.test`)", "middlewares": ["hello"]}],
+		"middlewares": {"hello": {"respond": {"status": 200, "body": "from L7"}}},
+	});
+	let (status, v) = h.post(body.clone()).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let resp = https_get(&pki, port, "cdn.test").await.unwrap();
+	assert!(resp.starts_with("HTTP/1.1 200") && resp.ends_with("from L7"), "{resp}");
+	assert_eq!(tls_roundtrip(&pki, port, "registry.test", None, "1").await.unwrap(), "P:1");
+	assert_eq!(tls_roundtrip(&pki, port, "deep.a.tenant.test", None, "2").await.unwrap(), "P:2");
+
+	// only passthrough routes are used by http rules
+	body["tls"]["routes"][0]["passthrough"] = json!(false);
+	body["listen_port"] = json!(free_port());
+	let (status, v) = h.post(body).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+}
