@@ -154,7 +154,7 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 
 ## 送信元 IP の引き渡し
 
-ルールごとに `source_ip` で選ぶ。
+ルールごとに `source_ip` で選ぶ。PROXY protocol とは何か、どれを選ぶか、転送先（Postfix・Dovecot・nginx・ingress-nginx など）の設定の例は [docs/SOURCE-IP.md](docs/SOURCE-IP.md)。
 
 | 値 | 動作 | 前提 |
 |---|---|---|

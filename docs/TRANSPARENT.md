@@ -4,7 +4,7 @@
 転送先のログやアクセス制御には、rproxy ではなくクライアントのアドレスが見える。TCP と UDP、IPv4 と IPv6 に対応する。
 
 転送先が PROXY protocol に対応していれば、`source_ip: proxy_v2` のほうが簡単（経路を変えずに、ヘッダでクライアントのアドレスを渡せる）。
-transparent は、PROXY protocol に対応していない転送先で、送信元のアドレスが要るときに使う。
+transparent は、PROXY protocol に対応していない転送先で、送信元のアドレスが要るときに使う（選び方は [SOURCE-IP.md](SOURCE-IP.md)）。
 
 ## 必要なもの
 
