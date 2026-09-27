@@ -138,11 +138,13 @@ rule '{"protocol":"udp","listen_addr":"127.0.0.1","listen_port":2000,"listen_por
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 during_fds=$(fds)
 during_rss=$(rss)
+# count the rule's own sockets: the fd total also moves when other connections close meanwhile
+range_socks=$(sudo ss -Hunlp 'sport >= :2000 and sport <= :11999' | grep -c 'rproxy-api' || true)
 curl -s -o /dev/null -X DELETE "$API/rules/udp/127.0.0.1/2000"
 sleep 1
 after_fds=$(fds)
-echo "range 10000 ports: created in ${ms} ms; fds ${before_fds} -> ${during_fds} -> ${after_fds}; RSS ${before_rss} -> ${during_rss} kB"
-[ $((during_fds - before_fds)) -ge 10000 ] || fail "the range did not open 10000 sockets"
+echo "range 10000 ports: created in ${ms} ms; sockets ${range_socks}; fds ${before_fds} -> ${during_fds} -> ${after_fds}; RSS ${before_rss} -> ${during_rss} kB"
+[ "$range_socks" -ge 10000 ] || fail "the range did not open 10000 sockets"
 [ $((after_fds - before_fds)) -lt 50 ] || fail "sockets were not released after DELETE"
 [ "$ms" -lt 30000 ] || fail "creating the range took ${ms} ms"
 [ $((during_rss - before_rss)) -lt 262144 ] || fail "the range took more than 256 MiB"
