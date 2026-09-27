@@ -13,7 +13,7 @@ use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use webrtc_dtls::conn::DTLSConn;
+use dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
 use crate::balance::{Lease, Member};

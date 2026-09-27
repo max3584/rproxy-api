@@ -101,7 +101,7 @@ mod tests {
 		});
 
 		let first = resolve(&lookup, "svc:80").await.unwrap();
-		assert_eq!(first[0], "10.0.0.1:80".parse().unwrap(), "answers are sorted");
+		assert_eq!(first[0], "10.0.0.1:80".parse::<SocketAddr>().unwrap(), "answers are sorted");
 
 		let (tx, rx) = watch::channel(first.clone());
 		let tx = Arc::new(tx);

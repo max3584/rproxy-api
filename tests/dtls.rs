@@ -9,8 +9,8 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::net::UdpSocket;
-use webrtc_dtls::config::{Config, ExtendedMasterSecretType};
-use webrtc_dtls::conn::DTLSConn;
+use dtls::config::{Config, ExtendedMasterSecretType};
+use dtls::conn::DTLSConn;
 use webrtc_util::conn::{Conn, Listener};
 
 use common::pki::{Issued, Pki};
@@ -93,7 +93,7 @@ async fn dtls_can_be_re_encrypted_towards_the_backend() {
 	let back = pki.server("back", &["back.test"]);
 
 	// a DTLS echo backend
-	let listener = webrtc_dtls::listener::listen(
+	let listener = dtls::listener::listen(
 		"127.0.0.1:0",
 		Config { certificates: vec![back.dtls()], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() },
 	)
@@ -131,7 +131,7 @@ async fn dtls_can_be_re_encrypted_towards_the_backend() {
 async fn dtls_needs_a_pkcs8_key() {
 	let pki = Pki::new("dtls-key");
 	let cert = pki.server("front", &["media.test"]);
-	// rewrite the key as SEC1 ("EC PRIVATE KEY"), which webrtc-dtls cannot load
+	// rewrite the key as SEC1 ("EC PRIVATE KEY"), which the dtls crate cannot load
 	let pem = std::fs::read_to_string(&cert.key_file).unwrap();
 	assert!(pem.contains("BEGIN PRIVATE KEY"));
 	let sec1_file = format!("{}.sec1", cert.key_file);

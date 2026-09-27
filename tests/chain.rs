@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
-use webrtc_dtls::config::{Config, ExtendedMasterSecretType};
-use webrtc_dtls::conn::DTLSConn;
+use dtls::config::{Config, ExtendedMasterSecretType};
+use dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
 use common::pki::{Issued, Pki};
@@ -154,7 +154,7 @@ async fn mtls_with_multi_tier_client_certificates() {
 	}
 }
 
-async fn dtls_client(pki: &Pki, port: u16, cert: Option<webrtc_dtls::crypto::Certificate>) -> Result<DTLSConn, String> {
+async fn dtls_client(pki: &Pki, port: u16, cert: Option<dtls::crypto::Certificate>) -> Result<DTLSConn, String> {
 	let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	sock.connect(("127.0.0.1", port)).await.unwrap();
 	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sock);
@@ -205,9 +205,9 @@ async fn dtls_mtls_with_multi_tier_client_certificates() {
 	let c = dtls_client(&pki, port, Some(alice.dtls())).await.unwrap();
 	assert!(dtls_echo(&c).await, "full client chain");
 	// leaf only: the handshake completes, but rproxy drops the session before forwarding anything
-	let leaf_only = webrtc_dtls::crypto::Certificate {
+	let leaf_only = dtls::crypto::Certificate {
 		certificate: vec![alice.der()],
-		private_key: webrtc_dtls::crypto::CryptoPrivateKey::try_from(&alice.key).unwrap(),
+		private_key: rproxy_api::tlsconf::dtls_private_key(&alice.key.serialize_der()).unwrap(),
 	};
 	if let Ok(c) = dtls_client(&pki, port, Some(leaf_only.clone())).await {
 		assert!(!dtls_echo(&c).await, "leaf only must not be forwarded");

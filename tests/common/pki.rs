@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rcgen::{
-	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+	BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::RootCertStore;
@@ -32,11 +32,11 @@ impl Issued {
 		[vec![self.der()], self.intermediates.clone()].concat()
 	}
 
-	/// The same certificate for webrtc-dtls.
-	pub fn dtls(&self) -> webrtc_dtls::crypto::Certificate {
-		webrtc_dtls::crypto::Certificate {
+	/// The same certificate for the dtls crate.
+	pub fn dtls(&self) -> dtls::crypto::Certificate {
+		dtls::crypto::Certificate {
 			certificate: self.full_chain(),
-			private_key: webrtc_dtls::crypto::CryptoPrivateKey::try_from(&self.key).unwrap(),
+			private_key: rproxy_api::tlsconf::dtls_private_key(&self.key.serialize_der()).unwrap(),
 		}
 	}
 }
@@ -83,8 +83,8 @@ impl Pki {
 			params.distinguished_name.push(DnType::CommonName, format!("rproxy test intermediate CA {}", level + 1));
 			params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
 			let cert = match pki.intermediates.last() {
-				Some((parent, parent_key)) => params.signed_by(&key, parent, parent_key).unwrap(),
-				None => params.signed_by(&key, &pki.ca, &pki.ca_key).unwrap(),
+				Some((parent, parent_key)) => params.signed_by(&key, &Issuer::from_ca_cert_der(parent.der(), parent_key).unwrap()).unwrap(),
+				None => params.signed_by(&key, &Issuer::from_ca_cert_der(pki.ca.der(), &pki.ca_key).unwrap()).unwrap(),
 			};
 			pki.intermediates.push((cert, key));
 		}
@@ -125,7 +125,7 @@ impl Pki {
 			Some((c, k)) => (c, k),
 			None => (&self.ca, &self.ca_key),
 		};
-		let cert = params.signed_by(&key, issuer, issuer_key).unwrap();
+		let cert = params.signed_by(&key, &Issuer::from_ca_cert_der(issuer.der(), issuer_key).unwrap()).unwrap();
 		let cert_file = self.dir.join(format!("{name}.pem")).to_string_lossy().into_owned();
 		let key_file = self.dir.join(format!("{name}.key")).to_string_lossy().into_owned();
 		std::fs::write(&cert_file, cert.pem()).unwrap();

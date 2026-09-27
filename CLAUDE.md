@@ -34,10 +34,10 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
 | `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
 | `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
-| `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / webrtc-dtls の設定の組み立て（`TlsRuntime`） |
+| `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / dtls クレート の設定の組み立て（`TlsRuntime`） |
 | `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
-| `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを webrtc-dtls に渡す `Conn` |
+| `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを dtls クレート に渡す `Conn` |
 | `src/rule.rs` | ルールの型と検証。`Features`（この版で動かせる v0.3 の設定。`GET /capabilities` の `features`。パッチで中身を入れたら true にする） |
 | `src/http/` | L7（ルールの `http`）の設定の型と検証、`match` の式（Traefik と同じ書き方）の解析と評価 |
 | `src/http/middleware.rs` | ミドルウェア（リダイレクト、`respond`、`ip_allow`、`headers`、パスの書き換え、`rate_limit`・`in_flight`）。`Router::compile` で一度だけ組み立てる |
