@@ -40,6 +40,7 @@ assets = [
     ["README.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/API.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/PROFILES.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/SOURCE-IP.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/MIGRATING-FROM-TRAEFIK.md", "usr/share/doc/rproxy-api/", "644"],
     ["contrib/traefik2rproxy.py", "usr/bin/rproxy-traefik-convert", "755"],
 ]
