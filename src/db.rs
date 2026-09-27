@@ -127,7 +127,9 @@ pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
 
 	let mut loaded = None;
 	for (i, (sql, schema)) in QUERIES.iter().enumerate() {
-		match sqlx::query(&sql.replace("{BASE}", BASE)).fetch_all(&pool).await {
+		// built only from the constants above (no input), so it is safe to run as is
+		let sql = sqlx::AssertSqlSafe(sql.replace("{BASE}", BASE));
+		match sqlx::query(sql).fetch_all(&pool).await {
 			Ok(rows) => {
 				if i > 0 {
 					warn!(event = "restore.legacy_schema", schema = ?schema, "newer columns missing; using defaults");
