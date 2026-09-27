@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use axum_server::tls_rustls::RustlsConfig;
-use axum_server::Handle;
+/// Handle of a control API listener on TCP (axum-server 0.8 is generic over the address).
+type Handle = axum_server::Handle<SocketAddr>;
 use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -620,7 +621,7 @@ impl ApiListener {
 		let addr = self.addr;
 		match tls {
 			Some(tls) => {
-				let server = axum_server::from_tcp_rustls(listener, tls).handle(handle.clone());
+				let server = axum_server::from_tcp_rustls(listener, tls).map_err(|e| e.to_string())?.handle(handle.clone());
 				tokio::spawn(async move {
 					if let Err(e) = server.serve(app).await {
 						error!(event = "api.stopped", addr = %addr, error = %e);
@@ -628,7 +629,7 @@ impl ApiListener {
 				});
 			}
 			None => {
-				let server = axum_server::from_tcp(listener).handle(handle.clone());
+				let server = axum_server::from_tcp(listener).map_err(|e| e.to_string())?.handle(handle.clone());
 				tokio::spawn(async move {
 					if let Err(e) = server.serve(app).await {
 						error!(event = "api.stopped", addr = %addr, error = %e);
