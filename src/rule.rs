@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::balance::{self, Balance, HealthCheckSpec, TargetSpec};
 use crate::cidr::{self, Cidr};
 use crate::error::ApiError;
 use crate::http::HttpSpec;
@@ -132,7 +133,7 @@ pub struct Features {
 	pub tls_options: bool,
 	/// Middleware kinds (`http.middlewares`) that can run
 	pub middlewares: &'static [&'static str],
-	/// Options of `http.services` that can run (`health_check`, `sticky`)
+	/// Options of `http.services` that can run (`health_check`, `sticky`, `balance`)
 	pub services: &'static [&'static str],
 }
 
@@ -148,7 +149,7 @@ impl Features {
 			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "retry",
 			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 		],
-		services: &["health_check", "sticky"],
+		services: &["health_check", "sticky", "balance"],
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -163,7 +164,7 @@ impl Features {
 			"forward_auth", "oidc", "basic_auth", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
 			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond",
 		],
-		services: &["health_check", "sticky"],
+		services: &["health_check", "sticky", "balance"],
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -207,11 +208,21 @@ pub struct RuleRequest {
 	pub listen_port: u16,
 	/// Last port of a range; ports map one to one onto `remote_port` upwards.
 	pub listen_port_end: Option<u16>,
-	/// The backend; left out on `http` rules, whose backends are `http.services`.
+	/// The backend; left out on `http` rules, whose backends are `http.services`,
+	/// and on rules with `targets`.
 	#[serde(default)]
 	pub remote_addr: String,
 	#[serde(default)]
 	pub remote_port: u16,
+	/// Several backends instead of `remote_addr` / `remote_port` (#98).
+	#[serde(default)]
+	pub targets: Vec<TargetSpec>,
+	/// How connections are spread over `targets`.
+	#[serde(default)]
+	pub balance: Balance,
+	/// TCP connection checks of the backends.
+	#[serde(default)]
+	pub health_check: Option<HealthCheckSpec>,
 	#[serde(default)]
 	pub source_ip: SourceIp,
 	pub udp_idle_secs: Option<u64>,
@@ -247,8 +258,13 @@ pub struct RuleSpec {
 	pub key: Key,
 	/// Number of consecutive ports, 1 for a single port.
 	pub port_count: u16,
+	/// The backend; with `targets`, the first target (for logs and older clients).
 	pub remote_host: String,
 	pub remote_port: u16,
+	/// Several backends; empty when the rule has just `remote_addr` / `remote_port`.
+	pub targets: Vec<TargetSpec>,
+	pub balance: Balance,
+	pub health_check: Option<HealthCheckSpec>,
 	pub source_ip: SourceIp,
 	pub udp_idle: Duration,
 	pub tls: TlsSpec,
@@ -269,6 +285,18 @@ impl RuleSpec {
 			tls.alpn = vec!["h2".into(), "http/1.1".into()];
 		}
 		tls
+	}
+
+	/// The backends to spread connections over: `targets`, or the single
+	/// `remote_addr` / `remote_port`; none for `http` rules.
+	pub fn members(&self) -> Vec<TargetSpec> {
+		if !self.targets.is_empty() {
+			return self.targets.clone();
+		}
+		if self.http.is_some() || self.remote_host.is_empty() {
+			return vec![];
+		}
+		vec![TargetSpec { addr: self.remote_host.clone(), port: self.remote_port, weight: None, backup: false }]
 	}
 
 	pub fn remote(&self) -> String {
@@ -310,6 +338,30 @@ pub fn validate_target(host: &str, port: u16, http: bool) -> Result<String, ApiE
 		return Err(ApiError::invalid("remote_addr / remote_port are not used with http; put the backends in http.services"));
 	}
 	Ok(String::new())
+}
+
+/// The backends of a rule: `remote_addr` / `remote_port` or `targets` (exactly
+/// one of them), none for `http` rules. Returns the host and port shown as the
+/// rule's `remote_addr` / `remote_port` (the first target with `targets`).
+pub fn validate_backends(
+	host: &str,
+	port: u16,
+	targets: &mut [TargetSpec],
+	http: bool,
+	port_count: u16,
+) -> Result<(String, u16), ApiError> {
+	if targets.is_empty() {
+		let host = validate_target(host, port, http)?;
+		return Ok((host, port));
+	}
+	if http {
+		return Err(ApiError::invalid("targets are not used with http; put the backends in http.services"));
+	}
+	if !host.trim().is_empty() || port != 0 {
+		return Err(ApiError::invalid("give remote_addr / remote_port or targets, not both"));
+	}
+	balance::validate_targets(targets, port_count)?;
+	Ok((targets[0].addr.clone(), targets[0].port))
 }
 
 /// What an `http` rule cannot combine with: the backend is chosen per request.
@@ -359,9 +411,19 @@ impl RuleRequest {
 	pub fn validate(self, caps: &Caps) -> Result<RuleSpec, ApiError> {
 		let transparent_available = caps.transparent;
 		let listen = parse_listen(&self.listen_addr, self.listen_port)?;
-		let remote_host = validate_target(&self.remote_addr, self.remote_port, self.http.is_some())?;
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
-		let port_count = port_count(self.listen_port, self.listen_port_end, self.remote_port, caps)?;
+		// every target's port must leave room for the range
+		let highest = self.targets.iter().map(|t| t.port).max().unwrap_or(self.remote_port);
+		let port_count = port_count(self.listen_port, self.listen_port_end, highest, caps)?;
+		let mut targets = self.targets;
+		let (remote_host, remote_port) =
+			validate_backends(&self.remote_addr, self.remote_port, &mut targets, self.http.is_some(), port_count)?;
+		if let Some(h) = &self.health_check {
+			if self.http.is_some() {
+				return Err(ApiError::invalid("health_check of a rule is not used with http; use http.services.<name>.health_check"));
+			}
+			h.validate(self.protocol)?;
+		}
 		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
@@ -409,7 +471,10 @@ impl RuleRequest {
 			key: Key { protocol: self.protocol, listen },
 			port_count,
 			remote_host,
-			remote_port: self.remote_port,
+			remote_port,
+			targets,
+			balance: self.balance,
+			health_check: self.health_check,
 			source_ip: self.source_ip,
 			udp_idle,
 			tls,
@@ -430,6 +495,13 @@ pub struct UpdateRequest {
 	pub remote_addr: String,
 	#[serde(default)]
 	pub remote_port: u16,
+	/// Several targets instead of remote_addr / remote_port. The backends
+	/// (remote_addr or targets, balance, health_check) are replaced as a whole:
+	/// `balance` left out is round_robin, `health_check` left out is none.
+	#[serde(default)]
+	pub targets: Vec<TargetSpec>,
+	pub balance: Option<Balance>,
+	pub health_check: Option<HealthCheckSpec>,
 	pub udp_idle_secs: Option<u64>,
 	pub source_ip: Option<SourceIp>,
 	/// Replaces the TLS settings (with `starttls` / `starttls_required`) when present.
@@ -465,6 +537,9 @@ pub struct RuleStats {
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::http::access::HttpStatsView>,
+	/// State of each backend, for rules with `targets` or `health_check`.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<balance::TargetStatus>,
 }
 
 /// A rule as returned by the API.
@@ -476,6 +551,13 @@ pub struct RuleView {
 	pub listen_port_end: Option<u16>,
 	pub remote_addr: String,
 	pub remote_port: u16,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<TargetSpec>,
+	/// Shown with `targets`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub balance: Option<Balance>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub health_check: Option<HealthCheckSpec>,
 	pub source_ip: &'static str,
 	pub udp_idle_secs: u64,
 	pub tls: TlsSpec,
@@ -505,6 +587,9 @@ impl RuleView {
 			listen_port_end: (spec.port_count > 1).then(|| spec.key.listen.port() + spec.port_count - 1),
 			remote_addr: spec.remote_host.clone(),
 			remote_port: spec.remote_port,
+			targets: spec.targets.clone(),
+			balance: (!spec.targets.is_empty()).then_some(spec.balance),
+			health_check: spec.health_check.clone(),
 			source_ip: spec.source_ip.as_str(),
 			udp_idle_secs: spec.udp_idle.as_secs(),
 			tls: spec.tls.clone(),
@@ -536,6 +621,9 @@ mod tests {
 			listen_port_end: None,
 			remote_addr: "example.com".into(),
 			remote_port: 80,
+			targets: vec![],
+			balance: Balance::RoundRobin,
+			health_check: None,
 			source_ip: SourceIp::Proxy,
 			udp_idle_secs: None,
 			tls: None,

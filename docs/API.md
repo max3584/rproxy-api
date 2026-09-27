@@ -51,8 +51,11 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `protocol` | `"tcp"` \| `"udp"` | ○ | 大文字・小文字は区別しない。応答では常に小文字で返す |
 | `listen_addr` | string | ○ | IP アドレス（ホスト名は不可） |
 | `listen_port` | 1–65535 | ○ | |
-| `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する。`http` のルールでは書かない（転送先は `http.services`。一覧では `""` / `0`） |
-| `remote_port` | 1–65535 | ○ | `http` のルールでは書かない |
+| `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する。`http` のルールでは書かない（転送先は `http.services`。一覧では `""` / `0`）。`targets` を使うときも書かない（一覧では `targets` の先頭が入る） |
+| `remote_port` | 1–65535 | ○ | `http` のルール・`targets` を使うルールでは書かない |
+| `targets` | object の配列 | | 宛先を複数にする（v0.3.3、`remote_addr` / `remote_port` の代わり。どちらか一方）。`{"addr", "port", "weight"?, "backup"?}`：`addr` は IP かホスト名（それぞれ再解決する）、`weight` は 1 以上（既定 1）、`backup: true` はほかの宛先がすべて down のときだけ使う（全部を backup にはできない）。最大 64 件。ポート範囲では各宛先の `port` も範囲の分ずれる。下の「複数の宛先」 |
+| `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
+| `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスは待ち受けのアドレスで、`0.0.0.0` で待ち受けていれば `0.0.0.0`）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
@@ -64,6 +67,33 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS や PROXY ヘッダより前）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`） |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
+
+### 複数の宛先（`targets`、v0.3.3）
+
+```json
+{
+  "protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 5432,
+  "targets": [
+    {"addr": "10.0.0.11", "port": 5432, "weight": 2},
+    {"addr": "10.0.0.12", "port": 5432},
+    {"addr": "db-backup.internal", "port": 5432, "backup": true}
+  ],
+  "balance": "least_conn",
+  "health_check": {"interval": "10s", "timeout": "3s"}
+}
+```
+
+- 新しい接続（TCP）・新しいセッション（UDP）ごとに宛先を選ぶ。
+  - `round_robin`：`weight` の比率で順に回す。
+  - `least_conn`：いま開いている接続（UDP はセッション）の数 ÷ `weight` が一番小さい宛先。同じなら順に回す。
+  - `failover`：`targets` の上から順に、up の最初の宛先だけを使う。上位が戻れば、新しい接続から戻る。
+- up / down：`health_check` があれば、その結果（最初の確認までは up）。なくても、TCP の接続を断られた（または 5 秒以内に応答がない）宛先は、10 秒のあいだ down として飛ばし、同じ接続を次の宛先で接続し直す。UDP は、転送先から ICMP の到達不能が返った宛先を同じく down にする。
+- `backup` の宛先は、ほかの宛先がすべて down のときだけ使う。すべて down なら、down の宛先も順に試す（接続を断らない）。
+- UDP の既存のセッションは、自分の宛先が down になったら次の宛先へ移る（`conn.retarget`、`reason: target down`）。`failover` で上位が戻っても、既存のセッションはそのまま。
+- 名前解決できない宛先があっても、ほかの宛先が解決できればルールは動く（解決できない宛先は後から再解決する）。すべて解決できなければ、これまでどおり `resolve_failed`。
+- `tls.routes`（サーバ名ごとの転送先）は今までどおり 1 つずつ。`targets` は一致しない名前（とサーバ名なし）の転送先。
+- 状態が変わると `event: "target.down"`（`reason: health_check` / `connect`、`error`）/ `"target.up"` のログ。ルールの `stats.targets` に宛先ごとの `[{"addr","port","backup"?,"up","connections","total_connections","resolved"}]`（`targets` が 2 つ以上か `health_check` があるときだけ）、`/metrics` に `rproxy_target_up{protocol,listen,target}`（1 / 0）と `rproxy_target_connections{protocol,listen,target}`。
+- 宛先・`balance`・`health_check` を変えると、宛先ごとの接続数と up / down は最初からになる（開いている接続はそのまま）。
 
 ### TLS
 
@@ -121,6 +151,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
 | `origin` | `dynamic`（API で作ったルール、または DB から復元したルール）か `static`（固定ルール。下を参照） |
 
 `stats` には `denied`（`allow_from` の範囲外、`crowdsec` の判定、または `unmatched: reject` で切断した接続の数）も含む。
+宛先が 2 つ以上か `health_check` のあるルールでは、`stats.targets` に宛先ごとの状態が入る（上の「複数の宛先」）。
 `http` のルールでは、`stats.http` にリクエストの数も入る（ほかのルールでは省く）。
 
 ```json
@@ -199,7 +230,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | 項目 | 場所 | 形 | features |
 |---|---|---|---|
 | L7 のルーティング | ルールの `http` | `routes`（`name`、`match`、`priority`、`service` か `to`、`middlewares`）、`default`、`services`、`middlewares`、`http3` | `http`（v0.3.1 から）、`http3`（v0.3.2 から）、`middlewares` |
-| サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky` | `http`。`health_check` / `sticky` は `services` に含まれるもの |
+| サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky`、`balance` | `http`。`health_check` / `sticky` / `balance` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
 | ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。**内蔵しない方針にしたため使えない**（常に `unsupported`）。外部のツールで取ったファイルを使う（上の「TLS」） | `acme`（常に false） |
@@ -230,6 +261,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - 転送先とは HTTP/1.1 で話す。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。
 - 転送先への接続は、応答の本文を読み終えたあと、次のリクエストに使い回す（転送先ごとに待機中の接続は 32 本まで。`source_ip: transparent` のルールでは、送信元がクライアントごとに違うので使い回さない）。使い回そうとした接続を転送先が閉じていたら、新しい接続で送り直す。
 - `health_check`（v0.3.2）: `interval`（既定 `10s`）ごとに各 `servers` へ `GET <URLのパス><path>`（`Host` は転送先のホスト）を送り、`timeout`（既定 `3s`）以内に 2xx / 3xx が返れば up、そうでなければ down。down の転送先はラウンドロビンから外し、戻れば入れる。最初の確認までは up として扱う。すべて down なら 503。状態が変わると `event: "http.health"` のログ（`service`、`server`、`up`、down の理由の `error`）。ルールの `stats.http.services.<サービス名>` に `[{"url","up"}]`、`/metrics` に `rproxy_http_server_up{protocol,listen,service,server}`（1 / 0）。
+- `balance`（v0.3.3）: `round_robin`（既定。`weight` の比率）、`least_conn`（処理中のリクエストが `weight` あたり一番少ない転送先）、`failover`（`servers` の上から順に、up の最初の転送先）。どれも down の転送先は外す（`health_check` の結果）。`sticky` のクッキーの転送先が up なら、そちらが優先。
 - `sticky`（v0.3.2）: 初めてのクライアントには、選んだ転送先を示すクッキー（`<cookie>=<URL から作った 16 桁の値>; Path=/; HttpOnly; SameSite=Lax`、HTTPS なら `Secure` も）を付け、以後そのクッキーの転送先へ送る。その転送先が down か、知らない値なら選び直してクッキーを付け直す。値は URL から作るので、rproxy を再起動してもほかの転送先を足しても変わらない。
 - `weight` で転送先を切り替えられる（例：新しい版を `weight: 1`、今の版を `weight: 9` にして 1 割だけ流す）。
 - `pass_host_header`（既定 true）が false なら、`Host` は転送先の URL のホスト（とポート）にする。
@@ -278,21 +310,21 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - 秘密のファイル（`users_file`・`client_secret_file`・`cookie_secret_file`）がない・中身が誤っていれば `invalid`（設定ファイルなら起動しない）。読めない（権限）なら起動は続け、そのミドルウェアを通るリクエストに 503 を返す。ファイルは変わったら（数秒以内に）読み直し、SIGHUP でも読み直す。読み直しに失敗したら今の中身を使い続ける（`reload.secret` の警告）。所有者とモードは docs/PERMISSIONS.md。
 - `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
-- DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec"}`。`crowdsec` は v0.3.2 から）。
+- DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec", "targets", "balance", "health_check"}`。`crowdsec` は v0.3.2、`targets` / `balance` / `health_check` は v0.3.3 から）。`targets` が空でなければ `dist_addr` / `dist_port` は読まない（UI は `''` / `0` を入れる）。
 
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky","balance"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`rules:read` |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
-| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port","udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"crowdsec"?}` | 200 | 転送先を変える。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`source_ip` とポート範囲は変更できない |
+| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"crowdsec"?}` | 200 | 転送先を変える。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`source_ip` とポート範囲は変更できない |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
 | `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`（上の「v0.3 の設定」） |
 
@@ -339,5 +371,5 @@ rproxy のルールには 3 つの出どころがある。どれも `GET /rules`
 
 `--database-url mysql://user:pass@host:port/db` を指定すると、起動時に `forward_rules` テーブルの全ルールを読み込んで開始する。DB ユーザーには `SELECT` 権限だけを与えればよい。失敗したルールは `failed` として登録し、残りのルールは開始する。名前解決に失敗して `failed` になったルールは、再解決に成功した時点で自動的に開始する。
 
-テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。
+テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。
 `options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。

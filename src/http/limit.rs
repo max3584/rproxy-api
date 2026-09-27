@@ -134,16 +134,31 @@ pub struct InFlight {
 	counts: Mutex<HashMap<String, u64>>,
 }
 
-/// One request counted by `in_flight`; dropping it frees the place.
+/// One request counted by `in_flight` (or on a server, for `balance:
+/// least_conn`); dropping it frees the place.
 #[derive(Debug)]
 pub struct Hold {
-	limiter: Arc<InFlight>,
+	limiter: Option<Arc<InFlight>>,
 	key: String,
+	/// A plain counter (requests in progress on a server).
+	counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl Hold {
+	/// Counts one request on `counter` until dropped.
+	pub fn counting(counter: Arc<std::sync::atomic::AtomicU64>) -> Hold {
+		counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		Hold { limiter: None, key: String::new(), counter: Some(counter) }
+	}
 }
 
 impl Drop for Hold {
 	fn drop(&mut self) {
-		let mut counts = self.limiter.counts.lock().unwrap();
+		if let Some(c) = &self.counter {
+			c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+		}
+		let Some(limiter) = &self.limiter else { return };
+		let mut counts = limiter.counts.lock().unwrap();
 		if let Some(n) = counts.get_mut(&self.key) {
 			*n -= 1;
 			if *n == 0 {
@@ -166,7 +181,7 @@ impl InFlight {
 			return None;
 		}
 		*n += 1;
-		Some(Hold { limiter: self.clone(), key: key.to_string() })
+		Some(Hold { limiter: Some(self.clone()), key: key.to_string(), counter: None })
 	}
 
 	#[cfg(test)]

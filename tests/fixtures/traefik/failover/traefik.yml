@@ -1,0 +1,7 @@
+# An HTTP failover service (main, then fallback)
+entryPoints:
+  web:
+    address: ":8080"
+providers:
+  file:
+    filename: dynamic.yml

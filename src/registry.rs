@@ -14,11 +14,12 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
+use crate::balance::{self, Member, Pool, TargetSpec};
 use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_target, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView,
+	validate_backends, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView,
 	State, UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
@@ -46,19 +47,38 @@ struct Running {
 	started_at: u64,
 	spec: RuleSpec,
 	rt: Arc<Runtime>,
-	target_tx: Arc<watch::Sender<Vec<SocketAddr>>>,
 	idle_tx: watch::Sender<Duration>,
-	resolver: Option<Resolver>,
+	/// Name resolution of the targets, and their health checks.
+	backends: Backends,
 	route_resolvers: Vec<Resolver>,
 	supervisor: JoinHandle<()>,
 }
 
+/// Background tasks of a rule's targets; replaced with the targets.
+#[derive(Default)]
+struct Backends {
+	resolvers: Vec<Resolver>,
+	health: Option<CancellationToken>,
+}
+
+impl Backends {
+	fn stop(&mut self) -> Vec<JoinHandle<()>> {
+		if let Some(h) = self.health.take() {
+			h.cancel();
+		}
+		self.resolvers
+			.drain(..)
+			.map(|(cancel, task)| {
+				cancel.cancel();
+				task
+			})
+			.collect()
+	}
+}
+
 impl Running {
-	fn stop_resolver(&mut self) -> Option<JoinHandle<()>> {
-		self.resolver.take().map(|(cancel, task)| {
-			cancel.cancel();
-			task
-		})
+	fn stop_resolver(&mut self) -> Vec<JoinHandle<()>> {
+		self.backends.stop()
 	}
 
 	fn stop_route_resolvers(&mut self) {
@@ -92,13 +112,9 @@ impl Entry {
 		match self {
 			Entry::Running(r) => {
 				let s = &r.rt.stats;
-				let mut view = RuleView::new(
-					&r.spec,
-					State::Running,
-					None,
-					&r.rt.target.borrow(),
-					s.active.load(Ordering::Relaxed),
-				);
+				let pool = r.rt.pool();
+				let resolved: Vec<SocketAddr> = pool.members.iter().flat_map(|m| m.addrs.borrow().clone()).collect();
+				let mut view = RuleView::new(&r.spec, State::Running, None, &resolved, s.active.load(Ordering::Relaxed));
 				view.stats = RuleStats {
 					total_connections: s.total.load(Ordering::Relaxed),
 					rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
@@ -111,6 +127,7 @@ impl Entry {
 						v.http3 = r.spec.http.as_ref().is_some_and(|h| h.http3).then(|| r.rt.h3.view());
 						v
 					}),
+					targets: if pool.reported { pool.status() } else { vec![] },
 				};
 				view.started_at = Some(r.started_at);
 				view
@@ -122,7 +139,8 @@ impl Entry {
 
 /// What a rule needs before it can listen: resolved targets and TLS settings.
 struct Prepared {
-	addrs: Vec<SocketAddr>,
+	/// The targets with their addresses (empty for one that could not be resolved yet).
+	members: Vec<(TargetSpec, Vec<SocketAddr>)>,
 	routes: Vec<(Route, Vec<SocketAddr>)>,
 	tls: Arc<TlsRuntime>,
 	http: Option<Arc<crate::http::server::Router>>,
@@ -326,12 +344,48 @@ impl Registry {
 			}
 			None => None,
 		};
-		let addrs = if http.is_some() { vec![] } else { resolve::resolve(&self.cfg.lookup, &spec.remote()).await? };
+		// with several targets, one that cannot be resolved yet is retried in the
+		// background; the rule fails only when none can be
+		let wanted = spec.members();
+		let mut members = vec![];
+		let mut first_error = None;
+		for t in wanted.iter() {
+			match resolve::resolve(&self.cfg.lookup, &t.remote()).await {
+				Ok(addrs) => members.push((t.clone(), addrs)),
+				Err(e) => {
+					warn!(event = "dns.stale", rule = %spec.key, target = %t.remote(), error = %e.message);
+					first_error.get_or_insert(e);
+					members.push((t.clone(), vec![]));
+				}
+			}
+		}
+		if let Some(e) = first_error.filter(|_| members.iter().all(|(_, a)| a.is_empty())) {
+			return Err(e);
+		}
 		let mut routes = vec![];
 		for route in &spec.tls.routes {
 			routes.push((route.clone(), resolve::resolve(&self.cfg.lookup, &route_spec(route)).await?));
 		}
-		Ok(Prepared { addrs, routes, tls, http })
+		Ok(Prepared { members, routes, tls, http })
+	}
+
+	/// The run-time targets of a rule, with their name resolution and health checks.
+	fn install_pool(&self, spec: &RuleSpec, members: Vec<(TargetSpec, Vec<SocketAddr>)>, events: &Arc<watch::Sender<u64>>, kill: &CancellationToken) -> (Arc<Pool>, Backends) {
+		let mut backends = Backends::default();
+		let mut pool_members = vec![];
+		for (t, addrs) in members {
+			let tx = Arc::new(watch::channel(addrs).0);
+			backends.resolvers.extend(self.spawn_resolver(spec.key, &t.addr, t.remote(), &tx));
+			pool_members.push(Arc::new(Member::new(t, tx)));
+		}
+		let reported = pool_members.len() > 1 || spec.health_check.is_some();
+		let pool = Arc::new(Pool::new(pool_members, spec.balance, events.clone(), reported));
+		if let Some(check) = spec.health_check.clone().filter(|_| !pool.members.is_empty()) {
+			let stop = kill.child_token();
+			balance::spawn_health_checks(spec.key, pool.clone(), check, stop.clone());
+			backends.health = Some(stop);
+		}
+		(pool, backends)
 	}
 
 	fn install_routes(&self, key: Key, routes: Vec<(Route, Vec<SocketAddr>)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
@@ -349,16 +403,16 @@ impl Registry {
 	/// Binds every port of the rule and starts serving. Called with the rules lock held.
 	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
 		let key = spec.key;
-		let (target_tx, target_rx) = watch::channel(prepared.addrs);
-		let target_tx = Arc::new(target_tx);
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
 		let (routes, route_resolvers) = self.install_routes(key, prepared.routes);
 		let kill = CancellationToken::new();
+		let events = Arc::new(watch::channel(0).0);
+		let (pool, backends) = self.install_pool(&spec, prepared.members, &events, &kill);
 		let rt = Arc::new(Runtime {
 			key,
 			source_ip: spec.source_ip,
-			target: target_rx,
-			remote_host: RwLock::new(spec.remote_host.clone()),
+			pool: RwLock::new(pool),
+			pool_events: events,
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
@@ -415,12 +469,11 @@ impl Registry {
 
 		let generation = self.generation();
 		let supervisor = tokio::spawn(supervise(Arc::downgrade(self), key, generation, rt.clone(), serve));
-		let resolver = self.spawn_resolver(key, &spec.remote_host, spec.remote(), &target_tx);
 		let started_at = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_secs())
 			.unwrap_or(0);
-		Ok(Running { generation, started_at, spec, rt, target_tx, idle_tx, resolver, route_resolvers, supervisor })
+		Ok(Running { generation, started_at, spec, rt, idle_tx, backends, route_resolvers, supervisor })
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
@@ -483,12 +536,24 @@ impl Registry {
 				return Err(ApiError::unsupported("the port range cannot be changed; delete and re-create the rule"));
 			}
 		}
-		let remote_host = validate_target(&req.remote_addr, req.remote_port, req.http.is_some() || spec.http.is_some())?;
-		if u32::from(req.remote_port) + u32::from(spec.port_count) - 1 > 65_535 {
+		let is_http = req.http.is_some() || spec.http.is_some();
+		let mut targets = req.targets;
+		if targets.is_empty() && u32::from(req.remote_port) + u32::from(spec.port_count) - 1 > 65_535 {
 			return Err(ApiError::invalid("remote_port + range length exceeds 65535"));
 		}
+		let (remote_host, remote_port) = validate_backends(&req.remote_addr, req.remote_port, &mut targets, is_http, spec.port_count)?;
 		spec.remote_host = remote_host;
-		spec.remote_port = req.remote_port;
+		spec.remote_port = remote_port;
+		// the backends are replaced as a whole: left out means the default
+		spec.targets = targets;
+		spec.balance = req.balance.unwrap_or_default();
+		spec.health_check = req.health_check;
+		if let Some(c) = &spec.health_check {
+			if is_http {
+				return Err(ApiError::invalid("health_check of a rule is not used with http; use http.services.<name>.health_check"));
+			}
+			c.validate(key.protocol)?;
+		}
 		if let Some(idle) = udp_idle {
 			spec.udp_idle = idle;
 		}
@@ -530,15 +595,19 @@ impl Registry {
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
-				let host_changed = r.spec.remote_host != spec.remote_host || r.spec.remote_port != spec.remote_port;
-				r.target_tx.send_replace(prepared.addrs);
+				let backends_changed = r.spec.members() != spec.members()
+					|| r.spec.balance != spec.balance
+					|| r.spec.health_check != spec.health_check;
 				r.idle_tx.send_replace(spec.udp_idle);
-				*r.rt.remote_host.write().unwrap() = spec.remote_host.clone();
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
-				if host_changed {
-					r.stop_resolver();
-					r.resolver = self.spawn_resolver(*key, &spec.remote_host, spec.remote(), &r.target_tx);
+				if backends_changed {
+					// new connections use the new targets; UDP sessions move when theirs is gone
+					r.backends.stop();
+					let (pool, backends) = self.install_pool(&spec, prepared.members, &r.rt.pool_events, &r.rt.kill);
+					*r.rt.pool.write().unwrap() = pool;
+					r.backends = backends;
+					r.rt.pool().notify();
 				}
 				if http_changed {
 					*r.rt.http.write().unwrap() = prepared.http;
@@ -687,7 +756,7 @@ impl Registry {
 				}
 				r.rt.kill.cancel();
 				r.rt.tracker.wait().await;
-				if let Some(task) = r.stop_resolver() {
+				for task in r.stop_resolver() {
 					let _ = task.await;
 				}
 				r.stop_route_resolvers();
@@ -917,6 +986,7 @@ impl Registry {
 				let _ = writeln!(out, "{name}{sample}");
 			}
 		}
+		target_metrics(&mut out, &rules);
 		http_metrics(&mut out, &rules);
 		if let Some(b) = self.cfg.http.crowdsec() {
 			let _ = writeln!(out, "# HELP rproxy_crowdsec_decisions Addresses and ranges blocked by the CrowdSec LAPI decisions.");
@@ -927,6 +997,37 @@ impl Registry {
 			let _ = writeln!(out, "rproxy_crowdsec_synced {}", u8::from(b.synced()));
 		}
 		out
+	}
+}
+
+/// Targets of L4 rules with several targets or a health check.
+fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
+	let mut up = vec![];
+	let mut conns = vec![];
+	let mut keys: Vec<&Key> = rules.keys().collect();
+	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
+	for key in keys {
+		let Some(Entry::Running(r)) = rules.get(key) else { continue };
+		let pool = r.rt.pool();
+		if !pool.reported {
+			continue;
+		}
+		for t in pool.status() {
+			let target = crate::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false }.remote();
+			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, target.replace('"', "\\\""));
+			up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
+			conns.push(format!("rproxy_target_connections{{{labels}}} {}", t.connections));
+		}
+	}
+	let _ = writeln!(out, "# HELP rproxy_target_up Targets of rules with several targets or a health check: 1 up, 0 down.");
+	let _ = writeln!(out, "# TYPE rproxy_target_up gauge");
+	for line in up {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_target_connections Open TCP connections or UDP sessions per target.");
+	let _ = writeln!(out, "# TYPE rproxy_target_connections gauge");
+	for line in conns {
+		let _ = writeln!(out, "{line}");
 	}
 }
 

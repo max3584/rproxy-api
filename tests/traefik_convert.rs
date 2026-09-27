@@ -89,13 +89,33 @@ fn tcp_and_udp_routers_from_toml() {
 	let sni = rule(&doc, 443);
 	let tls = sni.tls.as_ref().unwrap();
 	assert_eq!(tls.routes.len(), 2);
-	assert_eq!((sni.remote_addr.as_str(), sni.remote_port), ("10.0.1.11", 443), "HostSNI(`*`) is the default");
+	// HostSNI(`*`) is the default: a weighted service becomes targets with weights
+	let weights: Vec<(&str, Option<u32>)> = sni.targets.iter().map(|t| (t.addr.as_str(), t.weight)).collect();
+	assert_eq!(weights, [("10.0.1.11", Some(3)), ("10.0.1.12", None)]);
+	assert!(sni.remote_addr.is_empty());
 	let ssh = rule(&doc, 2222);
 	assert_eq!(ssh.listen_addr, "192.0.2.10");
 	assert_eq!(ssh.source_ip.as_str(), "proxy_v2");
+	assert_eq!(ssh.targets.len(), 2, "several servers: targets");
 	let imaps = rule(&doc, 993).tls.as_ref().unwrap();
 	assert_eq!(imaps.options.as_ref().unwrap().min_version.as_deref(), Some("1.3"));
-	assert_eq!(rule(&doc, 53).protocol.to_string(), "udp");
+	let dns = rule(&doc, 53);
+	assert_eq!((dns.protocol.to_string().as_str(), dns.targets.len()), ("udp", 2));
+}
+
+#[test]
+fn failover_services() {
+	if !python_ready() {
+		return;
+	}
+	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/failover/traefik.yml"]);
+	let http = rule(&doc, 8080).http.as_ref().unwrap();
+	let svc = http.services.values().next().unwrap();
+	let urls: Vec<&str> = svc.servers.iter().map(|s| s.url.as_str()).collect();
+	assert_eq!(urls, ["http://10.0.2.1:80", "http://10.0.2.2:80", "http://10.0.3.1:80"], "main first, then the fallback");
+	assert_eq!(svc.balance, rproxy_api::balance::Balance::Failover);
+	assert!(svc.health_check.is_some());
+	assert!(notes.contains("failover service"), "{notes}");
 }
 
 #[test]

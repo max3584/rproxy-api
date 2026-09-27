@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+use crate::balance::Lease;
 use crate::http::server::{self as http, Metered};
 use crate::proxy::{Counted, Runtime, Target};
 use crate::rule::SourceIp;
@@ -19,6 +20,8 @@ use crate::starttls::{self, Outcome};
 use crate::tlsconf::{StartTls, TlsMode, TlsRuntime};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// With other targets to fall back on, a target that does not answer is given up after this.
+const FAILOVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -43,12 +46,39 @@ pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16) {
 	}
 }
 
-async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Result<(TcpStream, SocketAddr)> {
+/// A connection to one of the rule's backends.
+struct Connected {
+	stream: TcpStream,
+	addr: SocketAddr,
+	/// Host name as configured, for verifying the backend's certificate.
+	host: String,
+	/// Counts the connection on its target while it lasts.
+	lease: Option<Lease>,
+}
+
+/// Connects to the first backend that answers, in the order `balance` gave;
+/// a target that refuses is marked down for a while and the next one is tried.
+async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Result<Connected> {
 	let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no resolved target");
-	for addr in &target.addrs {
-		match source::connect_tcp(*addr, rt.bind_as(client)).await {
-			Ok(stream) => return Ok((stream, *addr)),
-			Err(e) => last_err = e,
+	let fallback = target.candidates.iter().filter(|c| !c.addrs.is_empty()).count() > 1;
+	for c in target.candidates.iter().filter(|c| !c.addrs.is_empty()) {
+		let lease = c.lease();
+		for addr in &c.addrs {
+			let attempt = source::connect_tcp(*addr, rt.bind_as(client));
+			let result = if fallback {
+				tokio::time::timeout(FAILOVER_CONNECT_TIMEOUT, attempt)
+					.await
+					.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
+			} else {
+				attempt.await
+			};
+			match result {
+				Ok(stream) => return Ok(Connected { stream, addr: *addr, host: c.host.clone(), lease }),
+				Err(e) => last_err = io::Error::new(e.kind(), format!("{addr}: {e}")),
+			}
+		}
+		if let (Some(pool), Some(member)) = (&target.pool, &c.member) {
+			pool.mark_failed(&rt.key, member, &last_err.to_string());
 		}
 	}
 	Err(last_err)
@@ -72,6 +102,8 @@ async fn send_proxy_header(
 #[derive(Default)]
 struct Detail {
 	target: Option<SocketAddr>,
+	/// Counts the connection on the chosen target until it ends.
+	lease: Option<Lease>,
 	tls: Option<TlsInfo>,
 	rx: u64,
 	tx: u64,
@@ -137,8 +169,9 @@ async fn run(
 	match tls.mode() {
 		TlsMode::Passthrough => {
 			let target = rt.select(None, offset).ok_or_else(|| denied(rt, client, "unmatched", None))?;
-			let (mut out, addr) = connect(rt, client, &target).await?;
+			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
+			detail.lease = lease;
 			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			finish(rt, inbound, &mut out, detail).await
@@ -146,8 +179,9 @@ async fn run(
 		TlsMode::Sni => {
 			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
 			let target = rt.select(name.as_deref(), offset).ok_or_else(|| denied(rt, client, "unmatched", name.as_deref()))?;
-			let (mut out, addr) = connect(rt, client, &target).await?;
+			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
+			detail.lease = lease;
 			detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
 			info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""));
 			send_proxy_header(rt, &mut out, client, local, None).await?;
@@ -286,8 +320,9 @@ async fn terminate(
 	let target = rt
 		.select(info.server_name.as_deref(), offset)
 		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;
-	let (mut out, addr) = connect(rt, client, &target).await?;
+	let Connected { stream: mut out, addr, host, lease } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
+	detail.lease = lease;
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr,
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
@@ -297,7 +332,7 @@ async fn terminate(
 
 	let mut upstream: Box<dyn Stream> = match &tls.connector {
 		Some(connector) => {
-			let name = tls.upstream_name(&target.host).map_err(|e| io::Error::other(e.message))?;
+			let name = tls.upstream_name(&host).map_err(|e| io::Error::other(e.message))?;
 			Box::new(
 				tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, out))
 					.await
@@ -332,8 +367,9 @@ async fn plain_smtp(
 	detail: &mut Detail,
 ) -> io::Result<()> {
 	let target = rt.select(None, offset).ok_or_else(|| denied(rt, client, "unmatched", None))?;
-	let (mut out, addr) = connect(rt, client, &target).await?;
+	let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
+	detail.lease = lease;
 	info!(event = "conn.open", rule = %rt.key, client = %client, target = %addr, starttls = "smtp", tls = "none");
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	let extra = starttls::skip_greeting(StartTls::Smtp, &mut out).await?;

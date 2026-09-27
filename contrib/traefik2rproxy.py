@@ -35,7 +35,7 @@ KNOWN_MIDDLEWARES = {
     "replace_path", "replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering",
     "retry", "circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 }
-KNOWN_SERVICE_OPTIONS = {"health_check", "sticky"}
+KNOWN_SERVICE_OPTIONS = {"health_check", "sticky", "balance"}
 
 INTERNAL_SERVICES = {"api", "dashboard", "prometheus", "ping", "rest", "noop", "acme-http"}
 
@@ -621,6 +621,20 @@ class Rule:
         self.default_tls = None
 
 
+def backends(servers):
+    """remote_addr / remote_port for one backend, targets (round robin by weight) for several."""
+    if len(servers) == 1:
+        host, port, _ = servers[0]
+        return {"remote_addr": host, "remote_port": port}
+    targets = []
+    for host, port, weight in servers:
+        t = {"addr": host, "port": port}
+        if weight != 1:
+            t["weight"] = weight
+        targets.append(t)
+    return {"targets": targets}
+
+
 def parse_address(address, where):
     m = re.fullmatch(r"(.*):(\d+)(?:/(tcp|udp))?", str(address or "").strip())
     if not m:
@@ -723,12 +737,27 @@ class Converter:
                 for s in (inner or {}).get("servers", []):
                     out["servers"].append({"url": s["url"], "weight": w * s.get("weight", 1)})
             return out if out["servers"] else None
-        for kind in ("mirroring", "failover"):
-            other = g(svc, kind)
-            if other is not None:
-                main = strip_provider(g(other, "service"))
-                NOTES.add(where, f"{kind} service {name}: only its main service {main} is used")
-                return self.http_service(main, where, seen) if main not in seen else None
+        failover = g(svc, "failover")
+        if failover is not None:
+            main = strip_provider(g(failover, "service") or "")
+            fallback = strip_provider(g(failover, "fallback") or "")
+            parts = [self.http_service(n, where, seen) for n in (main, fallback) if n and n not in seen]
+            parts = [p for p in parts if p]
+            if not parts:
+                return None
+            out = dict(parts[0])
+            out["servers"] = [s for p in parts for s in p["servers"]]
+            out["balance"] = "failover"
+            NOTES.add(where, f"failover service {name}: the servers of {main} then {fallback}, balance: failover "
+                      f"(the first server that is up; within {main} no round robin)")
+            if not any("health_check" in p for p in parts):
+                NOTES.add(where, f"failover service {name}: add a health_check so a server that is down is noticed")
+            return out
+        mirroring = g(svc, "mirroring")
+        if mirroring is not None:
+            main = strip_provider(g(mirroring, "service"))
+            NOTES.add(where, f"mirroring service {name}: only its main service {main} is used")
+            return self.http_service(main, where, seen) if main not in seen else None
         NOTES.add(where, f"service {name}: type not converted")
         return None
 
@@ -899,6 +928,41 @@ class Converter:
                 if len(files) > 1:
                     NOTES.add(f"tls.options.{name}", "several clientAuth.caFiles: concatenate them into one file")
 
+    def l4_servers(self, section, name, where, seen=None):
+        """The backends of a TCP / UDP service as (host, port, weight): a
+        loadBalancer's servers, or a weighted service flattened (weights multiplied)."""
+        svc = g(self.dynamic, section, "services", name)
+        if svc is None:
+            NOTES.add(where, f"service {name} is not defined")
+            return []
+        seen = (seen or set()) | {name}
+        lb = g(svc, "loadBalancer")
+        if lb is not None:
+            out = []
+            for s in as_list(g(lb, "servers")):
+                address = g(s, "address")
+                try:
+                    host, port, _ = parse_address(address, where)
+                except InputError:
+                    NOTES.add(where, f"backend address {address!r} not understood; left out")
+                    continue
+                out.append((host, port, as_int(g(s, "weight"), 1) or 1))
+            if g(lb, "healthCheck") is not None:
+                NOTES.add(where, f"service {name}: healthCheck is not converted (rproxy checks L4 targets with a TCP connection: health_check)")
+            return out
+        weighted = g(svc, "weighted")
+        if weighted is not None:
+            out = []
+            for part in as_list(g(weighted, "services")):
+                sub = strip_provider(g(part, "name"))
+                if sub in seen:
+                    continue
+                w = as_int(g(part, "weight"), 1) or 1
+                out += [(h, p, w * pw) for h, p, pw in self.l4_servers(section, sub, where, seen)]
+            return out
+        NOTES.add(where, f"service {name}: type not converted")
+        return []
+
     def tcp_routers(self):
         tcp = g(self.dynamic, "tcp") or {}
         for full_name, r in (g(tcp, "routers") or {}).items():
@@ -918,18 +982,11 @@ class Converter:
                 NOTES.add(where, "combined rule: only its HostSNI part is used")
             svc_name = strip_provider(g(r, "service") or "")
             svc = g(tcp, "services", svc_name, "loadBalancer")
-            servers = as_list(g(svc, "servers"))
+            servers = self.l4_servers("tcp", svc_name, where)
             if not servers:
                 NOTES.add(where, f"service {svc_name} has no servers; left out")
                 continue
-            if len(servers) > 1:
-                NOTES.add(where, f"service {svc_name}: rproxy L4 forwards to one backend; the first is used")
-            address = g(servers[0], "address")
-            try:
-                host, port, _ = parse_address(address, where)
-            except InputError:
-                NOTES.add(where, f"backend address {address!r} not understood; left out")
-                continue
+            host, port, _ = servers[0]
             proxy = as_int(g(svc, "proxyProtocol", "version"))
             tls = g(r, "tls")
             if isinstance(tls, str):
@@ -937,24 +994,21 @@ class Converter:
             for rule in self.eps_for(r, "tcp"):
                 if tls is not None and not as_bool(g(tls, "passthrough")):
                     self.router_tls(rule, tls, "Host(" + quote([n for n in names if n != "*"]) + ")", where)
-                rule.tcp_routes.append({"name": name, "names": names or ["*"], "host": host, "port": port,
+                rule.tcp_routes.append({"name": name, "names": names or ["*"], "host": host, "port": port, "servers": servers,
                                         "proxy": proxy, "tls": tls, "client_ip": others, "rule_text": text})
         udp = g(self.dynamic, "udp") or {}
         for full_name, r in (g(udp, "routers") or {}).items():
             where = f"udp router {strip_provider(full_name)}"
             svc_name = strip_provider(g(r, "service") or "")
-            servers = as_list(g(udp, "services", svc_name, "loadBalancer", "servers"))
+            servers = self.l4_servers("udp", svc_name, where)
             if not servers:
                 NOTES.add(where, f"service {svc_name} has no servers; left out")
                 continue
-            if len(servers) > 1:
-                NOTES.add(where, f"service {svc_name}: rproxy forwards to one backend; the first is used")
-            host, port, _ = parse_address(g(servers[0], "address"), where)
             for rule in self.eps_for(r, "udp"):
                 if rule.udp_service:
                     NOTES.add(where, f"entry point {rule.ep} already has a UDP router; left out")
                     continue
-                rule.udp_service = (host, port)
+                rule.udp_service = servers
 
     # ------------------------------------------------------------ output
 
@@ -987,8 +1041,7 @@ class Converter:
             where = f"entry point {rule.ep}"
             if rule.protocol == "udp":
                 if rule.udp_service:
-                    host, port = rule.udp_service
-                    out.append({**self.base(rule), "remote_addr": host, "remote_port": port})
+                    out.append({**self.base(rule), **backends(rule.udp_service)})
                 continue
             if rule.redirect is not None:
                 out.append(self.redirect_rule(rule))
@@ -1086,8 +1139,10 @@ class Converter:
         ips = [ip for t in routes for kind, args in t["client_ip"] for ip in args]
         result = self.base(rule)
         default = catch_all[0] if catch_all else routes[0]
-        result["remote_addr"] = default["host"]
-        result["remote_port"] = default["port"]
+        result.update(backends(default["servers"]))
+        for t in named:
+            if len(t["servers"]) > 1:
+                NOTES.add(where, f"router {t['name']}: a server-name route (tls.routes) has one backend; the first is used")
         proxy = routes[0]["proxy"]
         if proxy in (1, 2):
             result["source_ip"] = f"proxy_v{proxy}"
@@ -1164,7 +1219,7 @@ def used_features(doc):
         for spec in (http.get("middlewares") or {}).values():
             mws |= set(spec)
         for svc in (http.get("services") or {}).values():
-            opts |= {k for k in ("health_check", "sticky") if k in svc}
+            opts |= {k for k in ("health_check", "sticky", "balance") if k in svc}
     return mws, opts, http3
 
 

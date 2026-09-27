@@ -90,6 +90,10 @@ pub struct ServiceSpec {
 	pub pass_host_header: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeouts: Option<TimeoutsSpec>,
+	/// How requests are spread over `servers` (#98): round_robin (default),
+	/// least_conn (fewest requests in progress) or failover (the first that is up).
+	#[serde(default, skip_serializing_if = "crate::balance::Balance::is_default")]
+	pub balance: crate::balance::Balance,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

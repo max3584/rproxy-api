@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep_until;
 use tracing::{debug, info, warn};
 
 use webrtc_dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
+use crate::balance::{Lease, Member};
 use crate::dtls::SessionConn;
 use crate::proxy::{shifted, Runtime};
 use crate::rule::SourceIp;
@@ -89,16 +90,17 @@ async fn session(
 		return dtls_session(id, client, from_client, listener, rt, sessions, offset, tls).await;
 	}
 	let started = Instant::now();
-	let mut target_rx = rt.target.clone();
+	let mut events = rt.pool_events.subscribe();
 	let mut idle_rx = rt.udp_idle.clone();
-	let mut target = target_rx.borrow_and_update().first().map(|a| shifted(*a, offset));
 	let mut idle = *idle_rx.borrow_and_update();
-
-	let upstream = match target {
-		Some(t) => source::udp_upstream(t, rt.bind_as(client)).await,
-		None => Err(std::io::Error::other("no resolved target")),
+	let Some(Picked { mut lease, addrs: mut target_rx, addr }) = pick(&rt, offset) else {
+		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target");
+		remove(&sessions, client, id);
+		return;
 	};
-	let upstream = match upstream {
+	let mut target = Some(addr);
+
+	let upstream = match source::udp_upstream(addr, rt.bind_as(client)).await {
 		Ok(s) => s,
 		Err(e) => {
 			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e);
@@ -139,7 +141,36 @@ async fn session(
 					deadline = tokio::time::Instant::now() + idle;
 				}
 				// ICMP unreachable from the backend surfaces here on a connected socket
-				Err(e) => debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e),
+				Err(e) => {
+					debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
+					if e.kind() == std::io::ErrorKind::ConnectionRefused {
+						let pool = rt.pool();
+						if pool.contains(lease.member()) {
+							pool.mark_failed(&rt.key, lease.member(), &e.to_string());
+						}
+					}
+				}
+			},
+			// a target went down (or the targets changed): move off it
+			changed = events.changed() => {
+				if changed.is_err() {
+					break "stopped";
+				}
+				let member = lease.member().clone();
+				if rt.pool().contains(&member) && member.is_up() {
+					continue;
+				}
+				let Some(next) = pick(&rt, offset).filter(|p| !Arc::ptr_eq(p.lease.member(), &member)) else { continue };
+				match upstream.connect(next.addr).await {
+					Ok(()) => {
+						info!(event = "conn.retarget", rule = %rt.key, client = %client, from = %addr_or_empty(target), to = %next.addr,
+							reason = "target down");
+						target = Some(next.addr);
+						target_rx = next.addrs;
+						lease = next.lease;
+					}
+					Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e),
+				}
 			},
 			changed = target_rx.changed() => {
 				if changed.is_err() {
@@ -167,9 +198,28 @@ async fn session(
 	};
 
 	remove(&sessions, client, id);
+	drop(lease);
 	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
+}
+
+/// The target of a session and its addresses.
+struct Picked {
+	lease: Lease,
+	addrs: watch::Receiver<Vec<SocketAddr>>,
+	addr: SocketAddr,
+}
+
+/// The target for a new session, or for one whose target went down: the best
+/// one (by `balance`) that has addresses.
+fn pick(rt: &Runtime, offset: u16) -> Option<Picked> {
+	rt.pool().order().into_iter().find_map(|m: Arc<Member>| {
+		let addr = *m.addrs(offset).first()?;
+		let mut addrs = m.addrs.clone();
+		addrs.borrow_and_update();
+		Some(Picked { lease: Lease::new(m), addrs, addr })
+	})
 }
 
 /// `source_ip: proxy_v2`: the PROXY v2 (DGRAM) header sent in front of every
@@ -259,14 +309,21 @@ async fn dtls_session(
 		remove(&sessions, client, id);
 		return;
 	};
+	let Some(chosen) = target.candidates.iter().find(|c| !c.addrs.is_empty()) else {
+		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", dtls = true);
+		let _ = dtls.close().await;
+		remove(&sessions, client, id);
+		return;
+	};
+	let _lease = chosen.lease();
 	let upstream = async {
-		let addr = *target.addrs.first().ok_or("no resolved target")?;
+		let addr = chosen.addrs[0];
 		let socket = Arc::new(source::udp_upstream(addr, rt.bind_as(client)).await.map_err(|e| e.to_string())?);
 		if !tls.spec.upstream.tls {
 			return Ok::<_, String>((addr, Upstream::Plain(socket)));
 		}
 		let conn: Arc<dyn Conn + Send + Sync> = socket;
-		let up = tokio::time::timeout(HANDSHAKE_TIMEOUT, DTLSConn::new(conn, tls.dtls_client_config(&target.host), true, None))
+		let up = tokio::time::timeout(HANDSHAKE_TIMEOUT, DTLSConn::new(conn, tls.dtls_client_config(&chosen.host), true, None))
 			.await
 			.map_err(|_| "backend DTLS handshake timed out".to_string())?
 			.map_err(|e| e.to_string())?;

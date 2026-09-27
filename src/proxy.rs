@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::balance::{Lease, Member, Pool};
 use crate::cidr::{self, Cidr};
 use crate::rule::{Key, SourceIp};
 use crate::tlsconf::{name_matches, TlsRuntime, Unmatched};
@@ -62,20 +63,37 @@ pub struct RouteTarget {
 	pub target: watch::Receiver<Vec<SocketAddr>>,
 }
 
-/// Where one connection goes.
-pub struct Target {
+/// One backend a connection may go to.
+pub struct Candidate {
+	/// The rule's target (None for a `tls.routes` backend).
+	pub member: Option<Arc<Member>>,
 	pub addrs: Vec<SocketAddr>,
 	/// Host name as configured, for verifying the backend's certificate.
 	pub host: String,
+}
+
+impl Candidate {
+	/// Counts the connection on its target while the lease lives.
+	pub fn lease(&self) -> Option<Lease> {
+		self.member.clone().map(Lease::new)
+	}
+}
+
+/// Where one connection goes: the backends to try, best first.
+pub struct Target {
+	pub candidates: Vec<Candidate>,
+	/// The rule's targets, for marking one that refuses (None for `tls.routes`).
+	pub pool: Option<Arc<Pool>>,
 }
 
 /// Everything a listener and its connections need at run time.
 pub struct Runtime {
 	pub key: Key,
 	pub source_ip: SourceIp,
-	/// Current backend addresses; the first one is used for new connections.
-	pub target: watch::Receiver<Vec<SocketAddr>>,
-	pub remote_host: RwLock<String>,
+	/// The rule's backends (`remote_addr` or `targets`) and how to choose among them.
+	pub pool: RwLock<Arc<Pool>>,
+	/// Bumped when a target goes up or down or the pool is replaced.
+	pub pool_events: Arc<watch::Sender<u64>>,
 	pub routes: RwLock<Arc<Vec<RouteTarget>>>,
 	pub tls: RwLock<Arc<TlsRuntime>>,
 	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
@@ -112,6 +130,10 @@ impl Runtime {
 		self.http.read().unwrap().clone()
 	}
 
+	pub fn pool(&self) -> Arc<Pool> {
+		self.pool.read().unwrap().clone()
+	}
+
 	pub fn tls(&self) -> Arc<TlsRuntime> {
 		self.tls.read().unwrap().clone()
 	}
@@ -134,19 +156,20 @@ impl Runtime {
 		let routes = self.routes.read().unwrap().clone();
 		if let Some(name) = server_name {
 			if let Some(route) = routes.iter().find(|r| name_matches(&r.pattern, name)) {
-				return Some(Target {
-					addrs: route.target.borrow().iter().map(|a| shifted(*a, offset)).collect(),
-					host: route.host.clone(),
-				});
+				let addrs = route.target.borrow().iter().map(|a| shifted(*a, offset)).collect();
+				return Some(Target { candidates: vec![Candidate { member: None, addrs, host: route.host.clone() }], pool: None });
 			}
 		}
 		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
 			return None;
 		}
-		Some(Target {
-			addrs: self.target.borrow().iter().map(|a| shifted(*a, offset)).collect(),
-			host: self.remote_host.read().unwrap().clone(),
-		})
+		let pool = self.pool();
+		let candidates = pool
+			.order()
+			.into_iter()
+			.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
+			.collect();
+		Some(Target { candidates, pool: Some(pool) })
 	}
 }
 

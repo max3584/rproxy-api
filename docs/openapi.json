@@ -354,6 +354,9 @@
        }
       },
       "additionalProperties": false
+     },
+     "balance": {
+      "$ref": "#/components/schemas/Balance"
      }
     },
     "required": [
@@ -1056,12 +1059,26 @@
      },
      "remote_addr": {
       "type": "string",
-      "description": "Left out on http rules."
+      "description": "Left out on http rules and rules with targets."
      },
      "remote_port": {
       "type": "integer",
       "minimum": 1,
       "maximum": 65535
+     },
+     "targets": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Target"
+      },
+      "maxItems": 64,
+      "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
+     },
+     "balance": {
+      "$ref": "#/components/schemas/Balance"
+     },
+     "health_check": {
+      "$ref": "#/components/schemas/L4HealthCheck"
      },
      "source_ip": {
       "$ref": "#/components/schemas/SourceIp"
@@ -1113,6 +1130,20 @@
       "minimum": 1,
       "maximum": 65535
      },
+     "targets": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Target"
+      },
+      "maxItems": 64,
+      "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
+     },
+     "balance": {
+      "$ref": "#/components/schemas/Balance"
+     },
+     "health_check": {
+      "$ref": "#/components/schemas/L4HealthCheck"
+     },
      "udp_idle_secs": {
       "type": "integer",
       "minimum": 1,
@@ -1150,7 +1181,8 @@
       "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
      }
     },
-    "additionalProperties": false
+    "additionalProperties": false,
+    "description": "The backends (remote_addr or targets, balance, health_check) are replaced as a whole: balance left out is round_robin, health_check left out is none."
    },
    "HttpStats": {
     "type": "object",
@@ -1243,6 +1275,13 @@
      },
      "http": {
       "$ref": "#/components/schemas/HttpStats"
+     },
+     "targets": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/TargetStatus"
+      },
+      "description": "Rules with several targets or a health_check."
      }
     }
    },
@@ -1271,6 +1310,20 @@
      },
      "remote_port": {
       "type": "integer"
+     },
+     "targets": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Target"
+      },
+      "maxItems": 64,
+      "description": "Several destinations; remote_addr / remote_port then hold the first."
+     },
+     "balance": {
+      "$ref": "#/components/schemas/Balance"
+     },
+     "health_check": {
+      "$ref": "#/components/schemas/L4HealthCheck"
      },
      "source_ip": {
       "$ref": "#/components/schemas/SourceIp"
@@ -1504,6 +1557,88 @@
       "nullable": true
      },
      "restart_needed": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "Balance": {
+    "type": "string",
+    "enum": [
+     "round_robin",
+     "least_conn",
+     "failover"
+    ],
+    "description": "How new connections (sessions, requests) are spread over the destinations."
+   },
+   "Target": {
+    "type": "object",
+    "properties": {
+     "addr": {
+      "type": "string"
+     },
+     "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+     },
+     "weight": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "backup": {
+      "type": "boolean",
+      "description": "Used only while every other target is down."
+     }
+    },
+    "required": [
+     "addr",
+     "port"
+    ],
+    "additionalProperties": false
+   },
+   "L4HealthCheck": {
+    "type": "object",
+    "properties": {
+     "interval": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "string"
+     },
+     "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "Port to connect to instead of each target's own (required for udp)."
+     }
+    },
+    "additionalProperties": false
+   },
+   "TargetStatus": {
+    "type": "object",
+    "properties": {
+     "addr": {
+      "type": "string"
+     },
+     "port": {
+      "type": "integer"
+     },
+     "backup": {
+      "type": "boolean"
+     },
+     "up": {
+      "type": "boolean"
+     },
+     "connections": {
+      "type": "integer"
+     },
+     "total_connections": {
+      "type": "integer"
+     },
+     "resolved": {
       "type": "array",
       "items": {
        "type": "string"

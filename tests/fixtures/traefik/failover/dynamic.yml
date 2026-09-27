@@ -1,0 +1,23 @@
+http:
+  routers:
+    app:
+      entryPoints: [web]
+      rule: Host(`app.example.com`)
+      service: app
+  services:
+    app:
+      failover:
+        service: main
+        fallback: spare
+    main:
+      loadBalancer:
+        healthCheck:
+          path: /health
+          interval: 5s
+        servers:
+          - url: http://10.0.2.1:80
+          - url: http://10.0.2.2:80
+    spare:
+      loadBalancer:
+        servers:
+          - url: http://10.0.3.1:80
