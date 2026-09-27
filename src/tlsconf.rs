@@ -44,10 +44,35 @@ pub enum Unmatched {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
-	/// `mail.example.com`, or `*.example.com` for one label under it.
+	/// `mail.example.com`, `*.example.com` for one label under it, or
+	/// `**.example.com` for one or more labels under it.
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	pub server_name: String,
+	/// Several names for one backend (instead of `server_name`).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub server_names: Vec<String>,
 	pub remote_addr: String,
 	pub remote_port: u16,
+	/// `terminate` only: send matching connections through without terminating
+	/// TLS (the ClientHello is replayed to the backend, as with mode `sni`).
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub passthrough: bool,
+}
+
+impl Route {
+	/// The names this route answers (`server_name` or `server_names`).
+	pub fn patterns(&self) -> Vec<String> {
+		if self.server_names.is_empty() {
+			vec![self.server_name.to_ascii_lowercase()]
+		} else {
+			self.server_names.iter().map(|n| n.to_ascii_lowercase()).collect()
+		}
+	}
+
+	/// A name for messages.
+	pub fn label(&self) -> String {
+		self.patterns().join(",")
+	}
 }
 
 /// One certificate: PEM files, or (v0.3) one obtained through an ACME resolver.
@@ -292,15 +317,23 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		return Err(tls_error("upstream chain_file needs cert_file"));
 	}
 	for route in &tls.routes {
-		if !valid_pattern(&route.server_name) {
-			return Err(tls_error(format!("invalid server_name: {}", route.server_name)));
+		if route.server_name.is_empty() == route.server_names.is_empty() {
+			return Err(tls_error("each route needs server_name or server_names (not both)"));
+		}
+		for name in route.patterns() {
+			if !valid_pattern(&name) {
+				return Err(tls_error(format!("invalid server_name: {name}")));
+			}
+		}
+		if route.passthrough && tls.mode != TlsMode::Terminate {
+			return Err(tls_error("passthrough routes are for mode terminate (with mode sni every route is passed through)"));
+		}
+		if route.passthrough && starttls.is_some() {
+			return Err(tls_error("passthrough routes cannot be combined with starttls (TLS starts after the plain-text dialogue)"));
 		}
 		crate::rule::validate_remote(&route.remote_addr, route.remote_port)?;
 		if u32::from(route.remote_port) + u32::from(port_count) - 1 > 65_535 {
-			return Err(ApiError::invalid(format!(
-				"route {}: remote_port + range length exceeds 65535",
-				route.server_name
-			)));
+			return Err(ApiError::invalid(format!("route {}: remote_port + range length exceeds 65535", route.label())));
 		}
 	}
 	if let Some(proto) = starttls {
@@ -312,19 +345,46 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 }
 
 fn valid_pattern(p: &str) -> bool {
-	let name = p.strip_prefix("*.").unwrap_or(p);
+	let name = p.strip_prefix("**.").or_else(|| p.strip_prefix("*.")).unwrap_or(p);
 	!name.is_empty()
 		&& name.len() <= 253
 		&& name.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// Whether `name` (from SNI) matches `pattern`; `*.` matches exactly one label.
+/// Whether `name` (from SNI) matches `pattern`; `*.` matches exactly one label,
+/// `**.` one or more labels (not the name itself).
 pub fn name_matches(pattern: &str, name: &str) -> bool {
+	match_rank(pattern, name).is_some()
+}
+
+/// How closely `pattern` matches `name`, for choosing among several matches:
+/// lower is better. An exact name comes first, then `*.`, then `**.` with the
+/// longest suffix first.
+pub fn match_rank(pattern: &str, name: &str) -> Option<(u8, usize)> {
 	let (pattern, name) = (pattern.to_ascii_lowercase(), name.to_ascii_lowercase());
-	match pattern.strip_prefix("*.") {
-		Some(suffix) => name.split_once('.').is_some_and(|(label, rest)| !label.is_empty() && rest == suffix),
-		None => pattern == name,
+	if let Some(suffix) = pattern.strip_prefix("**.") {
+		let dotted = format!(".{suffix}");
+		return (name.len() > dotted.len() && name.ends_with(&dotted) && !name.starts_with('.'))
+			.then(|| (2, usize::MAX - suffix.len()));
 	}
+	match pattern.strip_prefix("*.") {
+		Some(suffix) => name
+			.split_once('.')
+			.is_some_and(|(label, rest)| !label.is_empty() && rest == suffix)
+			.then_some((1, 0)),
+		None => (pattern == name).then_some((0, 0)),
+	}
+}
+
+/// The best of several pattern lists for `name`: the index of the list with the
+/// closest match (ties go to the earlier list).
+pub fn best_match<'a>(lists: impl IntoIterator<Item = &'a [String]>, name: &str) -> Option<usize> {
+	lists
+		.into_iter()
+		.enumerate()
+		.filter_map(|(i, patterns)| patterns.iter().filter_map(|p| match_rank(p, name)).min().map(|r| (r, i)))
+		.min()
+		.map(|(_, i)| i)
 }
 
 fn read(path: &str) -> Result<Vec<u8>, ApiError> {
@@ -836,6 +896,62 @@ impl TlsRuntime {
 mod tests {
 	use super::*;
 
+	fn route() -> Route {
+		Route {
+			server_name: String::new(),
+			server_names: vec![],
+			remote_addr: "10.0.0.1".into(),
+			remote_port: 443,
+			passthrough: false,
+		}
+	}
+
+	#[test]
+	fn double_wildcard_matches_any_depth_and_priorities() {
+		assert!(name_matches("**.tenant.example", "a.tenant.example"));
+		assert!(name_matches("**.tenant.example", "a.b.c.tenant.example"));
+		assert!(name_matches("**.Tenant.example", "A.B.TENANT.example"));
+		assert!(!name_matches("**.tenant.example", "tenant.example"), "not the apex");
+		assert!(!name_matches("**.tenant.example", "xtenant.example"));
+		assert!(!name_matches("**.tenant.example", ".tenant.example"));
+
+		let lists: Vec<Vec<String>> = [
+			vec!["**.example"],
+			vec!["**.tenant.example"],
+			vec!["*.tenant.example"],
+			vec!["registry.example", "a.tenant.example"],
+		]
+		.into_iter()
+		.map(|l| l.into_iter().map(String::from).collect())
+		.collect();
+		let best = |name| best_match(lists.iter().map(Vec::as_slice), name);
+		assert_eq!(best("a.tenant.example"), Some(3), "exact first");
+		assert_eq!(best("b.tenant.example"), Some(2), "then *.");
+		assert_eq!(best("x.b.tenant.example"), Some(1), "then the longer **. suffix");
+		assert_eq!(best("other.example"), Some(0));
+		assert_eq!(best("registry.example"), Some(3));
+		assert_eq!(best("example"), None);
+		// equal matches: the earlier list wins
+		let same: Vec<Vec<String>> = vec![vec!["**.a.test".into()], vec!["**.a.test".into()]];
+		assert_eq!(best_match(same.iter().map(Vec::as_slice), "x.a.test"), Some(0));
+	}
+
+	#[test]
+	fn route_names_and_passthrough_are_validated() {
+		let cert = CertFiles { cert_file: "c".into(), key_file: "k".into(), ..Default::default() };
+		let spec = |routes: Vec<Route>, mode| TlsSpec { mode, routes, certificates: if mode == TlsMode::Terminate { vec![cert.clone()] } else { vec![] }, ..Default::default() };
+		let check = |s: &TlsSpec, starttls| validate_range(Protocol::Tcp, s, starttls, 1).map_err(|e| e.message);
+		let names = Route { server_names: vec!["registry.example".into(), "**.tenant.example".into()], passthrough: true, ..route() };
+		assert_eq!(check(&spec(vec![names.clone()], TlsMode::Terminate), None), Ok(()));
+		let both = Route { server_name: "a.test".into(), ..names.clone() };
+		assert!(check(&spec(vec![both], TlsMode::Terminate), None).unwrap_err().contains("not both"));
+		assert!(check(&spec(vec![route()], TlsMode::Terminate), None).unwrap_err().contains("server_name"));
+		let bad = Route { server_names: vec!["***.x".into()], ..route() };
+		assert!(check(&spec(vec![bad], TlsMode::Terminate), None).unwrap_err().contains("invalid server_name"));
+		assert!(check(&spec(vec![names.clone()], TlsMode::Sni), None).unwrap_err().contains("mode terminate"));
+		assert!(check(&spec(vec![names], TlsMode::Terminate), Some(StartTls::Smtp)).unwrap_err().contains("starttls"));
+	}
+
 	#[test]
 	fn wildcard_matches_one_label() {
 		assert!(name_matches("*.example.com", "mail.example.com"));
@@ -871,7 +987,7 @@ mod tests {
 		assert_eq!(validate(Protocol::Tcp, &reject_without_routes, None).unwrap_err().code, "tls_config");
 		let routed = TlsSpec {
 			mode: TlsMode::Sni,
-			routes: vec![Route { server_name: "a.test".into(), remote_addr: "10.0.0.1".into(), remote_port: 65_530 }],
+			routes: vec![Route { server_name: "a.test".into(), remote_addr: "10.0.0.1".into(), remote_port: 65_530, ..route() }],
 			..Default::default()
 		};
 		assert!(validate_range(Protocol::Tcp, &routed, None, 6).is_ok());

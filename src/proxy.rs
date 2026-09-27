@@ -10,7 +10,7 @@ use tokio_util::task::TaskTracker;
 use crate::balance::{Lease, Member, Pool};
 use crate::cidr::{self, Cidr};
 use crate::rule::{Key, SourceIp};
-use crate::tlsconf::{name_matches, TlsRuntime, Unmatched};
+use crate::tlsconf::{best_match, TlsRuntime, Unmatched};
 
 #[derive(Default)]
 pub struct Stats {
@@ -58,7 +58,10 @@ impl Stats {
 
 /// A backend chosen by server name (TLS `sni` / `terminate` routes).
 pub struct RouteTarget {
-	pub pattern: String,
+	/// Lower-cased names (`server_name` or `server_names`).
+	pub patterns: Vec<String>,
+	/// Relay without terminating TLS (`passthrough: true` in a `terminate` rule).
+	pub passthrough: bool,
 	pub host: String,
 	pub target: watch::Receiver<Vec<SocketAddr>>,
 }
@@ -84,6 +87,8 @@ pub struct Target {
 	pub candidates: Vec<Candidate>,
 	/// The rule's targets, for marking one that refuses (None for `tls.routes`).
 	pub pool: Option<Arc<Pool>>,
+	/// A `passthrough` route: relay the TLS bytes as they are.
+	pub passthrough: bool,
 }
 
 /// Everything a listener and its connections need at run time.
@@ -150,14 +155,24 @@ impl Runtime {
 			&& self.global.crowdsec().is_some_and(|b| b.check_ip(client) == crate::http::crowdsec::Verdict::Block)
 	}
 
+	/// Whether some `tls.routes` relay without terminating (`passthrough`).
+	pub fn has_passthrough(&self) -> bool {
+		self.routes.read().unwrap().iter().any(|r| r.passthrough)
+	}
+
 	/// The backend for a connection, by server name when routes are configured.
 	/// None when the name matches no route and the rule rejects unmatched names.
 	pub fn select(&self, server_name: Option<&str>, offset: u16) -> Option<Target> {
 		let routes = self.routes.read().unwrap().clone();
 		if let Some(name) = server_name {
-			if let Some(route) = routes.iter().find(|r| name_matches(&r.pattern, name)) {
+			if let Some(i) = best_match(routes.iter().map(|r| r.patterns.as_slice()), name) {
+				let route = &routes[i];
 				let addrs = route.target.borrow().iter().map(|a| shifted(*a, offset)).collect();
-				return Some(Target { candidates: vec![Candidate { member: None, addrs, host: route.host.clone() }], pool: None });
+				return Some(Target {
+					candidates: vec![Candidate { member: None, addrs, host: route.host.clone() }],
+					pool: None,
+					passthrough: route.passthrough,
+				});
 			}
 		}
 		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
@@ -169,7 +184,7 @@ impl Runtime {
 			.into_iter()
 			.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 			.collect();
-		Some(Target { candidates, pool: Some(pool) })
+		Some(Target { candidates, pool: Some(pool), passthrough: false })
 	}
 }
 

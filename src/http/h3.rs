@@ -222,6 +222,11 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 	};
 	info!(event = "conn.open", rule = %rt.key, client = %client, transport = "quic",
 		sni = tls.server_name.as_deref().unwrap_or(""), client_cn = tls.client_cn.as_deref().unwrap_or(""));
+	// names of `passthrough` routes are served by their own backend over TCP, never here
+	if rt.select(tls.server_name.as_deref(), 0).is_some_and(|t| t.passthrough) {
+		conn.close(quinn::VarInt::from_u32(0x0100), b"passthrough name");
+		return Ok("passthrough");
+	}
 	let handler = Arc::new(Conn::new(rt.clone(), client, local, Some(tls), true));
 	let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn))
 		.await

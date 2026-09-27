@@ -141,7 +141,7 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 |---|---|
 | `tls.mode: passthrough`（既定） | 暗号化されたまま流す |
 | `tls.mode: sni` | ClientHello のサーバ名で転送先を振り分ける（復号しない。tcp のみ） |
-| `tls.mode: terminate` | rproxy で TLS（tcp）/ DTLS（udp）を終端する。SNI での証明書の選択、mTLS（`client_auth`）、ALPN、転送先への再暗号化（`upstream`）に対応 |
+| `tls.mode: terminate` | rproxy で TLS（tcp）/ DTLS（udp）を終端する。SNI での証明書の選択、mTLS（`client_auth`）、ALPN、転送先への再暗号化（`upstream`）に対応。`tls.routes` の `passthrough: true` の名前だけは終端せずにそのまま流せる（L7 のルールと同じポートでも） |
 | `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
 | `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
 

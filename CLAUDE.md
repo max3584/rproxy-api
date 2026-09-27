@@ -34,7 +34,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
 | `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
 | `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / webrtc-dtls の設定の組み立て（`TlsRuntime`） |
-| `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni`。読んだバイトは転送先へそのまま送る） |
+| `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
 | `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを webrtc-dtls に渡す `Conn` |
 | `src/rule.rs` | ルールの型と検証。`Features`（この版で動かせる v0.3 の設定。`GET /capabilities` の `features`。パッチで中身を入れたら true にする） |
@@ -77,6 +77,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 - `allow_from` は受け付けた直後（TLS や PROXY ヘッダより前）に確かめる。UDP は範囲外のデータグラムを捨てる。拒否は `stats.denied` に数え、`conn.denied` をログに出す。
 - `tls.unmatched: reject` の `terminate` は、`LazyConfigAcceptor` で ClientHello を読んでから判断する（一致しない名前には証明書を返さない）。
+- `tls.routes` の名前：完全一致・`*.`（1 階層）・`**.`（何階層でも）、`server_names` で複数。選び方は `tlsconf::best_match`（完全一致 → `*.` → 長い `**.` → 書いた順）。`passthrough` の route がある `terminate` のルールは、先に `sni::read_client_hello` で読み、passthrough の名前なら `relay_hello`、それ以外は読んだバイトを `Prefixed` で rustls に渡す（`http` のルールも同じ。HTTP/3 は passthrough の名前の接続を閉じる）。
 - 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作り、ファイルが変わったら `Registry::reload_static` で差分を反映する（誤りがあれば何も変えない）。API からの変更・削除は `409 static`。`global` の変更は再起動まで効かない（`GET /config` の `restart_needed`）。
 - API の定義は `docs/openapi.json`（`GET /openapi.json`）。エンドポイントを足したら、ここにも足す（`api.rs` のテストがルーターとの食い違いを見つける）。
 - バージョン管理とリリースは docs/RELEASING.md の決まりで、確認を取らずに進める（UI と同じ番号で一緒に出す。PR・issue を作るときにパッチ／マイナーのマイルストーンを付ける。マージ後のタグ・リリースノート・マイルストーンの片付けまで行う）。

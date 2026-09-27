@@ -91,7 +91,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 - `backup` の宛先は、ほかの宛先がすべて down のときだけ使う。すべて down なら、down の宛先も順に試す（接続を断らない）。
 - UDP の既存のセッションは、自分の宛先が down になったら次の宛先へ移る（`conn.retarget`、`reason: target down`）。`failover` で上位が戻っても、既存のセッションはそのまま。
 - 名前解決できない宛先があっても、ほかの宛先が解決できればルールは動く（解決できない宛先は後から再解決する）。すべて解決できなければ、これまでどおり `resolve_failed`。
-- `tls.routes`（サーバ名ごとの転送先）は今までどおり 1 つずつ。`targets` は一致しない名前（とサーバ名なし）の転送先。
+- `tls.routes`（サーバ名ごとの転送先）は今までどおり route ごとに 1 つ。`targets` は一致しない名前（とサーバ名なし）の転送先。
 - 状態が変わると `event: "target.down"`（`reason: health_check` / `connect`、`error`）/ `"target.up"` のログ。ルールの `stats.targets` に宛先ごとの `[{"addr","port","backup"?,"up","connections","total_connections","resolved"}]`（`targets` が 2 つ以上か `health_check` があるときだけ）、`/metrics` に `rproxy_target_up{protocol,listen,target}`（1 / 0）と `rproxy_target_connections{protocol,listen,target}`。
 - 宛先・`balance`・`health_check` を変えると、宛先ごとの接続数と up / down は最初からになる（開いている接続はそのまま）。
 
@@ -119,7 +119,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | フィールド | 説明 |
 |---|---|
 | `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（tcp のみ。ClientHello のサーバ名で転送先を選び、復号しない）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
-| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。`*.example.com` は 1 階層だけ一致する。一致しない名前はルールの `remote_addr` / `remote_port` へ。ポート範囲では、ここの `remote_port` も同じだけずれる |
+| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）：`{"server_name" または "server_names", "remote_addr", "remote_port", "passthrough"?}`。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。一致しない名前はルールの `remote_addr` / `remote_port`（`targets`）へ。ポート範囲では、ここの `remote_port` も同じだけずれる。<br>名前の書き方：`mail.example.com`（完全一致）、`*.example.com`（1 階層だけ）、`**.example.com`（1 階層以上、何階層でも。`example.com` 自体には一致しない）。`server_names` で 1 つの route に名前を複数書ける（`server_name` とどちらか一方）。複数の route に一致するときは、完全一致 → `*.` → `**.`（接尾辞が長い方）→ 書いた順。<br>`passthrough: true`（`terminate` だけ）：その名前の接続は終端せず、ClientHello ごと転送先へそのまま流す（`sni` と同じ。証明書は転送先が持つ）。`allow_from`・ルールの `crowdsec`・`source_ip`・統計は効く。`starttls` とは組み合わせられない。HTTP/3（QUIC）では扱わない（その名前の QUIC の接続は閉じる） |
 | `unmatched` | `default`（既定。どの `routes` にも一致しない名前・SNI なしは、ルールの `remote_addr` / `remote_port` へ）または `reject`（切断する。`terminate` ではハンドシェイクを完了せずに切る）。tcp の `sni` / `terminate` で、`routes` があるときだけ指定できる |
 | `certificates` | `terminate` で必須。`cert_file` はサーバ証明書、`chain_file` は中間 CA の証明書（サーバ証明書を発行した CA から、ルートへ向かう順。ルートは入れなくてよい）、`key_file` は秘密鍵。`cert_file` にチェーンを連結しても使える。読み込むときに、チェーンの順番と、鍵がサーバ証明書と対になっていることを確かめる。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
 | `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required`。`optional` と `required` では `ca_file` が必須。`ca_file` はルート CA（信頼の起点）。`chain_file` はクライアント証明書の中間 CA で、中間 CA を送ってこないクライアントのために、検証の途中経路を補う（信頼の起点にはしない）。TLS と DTLS で同じ規則で検証する |
@@ -242,6 +242,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - 鍵交換の曲線と、一致しない SNI を断る設定（Traefik の sniStrict。rproxy では `tls.unmatched: reject`）は `options` にはない。
   - 決まった版と暗号スイートは `conn.open` の `tls_version` / `tls_cipher` に出る。
 - `http` は `protocol: tcp` で、`tls.mode` が `terminate`（HTTPS）か、TLS なし（平文の HTTP）のときだけ。`sni`・`starttls`・ポート範囲とは組み合わせられない。`remote_addr` / `remote_port` は書かない（書くと `400 invalid`）。
+- `http` のルールでも、`tls.routes` の `passthrough: true` の route は使える（同じポートで、その名前だけを終端せずに流す。例：cdn・gitlab は L7、registry と `**.tenant.example.com` は Kubernetes へそのまま）。passthrough でない `tls.routes` と `unmatched: reject` は `tls_config`（振り分けは `http.routes`、一致しないときは `http.default`）。
 - `http.http3: true`（v0.3.2）で、同じアドレス・ポートの UDP でも QUIC + HTTP/3 を受ける。
   - `tls.mode: terminate` のときだけ（TLS なしなら `400 tls_config`）。`source_ip: transparent` とは組み合わせられない（`unsupported`）。
   - 証明書・クライアント認証（`client_auth`）は TCP と同じもの。QUIC は TLS 1.3 だけなので、`tls.options.cipher_suites` に TLS 1.3 の暗号スイートが要る（`TLS13_AES_128_GCM_SHA256` がないと QUIC の初期化に使えない）。証明書の読み直し（SIGHUP、`RPROXY_CERT_CHECK_SECS`）は新しい QUIC 接続から効く。

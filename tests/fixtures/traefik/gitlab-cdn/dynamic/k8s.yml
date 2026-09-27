@@ -1,0 +1,27 @@
+# Kubernetes behind the same :443: TLS is passed through (cert-manager holds
+# the certificates), next to the HTTP routers of gitlab and cdn.
+tcp:
+  routers:
+    registry:
+      entryPoints: [websecure]
+      rule: HostSNI(`registry.example.com`)
+      service: k8s-ingress
+      tls:
+        passthrough: true
+    tenant:
+      entryPoints: [websecure]
+      rule: HostSNIRegexp(`^.+\.tenant\.example\.com$`)
+      service: k8s-ingress
+      tls:
+        passthrough: true
+    tenant-one-label:
+      entryPoints: [websecure]
+      rule: HostSNIRegexp(`^[^.]+\.apps\.example\.com$`)
+      service: k8s-ingress
+      tls:
+        passthrough: true
+  services:
+    k8s-ingress:
+      loadBalancer:
+        servers:
+          - address: 10.0.1.10:443

@@ -395,7 +395,12 @@ impl Registry {
 			let (tx, rx) = watch::channel(addrs);
 			// the resolver task keeps the sender; without one the last value stays readable
 			resolvers.extend(self.spawn_resolver(key, &route.remote_addr, route_spec(&route), &Arc::new(tx)));
-			targets.push(RouteTarget { pattern: route.server_name.clone(), host: route.remote_addr.clone(), target: rx });
+			targets.push(RouteTarget {
+				patterns: route.patterns(),
+				passthrough: route.passthrough,
+				host: route.remote_addr.clone(),
+				target: rx,
+			});
 		}
 		(Arc::new(targets), resolvers)
 	}

@@ -356,6 +356,32 @@ def translate_http_rule(rule, where):
     return out
 
 
+# `^.+\.example\.com$` -> `**.example.com`, `^[^.]+\.example\.com$` -> `*.example.com`
+SNI_ANY_DEPTH = (".+", ".*", "(.+)", "(.*)")
+SNI_ONE_LABEL = ("[^.]+", "[^\\.]+", "[a-z0-9-]+", "[a-zA-Z0-9-]+", "[0-9a-z-]+", "[-a-z0-9]+")
+
+
+def sni_regexp_pattern(regex):
+    body = regex.strip()
+    body = body[1:] if body.startswith("^") else body
+    body = body[:-1] if body.endswith("$") else body
+    for prefixes, wildcard in ((SNI_ANY_DEPTH, "**."), (SNI_ONE_LABEL, "*.")):
+        for prefix in prefixes:
+            if body.startswith(prefix + "\\."):
+                suffix = body[len(prefix) + 2:].replace("\\.", ".")
+                if suffix and re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*", suffix):
+                    return wildcard + suffix.lower()
+    # v2 style: {name:regex}.example.com
+    m = re.fullmatch(r"\{[a-z]+:(.+?)\}\.([A-Za-z0-9.-]+)", body)
+    if m:
+        inner = m.group(1)
+        if inner in SNI_ANY_DEPTH or inner in (".+", ".*"):
+            return "**." + m.group(2).lower()
+        if inner in SNI_ONE_LABEL:
+            return "*." + m.group(2).lower()
+    return None
+
+
 def host_names(rule):
     names = []
     for m in CALL.finditer(rule or ""):
@@ -619,6 +645,21 @@ class Rule:
         self.redirect = None
         self.default_middlewares = []
         self.default_tls = None
+
+
+def is_passthrough(t):
+    return isinstance(t["tls"], dict) and as_bool(g(t["tls"], "passthrough"))
+
+
+def sni_route(t, where, passthrough=False):
+    names = [n.lower() for n in t["names"]]
+    route = {"server_name": names[0]} if len(names) == 1 else {"server_names": names}
+    route.update({"remote_addr": t["host"], "remote_port": t["port"]})
+    if passthrough:
+        route["passthrough"] = True
+    if len(t["servers"]) > 1:
+        NOTES.add(where, f"router {t['name']}: a server-name route (tls.routes) has one backend; the first is used")
+    return route
 
 
 def backends(servers):
@@ -974,6 +1015,14 @@ class Converter:
             for m in CALL.finditer(text):
                 if m.group(1) == "HostSNI":
                     names += call_args(m.group(2))
+                elif m.group(1) == "HostSNIRegexp":
+                    for regex in call_args(m.group(2)):
+                        pattern = sni_regexp_pattern(regex)
+                        if pattern:
+                            names.append(pattern)
+                        else:
+                            NOTES.add(where, f"HostSNIRegexp `{regex}` is not a plain suffix; not converted "
+                                      "(rproxy takes names, *.suffix for one label and **.suffix for any depth)")
                 elif m.group(1) == "ClientIP":
                     others.append(("ClientIP", call_args(m.group(2))))
                 else:
@@ -1049,10 +1098,12 @@ class Converter:
                     NOTES.add(where, "TCP routers on an entry point that redirects are left out")
                 continue
             if rule.http_routes:
-                if rule.tcp_routes:
-                    NOTES.add(where, "TCP routers next to HTTP routers on one port cannot be combined in rproxy; TCP routers left out: "
-                              + ", ".join(t["name"] for t in rule.tcp_routes))
-                out.append(self.http_rule(rule, where))
+                passthrough = [t for t in rule.tcp_routes if is_passthrough(t) and "*" not in t["names"]]
+                rest = [t for t in rule.tcp_routes if t not in passthrough]
+                if rest:
+                    NOTES.add(where, "TCP routers next to HTTP routers on one port are combined only when they pass TLS through "
+                              "for named hosts; left out: " + ", ".join(t["name"] for t in rest))
+                out.append(self.http_rule(rule, where, passthrough))
             elif rule.tcp_routes:
                 converted = self.tcp_rule(rule, where)
                 if converted:
@@ -1076,7 +1127,7 @@ class Converter:
         }
         return {**self.base(rule), "http": http}
 
-    def http_rule(self, rule, where):
+    def http_rule(self, rule, where, passthrough=()):
         tls_routes = [r for r in rule.http_routes if r[2]]
         plain = [r for r in rule.http_routes if not r[2]]
         routes = rule.http_routes
@@ -1115,7 +1166,18 @@ class Converter:
             tls = self.tls_spec(rule, mode, where)
             if upstream and uses_https:
                 tls["upstream"] = dict(upstream)
+            if passthrough:
+                tls["routes"] = [sni_route(t, where, passthrough=True) for t in passthrough]
+                for t in passthrough:
+                    if t["proxy"] in (1, 2):
+                        NOTES.add(where, f"router {t['name']}: PROXY protocol towards a passthrough backend next to HTTP "
+                                  "routers is not available in rproxy; left out of the conversion")
+                    if t["client_ip"]:
+                        NOTES.add(where, f"router {t['name']}: ClientIP is not converted for passthrough routes")
             result["tls"] = tls
+        elif passthrough:
+            NOTES.add(where, "TLS passthrough routers need an entry point whose HTTP routers use TLS; left out: "
+                      + ", ".join(t["name"] for t in passthrough))
         elif upstream and uses_https:
             NOTES.add(where, "serversTransport settings (insecureSkipVerify, rootCAs) apply in rproxy only to rules that "
                       "terminate TLS; https:// backends of this plain-HTTP rule are verified against the system roots")
@@ -1128,9 +1190,9 @@ class Converter:
         named = [t for t in routes if "*" not in t["names"]]
         passthrough = [t for t in routes if isinstance(t["tls"], dict) and as_bool(g(t["tls"], "passthrough"))]
         terminate = [t for t in routes if t["tls"] is not None and t not in passthrough]
-        if passthrough and terminate:
-            NOTES.add(where, "TLS passthrough and termination on one port cannot be combined; terminating routers left out: "
-                      + ", ".join(t["name"] for t in terminate))
+        if passthrough and terminate and any("*" in t["names"] for t in passthrough):
+            NOTES.add(where, "a HostSNI(`*`) passthrough router cannot share a port with terminating routers; "
+                      "terminating routers left out: " + ", ".join(t["name"] for t in terminate))
             routes = [t for t in routes if t not in terminate]
             terminate = []
         proxies = {t["proxy"] for t in routes}
@@ -1140,9 +1202,6 @@ class Converter:
         result = self.base(rule)
         default = catch_all[0] if catch_all else routes[0]
         result.update(backends(default["servers"]))
-        for t in named:
-            if len(t["servers"]) > 1:
-                NOTES.add(where, f"router {t['name']}: a server-name route (tls.routes) has one backend; the first is used")
         proxy = routes[0]["proxy"]
         if proxy in (1, 2):
             result["source_ip"] = f"proxy_v{proxy}"
@@ -1158,8 +1217,7 @@ class Converter:
             tls = self.tls_spec(rule, mode, where)
         else:
             tls = {"mode": "sni"}
-        tls["routes"] = [{"server_name": n.lower(), "remote_addr": t["host"], "remote_port": t["port"]}
-                         for t in named for n in t["names"]]
+        tls["routes"] = [sni_route(t, where, passthrough=mode == "terminate" and is_passthrough(t)) for t in named]
         if not catch_all:
             tls["unmatched"] = "reject"
         result["tls"] = tls
