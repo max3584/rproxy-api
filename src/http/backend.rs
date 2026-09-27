@@ -53,6 +53,8 @@ pub struct Server {
 	/// survives restarts and changes of the other servers).
 	pub id: String,
 	up: AtomicBool,
+	/// Requests in progress on this server (for `balance: least_conn`).
+	pub inflight: Arc<AtomicU64>,
 	idle: Mutex<Vec<SendRequest<Body>>>,
 }
 
@@ -73,6 +75,7 @@ impl Server {
 			weight: u64::from(weight.max(1)),
 			id,
 			up: AtomicBool::new(true),
+			inflight: Arc::default(),
 			idle: Mutex::new(vec![]),
 		})
 	}
@@ -129,6 +132,7 @@ pub struct Service {
 	pub health: Option<HealthCheck>,
 	/// Name of the sticky cookie.
 	pub sticky: Option<String>,
+	pub balance: crate::balance::Balance,
 }
 
 fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError> {
@@ -174,6 +178,7 @@ impl Service {
 			response: duration(timeouts.and_then(|t| t.response.as_ref()), DEFAULT_RESPONSE)?,
 			health,
 			sticky,
+			balance: spec.balance,
 		})
 	}
 
@@ -184,18 +189,38 @@ impl Service {
 			sticky: None,
 			pass_host_header: None,
 			timeouts: None,
+			balance: Default::default(),
 		};
 		Service::compile(url, &spec)
 	}
 
 	/// The server for a request: the one its sticky cookie names while that is
-	/// up, otherwise the next by weighted round robin among those up. None when
+	/// up, otherwise the one `balance` picks among those up (weighted round
+	/// robin, fewest requests in progress, or the first in order). None when
 	/// every server is down.
 	pub fn pick(&self, sticky: Option<&str>) -> Option<usize> {
 		if let Some(id) = sticky {
 			if let Some(i) = self.servers.iter().position(|s| s.id == id && s.is_up()) {
 				return Some(i);
 			}
+		}
+		match self.balance {
+			crate::balance::Balance::Failover => return self.servers.iter().position(Server::is_up),
+			crate::balance::Balance::LeastConn => {
+				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| self.servers[i].is_up()).collect();
+				if up.is_empty() {
+					return None;
+				}
+				// ties go round, so idle servers share requests evenly
+				let start = self.next.fetch_add(1, Ordering::Relaxed) as usize % up.len();
+				return up[start..].iter().chain(&up[..start]).copied().min_by(|&a, &b| {
+					let (sa, sb) = (&self.servers[a], &self.servers[b]);
+					let la = u128::from(sa.inflight.load(Ordering::Relaxed)) * u128::from(sb.weight);
+					let lb = u128::from(sb.inflight.load(Ordering::Relaxed)) * u128::from(sa.weight);
+					la.cmp(&lb)
+				});
+			}
+			crate::balance::Balance::RoundRobin => {}
 		}
 		// a few draws; with most servers down, fall back to scanning
 		for _ in 0..self.servers.len() * 4 {
@@ -389,6 +414,24 @@ mod tests {
 		assert!((0..8).all(|_| s.pick(None) == Some(1)));
 		s.servers[1].up.store(false, Ordering::Relaxed);
 		assert_eq!(s.pick(None), None, "every server is down");
+	}
+
+	#[test]
+	fn least_conn_and_failover() {
+		let s = service("servers: [{url: 'http://10.0.0.1'}, {url: 'http://10.0.0.2'}, {url: 'http://10.0.0.3'}]\nbalance: least_conn");
+		s.servers[0].inflight.store(3, Ordering::Relaxed);
+		s.servers[1].inflight.store(1, Ordering::Relaxed);
+		s.servers[2].inflight.store(2, Ordering::Relaxed);
+		assert!((0..4).all(|_| s.pick(None) == Some(1)));
+		s.servers[1].up.store(false, Ordering::Relaxed);
+		assert_eq!(s.pick(None), Some(2));
+
+		let f = service("servers: [{url: 'http://10.0.0.1'}, {url: 'http://10.0.0.2'}]\nbalance: failover");
+		assert!((0..4).all(|_| f.pick(None) == Some(0)));
+		f.servers[0].up.store(false, Ordering::Relaxed);
+		assert_eq!(f.pick(None), Some(1));
+		f.servers[0].up.store(true, Ordering::Relaxed);
+		assert_eq!(f.pick(None), Some(0), "back to the first once it is up");
 	}
 
 	#[test]

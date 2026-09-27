@@ -107,6 +107,12 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/rules
 curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/rules/tcp/0.0.0.0/8888 \
   -d '{"remote_addr":"192.168.1.3","remote_port":8081}'
 
+# 宛先を複数に（balance: round_robin / least_conn / failover。health_check で生死を確かめる）
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \
+  -d '{"protocol":"tcp","listen_addr":"0.0.0.0","listen_port":5432,
+       "targets":[{"addr":"10.0.0.11","port":5432},{"addr":"10.0.0.12","port":5432},{"addr":"10.0.0.13","port":5432,"backup":true}],
+       "balance":"least_conn","health_check":{"interval":"10s"}}'
+
 # 停止（既存の接続も切断。?drain_secs=30 で終了を待つ）
 curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp/0.0.0.0/8888
 ```
@@ -214,7 +220,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |
-| `conn.retarget` | UDP セッションの転送先の切り替え |
+| `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
+| `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元 |
 

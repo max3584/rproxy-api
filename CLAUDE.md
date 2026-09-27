@@ -28,7 +28,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/api.rs` | axum のルーター。Bearer 認証のミドルウェア。エラーは常に `ApiError` の JSON |
 | `src/registry.rs` | 稼働中ルールの唯一の持ち主。作成・変更・削除・一覧・metrics、listener の監視（panic したら `failed`）、名前解決できないルールの再試行 |
 | `src/tcp.rs` / `src/udp.rs` | データプレーン。停止は `CancellationToken`、転送先は `watch` で受け取る |
-| `src/proxy.rs` | ルールごとの実行時状態 `Runtime`（トークン、watch、統計、`TaskTracker`） |
+| `src/proxy.rs` | ルールごとの実行時状態 `Runtime`（トークン、watch、統計、`TaskTracker`）。`select` が転送先の候補を良い順に返す（`Target.candidates`） |
+| `src/balance.rs` | 複数の宛先（#98）：`targets` / `balance`（round_robin・least_conn・failover）/ `backup` / L4 の `health_check`（TCP の接続）。`Pool` は `Runtime.pool` にあり、宛先が変わったら丸ごと差し替える。接続に失敗した宛先は `FAIL_COOLDOWN` のあいだ飛ばす。`Lease` が宛先ごとの接続数を数える。状態の変化は `Runtime.pool_events` で UDP のセッションに知らせる（落ちた宛先から移る） |
 | `src/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
 | `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
 | `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
@@ -67,7 +68,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 - ルールの状態は `Registry` だけが持つ。タスクの `JoinHandle` を捨てない。
 - 停止は `stop`（受け付け停止）→ 任意の drain → `kill`（既存接続の切断）の順。`delete` は listener が閉じ、全接続が終わってから返る。
-- 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。
+- 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。宛先が複数のルールでは、UDP のセッションは自分の宛先が down になったときだけ移る（`failover` で上位が戻っても、既存のセッションはそのまま）。
+- 宛先（`remote_addr` か `targets`、`balance`、`health_check`）は PATCH で毎回まとめて置き換える（省いた `balance` は round_robin、`health_check` はなし）。一覧の `remote_addr` / `remote_port` は `targets` の先頭（古いクライアント・ログ用）。DB の `options.targets` があれば `dist_addr` / `dist_port` は読まない。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
 

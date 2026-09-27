@@ -62,17 +62,26 @@ async fn loads_every_schema_version() {
 		 ('u2', 'tcp', '0.0.0.0', 993, NULL, 'imap.local', 143, 'proxy_v2',
 		  '{"tls": {"mode": "terminate", "certificates": [{"cert_file": "/c.pem", "key_file": "/k.pem"}]}, "starttls": null}'),
 		 ('u3', 'tcp', '0.0.0.0', 25, NULL, 'mx.local', 25, 'proxy', '{"tls": {"mode": "terminate", "certificates": [{"cert_file": "/c", "key_file": "/k"}]}, "starttls": "smtp", "starttls_required": false, "allow_from": ["10.0.0.0/8"]}'),
-		 ('u4', 'tcp', '0.0.0.0', 26, NULL, 'x', 1, 'proxy', '{"tls": {"mode": "nonsense"}}')"#,
+		 ('u4', 'tcp', '0.0.0.0', 26, NULL, 'x', 1, 'proxy', '{"tls": {"mode": "nonsense"}}'),
+		 ('u5', 'tcp', '0.0.0.0', 5432, NULL, 'db1.local', 5432, 'proxy',
+		  '{"targets": [{"addr": "db1.local", "port": 5432, "weight": 2}, {"addr": "db2.local", "port": 5432, "backup": true}], "balance": "failover", "health_check": {"interval": "5s", "port": 5433}}')"#,
 	)
 	.await
 	.unwrap();
 	let rules = db::load_rules(&url).await.unwrap();
-	assert_eq!(rules.len(), 3, "the row with broken options is skipped");
+	assert_eq!(rules.len(), 4, "the row with broken options is skipped");
 	assert_eq!(rules[0].listen_port_end, Some(10099));
 	assert_eq!(rules[1].tls.as_ref().unwrap().mode, TlsMode::Terminate);
 	assert_eq!(rules[1].starttls, None);
 	assert_eq!((rules[2].starttls, rules[2].starttls_required), (Some(StartTls::Smtp), Some(false)));
 	assert_eq!(rules[2].allow_from, vec!["10.0.0.0/8".to_string()]);
+	// several targets (#98): dist_addr / dist_port are left to the targets
+	let r = &rules[3];
+	assert_eq!((r.remote_addr.as_str(), r.remote_port, r.targets.len()), ("", 0, 2));
+	assert_eq!((r.targets[0].weight, r.targets[1].backup), (Some(2), true));
+	assert_eq!(r.balance, rproxy_api::balance::Balance::Failover);
+	assert_eq!(r.health_check.as_ref().unwrap().port, Some(5433));
+	assert!(r.clone().validate(&Default::default()).is_ok());
 
 	pool.execute("DROP TABLE forward_rules").await.unwrap();
 	pool.execute(CURRENT).await.unwrap();

@@ -370,7 +370,7 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	for kind in ["compress", "oidc", "forward_auth", "basic_auth"] {
 		assert!(kinds.contains(&json!(kind)), "every middleware kind works now: {caps}");
 	}
-	assert_eq!(caps["features"]["services"], json!(["health_check", "sticky"]), "{caps}");
+	assert_eq!(caps["features"]["services"], json!(["health_check", "sticky", "balance"]), "{caps}");
 
 	let mut body = rule("tcp", free_port(), backend);
 	body["http"] = json!({"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1"}]});

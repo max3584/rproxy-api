@@ -30,14 +30,28 @@ main = "mail.example.com"
 [[tcp.services.app.loadBalancer.servers]]
 address = "10.0.1.10:443"
 
-[tcp.services.fallback.loadBalancer]
-[[tcp.services.fallback.loadBalancer.servers]]
+# weighted: flattened into targets with weights 3 and 1
+[[tcp.services.fallback.weighted.services]]
+name = "fallback-a"
+weight = 3
+[[tcp.services.fallback.weighted.services]]
+name = "fallback-b"
+weight = 1
+
+[tcp.services.fallback-a.loadBalancer]
+[[tcp.services.fallback-a.loadBalancer.servers]]
 address = "10.0.1.11:443"
+
+[tcp.services.fallback-b.loadBalancer]
+[[tcp.services.fallback-b.loadBalancer.servers]]
+address = "10.0.1.12:443"
 
 [tcp.services.ssh.loadBalancer]
 proxyProtocol = { version = 2 }
 [[tcp.services.ssh.loadBalancer.servers]]
 address = "10.0.1.20:22"
+[[tcp.services.ssh.loadBalancer.servers]]
+address = "10.0.1.21:22"
 
 [tcp.services.dovecot.loadBalancer]
 [[tcp.services.dovecot.loadBalancer.servers]]
@@ -50,6 +64,8 @@ service = "dns"
 [udp.services.dns.loadBalancer]
 [[udp.services.dns.loadBalancer.servers]]
 address = "10.0.1.53:53"
+[[udp.services.dns.loadBalancer.servers]]
+address = "10.0.1.54:53"
 
 [[tls.certificates]]
 certFile = "/etc/ssl/mail.pem"

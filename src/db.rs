@@ -47,6 +47,12 @@ struct Options {
 	http: Option<crate::http::HttpSpec>,
 	#[serde(default)]
 	crowdsec: bool,
+	/// Several backends (#98); dist_addr / dist_port are then ignored.
+	#[serde(default)]
+	targets: Vec<crate::balance::TargetSpec>,
+	#[serde(default)]
+	balance: crate::balance::Balance,
+	health_check: Option<crate::balance::HealthCheckSpec>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -64,6 +70,9 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		listen_port_end: None,
 		remote_addr: get_str("dist_addr")?,
 		remote_port: port(get_int("dist_port")?, "dist_port")?,
+		targets: vec![],
+		balance: Default::default(),
+		health_check: None,
 		source_ip: SourceIp::Proxy,
 		udp_idle_secs: None,
 		tls: None,
@@ -93,6 +102,13 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		req.allow_from = options.allow_from;
 		req.http = options.http;
 		req.crowdsec = options.crowdsec;
+		if !options.targets.is_empty() {
+			req.remote_addr = String::new();
+			req.remote_port = 0;
+			req.targets = options.targets;
+		}
+		req.balance = options.balance;
+		req.health_check = options.health_check;
 	}
 	Ok(req)
 }

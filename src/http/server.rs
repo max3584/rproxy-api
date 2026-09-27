@@ -766,7 +766,7 @@ impl Conn {
 		let mut first = Some((parts, body));
 
 		let mut attempt = 0;
-		let (mut resp, index) = loop {
+		let (mut resp, index, counted) = loop {
 			attempt += 1;
 			let Some(index) = service.pick(sticky.as_deref()) else {
 				warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, status = 503, error = "no server is up");
@@ -802,8 +802,10 @@ impl Conn {
 					req
 				}
 			};
+			// counted while in progress, for `balance: least_conn`
+			let counted = Hold::counting(server.inflight.clone());
 			match self.send(router, service, index, req).await {
-				Ok(resp) => break (resp, index),
+				Ok(resp) => break (resp, index, counted),
 				Err(Failure::Status(status, error)) => {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
 						status = status.as_u16(), error = %error, attempt, attempts);
@@ -816,6 +818,7 @@ impl Conn {
 				}
 			}
 		};
+		holds.push(counted);
 		let server = &service.servers[index];
 		if sticky.as_deref() != Some(server.id.as_str()) {
 			if let Some(cookie) = service.sticky_cookie(server, self.https) {
