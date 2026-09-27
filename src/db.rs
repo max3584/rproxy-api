@@ -53,6 +53,9 @@ struct Options {
 	#[serde(default)]
 	balance: crate::balance::Balance,
 	health_check: Option<crate::balance::HealthCheckSpec>,
+	/// More listen addresses (#99).
+	#[serde(default)]
+	extra_listen_addrs: Vec<String>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -68,6 +71,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		listen_addr: get_str("src_addr")?,
 		listen_port: port(get_int("src_port")?, "src_port")?,
 		listen_port_end: None,
+		extra_listen_addrs: vec![],
 		remote_addr: get_str("dist_addr")?,
 		remote_port: port(get_int("dist_port")?, "dist_port")?,
 		targets: vec![],
@@ -109,6 +113,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		}
 		req.balance = options.balance;
 		req.health_check = options.health_check;
+		req.extra_listen_addrs = options.extra_listen_addrs;
 	}
 	Ok(req)
 }

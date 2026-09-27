@@ -113,6 +113,11 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \
        "targets":[{"addr":"10.0.0.11","port":5432},{"addr":"10.0.0.12","port":5432},{"addr":"10.0.0.13","port":5432,"backup":true}],
        "balance":"least_conn","health_check":{"interval":"10s"}}'
 
+# IPv4 と IPv6 を 1 つのルールで待ち受ける（extra_listen_addrs。0.0.0.0 と :: も並べられる）
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \
+  -d '{"protocol":"tcp","listen_addr":"203.0.113.5","extra_listen_addrs":["2001:db8::5"],"listen_port":443,
+       "remote_addr":"10.0.0.20","remote_port":443}'
+
 # 停止（既存の接続も切断。?drain_secs=30 で終了を待つ）
 curl -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/tcp/0.0.0.0/8888
 ```

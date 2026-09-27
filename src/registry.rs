@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
-use socket2::{Domain, Socket, Type};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -19,8 +18,8 @@ use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
 use crate::rule::{
-	validate_backends, validate_udp_idle, Caps, Key, Origin, Protocol, RuleRequest, RuleSpec, RuleStats, RuleView,
-	State, UpdateRequest,
+	check_transparent_families, validate_backends, validate_extra_listen, validate_udp_idle, Caps, Key, Origin, Protocol,
+	RuleRequest, RuleSpec, RuleStats, RuleView, SourceIp, State, UpdateRequest,
 };
 use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
 use crate::{tcp, udp};
@@ -42,11 +41,25 @@ pub struct Config {
 
 type Resolver = (CancellationToken, JoinHandle<()>);
 
+/// One listening socket's task; true when it stopped because its address was
+/// taken off the rule (or the rule stopped), false when it ended on its own.
+type ListenerTask = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// The sockets of one listening address, one per port of the rule.
+enum Bound {
+	Tcp(Vec<tokio::net::TcpListener>),
+	Udp(Vec<tokio::net::UdpSocket>),
+}
+
 struct Running {
 	generation: u64,
 	started_at: u64,
 	spec: RuleSpec,
 	rt: Arc<Runtime>,
+	/// Stops the listeners of each address (`listen_addr` and `extra_listen_addrs`).
+	listeners: HashMap<IpAddr, CancellationToken>,
+	/// Hands listeners of addresses added later to the task that watches them all.
+	add_listeners: mpsc::UnboundedSender<ListenerTask>,
 	idle_tx: watch::Sender<Duration>,
 	/// Name resolution of the targets, and their health checks.
 	backends: Backends,
@@ -197,20 +210,49 @@ fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
 	ApiError::bind_failed(format!("{addr}: {e}"))
 }
 
-fn bind_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
-	let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
-	// lets a stopped rule's port be reused while old connections sit in TIME_WAIT
-	sock.set_reuse_address(true)?;
-	sock.set_nonblocking(true)?;
-	sock.bind(&addr.into())?;
-	sock.listen(1024)?;
-	tokio::net::TcpListener::from_std(sock.into())
+/// Binds every port of the rule on one address; all or nothing.
+fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
+	let v6only = spec.v6only();
+	let addrs = (0..spec.port_count).map(|offset| SocketAddr::new(ip, spec.key.listen.port() + offset));
+	let bound = match spec.key.protocol {
+		Protocol::Tcp => Bound::Tcp(
+			addrs
+				.map(|addr| crate::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
+				.collect::<Result<_, _>>()?,
+		),
+		Protocol::Udp => Bound::Udp(
+			addrs
+				.map(|addr| crate::listen::udp(addr, v6only).and_then(tokio::net::UdpSocket::from_std).map_err(|e| bind_error(addr, e)))
+				.collect::<Result<_, _>>()?,
+		),
+	};
+	Ok(bound)
 }
 
-fn bind_udp(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
-	let sock = std::net::UdpSocket::bind(addr)?;
-	sock.set_nonblocking(true)?;
-	tokio::net::UdpSocket::from_std(sock)
+/// The serving tasks of one address's sockets, stopped by `stop`.
+fn listener_tasks(bound: Bound, rt: &Arc<Runtime>, stop: &CancellationToken) -> Vec<ListenerTask> {
+	let mut tasks: Vec<ListenerTask> = vec![];
+	match bound {
+		Bound::Tcp(listeners) => {
+			for (offset, l) in listeners.into_iter().enumerate() {
+				let (rt, stop) = (rt.clone(), stop.clone());
+				tasks.push(Box::pin(async move {
+					tcp::serve(l, rt, offset as u16, stop.clone()).await;
+					stop.is_cancelled()
+				}));
+			}
+		}
+		Bound::Udp(sockets) => {
+			for (offset, s) in sockets.into_iter().enumerate() {
+				let (rt, stop) = (rt.clone(), stop.clone());
+				tasks.push(Box::pin(async move {
+					udp::serve(s, rt, offset as u16, stop.clone()).await;
+					stop.is_cancelled()
+				}));
+			}
+		}
+	}
+	tasks
 }
 
 fn panic_message(e: tokio::task::JoinError) -> String {
@@ -225,13 +267,21 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 		.unwrap_or_else(|| "unknown panic".into())
 }
 
-/// Two rules clash when they share a protocol, ports and an address (or a wildcard).
+/// Two rules clash when they share a protocol and ports on an address of either
+/// (`listen_addr` or `extra_listen_addrs`), or on a wildcard that covers it.
 fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
-	let (ai, bi): (IpAddr, IpAddr) = (a.key.listen.ip(), b.key.listen.ip());
-	let same_ip = ai == bi || ai.is_unspecified() || bi.is_unspecified();
 	let (a0, b0) = (u32::from(a.key.listen.port()), u32::from(b.key.listen.port()));
 	let (a1, b1) = (a0 + u32::from(a.port_count) - 1, b0 + u32::from(b.port_count) - 1);
-	a.key.protocol == b.key.protocol && same_ip && a0 <= b1 && b0 <= a1
+	if a.key.protocol != b.key.protocol || a0 > b1 || b0 > a1 {
+		return false;
+	}
+	let (bs, av, bv) = (b.listen_ips(), a.v6only(), b.v6only());
+	a.listen_ips().into_iter().any(|x| bs.iter().any(|y| crate::listen::clash(x, av, *y, bv)))
+}
+
+/// A rule on `::`, whose socket takes IPv4 too unless it has extra addresses.
+fn is_dual_stack_wildcard(key: &Key) -> bool {
+	key.listen.is_ipv6() && key.listen.ip().is_unspecified()
 }
 
 fn route_spec(route: &Route) -> String {
@@ -255,11 +305,12 @@ impl Registry {
 		if spec.key.protocol != Protocol::Tcp {
 			return None;
 		}
-		let (ip, start) = (spec.key.listen.ip(), u32::from(spec.key.listen.port()));
+		let start = u32::from(spec.key.listen.port());
 		let end = start + u32::from(spec.port_count) - 1;
+		let ips = spec.listen_ips();
+		// the control API's own sockets may be dual-stack
 		self.cfg.reserved.iter().copied().find(|r| {
-			let same_ip = r.ip() == ip || r.ip().is_unspecified() || ip.is_unspecified();
-			same_ip && (start..=end).contains(&u32::from(r.port()))
+			(start..=end).contains(&u32::from(r.port())) && ips.iter().any(|ip| crate::listen::clash(*ip, spec.v6only(), r.ip(), false))
 		})
 	}
 
@@ -426,6 +477,7 @@ impl Registry {
 			global: self.cfg.http.clone(),
 			http_stats: Default::default(),
 			h3: Default::default(),
+			listen: RwLock::new(spec.listen_ips()),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			stop: kill.child_token(),
@@ -434,40 +486,43 @@ impl Registry {
 		});
 
 		// bind everything first so a failure leaves nothing half-open
+		let bound = spec.listen_ips().into_iter().map(|ip| Ok((ip, bind_all(&spec, ip)?))).collect::<Result<Vec<_>, ApiError>>()?;
 		let mut set = JoinSet::new();
-		match key.protocol {
-			Protocol::Tcp => {
-				let mut listeners = vec![];
-				for offset in 0..spec.port_count {
-					let addr = crate::proxy::shifted(key.listen, offset);
-					listeners.push(bind_tcp(addr).map_err(|e| bind_error(addr, e))?);
-				}
-				for (offset, l) in listeners.into_iter().enumerate() {
-					set.spawn(tcp::serve(l, rt.clone(), offset as u16));
-				}
+		let mut listeners = HashMap::new();
+		for (ip, sockets) in bound {
+			let token = rt.stop.child_token();
+			for task in listener_tasks(sockets, &rt, &token) {
+				set.spawn(task);
 			}
-			Protocol::Udp => {
-				let mut sockets = vec![];
-				for offset in 0..spec.port_count {
-					let addr = crate::proxy::shifted(key.listen, offset);
-					sockets.push(bind_udp(addr).map_err(|e| bind_error(addr, e))?);
-				}
-				for (offset, s) in sockets.into_iter().enumerate() {
-					set.spawn(udp::serve(s, rt.clone(), offset as u16));
-				}
-			}
+			listeners.insert(ip, token);
 		}
 		if spec.http.as_ref().is_some_and(|h| h.http3) {
 			crate::http::h3::start(&rt);
 		}
 		let stop = rt.stop.clone();
+		let (add_listeners, mut added) = mpsc::unbounded_channel::<ListenerTask>();
 		let serve = tokio::spawn(async move {
-			while let Some(done) = set.join_next().await {
-				match done {
-					Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-					// one listener ending on its own fails the whole rule
-					_ if !stop.is_cancelled() => return,
-					_ => {}
+			let mut adding = true;
+			loop {
+				tokio::select! {
+					done = set.join_next(), if !set.is_empty() => match done {
+						Some(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+						// the listener's address was taken off the rule
+						Some(Ok(true)) => {}
+						// one listener ending on its own fails the whole rule
+						_ if !stop.is_cancelled() => return,
+						_ => {}
+					},
+					task = added.recv(), if adding => match task {
+						Some(task) => {
+							set.spawn(task);
+						}
+						None => adding = false,
+					},
+					else => return,
+				}
+				if stop.is_cancelled() && set.is_empty() {
+					return;
 				}
 			}
 		});
@@ -478,7 +533,7 @@ impl Registry {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_secs())
 			.unwrap_or(0);
-		Ok(Running { generation, started_at, spec, rt, idle_tx, backends, route_resolvers, supervisor })
+		Ok(Running { generation, started_at, spec, rt, listeners, add_listeners, idle_tx, backends, route_resolvers, supervisor })
 	}
 
 	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
@@ -532,6 +587,9 @@ impl Registry {
 		}
 		if let Some(on) = req.crowdsec {
 			spec.crowdsec = on;
+		}
+		if let Some(list) = &req.extra_listen_addrs {
+			spec.extra_listen = validate_extra_listen(key.listen.ip(), list)?;
 		}
 		if req.source_ip.is_some_and(|s| s != spec.source_ip) {
 			return Err(ApiError::unsupported("source_ip cannot be changed; delete and re-create the rule"));
@@ -588,18 +646,61 @@ impl Registry {
 		}
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
+		if spec.source_ip == SourceIp::Transparent {
+			check_transparent_families(&spec.extra_listen, &spec.members(), &self.caps())?;
+		}
 		self.apply(key, spec, tls_changed, http_changed).await
 	}
 
 	/// Puts a changed spec into effect on an existing rule, keeping its
 	/// connections (the fields PATCH can change: target, timeouts, TLS, allow_from, http).
 	async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
+		if let Some(api) = self.reserved_clash(&spec) {
+			return Err(ApiError::reserved(format!("{key} would take rproxy's control API ({api})")));
+		}
 		let prepared = self.prepare(&spec).await?;
 
 		let mut rules = self.rules.lock().await;
+		if let Some((other, _)) = rules.iter().find(|(k, e)| *k != key && overlaps(e.spec(), &spec)) {
+			return Err(ApiError::already_exists(format!("{key} overlaps with {other}")));
+		}
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
+				// open the added addresses first: a failure changes nothing
+				let listen_changed = r.spec.extra_listen != spec.extra_listen;
+				if listen_changed && is_dual_stack_wildcard(key) && r.spec.v6only() != spec.v6only() {
+					return Err(ApiError::unsupported(
+						"a rule on :: listens dual-stack alone and IPv6-only with extra_listen_addrs; delete and re-create it to switch",
+					));
+				}
+				let old_ips = r.spec.listen_ips();
+				let added = spec
+					.listen_ips()
+					.into_iter()
+					.filter(|ip| !old_ips.contains(ip))
+					.map(|ip| Ok((ip, bind_all(&spec, ip)?)))
+					.collect::<Result<Vec<_>, ApiError>>()?;
+				if listen_changed {
+					let new_ips = spec.listen_ips();
+					r.listeners.retain(|ip, token| {
+						let keep = new_ips.contains(ip);
+						if !keep {
+							token.cancel();
+						}
+						keep
+					});
+					for (ip, sockets) in added {
+						let token = r.rt.stop.child_token();
+						for task in listener_tasks(sockets, &r.rt, &token) {
+							// the watching task ends only with the rule
+							let _ = r.add_listeners.send(task);
+						}
+						r.listeners.insert(ip, token);
+					}
+					*r.rt.listen.write().unwrap() = new_ips;
+					info!(event = "rule.listen", rule = %key, addrs = ?r.rt.listen.read().unwrap());
+				}
 				let backends_changed = r.spec.members() != spec.members()
 					|| r.spec.balance != spec.balance
 					|| r.spec.health_check != spec.health_check;
@@ -627,7 +728,7 @@ impl Registry {
 				// HTTP/3 turned on or off (new certificates are picked up per QUIC connection)
 				let h3_was = r.spec.http.as_ref().is_some_and(|h| h.http3);
 				let h3_now = spec.http.as_ref().is_some_and(|h| h.http3);
-				if h3_now && (!h3_was || r.rt.h3.port().is_none()) {
+				if h3_now && (!h3_was || r.rt.h3.port().is_none() || listen_changed) {
 					crate::http::h3::start(&r.rt);
 				} else if h3_was && !h3_now {
 					crate::http::h3::stop(&r.rt);
@@ -919,7 +1020,8 @@ impl Registry {
 						&& missing.is_none()
 						&& old.port_count == spec.port_count
 						&& old.source_ip == spec.source_ip
-						&& old.http.is_some() == spec.http.is_some();
+						&& old.http.is_some() == spec.http.is_some()
+						&& !(is_dual_stack_wildcard(&key) && old.v6only() != spec.v6only());
 					if in_place {
 						let tls_changed =
 							old.tls != spec.tls || old.starttls != spec.starttls || old.starttls_required != spec.starttls_required;

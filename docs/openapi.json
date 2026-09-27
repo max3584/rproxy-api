@@ -1068,6 +1068,14 @@
       "minimum": 1,
       "maximum": 65535
      },
+     "extra_listen_addrs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 16,
+      "description": "More IP addresses to listen on with the same port or range (e.g. IPv6 next to an IPv4 listen_addr)."
+     },
      "remote_addr": {
       "type": "string",
       "description": "Left out on http rules and rules with targets."
@@ -1190,6 +1198,14 @@
      "crowdsec": {
       "type": "boolean",
       "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+     },
+     "extra_listen_addrs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 16,
+      "description": "Replaces the extra listen addresses when present ([] removes them all; left out keeps them)."
      }
     },
     "additionalProperties": false,
@@ -1315,6 +1331,14 @@
       "minimum": 1,
       "maximum": 65535,
       "nullable": true
+     },
+     "extra_listen_addrs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 16,
+      "description": "Left out when empty."
      },
      "remote_addr": {
       "type": "string"

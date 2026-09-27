@@ -112,6 +112,8 @@ pub struct Runtime {
 	pub http_stats: crate::http::access::HttpStats,
 	/// HTTP/3 of an `http` rule with `http3` (QUIC over UDP on the same address and port).
 	pub h3: crate::http::h3::H3State,
+	/// The addresses the rule listens on (`listen_addr`, then `extra_listen_addrs`).
+	pub listen: RwLock<Vec<std::net::IpAddr>>,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// Stops accepting new connections.

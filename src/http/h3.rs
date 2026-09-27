@@ -50,37 +50,56 @@ impl H3State {
 	}
 }
 
-/// Starts answering HTTP/3 on the rule's address over UDP. A port that cannot
-/// be bound or TLS settings QUIC cannot use leave the rule running over TCP only;
-/// the reason is in the rule view and the log (`event = "degraded"`, `part = "http3"`).
+/// Starts answering HTTP/3 over UDP on the rule's addresses (`listen_addr` and
+/// `extra_listen_addrs`). A port that cannot be bound or TLS settings QUIC cannot
+/// use leave the rule running over TCP only (on that address); the reason is in
+/// the rule view and the log (`event = "degraded"`, `part = "http3"`).
 pub fn start(rt: &Arc<Runtime>) {
 	stop(rt);
-	let addr = rt.key.listen;
-	let result = (|| {
+	let port = rt.key.listen.port();
+	let ips = rt.listen.read().unwrap().clone();
+	let v6only = ips.len() > 1;
+	let server = (|| {
 		let tls = rt.tls();
 		let config = match &tls.quic_config {
 			Some(Ok(c)) => c.clone(),
 			Some(Err(e)) => return Err(e.clone()),
 			None => return Err("HTTP/3 needs tls.mode terminate".to_string()),
 		};
-		let server = quinn_config(config)?;
-		let socket = std::net::UdpSocket::bind(addr).map_err(|e| format!("udp {addr}: {e}"))?;
-		quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(server), socket, Arc::new(quinn::TokioRuntime))
-			.map_err(|e| format!("udp {addr}: {e}"))
+		quinn_config(config)
 	})();
-	match result {
-		Ok(endpoint) => {
-			let token = rt.stop.child_token();
-			*rt.h3.stop.lock().unwrap() = Some(token.clone());
-			*rt.h3.error.write().unwrap() = None;
-			rt.h3.port.store(addr.port(), Ordering::Relaxed);
-			info!(event = "http3.listening", rule = %rt.key, addr = %addr);
-			rt.tracker.spawn(serve(endpoint, rt.clone(), token));
+	let mut endpoints = vec![];
+	let mut errors = vec![];
+	match server {
+		Ok(server) => {
+			for ip in ips {
+				let addr = SocketAddr::new(ip, port);
+				let endpoint = crate::listen::udp(addr, v6only).map_err(|e| format!("udp {addr}: {e}")).and_then(|socket| {
+					quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(server.clone()), socket, Arc::new(quinn::TokioRuntime))
+						.map_err(|e| format!("udp {addr}: {e}"))
+				});
+				match endpoint {
+					Ok(e) => endpoints.push((addr, e)),
+					Err(e) => errors.push(e),
+				}
+			}
 		}
-		Err(e) => {
-			warn!(event = "degraded", part = "http3", rule = %rt.key, error = %e, "answering over TCP only");
-			*rt.h3.error.write().unwrap() = Some(e);
-		}
+		Err(e) => errors.push(e),
+	}
+	let error = (!errors.is_empty()).then(|| errors.join("; "));
+	if let Some(e) = &error {
+		warn!(event = "degraded", part = "http3", rule = %rt.key, error = %e, "answering over TCP only there");
+	}
+	*rt.h3.error.write().unwrap() = error;
+	if endpoints.is_empty() {
+		return;
+	}
+	let token = rt.stop.child_token();
+	*rt.h3.stop.lock().unwrap() = Some(token.clone());
+	rt.h3.port.store(port, Ordering::Relaxed);
+	for (addr, endpoint) in endpoints {
+		info!(event = "http3.listening", rule = %rt.key, addr = %addr);
+		rt.tracker.spawn(serve(endpoint, rt.clone(), token.clone()));
 	}
 }
 

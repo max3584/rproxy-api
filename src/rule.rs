@@ -208,6 +208,10 @@ pub struct RuleRequest {
 	pub listen_port: u16,
 	/// Last port of a range; ports map one to one onto `remote_port` upwards.
 	pub listen_port_end: Option<u16>,
+	/// More addresses to listen on with the same port or range, e.g. an IPv6
+	/// address next to an IPv4 `listen_addr` (#99).
+	#[serde(default)]
+	pub extra_listen_addrs: Vec<String>,
 	/// The backend; left out on `http` rules, whose backends are `http.services`,
 	/// and on rules with `targets`.
 	#[serde(default)]
@@ -258,6 +262,8 @@ pub struct RuleSpec {
 	pub key: Key,
 	/// Number of consecutive ports, 1 for a single port.
 	pub port_count: u16,
+	/// More addresses listening with the same ports as `key.listen`.
+	pub extra_listen: Vec<IpAddr>,
 	/// The backend; with `targets`, the first target (for logs and older clients).
 	pub remote_host: String,
 	pub remote_port: u16,
@@ -277,6 +283,17 @@ pub struct RuleSpec {
 }
 
 impl RuleSpec {
+	/// Every address the rule listens on: `key.listen`'s first, then `extra_listen`.
+	pub fn listen_ips(&self) -> Vec<IpAddr> {
+		std::iter::once(self.key.listen.ip()).chain(self.extra_listen.iter().copied()).collect()
+	}
+
+	/// Whether IPv6 listeners take `IPV6_V6ONLY`: with more than one address, so
+	/// `0.0.0.0` and `::` can listen side by side. A lone `::` keeps the OS default.
+	pub fn v6only(&self) -> bool {
+		!self.extra_listen.is_empty()
+	}
+
 	/// The TLS settings to run with: an `http` rule that terminates TLS offers
 	/// HTTP/2 and HTTP/1.1 by ALPN unless `alpn` says otherwise.
 	pub fn runtime_tls(&self) -> TlsSpec {
@@ -389,6 +406,49 @@ pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp, http: &HttpSpec) -> Re
 	Ok(())
 }
 
+/// Most extra listen addresses a rule may have.
+pub const MAX_EXTRA_LISTEN: usize = 16;
+
+/// `extra_listen_addrs`: IP addresses, none twice and none equal to `listen_addr`.
+pub fn validate_extra_listen(primary: IpAddr, addrs: &[String]) -> Result<Vec<IpAddr>, ApiError> {
+	if addrs.len() > MAX_EXTRA_LISTEN {
+		return Err(ApiError::invalid(format!("extra_listen_addrs takes at most {MAX_EXTRA_LISTEN} addresses")));
+	}
+	let mut out: Vec<IpAddr> = vec![];
+	for a in addrs {
+		let ip: IpAddr = a
+			.trim()
+			.trim_matches(|c| c == '[' || c == ']')
+			.parse()
+			.map_err(|_| ApiError::invalid(format!("extra_listen_addrs must be IP addresses: {a}")))?;
+		if ip == primary || out.contains(&ip) {
+			return Err(ApiError::invalid(format!("{ip} is listed twice (listen_addr and extra_listen_addrs)")));
+		}
+		out.push(ip);
+	}
+	Ok(out)
+}
+
+/// With `transparent`, the connection to the backend is made from the client's
+/// address, so each extra listening family needs a backend of that family.
+/// Backends given by name are resolved later and not checked here.
+pub fn check_transparent_families(extra: &[IpAddr], members: &[TargetSpec], caps: &Caps) -> Result<(), ApiError> {
+	let literals: Vec<IpAddr> = members.iter().filter_map(|m| m.addr.trim_matches(|c| c == '[' || c == ']').parse().ok()).collect();
+	for ip in extra {
+		if ip.is_ipv6() && !caps.transparent_ipv6 {
+			return Err(ApiError::unsupported(format!(
+				"transparent over IPv6 ({ip} in extra_listen_addrs) is not available (needs IPV6_TRANSPARENT: Linux, CAP_NET_ADMIN and IPv6)"
+			)));
+		}
+		if !members.is_empty() && literals.len() == members.len() && !literals.iter().any(|t| t.is_ipv6() == ip.is_ipv6()) {
+			return Err(ApiError::invalid(format!(
+				"transparent needs a backend of the same address family as each listen address; {ip} has none"
+			)));
+		}
+	}
+	Ok(())
+}
+
 pub fn validate_udp_idle(secs: Option<u64>) -> Result<Duration, ApiError> {
 	let secs = secs.unwrap_or(DEFAULT_UDP_IDLE_SECS);
 	if secs == 0 || secs > MAX_UDP_IDLE_SECS {
@@ -416,6 +476,7 @@ impl RuleRequest {
 	pub fn validate(self, caps: &Caps) -> Result<RuleSpec, ApiError> {
 		let transparent_available = caps.transparent;
 		let listen = parse_listen(&self.listen_addr, self.listen_port)?;
+		let extra_listen = validate_extra_listen(listen.ip(), &self.extra_listen_addrs)?;
 		let udp_idle = validate_udp_idle(self.udp_idle_secs)?;
 		// every target's port must leave room for the range
 		let highest = self.targets.iter().map(|t| t.port).max().unwrap_or(self.remote_port);
@@ -472,9 +533,10 @@ impl RuleRequest {
 			}
 			_ => {}
 		}
-		Ok(RuleSpec {
+		let spec = RuleSpec {
 			key: Key { protocol: self.protocol, listen },
 			port_count,
+			extra_listen,
 			remote_host,
 			remote_port,
 			targets,
@@ -490,7 +552,11 @@ impl RuleRequest {
 			http: self.http,
 			crowdsec: self.crowdsec,
 			origin: Origin::Dynamic,
-		})
+		};
+		if spec.source_ip == SourceIp::Transparent {
+			check_transparent_families(&spec.extra_listen, &spec.members(), caps)?;
+		}
+		Ok(spec)
 	}
 }
 
@@ -521,6 +587,8 @@ pub struct UpdateRequest {
 	pub http: Option<HttpSpec>,
 	/// Turns the CrowdSec check at accept time on or off when present.
 	pub crowdsec: Option<bool>,
+	/// Replaces the extra listen addresses when present (`[]` removes them all).
+	pub extra_listen_addrs: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -554,6 +622,8 @@ pub struct RuleView {
 	pub listen_addr: String,
 	pub listen_port: u16,
 	pub listen_port_end: Option<u16>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub extra_listen_addrs: Vec<String>,
 	pub remote_addr: String,
 	pub remote_port: u16,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
@@ -590,6 +660,7 @@ impl RuleView {
 			listen_addr: spec.key.listen.ip().to_string(),
 			listen_port: spec.key.listen.port(),
 			listen_port_end: (spec.port_count > 1).then(|| spec.key.listen.port() + spec.port_count - 1),
+			extra_listen_addrs: spec.extra_listen.iter().map(|ip| ip.to_string()).collect(),
 			remote_addr: spec.remote_host.clone(),
 			remote_port: spec.remote_port,
 			targets: spec.targets.clone(),
@@ -624,6 +695,7 @@ mod tests {
 			listen_addr: "127.0.0.1".into(),
 			listen_port: 8888,
 			listen_port_end: None,
+			extra_listen_addrs: vec![],
 			remote_addr: "example.com".into(),
 			remote_port: 80,
 			targets: vec![],
@@ -664,6 +736,34 @@ mod tests {
 		let mut r = req();
 		r.remote_port = 0;
 		assert_eq!(r.validate(&Caps::default()).unwrap_err().code, "invalid");
+	}
+
+	#[test]
+	fn extra_listen_addresses_and_transparent_families() {
+		let mut r = req();
+		r.remote_addr = "10.0.0.1".into();
+		r.extra_listen_addrs = vec!["[2001:db8::5]".into(), "0.0.0.0".into()];
+		let spec = r.clone().validate(&Caps::default()).unwrap();
+		assert_eq!(spec.extra_listen, vec!["2001:db8::5".parse::<IpAddr>().unwrap(), "0.0.0.0".parse().unwrap()]);
+		assert!(spec.v6only());
+		assert_eq!(spec.listen_ips().len(), 3);
+
+		// transparent: the IPv6 address has no IPv6 backend
+		let caps = Caps { transparent: true, transparent_ipv6: true, ..Default::default() };
+		r.source_ip = SourceIp::Transparent;
+		assert_eq!(r.clone().validate(&caps).unwrap_err().code, "invalid");
+		r.targets = vec![
+			TargetSpec { addr: "10.0.0.1".into(), port: 80, weight: None, backup: false },
+			TargetSpec { addr: "2001:db8::10".into(), port: 80, weight: None, backup: false },
+		];
+		r.remote_addr = String::new();
+		r.remote_port = 0;
+		assert!(r.clone().validate(&caps).is_ok());
+		let no_v6 = Caps { transparent: true, transparent_ipv6: false, ..Default::default() };
+		assert_eq!(r.clone().validate(&no_v6).unwrap_err().code, "unsupported");
+		// a backend given by name is not checked here
+		r.targets = vec![TargetSpec { addr: "backend.local".into(), port: 80, weight: None, backup: false }];
+		assert!(r.validate(&caps).is_ok());
 	}
 
 	#[test]
