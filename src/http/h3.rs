@@ -247,7 +247,9 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 		return Ok("passthrough");
 	}
 	let handler = Arc::new(Conn::new(rt.clone(), client, local, Some(tls), true));
-	let mut h3 = h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn))
+	let mut h3 = h3::server::builder()
+		.max_field_section_size(u64::from(super::server::MAX_HEADER_SECTION))
+		.build::<_, Bytes>(h3_quinn::Connection::new(conn))
 		.await
 		.map_err(|e| format!("HTTP/3: {e}"))?;
 	loop {
