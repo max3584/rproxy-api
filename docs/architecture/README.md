@@ -1,11 +1,6 @@
 # 構成図
 
-PlantUML のソース（`*.puml`）と、そこから作った SVG です。構成を変えたら `.puml` を直して、`scripts/render-diagrams.sh` で SVG を作り直してください。
-
-```bash
-PLANTUML_SERVER=http://<PlantUML サーバ> scripts/render-diagrams.sh   # PlantUML サーバで描く
-scripts/render-diagrams.sh                                          # plantuml コマンド（または PLANTUML_JAR）で描く
-```
+今の構成を図にしたものです（SVG）。
 
 | 図 | 内容 |
 |---|---|
