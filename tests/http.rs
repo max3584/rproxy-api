@@ -29,6 +29,8 @@ async fn echo_backend(tag: &'static str) -> SocketAddr {
 			"proto": h("x-forwarded-proto"), "xhost": h("x-forwarded-host"), "real": h("x-real-ip"),
 			"xport": h("x-forwarded-port"), "secret": h("x-secret"), "prefix": h("x-forwarded-prefix"),
 			"replaced": h("x-replaced-path"), "xa": h("x-a"), "xb": h("x-b"),
+			// every Cookie line, to see whether HTTP/2 cookie fields were joined
+			"cookies": req.headers().get_all("cookie").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>(),
 		}))
 	});
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -329,6 +331,19 @@ async fn tls_terminate_with_http2_and_https_backends() {
 	let resp = send("/secure").await.unwrap();
 	assert_eq!(resp.status(), StatusCode::OK);
 	assert_eq!(&resp.into_body().collect().await.unwrap().to_bytes()[..], b"secure", "https:// backend verified with tls.upstream.ca_file");
+
+	// browsers (Chrome) send each cookie as its own HTTP/2 field; an HTTP/1.1 backend
+	// must get them joined into one Cookie line (RFC 9113 §8.2.3), or it loses the session
+	let req = hyper::Request::get("https://a.test/cookies")
+		.header("cookie", "a=1")
+		.header("cookie", "_gitlab_session=xyz")
+		.header("cookie", "b=2")
+		.body(Empty::<Bytes>::new())
+		.unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	assert_eq!(resp.status(), StatusCode::OK);
+	let v: Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+	assert_eq!(v["cookies"], json!(["a=1; _gitlab_session=xyz; b=2"]), "{v}");
 }
 
 #[tokio::test]
