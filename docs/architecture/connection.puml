@@ -1,0 +1,33 @@
+@startuml connection
+title TCP の接続の流れ
+participant "クライアント" as C
+participant "tcp.rs" as T
+participant "Runtime\n(allow_from・CrowdSec)" as R
+participant "TLS\n(tlsconf / sni)" as S
+participant "L7\n(http/server.rs)" as H
+participant "宛先の選択\n(balance.rs)" as B
+participant "転送先" as D
+
+C -> T : 接続
+T -> R : allow_from / crowdsec
+alt 拒否
+  R --> T : denied
+  T --> C : 切断（TLS の前）
+end
+T -> S : tls.mode
+alt passthrough / sni / passthrough の route
+  S -> B : サーバ名で宛先
+  B -> D : 接続（ClientHello ごと流す）
+else terminate
+  S -> S : 証明書を選んで終端
+  alt http のルール
+    S -> H : リクエストごとに処理
+    H -> H : match → ミドルウェア
+    H -> D : サービスの転送先へ
+  else L4
+    S -> B : 宛先
+    B -> D : 接続（PROXY ヘッダ・再暗号化）
+  end
+end
+D <-> C : 中継（統計・conn.open / conn.close）
+@enduml

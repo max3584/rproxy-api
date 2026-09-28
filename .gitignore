@@ -2,3 +2,6 @@
 target
 .env
 __pycache__/
+
+# Claude Code の作業用（エージェントの worktree）
+/.claude/worktrees/
