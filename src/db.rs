@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Row;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::rule::{RuleRequest, SourceIp};
 use crate::tlsconf::{StartTls, TlsSpec};
@@ -56,13 +56,16 @@ struct Options {
 	/// More listen addresses (#99).
 	#[serde(default)]
 	extra_listen_addrs: Vec<String>,
+	/// `false`: paused in the UI; kept in the table but not started (#116).
+	enabled: Option<bool>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
 	u16::try_from(value).map_err(|_| format!("{column} out of range: {value}"))
 }
 
-fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest, String> {
+/// The rule of a row, or `None` for a rule paused in the UI (`options.enabled: false`).
+fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<RuleRequest>, String> {
 	let get_str = |c: &str| row.try_get::<String, _>(c).map_err(|e| format!("{c}: {e}"));
 	let get_int = |c: &str| row.try_get::<i64, _>(c).map_err(|e| format!("{c}: {e}"));
 	let parse_err = |e: crate::error::ApiError| e.message;
@@ -100,6 +103,9 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 			None | Some("") | Some("null") => Options::default(),
 			Some(json) => serde_json::from_str(json).map_err(|e| format!("options: {e}"))?,
 		};
+		if options.enabled == Some(false) {
+			return Ok(None);
+		}
 		req.tls = options.tls;
 		req.starttls = options.starttls;
 		req.starttls_required = options.starttls_required;
@@ -115,7 +121,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<RuleRequest
 		req.health_check = options.health_check;
 		req.extra_listen_addrs = options.extra_listen_addrs;
 	}
-	Ok(req)
+	Ok(Some(req))
 }
 
 pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
@@ -147,14 +153,23 @@ pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
 	pool.close().await;
 	let (rows, schema) = loaded.expect("the last query either succeeds or returns");
 
-	Ok(rows
+	let mut paused = 0;
+	let rules = rows
 		.iter()
 		.filter_map(|row| match to_request(row, schema) {
-			Ok(req) => Some(req),
+			Ok(Some(req)) => Some(req),
+			Ok(None) => {
+				paused += 1;
+				None
+			}
 			Err(e) => {
 				warn!(event = "restore.skip", error = %e);
 				None
 			}
 		})
-		.collect())
+		.collect();
+	if paused > 0 {
+		info!(event = "restore.paused", rules = paused, "rules paused in the UI are not started");
+	}
+	Ok(rules)
 }
