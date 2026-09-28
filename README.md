@@ -228,7 +228,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
-| `restore.*` | 起動時の DB からの復元 |
+| `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
 
 ## 開発
 
