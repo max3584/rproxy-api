@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod balance;
+pub mod certstore;
 pub mod cidr;
 pub mod config;
 pub mod db;

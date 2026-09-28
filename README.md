@@ -59,6 +59,8 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP で読み直す |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
 | `RPROXY_CERT_CHECK_SECS` | `--cert-check-secs` | `60` | 証明書ファイル（ルールの `tls` と制御 API）が変わったかを確かめる間隔（秒）。変わったものだけ読み直す（certbot・cert-manager の更新をそのまま反映）。`0` で止める |
+| `RPROXY_CERT_EXPIRY_CHECK_SECS` | `--cert-expiry-check-secs` | `86400` | 証明書の期限を確かめる間隔（秒。読み込むときにも確かめる）。切れたサーバ証明書は外し、ルールの証明書がすべて切れたらそのルールを止める（docs/API.md の「証明書の期限」）。`0` で止める |
+| `RPROXY_CERT_WARN_DAYS` | `--cert-warn-days` | `14` | 期限の何日前から `expiring`（警告）にするか |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
@@ -229,6 +231,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
+| `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
+| `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
 
 ## 開発
 

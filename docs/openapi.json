@@ -1421,6 +1421,13 @@
      "crowdsec": {
       "type": "boolean",
       "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+     },
+     "cert_status": {
+      "type": "array",
+      "description": "Expiry of the certificates a terminate rule uses (left out when there are none).",
+      "items": {
+       "$ref": "#/components/schemas/CertStatus"
+      }
      }
     },
     "description": "Fields may be added in patch releases."
@@ -1680,6 +1687,47 @@
       }
      }
     }
+   },
+   "CertStatus": {
+    "type": "object",
+    "properties": {
+     "role": {
+      "type": "string",
+      "enum": [
+       "certificate",
+       "client_ca",
+       "client_chain",
+       "upstream_ca",
+       "upstream_certificate"
+      ]
+     },
+     "file": {
+      "type": "string"
+     },
+     "not_after": {
+      "type": "string",
+      "format": "date-time"
+     },
+     "days_left": {
+      "type": "integer",
+      "description": "Whole days left; negative once expired."
+     },
+     "state": {
+      "type": "string",
+      "enum": [
+       "ok",
+       "expiring",
+       "expired"
+      ]
+     }
+    },
+    "required": [
+     "role",
+     "file",
+     "not_after",
+     "days_left",
+     "state"
+    ]
    }
   }
  },

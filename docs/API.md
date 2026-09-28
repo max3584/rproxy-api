@@ -132,10 +132,22 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 - `PP2_TYPE_ALPN`：ALPN
 - `PP2_TYPE_SSL`：TLS であること、クライアント証明書の有無、`PP2_SUBTYPE_SSL_VERSION`、クライアント証明書の CN（`PP2_SUBTYPE_SSL_CN`）
 
-証明書ファイルは、ルールの作成・変更のときに読み込む。そのあとは：
-- `RPROXY_CERT_CHECK_SECS`（既定 60 秒、`0` で止める）ごとに、ルールが使うファイル（証明書・鍵・中間 CA・CA）の大きさ・更新時刻・inode を確かめ、変わったルールだけ読み直す。certbot などでの上書きも、Kubernetes の Secret のようにシンボリックリンクを差し替える方式も検知する。制御 API の証明書（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）も同じ。
+証明書ファイルは、ルールの作成・変更のときに読み込む。読み込んだ証明書は証明書の単位で共有する（同じファイルを使う複数のルールは同じものを使う）。そのあとは：
+- `RPROXY_CERT_CHECK_SECS`（既定 60 秒、`0` で止める）ごとに、証明書ごとにファイル（証明書・鍵・中間 CA・CA）の大きさ・更新時刻・inode を確かめ、変わった証明書だけ読み直して、それを使うルールに反映する。certbot などでの上書きも、Kubernetes の Secret のようにシンボリックリンクを差し替える方式も検知する。制御 API の証明書（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）も同じ。
 - 読み直せなかったとき（書き込み途中で鍵と証明書が合わないなど）は今の証明書のまま使い、次の確認でもう一度試す（`reload.tls` の警告はファイルの版ごとに 1 回）。
-- SIGHUP を送ると、変わったかどうかにかかわらず全ルールの証明書をすぐに読み直す。
+- SIGHUP を送ると、変わったかどうかにかかわらず全部の証明書をすぐに読み直す。
+
+### 証明書の期限（#115）
+
+証明書を読み込むとき（作成・変更・ファイルの変化・SIGHUP）と、`RPROXY_CERT_EXPIRY_CHECK_SECS`（既定 86400 秒 = 1 日、`0` で止める）ごとに、期限（notAfter）を確かめる。
+- **サーバ証明書**（`tls.certificates`。中間 CA を含めて、どれか 1 枚でも切れていれば切れた扱い）：
+  - 切れた証明書だけを外し、ほかの証明書で動き続ける。外した証明書の名前には、残りの先頭の証明書を返す（クライアントからは名前の不一致に見える。切れた証明書を返すことはない）。
+  - すべて切れたら、ルールを `failed`（`error` は `certificate expired: ...`）にして待ち受けを閉じる。更新されたファイルを読み込めた時点（ファイルの変化・SIGHUP・PATCH）で、自動で `running` に戻る。
+  - API で作成・変更するときに、すべて切れていれば `400 tls_config`（`certificate expired: ...`）で断る（作らない）。起動時（DB・設定ファイル）と読み直しのときは `failed` として登録する。
+- **クライアント認証の CA・中間 CA、転送先向けの CA・証明書、制御 API の証明書**：ルールは止めない。表示・ログ・メトリクスで知らせるだけ。
+- `passthrough` の route は対象外（証明書は転送先のもの）。
+- 期限の `RPROXY_CERT_WARN_DAYS`（既定 14 日）前から `expiring`。状態が変わったときに 1 回だけ、ログ `cert.expiring`（警告）・`cert.expired`（エラー）・`cert.ok`（更新された）を出す。
+- `/metrics` の `rproxy_cert_expiry_seconds{protocol,listen,role,file}`（制御 API の証明書は `{role="api",file}`）：期限までの秒数（切れたら負）。
 
 ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・acme.sh・cert-manager などに任せ、そのファイルを `cert_file` / `key_file` に指定する（更新は上のとおり自動で反映される）。certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。
 
@@ -149,6 +161,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
 | `connections` | 現在の接続数（UDP はセッション数） |
 | `stats` | ルールが開始してからの累計：`total_connections`、`rx_bytes`（クライアント → 転送先）、`tx_bytes`（転送先 → クライアント）、`tls_failures`（TLS / DTLS のハンドシェイクや STARTTLS の失敗） |
 | `started_at` | 待ち受けを始めた時刻（Unix 秒）。`failed` のときは `null` |
+| `cert_status` | `terminate` のルールが使う証明書の期限（下の「証明書の期限」）。証明書がなければ省く。各要素は `role`（`certificate` / `client_ca` / `client_chain` / `upstream_ca` / `upstream_certificate`）、`file`（証明書のファイル）、`not_after`（RFC 3339、UTC）、`days_left`（残りの日数。切れたら負）、`state`（`ok` / `expiring` / `expired`） |
 | `origin` | `dynamic`（API で作ったルール、または DB から復元したルール）か `static`（固定ルール。下を参照） |
 
 `stats` には `denied`（`allow_from` の範囲外、`crowdsec` の判定、または `unmatched: reject` で切断した接続の数）も含む。

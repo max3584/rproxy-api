@@ -651,6 +651,9 @@ pub struct RuleView {
 	pub stats: RuleStats,
 	/// When the listener started, in Unix seconds (null while failed).
 	pub started_at: Option<u64>,
+	/// Expiry of the certificates the rule uses (terminate); filled in by the registry.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub cert_status: Vec<crate::certstore::CertStatusView>,
 }
 
 impl RuleView {
@@ -681,6 +684,7 @@ impl RuleView {
 			connections,
 			stats: RuleStats::default(),
 			started_at: None,
+			cert_status: vec![],
 		}
 	}
 }

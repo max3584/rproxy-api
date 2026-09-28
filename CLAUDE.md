@@ -35,7 +35,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
 | `src/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
 | `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
-| `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み、SNI での証明書の選択、rustls / dtls クレート の設定の組み立て（`TlsRuntime`） |
+| `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み（`KeyedCert` / `CertBundle`）、SNI での証明書の選択、rustls / dtls クレート の設定の組み立て（`TlsRuntime::build` は読み込み済みの `RuleCerts` から組み立てる。`TlsRuntime::load` はファイルから直接）。証明書の期限を調べるのは `inspect_certificate` だけ（純粋な関数） |
+| `src/certstore.rs` | 証明書のストア（#115、`Registry.certs`）：ルールが使う証明書をファイルの組（`Source`）ごとに 1 回だけ読み込んで共有する。ファイルの変化（`refresh`、#90）・SIGHUP（`reload_all`）・期限（`newly_expired`）を証明書ごとに扱い、`Registry::apply_certs` が変わった証明書を使うルールだけを組み立て直す。誰も使わなくなった証明書は `retain` で捨てる。期限のログ（`cert.expiring` / `cert.expired`）は状態が変わったときに 1 回 |
 | `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
 | `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを dtls クレート に渡す `Conn` |
@@ -88,7 +89,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## TLS まわりの約束
 
-- 証明書ファイルは作成・変更・SIGHUP と、`RPROXY_CERT_CHECK_SECS` ごとの確認で変わっていたときだけ読む（`Registry::reload_changed_tls`、`tlsconf::fingerprint`）。ACME は内蔵しない方針（証明書は外部のツールで取る）。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う。
+- 証明書ファイルは証明書のストア（`certstore`）が読む。作成・変更で初めて使うとき、SIGHUP、`RPROXY_CERT_CHECK_SECS` ごとの確認で変わっていたときだけ読む（`Registry::reload_changed_tls`、`tlsconf::fingerprint`）。同じファイルを使うルールは同じ読み込み結果を共有する。ACME は内蔵しない方針（証明書は外部のツールで取る）。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う（接続ごとにファイルを読まない）。
+- 証明書の期限（#115）：期限は `tlsconf::inspect_certificate` だけで調べる。サーバ証明書は切れたものを SNI の候補から外し、すべて切れたらルールを `failed`（`tlsconf::CERT_EXPIRED`）にして待ち受けを閉じる。更新されたファイルが読めたら `apply_certs` が自動で戻す。API の作成・変更では断る（`400 tls_config`）。CA・転送先向けの証明書・制御 API の証明書（ストアの外、`note_external`）は止めずに知らせるだけ。定期の確認は `RPROXY_CERT_EXPIRY_CHECK_SECS`（`Registry::check_certificate_expiry`）。
 - STARTTLS では、STARTTLS への応答より前に届いた余分なデータを受け付けない（コマンドの紛れ込み対策）。
 - WebRTC のメディア（DTLS-SRTP）は終端できない（SDP のフィンガープリントに結びついているため）。docs/PROFILES.md に書いてあるとおり passthrough で流す。
 - 設定の例と用途別の推奨は `docs/PROFILES.md`。UI のプロファイルもこれに合わせる。

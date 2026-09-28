@@ -1,6 +1,6 @@
 //! The single owner of every running listener.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use crate::balance::{self, Member, Pool, TargetSpec};
+use crate::certstore::{self, CertStore, Source};
 use crate::error::ApiError;
 use crate::proxy::{RouteTarget, Runtime, Stats};
 use crate::resolve::{self, Lookup};
@@ -187,18 +188,26 @@ pub struct ConfigStatus {
 	pub restart_needed: Vec<String>,
 }
 
-/// What `Registry::reload_changed_tls` last saw of a rule's certificate files.
-#[derive(Debug, Clone, Copy)]
-pub struct FileState {
-	loaded: u64,
-	failed: Option<u64>,
-}
-
 pub struct Registry {
 	cfg: Config,
 	rules: Mutex<HashMap<Key, Entry>>,
 	next_generation: AtomicU64,
 	config_status: RwLock<Option<ConfigStatus>>,
+	/// Every certificate the rules use, loaded once and shared.
+	certs: CertStore,
+}
+
+/// What `Registry::apply_certs` does with one rule.
+enum CertAction {
+	Nothing,
+	/// Its certificates could not be reloaded; the current ones stay.
+	Failed,
+	/// New TLS settings were installed.
+	Rebuilt,
+	/// Every server certificate has expired: take the rule out of service.
+	Expired(String),
+	/// Stopped for expired certificates, and a certificate it uses changed.
+	Restart(Box<RuleSpec>, u64),
 }
 
 fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
@@ -293,7 +302,47 @@ fn route_spec(route: &Route) -> String {
 
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
-		Arc::new(Registry { cfg, rules: Mutex::default(), next_generation: AtomicU64::new(1), config_status: RwLock::default() })
+		Arc::new(Registry {
+			cfg,
+			rules: Mutex::default(),
+			next_generation: AtomicU64::new(1),
+			config_status: RwLock::default(),
+			certs: CertStore::default(),
+		})
+	}
+
+	/// The certificate store (#115).
+	pub fn certs(&self) -> &CertStore {
+		&self.certs
+	}
+
+	/// A rule's view with the expiry of its certificates.
+	fn view_of(&self, entry: &Entry) -> RuleView {
+		let mut view = entry.view();
+		let now = tlsconf::unix_now();
+		let warn = self.certs.warn_secs();
+		view.cert_status = certstore::sources(&entry.spec().tls)
+			.into_iter()
+			.filter_map(|(role, source)| {
+				let not_after = self.certs.not_after(&source)?;
+				Some(certstore::CertStatusView::new(role, source.file(), not_after, now, warn))
+			})
+			.collect();
+		view
+	}
+
+	/// The rule's TLS settings, with its certificates from the store.
+	fn build_tls(&self, spec: &RuleSpec) -> Result<TlsRuntime, ApiError> {
+		let tls = spec.runtime_tls();
+		let loaded = self.certs.rule_certs(&tls)?;
+		TlsRuntime::build(spec.key.protocol, &tls, spec.starttls, spec.starttls_required, &loaded)
+	}
+
+	/// Forgets certificates no rule uses any more.
+	async fn gc_certs(&self) {
+		let used: HashSet<Source> =
+			self.rules.lock().await.values().flat_map(|e| certstore::sources(&e.spec().tls)).map(|(_, s)| s).collect();
+		self.certs.retain(&used);
 	}
 
 	pub fn reserved(&self) -> &[SocketAddr] {
@@ -359,11 +408,11 @@ impl Registry {
 		let rules = self.rules.lock().await;
 		let mut keys: Vec<&Key> = rules.keys().collect();
 		keys.sort_by_key(|k| (k.protocol == Protocol::Udp, k.listen));
-		keys.into_iter().map(|k| rules[k].view()).collect()
+		keys.into_iter().map(|k| self.view_of(&rules[k])).collect()
 	}
 
 	pub async fn get(&self, key: &Key) -> Result<RuleView, ApiError> {
-		self.rules.lock().await.get(key).map(Entry::view).ok_or_else(|| ApiError::not_found(key.to_string()))
+		self.rules.lock().await.get(key).map(|e| self.view_of(e)).ok_or_else(|| ApiError::not_found(key.to_string()))
 	}
 
 	fn spawn_resolver(
@@ -384,7 +433,7 @@ impl Registry {
 
 	/// Resolves targets and reads certificates, without holding the rules lock.
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
-		let tls = Arc::new(TlsRuntime::build(spec.key.protocol, &spec.runtime_tls(), spec.starttls, spec.starttls_required)?);
+		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
 		}
@@ -550,7 +599,7 @@ impl Registry {
 		}
 		let key = spec.key;
 		let entry = Entry::Running(self.start(spec, prepared)?);
-		let view = entry.view();
+		let view = self.view_of(&entry);
 		rules.insert(key, entry);
 		info!(event = "rule.create", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
 			ports = view.listen_port_end.map(|e| e - view.listen_port + 1).unwrap_or(1),
@@ -749,83 +798,139 @@ impl Registry {
 				}
 			}
 		}
-		let view = entry.view();
+		let view = self.view_of(entry);
 		info!(event = "rule.update", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
 			udp_idle_secs = view.udp_idle_secs, tls = ?view.tls.mode, resolved = ?view.resolved);
 		Ok(view)
 	}
 
-	/// Re-reads certificate files for every rule that uses them (SIGHUP), and
-	/// the secret files of authentication middlewares.
-	/// A rule whose files are now broken keeps its current certificates.
-	pub async fn reload_tls(&self) -> (usize, usize) {
-		let rules = self.rules.lock().await;
+	/// SIGHUP: reloads every certificate of the store (and the secret files of
+	/// authentication middlewares), then rebuilds the TLS settings of every TLS
+	/// rule. Returns (rules updated, rules whose certificates could not be reloaded,
+	/// which keep their current ones).
+	pub async fn reload_tls(self: &Arc<Self>) -> (usize, usize) {
+		let changes = self.certs.reload_all();
+		self.apply_certs(&changes, true).await
+	}
+
+	/// Re-reads the certificates whose files changed since they were loaded
+	/// (renewed by certbot, cert-manager, ...; #90), once per certificate, and
+	/// updates the rules that use them. A version that does not load (half
+	/// written) keeps the current certificate and is tried again on the next call.
+	pub async fn reload_changed_tls(self: &Arc<Self>) -> (usize, usize) {
+		let changes = self.certs.refresh();
+		self.apply_certs(&changes, false).await
+	}
+
+	/// The daily expiry check: rules drop server certificates that have expired
+	/// since the last check, and stop when none is left. Returns the rules updated.
+	pub async fn check_certificate_expiry(self: &Arc<Self>) -> usize {
+		let expired = self.certs.newly_expired(tlsconf::unix_now());
+		let changes = certstore::Changes { changed: expired, failed: HashSet::new() };
+		self.apply_certs(&changes, false).await.0
+	}
+
+	/// Applies certificate changes of the store to the rules that use them
+	/// (`all`: every rule, SIGHUP): new TLS settings (an expired server
+	/// certificate is left out); a rule whose server certificates have all
+	/// expired is taken out of service (failed, listeners closed); a rule
+	/// stopped for that starts again once a renewed certificate loads.
+	async fn apply_certs(self: &Arc<Self>, changes: &certstore::Changes, all: bool) -> (usize, usize) {
+		let uses = |spec: &RuleSpec, set: &HashSet<Source>| certstore::sources(&spec.tls).iter().any(|(_, s)| set.contains(s));
 		let (mut ok, mut failed) = (0, 0);
-		for (key, entry) in rules.iter() {
-			let Entry::Running(r) = entry else { continue };
-			if let Some(router) = r.rt.http_router() {
-				router.reload_secrets();
-			}
-			if r.spec.tls.mode != TlsMode::Terminate {
-				continue;
-			}
-			match TlsRuntime::build(key.protocol, &r.spec.runtime_tls(), r.spec.starttls, r.spec.starttls_required) {
-				Ok(tls) => {
-					*r.rt.tls.write().unwrap() = Arc::new(tls);
-					ok += 1;
-				}
-				Err(e) => {
-					failed += 1;
-					warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
+		let mut stopped = vec![];
+		let mut restart = vec![];
+		{
+			let mut rules = self.rules.lock().await;
+			let keys: Vec<Key> = rules.keys().copied().collect();
+			for key in keys {
+				let action = match &rules[&key] {
+					Entry::Running(r) => {
+						if all {
+							if let Some(router) = r.rt.http_router() {
+								router.reload_secrets();
+							}
+						}
+						if uses(&r.spec, &changes.failed) {
+							CertAction::Failed
+						} else if r.spec.tls.mode != TlsMode::Terminate || !(all || uses(&r.spec, &changes.changed)) {
+							CertAction::Nothing
+						} else {
+							match self.build_tls(&r.spec) {
+								Ok(tls) => {
+									*r.rt.tls.write().unwrap() = Arc::new(tls);
+									CertAction::Rebuilt
+								}
+								Err(e) if tlsconf::is_cert_expired(&e) => CertAction::Expired(e.message),
+								Err(e) => {
+									warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
+									CertAction::Failed
+								}
+							}
+						}
+					}
+					Entry::Failed(f) if tlsconf::is_cert_expired_text(&f.error) && (all || uses(&f.spec, &changes.changed)) => {
+						CertAction::Restart(Box::new(f.spec.clone()), f.generation)
+					}
+					Entry::Failed(_) => CertAction::Nothing,
+				};
+				match action {
+					CertAction::Nothing => {}
+					CertAction::Failed => failed += 1,
+					CertAction::Rebuilt => {
+						ok += 1;
+						info!(event = "reload.tls", rule = %key, reason = if all { "sighup" } else { "certificates changed" });
+					}
+					CertAction::Expired(error) => {
+						error!(event = "rule.failed", rule = %key, error = %error, phase = "certificates");
+						if let Some(Entry::Running(r)) = rules.remove(&key) {
+							let generation = self.generation();
+							rules.insert(key, Entry::Failed(Failed { generation, spec: r.spec.clone(), error, retry: None }));
+							stopped.push((key, r));
+						}
+					}
+					CertAction::Restart(spec, generation) => restart.push((spec, generation)),
 				}
 			}
 		}
-		(ok, failed)
-	}
-
-	/// Re-reads the certificate files of rules whose files changed since the last
-	/// call (renewed by certbot, cert-manager, ...). `seen` holds each rule's
-	/// fingerprint between calls; a rule seen for the first time is only recorded.
-	/// Files that do not load (a half-written renewal) keep the current
-	/// certificates and are tried again on the next call.
-	pub async fn reload_changed_tls(&self, seen: &mut HashMap<Key, FileState>) -> (usize, usize) {
-		let rules = self.rules.lock().await;
-		seen.retain(|k, _| matches!(rules.get(k), Some(Entry::Running(_))));
-		let (mut ok, mut failed) = (0, 0);
-		for (key, entry) in rules.iter() {
-			let Entry::Running(r) = entry else { continue };
-			let tls = r.spec.runtime_tls();
-			let files = tls.files();
-			if files.is_empty() {
-				seen.remove(key);
-				continue;
-			}
-			let now = tlsconf::fingerprint(files.iter().copied());
-			let state = match seen.get_mut(key) {
-				None => {
-					seen.insert(*key, FileState { loaded: now, failed: None });
+		for (key, r) in stopped {
+			self.stop_entry(&key, Entry::Running(r), None).await;
+		}
+		for (spec, generation) in restart {
+			let spec = *spec;
+			let key = spec.key;
+			let still_failed = |rules: &HashMap<Key, Entry>| matches!(rules.get(&key), Some(Entry::Failed(f)) if f.generation == generation);
+			let prepared = match self.prepare(&spec).await {
+				Ok(p) => p,
+				Err(e) => {
+					let mut rules = self.rules.lock().await;
+					if still_failed(&rules) {
+						if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
+							f.error = e.message;
+						}
+					}
 					continue;
 				}
-				Some(s) if s.loaded == now => continue,
-				Some(s) => s,
 			};
-			match TlsRuntime::build(key.protocol, &tls, r.spec.starttls, r.spec.starttls_required) {
-				Ok(built) => {
-					*r.rt.tls.write().unwrap() = Arc::new(built);
-					*state = FileState { loaded: now, failed: None };
+			let mut rules = self.rules.lock().await;
+			if !still_failed(&rules) {
+				continue;
+			}
+			match self.start(spec, prepared) {
+				Ok(running) => {
+					info!(event = "rule.create", rule = %key, phase = "certificates renewed");
+					rules.insert(key, Entry::Running(running));
 					ok += 1;
-					info!(event = "reload.tls", rule = %key, reason = "files changed");
 				}
 				Err(e) => {
-					failed += 1;
-					// once per version of the files, not on every check
-					if state.failed != Some(now) {
-						warn!(event = "reload.tls", rule = %key, error = %e.message, "keeping current certificates");
-						state.failed = Some(now);
+					error!(event = "rule.failed", rule = %key, error = %e.message, phase = "certificates");
+					if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
+						f.error = e.message;
 					}
 				}
 			}
 		}
+		self.gc_certs().await;
 		(ok, failed)
 	}
 
@@ -842,6 +947,7 @@ impl Registry {
 			}
 		};
 		self.stop_entry(key, entry, drain).await;
+		self.gc_certs().await;
 		info!(event = "rule.delete", rule = %key, drain_secs = drain.map(|d| d.as_secs()));
 		Ok(())
 	}
@@ -1095,6 +1201,7 @@ impl Registry {
 		}
 		target_metrics(&mut out, &rules);
 		http_metrics(&mut out, &rules);
+		self.cert_metrics(&mut out, &rules);
 		if let Some(b) = self.cfg.http.crowdsec() {
 			let _ = writeln!(out, "# HELP rproxy_crowdsec_decisions Addresses and ranges blocked by the CrowdSec LAPI decisions.");
 			let _ = writeln!(out, "# TYPE rproxy_crowdsec_decisions gauge");
@@ -1104,6 +1211,42 @@ impl Registry {
 			let _ = writeln!(out, "rproxy_crowdsec_synced {}", u8::from(b.synced()));
 		}
 		out
+	}
+}
+
+impl Registry {
+	/// Seconds until each certificate a rule uses expires (negative once
+	/// expired), and the control API's.
+	fn cert_metrics(&self, out: &mut String, rules: &HashMap<Key, Entry>) {
+		let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+		let now = tlsconf::unix_now();
+		let mut samples = vec![];
+		for (key, entry) in rules {
+			for (role, source) in certstore::sources(&entry.spec().tls) {
+				if let Some(not_after) = self.certs.not_after(&source) {
+					samples.push(format!(
+						"{{protocol=\"{}\",listen=\"{}\",role=\"{}\",file=\"{}\"}} {}",
+						key.protocol,
+						key.listen,
+						role.as_str(),
+						esc(source.file()),
+						not_after - now
+					));
+				}
+			}
+		}
+		for (role, file, not_after) in self.certs.external() {
+			samples.push(format!("{{role=\"{}\",file=\"{}\"}} {}", role.as_str(), esc(&file), not_after - now));
+		}
+		if samples.is_empty() {
+			return;
+		}
+		samples.sort();
+		let _ = writeln!(out, "# HELP rproxy_cert_expiry_seconds Seconds until the certificate expires (negative once expired).");
+		let _ = writeln!(out, "# TYPE rproxy_cert_expiry_seconds gauge");
+		for sample in samples {
+			let _ = writeln!(out, "rproxy_cert_expiry_seconds{sample}");
+		}
 	}
 }
 
