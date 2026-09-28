@@ -116,8 +116,17 @@ impl Pki {
 	}
 
 	fn issue(&self, name: &str, cn: &str, sans: &[&str], client: bool) -> Issued {
+		self.issue_until(name, cn, sans, client, None)
+	}
+
+	/// `not_after`: Unix seconds the certificate is valid until (it starts a year earlier).
+	fn issue_until(&self, name: &str, cn: &str, sans: &[&str], client: bool, not_after: Option<i64>) -> Issued {
 		let key = KeyPair::generate().unwrap();
 		let mut params = CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+		if let Some(t) = not_after {
+			params.not_after = time::OffsetDateTime::from_unix_timestamp(t).unwrap();
+			params.not_before = time::OffsetDateTime::from_unix_timestamp(t - 365 * 86_400).unwrap();
+		}
 		params.distinguished_name.push(DnType::CommonName, cn);
 		params.extended_key_usages =
 			vec![if client { ExtendedKeyUsagePurpose::ClientAuth } else { ExtendedKeyUsagePurpose::ServerAuth }];
@@ -136,6 +145,23 @@ impl Pki {
 
 	pub fn server(&self, name: &str, sans: &[&str]) -> Issued {
 		self.issue(name, sans.first().copied().unwrap_or(name), sans, false)
+	}
+
+	/// A server certificate valid until `not_after` (Unix seconds; in the past for an expired one).
+	pub fn server_until(&self, name: &str, sans: &[&str], not_after: i64) -> Issued {
+		self.issue_until(name, sans.first().copied().unwrap_or(name), sans, false, Some(not_after))
+	}
+
+	/// A self-signed CA certificate valid until `not_after`, written to `name`.pem.
+	pub fn ca_until(&self, name: &str, not_after: i64) -> String {
+		let key = KeyPair::generate().unwrap();
+		let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+		params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		params.distinguished_name.push(DnType::CommonName, name);
+		params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+		params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after).unwrap();
+		params.not_before = time::OffsetDateTime::from_unix_timestamp(not_after - 365 * 86_400).unwrap();
+		self.write(&format!("{name}.pem"), &params.self_signed(&key).unwrap().pem())
 	}
 
 	pub fn client(&self, name: &str, cn: &str) -> Issued {

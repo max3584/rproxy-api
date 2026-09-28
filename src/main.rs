@@ -19,6 +19,7 @@ use rproxy_api::http::access::{AccessLogError, HttpGlobal};
 use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::config::{ConfigDoc, LoadError};
 use rproxy_api::registry::{Config, ConfigStatus, Registry};
+use rproxy_api::tlsconf::CertRole;
 use rproxy_api::{db, logging, resolve, source};
 
 /// TCP/UDP forwarder controlled over an HTTP API.
@@ -56,6 +57,15 @@ struct Options {
 	/// cert-manager, ...), which are then re-read; 0 turns the checks off
 	#[arg(long, env = "RPROXY_CERT_CHECK_SECS", default_value_t = 60)]
 	cert_check_secs: u64,
+	/// Seconds between checks for certificates that have expired (a rule drops
+	/// an expired certificate, and stops when all of its certificates have
+	/// expired); certificates are also checked whenever they are loaded; 0 turns
+	/// the periodic check off
+	#[arg(long, env = "RPROXY_CERT_EXPIRY_CHECK_SECS", default_value_t = 86_400)]
+	cert_expiry_check_secs: u64,
+	/// Days before expiry from which a certificate is reported as expiring
+	#[arg(long, env = "RPROXY_CERT_WARN_DAYS", default_value_t = rproxy_api::certstore::DEFAULT_WARN_DAYS)]
+	cert_warn_days: u64,
 	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
 	#[arg(long, env = "RPROXY_LOG_FILE")]
 	log_file: Option<PathBuf>,
@@ -294,6 +304,10 @@ async fn run(opts: Options) -> Result<(), String> {
 		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 		http: Arc::new(http_global),
 	});
+	registry.certs().set_warn_days(opts.cert_warn_days);
+	if let Some(cert) = &opts.tls_cert {
+		note_api_cert(&registry, cert);
+	}
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
@@ -361,9 +375,16 @@ async fn run(opts: Options) -> Result<(), String> {
 		None => None,
 	};
 
-	if opts.cert_check_secs > 0 {
-		let every = Duration::from_secs(opts.cert_check_secs);
-		tokio::spawn(watch_certificates(every, registry.clone(), tls.clone(), opts.tls_cert.clone().zip(opts.tls_key.clone()), stop.clone()));
+	if opts.cert_check_secs > 0 || opts.cert_expiry_check_secs > 0 {
+		let every = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
+		tokio::spawn(watch_certificates(
+			every(opts.cert_check_secs),
+			every(opts.cert_expiry_check_secs),
+			registry.clone(),
+			tls.clone(),
+			opts.tls_cert.clone().zip(opts.tls_key.clone()),
+			stop.clone(),
+		));
 	}
 
 	// the settings file: applied again when it changes, or on SIGHUP
@@ -393,35 +414,70 @@ async fn run(opts: Options) -> Result<(), String> {
 	Ok(())
 }
 
-/// Re-reads certificate files that changed: the rules' and the control API's.
+/// Records the control API's certificate expiry (it is not in the certificate
+/// store, but goes through the same check, logs and metrics).
+fn note_api_cert(registry: &Registry, cert: &Path) {
+	let file = cert.to_string_lossy();
+	match rproxy_api::tlsconf::file_expiry(&file) {
+		Ok(not_after) => registry.certs().note_external(CertRole::Api, &file, not_after, rproxy_api::tlsconf::unix_now()),
+		Err(e) => warn!(event = "cert.check", part = "api", error = %e.message),
+	}
+}
+
+/// Watches certificates: files that changed are re-read (`files`, #90), once
+/// per certificate in the store, and expiry is checked (`expiry`, daily by
+/// default), for the rules' certificates and the control API's.
 async fn watch_certificates(
-	every: Duration,
+	files: Option<Duration>,
+	expiry: Option<Duration>,
 	registry: Arc<Registry>,
 	api_tls: Arc<OnceCell<RustlsConfig>>,
 	api_files: Option<(PathBuf, PathBuf)>,
 	stop: CancellationToken,
 ) {
 	use rproxy_api::tlsconf::fingerprint;
-	let mut seen = std::collections::HashMap::new();
 	let api_print = |(c, k): &(PathBuf, PathBuf)| fingerprint([c.to_str().unwrap_or(""), k.to_str().unwrap_or("")]);
 	let mut api_seen = api_files.as_ref().map(api_print);
-	let mut ticks = tokio::time::interval(every);
-	ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	let ticker = |every: Option<Duration>| {
+		every.map(|e| {
+			let mut t = tokio::time::interval_at(tokio::time::Instant::now() + e, e);
+			t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			t
+		})
+	};
+	let (mut file_ticks, mut expiry_ticks) = (ticker(files), ticker(expiry));
+	async fn tick(t: &mut Option<tokio::time::Interval>) {
+		match t {
+			Some(t) => {
+				t.tick().await;
+			}
+			None => std::future::pending().await,
+		}
+	}
 	loop {
 		tokio::select! {
 			_ = stop.cancelled() => return,
-			_ = ticks.tick() => {}
-		}
-		registry.reload_changed_tls(&mut seen).await;
-		if let (Some(files), Some(config)) = (&api_files, api_tls.get()) {
-			let now = api_print(files);
-			if api_seen != Some(now) {
-				match config.reload_from_pem_file(&files.0, &files.1).await {
-					Ok(()) => {
-						info!(event = "reload.tls", part = "api", reason = "files changed");
-						api_seen = Some(now);
+			_ = tick(&mut file_ticks) => {
+				registry.reload_changed_tls().await;
+				if let (Some(files), Some(config)) = (&api_files, api_tls.get()) {
+					let now = api_print(files);
+					if api_seen != Some(now) {
+						match config.reload_from_pem_file(&files.0, &files.1).await {
+							Ok(()) => {
+								info!(event = "reload.tls", part = "api", reason = "files changed");
+								api_seen = Some(now);
+								note_api_cert(&registry, &files.0);
+							}
+							Err(e) => warn!(event = "reload.tls", part = "api", error = %e, "keeping current certificate"),
+						}
 					}
-					Err(e) => warn!(event = "reload.tls", part = "api", error = %e, "keeping current certificate"),
+				}
+			}
+			_ = tick(&mut expiry_ticks) => {
+				let changed = registry.check_certificate_expiry().await;
+				info!(event = "cert.check", rules_updated = changed);
+				if let Some((cert, _)) = &api_files {
+					note_api_cert(&registry, cert);
 				}
 			}
 		}
@@ -517,7 +573,7 @@ async fn wait_for_shutdown(
 	tokens: &Tokens,
 	tls: &OnceCell<RustlsConfig>,
 	opts: &Options,
-	registry: &Registry,
+	registry: &Arc<Registry>,
 	config_hup: &Notify,
 ) -> Result<(), String> {
 	use tokio::signal::unix::{signal, SignalKind};
@@ -533,7 +589,10 @@ async fn wait_for_shutdown(
 				}
 				if let (Some(tls), Some(cert), Some(key)) = (tls.get(), &opts.tls_cert, &opts.tls_key) {
 					match tls.reload_from_pem_file(cert, key).await {
-						Ok(()) => info!(event = "reload.tls"),
+						Ok(()) => {
+							info!(event = "reload.tls");
+							note_api_cert(registry, cert);
+						}
 						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
 					}
 				}
@@ -554,7 +613,7 @@ async fn wait_for_shutdown(
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Registry, _: &Notify) -> Result<(), String> {
+async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Arc<Registry>, _: &Notify) -> Result<(), String> {
 	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
 }
 

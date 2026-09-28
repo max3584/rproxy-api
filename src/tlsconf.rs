@@ -444,14 +444,6 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, ApiError> {
 		.ok_or_else(|| tls_error(format!("{path}: no private key block")))
 }
 
-fn load_roots(path: &str) -> Result<RootCertStore, ApiError> {
-	let mut roots = RootCertStore::empty();
-	for cert in load_chain(path)? {
-		roots.add(cert).map_err(|e| tls_error(format!("{path}: {e}")))?;
-	}
-	Ok(roots)
-}
-
 /// DNS names a certificate is valid for (subjectAltName, else the common name).
 pub fn cert_names(cert: &CertificateDer<'_>) -> Vec<String> {
 	let Ok((_, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) else { return vec![] };
@@ -481,6 +473,202 @@ pub fn common_name(cert: &[u8]) -> Option<String> {
 	let (_, parsed) = x509_parser::parse_x509_certificate(cert).ok()?;
 	let cn = parsed.subject().iter_common_name().next()?.as_str().ok()?.to_string();
 	Some(cn)
+}
+
+/// Start of the message of the error a rule gets when every server certificate
+/// has expired; `is_cert_expired` recognises it.
+pub const CERT_EXPIRED: &str = "certificate expired";
+
+/// Whether `e` says every server certificate of the rule has expired.
+pub fn is_cert_expired(e: &ApiError) -> bool {
+	e.code == "tls_config" && e.message.starts_with(CERT_EXPIRED)
+}
+
+/// Whether a rule's error text is the one of `is_cert_expired`.
+pub fn is_cert_expired_text(message: &str) -> bool {
+	message.starts_with(CERT_EXPIRED)
+}
+
+/// When one certificate stops being valid. Pure: `now` is Unix seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertCheck {
+	/// notAfter, Unix seconds.
+	pub not_after: i64,
+	pub seconds_left: i64,
+	pub expired: bool,
+}
+
+/// Reads the validity of one certificate (DER). The only place certificate
+/// expiry is worked out; everything else goes through it.
+pub fn inspect_certificate(der: &[u8], now: i64) -> Result<CertCheck, String> {
+	let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| e.to_string())?;
+	let not_after = cert.validity().not_after.timestamp();
+	Ok(CertCheck { not_after, seconds_left: not_after - now, expired: not_after <= now })
+}
+
+/// The earliest notAfter of `certs` (a chain or a bundle), through `inspect_certificate`.
+pub fn earliest_expiry(certs: &[CertificateDer<'_>]) -> Option<i64> {
+	certs.iter().filter_map(|c| inspect_certificate(c.as_ref(), 0).ok()).map(|c| c.not_after).min()
+}
+
+pub fn unix_now() -> i64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs() as i64)
+		.unwrap_or(0)
+}
+
+/// Earliest notAfter of the certificates in a PEM file (the control API's
+/// certificate, which is not in the certificate store).
+pub fn file_expiry(file: &str) -> Result<i64, ApiError> {
+	earliest_expiry(&load_chain(file)?).ok_or_else(|| tls_error(format!("{file}: cannot read the certificate's validity")))
+}
+
+/// What a certificate file is for. Only `certificate` (the rule's own server
+/// certificates) takes a rule out of service when it expires; the others warn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertRole {
+	/// `tls.certificates[]` (with its `chain_file`).
+	Certificate,
+	/// `tls.client_auth.ca_file`
+	ClientCa,
+	/// `tls.client_auth.chain_file`
+	ClientChain,
+	/// `tls.upstream.ca_file`
+	UpstreamCa,
+	/// `tls.upstream.cert_file` (with its `chain_file`).
+	UpstreamCertificate,
+	/// The control API's certificate (`RPROXY_TLS_CERT`).
+	Api,
+}
+
+impl CertRole {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			CertRole::Certificate => "certificate",
+			CertRole::ClientCa => "client_ca",
+			CertRole::ClientChain => "client_chain",
+			CertRole::UpstreamCa => "upstream_ca",
+			CertRole::UpstreamCertificate => "upstream_certificate",
+			CertRole::Api => "api",
+		}
+	}
+}
+
+/// A certificate with its key, loaded once and shared by every rule that
+/// names the same files (see `certstore`).
+pub struct KeyedCert {
+	/// The certificate followed by its intermediates.
+	pub chain: Vec<CertificateDer<'static>>,
+	pub key: PrivateKeyDer<'static>,
+	/// For serving TLS (tcp).
+	pub certified: Arc<CertifiedKey>,
+	/// DNS names it is valid for, for SNI selection.
+	pub names: Vec<String>,
+	/// For serving DTLS (udp): needs a PKCS#8 key; the error only matters to udp rules.
+	pub dtls: Result<dtls::crypto::Certificate, ApiError>,
+	/// Earliest notAfter of the chain.
+	pub not_after: i64,
+}
+
+impl std::fmt::Debug for KeyedCert {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("KeyedCert").field("names", &self.names).field("not_after", &self.not_after).finish_non_exhaustive()
+	}
+}
+
+impl KeyedCert {
+	/// Reads the certificate, its chain and its key, and checks they belong together.
+	pub fn load(cert_file: &str, chain_file: Option<&str>, key_file: &str) -> Result<KeyedCert, ApiError> {
+		let chain = load_full_chain(cert_file, chain_file)?;
+		let key = load_key(key_file)?;
+		let signing = provider()
+			.key_provider
+			.load_private_key(key.clone_key())
+			.map_err(|e| tls_error(format!("{key_file}: {e}")))?;
+		let certified = CertifiedKey::new(chain.clone(), signing);
+		certified
+			.keys_match()
+			.map_err(|e| tls_error(format!("{key_file} does not belong to {cert_file}: {e}")))?;
+		let dtls = dtls_certificate(&chain, &key, cert_file, key_file);
+		Ok(KeyedCert {
+			names: cert_names(&chain[0]),
+			not_after: earliest_expiry(&chain).unwrap_or(i64::MAX),
+			chain,
+			key,
+			certified: Arc::new(certified),
+			dtls,
+		})
+	}
+
+	pub fn expired(&self, now: i64) -> bool {
+		self.not_after <= now
+	}
+}
+
+/// CA certificates (a root bundle or intermediates), loaded once and shared.
+#[derive(Debug)]
+pub struct CertBundle {
+	pub certs: Vec<CertificateDer<'static>>,
+	pub not_after: i64,
+}
+
+impl CertBundle {
+	pub fn load(file: &str) -> Result<CertBundle, ApiError> {
+		let certs = load_chain(file)?;
+		Ok(CertBundle { not_after: earliest_expiry(&certs).unwrap_or(i64::MAX), certs })
+	}
+
+	fn roots(&self, file: &str) -> Result<RootCertStore, ApiError> {
+		let mut roots = RootCertStore::empty();
+		for cert in &self.certs {
+			roots.add(cert.clone()).map_err(|e| tls_error(format!("{file}: {e}")))?;
+		}
+		Ok(roots)
+	}
+}
+
+/// The loaded certificates one rule's TLS settings use (terminate mode).
+#[derive(Clone, Default)]
+pub struct RuleCerts {
+	/// `tls.certificates`, in order.
+	pub servers: Vec<Arc<KeyedCert>>,
+	pub client_ca: Option<Arc<CertBundle>>,
+	pub client_chain: Option<Arc<CertBundle>>,
+	pub upstream_ca: Option<Arc<CertBundle>>,
+	pub upstream_cert: Option<Arc<KeyedCert>>,
+}
+
+impl RuleCerts {
+	/// Reads every file directly (callers without a certificate store, tests).
+	pub fn load(spec: &TlsSpec) -> Result<RuleCerts, ApiError> {
+		if spec.mode != TlsMode::Terminate {
+			return Ok(RuleCerts::default());
+		}
+		let mut certs = RuleCerts::default();
+		for c in &spec.certificates {
+			certs.servers.push(Arc::new(KeyedCert::load(&c.cert_file, c.chain_file.as_deref(), &c.key_file)?));
+		}
+		let bundle = |f: &Option<String>| f.as_deref().map(|f| CertBundle::load(f).map(Arc::new)).transpose();
+		if spec.client_auth.mode != ClientAuthMode::None {
+			certs.client_ca = bundle(&spec.client_auth.ca_file)?;
+			certs.client_chain = bundle(&spec.client_auth.chain_file)?;
+		}
+		if spec.upstream.tls {
+			certs.upstream_ca = bundle(&spec.upstream.ca_file)?;
+			if let (Some(cert), Some(key)) = (&spec.upstream.cert_file, &spec.upstream.key_file) {
+				certs.upstream_cert = Some(Arc::new(KeyedCert::load(cert, spec.upstream.chain_file.as_deref(), key)?));
+			}
+		}
+		Ok(certs)
+	}
+}
+
+/// The error when no server certificate of the rule is still valid.
+fn all_expired(spec: &TlsSpec) -> ApiError {
+	let files: Vec<&str> = spec.certificates.iter().map(|c| c.cert_file.as_str()).collect();
+	tls_error(format!("{CERT_EXPIRED}: every certificate of this rule has expired ({}); renew the files", files.join(", ")))
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -547,25 +735,16 @@ fn server_crypto(
 /// The QUIC server settings, or why QUIC cannot be used with these TLS settings.
 pub type QuicConfig = Result<Arc<ServerConfig>, String>;
 
-fn server_configs(tls: &TlsSpec) -> Result<(Arc<ServerConfig>, QuicConfig), ApiError> {
+fn server_configs(tls: &TlsSpec, loaded: &RuleCerts, now: i64) -> Result<(Arc<ServerConfig>, QuicConfig), ApiError> {
 	let (provider, versions) = server_crypto(tls.options.as_ref())?;
-	let mut certs = vec![];
-	for files in &tls.certificates {
-		let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
-		let key = load_key(&files.key_file)?;
-		let signing = provider
-			.key_provider
-			.load_private_key(key)
-			.map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
-		let names = cert_names(&chain[0]);
-		let certified = CertifiedKey::new(chain, signing);
-		certified
-			.keys_match()
-			.map_err(|e| tls_error(format!("{} does not belong to {}: {e}", files.key_file, files.cert_file)))?;
-		certs.push((names, Arc::new(certified)));
+	// an expired certificate is left out; its names get the first remaining one
+	let certs: Vec<(Vec<String>, Arc<CertifiedKey>)> =
+		loaded.servers.iter().filter(|c| !c.expired(now)).map(|c| (c.names.clone(), c.certified.clone())).collect();
+	if certs.is_empty() {
+		return Err(all_expired(tls));
 	}
 
-	let verifier = client_verifier(&tls.client_auth)?;
+	let verifier = client_verifier(&tls.client_auth, loaded)?;
 	let resolver = Arc::new(SniCertResolver { certs });
 	let builder = ServerConfig::builder_with_provider(provider.clone())
 		.with_protocol_versions(&versions)
@@ -658,18 +837,15 @@ impl ClientCertVerifier for WithIntermediates {
 
 /// Client certificate verification for TLS and DTLS alike: the root(s) in
 /// `ca_file` are the only trust anchors; `chain_file` fills in intermediates.
-fn client_verifier(auth: &ClientAuth) -> Result<Option<Arc<dyn ClientCertVerifier>>, ApiError> {
-	let (mode, Some(ca)) = (auth.mode, &auth.ca_file) else { return Ok(None) };
+fn client_verifier(auth: &ClientAuth, loaded: &RuleCerts) -> Result<Option<Arc<dyn ClientCertVerifier>>, ApiError> {
+	let (mode, Some(ca), Some(bundle)) = (auth.mode, &auth.ca_file, &loaded.client_ca) else { return Ok(None) };
 	if mode == ClientAuthMode::None {
 		return Ok(None);
 	}
-	let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(load_roots(ca)?), provider());
+	let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(bundle.roots(ca)?), provider());
 	let builder = if mode == ClientAuthMode::Optional { builder.allow_unauthenticated() } else { builder };
 	let inner = builder.build().map_err(|e| tls_error(format!("{ca}: {e}")))?;
-	let extra = match &auth.chain_file {
-		Some(file) => load_chain(file)?,
-		None => vec![],
-	};
+	let extra = loaded.client_chain.as_ref().map(|b| b.certs.clone()).unwrap_or_default();
 	Ok(Some(Arc::new(WithIntermediates { inner, extra })))
 }
 
@@ -712,7 +888,22 @@ impl ServerCertVerifier for NoVerify {
 	}
 }
 
+/// Client TLS towards a backend, reading the files of `up` (L7 backends, OIDC, CrowdSec).
 pub(crate) fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError> {
+	let upstream_cert = match (&up.cert_file, &up.key_file) {
+		(Some(cert), Some(key)) => Some(Arc::new(KeyedCert::load(cert, up.chain_file.as_deref(), key)?)),
+		_ => None,
+	};
+	let loaded = RuleCerts {
+		upstream_ca: up.ca_file.as_deref().map(|f| CertBundle::load(f).map(Arc::new)).transpose()?,
+		upstream_cert,
+		..Default::default()
+	};
+	client_config_from(up, &loaded)
+}
+
+/// Client TLS towards a backend from certificates already loaded.
+fn client_config_from(up: &Upstream, loaded: &RuleCerts) -> Result<Arc<ClientConfig>, ApiError> {
 	let provider = provider();
 	let builder = ClientConfig::builder_with_provider(provider.clone())
 		.with_safe_default_protocol_versions()
@@ -720,37 +911,40 @@ pub(crate) fn client_config(up: &Upstream) -> Result<Arc<ClientConfig>, ApiError
 	let builder = if up.insecure_skip_verify {
 		builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
 	} else {
-		let roots = match &up.ca_file {
-			Some(ca) => load_roots(ca)?,
-			None => RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() },
+		let roots = match (&up.ca_file, &loaded.upstream_ca) {
+			(Some(ca), Some(bundle)) => bundle.roots(ca)?,
+			_ => RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() },
 		};
 		builder.with_root_certificates(roots)
 	};
-	let config = match (&up.cert_file, &up.key_file) {
-		(Some(cert), Some(key)) => builder
-			.with_client_auth_cert(load_full_chain(cert, up.chain_file.as_deref())?, load_key(key)?)
+	let config = match (&up.cert_file, &loaded.upstream_cert) {
+		(Some(cert), Some(keyed)) => builder
+			.with_client_auth_cert(keyed.chain.clone(), keyed.key.clone_key())
 			.map_err(|e| tls_error(format!("{cert}: {e}")))?,
 		_ => builder.with_no_client_auth(),
 	};
 	Ok(Arc::new(config))
 }
 
-fn dtls_certificate(files: &CertFiles) -> Result<dtls::crypto::Certificate, ApiError> {
-	let chain = load_full_chain(&files.cert_file, files.chain_file.as_deref())?;
-	let PrivateKeyDer::Pkcs8(key) = load_key(&files.key_file)? else {
+fn dtls_certificate(
+	chain: &[CertificateDer<'static>],
+	key: &PrivateKeyDer<'static>,
+	cert_file: &str,
+	key_file: &str,
+) -> Result<dtls::crypto::Certificate, ApiError> {
+	let PrivateKeyDer::Pkcs8(key) = key else {
 		return Err(tls_error(format!(
-			"{}: DTLS needs a PKCS#8 key (convert with: openssl pkcs8 -topk8 -nocrypt -in key.pem)",
-			files.key_file
+			"{key_file}: DTLS needs a PKCS#8 key (convert with: openssl pkcs8 -topk8 -nocrypt -in key.pem)"
 		)));
 	};
-	let private_key = dtls_private_key(key.secret_pkcs8_der()).map_err(|e| tls_error(format!("{}: {e}", files.key_file)))?;
+	let private_key = dtls_private_key(key.secret_pkcs8_der()).map_err(|e| tls_error(format!("{key_file}: {e}")))?;
 	let leaf_key = x509_parser::parse_x509_certificate(chain[0].as_ref())
 		.map(|(_, c)| c.public_key().subject_public_key.data.to_vec())
-		.map_err(|e| tls_error(format!("{}: {e}", files.cert_file)))?;
+		.map_err(|e| tls_error(format!("{cert_file}: {e}")))?;
 	if leaf_key != dtls_public_key(&private_key) {
-		return Err(tls_error(format!("{} does not belong to {}", files.key_file, files.cert_file)));
+		return Err(tls_error(format!("{key_file} does not belong to {cert_file}")));
 	}
-	Ok(dtls::crypto::Certificate { certificate: chain, private_key })
+	Ok(dtls::crypto::Certificate { certificate: chain.to_vec(), private_key })
 }
 
 /// A DTLS private key from PKCS#8 DER: ECDSA P-256, Ed25519 or RSA (what the
@@ -801,12 +995,21 @@ pub struct TlsRuntime {
 }
 
 impl TlsRuntime {
-	/// Reads every file the spec names; fails if any is missing or invalid.
+	/// `build` with certificates read directly from the files (no certificate store).
+	pub fn load(protocol: Protocol, spec: &TlsSpec, starttls: Option<StartTls>, starttls_required: bool) -> Result<Self, ApiError> {
+		validate(protocol, spec, starttls)?;
+		Self::build(protocol, spec, starttls, starttls_required, &RuleCerts::load(spec)?)
+	}
+
+	/// Builds the TLS / DTLS settings from certificates already loaded
+	/// (`RuleCerts`, from the certificate store). Expired server certificates
+	/// are left out; if every one has expired it fails (`is_cert_expired`).
 	pub fn build(
 		protocol: Protocol,
 		spec: &TlsSpec,
 		starttls: Option<StartTls>,
 		starttls_required: bool,
+		loaded: &RuleCerts,
 	) -> Result<Self, ApiError> {
 		validate(protocol, spec, starttls)?;
 		let mut rt = TlsRuntime {
@@ -825,36 +1028,41 @@ impl TlsRuntime {
 		if spec.mode != TlsMode::Terminate {
 			return Ok(rt);
 		}
+		let now = unix_now();
 		match protocol {
 			Protocol::Tcp => {
-				let (tcp, quic) = server_configs(spec)?;
+				let (tcp, quic) = server_configs(spec, loaded, now)?;
 				rt.server_config = Some(tcp);
 				rt.quic_config = Some(quic);
-				if let Some(name) = load_chain(&spec.certificates[0].cert_file)?
-					.first()
-					.and_then(|c| cert_names(c).into_iter().find(|n| !n.starts_with("*.")))
+				if let Some(name) =
+					loaded.servers.first().and_then(|c| c.names.iter().find(|n| !n.starts_with("*.")).cloned())
 				{
 					rt.greeting_name = name;
 				}
 				if spec.upstream.tls {
-					rt.connector = Some(tokio_rustls::TlsConnector::from(client_config(&spec.upstream)?));
+					rt.connector = Some(tokio_rustls::TlsConnector::from(client_config_from(&spec.upstream, loaded)?));
 				}
 			}
 			Protocol::Udp => {
-				rt.dtls_certs = spec.certificates.iter().map(dtls_certificate).collect::<Result<_, _>>()?;
-				rt.dtls_client_verifier = client_verifier(&spec.client_auth)?;
+				for cert in &loaded.servers {
+					let dtls = cert.dtls.clone()?;
+					if !cert.expired(now) {
+						rt.dtls_certs.push(dtls);
+					}
+				}
+				if rt.dtls_certs.is_empty() {
+					return Err(all_expired(spec));
+				}
+				rt.dtls_client_verifier = client_verifier(&spec.client_auth, loaded)?;
 				if spec.upstream.tls {
-					rt.dtls_upstream_roots = Some(match &spec.upstream.ca_file {
-						Some(ca) => load_roots(ca)?,
-						None => RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() },
+					rt.dtls_upstream_roots = Some(match (&spec.upstream.ca_file, &loaded.upstream_ca) {
+						(Some(ca), Some(bundle)) => bundle.roots(ca)?,
+						_ => RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() },
 					});
-					if let (Some(cert), Some(key)) = (&spec.upstream.cert_file, &spec.upstream.key_file) {
-						rt.dtls_upstream_cert = Some(dtls_certificate(&CertFiles {
-							cert_file: cert.clone(),
-							chain_file: spec.upstream.chain_file.clone(),
-							key_file: key.clone(),
-							..Default::default()
-						})?);
+					if let (Some(cert), Some(keyed)) = (&spec.upstream.cert_file, &loaded.upstream_cert) {
+						rt.dtls_upstream_cert = Some(
+							keyed.dtls.clone().map_err(|e| ApiError::tls_config(format!("{cert}: {}", e.message)))?,
+						);
 					}
 				}
 			}
@@ -922,6 +1130,20 @@ impl TlsRuntime {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn inspects_certificate_expiry() {
+		let key = rcgen::KeyPair::generate().unwrap();
+		let mut params = rcgen::CertificateParams::new(vec!["a.test".to_string()]).unwrap();
+		params.not_before = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+		params.not_after = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+		let cert = params.self_signed(&key).unwrap();
+		let check = inspect_certificate(cert.der(), 1_999_999_000).unwrap();
+		assert_eq!(check, CertCheck { not_after: 2_000_000_000, seconds_left: 1000, expired: false });
+		assert!(inspect_certificate(cert.der(), 2_000_000_000).unwrap().expired, "expired at notAfter");
+		assert_eq!(earliest_expiry(&[cert.der().clone()]), Some(2_000_000_000));
+		assert!(inspect_certificate(b"not a certificate", 0).is_err());
+	}
 
 	fn route() -> Route {
 		Route {
@@ -1028,7 +1250,7 @@ mod tests {
 			certificates: vec![CertFiles { cert_file: "/nonexistent.pem".into(), chain_file: None, key_file: "/nonexistent.key".into(), ..Default::default() }],
 			..Default::default()
 		};
-		let err = TlsRuntime::build(Protocol::Tcp, &spec, None, true).err().unwrap();
+		let err = TlsRuntime::load(Protocol::Tcp, &spec, None, true).err().unwrap();
 		assert_eq!(err.code, "tls_config");
 		assert!(err.message.contains("/nonexistent.pem"));
 	}

@@ -370,7 +370,6 @@ async fn reload_picks_up_renewed_certificates_and_patch_changes_tls() {
 
 #[tokio::test]
 async fn changed_certificate_files_are_noticed() {
-	use std::collections::HashMap;
 	let pki = Pki::new("watch");
 	let first = pki.server("front", &["one.test"]);
 	// cert-manager / Kubernetes secrets: the path is a symbolic link that gets swapped
@@ -386,21 +385,20 @@ async fn changed_certificate_files_are_noticed() {
 	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]});
 	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
-	let mut seen = HashMap::new();
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0), "the first check only records");
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0), "nothing changed");
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 0), "loaded when the rule was created");
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 0), "nothing changed");
 	assert!(tls_roundtrip(&pki, port, "one.test", None, "1").await.is_ok());
 
 	// renewed in place (certbot)
 	let second = pki.server("front", &["two.test"]);
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (1, 0));
+	assert_eq!(h.registry.reload_changed_tls().await, (1, 0));
 	assert_eq!(tls_roundtrip(&pki, port, "two.test", None, "2").await.unwrap(), "W:2");
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 0));
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 0));
 
 	// half-written: the key no longer matches; the current certificate stays
 	std::fs::write(&second.key_file, "not a key").unwrap();
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 1));
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (0, 1), "tried again on the next check");
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 1));
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 1), "tried again on the next check");
 	assert_eq!(tls_roundtrip(&pki, port, "two.test", None, "3").await.unwrap(), "W:3");
 
 	// the links are swapped to a new pair
@@ -410,7 +408,7 @@ async fn changed_certificate_files_are_noticed() {
 		std::os::unix::fs::symlink(target, &tmp).unwrap();
 		std::fs::rename(&tmp, link).unwrap();
 	}
-	assert_eq!(h.registry.reload_changed_tls(&mut seen).await, (1, 0));
+	assert_eq!(h.registry.reload_changed_tls().await, (1, 0));
 	assert_eq!(tls_roundtrip(&pki, port, "three.test", None, "4").await.unwrap(), "W:4");
 }
 
@@ -600,4 +598,111 @@ async fn http_rules_pass_some_names_through_on_the_same_port() {
 	body["listen_port"] = json!(free_port());
 	let (status, v) = h.post(body).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+}
+
+fn unix_now() -> i64 {
+	rproxy_api::tlsconf::unix_now()
+}
+
+/// The `cert_status` entry of a rule view for `file`.
+fn cert_status<'a>(view: &'a Value, file: &str) -> &'a Value {
+	view["cert_status"].as_array().unwrap().iter().find(|c| c["file"] == file).unwrap_or_else(|| panic!("{file} not in {view}"))
+}
+
+#[tokio::test]
+async fn expired_certificates_are_left_out_and_stop_the_rule_when_none_is_left() {
+	let pki = Pki::new("expiry");
+	let old = pki.server_until("old", &["old.test"], unix_now() - 86_400);
+	let valid = pki.server("ok", &["ok.test"]);
+	let h = harness().await;
+	let port = free_port();
+	let backend = tcp_backend("X:").await;
+	let tls = json!({"mode": "terminate", "certificates": [
+		{"cert_file": old.cert_file, "key_file": old.key_file},
+		{"cert_file": valid.cert_file, "key_file": valid.key_file}
+	]});
+	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "one certificate is still valid: {v}");
+	let key = format!("tcp/127.0.0.1/{port}");
+	let (_, v) = h.get(&format!("/rules/{key}")).await;
+	let expired = cert_status(&v, &old.cert_file);
+	assert_eq!((expired["role"].as_str(), expired["state"].as_str()), (Some("certificate"), Some("expired")), "{v}");
+	assert_eq!(expired["days_left"], -1, "{v}");
+	assert!(expired["not_after"].as_str().unwrap().ends_with('Z'), "{v}");
+	assert_eq!(cert_status(&v, &valid.cert_file)["state"], "ok");
+	assert_eq!(tls_roundtrip(&pki, port, "ok.test", None, "1").await.unwrap(), "X:1");
+	// the expired certificate is not offered: its name gets the first remaining one
+	// (a name mismatch for the client), never the expired certificate
+	assert!(tls_roundtrip(&pki, port, "old.test", None, "2").await.is_err());
+
+	let text = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	let line = text.lines().find(|l| l.starts_with("rproxy_cert_expiry_seconds") && l.contains(&old.cert_file)).unwrap();
+	assert!(line.contains("role=\"certificate\"") && line.ends_with(|c: char| c.is_ascii_digit()), "{line}");
+	assert!(line.rsplit(' ').next().unwrap().starts_with('-'), "negative once expired: {line}");
+
+	// the last valid certificate expires too (renewed with an expired one): the rule stops
+	pki.server_until("ok", &["ok.test"], unix_now() - 60);
+	assert_eq!(h.registry.reload_changed_tls().await, (0, 0));
+	let (_, v) = h.get(&format!("/rules/{key}")).await;
+	assert_eq!(v["state"], "failed", "{v}");
+	assert!(v["error"].as_str().unwrap().starts_with("certificate expired"), "{v}");
+	assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err(), "the port is closed");
+
+	// renewed: the rule comes back on its own
+	pki.server("ok", &["ok.test"]);
+	assert_eq!(h.registry.reload_changed_tls().await, (1, 0));
+	let (_, v) = h.get(&format!("/rules/{key}")).await;
+	assert_eq!(v["state"], "running", "{v}");
+	assert_eq!(tls_roundtrip(&pki, port, "ok.test", None, "3").await.unwrap(), "X:3");
+}
+
+#[tokio::test]
+async fn the_daily_check_stops_a_rule_whose_certificate_has_just_expired() {
+	let pki = Pki::new("expiry-daily");
+	let soon = pki.server_until("soon", &["soon.test"], unix_now() + 2);
+	let h = harness().await;
+	let port = free_port();
+	let backend = tcp_backend("D:").await;
+	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": soon.cert_file, "key_file": soon.key_file}]});
+	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(cert_status(&v, &soon.cert_file)["state"], "expiring", "within the warning period: {v}");
+	assert_eq!(h.registry.check_certificate_expiry().await, 0, "not expired yet");
+	tokio::time::sleep(Duration::from_millis(3_100)).await;
+	h.registry.check_certificate_expiry().await;
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(v["state"], "failed", "{v}");
+	assert_eq!(cert_status(&v, &soon.cert_file)["state"], "expired", "{v}");
+}
+
+#[tokio::test]
+async fn a_rule_whose_certificates_have_all_expired_is_refused() {
+	let pki = Pki::new("expiry-refused");
+	let old = pki.server_until("old", &["old.test"], unix_now() - 3600);
+	let h = harness().await;
+	let backend = tcp_backend("R:").await;
+	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": old.cert_file, "key_file": old.key_file}]});
+	let (status, v) = h.post(tcp_rule(free_port(), backend, tls)).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+	assert!(v["error"].as_str().unwrap().starts_with("certificate expired"), "{v}");
+}
+
+#[tokio::test]
+async fn an_expired_client_ca_only_warns() {
+	let pki = Pki::new("expiry-ca");
+	let server = pki.server("front", &["ca.test"]);
+	let old_ca = pki.ca_until("old-ca", unix_now() - 86_400);
+	let h = harness().await;
+	let port = free_port();
+	let backend = tcp_backend("C:").await;
+	let tls = json!({"mode": "terminate",
+		"certificates": [{"cert_file": server.cert_file, "key_file": server.key_file}],
+		"client_auth": {"mode": "optional", "ca_file": old_ca}});
+	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["state"], "running");
+	let ca = cert_status(&v, &old_ca);
+	assert_eq!((ca["role"].as_str(), ca["state"].as_str()), (Some("client_ca"), Some("expired")), "{v}");
+	assert_eq!(tls_roundtrip(&pki, port, "ca.test", None, "1").await.unwrap(), "C:1");
+	assert_eq!(h.registry.check_certificate_expiry().await, 0, "a CA does not stop the rule");
 }
