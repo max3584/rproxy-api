@@ -91,6 +91,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## TLS まわりの約束
 
+- L7：HTTP/2・HTTP/3 では、クライアントが `cookie` を複数のフィールドに分けて送れる（Chrome はそうする）。`server.rs` の `Conn::handle` の最初で `join_cookie_fields` が `"; "` で 1 本にまとめる（RFC 9113 §8.2.3 / RFC 9114 §4.2.1。HTTP/1.1 の転送先は Cookie を 1 行しか読まない）。転送先に渡すヘッダは、HTTP/1.1 で意味が変わるものがないか気をつける。
 - 証明書ファイルは証明書のストア（`certstore`）が読む。作成・変更で初めて使うとき、SIGHUP、`RPROXY_CERT_CHECK_SECS` ごとの確認で変わっていたときだけ読む（`Registry::reload_changed_tls`、`tlsconf::fingerprint`）。同じファイルを使うルールは同じ読み込み結果を共有する。ACME は内蔵しない方針（証明書は外部のツールで取る）。接続ごとには `Runtime.tls`（`RwLock<Arc<TlsRuntime>>`）の複製を使う（接続ごとにファイルを読まない）。
 - 証明書の期限（#115）：期限は `tlsconf::inspect_certificate` だけで調べる。サーバ証明書は切れたものを SNI の候補から外し、すべて切れたらルールを `failed`（`tlsconf::CERT_EXPIRED`）にして待ち受けを閉じる。更新されたファイルが読めたら `apply_certs` が自動で戻す。API の作成・変更では断る（`400 tls_config`）。CA・転送先向けの証明書・制御 API の証明書（ストアの外、`note_external`）は止めずに知らせるだけ。定期の確認は `RPROXY_CERT_EXPIRY_CHECK_SECS`（`Registry::check_certificate_expiry`）。
 - STARTTLS では、STARTTLS への応答より前に届いた余分なデータを受け付けない（コマンドの紛れ込み対策）。

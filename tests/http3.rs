@@ -26,6 +26,7 @@ async fn backend(tag: &'static str) -> SocketAddr {
 		axum::Json(json!({
 			"tag": tag, "method": parts.method.as_str(), "uri": parts.uri.to_string(), "host": h("host"),
 			"proto": h("x-forwarded-proto"), "body": String::from_utf8_lossy(&body),
+			"cookies": parts.headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>(),
 		}))
 	});
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -123,6 +124,18 @@ async fn http3_answers_on_the_same_port() {
 	assert_eq!((v["tag"].as_str(), v["uri"].as_str(), v["host"].as_str(), v["proto"].as_str()), (Some("A"), Some("/hello?x=1"), Some("a.test"), Some("https")), "{v}");
 	let (status, v) = h3_request(&mut send, "POST", "https://a.test/upload", b"posted over QUIC").await;
 	assert_eq!((status, v["method"].as_str(), v["body"].as_str()), (StatusCode::OK, Some("POST"), Some("posted over QUIC")), "{v}");
+
+	// cookie fields split by the client are joined for the HTTP/1.1 backend (RFC 9114 §4.2.1)
+	let req = hyper::Request::get("https://a.test/cookies").header("cookie", "a=1").header("cookie", "b=2").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.finish().await.unwrap();
+	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 200);
+	let mut out = vec![];
+	while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+		out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+	}
+	let v: Value = serde_json::from_slice(&out).unwrap();
+	assert_eq!(v["cookies"], json!(["a=1; b=2"]), "{v}");
 
 	// HTTP/1.1 and HTTP/2 over TCP are told about HTTP/3
 	let headers = https_head(&pki, port).await;

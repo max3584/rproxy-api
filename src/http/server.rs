@@ -343,6 +343,22 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 	headers.remove(header::UPGRADE);
 }
 
+/// Joins several `cookie` fields into one, separated by "; ".
+/// HTTP/2 (RFC 9113 §8.2.3) and HTTP/3 (RFC 9114 §4.2.1) let clients (Chrome does)
+/// send each cookie as its own field, and require joining them this way before
+/// passing the request to HTTP/1.1, where a server reads only one Cookie line.
+fn join_cookie_fields(headers: &mut HeaderMap) {
+	if headers.get_all(header::COOKIE).iter().nth(1).is_none() {
+		return;
+	}
+	let parts: Vec<&[u8]> = headers.get_all(header::COOKIE).iter().map(HeaderValue::as_bytes).collect();
+	let joined = parts.join(&b"; "[..]);
+	if let Ok(v) = HeaderValue::from_bytes(&joined) {
+		// insert replaces every field of that name
+		headers.insert(header::COOKIE, v);
+	}
+}
+
 /// The protocol a client asks to switch to (`Connection: upgrade` + `Upgrade`).
 fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 	let wants = headers
@@ -373,7 +389,10 @@ struct Sent {
 }
 
 impl Conn {
-	pub(super) async fn handle(&self, req: Request<Body>) -> Response<Body> {
+	pub(super) async fn handle(&self, mut req: Request<Body>) -> Response<Body> {
+		// HTTP/2 and HTTP/3 may split the cookie header into several fields; join them
+		// before anything reads cookies or the request goes to an HTTP/1.1 backend
+		join_cookie_fields(req.headers_mut());
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
@@ -1037,6 +1056,25 @@ mod tests {
 		let health = r.health();
 		assert_eq!(health.keys().collect::<Vec<_>>(), ["s"], "only services with health_check");
 		assert_eq!(health["s"], [ServerHealth { url: "http://10.0.0.1".into(), up: true }], "up until a check fails");
+	}
+
+	#[test]
+	fn cookie_fields_are_joined() {
+		let mut h = HeaderMap::new();
+		h.append(header::COOKIE, HeaderValue::from_static("a=1"));
+		h.append(header::COOKIE, HeaderValue::from_static("_gitlab_session=xyz"));
+		h.append(header::COOKIE, HeaderValue::from_static("b=2; c=3"));
+		join_cookie_fields(&mut h);
+		let all: Vec<&str> = h.get_all(header::COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+		assert_eq!(all, ["a=1; _gitlab_session=xyz; b=2; c=3"]);
+		// one field (HTTP/1.1, curl) and none are left alone
+		let mut one = HeaderMap::new();
+		one.insert(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
+		join_cookie_fields(&mut one);
+		assert_eq!(one[header::COOKIE], "a=1; b=2");
+		let mut none = HeaderMap::new();
+		join_cookie_fields(&mut none);
+		assert!(none.is_empty());
 	}
 
 	#[test]
