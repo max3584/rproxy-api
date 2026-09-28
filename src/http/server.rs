@@ -66,6 +66,11 @@ impl std::error::Error for BoxError {
 
 pub type Body = BoxBody<Bytes, BoxError>;
 
+/// Largest request header section taken over HTTP/2 and HTTP/3 (64 KiB). hyper's
+/// HTTP/2 default is 16 KiB, which browsers pass with a few sites' worth of cookies
+/// (GitLab, Keycloak); larger sections get 431. HTTP/1.1 keeps hyper's limit (about 400 KB).
+pub(super) const MAX_HEADER_SECTION: u32 = 64 * 1024;
+
 fn boxed_error(e: hyper::Error) -> BoxError {
 	BoxError::new(e)
 }
@@ -263,7 +268,7 @@ where
 	});
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 	builder.http1().timer(TokioTimer::new());
-	builder.http2().timer(TokioTimer::new());
+	builder.http2().timer(TokioTimer::new()).max_header_list_size(MAX_HEADER_SECTION);
 	builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await.map_err(io::Error::other)
 }
 
@@ -297,13 +302,20 @@ fn oidc_response(outcome: oidc::Outcome) -> Response<Body> {
 	}
 }
 
-/// Host of the request without the port (Host header, or :authority for HTTP/2).
+/// The authority a request is for: that of the request target when it has one
+/// (HTTP/2 and HTTP/3 :authority, an HTTP/1.1 absolute-form target, which
+/// RFC 9112 §3.2.2 says replaces the Host field), else the Host field.
+fn request_authority(uri: &Uri, headers: &HeaderMap) -> Option<HeaderValue> {
+	match uri.authority() {
+		Some(a) => HeaderValue::from_str(a.as_str()).ok(),
+		None => headers.get(header::HOST).cloned(),
+	}
+}
+
+/// Host of the request without the port (see `request_authority`).
 fn request_host<B>(req: &Request<B>) -> Option<String> {
-	let raw = match req.headers().get(header::HOST).and_then(|h| h.to_str().ok()) {
-		Some(h) => h.to_string(),
-		None => req.uri().authority()?.as_str().to_string(),
-	};
-	Some(strip_port(&raw).to_ascii_lowercase())
+	let raw = request_authority(req.uri(), req.headers())?;
+	Some(strip_port(raw.to_str().ok()?).to_ascii_lowercase())
 }
 
 fn strip_port(host: &str) -> &str {
@@ -444,10 +456,7 @@ impl Conn {
 		let mut sent = Sent {
 			accept_encoding: header_text(header::ACCEPT_ENCODING),
 			head: req.method() == hyper::Method::HEAD,
-			host: req
-				.headers()
-				.get(header::HOST)
-				.cloned()
+			host: request_authority(req.uri(), req.headers())
 				.unwrap_or_else(|| HeaderValue::from_str(&host).unwrap_or(HeaderValue::from_static("localhost"))),
 			tickets: vec![],
 		};
@@ -459,12 +468,8 @@ impl Conn {
 		let mut retry: Option<RetryPolicy> = None;
 		// cookies of the authentication middlewares for the response
 		let mut set_cookies: Vec<HeaderValue> = vec![];
-		let authority = parts
-			.headers
-			.get(header::HOST)
-			.and_then(|h| h.to_str().ok())
-			.map(str::to_string)
-			.or_else(|| parts.uri.authority().map(|a| a.to_string()))
+		let authority = request_authority(&parts.uri, &parts.headers)
+			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.clone());
 		// sign-in callbacks and logout of `oidc`, whichever route matched
 		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
@@ -730,9 +735,7 @@ impl Conn {
 		let Target { router, service, route, host, client_ip } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
-		let original_host = req.headers().get(header::HOST).cloned().or_else(|| {
-			req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok())
-		});
+		let original_host = request_authority(req.uri(), req.headers());
 		let sticky = service.sticky_value(req.headers());
 		// a body can be sent again when it was buffered or there is none
 		let replayable = replay.is_some() || req.body().is_end_stream();
@@ -877,22 +880,25 @@ impl Conn {
 		// connections from the client's address (transparent) are not shared
 		let pooled = self.rt.bind_as(self.client).is_none();
 		let keep = pooled && !req.headers().contains_key(header::UPGRADE);
-		let mut req = req;
+		// timeouts.response counts from the end of the request body: large uploads
+		// may take longer than the backend then needs to answer
+		let (mut req, sent) = until_sent(req);
+		let timed_out = || Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into());
 		if let Some(mut sender) = pooled.then(|| server.checkout()).flatten() {
-			match tokio::time::timeout(service.response, sender.try_send_request(req)).await {
-				Err(_) => return Err(Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into())),
-				Ok(Ok(resp)) => return Ok(self.returning(resp, sender, service, index, keep)),
+			match within(service.response, sent.clone(), sender.try_send_request(req)).await {
+				None => return Err(timed_out()),
+				Some(Ok(resp)) => return Ok(self.returning(resp, sender, service, index, keep)),
 				// the kept connection closed before the request went out: use a new one
-				Ok(Err(mut e)) => match e.take_message() {
+				Some(Err(mut e)) => match e.take_message() {
 					Some(r) => req = r,
 					None => return Err(Failure::Status(StatusCode::BAD_GATEWAY, e.into_error().to_string())),
 				},
 			}
 		}
 		let mut sender = self.connect(router, service, index).await?;
-		let resp = tokio::time::timeout(service.response, sender.send_request(req))
+		let resp = within(service.response, sent, sender.send_request(req))
 			.await
-			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))?
+			.ok_or_else(timed_out)?
 			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
 		Ok(self.returning(resp, sender, service, index, keep))
 	}
@@ -931,6 +937,53 @@ struct Target<'a> {
 
 fn empty_body() -> Body {
 	http_body_util::Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+}
+
+/// Tells (through the returned receiver) when the request body has been sent to the end.
+fn until_sent(req: Request<Body>) -> (Request<Body>, tokio::sync::watch::Receiver<bool>) {
+	let (tx, rx) = tokio::sync::watch::channel(req.body().is_end_stream());
+	(req.map(|inner| EndSignal { inner, done: Some(tx) }.boxed()), rx)
+}
+
+/// `fut` (the backend's response headers), allowed `limit` once the request body has
+/// been sent; None when that runs out. While the body is still going up, no limit.
+async fn within<T>(limit: std::time::Duration, mut sent: tokio::sync::watch::Receiver<bool>, fut: impl std::future::Future<Output = T>) -> Option<T> {
+	tokio::pin!(fut);
+	tokio::select! {
+		out = &mut fut => return Some(out),
+		// sent to the end, or the body is gone (hyper dropped it): the clock starts
+		_ = sent.wait_for(|done| *done) => {}
+	}
+	tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// A request body that signals when it has been read to the end.
+struct EndSignal {
+	inner: Body,
+	done: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl hyper::body::Body for EndSignal {
+	type Data = Bytes;
+	type Error = BoxError;
+
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+		let poll = Pin::new(&mut self.inner).poll_frame(cx);
+		if matches!(poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) || self.inner.is_end_stream() {
+			if let Some(done) = self.done.take() {
+				let _ = done.send(true);
+			}
+		}
+		poll
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
+	}
 }
 
 fn full_body(bytes: Bytes) -> Body {

@@ -282,7 +282,22 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - `pass_host_header`（既定 true）が false なら、`Host` は転送先の URL のホスト（とポート）にする。
 - 転送先へは `X-Forwarded-For`・`X-Real-IP`（クライアントの IP）、`X-Forwarded-Proto`（`http` / `https`）、`X-Forwarded-Host`、`X-Forwarded-Port` を付ける。クライアントが送ってきた同名のヘッダは置き換える。ただし接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` は受けた値の後ろに接続元を足し、`X-Forwarded-Proto` / `-Host` / `-Port` は受けた値を保つ。ホップごとのヘッダ（`Connection` とそこに書かれたもの、`Keep-Alive`、`TE`、`Transfer-Encoding` など）は取り除く。
 - `Connection: Upgrade`（WebSocket など）は、転送先が 101 を返せばそのまま中継する。ルールを削除すると切れる。
-- 転送先に接続できなければ 502、`timeouts.connect`（既定 5 秒）・`timeouts.response`（既定 60 秒。応答ヘッダまで）を過ぎると 504。`event: "http.error"` のログを出す。
+- 転送先に接続できなければ 502、`timeouts.connect`（既定 5 秒）・`timeouts.response`（既定 60 秒）を過ぎると 504。`event: "http.error"` のログを出す。`timeouts.response` は、リクエストの本文を送り終えてから応答ヘッダが届くまでの時間（アップロードにかかる時間は含めない。応答の本文にも上限はない）。
+
+### HTTP の転送の扱い
+
+rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先とは HTTP/1.1 で話す。そのあいだで次のように扱う（tests/http_semantics.rs で HTTP/1.1・HTTP/2・HTTP/3 のクライアントから確かめている）。
+
+| 項目 | 扱い |
+|---|---|
+| `Cookie` | HTTP/2・HTTP/3 で複数のフィールドに分けて届いたもの（Chrome はそうする）は `"; "` で 1 本にまとめる（RFC 9113 §8.2.3 / RFC 9114 §4.2.1）。まとめたものをミドルウェア（`oidc`・`sticky`・`forward_auth`）も読む |
+| `Set-Cookie` | 転送先の複数の `Set-Cookie` は 1 本ずつそのままクライアントへ（まとめない。`compress`・`headers` を通っても同じ）。`Domain` / `Path` / `Secure` などの属性、`Location` は書き換えない |
+| そのほかのヘッダ | 同じ名前の複数のフィールドは順番どおり、値はバイトのまま（ASCII 以外も）渡す。`Authorization` は渡す |
+| ホップごとのヘッダ | 両方向で取り除く：`Connection` とそこに書かれた名前、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`（WebSocket などの `Upgrade` は付け直して中継する）。`Via` と `Forwarded`（RFC 7239）は付けない（Traefik・nginx の既定と同じ。`X-Forwarded-*` を使う） |
+| `Host` | HTTP/2・HTTP/3 の `:authority`、HTTP/1.1 の absolute-form の宛先（`GET https://a.example/ HTTP/1.1`）の authority を、`Host` フィールドより優先する（RFC 9112 §3.2.2）。転送先には origin-form（パスとクエリ）で送る。`pass_host_header: false` なら転送先の URL のホスト |
+| ヘッダの大きさ | HTTP/2・HTTP/3 は 1 リクエストのヘッダの合計 64 KiB まで（hyper の既定の 16 KiB では、大きなクッキーのブラウザで足りない）。HTTP/1.1 は約 400 KB まで。超えると 431 |
+| 本文 | 流しながら中継する（`buffering` がなければため込まない）。chunked、`Expect: 100-continue`、`HEAD`（`Content-Length` を保つ）、`204` / `304` に対応 |
+| タイムアウト | `timeouts.response` は本文を送り終えてから応答ヘッダまで。長いダウンロード・SSE・ロングポーリングの応答の本文は切らない |
 - アクセスログ（`event: "http.access"`）はリクエストごとに 1 行：`rule`、`route`（一致しなければ `(none)`）、`service`、`backend`、`client`、`method`、`host`、`path`（クエリは含めない）、`protocol`（`HTTP/1.1` / `HTTP/2.0`）、`status`、`duration_ms`（応答の本文を送り終えるまで）、`bytes_in`（`Content-Length`）、`bytes_out`（応答の本文）、`user_agent`、`sni`、`tls_version`。出す先は `global.access_log`。
 - `GET /metrics` の `rproxy_http_requests_total{protocol,listen,route,code}`（`code` は `2xx` など）と `rproxy_http_request_duration_seconds{protocol,listen,route}`（ヒストグラム。境界は 5ms〜10s）、`rproxy_http_limited_total{protocol,listen,route,middleware}`（`rate_limit` / `in_flight` で断った数）、`rproxy_http_blocked_total{protocol,listen,route,middleware}`（`crowdsec` で断った数）。`global.crowdsec` があれば `rproxy_crowdsec_decisions`（判定で止めているアドレスと範囲の数）と `rproxy_crowdsec_synced`（LAPI から一度でも取得できたら 1）。ラベルにパスは入れない。
 - ミドルウェアはルートの `middlewares` に書いた順にリクエストへ働き、応答へは逆の順に働く（Traefik と同じ）。途中のミドルウェアが応答を返したら（リダイレクト・`respond`・拒否）、その先へは進まない。その応答にも、それまでに通ったミドルウェアの応答側（`headers` など）が働く。
