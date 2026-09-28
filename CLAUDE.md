@@ -57,6 +57,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |
 | `src/logging.rs` | tracing の JSON Lines 出力（日次ローテーション） |
 
+構成図は `docs/architecture/`（PlantUML のソースと SVG。`scripts/render-diagrams.sh` で作り直す）。モジュールや状態を変えたら図も直す。
+
 ## 制御 API（UI との契約）
 
 `docs/API.md` が正。ルールのキーは `(protocol, listen_addr, listen_port)`。
