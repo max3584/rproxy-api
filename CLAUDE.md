@@ -37,7 +37,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
 | `src/tlsconf.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み（`KeyedCert` / `CertBundle`）、SNI での証明書の選択、rustls / dtls クレート の設定の組み立て（`TlsRuntime::build` は読み込み済みの `RuleCerts` から組み立てる。`TlsRuntime::load` はファイルから直接）。証明書の期限を調べるのは `inspect_certificate` だけ（純粋な関数） |
 | `src/certstore.rs` | 証明書のストア（#115、`Registry.certs`）：ルールが使う証明書をファイルの組（`Source`）ごとに 1 回だけ読み込んで共有する。ファイルの変化（`refresh`、#90）・SIGHUP（`reload_all`）・期限（`newly_expired`）を証明書ごとに扱い、`Registry::apply_certs` が変わった証明書を使うルールだけを組み立て直す。誰も使わなくなった証明書は `retain` で捨てる。期限のログ（`cert.expiring` / `cert.expired`）は状態が変わったときに 1 回 |
-| `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
+| `src/udp_sni.rs` | udp の `tls.mode: sni`（#130）：DTLS の ClientHello（断片のつなぎ合わせ）と QUIC v1 / v2 の Initial（接続 ID から鍵を計算し、ヘッダの保護と AEAD を外して CRYPTO フレームをつなぐ）からサーバ名を読む `Sniffer`。`udp.rs` の `sniff` が新しいセッションの最初のデータグラムを持って名前を読み、`renamed` が同じソケットからの別の名前の新しい QUIC の接続でセッションを作り直す。テストは RFC 9001 / 9369 付録 A の例と、tests/udp_sni.rs（本物の quinn・dtls のクライアントとサーバ） |
+| `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。ClientHello の本体の解析 `hello_server_name` / `parse_handshake` は udp の DTLS・QUIC（`udp_sni`）と共有。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
 | `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを dtls クレート に渡す `Conn` |
 | `src/rule.rs` | ルールの型と検証。`Features`（この版で動かせる v0.3 の設定。`GET /capabilities` の `features`。パッチで中身を入れたら true にする） |

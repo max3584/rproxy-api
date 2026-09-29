@@ -40,24 +40,42 @@ pub fn parse_client_hello(buf: &[u8]) -> Parse {
 		}
 		hs.extend_from_slice(&buf[pos + 5..pos + 5 + len]);
 		pos += 5 + len;
-		if hs.len() >= 4 {
-			if hs[0] != 0x01 {
-				return Parse::NotTls;
-			}
-			let body = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;
-			if hs.len() >= 4 + body {
-				return Parse::Done(server_name(&hs[4..4 + body]));
-			}
+		match parse_handshake(&hs) {
+			Parse::Incomplete => {}
+			done => return done,
 		}
 	}
 }
 
-/// Walks a ClientHello body to the server_name extension.
-fn server_name(body: &[u8]) -> Option<String> {
+/// Parses TLS handshake bytes without the record layer (the QUIC CRYPTO stream,
+/// or the handshake records of TLS gathered): a ClientHello message first.
+pub fn parse_handshake(hs: &[u8]) -> Parse {
+	if hs.len() < 4 {
+		return if !hs.is_empty() && hs[0] != 0x01 { Parse::NotTls } else { Parse::Incomplete };
+	}
+	if hs[0] != 0x01 {
+		return Parse::NotTls;
+	}
+	let body = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;
+	if hs.len() < 4 + body {
+		return Parse::Incomplete;
+	}
+	Parse::Done(hello_server_name(&hs[4..4 + body], false))
+}
+
+/// Walks a ClientHello body (after the 4-byte handshake header) to the server_name
+/// extension. `dtls`: the DTLS ClientHello, which has a cookie after the session id
+/// (RFC 6347 §4.2.1; DTLS 1.3 keeps it as legacy_cookie, RFC 9147 §5.3).
+/// Shared by TCP `sni`, DTLS and QUIC (`udp_sni`).
+pub fn hello_server_name(body: &[u8], dtls: bool) -> Option<String> {
 	let mut r = Reader(body);
 	r.skip(2 + 32)?; // version, random
 	let sid = r.u8()? as usize;
 	r.skip(sid)?;
+	if dtls {
+		let cookie = r.u8()? as usize;
+		r.skip(cookie)?;
+	}
 	let suites = r.u16()? as usize;
 	r.skip(suites)?;
 	let comp = r.u8()? as usize;

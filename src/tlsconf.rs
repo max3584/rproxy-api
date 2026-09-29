@@ -246,9 +246,6 @@ pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -
 
 pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>, port_count: u16) -> Result<(), ApiError> {
 	match (protocol, tls.mode) {
-		(Protocol::Udp, TlsMode::Sni) => {
-			return Err(ApiError::unsupported("sni routing is supported for tcp only; use terminate for DTLS"));
-		}
 		(_, TlsMode::Terminate) if tls.certificates.is_empty() => {
 			return Err(tls_error("terminate needs at least one entry in certificates"));
 		}
@@ -302,10 +299,11 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 	if tls.client_auth.mode == ClientAuthMode::None && tls.client_auth.chain_file.is_some() {
 		return Err(tls_error("client_auth chain_file needs mode optional or required"));
 	}
+	// udp: only mode sni reads a name before choosing the backend (DTLS terminate does not route by name)
 	if tls.unmatched == Unmatched::Reject
-		&& (protocol != Protocol::Tcp || tls.mode == TlsMode::Passthrough || tls.routes.is_empty())
+		&& ((protocol == Protocol::Udp && tls.mode != TlsMode::Sni) || tls.mode == TlsMode::Passthrough || tls.routes.is_empty())
 	{
-		return Err(tls_error("unmatched: reject needs protocol tcp, mode sni or terminate, and at least one route"));
+		return Err(tls_error("unmatched: reject needs mode sni (tcp or udp) or terminate (tcp), and at least one route"));
 	}
 	if protocol == Protocol::Udp && !tls.alpn.is_empty() {
 		return Err(tls_error("alpn is supported for tcp only"));
@@ -324,6 +322,9 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 			if !valid_pattern(&name) {
 				return Err(tls_error(format!("invalid server_name: {name}")));
 			}
+		}
+		if route.passthrough && protocol == Protocol::Udp {
+			return Err(tls_error("passthrough routes are for tcp; a udp rule with mode sni passes every route through"));
 		}
 		if route.passthrough && tls.mode != TlsMode::Terminate {
 			return Err(tls_error("passthrough routes are for mode terminate (with mode sni every route is passed through)"));
@@ -1215,7 +1216,8 @@ mod tests {
 		let terminate = TlsSpec { mode: TlsMode::Terminate, ..Default::default() };
 		assert_eq!(validate(Protocol::Tcp, &terminate, None).unwrap_err().code, "tls_config");
 		let sni = TlsSpec { mode: TlsMode::Sni, ..Default::default() };
-		assert_eq!(validate(Protocol::Udp, &sni, None).unwrap_err().code, "unsupported");
+		// udp sni (#130): DTLS and QUIC server names
+		assert!(validate(Protocol::Udp, &sni, None).is_ok());
 		assert!(validate(Protocol::Tcp, &sni, None).is_ok());
 		assert_eq!(validate(Protocol::Tcp, &sni, Some(StartTls::Smtp)).unwrap_err().code, "tls_config");
 		let mut auth = TlsSpec {

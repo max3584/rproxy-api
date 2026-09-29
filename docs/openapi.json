@@ -208,6 +208,7 @@
     "properties": {
      "mode": {
       "type": "string",
+      "description": "sni routes by the ClientHello's server name without decrypting: TLS on tcp, DTLS and QUIC on udp",
       "enum": [
        "passthrough",
        "sni",
