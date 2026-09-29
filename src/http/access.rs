@@ -165,8 +165,9 @@ pub struct AccessEntry {
 	pub host: String,
 	/// Without the query string.
 	pub path: String,
-	/// The query string without `?` (empty when there is none). A field of its own so
-	/// that tools can drop it; CrowdSec's HTTP scenarios need it (docs/CROWDSEC.md).
+	/// The query string without `?` (empty when there is none), with the values of
+	/// parameters that usually carry secrets replaced (`redact_query`). A field of its
+	/// own so that tools can drop it; CrowdSec's HTTP scenarios need it (docs/CROWDSEC.md).
 	pub query: String,
 	pub protocol: String,
 	pub status: u16,
@@ -324,9 +325,52 @@ impl HttpStatsView {
 	}
 }
 
+/// Parameter names (lowercased, as substrings) whose values are not written to the
+/// access log: tokens, OAuth / OIDC codes, passwords, signatures, session ids.
+const SECRET_PARAMS: [&str; 14] = [
+	"token", "code", "state", "password", "passwd", "secret", "key", "signature", "sig", "auth", "session", "sid", "credential", "otp",
+];
+
+/// The query string for the access log: parameters named like secrets keep their
+/// name but get `REDACTED` as the value (GitLab `private_token`, OIDC `code` / `state`,
+/// S3-style `X-Amz-Signature`, …). The rest is kept as sent, so CrowdSec can still
+/// see injection attempts in ordinary parameters.
+pub fn redact_query(query: &str) -> String {
+	if query.is_empty() {
+		return String::new();
+	}
+	query
+		.split('&')
+		.map(|pair| {
+			let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+			let lower = name.to_ascii_lowercase();
+			if !value.is_empty() && SECRET_PARAMS.iter().any(|s| lower.contains(s)) {
+				format!("{name}=REDACTED")
+			} else {
+				pair.to_string()
+			}
+		})
+		.collect::<Vec<_>>()
+		.join("&")
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn secrets_in_the_query_are_not_logged() {
+		assert_eq!(redact_query(""), "");
+		assert_eq!(redact_query("page=2&per_page=20"), "page=2&per_page=20");
+		assert_eq!(redact_query("private_token=glpat-abc&scope=api"), "private_token=REDACTED&scope=api");
+		assert_eq!(redact_query("code=xyz&state=s1&session_state=q"), "code=REDACTED&state=REDACTED&session_state=REDACTED");
+		assert_eq!(redact_query("X-Amz-Signature=deadbeef&X-Amz-Date=1"), "X-Amz-Signature=REDACTED&X-Amz-Date=1");
+		// injection attempts in ordinary parameters stay visible for CrowdSec
+		assert_eq!(redact_query("q=1%27%20OR%201=1--"), "q=1%27%20OR%201=1--");
+		// a name without a value, and an empty value, are left as they are
+		assert_eq!(redact_query("token&debug"), "token&debug");
+		assert_eq!(redact_query("token="), "token=");
+	}
 
 	fn global(trusted: &[&str]) -> HttpGlobal {
 		HttpGlobal::without_file(&trusted.iter().map(|s| s.to_string()).collect::<Vec<_>>())
