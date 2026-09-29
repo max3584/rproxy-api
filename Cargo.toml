@@ -43,6 +43,12 @@ assets = [
     ["docs/SOURCE-IP.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/MIGRATING-FROM-TRAEFIK.md", "usr/share/doc/rproxy-api/", "644"],
     ["contrib/traefik2rproxy.py", "usr/bin/rproxy-traefik-convert", "755"],
+    ["docs/CROWDSEC.md", "usr/share/doc/rproxy-api/", "644"],
+    ["contrib/crowdsec/parsers/s01-parse/rproxy-logs.yaml", "usr/share/rproxy-api/crowdsec/parsers/s01-parse/", "644"],
+    ["contrib/crowdsec/scenarios/rproxy-conn-denied.yaml", "usr/share/rproxy-api/crowdsec/scenarios/", "644"],
+    ["contrib/crowdsec/scenarios/rproxy-conn-flood.yaml", "usr/share/rproxy-api/crowdsec/scenarios/", "644"],
+    ["contrib/crowdsec/acquis.d/rproxy.yaml", "usr/share/rproxy-api/crowdsec/acquis.d/", "644"],
+    ["contrib/crowdsec/acquis.d/appsec.yaml", "usr/share/rproxy-api/crowdsec/acquis.d/", "644"],
 ]
 
 [dependencies]

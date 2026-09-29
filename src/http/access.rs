@@ -118,7 +118,7 @@ impl HttpGlobal {
 		match &self.sink {
 			Sink::Log => info!(event = "http.access", rule = %entry.rule, route = %entry.route, service = %entry.service,
 				backend = %entry.backend, client = %entry.client, method = %entry.method, host = %entry.host,
-				path = %entry.path, protocol = %entry.protocol, status = entry.status, duration_ms = entry.duration_ms,
+				path = %entry.path, query = %entry.query, protocol = %entry.protocol, status = entry.status, duration_ms = entry.duration_ms,
 				bytes_in = entry.bytes_in, bytes_out = entry.bytes_out, user_agent = %entry.user_agent,
 				sni = %entry.sni, tls_version = %entry.tls_version),
 			Sink::File { writer, .. } => {
@@ -165,6 +165,9 @@ pub struct AccessEntry {
 	pub host: String,
 	/// Without the query string.
 	pub path: String,
+	/// The query string without `?` (empty when there is none). A field of its own so
+	/// that tools can drop it; CrowdSec's HTTP scenarios need it (docs/CROWDSEC.md).
+	pub query: String,
 	pub protocol: String,
 	pub status: u16,
 	pub duration_ms: u64,

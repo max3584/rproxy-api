@@ -1,0 +1,19 @@
+# 同じ IP からの、rproxy の L4（TCP / UDP）のルールへの新しい接続が多すぎる（平均 10 件/秒を超えて、
+# 200 件ぶんたまった）。ふつうの利用では起きにくい値にしてある。使い方に合わせて capacity / leakspeed を調整する。
+type: leaky
+name: max3584/rproxy-conn-flood
+description: "Too many new connections to rproxy L4 rules from one IP"
+filter: "evt.Meta.log_type == 'rproxy_conn' && evt.Meta.rproxy_event == 'conn.open'"
+groupby: evt.Meta.source_ip
+capacity: 200
+leakspeed: 100ms
+blackhole: 5m
+labels:
+  service: rproxy
+  confidence: 1
+  spoofable: 0
+  classification:
+    - attack.T1498
+  behavior: "tcp:flood"
+  label: "rproxy: connection flood"
+  remediation: true
