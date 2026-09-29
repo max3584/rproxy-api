@@ -334,8 +334,9 @@ async fn bad_tls_settings_are_reported() {
 	let (status, v) = h.post(tcp_rule(free_port(), backend, json!({"mode": "bogus"}))).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")));
 	let mut udp_sni = rule("udp", free_udp_port(), backend);
-	udp_sni["tls"] = json!({"mode": "sni"});
-	assert_eq!(h.post(udp_sni).await.1["code"], "unsupported");
+	// udp takes mode sni (#130, tests/udp_sni.rs), but not passthrough routes
+	udp_sni["tls"] = json!({"mode": "sni", "routes": [{"server_name": "a.test", "remote_addr": "127.0.0.1", "remote_port": 9, "passthrough": true}]});
+	assert_eq!(h.post(udp_sni).await.1["code"], "tls_config");
 	let (_, rules) = h.get("/rules").await;
 	assert_eq!(rules.as_array().unwrap().len(), 0);
 }

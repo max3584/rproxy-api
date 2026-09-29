@@ -119,13 +119,29 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 
 | フィールド | 説明 |
 |---|---|
-| `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（tcp のみ。ClientHello のサーバ名で転送先を選び、復号しない）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
+| `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（ClientHello のサーバ名で転送先を選び、復号しない。tcp は TLS、udp は DTLS と QUIC（HTTP/3 など）。下の「UDP のサーバ名での振り分け」）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
 | `routes` | サーバ名ごとの転送先（`sni` と `terminate`）：`{"server_name" または "server_names", "remote_addr", "remote_port", "passthrough"?}`。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。一致しない名前はルールの `remote_addr` / `remote_port`（`targets`）へ。ポート範囲では、ここの `remote_port` も同じだけずれる。<br>名前の書き方：`mail.example.com`（完全一致）、`*.example.com`（1 階層だけ）、`**.example.com`（1 階層以上、何階層でも。`example.com` 自体には一致しない）。`server_names` で 1 つの route に名前を複数書ける（`server_name` とどちらか一方）。複数の route に一致するときは、完全一致 → `*.` → `**.`（接尾辞が長い方）→ 書いた順。<br>`passthrough: true`（`terminate` だけ）：その名前の接続は終端せず、ClientHello ごと転送先へそのまま流す（`sni` と同じ。証明書は転送先が持つ）。`allow_from`・ルールの `crowdsec`・`source_ip`・統計は効く。`starttls` とは組み合わせられない。HTTP/3（QUIC）では扱わない（その名前の QUIC の接続は閉じる） |
-| `unmatched` | `default`（既定。どの `routes` にも一致しない名前・SNI なしは、ルールの `remote_addr` / `remote_port` へ）または `reject`（切断する。`terminate` ではハンドシェイクを完了せずに切る）。tcp の `sni` / `terminate` で、`routes` があるときだけ指定できる |
+| `unmatched` | `default`（既定。どの `routes` にも一致しない名前・SNI なしは、ルールの `remote_addr` / `remote_port` へ）または `reject`（切断する。`terminate` ではハンドシェイクを完了せずに切る）。`sni`（tcp・udp）と tcp の `terminate` で、`routes` があるときだけ指定できる |
 | `certificates` | `terminate` で必須。`cert_file` はサーバ証明書、`chain_file` は中間 CA の証明書（サーバ証明書を発行した CA から、ルートへ向かう順。ルートは入れなくてよい）、`key_file` は秘密鍵。`cert_file` にチェーンを連結しても使える。読み込むときに、チェーンの順番と、鍵がサーバ証明書と対になっていることを確かめる。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
 | `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required`。`optional` と `required` では `ca_file` が必須。`ca_file` はルート CA（信頼の起点）。`chain_file` はクライアント証明書の中間 CA で、中間 CA を送ってこないクライアントのために、検証の途中経路を補う（信頼の起点にはしない）。TLS と DTLS で同じ規則で検証する |
 | `alpn` | `terminate` でクライアントに提示する ALPN（tcp のみ） |
 | `upstream` | `terminate` の転送先側。`tls: true` で再暗号化する（tcp は TLS、udp は DTLS）。`server_name`（既定は転送先のホスト名）、`ca_file`（既定は Mozilla のルート証明書）、`insecure_skip_verify`（検証しない。テスト用）、`cert_file` / `chain_file` / `key_file`（転送先へのクライアント証明書と、その中間 CA） |
+
+### UDP のサーバ名での振り分け（`tls.mode: sni`、v0.3.8）
+
+udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータグラムのサーバ名（SNI）から転送先を選べる。終端しないので rproxy に証明書は要らず、証明書は転送先が持つ。
+
+- 読めるもの：
+  - DTLS 1.2 / 1.3 の ClientHello（平文。断片に分かれていても、データグラムをまたいでもつなぎ合わせる）
+  - QUIC v1（RFC 9000 / 9001）/ v2（RFC 9369）の Initial パケット（HTTP/3 など）。Initial の鍵はクライアントが選んだ接続 ID から誰でも計算できる（RFC 9001 §5.2）ので、ヘッダの保護と暗号を外して CRYPTO フレームから ClientHello を読む。ClientHello が複数の Initial にまたがっても（大きな鍵共有など）つなぎ合わせる
+- 新しいクライアント（アドレスとポート）の最初のデータグラムを、名前が分かるまで持つ（最大 3 秒・16 データグラム・64 KiB）。名前が分かったら、持っていたデータグラムを順番どおり転送先へ送り、あとは今までの UDP と同じくそのクライアントのセッションとして中継する。名前を読んでいるセッションは 1 ポートあたり 4096 まで（超えた新しいクライアントの最初のデータグラムは捨てる。クライアントが再送する）
+- DTLS でも QUIC でもないデータグラム、SNI がないもの、どの route にも一致しない名前：`unmatched: default`（既定）ならルールの宛先（`remote_addr` / `targets`）、`reject` なら捨てる（`stats.denied`、`conn.denied` の `reason: unmatched`）
+- 同じクライアントのソケットから、別の名前への新しい QUIC の接続（違う接続 ID の Initial）が来たら、名前を読み直し、違う名前ならセッションを作り直す（quinn などは 1 つのソケットから次の接続を始める）。同じ名前（Retry の後など）なら今の転送先のまま
+- `allow_from`・ルールの `crowdsec` は名前を読む前に効く。`conn.open` のログに `sni`
+- `routes` の `passthrough` は使えない（`sni` はすべて passthrough）。DTLS を終端する `terminate` の udp のルールは名前で振り分けない
+- できないこと：
+  - QUIC の接続の移動（クライアントのアドレスやポートが変わる）は追いかけない（移った先は新しいクライアントとして名前を読み直す。Initial でないので、ルールの宛先へ）
+  - ECH（Encrypted Client Hello）を使う接続では、本当の名前は読めない（外側の public name で振り分ける）
 
 `terminate` と `source_ip: "proxy_v2"` を組み合わせると、PROXY v2 ヘッダに TLS の情報を TLV で付ける。
 - `PP2_TYPE_AUTHORITY`：SNI
