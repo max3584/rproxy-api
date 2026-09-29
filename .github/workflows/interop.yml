@@ -1,12 +1,13 @@
 name: Interop
 
-# 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX）を rproxy の後ろに置いて通す（scripts/interop/）。
+# 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX、CrowdSec）を rproxy と組み合わせて通す（scripts/interop/）。
 # 時間がかかるので必須のチェックにはしない。データプレーンや試験を変えた PR、毎週、手動で動かす。
 on:
   pull_request:
     paths:
       - src/**
       - scripts/interop/**
+      - contrib/crowdsec/**
       - .github/workflows/interop.yml
   schedule:
     - cron: "0 18 * * 0"   # 毎週月曜 3:00（JST）
@@ -39,3 +40,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build
       - run: scripts/interop/media.sh
+
+  crowdsec:
+    name: crowdsec (LAPI, AppSec, detection from rproxy logs, global IPs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: scripts/interop/crowdsec.sh
