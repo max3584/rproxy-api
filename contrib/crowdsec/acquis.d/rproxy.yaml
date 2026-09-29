@@ -1,0 +1,7 @@
+# /etc/crowdsec/acquis.d/rproxy.yaml
+# rproxy-api のログ（RPROXY_LOG_FILE は日ごとに <名前>.<日付>.<拡張子> へ分かれるので、glob で指定する）。
+# global.access_log を使うなら、そのファイルも足す。
+filenames:
+  - /var/log/rproxy/*.log
+labels:
+  type: rproxy

@@ -439,6 +439,7 @@ impl Conn {
 			method: req.method().to_string(),
 			host: host.clone(),
 			path: req.uri().path().to_string(),
+			query: super::access::redact_query(req.uri().query().unwrap_or("")),
 			protocol: format!("{:?}", req.version()),
 			bytes_in: header_text(header::CONTENT_LENGTH).parse().unwrap_or(0),
 			user_agent: header_text(header::USER_AGENT),

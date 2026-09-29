@@ -1,0 +1,75 @@
+# rproxy-api の JSON Lines のログ（メインのログ RPROXY_LOG_FILE、または global.access_log）を
+# CrowdSec で読むためのパーサー（docs/CROWDSEC.md）。
+#
+# - acquis の labels.type を rproxy にする（crowdsecurity/non-syslog が evt.Parsed.program に入れる）
+# - event = http.access：CrowdSec の HTTP のアクセスログ（log_type http_access-log）として扱う。
+#   crowdsecurity/http-logs（s02）と crowdsecurity/base-http-scenarios・http-cve などがそのまま使える
+# - event = conn.open / conn.denied：L4（TCP / UDP）の接続（log_type rproxy_conn）。
+#   max3584/rproxy-conn-* のシナリオが使う
+# - クライアントの IP は rproxy の client（L7 は global.trusted_proxies を反映したもの）
+onsuccess: next_stage
+filter: "evt.Parsed.program == 'rproxy'"
+name: max3584/rproxy-logs
+description: "Parse rproxy-api JSON logs: http.access (as HTTP access logs) and L4 connection events"
+nodes:
+  - filter: "JsonExtract(evt.Parsed.message, 'event') == 'http.access'"
+    statics:
+      - meta: log_type
+        value: http_access-log
+      - meta: service
+        value: http
+      - target: evt.StrTime
+        expression: "JsonExtract(evt.Parsed.message, 'timestamp')"
+      - parsed: remote_addr
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'client')"
+      - meta: source_ip
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'client')"
+      - parsed: verb
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'method')"
+      - meta: http_verb
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'method')"
+      # the path with the query, as other HTTP parsers put it (crowdsecurity/http-logs splits it into http_args)
+      - parsed: request
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'query') != '' ? JsonExtractUnescape(evt.Parsed.message, 'path') + '?' + JsonExtractUnescape(evt.Parsed.message, 'query') : JsonExtractUnescape(evt.Parsed.message, 'path')"
+      - meta: http_path
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'query') != '' ? JsonExtractUnescape(evt.Parsed.message, 'path') + '?' + JsonExtractUnescape(evt.Parsed.message, 'query') : JsonExtractUnescape(evt.Parsed.message, 'path')"
+      - parsed: status
+        expression: "JsonExtract(evt.Parsed.message, 'status')"
+      - meta: http_status
+        expression: "JsonExtract(evt.Parsed.message, 'status')"
+      - parsed: http_user_agent
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'user_agent')"
+      - meta: http_user_agent
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'user_agent')"
+      - parsed: target_fqdn
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'host')"
+      - meta: target_fqdn
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'host')"
+      - parsed: http_version
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'protocol')"
+      - parsed: body_bytes_sent
+        expression: "JsonExtract(evt.Parsed.message, 'bytes_out')"
+      - meta: rproxy_rule
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'rule')"
+      - meta: rproxy_route
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'route')"
+  # L4: client is "IP:port" or "[IPv6]:port"
+  - filter: "JsonExtract(evt.Parsed.message, 'event') in ['conn.open', 'conn.denied']"
+    grok:
+      pattern: '"client":"\[?%{IP:client_ip}\]?:%{INT:client_port}"'
+      apply_on: message
+    statics:
+      - meta: log_type
+        value: rproxy_conn
+      - meta: service
+        value: rproxy
+      - target: evt.StrTime
+        expression: "JsonExtract(evt.Parsed.message, 'timestamp')"
+      - meta: source_ip
+        expression: "evt.Parsed.client_ip"
+      - meta: rproxy_event
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'event')"
+      - meta: rproxy_reason
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'reason')"
+      - meta: rproxy_rule
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'rule')"

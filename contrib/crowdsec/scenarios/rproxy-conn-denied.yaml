@@ -1,0 +1,19 @@
+# 同じ IP が、allow_from で許していない rproxy の L4（TCP / UDP）のルールに短い間に何度も接続してくる
+# （ポートの探索など）。CrowdSec の判定で切った接続（reason: crowdsec）は数えない。
+type: leaky
+name: max3584/rproxy-conn-denied
+description: "Repeated connections refused by rproxy allow_from from one IP"
+filter: "evt.Meta.log_type == 'rproxy_conn' && evt.Meta.rproxy_event == 'conn.denied' && evt.Meta.rproxy_reason == 'allow_from'"
+groupby: evt.Meta.source_ip
+capacity: 10
+leakspeed: 10s
+blackhole: 5m
+labels:
+  service: rproxy
+  confidence: 2
+  spoofable: 0
+  classification:
+    - attack.T1046
+  behavior: "tcp:scan"
+  label: "rproxy: refused by allow_from repeatedly"
+  remediation: true

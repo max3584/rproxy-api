@@ -627,7 +627,8 @@ async fn expired_certificates_are_left_out_and_stop_the_rule_when_none_is_left()
 	let (_, v) = h.get(&format!("/rules/{key}")).await;
 	let expired = cert_status(&v, &old.cert_file);
 	assert_eq!((expired["role"].as_str(), expired["state"].as_str()), (Some("certificate"), Some("expired")), "{v}");
-	assert_eq!(expired["days_left"], -1, "{v}");
+	// issued to end a day ago; whole days are rounded down, so a second either way gives -1 or -2
+	assert!(matches!(expired["days_left"].as_i64(), Some(-2..=-1)), "{v}");
 	assert!(expired["not_after"].as_str().unwrap().ends_with('Z'), "{v}");
 	assert_eq!(cert_status(&v, &valid.cert_file)["state"], "ok");
 	assert_eq!(tls_roundtrip(&pki, port, "ok.test", None, "1").await.unwrap(), "X:1");

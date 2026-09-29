@@ -156,6 +156,10 @@ systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.servi
 
 証明書はファイルで指定します。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
+## CrowdSec
+
+CrowdSec の判定で止める（L7 の `crowdsec` ミドルウェア、L4 のルールの `crowdsec: true`、AppSec）だけでなく、CrowdSec のエージェントに rproxy のログを読ませて、rproxy を通るアクセスから攻撃を見つけて ban させることもできます。パーサー・シナリオ・acquis は `contrib/crowdsec/`（.deb では `/usr/share/rproxy-api/crowdsec/`）、手順は [docs/CROWDSEC.md](docs/CROWDSEC.md)。本物の CrowdSec との一周（検知 → ban → rproxy で止める）は CI（interop の `crowdsec` ジョブ）で確かめています。
+
 ## 送信元 IP の引き渡し
 
 ルールごとに `source_ip` で選ぶ。PROXY protocol とは何か、どれを選ぶか、転送先（Postfix・Dovecot・nginx・ingress-nginx など）の設定の例は [docs/SOURCE-IP.md](docs/SOURCE-IP.md)。

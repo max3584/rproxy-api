@@ -1,0 +1,9 @@
+# /etc/crowdsec/acquis.d/appsec.yaml
+# CrowdSec の AppSec（rproxy の crowdsec ミドルウェアの appsec: true が問い合わせる先）。
+# rproxy の global.crowdsec.appsec_url を http://127.0.0.1:7422 にする。
+# 事前に: cscli collections install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules
+appsec_config: crowdsecurity/appsec-default
+labels:
+  type: appsec
+listen_addr: 127.0.0.1:7422
+source: appsec
