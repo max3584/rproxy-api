@@ -71,6 +71,9 @@ jobs:
             done
             FAMILY=$family ROUTING=nft RETURN=gateway scripts/test-transparent.sh
           done
+      # UDP replies leave from the address the client sent to (#137)
+      - name: scripts/test-udp-source.sh
+        run: scripts/test-udp-source.sh
 
   deb:
     name: Debian package (install, apt repository, purge)
