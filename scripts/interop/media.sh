@@ -20,6 +20,8 @@ cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "== packages"
+# the runner image's package lists can be stale (404 on the mirror)
+sudo apt-get update -q >/dev/null
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q coturn ffmpeg openssl >/dev/null
 sudo systemctl stop coturn 2>/dev/null || true
 curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" \
