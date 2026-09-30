@@ -216,9 +216,10 @@ impl hyper::body::Body for Compressed {
 					let done = this.encoder.take().map(Encoder::finish);
 					return match done {
 						Some(Ok(rest)) if !rest.is_empty() => Poll::Ready(Some(Ok(Frame::data(rest)))),
+						// an error, not the end: the client must not take a cut stream for a complete one
 						Some(Err(e)) => {
 							warn!(event = "http.error", error = %e, "compression failed; response cut short");
-							Poll::Ready(None)
+							Poll::Ready(Some(Err(super::server::BoxError::new(e))))
 						}
 						_ => Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t)))),
 					};
@@ -231,7 +232,8 @@ impl hyper::body::Body for Compressed {
 					Err(e) => {
 						warn!(event = "http.error", error = %e, "compression failed; response cut short");
 						this.encoder = None;
-						return Poll::Ready(None);
+						this.trailers = None;
+						return Poll::Ready(Some(Err(super::server::BoxError::new(e))));
 					}
 				},
 				Err(frame) => {

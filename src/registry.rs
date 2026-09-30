@@ -135,6 +135,7 @@ impl Entry {
 					tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
 					denied: s.denied.load(Ordering::Relaxed),
+					dropped: s.dropped.load(Ordering::Relaxed),
 					http: r.spec.http.is_some().then(|| {
 						let mut v = crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats);
 						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
@@ -1169,12 +1170,13 @@ impl Registry {
 		let _ = writeln!(out, "rproxy_rules{{state=\"running\"}} {running}");
 		let _ = writeln!(out, "rproxy_rules{{state=\"failed\"}} {}", rules.len() - running);
 
-		let mut lines: [(&str, &str, &str, Vec<String>); 5] = [
+		let mut lines: [(&str, &str, &str, Vec<String>); 6] = [
 			("rproxy_rule_up", "gauge", "1 if the rule is running.", vec![]),
 			("rproxy_connections", "gauge", "Open TCP connections or UDP sessions.", vec![]),
 			("rproxy_connections_total", "counter", "TCP connections or UDP sessions handled.", vec![]),
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
 			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
+			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, or sending failed).", vec![]),
 		];
 		for (key, entry) in rules.iter() {
 			let labels = format!("protocol=\"{}\",listen=\"{}\"", key.protocol, key.listen);
@@ -1182,6 +1184,9 @@ impl Registry {
 				Entry::Running(r) => {
 					let s = &r.rt.stats;
 					lines[4].3.push(format!("{{{labels}}} {}", s.tls_failures.load(Ordering::Relaxed)));
+					if key.protocol == Protocol::Udp {
+						lines[5].3.push(format!("{{{labels}}} {}", s.dropped.load(Ordering::Relaxed)));
+					}
 					lines[0].3.push(format!("{{{labels}}} 1"));
 					lines[1].3.push(format!("{{{labels}}} {}", s.active.load(Ordering::Relaxed)));
 					lines[2].3.push(format!("{{{labels}}} {}", s.total.load(Ordering::Relaxed)));

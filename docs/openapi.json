@@ -1301,6 +1301,10 @@
      "denied": {
       "type": "integer"
      },
+     "dropped": {
+      "type": "integer",
+      "description": "UDP datagrams rproxy dropped (a session queue full, or sending failed)"
+     },
      "http": {
       "$ref": "#/components/schemas/HttpStats"
      },

@@ -127,6 +127,23 @@
 | `dtls_can_be_re_encrypted_towards_the_backend` | 転送先へ DTLS で再暗号化する |
 | `dtls_needs_a_pkcs8_key` | PKCS#8 でない鍵は `tls_config` |
 
+## 結合テスト：データの完全性（`tests/integrity.rs`、#134）
+
+何十 MiB の擬似乱数のデータ（1 MiB のブロックから、流れの番号とチャンクの番号で決まる位置を切り出したもの。並べ替え・重複・ずれがあればハッシュが変わる）を流し、SHA-256 を比べる。大きさは `RPROXY_TEST_INTEGRITY_MB`（既定 32。`.github/workflows/integrity.yml` が毎週 512 で動かす）。
+
+| テスト | 確かめること |
+|---|---|
+| `tcp_streams_arrive_unchanged_on_every_path` | TCP の passthrough・`proxy_v2`・terminate・`upstream.tls` で、4 本の接続が同時に両方向へ流したデータが変わらずに届く |
+| `a_reset_is_passed_on_as_a_reset_and_a_close_as_a_close` | 転送先のリセットはクライアントに、クライアントのリセットは転送先にリセットとして届く（正常な終わりに見えない）。片方の FIN は半分閉じとして伝わる。TLS を終端しても、転送先のリセットで TLS はきれいに終わらない |
+| `udp_datagrams_arrive_unchanged_once_and_in_order` | 番号つきのデータグラム（1 バイト〜65,507 バイト）が 4 つのクライアントから、変わらずに 1 回ずつ順番どおり返る。`stats.dropped` は 0 |
+| `dtls_records_arrive_unchanged_once_and_in_order` | DTLS を終端したルールでも同じ |
+| `http_bodies_arrive_unchanged_on_every_protocol` | HTTP/1.1・HTTP/2・HTTP/3 のダウンロード（`Content-Length` と chunked）とアップロード（長さつきと chunked）が、4 本同時でも変わらない |
+| `middlewares_keep_bodies_intact` | `compress`（gzip・br・zstd を展開すると元に戻る）、`buffering`、`retry`（1 台目が止まっていても。アップロードは冪等な PUT）で変わらない |
+| `reused_backend_connections_never_mix_bodies` | 1 本の HTTP/2 の接続で 48 件を同時に、続けて 16 件を順に送り、転送先への接続を使い回しても、どの応答・リクエストも自分の本文だけを持つ |
+| `websocket_streams_arrive_unchanged` | WebSocket（Upgrade）の両方向の流れが変わらない |
+| `a_response_cut_off_by_the_backend_never_looks_complete` | 転送先が応答の途中で切れると、HTTP/1.1・HTTP/2・HTTP/3 のクライアントには誤り（途中で終わった）として見える（`Content-Length`・chunked・`compress` を通したもの） |
+| `a_request_cut_off_by_the_client_never_reaches_the_backend_as_complete` | クライアントが本文の途中で切れる（HTTP/1.1 の `Content-Length` と chunked の切断、HTTP/2 の RST_STREAM、HTTP/3 のリセット）と、転送先には完全なリクエストとして届かない |
+
 ## DB からの復元（`tests/db_restore.rs`）
 
 | テスト | 確かめること |

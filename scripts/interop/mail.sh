@@ -21,6 +21,8 @@ fail() { echo "FAIL: $*" >&2; sudo tail -n 40 /var/log/mail.log 2>/dev/null >&2 
 echo "== packages"
 echo "postfix postfix/main_mailer_type select Local only" | sudo debconf-set-selections
 echo "postfix postfix/mailname string mail.test" | sudo debconf-set-selections
+# the runner image's package lists can be stale (404 on the mirror)
+sudo apt-get update -q >/dev/null
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q postfix dovecot-imapd dovecot-pop3d openssl >/dev/null
 grep -q ' mail.test$' /etc/hosts || echo '127.0.0.1 mail.test' | sudo tee -a /etc/hosts >/dev/null
 id mailtest >/dev/null 2>&1 || sudo useradd -m mailtest

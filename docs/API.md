@@ -180,7 +180,13 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
 | `cert_status` | `terminate` のルールが使う証明書の期限（下の「証明書の期限」）。証明書がなければ省く。各要素は `role`（`certificate` / `client_ca` / `client_chain` / `upstream_ca` / `upstream_certificate`）、`file`（証明書のファイル）、`not_after`（RFC 3339、UTC）、`days_left`（残りの日数。切れたら負）、`state`（`ok` / `expiring` / `expired`） |
 | `origin` | `dynamic`（API で作ったルール、または DB から復元したルール）か `static`（固定ルール。下を参照） |
 
-`stats` には `denied`（`allow_from` の範囲外、`crowdsec` の判定、または `unmatched: reject` で切断した接続の数）も含む。
+`stats` には `denied`（`allow_from` の範囲外、`crowdsec` の判定、または `unmatched: reject` で切断した接続の数）と、`dropped`（UDP で rproxy が転送できずに捨てたデータグラムの数：セッションの待ち行列があふれた、送信に失敗した、名前を読んでいるセッションが多すぎる。v0.3.9 から。カーネルのソケットの受信バッファがあふれて捨てたものは rproxy からは見えないので数えない）も含む。`GET /metrics` では `rproxy_udp_dropped_total{protocol,listen}`（UDP のルールだけ）。
+
+#### データの完全性（L4）
+
+- TCP：片方が閉じた（FIN）ときは、もう片方にも半分閉じた（FIN）として伝え、反対の向きはそのまま続ける。片方がリセット（RST）した、または書き込めなくなったときは、もう片方もリセットで切る（正常に終わったように見せない。`SO_LINGER` 0）。TLS を終端するルールでは、転送先がリセットしたらクライアントの TLS は close_notify なしで切れる。
+- UDP：データグラムは 1 つずつそのまま、届いた順に転送する（まとめない・分けない・並べ替えない・重ねない）。rproxy が捨てたものは上の `dropped` に数える。
+- tests/integrity.rs で、何十 MiB の擬似乱数のデータを流して SHA-256 を比べて確かめている（TCP の passthrough・terminate・`upstream.tls`・`proxy_v2`、UDP・DTLS、HTTP/1.1・HTTP/2・HTTP/3・WebSocket、`compress`・`buffering`・`retry`、転送先への接続の再利用）。`RPROXY_TEST_INTEGRITY_MB` で大きさを変えられ、CI（`.github/workflows/integrity.yml`）で毎週 512 MiB で動かす。
 宛先が 2 つ以上か `health_check` のあるルールでは、`stats.targets` に宛先ごとの状態が入る（上の「複数の宛先」）。
 `http` のルールでは、`stats.http` にリクエストの数も入る（ほかのルールでは省く）。
 
@@ -314,6 +320,8 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | ヘッダの大きさ | HTTP/2・HTTP/3 は 1 リクエストのヘッダの合計 64 KiB まで（hyper の既定の 16 KiB では、大きなクッキーのブラウザで足りない）。HTTP/1.1 は約 400 KB まで。超えると 431 |
 | 本文 | 流しながら中継する（`buffering` がなければため込まない）。chunked、`Expect: 100-continue`、`HEAD`（`Content-Length` を保つ）、`204` / `304` に対応 |
 | タイムアウト | `timeouts.response` は本文を送り終えてから応答ヘッダまで。長いダウンロード・SSE・ロングポーリングの応答の本文は切らない |
+| 途中で切れた応答 | 転送先が応答の途中で切れたら（`Content-Length` に足りない、chunked の最後のチャンクがない、リセット）、クライアントにも完全な応答に見えないように切る：HTTP/1.1 は足りないまま接続を閉じる（chunked なら最後のチャンクを送らない）、HTTP/2 は RST_STREAM、HTTP/3 は RESET_STREAM。`compress` を通していても同じ（圧縮の終わりを付けない）。長さのない（接続を閉じて終わる）HTTP/1.0 型の応答は、転送先の側で途中かどうかが分からない |
+| 途中で切れたリクエスト | クライアントが本文の途中で切れたら（HTTP/1.1 の切断、HTTP/2 の RST_STREAM、HTTP/3 のリセット）、転送先への接続も本文を終えずに切り、転送先に完全なリクエストとして渡さない |
 - アクセスログ（`event: "http.access"`）はリクエストごとに 1 行：`rule`、`route`（一致しなければ `(none)`）、`service`、`backend`、`client`、`method`、`host`、`path`（クエリは含めない）、`query`（クエリ。`?` なし、なければ空。v0.3.8 から。秘密になりやすい名前のパラメータ（`token`・`code`・`state`・`password`・`secret`・`key`・`signature`・`auth`・`session` などを名前に含むもの）は値を `REDACTED` に置き換える。GitLab の `private_token`、OIDC の `code` / `state` などをログに残さないため）、`protocol`（`HTTP/1.1` / `HTTP/2.0`）、`status`、`duration_ms`（応答の本文を送り終えるまで）、`bytes_in`（`Content-Length`）、`bytes_out`（応答の本文）、`user_agent`、`sni`、`tls_version`。出す先は `global.access_log`。
 - `GET /metrics` の `rproxy_http_requests_total{protocol,listen,route,code}`（`code` は `2xx` など）と `rproxy_http_request_duration_seconds{protocol,listen,route}`（ヒストグラム。境界は 5ms〜10s）、`rproxy_http_limited_total{protocol,listen,route,middleware}`（`rate_limit` / `in_flight` で断った数）、`rproxy_http_blocked_total{protocol,listen,route,middleware}`（`crowdsec` で断った数）。`global.crowdsec` があれば `rproxy_crowdsec_decisions`（判定で止めているアドレスと範囲の数）と `rproxy_crowdsec_synced`（LAPI から一度でも取得できたら 1）。ラベルにパスは入れない。
 - ミドルウェアはルートの `middlewares` に書いた順にリクエストへ働き、応答へは逆の順に働く（Traefik と同じ）。途中のミドルウェアが応答を返したら（リダイレクト・`respond`・拒否）、その先へは進まない。その応答にも、それまでに通ったミドルウェアの応答側（`headers` など）が働く。
