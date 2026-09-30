@@ -75,6 +75,7 @@ pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16, stop: Cance
 						}
 					};
 					if tx.try_send(buf[..n].to_vec()).is_err() {
+						rt.stats.dropped();
 						debug!(event = "udp.drop", rule = %rt.key, client = %client);
 					}
 				}
@@ -196,6 +197,7 @@ async fn session(
 	// the datagrams held while reading the server name, in order
 	for data in &first {
 		if let Err(e) = upstream.send(&with_header(&header, data)).await {
+			rt.stats.dropped();
 			debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 		}
 		rx_bytes += data.len() as u64;
@@ -211,6 +213,7 @@ async fn session(
 			_ = async { match &probe { Some(p) => sleep_until(p.until).await, None => std::future::pending().await } } => {
 				for data in probe.take().map(|p| p.held).unwrap_or_default() {
 					if let Err(e) = upstream.send(&with_header(&header, &data)).await {
+						rt.stats.dropped();
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += data.len() as u64;
@@ -234,6 +237,7 @@ async fn session(
 					};
 					for data in forward {
 						if let Err(e) = upstream.send(&with_header(&header, &data)).await {
+							rt.stats.dropped();
 							debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 						}
 						rx_bytes += data.len() as u64;
@@ -245,6 +249,7 @@ async fn session(
 			received = upstream.recv(&mut buf) => match received {
 				Ok(n) => {
 					if let Err(e) = listener.send_to(&buf[..n], client).await {
+						rt.stats.dropped();
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					tx_bytes += n as u64;
@@ -416,6 +421,7 @@ async fn sniff(
 	}
 	if sniffing.fetch_add(1, Ordering::Relaxed) >= SNI_MAX_PENDING {
 		sniffing.fetch_sub(1, Ordering::Relaxed);
+		rt.stats.dropped();
 		debug!(event = "udp.drop", rule = %rt.key, reason = "too many sessions reading their server name");
 		return None;
 	}
@@ -591,6 +597,7 @@ async fn dtls_session(
 			read = dtls.read(&mut buf, None) => match read {
 				Ok(n) => {
 					if let Err(e) = upstream.send(&with_header(&header, &buf[..n])).await {
+						rt.stats.dropped();
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					rx_bytes += n as u64;
@@ -602,6 +609,7 @@ async fn dtls_session(
 			received = upstream.recv(&mut ubuf) => match received {
 				Ok(n) => {
 					if let Err(e) = dtls.write(&ubuf[..n], None).await {
+						rt.stats.dropped();
 						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 					}
 					tx_bytes += n as u64;

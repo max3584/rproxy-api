@@ -25,6 +25,9 @@ pub struct Stats {
 	pub tls_failures: AtomicU64,
 	/// Refused by allow_from or `unmatched: reject`.
 	pub denied: AtomicU64,
+	/// UDP datagrams rproxy could not pass on: a session's queue was full, or
+	/// sending failed (the kernel's own socket-buffer drops are not seen here).
+	pub dropped: AtomicU64,
 }
 
 impl Stats {
@@ -45,6 +48,10 @@ impl Stats {
 
 	pub fn add_tx(&self, n: u64) {
 		self.tx_bytes.fetch_add(n, Ordering::Relaxed);
+	}
+
+	pub fn dropped(&self) {
+		self.dropped.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn denied(&self) {

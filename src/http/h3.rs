@@ -278,6 +278,9 @@ async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<R
 	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone()))).await;
 	if let Err(e) = respond(&mut send, resp, &rt).await {
 		warn!(event = "http.error", rule = %rt.key, error = %e, transport = "quic", "response cut short");
+		// reset the stream: dropping it would finish it (quinn), and the client would
+		// take a response cut short for a complete one
+		send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
 	}
 }
 
@@ -318,7 +321,10 @@ fn request_body(mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>
 			}
 		};
 		tokio::select! {
-			_ = kill.cancelled() => {}
+			// the rule stopped: the body did not end, so do not let it look complete
+			_ = kill.cancelled() => {
+				let _ = tx.try_send(Err(BoxError::new(std::io::Error::other("rule stopped"))));
+			}
 			_ = read => {}
 		}
 	});

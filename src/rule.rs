@@ -607,6 +607,8 @@ pub struct RuleStats {
 	pub tls_failures: u64,
 	/// Refused by allow_from, `crowdsec` or `unmatched: reject` (UDP: datagrams).
 	pub denied: u64,
+	/// UDP datagrams rproxy dropped (a session's queue full, or sending failed).
+	pub dropped: u64,
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::http::access::HttpStatsView>,

@@ -2,6 +2,7 @@
 // has been rewritten around cancellation tokens for rproxy-api.
 
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -181,6 +182,11 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	let elapsed_ms = started.elapsed().as_millis() as u64;
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
+	if matches!(&result, Err(e) if !is_denied(e)) {
+		// the relay failed (a side reset, or could not be written): end the client's
+		// connection with a reset too, not a clean close it would take for a complete one
+		reset_on_close(&inbound);
+	}
 	match result {
 		Err(e) if is_denied(&e) => {}
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
@@ -209,7 +215,8 @@ async fn run(
 			detail.lease = lease;
 			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
-			finish(rt, inbound, &mut out, detail).await
+			let backend = out.as_raw_fd();
+			finish(rt, inbound, &mut out, backend, detail).await
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
@@ -243,7 +250,8 @@ async fn relay_hello(
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
-	finish(rt, inbound, &mut out, detail).await
+	let backend = out.as_raw_fd();
+	finish(rt, inbound, &mut out, backend, detail).await
 }
 
 /// A stream that first yields bytes already read from it (the ClientHello read
@@ -291,11 +299,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 	}
 }
 
-/// Relays until both sides close. `a` is the client side, `b` the backend.
+/// Relays until both sides close. `a` is the client side, `b` the backend, whose
+/// socket is `b_fd`. A clean close (FIN) of one side is passed on as a half-close;
+/// when the relay fails (a side reset, or could not be written), the backend's
+/// connection is reset (RST) rather than closed cleanly, so it does not take a
+/// cut-off stream for a complete one (the client's is reset by `handle`).
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 	rt: &Runtime,
 	a: &mut A,
 	b: &mut B,
+	b_fd: RawFd,
 	detail: &mut Detail,
 ) -> io::Result<()> {
 	let mut client = Counted::new(a, &rt.stats.rx_bytes);
@@ -303,9 +316,19 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 	detail.rx += client.count;
 	detail.tx += backend.count;
+	if result.is_err() {
+		// SAFETY: `b` (which owns `b_fd`) is borrowed for this whole call, so the fd is open
+		reset_on_close(&unsafe { BorrowedFd::borrow_raw(b_fd) });
+	}
 	result?;
 	detail.reason = "closed";
 	Ok(())
+}
+
+/// Makes closing the socket reset the connection (RST, SO_LINGER 0) instead of
+/// closing it cleanly (FIN).
+fn reset_on_close(socket: &impl AsFd) {
+	let _ = socket2::SockRef::from(socket).set_linger(Some(Duration::ZERO));
 }
 
 /// TLS handshake of a `terminate` rule. The ClientHello is read first so
@@ -429,6 +452,7 @@ async fn terminate(
 	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);
 
+	let backend = out.as_raw_fd();
 	let mut upstream: Box<dyn Stream> = match &tls.connector {
 		Some(connector) => {
 			let name = tls.upstream_name(&host).map_err(|e| io::Error::other(e.message))?;
@@ -450,7 +474,7 @@ async fn terminate(
 			session.write_all(&to_client).await?;
 		}
 	}
-	finish(rt, &mut session, &mut upstream, detail).await
+	finish(rt, &mut session, &mut upstream, backend, detail).await
 }
 
 /// SMTP client that carried on without STARTTLS (`starttls_required: false`).
@@ -475,5 +499,6 @@ async fn plain_smtp(
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;
 	inbound.write_all(&extra).await?;
 	inbound.write_all(&after).await?;
-	finish(rt, inbound, &mut out, detail).await
+	let backend = out.as_raw_fd();
+	finish(rt, inbound, &mut out, backend, detail).await
 }
