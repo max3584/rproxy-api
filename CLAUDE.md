@@ -41,6 +41,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/sni.rs` | ClientHello からサーバ名を読む（`tls.mode: sni` と、`terminate` の `passthrough` の route。ClientHello の本体の解析 `hello_server_name` / `parse_handshake` は udp の DTLS・QUIC（`udp_sni`）と共有。読んだバイトは転送先へそのまま送るか、`tcp.rs` の `Prefixed` で rustls に渡し直して終端する） |
 | `src/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
 | `src/dtls.rs` | 共有の UDP ソケットから 1 クライアント分のデータグラムを dtls クレート に渡す `Conn` |
+| `src/udpsock.rs` | ルールの UDP の待ち受けソケット（`Listener`）。`0.0.0.0` / `::` では `IP_PKTINFO` / `IPV6_RECVPKTINFO` で受けた宛先（`Local`）を覚え、返信は `sendmsg` でそこから送る（#137。アドレスが複数のホストで、カーネルに任せると違うアドレスから返ってしまう）。UDP のセッションは（クライアント, `Local`）ごと |
 | `src/rule.rs` | ルールの型と検証。`Features`（この版で動かせる v0.3 の設定。`GET /capabilities` の `features`。パッチで中身を入れたら true にする） |
 | `src/http/` | L7（ルールの `http`）の設定の型と検証、`match` の式（Traefik と同じ書き方）の解析と評価 |
 | `src/http/middleware.rs` | ミドルウェア（リダイレクト、`respond`、`ip_allow`、`headers`、パスの書き換え、`rate_limit`・`in_flight`）。`Router::compile` で一度だけ組み立てる |
@@ -103,6 +104,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## 注意点
 
+- UDP の返信の送信元（#137）：ワイルドカードで待ち受ける UDP は `udpsock::Listener` を通して、受けた宛先のアドレスから返す。UDP の待ち受けソケットに直接 `send_to` を書かない。HTTP/3 は quinn（quinn-udp）が自分で同じことをしている。確かめるのは tests/udp_source.rs（127.0.0.2 宛て）と `scripts/test-udp-source.sh`（名前空間で 1 つのインターフェースに IPv4・IPv6 のアドレスを 2 つずつ。CI の transparent のジョブ）。
 - `transparent` は Linux・`CAP_NET_ADMIN` が前提（IPv4 は `IP_TRANSPARENT`、IPv6 は `IPV6_TRANSPARENT`。socket2 0.6 の `set_ip_transparent_v4` / `_v6`）で、ポリシールーティングの設定も要る（README）。ユニットは `CAP_NET_ADMIN` を既定で与え、ポリシールーティングは `contrib/rproxy-transparent-routing`（install.sh の `--transparent-*`）で入れる。権限を足したり外したりしたら docs/PERMISSIONS.md も直す。`scripts/test-transparent.sh` で名前空間の中の実経路では確認済み。`FAMILY=4|6`・`ROUTING=iif|iptables|nft`・`RETURN=rproxy|gateway`（転送先の出口が別のルータで、転送先で connmark を使う構成）の組み合わせを CI で確かめている。利用者向けの説明は docs/TRANSPARENT.md。
 - DB からの復元（`src/db.rs`）は MariaDB 11.4 で確認済み。テーブルが古く `source_ip` / `udp_idle_secs` 列がない場合は、既定値で読み込む。
 - CrowdSec の検知（#129）：`contrib/crowdsec/` のパーサー（`max3584/rproxy-logs`）は rproxy のログの JSON（`http.access` と `conn.open` / `conn.denied`）の項目名に依っている。ログの項目を変えたらパーサーと `scripts/interop/crowdsec-samples.log` も直す。CI の `crowdsec` ジョブ（`scripts/interop/crowdsec.sh`）は本物の CrowdSec で、文書用アドレス（RFC 5737 / RFC 3849）のクライアントを ban させて確かめる（私用アドレスは CrowdSec が whitelist するので検知の試験にならない）。
