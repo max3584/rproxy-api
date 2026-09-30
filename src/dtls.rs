@@ -7,21 +7,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use webrtc_util::conn::Conn;
 
+use crate::udpsock::{Listener, Local};
+
 /// A per-client view of the listener: reads come from the session's queue,
-/// writes go out of the listener to that client.
+/// writes go out of the listener to that client, from the address it sent to.
 pub struct SessionConn {
 	from_client: Mutex<mpsc::Receiver<Vec<u8>>>,
-	listener: Arc<UdpSocket>,
+	listener: Arc<Listener>,
 	client: SocketAddr,
+	local: Option<Local>,
 }
 
 impl SessionConn {
-	pub fn new(from_client: mpsc::Receiver<Vec<u8>>, listener: Arc<UdpSocket>, client: SocketAddr) -> Self {
-		SessionConn { from_client: Mutex::new(from_client), listener, client }
+	pub fn new(from_client: mpsc::Receiver<Vec<u8>>, listener: Arc<Listener>, client: SocketAddr, local: Option<Local>) -> Self {
+		SessionConn { from_client: Mutex::new(from_client), listener, client, local }
 	}
 }
 
@@ -47,7 +49,7 @@ impl Conn for SessionConn {
 	}
 
 	async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
-		Ok(self.listener.send_to(buf, self.client).await?)
+		Ok(self.listener.send_to(buf, self.client, self.local).await?)
 	}
 
 	async fn send_to(&self, buf: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
@@ -55,7 +57,7 @@ impl Conn for SessionConn {
 	}
 
 	fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
-		Ok(self.listener.local_addr()?)
+		Ok(self.listener.local_for(self.local))
 	}
 
 	fn remote_addr(&self) -> Option<SocketAddr> {

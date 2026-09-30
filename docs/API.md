@@ -50,14 +50,14 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 |---|---|---|---|
 | `protocol` | `"tcp"` \| `"udp"` | ○ | 大文字・小文字は区別しない。応答では常に小文字で返す |
 | `listen_addr` | string | ○ | IP アドレス（ホスト名は不可） |
-| `extra_listen_addrs` | string[] | | 同じポート（範囲）で追加で待ち受ける IP アドレス（最大 16 件。例 `listen_addr` が代表の IPv4 で、ここに GUA の IPv6）。ルールのキーは `listen_addr` のまま。統計・ログは 1 つのルールとしてまとめ、`conn.open` の `listen` に受けたアドレスが出る。追加のアドレスがあるルールの IPv6 の待ち受けは `IPV6_V6ONLY` で開くので、`0.0.0.0` と `::` を並べられる（`::` だけのルールは OS の既定のまま：Linux の既定では IPv4 も受ける）。ほかのルール・制御 API との重なりは、追加のアドレスも含めて確かめる（`409 already_exists` / `reserved`）。`transparent` では、追加のアドレスのファミリーの宛先（IP で書いたもの）が 1 つもなければ `invalid`、IPv6 のアドレスは `transparent_ipv6` が要る。`http3` の QUIC も全部のアドレスで受ける。一覧では空なら省く |
+| `extra_listen_addrs` | string[] | | 同じポート（範囲）で追加で待ち受ける IP アドレス（最大 16 件。例 `listen_addr` が代表の IPv4 で、ここに GUA の IPv6）。ルールのキーは `listen_addr` のまま。統計・ログは 1 つのルールとしてまとめ、`conn.open` の `listen` に受けたアドレスが出る。追加のアドレスがあるルールの IPv6 の待ち受けは `IPV6_V6ONLY` で開くので、`0.0.0.0` と `::` を並べられる（`::` だけのルールは OS の既定のまま：Linux の既定では IPv4 も受ける）。ほかのルール・制御 API との重なりは、追加のアドレスも含めて確かめる（`409 already_exists` / `reserved`）。`transparent` では、追加のアドレスのファミリーの宛先（IP で書いたもの）が 1 つもなければ `invalid`、IPv6 のアドレスは `transparent_ipv6` が要る。`http3` の QUIC も全部のアドレスで受ける。一覧では空なら省く。UDP の返信の送信元は、`0.0.0.0` / `::` で待ち受けていてもクライアントが送った宛先のアドレスになるので、アドレスを複数持つホストで返信元を固定するためにアドレスを並べる必要はない（v0.3.10 から） |
 | `listen_port` | 1–65535 | ○ | |
 | `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する。`http` のルールでは書かない（転送先は `http.services`。一覧では `""` / `0`）。`targets` を使うときも書かない（一覧では `targets` の先頭が入る） |
 | `remote_port` | 1–65535 | ○ | `http` のルール・`targets` を使うルールでは書かない |
 | `targets` | object の配列 | | 宛先を複数にする（v0.3.3、`remote_addr` / `remote_port` の代わり。どちらか一方）。`{"addr", "port", "weight"?, "backup"?}`：`addr` は IP かホスト名（それぞれ再解決する）、`weight` は 1 以上（既定 1）、`backup: true` はほかの宛先がすべて down のときだけ使う（全部を backup にはできない）。最大 64 件。ポート範囲では各宛先の `port` も範囲の分ずれる。下の「複数の宛先」 |
 | `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
-| `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスは待ち受けのアドレスで、`0.0.0.0` で待ち受けていれば `0.0.0.0`）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md |
+| `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
@@ -68,6 +68,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS や PROXY ヘッダより前）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`） |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
+
+UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けたデータグラムの宛先アドレスを覚え（`IP_PKTINFO` / `IPV6_RECVPKTINFO`）、返信はそのアドレスから送る（v0.3.10 から。Linux）。アドレスを複数持つホストでも、クライアントは送った宛先から返信を受け取れる（IKE・WebRTC・QUIC・DTLS など、宛先と違うアドレスからの返信を捨てるクライアントのため）。同じクライアント（アドレスとポート）が別のアドレスに送ったものは別のセッションになり、それぞれのアドレスから返す。L4 の中継・DTLS の終端・UDP のサーバ名での振り分け・HTTP/3 のどれも同じ。`conn.open` の `listen` と PROXY v2 のヘッダの宛先も受けたアドレスになる。
 
 ### 複数の宛先（`targets`、v0.3.3）
 
