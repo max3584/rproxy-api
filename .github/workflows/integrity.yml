@@ -1,0 +1,33 @@
+name: Integrity
+
+# データの完全性のテスト（tests/integrity.rs、issue #134）を大きなデータで動かす。
+# ふだんの CI（ci.yml の cargo test）は 1 ケース 32 MiB。ここでは毎週 512 MiB、手動では大きさを指定して動かす。
+# このファイルやテストを変えた PR では 64 MiB で動かして、ワークフローが壊れていないことを確かめる。
+on:
+  schedule:
+    - cron: "0 20 * * 0"   # 毎週月曜 5:00（JST）
+  workflow_dispatch:
+    inputs:
+      mb:
+        description: 1 ケースあたりの MiB
+        default: "512"
+  pull_request:
+    paths:
+      - tests/integrity.rs
+      - .github/workflows/integrity.yml
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RPROXY_TEST_INTEGRITY_MB: ${{ inputs.mb || (github.event_name == 'pull_request' && '64') || '512' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: tests/integrity.rs (${{ env.RPROXY_TEST_INTEGRITY_MB }} MiB per case)
+        run: cargo test --release --test integrity -- --test-threads 2
