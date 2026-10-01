@@ -68,6 +68,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
+| — | `--check-config [PATH]` | — | 設定ファイル（PATH、なければ `RPROXY_CONFIG`）を確かめて終わる。問題がなければ 0、誤りがあれば 1。`--check-config-format json` で JSON（下の「設定を確かめる」） |
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
@@ -141,6 +142,25 @@ SNI やサーバ名は、クライアントが自由に名乗れます。名前�
 Traefik から移るときは、`rproxy-traefik-convert`（[contrib/traefik2rproxy.py](contrib/traefik2rproxy.py)。.deb に入っている）で Traefik の設定（静的・動的な設定、Docker のラベル）をこの設定ファイルに変換できます。変換できなかった設定は出力の先頭と標準エラーに一覧されます（[docs/MIGRATING-FROM-TRAEFIK.md](docs/MIGRATING-FROM-TRAEFIK.md)）。
 
 systemd で動かす例は [contrib/rproxy-api.service](contrib/rproxy-api.service) にあります（80 / 443 などのために `CAP_NET_BIND_SERVICE` を付ける）。
+
+### 設定を確かめる
+
+設定ファイルを書き換えたら、反映する前に `rproxy-api --check-config` で確かめられます（nginx の `nginx -t` にあたる）。起動時・再読み込みと同じ検証（書式、ルールの値、待ち受けの重なり、制御 API との重なり、証明書・鍵・CA のファイルと期限、`global` と認証などの秘密のファイル）をして、問題がなければ 0、誤りがあれば 1 で終わります。待ち受けも DB も開かず、動いている rproxy にも触りません。
+
+```bash
+rproxy-api --check-config                            # RPROXY_CONFIG（/etc/rproxy/rproxy.env など）のファイル
+rproxy-api --check-config /etc/rproxy/conf.d         # ファイルかディレクトリを指定
+rproxy-api --check-config /etc/rproxy/rproxy.yaml --check-config-format json   # スクリプト向け
+rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
+```
+
+- 誤り：ファイル・ルール（`rproxy.yaml rule #2` など）ごとに理由を出す。最初の 1 つで止めず、すべて出す
+- 警告：期限が近い証明書（`RPROXY_CERT_WARN_DAYS`）、この版や権限で動かせない設定（起動すると `failed` になる）、`rproxy` のユーザーが読めないかもしれないファイル（所有者とモードからの判断）
+- JSON：`{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
+- 名前解決はしない（転送先の名前が引けるかは、起動したときに分かる）
+- 設定ファイルが指定されていなければ、確かめるものがないので 0 で終わる
+
+パッケージ（と install.sh）の systemd のユニットは、`systemctl reload rproxy-api` で先にこの確認をします。誤りがあれば reload は失敗し（`journalctl -u rproxy-api` に理由）、rproxy には何も送りません。そのときは、トークンや証明書の読み直しも行われないので、設定ファイルを直してから reload してください。
 
 ## TLS・DTLS・STARTTLS・ポート範囲
 

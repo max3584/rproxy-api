@@ -56,6 +56,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/oidc.rs` | `oidc`：認可コード + PKCE、discovery と JWKS のキャッシュ、ID トークンの検証（ring。RS/PS/ES）、AES-256-GCM で暗号化したセッションのクッキー、リフレッシュ、ログアウト。コールバックとログアウトのパスは `server.rs` がルーティングの前に渡す。プロバイダへの HTTP は `crowdsec::call` |
 | `src/http/compress.rs` | `compress`：`Accept-Encoding` の交渉、圧縮しない応答の判定、流れてきた分ずつ圧縮する本文（gzip・br・zstd） |
 | `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `main.rs` の `watch_config` → `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
+| `src/check.rs` | `rproxy-api --check-config`（#140）：設定ファイルを起動時・再読み込みと同じ道筋で確かめる（`ConfigDoc::load`、`Registry::check_rules`。`check_rules` は `validate_static` と同じ検証と、`prepare` のうちソケットと名前解決を除いた `build_parts`（証明書・`http`・秘密のファイル）を通り、誤りで止めずにすべて集める）。待ち受け・DB・制御 API は開かない。`rproxy` のユーザーが読めないかもしれないファイルは所有者とモードから警告 |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |
 | `src/logging.rs` | tracing の JSON Lines 出力（日次ローテーション） |
@@ -85,6 +86,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - `allow_from` は受け付けた直後（TLS や PROXY ヘッダより前）に確かめる。UDP は範囲外のデータグラムを捨てる。拒否は `stats.denied` に数え、`conn.denied` をログに出す。
 - `tls.unmatched: reject` の `terminate` は、`LazyConfigAcceptor` で ClientHello を読んでから判断する（一致しない名前には証明書を返さない）。
 - `tls.routes` の名前：完全一致・`*.`（1 階層）・`**.`（何階層でも）、`server_names` で複数。選び方は `tlsconf::best_match`（完全一致 → `*.` → 長い `**.` → 書いた順）。`passthrough` の route がある `terminate` のルールは、先に `sni::read_client_hello` で読み、passthrough の名前なら `relay_hello`、それ以外は読んだバイトを `Prefixed` で rustls に渡す（`http` のルールも同じ。HTTP/3 は passthrough の名前の接続を閉じる）。
+- 設定ファイルの検証を変えたら、`--check-config`（`src/check.rs`・`Registry::check_rules`・`build_parts`）も同じ道筋を通っているか確かめる（tests/check_config.rs）。ユニットの `ExecReload` は先に `--check-config` を実行するので、ここで誤りになる変更は reload を止める。
 - 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作り、ファイルが変わったら `Registry::reload_static` で差分を反映する（誤りがあれば何も変えない）。API からの変更・削除は `409 static`。`global` の変更は再起動まで効かない（`GET /config` の `restart_needed`）。
 - API の定義は `docs/openapi.json`（`GET /openapi.json`）。エンドポイントを足したら、ここにも足す（`api.rs` のテストがルーターとの食い違いを見つける）。
 - バージョン管理とリリースは docs/RELEASING.md の決まりで、確認を取らずに進める（UI と同じ番号で一緒に出す。PR・issue を作るときにパッチ／マイナーのマイルストーンを付ける。マージ後のタグ・リリースノート・マイルストーンの片付けまで行う）。

@@ -98,6 +98,14 @@ struct Options {
 	/// Seconds between attempts to open a control API listener that could not start
 	#[arg(long, env = "RPROXY_API_RETRY_SECS", default_value_t = 10, hide = true)]
 	api_retry_secs: u64,
+	/// Check the settings file (PATH, or --config / RPROXY_CONFIG) as startup and
+	/// reloads would, then exit: 0 when it is fine, 1 otherwise. Opens no sockets
+	/// and does not touch a running rproxy
+	#[arg(long, value_name = "PATH", num_args = 0..=1)]
+	check_config: Option<Option<PathBuf>>,
+	/// Output of --check-config: text or json
+	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
+	check_config_format: String,
 }
 
 /// Port ranges open one socket per port; lift the soft file limit to the hard one.
@@ -159,6 +167,9 @@ fn main() -> ExitCode {
 		}
 	}
 	let opts = Options::parse();
+	if let Some(path) = &opts.check_config {
+		return check_config(&opts, path.clone());
+	}
 
 	let _log_guard = match logging::init(&opts.log_level, opts.log_file.as_deref(), opts.log_keep) {
 		Ok((guard, fallback)) => {
@@ -185,6 +196,61 @@ fn main() -> ExitCode {
 			error!(event = "fatal", error = %e);
 			ExitCode::FAILURE
 		}
+	}
+}
+
+/// `--check-config`: validates the settings file and prints the result. No log
+/// is set up (the report is the output), nothing listens.
+fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
+	let json = opts.check_config_format == "json";
+	let fail = |message: String| {
+		if json {
+			let report = rproxy_api::check::Report {
+				errors: vec![rproxy_api::check::Finding { rule: String::new(), message }],
+				..Default::default()
+			};
+			println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+		} else {
+			eprintln!("rproxy-api: {message}");
+		}
+		ExitCode::FAILURE
+	};
+	if opts.config.is_some() && opts.static_rules.is_some() {
+		return fail("give --config (RPROXY_CONFIG) or --static-rules (RPROXY_STATIC_RULES), not both".into());
+	}
+	let Some(path) = path.or_else(|| opts.config.clone()).or_else(|| opts.static_rules.clone()) else {
+		// no settings file configured: nothing can be wrong (so `systemctl reload`
+		// with the check in ExecReload works on hosts without one)
+		let message = "no settings file (RPROXY_CONFIG) is configured; nothing to check";
+		if json {
+			let report = rproxy_api::check::Report { ok: true, ..Default::default() };
+			println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+		} else {
+			println!("{message}");
+		}
+		return ExitCode::SUCCESS;
+	};
+	let api_addrs = if opts.api_port == 0 { vec![] } else { opts.api_addr.clone() };
+	let input = rproxy_api::check::CheckInput {
+		path,
+		reserved: api_addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
+		max_range_ports: opts.max_range_ports,
+		warn_days: opts.cert_warn_days,
+	};
+	let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+		Ok(rt) => rt,
+		Err(e) => return fail(e.to_string()),
+	};
+	let report = runtime.block_on(rproxy_api::check::check(&input));
+	if json {
+		println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+	} else {
+		print!("{}", report.to_text());
+	}
+	if report.ok {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
 	}
 }
 

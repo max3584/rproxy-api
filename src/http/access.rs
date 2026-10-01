@@ -52,6 +52,16 @@ pub enum AccessLogError {
 	Unavailable(String),
 }
 
+/// The directory of `global.access_log`, which must exist (nothing is created;
+/// shared with `--check-config`).
+pub fn access_log_dir(path: &Path) -> Result<&Path, AccessLogError> {
+	let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+	if !dir.is_dir() {
+		return Err(AccessLogError::Config(format!("access log directory {} does not exist", dir.display())));
+	}
+	Ok(dir)
+}
+
 impl HttpGlobal {
 	/// `trusted_proxies` must already be validated (ConfigDoc::check).
 	pub fn new(trusted_proxies: &[String], access_log: Option<&Path>, keep_files: usize) -> Result<Self, AccessLogError> {
@@ -59,10 +69,7 @@ impl HttpGlobal {
 		let Some(path) = access_log else {
 			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, crowdsec: None });
 		};
-		let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-		if !dir.is_dir() {
-			return Err(AccessLogError::Config(format!("access log directory {} does not exist", dir.display())));
-		}
+		let dir = access_log_dir(path)?;
 		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("access");
 		let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
 		let appender = RollingFileAppender::builder()

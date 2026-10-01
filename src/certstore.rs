@@ -35,7 +35,8 @@ impl Source {
 		}
 	}
 
-	fn files(&self) -> Vec<&str> {
+	/// Every file of the set (certificate, chain, key).
+	pub fn files(&self) -> Vec<&str> {
 		match self {
 			Source::Keyed { cert, chain, key } => [Some(cert.as_str()), chain.as_deref(), Some(key.as_str())].into_iter().flatten().collect(),
 			Source::Bundle(file) => vec![file],
