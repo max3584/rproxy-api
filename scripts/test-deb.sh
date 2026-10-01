@@ -58,6 +58,19 @@ curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/capabilities" 
 sudo systemctl reload rproxy-api
 sleep 0.5
 systemctl is-active --quiet rproxy-api || fail "reload stopped the service"
+# the unit checks the settings file before signalling (--check-config): a mistake
+# fails the reload and leaves the service running
+printf 'version: 9\nrules: []\n' | sudo tee /etc/rproxy/broken.yaml >/dev/null
+sudo cp /etc/rproxy/rproxy.env "$work/rproxy.env.saved"
+echo 'RPROXY_CONFIG=/etc/rproxy/broken.yaml' | sudo tee -a /etc/rproxy/rproxy.env >/dev/null
+if sudo systemctl reload rproxy-api; then
+	fail "reload went through with a broken settings file"
+fi
+systemctl is-active --quiet rproxy-api || fail "a failed reload stopped the service"
+sudo -u rproxy /usr/bin/rproxy-api --check-config /etc/rproxy/broken.yaml >/dev/null 2>&1 && fail "--check-config accepted version 9"
+sudo cp "$work/rproxy.env.saved" /etc/rproxy/rproxy.env
+sudo rm /etc/rproxy/broken.yaml
+sudo systemctl reload rproxy-api || fail "reload failed after the settings file was fixed"
 
 echo "== upgrade from a signed apt repository"
 export GNUPGHOME="$work/gnupg"

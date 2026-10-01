@@ -161,6 +161,17 @@ struct Prepared {
 	http: Option<Arc<crate::http::server::Router>>,
 }
 
+/// What `Registry::check_rules` found: (label, message) per problem.
+#[derive(Debug, Default)]
+pub struct RulesCheck {
+	/// Rules that would start.
+	pub ok: usize,
+	pub errors: Vec<(String, String)>,
+	pub warnings: Vec<(String, String)>,
+	/// Certificate, chain, key and CA files the rules use.
+	pub files: Vec<String>,
+}
+
 /// What a reload of the settings file did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ReloadCounts {
@@ -433,7 +444,10 @@ impl Registry {
 	}
 
 	/// Resolves targets and reads certificates, without holding the rules lock.
-	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
+	/// What a rule needs besides sockets and name resolution: its TLS settings
+	/// with the certificates from the store, and its compiled `http` (secret files
+	/// read). Shared by starting a rule and by `--check-config` (`check_rules`).
+	fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::http::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
@@ -445,6 +459,11 @@ impl Registry {
 			}
 			None => None,
 		};
+		Ok((tls, http))
+	}
+
+	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
+		let (tls, http) = self.build_parts(spec)?;
 		// with several targets, one that cannot be resolved yet is retried in the
 		// background; the rule fails only when none can be
 		let wanted = spec.members();
@@ -1062,6 +1081,76 @@ impl Registry {
 			specs.push((spec, missing, label));
 		}
 		Ok(specs.into_iter().map(|(s, m, _)| (s, m)).collect())
+	}
+
+	/// Checks the rules of a settings file without starting anything (`rproxy-api
+	/// --check-config`): the same validation as `validate_static`, then what
+	/// `prepare` does short of name resolution (certificates, `http`, secret
+	/// files). Unlike `validate_static` it goes on after a mistake, so every
+	/// problem is reported.
+	pub fn check_rules(&self, reqs: Vec<(String, RuleRequest)>) -> RulesCheck {
+		let mut out = RulesCheck::default();
+		let mut specs: Vec<(RuleSpec, String)> = vec![];
+		for (label, req) in reqs {
+			let (spec, missing) = match self.validate_at_startup(req) {
+				Ok(v) => v,
+				Err(e) => {
+					out.errors.push((label, e.message));
+					continue;
+				}
+			};
+			if let Some((other, other_label)) = specs.iter().find(|(s, _)| overlaps(s, &spec)) {
+				out.errors.push((label, format!("{} overlaps with {} ({other_label})", spec.key, other.key)));
+				continue;
+			}
+			if let Some(api) = self.reserved_clash(&spec) {
+				out.errors.push((label, format!("{} would take the control API ({api})", spec.key)));
+				continue;
+			}
+			if let Some(missing) = missing {
+				out.warnings.push((
+					label.clone(),
+					format!("cannot run with this build or these permissions (it would be registered as failed): {missing}"),
+				));
+			}
+			match self.build_parts(&spec) {
+				Ok(_) => out.ok += 1,
+				Err(e) => out.errors.push((label.clone(), e.message)),
+			}
+			specs.push((spec, label));
+		}
+		// expiry of every certificate the rules use; a rule whose server
+		// certificates have all expired is already an error from build_tls
+		let now = tlsconf::unix_now();
+		let warn = self.certs.warn_secs();
+		let mut seen = HashSet::new();
+		for (spec, label) in &specs {
+			for (role, source) in certstore::sources(&spec.tls) {
+				if !seen.insert(source.clone()) {
+					continue;
+				}
+				out.files.extend(source.files().into_iter().map(str::to_string));
+				let Some(not_after) = self.certs.not_after(&source) else { continue };
+				let file = source.file().to_string();
+				let when = certstore::rfc3339(not_after);
+				let server = role == tlsconf::CertRole::Certificate;
+				let role = serde_json::to_value(role).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+				match certstore::CertState::of(not_after, now, warn) {
+					// a server certificate that has expired is not used (#115): a mistake to fix
+					certstore::CertState::Expired if server => {
+						let msg = format!("{file} ({role}) expired at {when}");
+						if !out.errors.iter().any(|(l, m)| l == label && m.contains(&file)) {
+							out.errors.push((label.clone(), msg));
+						}
+					}
+					// CA and client certificates towards backends only warn when running
+					certstore::CertState::Expired => out.warnings.push((label.clone(), format!("{file} ({role}) expired at {when}"))),
+					certstore::CertState::Expiring => out.warnings.push((label.clone(), format!("{file} ({role}) expires at {when}"))),
+					certstore::CertState::Ok => {}
+				}
+			}
+		}
+		out
 	}
 
 	/// Starts one rule of the settings file; false if it ended up failed.
