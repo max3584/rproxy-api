@@ -1,2270 +1,2410 @@
 {
- "openapi": "3.0.3",
- "info": {
-  "title": "rproxy-api control API",
-  "version": "see GET /capabilities and the release",
-  "description": "The contract is docs/API.md; this document follows it."
- },
- "servers": [
-  {
-   "url": "http://127.0.0.1:8080"
-  }
- ],
- "security": [
-  {
-   "bearer": []
-  }
- ],
- "components": {
-  "securitySchemes": {
-   "bearer": {
-    "type": "http",
-    "scheme": "bearer"
-   }
+  "openapi": "3.0.3",
+  "info": {
+    "title": "rproxy-api control API",
+    "version": "see GET /capabilities and the release",
+    "description": "The contract is docs/API.md; this document follows it."
   },
-  "schemas": {
-   "Error": {
-    "type": "object",
-    "properties": {
-     "error": {
-      "type": "string"
-     },
-     "code": {
-      "type": "string",
-      "enum": [
-       "invalid",
-       "tls_config",
-       "unsupported",
-       "not_found",
-       "already_exists",
-       "static",
-       "reserved",
-       "bind_failed",
-       "resolve_failed",
-       "unauthorized",
-       "forbidden",
-       "internal"
-      ]
-     }
-    },
-    "description": "Every error response. `code` is stable; `error` is for people.",
-    "required": [
-     "error",
-     "code"
-    ],
-    "additionalProperties": false
-   },
-   "Protocol": {
-    "type": "string",
-    "enum": [
-     "tcp",
-     "udp"
-    ],
-    "description": "Case-insensitive on input."
-   },
-   "SourceIp": {
-    "type": "string",
-    "enum": [
-     "proxy",
-     "proxy_v1",
-     "proxy_v2",
-     "transparent"
-    ]
-   },
-   "StartTls": {
-    "type": "string",
-    "enum": [
-     "smtp",
-     "imap",
-     "pop3"
-    ]
-   },
-   "TlsRoute": {
-    "type": "object",
-    "properties": {
-     "server_name": {
-      "type": "string",
-      "description": "name, *.suffix (one label) or **.suffix (any depth)"
-     },
-     "server_names": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "description": "several names instead of server_name"
-     },
-     "remote_addr": {
-      "type": "string"
-     },
-     "remote_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "passthrough": {
-      "type": "boolean",
-      "description": "terminate rules: relay TLS of these names untouched"
-     }
-    },
-    "required": [
-     "remote_addr",
-     "remote_port"
-    ],
-    "additionalProperties": false
-   },
-   "Certificate": {
-    "type": "object",
-    "properties": {
-     "cert_file": {
-      "type": "string"
-     },
-     "chain_file": {
-      "type": "string"
-     },
-     "key_file": {
-      "type": "string"
-     },
-     "acme": {
-      "type": "string",
-      "description": "Not built in (always unsupported); use files from certbot / cert-manager."
-     },
-     "domains": {
-      "type": "array",
-      "items": {
-       "type": "string"
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080"
+    }
+  ],
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
       }
-     }
     },
-    "additionalProperties": false
-   },
-   "ClientAuth": {
-    "type": "object",
-    "properties": {
-     "mode": {
-      "type": "string",
-      "enum": [
-       "none",
-       "optional",
-       "required"
-      ]
-     },
-     "ca_file": {
-      "type": "string"
-     },
-     "chain_file": {
-      "type": "string"
-     }
-    },
-    "additionalProperties": false
-   },
-   "Upstream": {
-    "type": "object",
-    "properties": {
-     "tls": {
-      "type": "boolean"
-     },
-     "server_name": {
-      "type": "string"
-     },
-     "ca_file": {
-      "type": "string"
-     },
-     "insecure_skip_verify": {
-      "type": "boolean"
-     },
-     "cert_file": {
-      "type": "string"
-     },
-     "chain_file": {
-      "type": "string"
-     },
-     "key_file": {
-      "type": "string"
-     }
-    },
-    "additionalProperties": false
-   },
-   "TlsOptions": {
-    "type": "object",
-    "properties": {
-     "min_version": {
-      "type": "string",
-      "enum": [
-       "1.2",
-       "1.3"
-      ]
-     },
-     "cipher_suites": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     }
-    },
-    "additionalProperties": false
-   },
-   "Tls": {
-    "type": "object",
-    "properties": {
-     "mode": {
-      "type": "string",
-      "description": "sni routes by the ClientHello's server name without decrypting: TLS on tcp, DTLS and QUIC on udp",
-      "enum": [
-       "passthrough",
-       "sni",
-       "terminate"
-      ]
-     },
-     "routes": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/TlsRoute"
-      }
-     },
-     "certificates": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/Certificate"
-      }
-     },
-     "client_auth": {
-      "$ref": "#/components/schemas/ClientAuth"
-     },
-     "alpn": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "upstream": {
-      "$ref": "#/components/schemas/Upstream"
-     },
-     "unmatched": {
-      "type": "string",
-      "enum": [
-       "default",
-       "reject"
-      ]
-     },
-     "options": {
-      "$ref": "#/components/schemas/TlsOptions"
-     }
-    },
-    "additionalProperties": false
-   },
-   "HttpRoute": {
-    "type": "object",
-    "properties": {
-     "name": {
-      "type": "string"
-     },
-     "match": {
-      "type": "string",
-      "description": "Traefik rule syntax: Host, HostRegexp, Path, PathPrefix, PathRegexp, Method, Header, HeaderRegexp, Query, QueryRegexp, ClientIP with &&, ||, ! and parentheses."
-     },
-     "priority": {
-      "type": "integer"
-     },
-     "service": {
-      "type": "string"
-     },
-     "to": {
-      "type": "string",
-      "format": "uri"
-     },
-     "middlewares": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     }
-    },
-    "required": [
-     "name",
-     "match"
-    ],
-    "additionalProperties": false
-   },
-   "HttpDefault": {
-    "type": "object",
-    "properties": {
-     "status": {
-      "type": "integer",
-      "minimum": 100,
-      "maximum": 599
-     },
-     "service": {
-      "type": "string"
-     }
-    },
-    "additionalProperties": false
-   },
-   "HttpService": {
-    "type": "object",
-    "properties": {
-     "servers": {
-      "type": "array",
-      "items": {
-       "type": "object",
-       "properties": {
-        "url": {
-         "type": "string",
-         "format": "uri"
-        },
-        "weight": {
-         "type": "integer",
-         "minimum": 0
-        }
-       },
-       "required": [
-        "url"
-       ],
-       "additionalProperties": false
-      }
-     },
-     "health_check": {
-      "type": "object",
-      "properties": {
-       "path": {
-        "type": "string"
-       },
-       "interval": {
-        "type": "string"
-       },
-       "timeout": {
-        "type": "string"
-       }
-      },
-      "required": [
-       "path"
-      ],
-      "additionalProperties": false
-     },
-     "sticky": {
-      "type": "object",
-      "properties": {
-       "cookie": {
-        "type": "string"
-       }
-      },
-      "required": [
-       "cookie"
-      ],
-      "additionalProperties": false
-     },
-     "pass_host_header": {
-      "type": "boolean"
-     },
-     "timeouts": {
-      "type": "object",
-      "properties": {
-       "connect": {
-        "type": "string"
-       },
-       "response": {
-        "type": "string"
-       }
-      },
-      "additionalProperties": false
-     },
-     "balance": {
-      "$ref": "#/components/schemas/Balance"
-     }
-    },
-    "required": [
-     "servers"
-    ],
-    "additionalProperties": false
-   },
-   "HeaderOps": {
-    "type": "object",
-    "properties": {
-     "set": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": {
-       "type": "string"
-      }
-     },
-     "remove": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     }
-    },
-    "additionalProperties": false
-   },
-   "Middleware": {
-    "description": "Exactly one kind: `{kind: {settings}}`. Kinds this build runs: GET /capabilities features.middlewares.",
-    "oneOf": [
-     {
-      "type": "object",
-      "properties": {
-       "redirect_scheme": {
+    "schemas": {
+      "Error": {
         "type": "object",
         "properties": {
-         "scheme": {
-          "type": "string"
-         },
-         "port": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 65535
-         },
-         "permanent": {
-          "type": "boolean"
-         }
-        },
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "redirect_scheme"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "redirect_regex": {
-        "type": "object",
-        "properties": {
-         "regex": {
-          "type": "string"
-         },
-         "replacement": {
-          "type": "string"
-         },
-         "permanent": {
-          "type": "boolean"
-         }
-        },
-        "required": [
-         "regex",
-         "replacement"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "redirect_regex"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "rate_limit": {
-        "type": "object",
-        "properties": {
-         "average": {
-          "type": "integer",
-          "minimum": 1
-         },
-         "period": {
-          "type": "string"
-         },
-         "burst": {
-          "type": "integer"
-         },
-         "source": {
-          "type": "string",
-          "description": "ip or header:<name>"
-         }
-        },
-        "required": [
-         "average"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "rate_limit"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "in_flight": {
-        "type": "object",
-        "properties": {
-         "amount": {
-          "type": "integer",
-          "minimum": 1
-         }
-        },
-        "required": [
-         "amount"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "in_flight"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "crowdsec": {
-        "type": "object",
-        "properties": {
-         "appsec": {
-          "type": "boolean"
-         },
-         "on_error": {
-          "type": "string",
-          "enum": [
-           "allow",
-           "block"
-          ]
-         }
-        },
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "crowdsec"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "ip_allow": {
-        "type": "object",
-        "properties": {
-         "source_range": {
-          "type": "array",
-          "items": {
-           "type": "string"
-          }
-         }
-        },
-        "required": [
-         "source_range"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "ip_allow"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "headers": {
-        "type": "object",
-        "properties": {
-         "request": {
-          "$ref": "#/components/schemas/HeaderOps"
-         },
-         "response": {
-          "$ref": "#/components/schemas/HeaderOps"
-         },
-         "hsts": {
-          "type": "object",
-          "properties": {
-           "max_age": {
-            "type": "integer"
-           },
-           "include_subdomains": {
-            "type": "boolean"
-           },
-           "preload": {
-            "type": "boolean"
-           }
+          "error": {
+            "type": "string"
           },
-          "required": [
-           "max_age"
-          ],
-          "additionalProperties": false
-         },
-         "frame_deny": {
-          "type": "boolean"
-         },
-         "content_type_nosniff": {
-          "type": "boolean"
-         },
-         "referrer_policy": {
-          "type": "string"
-         },
-         "csp": {
-          "type": "string"
-         },
-         "cors": {
-          "type": "object",
-          "properties": {
-           "allow_origins": {
-            "type": "array",
-            "items": {
-             "type": "string"
-            }
-           },
-           "allow_methods": {
-            "type": "array",
-            "items": {
-             "type": "string"
-            }
-           },
-           "allow_headers": {
-            "type": "array",
-            "items": {
-             "type": "string"
-            }
-           },
-           "allow_credentials": {
-            "type": "boolean"
-           },
-           "max_age": {
-            "type": "integer"
-           }
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid",
+              "tls_config",
+              "unsupported",
+              "not_found",
+              "already_exists",
+              "static",
+              "reserved",
+              "bind_failed",
+              "resolve_failed",
+              "unauthorized",
+              "forbidden",
+              "internal"
+            ]
+          }
+        },
+        "description": "Every error response. `code` is stable; `error` is for people.",
+        "required": [
+          "error",
+          "code"
+        ],
+        "additionalProperties": false
+      },
+      "Protocol": {
+        "type": "string",
+        "enum": [
+          "tcp",
+          "udp"
+        ],
+        "description": "Case-insensitive on input."
+      },
+      "SourceIp": {
+        "type": "string",
+        "enum": [
+          "proxy",
+          "proxy_v1",
+          "proxy_v2",
+          "transparent"
+        ]
+      },
+      "StartTls": {
+        "type": "string",
+        "enum": [
+          "smtp",
+          "imap",
+          "pop3"
+        ]
+      },
+      "TlsRoute": {
+        "type": "object",
+        "properties": {
+          "server_name": {
+            "type": "string",
+            "description": "name, *.suffix (one label) or **.suffix (any depth)"
           },
-          "required": [
-           "allow_origins"
-          ],
-          "additionalProperties": false
-         }
-        },
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "headers"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "forward_auth": {
-        "type": "object",
-        "properties": {
-         "address": {
-          "type": "string"
-         },
-         "response_headers": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "server_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "several names instead of server_name"
+          },
+          "remote_addr": {
+            "type": "string"
+          },
+          "remote_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "passthrough": {
+            "type": "boolean",
+            "description": "terminate rules: relay TLS of these names untouched"
           }
-         },
-         "trust_forward_header": {
-          "type": "boolean"
-         },
-         "request_headers": {
-          "type": "array",
-          "items": {
-           "type": "string"
+        },
+        "required": [
+          "remote_addr",
+          "remote_port"
+        ],
+        "additionalProperties": false
+      },
+      "Certificate": {
+        "type": "object",
+        "properties": {
+          "cert_file": {
+            "type": "string"
+          },
+          "chain_file": {
+            "type": "string"
+          },
+          "key_file": {
+            "type": "string"
+          },
+          "acme": {
+            "type": "string",
+            "description": "Not built in (always unsupported); use files from certbot / cert-manager."
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
-         },
-         "timeout": {
-          "type": "string",
-          "description": "default 10s"
-         }
         },
-        "required": [
-         "address"
-        ],
         "additionalProperties": false
-       }
       },
-      "required": [
-       "forward_auth"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "oidc": {
+      "ClientAuth": {
         "type": "object",
         "properties": {
-         "issuer": {
-          "type": "string"
-         },
-         "client_id": {
-          "type": "string"
-         },
-         "client_secret_file": {
-          "type": "string"
-         },
-         "scopes": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "mode": {
+            "type": "string",
+            "enum": [
+              "none",
+              "optional",
+              "required"
+            ]
+          },
+          "ca_file": {
+            "type": "string"
+          },
+          "chain_file": {
+            "type": "string"
           }
-         },
-         "cookie_secret_file": {
-          "type": "string"
-         },
-         "ca_file": {
-          "type": "string"
-         },
-         "callback_path": {
-          "type": "string"
-         },
-         "logout_path": {
-          "type": "string"
-         },
-         "cookie_name": {
-          "type": "string"
-         },
-         "groups_claim": {
-          "type": "string"
-         }
         },
-        "required": [
-         "issuer",
-         "client_id",
-         "client_secret_file",
-         "cookie_secret_file"
-        ],
         "additionalProperties": false
-       }
       },
-      "required": [
-       "oidc"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "basic_auth": {
+      "Upstream": {
         "type": "object",
         "properties": {
-         "users_file": {
-          "type": "string"
-         },
-         "realm": {
-          "type": "string"
-         },
-         "keep_authorization": {
-          "type": "boolean"
-         },
-         "user_header": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "users_file"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "basic_auth"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "strip_prefix": {
-        "type": "object",
-        "properties": {
-         "prefixes": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "tls": {
+            "type": "boolean"
+          },
+          "server_name": {
+            "type": "string"
+          },
+          "ca_file": {
+            "type": "string"
+          },
+          "insecure_skip_verify": {
+            "type": "boolean"
+          },
+          "cert_file": {
+            "type": "string"
+          },
+          "chain_file": {
+            "type": "string"
+          },
+          "key_file": {
+            "type": "string"
           }
-         }
         },
-        "required": [
-         "prefixes"
-        ],
         "additionalProperties": false
-       }
       },
-      "required": [
-       "strip_prefix"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "add_prefix": {
+      "TlsOptions": {
         "type": "object",
         "properties": {
-         "prefix": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "prefix"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "add_prefix"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "replace_path": {
-        "type": "object",
-        "properties": {
-         "path": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "path"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "replace_path"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "replace_path_regex": {
-        "type": "object",
-        "properties": {
-         "regex": {
-          "type": "string"
-         },
-         "replacement": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "regex",
-         "replacement"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "replace_path_regex"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "compress": {
-        "type": "object",
-        "properties": {
-         "encodings": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "min_version": {
+            "type": "string",
+            "enum": [
+              "1.2",
+              "1.3"
+            ]
+          },
+          "cipher_suites": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
-         },
-         "min_size": {
-          "type": "integer"
-         }
         },
         "additionalProperties": false
-       }
       },
-      "required": [
-       "compress"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "buffering": {
+      "Tls": {
         "type": "object",
         "properties": {
-         "max_request_body": {
-          "type": "integer"
-         }
-        },
-        "required": [
-         "max_request_body"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "buffering"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "retry": {
-        "type": "object",
-        "properties": {
-         "attempts": {
-          "type": "integer"
-         },
-         "initial_interval": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "attempts"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "retry"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "circuit_breaker": {
-        "type": "object",
-        "properties": {
-         "failure_percent": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 100
-         },
-         "window": {
-          "type": "string"
-         },
-         "recovery": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "failure_percent",
-         "window",
-         "recovery"
-        ],
-        "additionalProperties": false
-       }
-      },
-      "required": [
-       "circuit_breaker"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "errors": {
-        "type": "object",
-        "properties": {
-         "status": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "mode": {
+            "type": "string",
+            "description": "sni routes by the ClientHello's server name without decrypting: TLS on tcp, DTLS and QUIC on udp",
+            "enum": [
+              "passthrough",
+              "sni",
+              "terminate"
+            ]
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TlsRoute"
+            }
+          },
+          "certificates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Certificate"
+            }
+          },
+          "client_auth": {
+            "$ref": "#/components/schemas/ClientAuth"
+          },
+          "alpn": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "upstream": {
+            "$ref": "#/components/schemas/Upstream"
+          },
+          "unmatched": {
+            "type": "string",
+            "enum": [
+              "default",
+              "reject"
+            ]
+          },
+          "options": {
+            "$ref": "#/components/schemas/TlsOptions"
           }
-         },
-         "service": {
-          "type": "string"
-         },
-         "path": {
-          "type": "string"
-         }
         },
-        "required": [
-         "status",
-         "service",
-         "path"
-        ],
         "additionalProperties": false
-       }
       },
-      "required": [
-       "errors"
-      ],
-      "additionalProperties": false
-     },
-     {
-      "type": "object",
-      "properties": {
-       "respond": {
+      "HttpRoute": {
         "type": "object",
         "properties": {
-         "status": {
-          "type": "integer",
-          "minimum": 100,
-          "maximum": 599
-         },
-         "body": {
-          "type": "string"
-         },
-         "content_type": {
-          "type": "string"
-         }
+          "name": {
+            "type": "string"
+          },
+          "match": {
+            "type": "string",
+            "description": "Traefik rule syntax: Host, HostRegexp, Path, PathPrefix, PathRegexp, Method, Header, HeaderRegexp, Query, QueryRegexp, ClientIP with &&, ||, ! and parentheses."
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "service": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string",
+            "format": "uri"
+          },
+          "middlewares": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         },
         "required": [
-         "status"
+          "name",
+          "match"
         ],
         "additionalProperties": false
-       }
       },
-      "required": [
-       "respond"
-      ],
-      "additionalProperties": false
-     }
-    ]
-   },
-   "Http": {
-    "type": "object",
-    "properties": {
-     "http3": {
-      "type": "boolean"
-     },
-     "routes": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/HttpRoute"
-      }
-     },
-     "default": {
-      "$ref": "#/components/schemas/HttpDefault"
-     },
-     "services": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": {
-       "$ref": "#/components/schemas/HttpService"
-      }
-     },
-     "middlewares": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": {
-       "$ref": "#/components/schemas/Middleware"
-      }
-     }
-    },
-    "description": "L7 routing of a tcp rule (plain HTTP or tls.mode terminate).",
-    "additionalProperties": false
-   },
-   "RuleRequest": {
-    "type": "object",
-    "properties": {
-     "protocol": {
-      "$ref": "#/components/schemas/Protocol"
-     },
-     "listen_addr": {
-      "type": "string"
-     },
-     "listen_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "listen_port_end": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "extra_listen_addrs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16,
-      "description": "More IP addresses to listen on with the same port or range (e.g. IPv6 next to an IPv4 listen_addr)."
-     },
-     "remote_addr": {
-      "type": "string",
-      "description": "Left out on http rules and rules with targets."
-     },
-     "remote_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "targets": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/Target"
-      },
-      "maxItems": 64,
-      "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
-     },
-     "balance": {
-      "$ref": "#/components/schemas/Balance"
-     },
-     "health_check": {
-      "$ref": "#/components/schemas/L4HealthCheck"
-     },
-     "source_ip": {
-      "$ref": "#/components/schemas/SourceIp"
-     },
-     "udp_idle_secs": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 86400
-     },
-     "tls": {
-      "$ref": "#/components/schemas/Tls"
-     },
-     "starttls": {
-      "$ref": "#/components/schemas/StartTls"
-     },
-     "starttls_required": {
-      "type": "boolean"
-     },
-     "allow_from": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 64
-     },
-     "http": {
-      "$ref": "#/components/schemas/Http"
-     },
-     "crowdsec": {
-      "type": "boolean",
-      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
-     }
-    },
-    "required": [
-     "protocol",
-     "listen_addr",
-     "listen_port"
-    ],
-    "additionalProperties": false
-   },
-   "RulePatch": {
-    "type": "object",
-    "properties": {
-     "remote_addr": {
-      "type": "string"
-     },
-     "remote_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "targets": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/Target"
-      },
-      "maxItems": 64,
-      "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
-     },
-     "balance": {
-      "$ref": "#/components/schemas/Balance"
-     },
-     "health_check": {
-      "$ref": "#/components/schemas/L4HealthCheck"
-     },
-     "udp_idle_secs": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 86400
-     },
-     "source_ip": {
-      "$ref": "#/components/schemas/SourceIp"
-     },
-     "tls": {
-      "$ref": "#/components/schemas/Tls"
-     },
-     "starttls": {
-      "$ref": "#/components/schemas/StartTls"
-     },
-     "starttls_required": {
-      "type": "boolean"
-     },
-     "listen_port_end": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "allow_from": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 64
-     },
-     "http": {
-      "$ref": "#/components/schemas/Http"
-     },
-     "crowdsec": {
-      "type": "boolean",
-      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
-     },
-     "extra_listen_addrs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16,
-      "description": "Replaces the extra listen addresses when present ([] removes them all; left out keeps them)."
-     }
-    },
-    "additionalProperties": false,
-    "description": "The backends (remote_addr or targets, balance, health_check) are replaced as a whole: balance left out is round_robin, health_check left out is none."
-   },
-   "HttpStats": {
-    "type": "object",
-    "properties": {
-     "requests": {
-      "type": "integer"
-     },
-     "by_status": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": {
-       "type": "integer"
-      }
-     },
-     "limited": {
-      "type": "integer"
-     },
-     "blocked": {
-      "type": "integer"
-     },
-     "routes": {
-      "type": "object",
-      "properties": {},
-      "additionalProperties": {
-       "type": "object",
-       "properties": {
-        "requests": {
-         "type": "integer"
+      "HttpDefault": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "service": {
+            "type": "string"
+          }
         },
-        "by_status": {
-         "type": "object",
-         "properties": {},
-         "additionalProperties": {
-          "type": "integer"
-         }
+        "additionalProperties": false
+      },
+      "HttpService": {
+        "type": "object",
+        "properties": {
+          "servers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "weight": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "health_check": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "interval": {
+                "type": "string"
+              },
+              "timeout": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          },
+          "sticky": {
+            "type": "object",
+            "properties": {
+              "cookie": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "cookie"
+            ],
+            "additionalProperties": false
+          },
+          "pass_host_header": {
+            "type": "boolean"
+          },
+          "timeouts": {
+            "type": "object",
+            "properties": {
+              "connect": {
+                "type": "string"
+              },
+              "response": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Balance"
+          }
         },
-        "limited": {
-         "type": "object",
-         "properties": {},
-         "additionalProperties": {
-          "type": "integer"
-         }
+        "required": [
+          "servers"
+        ],
+        "additionalProperties": false
+      },
+      "HeaderOps": {
+        "type": "object",
+        "properties": {
+          "set": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         },
-        "blocked": {
-         "type": "object",
-         "properties": {},
-         "additionalProperties": {
-          "type": "integer"
-         }
+        "additionalProperties": false
+      },
+      "Middleware": {
+        "description": "Exactly one kind: `{kind: {settings}}`. Kinds this build runs: GET /capabilities features.middlewares.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "redirect_scheme": {
+                "type": "object",
+                "properties": {
+                  "scheme": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
+                  "permanent": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "redirect_scheme"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "redirect_regex": {
+                "type": "object",
+                "properties": {
+                  "regex": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  },
+                  "permanent": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "regex",
+                  "replacement"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "redirect_regex"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rate_limit": {
+                "type": "object",
+                "properties": {
+                  "average": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "period": {
+                    "type": "string"
+                  },
+                  "burst": {
+                    "type": "integer"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "ip or header:<name>"
+                  }
+                },
+                "required": [
+                  "average"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "rate_limit"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "in_flight": {
+                "type": "object",
+                "properties": {
+                  "amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "amount"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "in_flight"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "crowdsec": {
+                "type": "object",
+                "properties": {
+                  "appsec": {
+                    "type": "boolean"
+                  },
+                  "on_error": {
+                    "type": "string",
+                    "enum": [
+                      "allow",
+                      "block"
+                    ]
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "crowdsec"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "ip_allow": {
+                "type": "object",
+                "properties": {
+                  "source_range": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "source_range"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "ip_allow"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "headers": {
+                "type": "object",
+                "properties": {
+                  "request": {
+                    "$ref": "#/components/schemas/HeaderOps"
+                  },
+                  "response": {
+                    "$ref": "#/components/schemas/HeaderOps"
+                  },
+                  "hsts": {
+                    "type": "object",
+                    "properties": {
+                      "max_age": {
+                        "type": "integer"
+                      },
+                      "include_subdomains": {
+                        "type": "boolean"
+                      },
+                      "preload": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "max_age"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "frame_deny": {
+                    "type": "boolean"
+                  },
+                  "content_type_nosniff": {
+                    "type": "boolean"
+                  },
+                  "referrer_policy": {
+                    "type": "string"
+                  },
+                  "csp": {
+                    "type": "string"
+                  },
+                  "cors": {
+                    "type": "object",
+                    "properties": {
+                      "allow_origins": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "allow_methods": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "allow_headers": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      },
+                      "allow_credentials": {
+                        "type": "boolean"
+                      },
+                      "max_age": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "allow_origins"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "headers"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "forward_auth": {
+                "type": "object",
+                "properties": {
+                  "address": {
+                    "type": "string"
+                  },
+                  "response_headers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "trust_forward_header": {
+                    "type": "boolean"
+                  },
+                  "request_headers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "timeout": {
+                    "type": "string",
+                    "description": "default 10s"
+                  }
+                },
+                "required": [
+                  "address"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "forward_auth"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "oidc": {
+                "type": "object",
+                "properties": {
+                  "issuer": {
+                    "type": "string"
+                  },
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "client_secret_file": {
+                    "type": "string"
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "cookie_secret_file": {
+                    "type": "string"
+                  },
+                  "ca_file": {
+                    "type": "string"
+                  },
+                  "callback_path": {
+                    "type": "string"
+                  },
+                  "logout_path": {
+                    "type": "string"
+                  },
+                  "cookie_name": {
+                    "type": "string"
+                  },
+                  "groups_claim": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "issuer",
+                  "client_id",
+                  "client_secret_file",
+                  "cookie_secret_file"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "oidc"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "basic_auth": {
+                "type": "object",
+                "properties": {
+                  "users_file": {
+                    "type": "string"
+                  },
+                  "realm": {
+                    "type": "string"
+                  },
+                  "keep_authorization": {
+                    "type": "boolean"
+                  },
+                  "user_header": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "users_file"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "basic_auth"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "strip_prefix": {
+                "type": "object",
+                "properties": {
+                  "prefixes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "prefixes"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "strip_prefix"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "add_prefix": {
+                "type": "object",
+                "properties": {
+                  "prefix": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "prefix"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "add_prefix"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "replace_path": {
+                "type": "object",
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "replace_path"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "replace_path_regex": {
+                "type": "object",
+                "properties": {
+                  "regex": {
+                    "type": "string"
+                  },
+                  "replacement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "regex",
+                  "replacement"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "replace_path_regex"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "compress": {
+                "type": "object",
+                "properties": {
+                  "encodings": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "min_size": {
+                    "type": "integer"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "compress"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "buffering": {
+                "type": "object",
+                "properties": {
+                  "max_request_body": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_request_body"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "buffering"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "retry": {
+                "type": "object",
+                "properties": {
+                  "attempts": {
+                    "type": "integer"
+                  },
+                  "initial_interval": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "attempts"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "retry"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "circuit_breaker": {
+                "type": "object",
+                "properties": {
+                  "failure_percent": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "window": {
+                    "type": "string"
+                  },
+                  "recovery": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "failure_percent",
+                  "window",
+                  "recovery"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "circuit_breaker"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "errors": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "service": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status",
+                  "service",
+                  "path"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "errors"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "respond": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 599
+                  },
+                  "body": {
+                    "type": "string"
+                  },
+                  "content_type": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "respond"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Http": {
+        "type": "object",
+        "properties": {
+          "http3": {
+            "type": "boolean"
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HttpRoute"
+            }
+          },
+          "default": {
+            "$ref": "#/components/schemas/HttpDefault"
+          },
+          "services": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/HttpService"
+            }
+          },
+          "middlewares": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Middleware"
+            }
+          }
+        },
+        "description": "L7 routing of a tcp rule (plain HTTP or tls.mode terminate).",
+        "additionalProperties": false
+      },
+      "RuleRequest": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "$ref": "#/components/schemas/Protocol"
+          },
+          "listen_addr": {
+            "type": "string"
+          },
+          "listen_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "listen_port_end": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "extra_listen_addrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "More IP addresses to listen on with the same port or range (e.g. IPv6 next to an IPv4 listen_addr)."
+          },
+          "remote_addr": {
+            "type": "string",
+            "description": "Left out on http rules and rules with targets."
+          },
+          "remote_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Target"
+            },
+            "maxItems": 64,
+            "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Balance"
+          },
+          "health_check": {
+            "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "source_ip": {
+            "$ref": "#/components/schemas/SourceIp"
+          },
+          "udp_idle_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400
+          },
+          "tls": {
+            "$ref": "#/components/schemas/Tls"
+          },
+          "starttls": {
+            "$ref": "#/components/schemas/StartTls"
+          },
+          "starttls_required": {
+            "type": "boolean"
+          },
+          "allow_from": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64
+          },
+          "http": {
+            "$ref": "#/components/schemas/Http"
+          },
+          "crowdsec": {
+            "type": "boolean",
+            "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+          }
+        },
+        "required": [
+          "protocol",
+          "listen_addr",
+          "listen_port"
+        ],
+        "additionalProperties": false
+      },
+      "RulePatch": {
+        "type": "object",
+        "properties": {
+          "remote_addr": {
+            "type": "string"
+          },
+          "remote_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Target"
+            },
+            "maxItems": 64,
+            "description": "Several destinations instead of remote_addr / remote_port (exactly one of them)."
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Balance"
+          },
+          "health_check": {
+            "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "udp_idle_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400
+          },
+          "source_ip": {
+            "$ref": "#/components/schemas/SourceIp"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/Tls"
+          },
+          "starttls": {
+            "$ref": "#/components/schemas/StartTls"
+          },
+          "starttls_required": {
+            "type": "boolean"
+          },
+          "listen_port_end": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "allow_from": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64
+          },
+          "http": {
+            "$ref": "#/components/schemas/Http"
+          },
+          "crowdsec": {
+            "type": "boolean",
+            "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+          },
+          "extra_listen_addrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Replaces the extra listen addresses when present ([] removes them all; left out keeps them)."
+          }
+        },
+        "additionalProperties": false,
+        "description": "The backends (remote_addr or targets, balance, health_check) are replaced as a whole: balance left out is round_robin, health_check left out is none."
+      },
+      "HttpStats": {
+        "type": "object",
+        "properties": {
+          "requests": {
+            "type": "integer"
+          },
+          "by_status": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "limited": {
+            "type": "integer"
+          },
+          "blocked": {
+            "type": "integer"
+          },
+          "routes": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "integer"
+                },
+                "by_status": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                },
+                "limited": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                },
+                "blocked": {
+                  "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "http3": {
+            "type": "object",
+            "description": "Rules with http.http3: whether HTTP/3 (QUIC) is answered on the UDP port, and why not.",
+            "properties": {
+              "listening": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "listening"
+            ],
+            "additionalProperties": false
+          }
         }
-       },
-       "additionalProperties": false
-      }
-     },
-     "http3": {
-      "type": "object",
-      "description": "Rules with http.http3: whether HTTP/3 (QUIC) is answered on the UDP port, and why not.",
-      "properties": {
-       "listening": {
-        "type": "boolean"
-       },
-       "error": {
-        "type": "string"
-       }
       },
-      "required": [
-       "listening"
+      "RuleStats": {
+        "type": "object",
+        "properties": {
+          "total_connections": {
+            "type": "integer"
+          },
+          "rx_bytes": {
+            "type": "integer"
+          },
+          "tx_bytes": {
+            "type": "integer"
+          },
+          "tls_failures": {
+            "type": "integer"
+          },
+          "denied": {
+            "type": "integer"
+          },
+          "dropped": {
+            "type": "integer",
+            "description": "UDP datagrams rproxy dropped (a session queue full, or sending failed)"
+          },
+          "http": {
+            "$ref": "#/components/schemas/HttpStats"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TargetStatus"
+            },
+            "description": "Rules with several targets or a health_check."
+          }
+        }
+      },
+      "Rule": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "$ref": "#/components/schemas/Protocol"
+          },
+          "listen_addr": {
+            "type": "string"
+          },
+          "listen_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "listen_port_end": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "nullable": true
+          },
+          "extra_listen_addrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "description": "Left out when empty."
+          },
+          "remote_addr": {
+            "type": "string"
+          },
+          "remote_port": {
+            "type": "integer"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Target"
+            },
+            "maxItems": 64,
+            "description": "Several destinations; remote_addr / remote_port then hold the first."
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Balance"
+          },
+          "health_check": {
+            "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "source_ip": {
+            "$ref": "#/components/schemas/SourceIp"
+          },
+          "udp_idle_secs": {
+            "type": "integer"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/Tls"
+          },
+          "starttls": {
+            "$ref": "#/components/schemas/StartTls"
+          },
+          "starttls_required": {
+            "type": "boolean"
+          },
+          "allow_from": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "http": {
+            "$ref": "#/components/schemas/Http"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "dynamic",
+              "static"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "failed"
+            ]
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "resolved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "connections": {
+            "type": "integer"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/RuleStats"
+          },
+          "started_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "crowdsec": {
+            "type": "boolean",
+            "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+          },
+          "cert_status": {
+            "type": "array",
+            "description": "Expiry of the certificates a terminate rule uses (left out when there are none).",
+            "items": {
+              "$ref": "#/components/schemas/CertStatus"
+            }
+          }
+        },
+        "description": "Fields may be added in patch releases."
+      },
+      "Capabilities": {
+        "type": "object",
+        "properties": {
+          "source_ip": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceIp"
+            }
+          },
+          "transparent": {
+            "type": "boolean"
+          },
+          "transparent_ipv6": {
+            "type": "boolean"
+          },
+          "tls_modes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dtls": {
+            "type": "boolean"
+          },
+          "starttls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StartTls"
+            }
+          },
+          "max_range_ports": {
+            "type": "integer"
+          },
+          "features": {
+            "type": "object",
+            "properties": {
+              "http": {
+                "type": "boolean"
+              },
+              "http3": {
+                "type": "boolean"
+              },
+              "acme": {
+                "type": "boolean"
+              },
+              "tls_options": {
+                "type": "boolean"
+              },
+              "middlewares": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "services": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Interfaces": {
+        "type": "object",
+        "properties": {
+          "interfaces": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "addr": {
+                  "type": "string"
+                },
+                "family": {
+                  "type": "string",
+                  "enum": [
+                    "ipv4",
+                    "ipv6"
+                  ]
+                },
+                "loopback": {
+                  "type": "boolean"
+                },
+                "link_local": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "reserved": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "protocol": {
+                  "type": "string"
+                },
+                "addr": {
+                  "type": "string"
+                },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                },
+                "purpose": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "ConfigStatus": {
+        "type": "object",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "loaded_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "rules": {
+            "type": "integer"
+          },
+          "last_reload": {
+            "type": "object",
+            "properties": {
+              "added": {
+                "type": "integer"
+              },
+              "removed": {
+                "type": "integer"
+              },
+              "changed": {
+                "type": "integer"
+              },
+              "unchanged": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "integer"
+              }
+            },
+            "nullable": true,
+            "additionalProperties": false
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "restart_needed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Balance": {
+        "type": "string",
+        "enum": [
+          "round_robin",
+          "least_conn",
+          "failover"
+        ],
+        "description": "How new connections (sessions, requests) are spread over the destinations."
+      },
+      "Target": {
+        "type": "object",
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "weight": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "backup": {
+            "type": "boolean",
+            "description": "Used only while every other target is down."
+          }
+        },
+        "required": [
+          "addr",
+          "port"
+        ],
+        "additionalProperties": false
+      },
+      "L4HealthCheck": {
+        "type": "object",
+        "properties": {
+          "interval": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "Port to connect to instead of each target's own (required for udp)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TargetStatus": {
+        "type": "object",
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer"
+          },
+          "backup": {
+            "type": "boolean"
+          },
+          "up": {
+            "type": "boolean"
+          },
+          "connections": {
+            "type": "integer"
+          },
+          "total_connections": {
+            "type": "integer"
+          },
+          "resolved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "CertStatus": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "certificate",
+              "client_ca",
+              "client_chain",
+              "upstream_ca",
+              "upstream_certificate"
+            ]
+          },
+          "file": {
+            "type": "string"
+          },
+          "not_after": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "days_left": {
+            "type": "integer",
+            "description": "Whole days left; negative once expired."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "expiring",
+              "expired"
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "file",
+          "not_after",
+          "days_left",
+          "state"
+        ]
+      },
+      "ConfigReload": {
+        "type": "object",
+        "properties": {
+          "added": {
+            "type": "integer"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "changed": {
+            "type": "integer"
+          },
+          "unchanged": {
+            "type": "integer"
+          },
+          "failed": {
+            "type": "integer",
+            "description": "Of the added and changed rules: those registered as failed"
+          },
+          "restart_needed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rules": {
+            "type": "integer"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            }
+          }
+        }
+      },
+      "Finding": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ]
+      },
+      "ConfigReloadError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            }
+          }
+        },
+        "required": [
+          "code",
+          "error"
+        ]
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness (no token)",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/capabilities": {
+      "get": {
+        "summary": "What this build and host can do (any valid token)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This document (any valid token)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/interfaces": {
+      "get": {
+        "summary": "Addresses rules can listen on (rules:read)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Interfaces"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config": {
+      "get": {
+        "summary": "State of the settings file RPROXY_CONFIG (rules:read)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config/reload": {
+      "post": {
+        "summary": "Apply the settings file RPROXY_CONFIG now and answer what happened (admin; by default only over the Unix socket, RPROXY_API_RELOAD_UNIX_ONLY)",
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigReload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The settings have a mistake; nothing changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigReloadError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the admin scope, or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No settings file is configured (code no_config)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rules": {
+      "get": {
+        "summary": "All rules (rules:read)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Rule"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a rule (rules:write)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / tls_config / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "already_exists / reserved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "resolve_failed / bind_failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rules/{protocol}/{listen_addr}/{listen_port}": {
+      "parameters": [
+        {
+          "name": "protocol",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Protocol"
+          }
+        },
+        {
+          "name": "listen_addr",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "IP address; IPv6 without brackets"
+        },
+        {
+          "name": "listen_port",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
       ],
-      "additionalProperties": false
-     }
-    }
-   },
-   "RuleStats": {
-    "type": "object",
-    "properties": {
-     "total_connections": {
-      "type": "integer"
-     },
-     "rx_bytes": {
-      "type": "integer"
-     },
-     "tx_bytes": {
-      "type": "integer"
-     },
-     "tls_failures": {
-      "type": "integer"
-     },
-     "denied": {
-      "type": "integer"
-     },
-     "dropped": {
-      "type": "integer",
-      "description": "UDP datagrams rproxy dropped (a session queue full, or sending failed)"
-     },
-     "http": {
-      "$ref": "#/components/schemas/HttpStats"
-     },
-     "targets": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/TargetStatus"
-      },
-      "description": "Rules with several targets or a health_check."
-     }
-    }
-   },
-   "Rule": {
-    "type": "object",
-    "properties": {
-     "protocol": {
-      "$ref": "#/components/schemas/Protocol"
-     },
-     "listen_addr": {
-      "type": "string"
-     },
-     "listen_port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "listen_port_end": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535,
-      "nullable": true
-     },
-     "extra_listen_addrs": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      },
-      "maxItems": 16,
-      "description": "Left out when empty."
-     },
-     "remote_addr": {
-      "type": "string"
-     },
-     "remote_port": {
-      "type": "integer"
-     },
-     "targets": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/Target"
-      },
-      "maxItems": 64,
-      "description": "Several destinations; remote_addr / remote_port then hold the first."
-     },
-     "balance": {
-      "$ref": "#/components/schemas/Balance"
-     },
-     "health_check": {
-      "$ref": "#/components/schemas/L4HealthCheck"
-     },
-     "source_ip": {
-      "$ref": "#/components/schemas/SourceIp"
-     },
-     "udp_idle_secs": {
-      "type": "integer"
-     },
-     "tls": {
-      "$ref": "#/components/schemas/Tls"
-     },
-     "starttls": {
-      "$ref": "#/components/schemas/StartTls"
-     },
-     "starttls_required": {
-      "type": "boolean"
-     },
-     "allow_from": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "http": {
-      "$ref": "#/components/schemas/Http"
-     },
-     "origin": {
-      "type": "string",
-      "enum": [
-       "dynamic",
-       "static"
-      ]
-     },
-     "state": {
-      "type": "string",
-      "enum": [
-       "running",
-       "failed"
-      ]
-     },
-     "error": {
-      "type": "string",
-      "nullable": true
-     },
-     "resolved": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "connections": {
-      "type": "integer"
-     },
-     "stats": {
-      "$ref": "#/components/schemas/RuleStats"
-     },
-     "started_at": {
-      "type": "integer",
-      "nullable": true
-     },
-     "crowdsec": {
-      "type": "boolean",
-      "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
-     },
-     "cert_status": {
-      "type": "array",
-      "description": "Expiry of the certificates a terminate rule uses (left out when there are none).",
-      "items": {
-       "$ref": "#/components/schemas/CertStatus"
-      }
-     }
-    },
-    "description": "Fields may be added in patch releases."
-   },
-   "Capabilities": {
-    "type": "object",
-    "properties": {
-     "source_ip": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/SourceIp"
-      }
-     },
-     "transparent": {
-      "type": "boolean"
-     },
-     "transparent_ipv6": {
-      "type": "boolean"
-     },
-     "tls_modes": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "dtls": {
-      "type": "boolean"
-     },
-     "starttls": {
-      "type": "array",
-      "items": {
-       "$ref": "#/components/schemas/StartTls"
-      }
-     },
-     "max_range_ports": {
-      "type": "integer"
-     },
-     "features": {
-      "type": "object",
-      "properties": {
-       "http": {
-        "type": "boolean"
-       },
-       "http3": {
-        "type": "boolean"
-       },
-       "acme": {
-        "type": "boolean"
-       },
-       "tls_options": {
-        "type": "boolean"
-       },
-       "middlewares": {
-        "type": "array",
-        "items": {
-         "type": "string"
+      "get": {
+        "summary": "One rule (rules:read)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
         }
-       },
-       "services": {
-        "type": "array",
-        "items": {
-         "type": "string"
-        }
-       }
-      }
-     }
-    }
-   },
-   "Interfaces": {
-    "type": "object",
-    "properties": {
-     "interfaces": {
-      "type": "array",
-      "items": {
-       "type": "object",
-       "properties": {
-        "name": {
-         "type": "string"
-        },
-        "addr": {
-         "type": "string"
-        },
-        "family": {
-         "type": "string",
-         "enum": [
-          "ipv4",
-          "ipv6"
-         ]
-        },
-        "loopback": {
-         "type": "boolean"
-        },
-        "link_local": {
-         "type": "boolean"
-        }
-       }
-      }
-     },
-     "reserved": {
-      "type": "array",
-      "items": {
-       "type": "object",
-       "properties": {
-        "protocol": {
-         "type": "string"
-        },
-        "addr": {
-         "type": "string"
-        },
-        "port": {
-         "type": "integer",
-         "minimum": 1,
-         "maximum": 65535
-        },
-        "purpose": {
-         "type": "string"
-        }
-       }
-      }
-     }
-    }
-   },
-   "ConfigStatus": {
-    "type": "object",
-    "properties": {
-     "configured": {
-      "type": "boolean"
-     },
-     "path": {
-      "type": "string"
-     },
-     "files": {
-      "type": "array",
-      "items": {
-       "type": "string"
-      }
-     },
-     "loaded_at": {
-      "type": "integer",
-      "nullable": true
-     },
-     "rules": {
-      "type": "integer"
-     },
-     "last_reload": {
-      "type": "object",
-      "properties": {
-       "added": {
-        "type": "integer"
-       },
-       "removed": {
-        "type": "integer"
-       },
-       "changed": {
-        "type": "integer"
-       },
-       "unchanged": {
-        "type": "integer"
-       },
-       "failed": {
-        "type": "integer"
-       }
       },
-      "nullable": true,
-      "additionalProperties": false
-     },
-     "error": {
-      "type": "string",
-      "nullable": true
-     },
-     "restart_needed": {
-      "type": "array",
-      "items": {
-       "type": "string"
+      "patch": {
+        "summary": "Change a rule; new connections use it at once (rules:write)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RulePatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / tls_config / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "static",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a rule (rules:write)",
+        "parameters": [
+          {
+            "name": "drain_secs",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Wait this long for connections to finish before closing them"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "static",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
-     }
-    }
-   },
-   "Balance": {
-    "type": "string",
-    "enum": [
-     "round_robin",
-     "least_conn",
-     "failover"
-    ],
-    "description": "How new connections (sessions, requests) are spread over the destinations."
-   },
-   "Target": {
-    "type": "object",
-    "properties": {
-     "addr": {
-      "type": "string"
-     },
-     "port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     },
-     "weight": {
-      "type": "integer",
-      "minimum": 1
-     },
-     "backup": {
-      "type": "boolean",
-      "description": "Used only while every other target is down."
-     }
     },
-    "required": [
-     "addr",
-     "port"
-    ],
-    "additionalProperties": false
-   },
-   "L4HealthCheck": {
-    "type": "object",
-    "properties": {
-     "interval": {
-      "type": "string"
-     },
-     "timeout": {
-      "type": "string"
-     },
-     "port": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535,
-      "description": "Port to connect to instead of each target's own (required for udp)."
-     }
-    },
-    "additionalProperties": false
-   },
-   "TargetStatus": {
-    "type": "object",
-    "properties": {
-     "addr": {
-      "type": "string"
-     },
-     "port": {
-      "type": "integer"
-     },
-     "backup": {
-      "type": "boolean"
-     },
-     "up": {
-      "type": "boolean"
-     },
-     "connections": {
-      "type": "integer"
-     },
-     "total_connections": {
-      "type": "integer"
-     },
-     "resolved": {
-      "type": "array",
-      "items": {
-       "type": "string"
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics (metrics:read)",
+        "responses": {
+          "200": {
+            "description": "Prometheus text format",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
-     }
     }
-   },
-   "CertStatus": {
-    "type": "object",
-    "properties": {
-     "role": {
-      "type": "string",
-      "enum": [
-       "certificate",
-       "client_ca",
-       "client_chain",
-       "upstream_ca",
-       "upstream_certificate"
-      ]
-     },
-     "file": {
-      "type": "string"
-     },
-     "not_after": {
-      "type": "string",
-      "format": "date-time"
-     },
-     "days_left": {
-      "type": "integer",
-      "description": "Whole days left; negative once expired."
-     },
-     "state": {
-      "type": "string",
-      "enum": [
-       "ok",
-       "expiring",
-       "expired"
-      ]
-     }
-    },
-    "required": [
-     "role",
-     "file",
-     "not_after",
-     "days_left",
-     "state"
-    ]
-   }
   }
- },
- "paths": {
-  "/healthz": {
-   "get": {
-    "summary": "Liveness (no token)",
-    "security": [],
-    "responses": {
-     "200": {
-      "description": "ok",
-      "content": {
-       "text/plain": {
-        "schema": {
-         "type": "string"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/capabilities": {
-   "get": {
-    "summary": "What this build and host can do (any valid token)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Capabilities"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/openapi.json": {
-   "get": {
-    "summary": "This document (any valid token)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "type": "object",
-         "properties": {}
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/interfaces": {
-   "get": {
-    "summary": "Addresses rules can listen on (rules:read)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Interfaces"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/config": {
-   "get": {
-    "summary": "State of the settings file RPROXY_CONFIG (rules:read)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/ConfigStatus"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/rules": {
-   "get": {
-    "summary": "All rules (rules:read)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "type": "array",
-         "items": {
-          "$ref": "#/components/schemas/Rule"
-         }
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   },
-   "post": {
-    "summary": "Create a rule (rules:write)",
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "$ref": "#/components/schemas/RuleRequest"
-       }
-      }
-     }
-    },
-    "responses": {
-     "201": {
-      "description": "Created",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Rule"
-        }
-       }
-      }
-     },
-     "400": {
-      "description": "invalid / tls_config / unsupported",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "409": {
-      "description": "already_exists / reserved",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "502": {
-      "description": "resolve_failed / bind_failed",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/rules/{protocol}/{listen_addr}/{listen_port}": {
-   "parameters": [
-    {
-     "name": "protocol",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "$ref": "#/components/schemas/Protocol"
-     }
-    },
-    {
-     "name": "listen_addr",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "type": "string"
-     },
-     "description": "IP address; IPv6 without brackets"
-    },
-    {
-     "name": "listen_port",
-     "in": "path",
-     "required": true,
-     "schema": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 65535
-     }
-    }
-   ],
-   "get": {
-    "summary": "One rule (rules:read)",
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Rule"
-        }
-       }
-      }
-     },
-     "404": {
-      "description": "not_found",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   },
-   "patch": {
-    "summary": "Change a rule; new connections use it at once (rules:write)",
-    "requestBody": {
-     "required": true,
-     "content": {
-      "application/json": {
-       "schema": {
-        "$ref": "#/components/schemas/RulePatch"
-       }
-      }
-     }
-    },
-    "responses": {
-     "200": {
-      "description": "OK",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Rule"
-        }
-       }
-      }
-     },
-     "400": {
-      "description": "invalid / tls_config / unsupported",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "404": {
-      "description": "not_found",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "409": {
-      "description": "static",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   },
-   "delete": {
-    "summary": "Delete a rule (rules:write)",
-    "parameters": [
-     {
-      "name": "drain_secs",
-      "in": "query",
-      "schema": {
-       "type": "integer",
-       "minimum": 0
-      },
-      "description": "Wait this long for connections to finish before closing them"
-     }
-    ],
-    "responses": {
-     "204": {
-      "description": "Deleted"
-     },
-     "404": {
-      "description": "not_found",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "409": {
-      "description": "static",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  },
-  "/metrics": {
-   "get": {
-    "summary": "Prometheus metrics (metrics:read)",
-    "responses": {
-     "200": {
-      "description": "Prometheus text format",
-      "content": {
-       "text/plain": {
-        "schema": {
-         "type": "string"
-        }
-       }
-      }
-     },
-     "401": {
-      "description": "Missing, unknown or expired token",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     },
-     "403": {
-      "description": "The token lacks a scope or the listen port",
-      "content": {
-       "application/json": {
-        "schema": {
-         "$ref": "#/components/schemas/Error"
-        }
-       }
-      }
-     }
-    }
-   }
-  }
- }
 }

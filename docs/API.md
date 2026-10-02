@@ -225,7 +225,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
   - 同じキー（プロトコル・アドレス・ポート）のルールが 2 つあると、両方のファイル名と位置（`web.yaml rule #2` など）を示してエラーにする。
 - DB からの復元より前に開始する。DB に接続できなくても動く。
 - API からは変更・削除できない（`409 static`）。変えるときはファイルを書き換える。
-- **再起動なしの反映**：`RPROXY_CONFIG_CHECK_SECS`（既定 10 秒。`0` なら SIGHUP のときだけ）ごとに、ファイルの大きさ・更新時刻・inode（ディレクトリならファイルの増減も）を確かめ、変わっていれば読み直す。SIGHUP を送ると、変わっていなくても読み直す。シンボリックリンクの差し替え（ConfigMap の更新）も検知する。
+- **再起動なしの反映**：`RPROXY_CONFIG_CHECK_SECS`（既定 10 秒。`0` なら SIGHUP のときだけ）ごとに、ファイルの大きさ・更新時刻・inode（ディレクトリならファイルの増減も）を確かめ、変わっていれば読み直す。SIGHUP を送ると、変わっていなくても読み直す。結果をその場で知りたいときは `POST /config/reload`（下のエンドポイントの表）。シンボリックリンクの差し替え（ConfigMap の更新）も検知する。
   - 読み直した設定は、まず全体を検証する。誤りがあれば何も変えず、それまでのルールを使い続ける（`event: "config.error"`。同じ内容では 1 回だけ）。読めない（権限）ときも同じで、読めるようになるまで確認のたびに試す。
   - 正しければ差分だけを反映する（`event: "config.reload"`。`added`・`removed`・`changed`・`unchanged`・`failed` の件数）。
     - 増えたルールは開始し、なくなったルールは停止する（既存の接続は切る）。
@@ -377,6 +377,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | `GET /capabilities` | | 200 | `{"source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors"],"services":["health_check","sticky","balance"]}}`。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`rules:read` |
+| `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |

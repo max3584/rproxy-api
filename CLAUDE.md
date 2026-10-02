@@ -55,7 +55,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/http/auth.rs` | 認証のミドルウェア（#59）：`basic_auth`（htpasswd の bcrypt / APR1 / {SHA}、通った組み合わせのキャッシュ）、`forward_auth` の問い合わせのヘッダと応答の写し（送るのは `server.rs` が転送先の接続で）、秘密のファイル（`SecretFile`。変わったら数秒以内に読み直す、SIGHUP で `Router::reload_secrets`） |
 | `src/http/oidc.rs` | `oidc`：認可コード + PKCE、discovery と JWKS のキャッシュ、ID トークンの検証（ring。RS/PS/ES）、AES-256-GCM で暗号化したセッションのクッキー、リフレッシュ、ログアウト。コールバックとログアウトのパスは `server.rs` がルーティングの前に渡す。プロバイダへの HTTP は `crowdsec::call` |
 | `src/http/compress.rs` | `compress`：`Accept-Encoding` の交渉、圧縮しない応答の判定、流れてきた分ずつ圧縮する本文（gzip・br・zstd） |
-| `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `main.rs` の `watch_config` → `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
+| `src/config.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `src/config_reload.rs` の `ConfigReloader::reload`（`main.rs` の `watch_config`・SIGHUP・`POST /config/reload` が共有し、Mutex で同時に動かない）→ `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
+| `src/config_reload.rs` | 設定ファイルの再読み込み（`ConfigReloader`）。最後に反映した指紋・誤りを持ち、ファイルの監視・SIGHUP・`POST /config/reload`（`admin` のスコープ。既定は Unix ソケットからだけ：`api::Transport::UnixSocket` の拡張と `RPROXY_API_RELOAD_UNIX_ONLY`）が同じものを使う。失敗したときの詳しい理由は `check::check` |
 | `src/check.rs` | `rproxy-api --check-config`（#140）：設定ファイルを起動時・再読み込みと同じ道筋で確かめる（`ConfigDoc::load`、`Registry::check_rules`。`check_rules` は `validate_static` と同じ検証と、`prepare` のうちソケットと名前解決を除いた `build_parts`（証明書・`http`・秘密のファイル）を通り、誤りで止めずにすべて集める）。待ち受け・DB・制御 API は開かない。`rproxy` のユーザーが読めないかもしれないファイルは所有者とモードから警告 |
 | `src/auth.rs` | トークンファイル（複数トークン同時有効、再読込） |
 | `src/db.rs` | 起動時に `forward_rules` を読む（sqlx / mysql） |

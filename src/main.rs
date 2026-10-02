@@ -18,6 +18,7 @@ use rproxy_api::auth::Tokens;
 use rproxy_api::http::access::{AccessLogError, HttpGlobal};
 use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::config::{ConfigDoc, LoadError};
+use rproxy_api::config_reload::ConfigReloader;
 use rproxy_api::registry::{Config, ConfigStatus, Registry};
 use rproxy_api::tlsconf::CertRole;
 use rproxy_api::{db, logging, resolve, source};
@@ -44,6 +45,9 @@ struct Options {
 	/// Group of the socket file (name or id), e.g. the UI's user group
 	#[arg(long, env = "RPROXY_API_SOCKET_GROUP")]
 	api_socket_group: Option<String>,
+	/// Accept POST /config/reload only over the Unix socket (true / false)
+	#[arg(long, env = "RPROXY_API_RELOAD_UNIX_ONLY", default_value_t = true, action = clap::ArgAction::Set)]
+	api_reload_unix_only: bool,
 	/// File of bearer tokens (one per line, or YAML with scopes); re-read on SIGHUP
 	#[arg(long, env = "RPROXY_TOKEN_FILE")]
 	token_file: Option<PathBuf>,
@@ -403,7 +407,25 @@ async fn run(opts: Options) -> Result<(), String> {
 		}
 	}
 
-	let app = api::router(Arc::new(AppState { registry: registry.clone(), tokens: tokens.clone() }));
+	// the settings file: applied again when it changes, on SIGHUP or by POST /config/reload
+	let reloader = config_path.clone().map(|path| {
+		Arc::new(ConfigReloader::new(
+			doc.map(|(_, d)| d).unwrap_or_default(),
+			registry.clone(),
+			rproxy_api::check::CheckInput {
+				path,
+				reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
+				max_range_ports: opts.max_range_ports,
+				warn_days: opts.cert_warn_days,
+			},
+		))
+	});
+	let app = api::router(Arc::new(AppState {
+		registry: registry.clone(),
+		tokens: tokens.clone(),
+		reloader: reloader.clone(),
+		reload_unix_only: opts.api_reload_unix_only,
+	}));
 	let handles: Arc<Mutex<Vec<Handle>>> = Arc::default();
 	let stop = CancellationToken::new();
 	let retry = Duration::from_secs(opts.api_retry_secs.max(1));
@@ -429,7 +451,8 @@ async fn run(opts: Options) -> Result<(), String> {
 		Some(socket) => match rproxy_api::unix_api::bind(socket).await {
 			Ok(listener) => {
 				info!(event = "api.listening", socket = %socket.path.display());
-				let serve = axum::serve(listener, app.clone()).with_graceful_shutdown(stop.clone().cancelled_owned());
+				let unix_app = app.clone().layer(axum::Extension(api::Transport::UnixSocket));
+				let serve = axum::serve(listener, unix_app).with_graceful_shutdown(stop.clone().cancelled_owned());
 				Some(tokio::spawn(async move { serve.await }))
 			}
 			Err(rproxy_api::unix_api::SocketError::Config(e)) => return Err(e),
@@ -453,12 +476,10 @@ async fn run(opts: Options) -> Result<(), String> {
 		));
 	}
 
-	// the settings file: applied again when it changes, or on SIGHUP
 	let config_hup = Arc::new(Notify::new());
-	if let Some(path) = config_path {
+	if let Some(reloader) = reloader {
 		let every = (opts.config_check_secs > 0).then(|| Duration::from_secs(opts.config_check_secs));
-		let base = doc.map(|(_, d)| d).unwrap_or_default();
-		tokio::spawn(watch_config(path, every, registry.clone(), base, config_hup.clone(), stop.clone()));
+		tokio::spawn(watch_config(every, reloader, config_hup.clone(), stop.clone()));
 	}
 
 	wait_for_shutdown(&tokens, &tls, &opts, &registry, &config_hup).await?;
@@ -556,20 +577,9 @@ fn unix_now() -> u64 {
 
 /// Applies the settings file again when it changes (checked every `every`) or on
 /// SIGHUP (`hup`). A version with a mistake, or one that cannot be read, changes
-/// nothing: the rules of the last good version keep running. `base` is the
-/// version the process started with; `global` changes against it need a restart.
-async fn watch_config(
-	path: PathBuf,
-	every: Option<Duration>,
-	registry: Arc<Registry>,
-	base: ConfigDoc,
-	hup: Arc<Notify>,
-	stop: CancellationToken,
-) {
-	let started_ok = registry.config_status().is_some_and(|s| s.error.is_none());
-	// what was last applied (or found broken); None: try again on every check
-	let mut seen = started_ok.then(|| rproxy_api::config::fingerprint(&path));
-	let mut last_error: Option<String> = None;
+/// nothing: the rules of the last good version keep running. The work is done by
+/// the shared `ConfigReloader`, which `POST /config/reload` also uses.
+async fn watch_config(every: Option<Duration>, reloader: Arc<ConfigReloader>, hup: Arc<Notify>, stop: CancellationToken) {
 	let mut ticks = every.map(|every| {
 		let mut t = tokio::time::interval(every);
 		t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -581,55 +591,7 @@ async fn watch_config(
 			_ = hup.notified() => true,
 			_ = async { match ticks.as_mut() { Some(t) => { t.tick().await; } None => std::future::pending().await } } => false,
 		};
-		let now = rproxy_api::config::fingerprint(&path);
-		if !forced && seen == Some(now) {
-			continue;
-		}
-		let mut status = registry.config_status().unwrap_or_default();
-		status.path = path.display().to_string();
-		let result = match ConfigDoc::load(&path) {
-			Ok(doc) => {
-				let restart: Vec<String> = doc.restart_needed(&base).into_iter().map(String::from).collect();
-				let files: Vec<String> = doc.files.iter().map(|f| f.display().to_string()).collect();
-				let rules = doc.rules.len();
-				match registry.reload_static(doc.labeled_rules()).await {
-					Ok(counts) => {
-						info!(event = "config.reload", added = counts.added, removed = counts.removed, changed = counts.changed,
-							unchanged = counts.unchanged, failed = counts.failed, files = files.len());
-						if !restart.is_empty() {
-							warn!(event = "config.reload", restart_needed = ?restart, "these settings take effect after a restart");
-						}
-						status = ConfigStatus {
-							path: status.path,
-							files,
-							loaded_at: Some(unix_now()),
-							rules,
-							last_reload: Some(counts),
-							error: None,
-							restart_needed: restart,
-						};
-						seen = Some(now);
-						last_error = None;
-						Ok(())
-					}
-					Err(e) => Err((format!("{}: {e}", path.display()), true)),
-				}
-			}
-			Err(LoadError::Invalid(e)) => Err((e, true)),
-			// e.g. permissions: the fingerprint may not change when fixed, so keep trying
-			Err(e @ LoadError::Read(..)) => Err((e.to_string(), false)),
-		};
-		if let Err((error, settled)) = result {
-			if last_error.as_deref() != Some(error.as_str()) {
-				error!(event = "config.error", error = %error, "keeping the rules of the last good settings");
-			}
-			if settled {
-				seen = Some(now);
-			}
-			status.error = Some(error.clone());
-			last_error = Some(error);
-		}
-		registry.set_config_status(status);
+		reloader.reload(forced).await;
 	}
 }
 

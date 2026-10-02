@@ -580,3 +580,131 @@ async fn a_settings_directory_follows_a_swapped_link_and_sighup() {
 	let (_, status) = get_json(port, "/config").await;
 	assert!(status["files"][0].as_str().unwrap().ends_with("rules.yaml"), "{status}");
 }
+
+/// One HTTP/1.1 request with any method over a Unix socket; (status, body).
+async fn unix_request(socket: &Path, method: &str, path: &str, token: Option<&str>) -> (u16, serde_json::Value) {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let mut s = tokio::net::UnixStream::connect(socket).await.unwrap();
+	let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+	s.write_all(format!("{method} {path} HTTP/1.1\r\nHost: rproxy\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+		.await
+		.unwrap();
+	let mut out = String::new();
+	s.read_to_string(&mut out).await.unwrap();
+	let status = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+	let body = out.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+	(status, serde_json::from_str(body).unwrap_or_default())
+}
+
+async fn tcp_post(port: u16, path: &str, token: &str) -> (u16, serde_json::Value) {
+	let r = reqwest::Client::new().post(format!("http://127.0.0.1:{port}{path}")).bearer_auth(token).send().await.unwrap();
+	let status = r.status().as_u16();
+	(status, r.json().await.unwrap_or_default())
+}
+
+fn token_yaml(dir: &Path) -> PathBuf {
+	use sha2::{Digest, Sha256};
+	let hex = |t: &str| Sha256::digest(t.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+	let file = dir.join("tokens.yaml");
+	fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: root, sha256: {}, scopes: [admin]}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n",
+			hex("root-secret"),
+			hex("ui-secret")
+		),
+	)
+	.unwrap();
+	file
+}
+
+#[tokio::test]
+async fn post_config_reload_applies_now_and_answers() {
+	let dir = workdir("reload-api");
+	let socket = dir.join("api.sock");
+	let tokens = token_yaml(&dir);
+	let (a, b) = (tcp_backend("A:").await, tcp_backend("B:").await);
+	let (keep, change, add) = (free_port(), free_port(), free_port());
+	let cfg = dir.join("rproxy.yaml");
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}{}", static_rule(keep, a.port(), ""), static_rule(change, a.port(), "")));
+	let port = free_port();
+	// no background checks: only the API applies changes here
+	let rp = Rproxy::start(
+		&dir,
+		port,
+		&[
+			("RPROXY_CONFIG", cfg.to_str().unwrap()),
+			("RPROXY_CONFIG_CHECK_SECS", "0"),
+			("RPROXY_API_SOCKET", socket.to_str().unwrap()),
+			("RPROXY_TOKEN_FILE", tokens.to_str().unwrap()),
+		],
+	);
+	wait_for("the socket", &rp, || async { unix_get(&socket, "/healthz", None).await.is_some_and(|r| r.ends_with("ok")) }).await;
+
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}{}{}", static_rule(keep, a.port(), ""), static_rule(change, b.port(), ""), static_rule(add, b.port(), "")));
+	// by default only over the Unix socket
+	let (status, v) = tcp_post(port, "/config/reload", "root-secret").await;
+	assert_eq!((status, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("Unix socket"), "{v}");
+	// rules:write is not enough
+	let (status, v) = unix_request(&socket, "POST", "/config/reload", Some("ui-secret")).await;
+	assert_eq!((status, v["code"].as_str()), (403, Some("forbidden")), "{v}");
+	assert_eq!(roundtrip_port(add, "x").await, None, "nothing applied yet");
+
+	let (status, v) = unix_request(&socket, "POST", "/config/reload", Some("root-secret")).await;
+	assert_eq!(status, 200, "{v}");
+	assert_eq!((v["added"].as_u64(), v["changed"].as_u64(), v["removed"].as_u64(), v["unchanged"].as_u64()), (Some(1), Some(1), Some(0), Some(1)), "{v}");
+	assert_eq!(v["restart_needed"], serde_json::json!([]), "{v}");
+	assert_eq!(roundtrip_port(change, "1").await.as_deref(), Some("B:1"));
+	assert_eq!(roundtrip_port(add, "2").await.as_deref(), Some("B:2"));
+	wait_for("the audit line", &rp, || async { rp.log().contains(r#""action":"config.reload""#) && rp.log().contains(r#""outcome":"ok""#) }).await;
+
+	// a mistake: 400 with every finding, the rules stay as they are
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}{}", static_rule(keep, a.port(), ""), static_rule(keep, b.port(), "")));
+	let (status, v) = unix_request(&socket, "POST", "/config/reload", Some("root-secret")).await;
+	assert_eq!((status, v["code"].as_str()), (400, Some("invalid")), "{v}");
+	assert!(!v["errors"].as_array().unwrap().is_empty(), "{v}");
+	assert_eq!(roundtrip_port(add, "3").await.as_deref(), Some("B:3"), "the last good rules keep running");
+	let (_, status) = get_json_unix(&socket, "root-secret").await;
+	assert!(status["error"].as_str().is_some_and(|e| !e.is_empty()), "{status}");
+}
+
+async fn get_json_unix(socket: &Path, token: &str) -> (u16, serde_json::Value) {
+	unix_request(socket, "GET", "/config", Some(token)).await
+}
+
+#[tokio::test]
+async fn post_config_reload_over_tcp_when_allowed_and_without_a_settings_file() {
+	let dir = workdir("reload-api-tcp");
+	let tokens = token_yaml(&dir);
+	let backend = tcp_backend("T:").await;
+	let rule = free_port();
+	let cfg = dir.join("rproxy.yaml");
+	rewrite(&cfg, "version: 1\nrules: []\n");
+	let port = free_port();
+	let rp = Rproxy::start(
+		&dir,
+		port,
+		&[
+			("RPROXY_CONFIG", cfg.to_str().unwrap()),
+			("RPROXY_CONFIG_CHECK_SECS", "0"),
+			("RPROXY_TOKEN_FILE", tokens.to_str().unwrap()),
+			("RPROXY_API_RELOAD_UNIX_ONLY", "false"),
+		],
+	);
+	wait_for("the API", &rp, || async { api_status(port, Some("root-secret")).await == Some(200) }).await;
+	rewrite(&cfg, &format!("version: 1\nrules:\n{}", static_rule(rule, backend.port(), "")));
+	let (status, v) = tcp_post(port, "/config/reload", "root-secret").await;
+	assert_eq!((status, v["added"].as_u64()), (200, Some(1)), "{v}");
+	assert_eq!(roundtrip_port(rule, "x").await.as_deref(), Some("T:x"));
+	drop(rp);
+
+	// no settings file at all
+	let dir = workdir("reload-api-none");
+	let tokens = token_yaml(&dir);
+	let port = free_port();
+	let rp = Rproxy::start(&dir, port, &[("RPROXY_TOKEN_FILE", tokens.to_str().unwrap()), ("RPROXY_API_RELOAD_UNIX_ONLY", "false")]);
+	wait_for("the API", &rp, || async { api_status(port, Some("root-secret")).await == Some(200) }).await;
+	let (status, v) = tcp_post(port, "/config/reload", "root-secret").await;
+	assert_eq!((status, v["code"].as_str()), (409, Some("no_config")), "{v}");
+}
