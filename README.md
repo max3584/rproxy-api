@@ -68,6 +68,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
+| `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | `POST /config/reload`（設定ファイルをその場で読み直して結果を返す）を Unix ソケットからだけ受け付ける。`false` で TCP の制御 API でも受け付ける（どちらも `admin` のトークンが要る） |
 | — | `--check-config [PATH]` | — | 設定ファイル（PATH、なければ `RPROXY_CONFIG`）を確かめて終わる。問題がなければ 0、誤りがあれば 1。`--check-config-format json` で JSON（下の「設定を確かめる」） |
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
@@ -161,6 +162,19 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
 - 設定ファイルが指定されていなければ、確かめるものがないので 0 で終わる
 
 パッケージ（と install.sh）の systemd のユニットは、`systemctl reload rproxy-api` で先にこの確認をします。誤りがあれば reload は失敗し（`journalctl -u rproxy-api` に理由）、rproxy には何も送りません。そのときは、トークンや証明書の読み直しも行われないので、設定ファイルを直してから reload してください。
+
+### その場で反映して結果を受け取る
+
+`systemctl reload` は合図を送るだけなので、反映できたかはコマンドの結果では分かりません。スクリプトで結果がほしいときは、制御 API の `POST /config/reload` を使います。読み直して反映し、追加・変更・削除の数（誤りがあれば何も変えずに `400` と理由）を返します。
+
+```bash
+curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" -X POST http://localhost/config/reload
+# {"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0,"restart_needed":[],"files":["/etc/rproxy/rproxy.yaml"],"rules":5,"warnings":[]}
+```
+
+- `admin` のスコープを持つトークンだけが使えます（UI 用の `rules:read` / `rules:write` では使えない）
+- 既定では Unix ソケット（`RPROXY_API_SOCKET`）からだけ受け付けます。TCP の制御 API から使うなら `RPROXY_API_RELOAD_UNIX_ONLY=false`
+- ファイルの変化の検知・SIGHUP と同じ処理で、同時には動きません
 
 ## TLS・DTLS・STARTTLS・ポート範囲
 

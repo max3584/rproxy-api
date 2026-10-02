@@ -64,7 +64,7 @@ pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::http::access:
 		reserved: vec!["127.0.0.1:1".parse().unwrap()],
 		http: Arc::new(http),
 	});
-	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens) }));
+	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens), reloader: None, reload_unix_only: true }));
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let base = format!("http://{}", listener.local_addr().unwrap());
 	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

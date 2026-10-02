@@ -7,13 +7,15 @@ use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use tracing::info;
 
 use crate::auth::{Principal, Scope, Tokens};
+use crate::check::Finding;
+use crate::config_reload::{ConfigReloader, Outcome};
 use crate::error::ApiError;
 use crate::registry::Registry;
 use crate::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
@@ -21,6 +23,17 @@ use crate::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
 pub struct AppState {
 	pub registry: Arc<Registry>,
 	pub tokens: Arc<Tokens>,
+	/// The settings file (`RPROXY_CONFIG`), for `POST /config/reload`; None when there is none.
+	pub reloader: Option<Arc<ConfigReloader>>,
+	/// `POST /config/reload` only over the Unix socket (`RPROXY_API_RELOAD_UNIX_ONLY`).
+	pub reload_unix_only: bool,
+}
+
+/// How a request reached the control API. The Unix socket's router carries
+/// `Transport::UnixSocket` as an extension; TCP requests have none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+	UnixSocket,
 }
 
 type AppResult<T> = Result<T, ApiError>;
@@ -30,6 +43,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/capabilities", get(capabilities))
 		.route("/openapi.json", get(openapi))
 		.route("/config", get(config_status))
+		.route("/config/reload", post(config_reload))
 		.route("/interfaces", get(interfaces))
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
@@ -48,6 +62,8 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 	match path {
 		"/capabilities" | "/openapi.json" => None,
 		"/metrics" => Some(Scope::MetricsRead),
+		// re-reads files on the host: only for administrators
+		"/config/reload" => Some(Scope::Admin),
 		_ if method == Method::GET => Some(Scope::RulesRead),
 		_ => Some(Scope::RulesWrite),
 	}
@@ -133,6 +149,50 @@ async fn config_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 			Json(v)
 		}
 		None => Json(json!({"configured": false})),
+	}
+}
+
+/// Applies the settings file again now and answers what happened (the same as
+/// the file watcher and SIGHUP do, but the caller learns the result).
+async fn config_reload(
+	State(state): State<Arc<AppState>>,
+	Extension(principal): Extension<Principal>,
+	transport: Option<Extension<Transport>>,
+) -> Response {
+	let audit = |outcome: &str, code: &str| {
+		info!(event = "audit", token = %principal.name, action = "config.reload", rule = "", outcome, code);
+	};
+	if state.reload_unix_only && transport.is_none() {
+		audit("forbidden", "unix_only");
+		return ApiError::forbidden(
+			"POST /config/reload is accepted only over the Unix socket (RPROXY_API_SOCKET); set RPROXY_API_RELOAD_UNIX_ONLY=false to allow it over TCP",
+		)
+		.into_response();
+	}
+	let Some(reloader) = &state.reloader else {
+		audit("error", "no_config");
+		return (StatusCode::CONFLICT, Json(json!({"code": "no_config", "error": "no settings file (RPROXY_CONFIG) is configured"})))
+			.into_response();
+	};
+	match reloader.reload(true).await {
+		Outcome::Applied(applied) => {
+			audit("ok", "");
+			let (errors, warnings) = reloader.findings().await;
+			// applied anyway (e.g. a rule registered as failed): report them as warnings
+			let warnings: Vec<_> = errors.into_iter().chain(warnings).collect();
+			let mut v = serde_json::to_value(&applied).unwrap_or_default();
+			v["warnings"] = json!(warnings);
+			(StatusCode::OK, Json(v)).into_response()
+		}
+		Outcome::Failed(error) => {
+			audit("error", "invalid");
+			let (errors, warnings) = reloader.findings().await;
+			let errors = if errors.is_empty() { vec![Finding { rule: String::new(), message: error.clone() }] } else { errors };
+			(StatusCode::BAD_REQUEST, Json(json!({"code": "invalid", "error": error, "errors": errors, "warnings": warnings})))
+				.into_response()
+		}
+		// forced reloads always read the files
+		Outcome::Unchanged => (StatusCode::OK, Json(json!({}))).into_response(),
 	}
 }
 

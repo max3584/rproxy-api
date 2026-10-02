@@ -5,6 +5,7 @@ pub mod certstore;
 pub mod check;
 pub mod cidr;
 pub mod config;
+pub mod config_reload;
 pub mod db;
 pub mod dtls;
 pub mod error;
