@@ -57,10 +57,14 @@ assets = [
     ["contrib/crowdsec/acquis.d/appsec.yaml", "usr/share/rproxy-api/crowdsec/acquis.d/", "644"],
 ]
 
+[package.metadata.cargo-machete]
+# md-5 is used as `md5` (src/http/auth.rs, htpasswd APR1)
+ignored = ["md-5"]
+
 [dependencies]
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "query", "form"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -72,10 +76,9 @@ socket2 = { version = "0.6.5", features = ["all"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "mysql"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
-dtls = { version = "0.17.2", features = ["pem"] }
+dtls = "0.17.2"
 webrtc-util = { version = "0.17.2", default-features = false, features = ["conn"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2.2.0"
 webpki-roots = "1.0.9"
 x509-parser = "0.18.1"
 async-trait = "0.1.92"
@@ -84,7 +87,6 @@ serde_yaml_ng = "0.10.0"
 regex = "1.13.1"
 hyper = { version = "1.11.1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server", "server-auto", "http1", "http2"] }
-http-body = "1.1.0"
 http-body-util = "0.1.5"
 bytes = "1.12.1"
 futures-util = "0.3.34"

@@ -47,11 +47,11 @@
       "groupName": "GitHub Actions"
     },
     {
-      "description": "Cargo.lock はコミットしていないので、Cargo.toml の範囲を最新に合わせる",
+      "description": "Cargo.lock をコミットしているので、互換の範囲の更新は Cargo.lock だけを上げる（Cargo.toml の下限は互換が切れる更新のときだけ上がる）",
       "matchManagers": [
         "cargo"
       ],
-      "rangeStrategy": "bump"
+      "rangeStrategy": "update-lockfile"
     }
   ]
 }

@@ -46,7 +46,7 @@ API のトークンはインストール時に `/etc/rproxy/tokens` に生成さ
 同じ項目をコマンドライン引数（`--api-port` など）で指定した場合は、引数が優先される。
 
 ```shell
-cargo build --release
+cargo build --locked --release
 cp .env.example .env   # 値を環境に合わせて書き換える
 ./target/release/rproxy-api
 ```
