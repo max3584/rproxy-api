@@ -1,3 +1,5 @@
+English: [API.md](en/API.md)
+
 # rproxy-api 制御 API
 
 UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを変えるときは、このファイルも合わせて更新する。
@@ -63,7 +65,6 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
 | `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
-
 | `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS や PROXY ヘッダより前に切断する。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない） |
 | `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS や PROXY ヘッダより前）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`） |
 

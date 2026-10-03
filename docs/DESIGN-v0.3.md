@@ -1,3 +1,5 @@
+English: [DESIGN-v0.3.md](en/DESIGN-v0.3.md)
+
 # v0.3 の設計: 設定と API の形
 
 v0.3.0 では、これから入れる機能の**設定と API の形**をまとめて決める（#72）。中身は v0.3.x のパッチで順に使えるようにする（docs/RELEASING.md）。

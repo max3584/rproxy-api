@@ -1,3 +1,5 @@
+English: [PERMISSIONS.md](en/PERMISSIONS.md)
+
 # 権限
 
 rproxy-api は root やネットワークの強い権限を持つホストで動かす前提にしている。

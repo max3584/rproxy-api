@@ -1,3 +1,5 @@
+English: [TESTING.md](en/TESTING.md)
+
 # テスト一覧（rproxy-api）
 
 | 実行方法 | 対象 | CI のジョブ |

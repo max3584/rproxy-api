@@ -1,3 +1,5 @@
+English: [MIGRATING-FROM-TRAEFIK.md](en/MIGRATING-FROM-TRAEFIK.md)
+
 # Traefik から移る
 
 `contrib/traefik2rproxy.py`（.deb では `/usr/bin/rproxy-traefik-convert`）は、Traefik の設定を rproxy の設定ファイル（`RPROXY_CONFIG`。`version: 1`・`global`・`rules`）に変換します。変換できなかった設定は、出力の先頭のコメントと標準エラーに一覧されます。出力はそのまま使わず、一覧を確かめてから置いてください。

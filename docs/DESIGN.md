@@ -1,3 +1,5 @@
+English: [DESIGN.md](en/DESIGN.md)
+
 # rproxy-api 設計メモ
 
 実装を進めるための設計記録。2026-09-25 時点のコード (`829521a`) を読んだ上での

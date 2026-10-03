@@ -1,3 +1,5 @@
+English: [architecture.md](../en/architecture.md)
+
 # 構成図
 
 今の構成を図にしたものです（SVG）。
