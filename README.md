@@ -1,3 +1,5 @@
+English: [README.en.md](README.en.md)
+
 # rproxy-api
 
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。

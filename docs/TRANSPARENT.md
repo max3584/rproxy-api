@@ -1,3 +1,5 @@
+English: [TRANSPARENT.md](en/TRANSPARENT.md)
+
 # transparent（クライアントの IP のまま転送先に接続する）
 
 `source_ip: transparent` のルールでは、rproxy がクライアントのアドレスを送信元にして転送先へ接続する（`IP_TRANSPARENT` / `IPV6_TRANSPARENT`）。

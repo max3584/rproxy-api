@@ -1,3 +1,5 @@
+English: [CROWDSEC.md](en/CROWDSEC.md)
+
 # CrowdSec との連携
 
 rproxy は CrowdSec と 2 つの向きで連携します。

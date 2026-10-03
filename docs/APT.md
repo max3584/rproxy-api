@@ -1,3 +1,5 @@
+English: [APT.md](en/APT.md)
+
 # Debian パッケージと apt リポジトリ
 
 ## パッケージの中身

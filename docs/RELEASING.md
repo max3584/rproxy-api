@@ -1,3 +1,5 @@
+English: [RELEASING.md](en/RELEASING.md)
+
 # バージョン管理とリリース
 
 rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と UI（[max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)）は、**同じバージョン番号で一緒に出す**。

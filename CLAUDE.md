@@ -13,7 +13,7 @@ scripts/test-transparent.sh   # transparent の実経路テスト（root 不要�
 cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.example を参照）
 ```
 
-- 設定項目は `src/main.rs` の `Options`（clap）。すべて `RPROXY_*` 環境変数でも指定でき、起動時に `.env` を読む。項目を増やすときは `.env.example` と README の表も更新する。
+- 設定項目は `src/main.rs` の `Options`（clap）。すべて `RPROXY_*` 環境変数でも指定でき、起動時に `.env` を読む。項目を増やすときは `.env.example` と README（`README.md`・`README.en.md`）の表も更新する。
 
 - ring（rustls）のビルドには C コンパイラが要る。
 - `Cargo.toml` を変える PR（Renovate を含む）では `.github/workflows/cross.yml` がリリースと同じターゲット（arm・musl）をビルドする（ARM や musl だけで壊れる依存の更新を、マージ前に見つけるため）。
@@ -81,6 +81,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 宛先（`remote_addr` か `targets`、`balance`、`health_check`）は PATCH で毎回まとめて置き換える（省いた `balance` は round_robin、`health_check` はなし）。一覧の `remote_addr` / `remote_port` は `targets` の先頭（古いクライアント・ログ用）。DB の `options.targets` があれば `dist_addr` / `dist_port` は読まない。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
+- 利用者向けの文書は日本語と英語の両方がある（日本語は `README.md`・`docs/*.md`・`docs/architecture/README.md`、英語は `README.en.md`・`docs/en/`）。片方を変えたら、同じ PR でもう片方も直す。文書を足したら英語版も作り、互いの先頭のリンクと `.deb` の assets（英語版は `/usr/share/doc/rproxy-api/en/`）も揃える。
 
 ## アクセス制御と固定ルール
 
