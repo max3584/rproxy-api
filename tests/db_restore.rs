@@ -4,9 +4,9 @@
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Executor;
 
-use rproxy_api::db;
-use rproxy_api::rule::{Protocol, SourceIp};
-use rproxy_api::tlsconf::{StartTls, TlsMode};
+use rproxy_api::config::db;
+use rproxy_api::core::rule::{Protocol, SourceIp};
+use rproxy_api::tls::config::{StartTls, TlsMode};
 
 const WITH_OPTIONS: &str = "CREATE TABLE forward_rules (
 	id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -85,7 +85,7 @@ async fn loads_every_schema_version() {
 	let r = &rules[3];
 	assert_eq!((r.remote_addr.as_str(), r.remote_port, r.targets.len()), ("", 0, 2));
 	assert_eq!((r.targets[0].weight, r.targets[1].backup), (Some(2), true));
-	assert_eq!(r.balance, rproxy_api::balance::Balance::Failover);
+	assert_eq!(r.balance, rproxy_api::core::balance::Balance::Failover);
 	assert_eq!(r.health_check.as_ref().unwrap().port, Some(5433));
 	assert!(r.clone().validate(&Default::default()).is_ok());
 

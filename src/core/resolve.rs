@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::ApiError;
-use crate::rule::Key;
+use crate::core::rule::Key;
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,7 +78,7 @@ pub fn spawn_refresh(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::rule::Protocol;
+	use crate::core::rule::Protocol;
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	fn key() -> Key {

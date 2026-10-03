@@ -7,10 +7,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::balance::{Lease, Member, Pool};
-use crate::cidr::{self, Cidr};
-use crate::rule::{Key, SourceIp};
-use crate::tlsconf::{best_match, TlsRuntime, Unmatched};
+use crate::core::balance::{Lease, Member, Pool};
+use crate::net::cidr::{self, Cidr};
+use crate::core::rule::{Key, SourceIp};
+use crate::tls::config::{best_match, TlsRuntime, Unmatched};
 
 #[derive(Default)]
 pub struct Stats {
@@ -112,13 +112,13 @@ pub struct Runtime {
 	/// The rule's `crowdsec`: refuse clients blocked by the CrowdSec decisions.
 	pub crowdsec: std::sync::atomic::AtomicBool,
 	/// L7 routing of an `http` rule; replaced as a whole on changes.
-	pub http: RwLock<Option<Arc<crate::http::server::Router>>>,
+	pub http: RwLock<Option<Arc<crate::l7::server::Router>>>,
 	/// `global` settings of `http` rules (trusted proxies, access log).
-	pub global: Arc<crate::http::access::HttpGlobal>,
+	pub global: Arc<crate::l7::access::HttpGlobal>,
 	/// Requests of an `http` rule by route.
-	pub http_stats: crate::http::access::HttpStats,
+	pub http_stats: crate::l7::access::HttpStats,
 	/// HTTP/3 of an `http` rule with `http3` (QUIC over UDP on the same address and port).
-	pub h3: crate::http::h3::H3State,
+	pub h3: crate::l7::h3::H3State,
 	/// The addresses the rule listens on (`listen_addr`, then `extra_listen_addrs`).
 	pub listen: RwLock<Vec<std::net::IpAddr>>,
 	pub udp_idle: watch::Receiver<Duration>,
@@ -140,7 +140,7 @@ impl Runtime {
 		(self.source_ip == SourceIp::Transparent).then_some(client)
 	}
 
-	pub fn http_router(&self) -> Option<Arc<crate::http::server::Router>> {
+	pub fn http_router(&self) -> Option<Arc<crate::l7::server::Router>> {
 		self.http.read().unwrap().clone()
 	}
 
@@ -161,7 +161,7 @@ impl Runtime {
 	/// Until the LAPI has answered once, clients pass.
 	pub fn crowdsec_blocks(&self, client: std::net::IpAddr) -> bool {
 		self.crowdsec.load(Ordering::Relaxed)
-			&& self.global.crowdsec().is_some_and(|b| b.check_ip(client) == crate::http::crowdsec::Verdict::Block)
+			&& self.global.crowdsec().is_some_and(|b| b.check_ip(client) == crate::l7::middleware::crowdsec::Verdict::Block)
 	}
 
 	/// Whether some `tls.routes` relay without terminating (`passthrough`).

@@ -13,8 +13,8 @@ use tracing::info;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-use super::crowdsec::Bouncer;
-use crate::cidr::{self, Cidr};
+use super::middleware::crowdsec::Bouncer;
+use crate::net::cidr::{self, Cidr};
 
 /// Route label for requests that matched no route.
 pub const NO_ROUTE: &str = "(none)";

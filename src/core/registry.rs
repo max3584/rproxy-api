@@ -13,17 +13,17 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use crate::balance::{self, Member, Pool, TargetSpec};
-use crate::certstore::{self, CertStore, Source};
+use crate::core::balance::{self, Member, Pool, TargetSpec};
+use crate::tls::certstore::{self, CertStore, Source};
 use crate::error::ApiError;
-use crate::proxy::{RouteTarget, Runtime, Stats};
-use crate::resolve::{self, Lookup};
-use crate::rule::{
+use crate::core::proxy::{RouteTarget, Runtime, Stats};
+use crate::core::resolve::{self, Lookup};
+use crate::core::rule::{
 	check_transparent_families, validate_backends, validate_extra_listen, validate_udp_idle, Caps, Key, Origin, Protocol,
 	RuleRequest, RuleSpec, RuleStats, RuleView, SourceIp, State, UpdateRequest,
 };
-use crate::tlsconf::{self, Route, TlsMode, TlsRuntime};
-use crate::{tcp, udp};
+use crate::tls::config::{self as tlsconf, Route, TlsMode, TlsRuntime};
+use crate::l4::{tcp, udp};
 
 pub struct Config {
 	pub dns_interval: Duration,
@@ -37,7 +37,7 @@ pub struct Config {
 	/// Addresses rproxy itself listens on (the control API); rules may not take them.
 	pub reserved: Vec<SocketAddr>,
 	/// `global` settings of `http` rules (trusted proxies, access log).
-	pub http: Arc<crate::http::access::HttpGlobal>,
+	pub http: Arc<crate::l7::access::HttpGlobal>,
 }
 
 type Resolver = (CancellationToken, JoinHandle<()>);
@@ -137,7 +137,7 @@ impl Entry {
 					denied: s.denied.load(Ordering::Relaxed),
 					dropped: s.dropped.load(Ordering::Relaxed),
 					http: r.spec.http.is_some().then(|| {
-						let mut v = crate::http::access::HttpStatsView::from_stats(&r.rt.http_stats);
+						let mut v = crate::l7::access::HttpStatsView::from_stats(&r.rt.http_stats);
 						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
 						v.http3 = r.spec.http.as_ref().is_some_and(|h| h.http3).then(|| r.rt.h3.view());
 						v
@@ -158,7 +158,7 @@ struct Prepared {
 	members: Vec<(TargetSpec, Vec<SocketAddr>)>,
 	routes: Vec<(Route, Vec<SocketAddr>)>,
 	tls: Arc<TlsRuntime>,
-	http: Option<Arc<crate::http::server::Router>>,
+	http: Option<Arc<crate::l7::server::Router>>,
 }
 
 /// What `Registry::check_rules` found: (label, message) per problem.
@@ -238,12 +238,12 @@ fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
 	let bound = match spec.key.protocol {
 		Protocol::Tcp => Bound::Tcp(
 			addrs
-				.map(|addr| crate::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
+				.map(|addr| crate::net::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
 		Protocol::Udp => Bound::Udp(
 			addrs
-				.map(|addr| crate::listen::udp(addr, v6only).and_then(tokio::net::UdpSocket::from_std).map_err(|e| bind_error(addr, e)))
+				.map(|addr| crate::net::listen::udp(addr, v6only).and_then(tokio::net::UdpSocket::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
 	};
@@ -297,7 +297,7 @@ fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 		return false;
 	}
 	let (bs, av, bv) = (b.listen_ips(), a.v6only(), b.v6only());
-	a.listen_ips().into_iter().any(|x| bs.iter().any(|y| crate::listen::clash(x, av, *y, bv)))
+	a.listen_ips().into_iter().any(|x| bs.iter().any(|y| crate::net::listen::clash(x, av, *y, bv)))
 }
 
 /// A rule on `::`, whose socket takes IPv4 too unless it has extra addresses.
@@ -371,7 +371,7 @@ impl Registry {
 		let ips = spec.listen_ips();
 		// the control API's own sockets may be dual-stack
 		self.cfg.reserved.iter().copied().find(|r| {
-			(start..=end).contains(&u32::from(r.port())) && ips.iter().any(|ip| crate::listen::clash(*ip, spec.v6only(), r.ip(), false))
+			(start..=end).contains(&u32::from(r.port())) && ips.iter().any(|ip| crate::net::listen::clash(*ip, spec.v6only(), r.ip(), false))
 		})
 	}
 
@@ -380,7 +380,7 @@ impl Registry {
 			transparent: self.cfg.transparent,
 			transparent_ipv6: self.cfg.transparent_ipv6,
 			max_range_ports: self.cfg.max_range_ports,
-			features: crate::rule::Features::CURRENT,
+			features: crate::core::rule::Features::CURRENT,
 		}
 	}
 
@@ -395,7 +395,7 @@ impl Registry {
 			Ok(spec) => Ok((spec, None)),
 			Err(e) if e.code == "unsupported" => {
 				let everything =
-					Caps { transparent: true, transparent_ipv6: true, features: crate::rule::Features::ALL, ..caps };
+					Caps { transparent: true, transparent_ipv6: true, features: crate::core::rule::Features::ALL, ..caps };
 				// still unsupported with everything available: a real mistake (e.g. proxy_v1 on udp)
 				let spec = req.validate(&everything)?;
 				Ok((spec, Some(e.message)))
@@ -447,15 +447,15 @@ impl Registry {
 	/// What a rule needs besides sockets and name resolution: its TLS settings
 	/// with the certificates from the store, and its compiled `http` (secret files
 	/// read). Shared by starting a rule and by `--check-config` (`check_rules`).
-	fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::http::server::Router>>), ApiError> {
+	fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
 		}
 		let http = match &spec.http {
 			Some(h) => {
-				crate::http::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
-				Some(Arc::new(crate::http::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
+				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
+				Some(Arc::new(crate::l7::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
 			}
 			None => None,
 		};
@@ -566,7 +566,7 @@ impl Registry {
 			listeners.insert(ip, token);
 		}
 		if spec.http.as_ref().is_some_and(|h| h.http3) {
-			crate::http::h3::start(&rt);
+			crate::l7::h3::start(&rt);
 		}
 		let stop = rt.stop.clone();
 		let (add_listeners, mut added) = mpsc::unbounded_channel::<ListenerTask>();
@@ -629,7 +629,7 @@ impl Registry {
 	}
 
 	/// The `global` settings of `http` rules.
-	pub fn http_global(&self) -> Arc<crate::http::access::HttpGlobal> {
+	pub fn http_global(&self) -> Arc<crate::l7::access::HttpGlobal> {
 		self.cfg.http.clone()
 	}
 
@@ -652,7 +652,7 @@ impl Registry {
 			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 		}
 		if let Some(list) = &req.allow_from {
-			spec.allow_from = crate::cidr::parse_list(list)?;
+			spec.allow_from = crate::net::cidr::parse_list(list)?;
 		}
 		if let Some(on) = req.crowdsec {
 			spec.crowdsec = on;
@@ -697,21 +697,21 @@ impl Registry {
 			}
 			spec.tls = tls;
 			spec.starttls = req.starttls;
-			spec.starttls_required = req.starttls != Some(crate::tlsconf::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
+			spec.starttls_required = req.starttls != Some(crate::tls::config::StartTls::Smtp) || req.starttls_required.unwrap_or(true);
 		}
 		let http_changed = req.http.is_some();
 		if let Some(http) = req.http {
 			if spec.http.is_none() {
 				return Err(ApiError::unsupported("a rule cannot be turned into an http rule; delete and re-create it"));
 			}
-			if key.protocol != crate::rule::Protocol::Tcp || spec.tls.mode == crate::tlsconf::TlsMode::Sni || spec.starttls.is_some() {
+			if key.protocol != crate::core::rule::Protocol::Tcp || spec.tls.mode == crate::tls::config::TlsMode::Sni || spec.starttls.is_some() {
 				return Err(ApiError::invalid("http needs protocol tcp with tls mode terminate (or no TLS) and no starttls"));
 			}
 			http.validate()?;
 			spec.http = Some(http);
 		}
 		if let Some(h) = &spec.http {
-			crate::rule::check_http_tls(&spec.tls, spec.source_ip, h)?;
+			crate::core::rule::check_http_tls(&spec.tls, spec.source_ip, h)?;
 		}
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
@@ -798,9 +798,9 @@ impl Registry {
 				let h3_was = r.spec.http.as_ref().is_some_and(|h| h.http3);
 				let h3_now = spec.http.as_ref().is_some_and(|h| h.http3);
 				if h3_now && (!h3_was || r.rt.h3.port().is_none() || listen_changed) {
-					crate::http::h3::start(&r.rt);
+					crate::l7::h3::start(&r.rt);
 				} else if h3_was && !h3_now {
-					crate::http::h3::stop(&r.rt);
+					crate::l7::h3::stop(&r.rt);
 				}
 				r.spec = spec;
 			}
@@ -1357,7 +1357,7 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 			continue;
 		}
 		for t in pool.status() {
-			let target = crate::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false }.remote();
+			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false }.remote();
 			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, target.replace('"', "\\\""));
 			up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
 			conns.push(format!("rproxy_target_connections{{{labels}}} {}", t.connections));
@@ -1378,7 +1378,7 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 /// Requests of `http` rules: a counter by route and status class, and a duration
 /// histogram by route. Routes are named in the settings, so the labels stay few.
 fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
-	use crate::http::access::{BUCKETS, CLASSES};
+	use crate::l7::access::{BUCKETS, CLASSES};
 	let mut requests = vec![];
 	let mut durations = vec![];
 	let mut limited = vec![];
@@ -1536,7 +1536,7 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::rule::RuleRequest;
+	use crate::core::rule::RuleRequest;
 
 	fn registry() -> Arc<Registry> {
 		Registry::new(Config {
@@ -1544,7 +1544,7 @@ mod tests {
 			lookup: resolve::system_lookup(),
 			transparent: false,
 			transparent_ipv6: false,
-			max_range_ports: crate::rule::DEFAULT_MAX_RANGE_PORTS,
+			max_range_ports: crate::core::rule::DEFAULT_MAX_RANGE_PORTS,
 			reserved: vec![],
 			http: Default::default(),
 		})

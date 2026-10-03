@@ -16,13 +16,13 @@ use tracing::{debug, info, warn};
 use dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
-use crate::balance::{Lease, Member};
-use crate::dtls::SessionConn;
-use crate::proxy::{shifted, Runtime};
-use crate::rule::SourceIp;
-use crate::source;
-use crate::tlsconf::{TlsMode, TlsRuntime};
-use crate::udpsock::{Listener, Local};
+use crate::core::balance::{Lease, Member};
+use crate::tls::dtls::SessionConn;
+use crate::core::proxy::{shifted, Runtime};
+use crate::core::rule::SourceIp;
+use crate::net::source;
+use crate::tls::config::{TlsMode, TlsRuntime};
+use crate::net::udpsock::{Listener, Local};
 
 const MAX_DATAGRAM: usize = 65_535;
 const SESSION_QUEUE: usize = 1024;
@@ -194,7 +194,7 @@ async fn session(
 		sni = sni.as_deref().unwrap_or(""));
 	let header = proxy_header(rt, client, listener.local_for(local));
 	// sni: the QUIC connection this session was routed for, and a new one being read
-	let mut quic_dcid = first.iter().find_map(|d| crate::udp_sni::quic::initial_dcid(d));
+	let mut quic_dcid = first.iter().find_map(|d| crate::tls::udp_sni::quic::initial_dcid(d));
 	let mut probe: Option<Probe> = None;
 	let mut restart = None;
 
@@ -335,7 +335,7 @@ async fn session(
 /// server name is being read. Its datagrams are held meanwhile.
 struct Probe {
 	dcid: Vec<u8>,
-	sniffer: crate::udp_sni::Sniffer,
+	sniffer: crate::tls::udp_sni::Sniffer,
 	held: Vec<Vec<u8>>,
 	until: tokio::time::Instant,
 }
@@ -354,13 +354,13 @@ enum Step {
 /// new connection to the same name (or one after a Retry, or whose name cannot
 /// be read) stays on this session's backend.
 fn renamed(probe: &mut Option<Probe>, quic_dcid: &mut Option<Vec<u8>>, name: Option<&str>, data: Vec<u8>) -> Step {
-	use crate::udp_sni::Sniff;
+	use crate::tls::udp_sni::Sniff;
 	if probe.is_none() {
-		match crate::udp_sni::quic::initial_dcid(&data) {
+		match crate::tls::udp_sni::quic::initial_dcid(&data) {
 			Some(dcid) if quic_dcid.as_deref() != Some(dcid.as_slice()) => {
 				*probe = Some(Probe {
 					dcid,
-					sniffer: crate::udp_sni::Sniffer::default(),
+					sniffer: crate::tls::udp_sni::Sniffer::default(),
 					held: vec![],
 					until: tokio::time::Instant::now() + SNI_WAIT,
 				});
@@ -417,7 +417,7 @@ async fn sniff(
 	sniffing: &AtomicUsize,
 	carry: Vec<Vec<u8>>,
 ) -> Option<(Option<String>, Vec<Vec<u8>>)> {
-	use crate::udp_sni::{Sniff, Sniffer};
+	use crate::tls::udp_sni::{Sniff, Sniffer};
 	struct Pending<'a>(&'a AtomicUsize);
 	impl Drop for Pending<'_> {
 		fn drop(&mut self) {
@@ -546,7 +546,7 @@ async fn dtls_session(
 		remove(&sessions, peer, id);
 		return;
 	}
-	let client_cn = state.peer_certificates.first().and_then(|c| crate::tlsconf::common_name(c));
+	let client_cn = state.peer_certificates.first().and_then(|c| crate::tls::config::common_name(c));
 
 	let Some(target) = rt.select(None, offset) else {
 		let _ = dtls.close().await;

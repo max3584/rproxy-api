@@ -1,4 +1,4 @@
-//! The `crowdsec` middleware against a fake LAPI and AppSec (src/http/crowdsec.rs).
+//! The `crowdsec` middleware against a fake LAPI and AppSec (src/l7/middleware/crowdsec.rs).
 
 mod common;
 
@@ -15,10 +15,10 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use common::*;
-use rproxy_api::auth::Tokens;
+use rproxy_api::control::auth::Tokens;
 use rproxy_api::config::CrowdsecGlobal;
-use rproxy_api::http::access::HttpGlobal;
-use rproxy_api::http::crowdsec::Bouncer;
+use rproxy_api::l7::access::HttpGlobal;
+use rproxy_api::l7::middleware::crowdsec::Bouncer;
 
 #[derive(Default)]
 struct Lapi {

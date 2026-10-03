@@ -1,5 +1,9 @@
 //! Settings files written by people: YAML (`.yaml` / `.yml`) or JSON (docs/DESIGN-v0.3.md).
 
+pub mod check;
+pub mod db;
+pub mod reload;
+
 use serde::de::DeserializeOwned;
 
 /// Reads YAML through a JSON value, so YAML and JSON mean exactly the same
@@ -22,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::cidr::Cidr;
-use crate::rule::RuleRequest;
+use crate::net::cidr::Cidr;
+use crate::core::rule::RuleRequest;
 
 /// `RPROXY_CONFIG` / `RPROXY_STATIC_RULES`: a document (`version`, `global`,
 /// `rules`) or, as in 0.2, just the array of rules.
@@ -130,8 +134,8 @@ pub fn config_files(path: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// swapped through a symbolic link.
 pub fn fingerprint(path: &Path) -> u64 {
 	match config_files(path) {
-		Ok(files) => crate::tlsconf::fingerprint(files.iter().filter_map(|f| f.to_str())),
-		Err(e) => crate::tlsconf::fingerprint([format!("{:?}", e.kind()).as_str()]),
+		Ok(files) => crate::tls::config::fingerprint(files.iter().filter_map(|f| f.to_str())),
+		Err(e) => crate::tls::config::fingerprint([format!("{:?}", e.kind()).as_str()]),
 	}
 }
 
@@ -211,9 +215,9 @@ impl ConfigDoc {
 
 	/// The same protocol, address and port twice (in one file or across files).
 	fn check_duplicates(&self) -> Result<(), String> {
-		let mut seen: std::collections::HashMap<(crate::rule::Protocol, std::net::SocketAddr), usize> = Default::default();
+		let mut seen: std::collections::HashMap<(crate::core::rule::Protocol, std::net::SocketAddr), usize> = Default::default();
 		for (i, r) in self.rules.iter().enumerate() {
-			let Ok(listen) = crate::rule::parse_listen(&r.listen_addr, r.listen_port) else { continue };
+			let Ok(listen) = crate::core::rule::parse_listen(&r.listen_addr, r.listen_port) else { continue };
 			if let Some(first) = seen.insert((r.protocol, listen), i) {
 				return Err(format!(
 					"{} and {} both listen on {}/{listen}",
@@ -265,13 +269,13 @@ impl ConfigDoc {
 		}
 		if let Some(cs) = &self.global.crowdsec {
 			if let Some(i) = &cs.update_interval {
-				crate::http::parse_duration(i).map_err(|e| format!("global.crowdsec.update_interval: {e}"))?;
+				crate::l7::parse_duration(i).map_err(|e| format!("global.crowdsec.update_interval: {e}"))?;
 			}
 		}
 		// crowdsec middlewares need global.crowdsec (and appsec_url for appsec)
 		for (i, r) in self.rules.iter().enumerate() {
 			for (name, m) in r.http.iter().flat_map(|h| &h.middlewares) {
-				if let crate::http::MiddlewareSpec::Crowdsec { appsec, .. } = m {
+				if let crate::l7::MiddlewareSpec::Crowdsec { appsec, .. } = m {
 					match &self.global.crowdsec {
 						None => return Err(format!("{}: middleware {name}: crowdsec needs global.crowdsec", self.label(i))),
 						Some(cs) if *appsec && cs.appsec_url.is_none() => {
@@ -344,13 +348,13 @@ rules:
 	/// The examples people copy must stay valid.
 	#[test]
 	fn the_examples_in_the_repository_are_valid() {
-		let caps = crate::rule::Caps { features: crate::rule::Features::ALL, ..Default::default() };
-		let example = ConfigDoc::parse(Path::new("rproxy.example.yaml"), include_str!("../contrib/rproxy.example.yaml")).unwrap();
+		let caps = crate::core::rule::Caps { features: crate::core::rule::Features::ALL, ..Default::default() };
+		let example = ConfigDoc::parse(Path::new("rproxy.example.yaml"), include_str!("../../contrib/rproxy.example.yaml")).unwrap();
 		for r in example.rules {
 			r.validate(&caps).unwrap();
 		}
 		// docs/DESIGN-v0.3.md, 7.: the Traefik settings written for rproxy
-		let design = include_str!("../docs/DESIGN-v0.3.md");
+		let design = include_str!("../../docs/DESIGN-v0.3.md");
 		let section = &design[design.find("## 7.").unwrap()..];
 		let yaml = section.split("```yaml").nth(1).unwrap().split("```").next().unwrap();
 		// the example refers to a resolver defined elsewhere in the document

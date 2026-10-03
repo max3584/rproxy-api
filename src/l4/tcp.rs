@@ -13,13 +13,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::balance::Lease;
-use crate::http::server::{self as http, Metered};
-use crate::proxy::{Counted, Runtime, Target};
-use crate::rule::SourceIp;
-use crate::source::{self, TlsInfo};
-use crate::starttls::{self, Outcome};
-use crate::tlsconf::{StartTls, TlsMode, TlsRuntime};
+use crate::core::balance::Lease;
+use crate::l7::server::{self as http, Metered};
+use crate::core::proxy::{Counted, Runtime, Target};
+use crate::core::rule::SourceIp;
+use crate::net::source::{self, TlsInfo};
+use crate::l4::starttls::{self, Outcome};
+use crate::tls::config::{StartTls, TlsMode, TlsRuntime};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// With other targets to fall back on, a target that does not answer is given up after this.
@@ -66,7 +66,7 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	let bind_as = rt.bind_as(client);
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
-	let usable = |c: &&crate::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
+	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
 	let fallback = target.candidates.iter().filter(usable).count() > 1;
 	for c in target.candidates.iter().filter(usable) {
 		let lease = c.lease();
@@ -144,7 +144,7 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	let mut prefix = Vec::new();
 	let mut pass = None;
 	if tls.mode() == TlsMode::Terminate && tls.starttls.is_none() && rt.has_passthrough() {
-		match crate::sni::read_client_hello(&mut inbound).await {
+		match crate::tls::sni::read_client_hello(&mut inbound).await {
 			Ok((name, hello)) => match rt.select(name.as_deref(), offset) {
 				Some(target) if target.passthrough => pass = Some((name, hello, target)),
 				// no match with `unmatched: reject` is refused by the TLS handshake below
@@ -219,7 +219,7 @@ async fn run(
 			finish(rt, inbound, &mut out, backend, detail).await
 		}
 		TlsMode::Sni => {
-			let (name, hello) = crate::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
+			let (name, hello) = crate::tls::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
 			let target = rt.select(name.as_deref(), offset).ok_or_else(|| denied(rt, client, "unmatched", name.as_deref()))?;
 			relay_hello(inbound, client, local, rt, &target, name, hello, false, detail).await
 		}
@@ -364,14 +364,14 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 		alpn: conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
 		version: conn.protocol_version().map(|v| format!("{v:?}")),
 		cipher: conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())),
-		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
+		client_cn: peer_cert.as_deref().and_then(crate::tls::config::common_name),
 		client_cert: peer_cert.is_some(),
 	};
 	Ok((session, info))
 }
 
 /// A connection of an `http` rule: TLS (for `terminate`), then HTTP requests
-/// routed one by one (src/http/server.rs).
+/// routed one by one (src/l7/server.rs).
 async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
 	let started = Instant::now();
 	rt.stats.opened();

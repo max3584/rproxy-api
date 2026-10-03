@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use common::pki::Pki;
 use common::*;
-use rproxy_api::starttls::Lines;
+use rproxy_api::l4::starttls::Lines;
 
 type Seen = Arc<Mutex<Vec<String>>>;
 

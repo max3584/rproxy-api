@@ -11,7 +11,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use common::pki::Pki;
 use common::*;
-use rproxy_api::rule::RuleRequest;
+use rproxy_api::core::rule::RuleRequest;
 
 /// Whether the proxy answers `msg` on a fresh connection (closed = refused).
 async fn tcp_answers(port: u16, msg: &str) -> bool {

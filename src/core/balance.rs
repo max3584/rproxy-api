@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::ApiError;
-use crate::rule::{validate_remote, Key, Protocol};
+use crate::core::rule::{validate_remote, Key, Protocol};
 
 /// Targets one rule may have.
 pub const MAX_TARGETS: usize = 64;
@@ -92,7 +92,7 @@ pub struct HealthCheckSpec {
 impl HealthCheckSpec {
 	fn duration(value: Option<&String>, default: Duration, what: &str) -> Result<Duration, ApiError> {
 		match value {
-			Some(v) => crate::http::parse_duration(v).map_err(|e| ApiError::invalid(format!("health_check.{what}: {e}"))),
+			Some(v) => crate::l7::parse_duration(v).map_err(|e| ApiError::invalid(format!("health_check.{what}: {e}"))),
 			None => Ok(default),
 		}
 	}
@@ -178,7 +178,7 @@ impl Member {
 
 	/// The addresses to connect to on port `offset` of a range.
 	pub fn addrs(&self, offset: u16) -> Vec<SocketAddr> {
-		self.addrs.borrow().iter().map(|a| crate::proxy::shifted(*a, offset)).collect()
+		self.addrs.borrow().iter().map(|a| crate::core::proxy::shifted(*a, offset)).collect()
 	}
 }
 

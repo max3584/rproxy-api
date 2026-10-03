@@ -10,10 +10,10 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::{ConfigDoc, LoadError};
-use crate::http::access::{access_log_dir, HttpGlobal};
-use crate::http::crowdsec::{Bouncer, CrowdsecError};
-use crate::http::MiddlewareSpec;
-use crate::registry::{Config, Registry};
+use crate::l7::access::{access_log_dir, HttpGlobal};
+use crate::l7::middleware::crowdsec::{Bouncer, CrowdsecError};
+use crate::l7::MiddlewareSpec;
+use crate::core::registry::{Config, Registry};
 
 /// What to check, from the same options the service starts with.
 pub struct CheckInput {
@@ -132,9 +132,9 @@ pub async fn check(input: &CheckInput) -> Report {
 
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_secs(30),
-		lookup: crate::resolve::system_lookup(),
-		transparent: crate::source::transparent_available(),
-		transparent_ipv6: crate::source::transparent_v6_available(),
+		lookup: crate::core::resolve::system_lookup(),
+		transparent: crate::net::source::transparent_available(),
+		transparent_ipv6: crate::net::source::transparent_v6_available(),
 		max_range_ports: input.max_range_ports.max(1),
 		reserved: input.reserved.clone(),
 		http: Arc::new(http),
@@ -174,9 +174,9 @@ pub async fn check(input: &CheckInput) -> Report {
 	report
 }
 
-fn access_error(e: crate::http::access::AccessLogError) -> String {
+fn access_error(e: crate::l7::access::AccessLogError) -> String {
 	match e {
-		crate::http::access::AccessLogError::Config(m) | crate::http::access::AccessLogError::Unavailable(m) => m,
+		crate::l7::access::AccessLogError::Config(m) | crate::l7::access::AccessLogError::Unavailable(m) => m,
 	}
 }
 

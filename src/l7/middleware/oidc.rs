@@ -170,8 +170,8 @@ pub struct OidcSettings<'a> {
 impl Oidc {
 	pub fn new(name: &str, s: OidcSettings<'_>) -> Result<Oidc, ApiError> {
 		let what = format!("middleware {name}");
-		let up = crate::tlsconf::Upstream { ca_file: s.ca_file.map(str::to_string), ..Default::default() };
-		let tls = crate::tlsconf::client_config(&up).map_err(|e| ApiError::invalid(format!("{what}: ca_file: {}", e.message)))?;
+		let up = crate::tls::config::Upstream { ca_file: s.ca_file.map(str::to_string), ..Default::default() };
+		let tls = crate::tls::config::client_config(&up).map_err(|e| ApiError::invalid(format!("{what}: ca_file: {}", e.message)))?;
 		Ok(Oidc {
 			name: name.to_string(),
 			issuer: s.issuer.trim_end_matches('/').to_string(),

@@ -602,7 +602,7 @@ async fn http_rules_pass_some_names_through_on_the_same_port() {
 }
 
 fn unix_now() -> i64 {
-	rproxy_api::tlsconf::unix_now()
+	rproxy_api::tls::config::unix_now()
 }
 
 /// The `cert_status` entry of a rule view for `file`.

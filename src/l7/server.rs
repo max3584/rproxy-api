@@ -24,21 +24,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
-use super::auth::{BasicVerdict, ForwardAuth};
-use super::oidc::{self, Oidc};
+use super::middleware::auth::{BasicVerdict, ForwardAuth};
+use super::middleware::oidc::{self, Oidc};
 use super::backend::{self, Dialer, ServerHealth, Service};
 use super::compress;
-use super::crowdsec::Verdict;
-use super::limit::Hold;
+use super::middleware::crowdsec::Verdict;
+use super::middleware::limit::Hold;
 use super::middleware::{self, Blocked, Ctx, Limited, Middleware};
 use super::resilience::{self, RetryPolicy, Ticket};
 use super::{HttpSpec, Matcher};
 use crate::error::ApiError;
-use crate::http::matcher::RequestInfo;
-use crate::proxy::Runtime;
-use crate::resolve::Lookup;
-use crate::source::TlsInfo;
-use crate::tlsconf::Upstream;
+use crate::l7::matcher::RequestInfo;
+use crate::core::proxy::Runtime;
+use crate::core::resolve::Lookup;
+use crate::net::source::TlsInfo;
+use crate::tls::config::Upstream;
 
 /// An error of a request or response body: hyper's (HTTP/1.1, HTTP/2) or h3's
 /// (HTTP/3). A struct rather than `Box<dyn Error>` itself, which trips the
@@ -147,7 +147,7 @@ impl Router {
 		};
 		let default_status = StatusCode::from_u16(default.map(|d| d.status).unwrap_or(404))
 			.map_err(|e| ApiError::invalid(format!("default: {e}")))?;
-		let mut config: ClientConfig = (*crate::tlsconf::client_config(upstream)?).clone();
+		let mut config: ClientConfig = (*crate::tls::config::client_config(upstream)?).clone();
 		config.alpn_protocols = vec![b"http/1.1".to_vec()];
 		let dialer = Dialer {
 			lookup,
@@ -1084,7 +1084,7 @@ mod tests {
 	fn router(yaml: &str) -> Router {
 		let spec: HttpSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
 		spec.validate().unwrap();
-		Router::compile(&spec, &Upstream::default(), crate::resolve::system_lookup()).unwrap()
+		Router::compile(&spec, &Upstream::default(), crate::core::resolve::system_lookup()).unwrap()
 	}
 
 	fn route<'a>(r: &'a Router, host: &str, path: &str) -> &'a str {

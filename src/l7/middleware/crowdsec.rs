@@ -20,9 +20,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::server::Body;
-use super::{HttpSpec, MiddlewareSpec};
-use crate::cidr::Cidr;
+use crate::l7::server::Body;
+use crate::l7::{HttpSpec, MiddlewareSpec};
+use crate::net::cidr::Cidr;
 use crate::config::CrowdsecGlobal;
 use crate::error::ApiError;
 
@@ -72,7 +72,7 @@ enum Target {
 }
 
 fn canonical(ip: IpAddr) -> IpAddr {
-	super::access::canonical(ip)
+	crate::l7::access::canonical(ip)
 }
 
 impl Target {
@@ -207,7 +207,7 @@ impl Bouncer {
 		let lapi = parse_url(&g.lapi_url, "global.crowdsec.lapi_url")?;
 		let appsec = g.appsec_url.as_deref().map(|u| parse_url(u, "global.crowdsec.appsec_url")).transpose()?;
 		let interval = match &g.update_interval {
-			Some(i) => super::parse_duration(i).map_err(|e| CrowdsecError::Config(format!("global.crowdsec.update_interval: {e}")))?,
+			Some(i) => crate::l7::parse_duration(i).map_err(|e| CrowdsecError::Config(format!("global.crowdsec.update_interval: {e}")))?,
 			None => DEFAULT_INTERVAL,
 		}
 		.max(Duration::from_secs(1));
@@ -223,7 +223,7 @@ impl Bouncer {
 				String::new()
 			}
 		};
-		let tls = crate::tlsconf::client_config(&Default::default())
+		let tls = crate::tls::config::client_config(&Default::default())
 			.map_err(|e| CrowdsecError::Config(format!("global.crowdsec: {}", e.message)))?;
 		Ok(Arc::new(Bouncer {
 			lapi,

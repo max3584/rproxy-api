@@ -25,7 +25,7 @@ use tracing::{info, warn};
 use super::server::Body;
 use super::{parse_duration, ServiceSpec};
 use crate::error::ApiError;
-use crate::resolve::{self, Lookup};
+use crate::core::resolve::{self, Lookup};
 
 const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 const DEFAULT_RESPONSE: Duration = Duration::from_secs(60);
@@ -132,7 +132,7 @@ pub struct Service {
 	pub health: Option<HealthCheck>,
 	/// Name of the sticky cookie.
 	pub sticky: Option<String>,
-	pub balance: crate::balance::Balance,
+	pub balance: crate::core::balance::Balance,
 }
 
 fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError> {
@@ -205,8 +205,8 @@ impl Service {
 			}
 		}
 		match self.balance {
-			crate::balance::Balance::Failover => return self.servers.iter().position(Server::is_up),
-			crate::balance::Balance::LeastConn => {
+			crate::core::balance::Balance::Failover => return self.servers.iter().position(Server::is_up),
+			crate::core::balance::Balance::LeastConn => {
 				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| self.servers[i].is_up()).collect();
 				if up.is_empty() {
 					return None;
@@ -220,7 +220,7 @@ impl Service {
 					la.cmp(&lb)
 				});
 			}
-			crate::balance::Balance::RoundRobin => {}
+			crate::core::balance::Balance::RoundRobin => {}
 		}
 		// a few draws; with most servers down, fall back to scanning
 		for _ in 0..self.servers.len() * 4 {
@@ -284,7 +284,7 @@ impl Dialer {
 		let mut last = String::from("no addresses");
 		let mut tcp = None;
 		for addr in addrs {
-			match crate::source::connect_tcp(addr, bind).await {
+			match crate::net::source::connect_tcp(addr, bind).await {
 				Ok(s) => {
 					tcp = Some(s);
 					break;

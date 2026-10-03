@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::balance::{self, Balance, HealthCheckSpec, TargetSpec};
-use crate::cidr::{self, Cidr};
+use crate::core::balance::{self, Balance, HealthCheckSpec, TargetSpec};
+use crate::net::cidr::{self, Cidr};
 use crate::error::ApiError;
-use crate::http::HttpSpec;
-use crate::tlsconf::{self, StartTls, TlsMode, TlsSpec};
+use crate::l7::HttpSpec;
+use crate::tls::config::{self as tlsconf, StartTls, TlsMode, TlsSpec};
 
 pub const DEFAULT_UDP_IDLE_SECS: u64 = 30;
 pub const DEFAULT_MAX_RANGE_PORTS: u16 = 20_000;
@@ -394,7 +394,7 @@ pub fn check_http_tls(tls: &TlsSpec, source_ip: SourceIp, http: &HttpSpec) -> Re
 			"http rules route by match; only passthrough tls.routes are used (use Host(...) in http.routes)",
 		));
 	}
-	if tls.unmatched == crate::tlsconf::Unmatched::Reject {
+	if tls.unmatched == crate::tls::config::Unmatched::Reject {
 		return Err(ApiError::tls_config("http rules answer unmatched names with http.default; unmatched: reject is not used"));
 	}
 	if tls.upstream.tls {
@@ -611,7 +611,7 @@ pub struct RuleStats {
 	pub dropped: u64,
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub http: Option<crate::http::access::HttpStatsView>,
+	pub http: Option<crate::l7::access::HttpStatsView>,
 	/// State of each backend, for rules with `targets` or `health_check`.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub targets: Vec<balance::TargetStatus>,
@@ -655,7 +655,7 @@ pub struct RuleView {
 	pub started_at: Option<u64>,
 	/// Expiry of the certificates the rule uses (terminate); filled in by the registry.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
-	pub cert_status: Vec<crate::certstore::CertStatusView>,
+	pub cert_status: Vec<crate::tls::certstore::CertStatusView>,
 }
 
 impl RuleView {
@@ -825,8 +825,8 @@ mod tests {
 	fn starttls_required_is_only_optional_for_smtp() {
 		let terminate = || {
 			Some(TlsSpec {
-				mode: crate::tlsconf::TlsMode::Terminate,
-				certificates: vec![crate::tlsconf::CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into(), ..Default::default() }],
+				mode: crate::tls::config::TlsMode::Terminate,
+				certificates: vec![crate::tls::config::CertFiles { cert_file: "a".into(), chain_file: None, key_file: "b".into(), ..Default::default() }],
 				..Default::default()
 			})
 		};

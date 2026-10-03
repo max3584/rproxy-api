@@ -9,9 +9,9 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::check::{self, CheckInput, Finding};
+use crate::config::check::{self, CheckInput, Finding};
 use crate::config::{fingerprint, ConfigDoc, LoadError};
-use crate::registry::{ConfigStatus, Registry, ReloadCounts};
+use crate::core::registry::{ConfigStatus, Registry, ReloadCounts};
 
 /// What one reload did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

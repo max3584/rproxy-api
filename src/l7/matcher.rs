@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use regex::Regex;
 
-use crate::cidr::Cidr;
+use crate::net::cidr::Cidr;
 
 /// A parsed `match` expression.
 #[derive(Clone, Debug)]
@@ -282,7 +282,7 @@ impl Matcher {
 			Matcher::Not(a) => !a.matches(r),
 			Matcher::Host(hosts) => {
 				let host = strip_port(r.host).to_ascii_lowercase();
-				hosts.iter().any(|h| crate::tlsconf::name_matches(h, &host))
+				hosts.iter().any(|h| crate::tls::config::name_matches(h, &host))
 			}
 			Matcher::HostRegexp(re) => re.is_match(&strip_port(r.host).to_ascii_lowercase()),
 			Matcher::Path(paths) => paths.iter().any(|p| p == r.path),

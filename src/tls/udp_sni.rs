@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use ring::{aead, hkdf};
 
-use crate::sni;
+use crate::tls::sni;
 
 /// ClientHellos larger than this are not assembled (post-quantum key shares make
 /// them ~2 KiB today).
@@ -557,7 +557,7 @@ mod tests {
 
 	#[test]
 	fn rfc9001_client_initial_decrypts_to_example_com() {
-		let packet = hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"));
+		let packet = hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"));
 		assert_eq!(packet.len(), 1200);
 		// header c0 00000001 08 <dcid> 00 00 449e: packet number at 18
 		let frames = unprotect(Version::V1, &hex(DCID), &packet, 18).expect("decrypts with the RFC's keys");
@@ -570,7 +570,7 @@ mod tests {
 
 	#[test]
 	fn rfc9369_client_initial_decrypts_to_example_com() {
-		let packet = hex(include_str!("../tests/fixtures/quic/rfc9369-client-initial.hex"));
+		let packet = hex(include_str!("../../tests/fixtures/quic/rfc9369-client-initial.hex"));
 		assert!(quic::looks_like(&packet));
 		assert_eq!(Sniffer::default().push(&packet), Sniff::Done(Some("example.com".into())));
 		// the v1 keys do not open it
@@ -579,12 +579,12 @@ mod tests {
 
 	#[test]
 	fn a_corrupted_rfc_packet_gives_no_name() {
-		let mut packet = hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"));
+		let mut packet = hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"));
 		packet[600] ^= 1; // fails the AEAD tag
 		let mut s = Sniffer::default();
 		assert_eq!(s.push(&packet), Sniff::NeedMore, "an Initial that does not decrypt is skipped");
 		// a later, good one still works
-		let good = hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"));
+		let good = hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"));
 		assert_eq!(s.push(&good), Sniff::Done(Some("example.com".into())));
 	}
 
@@ -653,7 +653,7 @@ mod tests {
 	#[test]
 	fn builder_matches_the_rfc_packet() {
 		// the same frames, packet number and keys give the RFC's bytes
-		let rfc = hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"));
+		let rfc = hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"));
 		let frames = unprotect(Version::V1, &hex(DCID), &rfc, 18).unwrap();
 		let built = initial(Version::V1, &hex(DCID), 2, &frames, b"");
 		assert_eq!(built, rfc);
@@ -878,7 +878,7 @@ mod tests {
 		// once decided, later datagrams do not change it
 		let mut s = Sniffer::default();
 		assert_eq!(s.push(b"hello"), Sniff::Unknown);
-		assert_eq!(s.push(&hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"))), Sniff::Unknown);
+		assert_eq!(s.push(&hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"))), Sniff::Unknown);
 	}
 
 	/// Random and mutated input never panics and always ends in one of the three answers.
@@ -891,7 +891,7 @@ mod tests {
 			seed ^= seed << 17;
 			seed
 		};
-		let rfc = hex(include_str!("../tests/fixtures/quic/rfc9001-client-initial.hex"));
+		let rfc = hex(include_str!("../../tests/fixtures/quic/rfc9001-client-initial.hex"));
 		let body = dtls_hello_body(Some("fuzz.example"), b"", [0xfe, 0xfd]);
 		let dtls_rec = dtls_records(&body, 0, &[], [0xfe, 0xfd]).remove(0);
 		for i in 0..20_000 {

@@ -295,6 +295,6 @@ cargo clippy --all-targets
 
 rproxy-api は glacierx の [rproxy](https://github.com/glacierx/rproxy)（MIT License）を出発点に始めた。
 今は制御 API・TLS・DTLS・STARTTLS・送信元 IP の引き渡しなどを含め、コードはすべて作り直した独立したプロジェクトで、元のプロジェクトとは別に開発している。
-TCP の双方向の転送ループと、UDP のクライアントごとのセッションという設計は元のプロジェクトに由来する（`src/tcp.rs` と `src/udp.rs` の先頭に記載）。
+TCP の双方向の転送ループと、UDP のクライアントごとのセッションという設計は元のプロジェクトに由来する（`src/l4/tcp.rs` と `src/l4/udp.rs` の先頭に記載）。
 
 MIT License。元のプロジェクトの著作権表示も含めて [LICENSE](LICENSE) を参照。

@@ -28,7 +28,7 @@ pub const DEFAULT_REALM: &str = "rproxy";
 pub const DEFAULT_FORWARD_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn fingerprint(path: &Path) -> u64 {
-	crate::tlsconf::fingerprint([path.to_str().unwrap_or("")])
+	crate::tls::config::fingerprint([path.to_str().unwrap_or("")])
 }
 
 /// A file with a secret (users, client secret, cookie key), parsed into `T`.
@@ -323,7 +323,7 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 #[derive(Debug)]
 pub struct ForwardAuth {
 	pub name: String,
-	pub service: Arc<super::backend::Service>,
+	pub service: Arc<crate::l7::backend::Service>,
 	/// Path and query of `address`.
 	pub path: String,
 	/// Headers of the auth server's 2xx answer copied to the request for the backend.
@@ -486,7 +486,7 @@ mod tests {
 
 	#[test]
 	fn forward_auth_headers() {
-		let service = Arc::new(super::super::backend::Service::single("http://127.0.0.1:1/auth").unwrap());
+		let service = Arc::new(crate::l7::backend::Service::single("http://127.0.0.1:1/auth").unwrap());
 		let mut fa = ForwardAuth {
 			name: "fa".into(),
 			service,

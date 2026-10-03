@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::tlsconf::StartTls;
+use crate::tls::config::StartTls;
 
 const MAX_LINE: usize = 4096;
 const MAX_PLAIN_COMMANDS: usize = 32;

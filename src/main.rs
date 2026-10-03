@@ -13,15 +13,15 @@ use tokio::sync::{Notify, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use rproxy_api::api::{self, AppState};
-use rproxy_api::auth::Tokens;
-use rproxy_api::http::access::{AccessLogError, HttpGlobal};
-use rproxy_api::http::crowdsec::{Bouncer, CrowdsecError};
+use rproxy_api::control::api::{self, AppState};
+use rproxy_api::control::auth::Tokens;
+use rproxy_api::l7::access::{AccessLogError, HttpGlobal};
+use rproxy_api::l7::middleware::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::config::{ConfigDoc, LoadError};
-use rproxy_api::config_reload::ConfigReloader;
-use rproxy_api::registry::{Config, ConfigStatus, Registry};
-use rproxy_api::tlsconf::CertRole;
-use rproxy_api::{db, logging, resolve, source};
+use rproxy_api::config::reload::ConfigReloader;
+use rproxy_api::core::registry::{Config, ConfigStatus, Registry};
+use rproxy_api::tls::config::CertRole;
+use rproxy_api::{config::db, core::resolve, logging, net::source};
 
 /// TCP/UDP forwarder controlled over an HTTP API.
 ///
@@ -68,7 +68,7 @@ struct Options {
 	#[arg(long, env = "RPROXY_CERT_EXPIRY_CHECK_SECS", default_value_t = 86_400)]
 	cert_expiry_check_secs: u64,
 	/// Days before expiry from which a certificate is reported as expiring
-	#[arg(long, env = "RPROXY_CERT_WARN_DAYS", default_value_t = rproxy_api::certstore::DEFAULT_WARN_DAYS)]
+	#[arg(long, env = "RPROXY_CERT_WARN_DAYS", default_value_t = rproxy_api::tls::certstore::DEFAULT_WARN_DAYS)]
 	cert_warn_days: u64,
 	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
 	#[arg(long, env = "RPROXY_LOG_FILE")]
@@ -97,7 +97,7 @@ struct Options {
 	#[arg(long, env = "RPROXY_DNS_INTERVAL", default_value_t = 30)]
 	dns_interval: u64,
 	/// Largest port range (listen_port..listen_port_end) one rule may open
-	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS)]
+	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::core::rule::DEFAULT_MAX_RANGE_PORTS)]
 	max_range_ports: u16,
 	/// Seconds between attempts to open a control API listener that could not start
 	#[arg(long, env = "RPROXY_API_RETRY_SECS", default_value_t = 10, hide = true)]
@@ -209,8 +209,8 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 	let json = opts.check_config_format == "json";
 	let fail = |message: String| {
 		if json {
-			let report = rproxy_api::check::Report {
-				errors: vec![rproxy_api::check::Finding { rule: String::new(), message }],
+			let report = rproxy_api::config::check::Report {
+				errors: vec![rproxy_api::config::check::Finding { rule: String::new(), message }],
 				..Default::default()
 			};
 			println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
@@ -227,7 +227,7 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		// with the check in ExecReload works on hosts without one)
 		let message = "no settings file (RPROXY_CONFIG) is configured; nothing to check";
 		if json {
-			let report = rproxy_api::check::Report { ok: true, ..Default::default() };
+			let report = rproxy_api::config::check::Report { ok: true, ..Default::default() };
 			println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
 		} else {
 			println!("{message}");
@@ -235,7 +235,7 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		return ExitCode::SUCCESS;
 	};
 	let api_addrs = if opts.api_port == 0 { vec![] } else { opts.api_addr.clone() };
-	let input = rproxy_api::check::CheckInput {
+	let input = rproxy_api::config::check::CheckInput {
 		path,
 		reserved: api_addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 		max_range_ports: opts.max_range_ports,
@@ -245,7 +245,7 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		Ok(rt) => rt,
 		Err(e) => return fail(e.to_string()),
 	};
-	let report = runtime.block_on(rproxy_api::check::check(&input));
+	let report = runtime.block_on(rproxy_api::config::check::check(&input));
 	if json {
 		println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
 	} else {
@@ -266,9 +266,9 @@ async fn run(opts: Options) -> Result<(), String> {
 	check_exposure(&opts, &addrs)?;
 	#[cfg(unix)]
 	let socket = match &opts.api_socket {
-		Some(path) => Some(rproxy_api::unix_api::SocketOptions {
+		Some(path) => Some(rproxy_api::control::unix_api::SocketOptions {
 			path: path.clone(),
-			mode: rproxy_api::unix_api::parse_mode(&opts.api_socket_mode)?,
+			mode: rproxy_api::control::unix_api::parse_mode(&opts.api_socket_mode)?,
 			group: opts.api_socket_group.clone(),
 		}),
 		None => None,
@@ -412,7 +412,7 @@ async fn run(opts: Options) -> Result<(), String> {
 		Arc::new(ConfigReloader::new(
 			doc.map(|(_, d)| d).unwrap_or_default(),
 			registry.clone(),
-			rproxy_api::check::CheckInput {
+			rproxy_api::config::check::CheckInput {
 				path,
 				reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
 				max_range_ports: opts.max_range_ports,
@@ -448,15 +448,15 @@ async fn run(opts: Options) -> Result<(), String> {
 
 	#[cfg(unix)]
 	let unix_server = match &socket {
-		Some(socket) => match rproxy_api::unix_api::bind(socket).await {
+		Some(socket) => match rproxy_api::control::unix_api::bind(socket).await {
 			Ok(listener) => {
 				info!(event = "api.listening", socket = %socket.path.display());
 				let unix_app = app.clone().layer(axum::Extension(api::Transport::UnixSocket));
 				let serve = axum::serve(listener, unix_app).with_graceful_shutdown(stop.clone().cancelled_owned());
 				Some(tokio::spawn(async move { serve.await }))
 			}
-			Err(rproxy_api::unix_api::SocketError::Config(e)) => return Err(e),
-			Err(rproxy_api::unix_api::SocketError::Unavailable(e)) => {
+			Err(rproxy_api::control::unix_api::SocketError::Config(e)) => return Err(e),
+			Err(rproxy_api::control::unix_api::SocketError::Unavailable(e)) => {
 				error!(event = "degraded", part = "api_socket", error = %e, "control API is not on the Unix socket");
 				None
 			}
@@ -505,8 +505,8 @@ async fn run(opts: Options) -> Result<(), String> {
 /// store, but goes through the same check, logs and metrics).
 fn note_api_cert(registry: &Registry, cert: &Path) {
 	let file = cert.to_string_lossy();
-	match rproxy_api::tlsconf::file_expiry(&file) {
-		Ok(not_after) => registry.certs().note_external(CertRole::Api, &file, not_after, rproxy_api::tlsconf::unix_now()),
+	match rproxy_api::tls::config::file_expiry(&file) {
+		Ok(not_after) => registry.certs().note_external(CertRole::Api, &file, not_after, rproxy_api::tls::config::unix_now()),
 		Err(e) => warn!(event = "cert.check", part = "api", error = %e.message),
 	}
 }
@@ -522,7 +522,7 @@ async fn watch_certificates(
 	api_files: Option<(PathBuf, PathBuf)>,
 	stop: CancellationToken,
 ) {
-	use rproxy_api::tlsconf::fingerprint;
+	use rproxy_api::tls::config::fingerprint;
 	let api_print = |(c, k): &(PathBuf, PathBuf)| fingerprint([c.to_str().unwrap_or(""), k.to_str().unwrap_or("")]);
 	let mut api_seen = api_files.as_ref().map(api_print);
 	let ticker = |every: Option<Duration>| {

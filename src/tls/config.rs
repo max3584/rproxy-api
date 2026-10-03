@@ -16,7 +16,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, S
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::rule::Protocol;
+use crate::core::rule::Protocol;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -332,7 +332,7 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		if route.passthrough && starttls.is_some() {
 			return Err(tls_error("passthrough routes cannot be combined with starttls (TLS starts after the plain-text dialogue)"));
 		}
-		crate::rule::validate_remote(&route.remote_addr, route.remote_port)?;
+		crate::core::rule::validate_remote(&route.remote_addr, route.remote_port)?;
 		if u32::from(route.remote_port) + u32::from(port_count) - 1 > 65_535 {
 			return Err(ApiError::invalid(format!("route {}: remote_port + range length exceeds 65535", route.label())));
 		}

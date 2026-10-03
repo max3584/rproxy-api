@@ -36,7 +36,7 @@ impl Issued {
 	pub fn dtls(&self) -> dtls::crypto::Certificate {
 		dtls::crypto::Certificate {
 			certificate: self.full_chain(),
-			private_key: rproxy_api::tlsconf::dtls_private_key(&self.key.serialize_der()).unwrap(),
+			private_key: rproxy_api::tls::config::dtls_private_key(&self.key.serialize_der()).unwrap(),
 		}
 	}
 }

@@ -13,12 +13,12 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tracing::info;
 
-use crate::auth::{Principal, Scope, Tokens};
-use crate::check::Finding;
-use crate::config_reload::{ConfigReloader, Outcome};
+use crate::control::auth::{Principal, Scope, Tokens};
+use crate::config::check::Finding;
+use crate::config::reload::{ConfigReloader, Outcome};
 use crate::error::ApiError;
-use crate::registry::Registry;
-use crate::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
+use crate::core::registry::Registry;
+use crate::core::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
 
 pub struct AppState {
 	pub registry: Arc<Registry>,
@@ -134,7 +134,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// The OpenAPI definition of this API (docs/openapi.json).
-const OPENAPI: &str = include_str!("../docs/openapi.json");
+const OPENAPI: &str = include_str!("../../docs/openapi.json");
 
 async fn openapi() -> impl IntoResponse {
 	([(header::CONTENT_TYPE, "application/json")], OPENAPI)

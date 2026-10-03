@@ -12,7 +12,7 @@ use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::error::ApiError;
-use crate::tlsconf::{self, CertBundle, CertRole, ClientAuthMode, KeyedCert, RuleCerts, TlsMode, TlsSpec};
+use crate::tls::config::{self as tlsconf, CertBundle, CertRole, ClientAuthMode, KeyedCert, RuleCerts, TlsMode, TlsSpec};
 
 /// Warn this long before a certificate expires, unless `set_warn_days` says otherwise.
 pub const DEFAULT_WARN_DAYS: u64 = 14;

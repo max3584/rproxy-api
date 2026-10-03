@@ -207,7 +207,7 @@ async fn dtls_mtls_with_multi_tier_client_certificates() {
 	// leaf only: the handshake completes, but rproxy drops the session before forwarding anything
 	let leaf_only = dtls::crypto::Certificate {
 		certificate: vec![alice.der()],
-		private_key: rproxy_api::tlsconf::dtls_private_key(&alice.key.serialize_der()).unwrap(),
+		private_key: rproxy_api::tls::config::dtls_private_key(&alice.key.serialize_der()).unwrap(),
 	};
 	if let Ok(c) = dtls_client(&pki, port, Some(leaf_only.clone())).await {
 		assert!(!dtls_echo(&c).await, "leaf only must not be forwarded");

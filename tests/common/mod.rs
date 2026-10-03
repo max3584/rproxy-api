@@ -14,10 +14,10 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use rproxy_api::api::{router, AppState};
-use rproxy_api::auth::Tokens;
-use rproxy_api::registry::{Config, Registry};
-use rproxy_api::resolve::Lookup;
+use rproxy_api::control::api::{router, AppState};
+use rproxy_api::control::auth::Tokens;
+use rproxy_api::core::registry::{Config, Registry};
+use rproxy_api::core::resolve::Lookup;
 
 /// Name → addresses served by the fake resolver (several entries = several A records).
 pub type Names = Arc<Mutex<HashMap<String, Vec<SocketAddr>>>>;
@@ -53,14 +53,14 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 }
 
 /// With `global` settings of `http` rules (trusted proxies, access log).
-pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::http::access::HttpGlobal) -> Harness {
+pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::HttpGlobal) -> Harness {
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_millis(100),
 		lookup: fake_lookup(names.clone()),
 		transparent: false,
 		transparent_ipv6: false,
-		max_range_ports: rproxy_api::rule::DEFAULT_MAX_RANGE_PORTS,
+		max_range_ports: rproxy_api::core::rule::DEFAULT_MAX_RANGE_PORTS,
 		reserved: vec!["127.0.0.1:1".parse().unwrap()],
 		http: Arc::new(http),
 	});

@@ -3,6 +3,11 @@
 //! request side runs in the route's order; the response side in reverse, as in
 //! Traefik.
 
+pub mod auth;
+pub mod crowdsec;
+pub mod limit;
+pub mod oidc;
+
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
@@ -13,15 +18,15 @@ use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode, Uri};
 use regex::Regex;
 
-use super::auth::{self, BasicAuth, ForwardAuth};
+use self::auth::{BasicAuth, ForwardAuth};
 use super::backend::Service;
-use super::oidc::{Oidc, OidcSettings};
+use self::oidc::{Oidc, OidcSettings};
 use super::compress::{self, Encoding};
-use super::limit::{Hold, InFlight, RateLimiter, Source};
+use self::limit::{Hold, InFlight, RateLimiter, Source};
 use super::resilience::{Breaker, RetryPolicy, DEFAULT_RETRY_INTERVAL};
 use super::server::Body;
 use super::{parse_duration, parse_status_range, CorsSpec, HeaderOps, HstsSpec, MiddlewareSpec};
-use crate::cidr::{self, Cidr};
+use crate::net::cidr::{self, Cidr};
 use crate::error::ApiError;
 
 /// What a middleware sees of the request besides its parts.

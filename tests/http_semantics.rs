@@ -1,6 +1,6 @@
 //! What a reverse proxy must keep or change when it forwards HTTP: session
 //! cookies, repeated fields, hop-by-hop headers, bodies, large headers and
-//! timeouts, through HTTP/1.1, HTTP/2 and HTTP/3 clients (src/http/server.rs).
+//! timeouts, through HTTP/1.1, HTTP/2 and HTTP/3 clients (src/l7/server.rs).
 
 mod common;
 

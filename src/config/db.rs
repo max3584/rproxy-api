@@ -7,8 +7,8 @@ use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Row;
 use tracing::{info, warn};
 
-use crate::rule::{RuleRequest, SourceIp};
-use crate::tlsconf::{StartTls, TlsSpec};
+use crate::core::rule::{RuleRequest, SourceIp};
+use crate::tls::config::{StartTls, TlsSpec};
 
 const BASE: &str = "protocol, src_addr, CAST(src_port AS SIGNED) AS src_port, dist_addr, CAST(dist_port AS SIGNED) AS dist_port";
 
@@ -44,15 +44,15 @@ struct Options {
 	#[serde(default)]
 	allow_from: Vec<String>,
 	/// L7 routing (v0.3)
-	http: Option<crate::http::HttpSpec>,
+	http: Option<crate::l7::HttpSpec>,
 	#[serde(default)]
 	crowdsec: bool,
 	/// Several backends (#98); dist_addr / dist_port are then ignored.
 	#[serde(default)]
-	targets: Vec<crate::balance::TargetSpec>,
+	targets: Vec<crate::core::balance::TargetSpec>,
 	#[serde(default)]
-	balance: crate::balance::Balance,
-	health_check: Option<crate::balance::HealthCheckSpec>,
+	balance: crate::core::balance::Balance,
+	health_check: Option<crate::core::balance::HealthCheckSpec>,
 	/// More listen addresses (#99).
 	#[serde(default)]
 	extra_listen_addrs: Vec<String>,

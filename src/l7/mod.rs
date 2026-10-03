@@ -3,14 +3,10 @@
 //! parts that can already run are listed in `GET /capabilities` `features`.
 
 pub mod access;
-pub mod crowdsec;
-pub mod limit;
 pub mod backend;
 pub mod compress;
 pub mod h3;
-pub mod auth;
 pub mod matcher;
-pub mod oidc;
 pub mod resilience;
 pub mod middleware;
 pub mod server;
@@ -20,7 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cidr::Cidr;
+use crate::net::cidr::Cidr;
 use crate::error::ApiError;
 pub use matcher::Matcher;
 
@@ -92,8 +88,8 @@ pub struct ServiceSpec {
 	pub timeouts: Option<TimeoutsSpec>,
 	/// How requests are spread over `servers` (#98): round_robin (default),
 	/// least_conn (fewest requests in progress) or failover (the first that is up).
-	#[serde(default, skip_serializing_if = "crate::balance::Balance::is_default")]
-	pub balance: crate::balance::Balance,
+	#[serde(default, skip_serializing_if = "crate::core::balance::Balance::is_default")]
+	pub balance: crate::core::balance::Balance,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,7 +443,7 @@ impl MiddlewareSpec {
 				if client_id.is_empty() {
 					return bad("client_id is empty".into());
 				}
-				let paths = [callback_path.as_deref().unwrap_or(oidc::DEFAULT_CALLBACK), logout_path.as_deref().unwrap_or(oidc::DEFAULT_LOGOUT)];
+				let paths = [callback_path.as_deref().unwrap_or(middleware::oidc::DEFAULT_CALLBACK), logout_path.as_deref().unwrap_or(middleware::oidc::DEFAULT_LOGOUT)];
 				if paths.iter().any(|p| !p.starts_with('/')) || paths[0] == paths[1] {
 					return bad("callback_path and logout_path must start with / and differ".into());
 				}

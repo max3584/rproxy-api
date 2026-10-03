@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::server::{Body, BoxError, Conn};
-use crate::proxy::Runtime;
-use crate::source::TlsInfo;
+use crate::core::proxy::Runtime;
+use crate::net::source::TlsInfo;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -74,7 +74,7 @@ pub fn start(rt: &Arc<Runtime>) {
 		Ok(server) => {
 			for ip in ips {
 				let addr = SocketAddr::new(ip, port);
-				let endpoint = crate::listen::udp(addr, v6only).map_err(|e| format!("udp {addr}: {e}")).and_then(|socket| {
+				let endpoint = crate::net::listen::udp(addr, v6only).map_err(|e| format!("udp {addr}: {e}")).and_then(|socket| {
 					quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(server.clone()), socket, Arc::new(quinn::TokioRuntime))
 						.map_err(|e| format!("udp {addr}: {e}"))
 				});
@@ -236,7 +236,7 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 		alpn: Some("h3".into()),
 		version: Some("TLSv1_3".into()),
 		cipher: None,
-		client_cn: peer_cert.as_deref().and_then(crate::tlsconf::common_name),
+		client_cn: peer_cert.as_deref().and_then(crate::tls::config::common_name),
 		client_cert: peer_cert.is_some(),
 	};
 	info!(event = "conn.open", rule = %rt.key, client = %client, transport = "quic",

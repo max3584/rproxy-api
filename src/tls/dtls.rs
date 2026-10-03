@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 use webrtc_util::conn::Conn;
 
-use crate::udpsock::{Listener, Local};
+use crate::net::udpsock::{Listener, Local};
 
 /// A per-client view of the listener: reads come from the session's queue,
 /// writes go out of the listener to that client, from the address it sent to.
