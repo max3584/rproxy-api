@@ -30,4 +30,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: tests/integrity.rs (${{ env.RPROXY_TEST_INTEGRITY_MB }} MiB per case)
-        run: cargo test --release --test integrity -- --test-threads 2
+        run: cargo test --locked --release --test integrity -- --test-threads 2

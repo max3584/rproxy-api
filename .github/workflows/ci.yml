@@ -37,7 +37,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       # tests/traefik_convert.rs runs contrib/traefik2rproxy.py
       - name: python3-yaml
         run: python3 -c 'import yaml, tomllib' || sudo apt-get install -y python3-yaml
@@ -45,7 +45,7 @@ jobs:
         env:
           RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
           RPROXY_TEST_REQUIRE_PYTHON: "1"
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   transparent:
     name: transparent mode (network namespaces)
@@ -54,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build
+      - run: cargo build --locked
       # Ubuntu blocks unprivileged user namespaces by default; allow them so the
       # script can build its isolated namespaces as the normal runner user.
       - name: allow unprivileged user namespaces
@@ -85,7 +85,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb
-      - run: cargo deb
+      - run: cargo deb -- --locked
       - name: scripts/test-deb.sh
         run: scripts/test-deb.sh target/debian/*.deb
 
@@ -98,6 +98,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: shellcheck
         run: shellcheck scripts/*.sh contrib/rproxy-transparent-routing
-      - run: cargo build --release
+      - run: cargo build --locked --release
       - name: scripts/test-install.sh
         run: sudo scripts/test-install.sh target/release/rproxy-api
