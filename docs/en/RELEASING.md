@@ -13,8 +13,10 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 |---|---|---|
 | Adding to or changing the shape of the config file, control API, or DB (`options`, etc.) (until 1.0, breaking changes also go here) | Minor | 0.2.x → 0.3.0 |
 | Making the contents of a feature whose shape is already decided usable (`GET /capabilities` reports whether it is available) | Patch | 0.3.0 → 0.3.1 |
-| Bug fixes, documentation, dependency updates, packaging/installer improvements, tests | Patch | 0.3.1 → 0.3.2 |
+| Bug fixes, dependency updates (they change what gets built), improvements to packaging and installers | Patch | 0.3.1 → 0.3.2 |
+| Changes only to the README, docs, CI or tests | No bump | Ship them with the next release that changes code |
 
+- **Bump the version only when what runs changes** (the rproxy-api binary or source code, the UI code, the package contents). Changes only to the README, docs, badges, CI or tests don't get a release of their own; they stay in the milestone and go out with the next release.
 - In a minor release, decide together the config and API shape for the features that will land over the following period, and write it in docs/API.md. Items whose contents are not ready yet are reported as unavailable by `GET /capabilities` and rejected with `unsupported` when specified.
 - If a change cannot be made without changing the shape, bundle it into the next minor release.
 
