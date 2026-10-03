@@ -7,9 +7,17 @@ on:
   push:
     tags:
       - v*
+  # UI だけのリリース（rproxy-api のコードが変わらない版）の rproxy-ui の .deb を
+  # apt リポジトリに載せる。rproxy-api はビルドしない（docs/RELEASING.md）
+  workflow_dispatch:
+    inputs:
+      ui_tag:
+        description: "TCP-UDP-rproxy-ui のリリースのタグ（例 v0.3.16）"
+        required: true
 
 jobs:
   build:
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
@@ -98,7 +106,10 @@ jobs:
   # APT_GPG_KEY_ID; skipped when they are not set. See docs/APT.md.
   apt:
     needs: build
-    if: github.ref_type == 'tag'
+    if: >-
+      always() &&
+      ((github.event_name == 'push' && github.ref_type == 'tag' && needs.build.result == 'success') ||
+       github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     concurrency:
       group: apt-repository
@@ -106,6 +117,8 @@ jobs:
     env:
       APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
       APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+      # push のときは rproxy-api と同じタグ、手動のときは入力した UI のタグ
+      UI_TAG: ${{ inputs.ui_tag || github.ref_name }}
     steps:
       - name: Check signing key
         id: key
@@ -131,7 +144,7 @@ jobs:
           fi
 
       - name: Download packages
-        if: steps.key.outputs.ok
+        if: steps.key.outputs.ok && github.event_name == 'push'
         uses: actions/download-artifact@v4
         with:
           pattern: deb-*
@@ -144,10 +157,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release download "${{ github.ref_name }}" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
+          if gh release download "$UI_TAG" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
             ls debs
+          elif [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "::error::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG"
+            exit 1
           else
-            echo "::warning::no rproxy-ui .deb in TCP-UDP-rproxy-ui ${{ github.ref_name }}; publishing rproxy-api only (re-run this job once the UI release has it)"
+            echo "::warning::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG; publishing rproxy-api only (re-run this job once the UI release has it)"
           fi
 
       - name: Update the repository
@@ -164,5 +180,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "apt: ${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            git commit -m "apt: rproxy-ui $UI_TAG"
+          else
+            git commit -m "apt: ${{ github.ref_name }}"
+          fi
           git push origin HEAD:gh-pages

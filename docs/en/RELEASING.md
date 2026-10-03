@@ -2,8 +2,8 @@
 
 # Versioning and releases
 
-rproxy-api ([max3584/rproxy-api](https://github.com/max3584/rproxy-api)) and the UI ([max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)) are **released together under the same version number**.
-UI vX.Y.Z is used together with rproxy-api vX.Y.Z. Even when only one of them has changes, create a tag and a release with the same number in both.
+rproxy-api ([max3584/rproxy-api](https://github.com/max3584/rproxy-api)) and the UI ([max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)) **share one sequence of version numbers**.
+When what runs changes in both, release them together under the same number (UI vX.Y.Z pairs with rproxy-api vX.Y.Z). **When what runs changes in only one of them, release only that one** (the other skips the number; e.g. after a UI-only v0.3.16, rproxy-api's next release is v0.3.17). A release pairs with the newest release of the other at or below its number (UI v0.3.16 pairs with rproxy-api v0.3.15).
 
 ## How to bump the version
 
@@ -37,6 +37,7 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
    - rproxy-api: pushing the tag makes `release.yml` build the binaries and .deb files, attach them to the GitHub Release, and update the apt repository. It stops if the tag and `version` in `Cargo.toml` differ
    - UI: create the tag and release with `gh release create vX.Y.Z --target <full ID of the merge commit>`. On publishing, `release.yml` builds and attaches `rproxy-ui_X.Y.Z-1_all.deb`, so wait for it to finish
    - rproxy-api: push the tag after the UI .deb above has been attached (if it is missing, the apt job emits a warning and publishes only rproxy-api; to add it later, rerun the apt job)
-3. **Release notes**: write "Main changes" in Japanese from the PRs merged in that milestone, and add a link to the release of the counterpart it is paired with
+   - **UI-only release**: once the UI release has its .deb attached, run rproxy-api's `release.yml` by hand to publish it to apt (`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`; rproxy-api is not built). Don't open a version bump PR or push a tag in rproxy-api
+3. **Release notes**: write "Main changes" in Japanese from the PRs merged in that milestone, and add a link to the release of the counterpart it is paired with (for a one-sided release, link the previous release of the other)
 4. **Close the milestone** and create the milestone for the next patch
 5. Confirm that it has been published via apt (the new version is visible with `apt-cache policy rproxy-api`)
