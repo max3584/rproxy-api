@@ -95,7 +95,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 設定ファイルの検証を変えたら、`--check-config`（`src/config/check.rs`・`Registry::check_rules`・`build_parts`）も同じ道筋を通っているか確かめる（tests/check_config.rs）。ユニットの `ExecReload` は先に `--check-config` を実行するので、ここで誤りになる変更は reload を止める。
 - 固定ルール（`origin: static`）は `Registry::load_static` で起動時に作り、ファイルが変わったら `Registry::reload_static` で差分を反映する（誤りがあれば何も変えない）。API からの変更・削除は `409 static`。`global` の変更は再起動まで効かない（`GET /config` の `restart_needed`）。
 - API の定義は `docs/openapi.json`（`GET /openapi.json`）。エンドポイントを足したら、ここにも足す（`api.rs` のテストがルーターとの食い違いを見つける）。
-- バージョン管理とリリースは docs/RELEASING.md の決まりで、確認を取らずに進める（UI と同じ番号で一緒に出す。PR・issue を作るときにパッチ／マイナーのマイルストーンを付ける。マージ後のタグ・リリースノート・マイルストーンの片付けまで行う）。
+- バージョン管理とリリースは docs/RELEASING.md の決まりで、確認を取らずに進める（番号の並びは UI と共有し、両方の動くものが変わったら同じ番号で一緒に、片方だけなら片方だけ出す。UI だけの版は `release.yml` の手動実行で apt に載せる。PR・issue を作るときにパッチ／マイナーのマイルストーンを付ける。マージ後のタグ・リリースノート・マイルストーンの片付けまで行う）。
 - PR のブランチに追加で push する前に、その PR がまだ開いているか（`gh pr view <n> --json state`）を確かめる。マージ後に push したコミットは master に入らない（#20/#22、#32 で起きた）。
 - 文字列の置き換えでコードを編集するときは、置き換えの対象が 1 件見つかることを確かめる（見つからないまま空振りして、修正が入っていなかったことがある）。
 

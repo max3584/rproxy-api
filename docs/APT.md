@@ -32,7 +32,7 @@ CI の `Debian package` ジョブ（`scripts/test-deb.sh`）が、実際にイ�
 1. 各ターゲットのバイナリと、amd64 / arm64 / armhf の `.deb` を作って GitHub Release に添付する（タグと `Cargo.toml` の `version` が違うと止まる）
 2. `scripts/apt-repo.sh` で `.deb` を `gh-pages` ブランチの apt リポジトリに足し、索引（`dists/stable/`）を署名し直して push する
 
-`https://max3584.github.io/rproxy-api/` を GitHub Pages が配る。管理 UI の `rproxy-ui`（Architecture: all）も同じリポジトリに載せる。apt ジョブが、同じ番号の [TCP-UDP-rproxy-ui のリリース](https://github.com/max3584/TCP-UDP-rproxy-ui/releases) から `rproxy-ui_X.Y.Z-1_all.deb` を取ってくる（UI を先にリリースする。docs/RELEASING.md）。構成は次のとおり。
+`https://max3584.github.io/rproxy-api/` を GitHub Pages が配る。管理 UI の `rproxy-ui`（Architecture: all）も同じリポジトリに載せる。apt ジョブが、同じ番号の [TCP-UDP-rproxy-ui のリリース](https://github.com/max3584/TCP-UDP-rproxy-ui/releases) から `rproxy-ui_X.Y.Z-1_all.deb` を取ってくる（UI を先にリリースする。docs/RELEASING.md）。UI だけを出した版は、`release.yml` を手動で実行（`ui_tag` に UI のタグ）すると rproxy-ui だけを載せる。構成は次のとおり。
 
 ```
 pool/main/r/<パッケージ>/<パッケージ>_<version>_<arch>.deb   rproxy-api と rproxy-ui。過去のバージョンも残す
