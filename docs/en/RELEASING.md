@@ -29,7 +29,7 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 ## Release procedure
 
 1. **A version bump PR** (branch `release/vX.Y.Z`, with the same name in both repositories; the UI's e2e tests run against the rproxy-api branch with the same name)
-   - rproxy-api: `version` in `Cargo.toml`
+   - rproxy-api: `version` in `Cargo.toml` and the rproxy-api entry in `Cargo.lock` (`cargo update -p rproxy-api --offline`). If `Cargo.lock` is not updated, CI and the release, which build with `--locked`, stop
    - UI: `npm version X.Y.Z --no-git-tag-version` (`package.json` and `package-lock.json`)
 2. **Once merged, release the UI first, then rproxy-api** (because rproxy-api's apt publishing takes the `rproxy-ui` .deb from the UI release with the same number) (`vX.Y.Z`. Tags cannot be deleted or moved because of the ruleset, so verify the commit before tagging)
    - rproxy-api: pushing the tag makes `release.yml` build the binaries and .deb files, attach them to the GitHub Release, and update the apt repository. It stops if the tag and `version` in `Cargo.toml` differ

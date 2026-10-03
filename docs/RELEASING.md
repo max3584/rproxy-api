@@ -29,7 +29,7 @@ UI の vX.Y.Z は rproxy-api の vX.Y.Z と組み合わせて使う。片方だ�
 ## リリースの手順
 
 1. **バージョンを上げる PR**（ブランチ `release/vX.Y.Z`、両方のリポジトリで同じ名前にする。UI の e2e は同じ名前の rproxy-api のブランチでテストする）
-   - rproxy-api: `Cargo.toml` の `version`
+   - rproxy-api: `Cargo.toml` の `version` と、`Cargo.lock` の rproxy-api の版（`cargo update -p rproxy-api --offline`）。`Cargo.lock` を直し忘れると、`--locked` でビルドする CI とリリースが止まる
    - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）
 2. **マージされたら、UI → rproxy-api の順にリリースする**（rproxy-api の apt の公開が、同じ番号の UI のリリースから `rproxy-ui` の .deb を取るため）（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
    - rproxy-api: タグの push で `release.yml` がバイナリ・.deb を作り、GitHub Release に添付し、apt リポジトリを更新する。タグと `Cargo.toml` の `version` が違うと止まる
