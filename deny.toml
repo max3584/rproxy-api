@@ -1,0 +1,53 @@
+# cargo-deny: checks Cargo.lock (the whole dependency tree) on PRs that change
+# dependencies and every day (.github/workflows/deny.yml).
+# To accept an advisory that cannot be fixed yet, add it to `advisories.ignore`
+# with the reason and the condition for removing it.
+
+[graph]
+# the .deb / release builds are Linux only
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "armv7-unknown-linux-gnueabihf",
+    "armv7-unknown-linux-musleabihf",
+]
+
+[advisories]
+# vulnerabilities, unmaintained and unsound crates and yanked versions all fail the check
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# what the dependency tree uses today (cargo deny list); all permissive
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# duplicates come from upstream: dtls 0.17 still uses the older RustCrypto
+# (digest 0.10, sha1/sha2 0.10, rand 0.9), rcgen 0.13 and x509-parser 0.16;
+# sqlx brings base64 0.22 and hashbrown 0.16. Warn only.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -52,9 +52,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.job.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.job.target }}
+            cross build --locked --release --target ${{ matrix.job.target }}
           else
-            cargo build --release --target ${{ matrix.job.target }}
+            cargo build --locked --release --target ${{ matrix.job.target }}
           fi
 
       - name: Install cargo-deb

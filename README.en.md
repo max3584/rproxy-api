@@ -46,7 +46,7 @@ Configuration is done with environment variables. If there is a `.env` in the wo
 If the same setting is also given as a command-line argument (such as `--api-port`), the argument takes precedence.
 
 ```shell
-cargo build --release
+cargo build --locked --release
 cp .env.example .env   # edit the values to match your environment
 ./target/release/rproxy-api
 ```

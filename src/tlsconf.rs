@@ -2,10 +2,10 @@
 //! the dtls crate configurations built from it.
 
 use std::fs;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::client::danger::HandshakeSignatureValid as SigValid;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -394,7 +394,7 @@ fn read(path: &str) -> Result<Vec<u8>, ApiError> {
 
 fn load_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, ApiError> {
 	let data = read(path)?;
-	let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(&data[..]))
+	let certs: Vec<_> = CertificateDer::pem_slice_iter(&data)
 		.collect::<Result<_, _>>()
 		.map_err(|e| tls_error(format!("{path}: {e}")))?;
 	if certs.is_empty() {
@@ -440,9 +440,11 @@ fn check_order(chain: &[CertificateDer<'_>], file: &str) -> Result<(), ApiError>
 
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, ApiError> {
 	let data = read(path)?;
-	rustls_pemfile::private_key(&mut BufReader::new(&data[..]))
-		.map_err(|e| tls_error(format!("{path}: {e}")))?
-		.ok_or_else(|| tls_error(format!("{path}: no private key block")))
+	// the first PKCS#8, PKCS#1 (RSA) or SEC1 (EC) key in the file
+	PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
+		pem::Error::NoItemsFound => tls_error(format!("{path}: no private key block")),
+		e => tls_error(format!("{path}: {e}")),
+	})
 }
 
 /// DNS names a certificate is valid for (subjectAltName, else the common name).

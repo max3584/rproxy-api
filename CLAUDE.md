@@ -16,6 +16,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 設定項目は `src/main.rs` の `Options`（clap）。すべて `RPROXY_*` 環境変数でも指定でき、起動時に `.env` を読む。項目を増やすときは `.env.example` と README（`README.md`・`README.en.md`）の表も更新する。
 
 - ring（rustls）のビルドには C コンパイラが要る。
+- `Cargo.lock` はコミットしている（#150）。CI・リリース・パッケージのビルドは `--locked` で、`Cargo.lock` と食い違えば失敗する。依存を変えたら `cargo build` で更新した `Cargo.lock` も同じ PR に入れる。Renovate は cargo を `rangeStrategy: update-lockfile` で更新する（互換の範囲の更新は `Cargo.lock` だけ。`Cargo.toml` の下限は互換が切れる更新のときだけ上がる）。
+- `deny.toml` と `.github/workflows/deny.yml`（`cargo deny --locked check`）：RustSec の勧告（脆弱性・メンテ終了・yank）、ライセンス、取得元（crates.io だけ）を、依存を変える PR と毎日確かめる（必須のチェックではない）。直せない勧告は `advisories.ignore` に `{ id = "RUSTSEC-…", reason = "…" }` で、理由と外す条件を書いて足す。新しいライセンスは中身を確かめてから `licenses.allow` に足す。依存を足したら `cargo machete` で使っていないものがないか確かめる（`md-5` は `md5` の名前で使っているので `[package.metadata.cargo-machete]` で除外）。
 - `Cargo.toml` を変える PR（Renovate を含む）では `.github/workflows/cross.yml` がリリースと同じターゲット（arm・musl）をビルドする（ARM や musl だけで壊れる依存の更新を、マージ前に見つけるため）。
 - リリースは `v*` タグの push で `.github/workflows/release.yml` が Linux の 6 ターゲット（x86_64・aarch64・armv7 の gnu と musl）向けにクロスビルドし、amd64 / arm64 / armhf の `.deb`（musl の静的リンク）を作って `gh-pages` の apt リポジトリに載せる。タグと `Cargo.toml` の `version` を揃えること。詳細は `docs/APT.md`。
 - `scripts/install.sh` は VM 向けのインストーラ（root・systemd が前提。Debian / Ubuntu は apt、それ以外はリリースのバイナリ）。設定の雛形は `debian/rproxy.env` と `contrib/rproxy-api.service` を使う（チェックアウトから実行したときは手元のもの、curl で実行したときは GitHub のもの）。CI の `install.sh` ジョブ（`scripts/test-install.sh`）で実際に入れて確かめる。

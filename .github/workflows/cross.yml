@@ -46,4 +46,4 @@ jobs:
         with:
           tool: cross
       - name: Build (release profile, like release.yml)
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --locked --release --target ${{ matrix.target }}
