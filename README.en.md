@@ -295,6 +295,6 @@ cargo clippy --all-targets
 
 rproxy-api started from glacierx's [rproxy](https://github.com/glacierx/rproxy) (MIT License).
 It is now an independent project whose code has been entirely rewritten, including the control API, TLS, DTLS, STARTTLS, and source IP passing, and it is developed separately from the original project.
-The design of the bidirectional TCP forwarding loop and the per-client UDP sessions comes from the original project (noted at the top of `src/tcp.rs` and `src/udp.rs`).
+The design of the bidirectional TCP forwarding loop and the per-client UDP sessions comes from the original project (noted at the top of `src/l4/tcp.rs` and `src/l4/udp.rs`).
 
 MIT License. See [LICENSE](LICENSE), which includes the original project's copyright notice.

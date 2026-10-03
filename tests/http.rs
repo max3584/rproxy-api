@@ -1,4 +1,4 @@
-//! `http` rules: L7 routing through real sockets (src/http/server.rs).
+//! `http` rules: L7 routing through real sockets (src/l7/server.rs).
 
 mod common;
 
@@ -514,8 +514,8 @@ async fn get_with(port: u16, host: &str, path: &str, headers: &[(&str, &str)]) -
 
 #[tokio::test]
 async fn trusted_proxies_pass_the_client_on() {
-	use rproxy_api::auth::Tokens;
-	use rproxy_api::http::access::HttpGlobal;
+	use rproxy_api::control::auth::Tokens;
+	use rproxy_api::l7::access::HttpGlobal;
 	// the test client connects from 127.0.0.1, which is trusted here
 	let h = harness_with_global(Tokens::disabled(), HttpGlobal::without_file(&["127.0.0.0/8".to_string()])).await;
 	let a = echo_backend("A").await;

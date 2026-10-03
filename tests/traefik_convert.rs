@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rproxy_api::config::ConfigDoc;
-use rproxy_api::http::MiddlewareSpec;
-use rproxy_api::rule::{Caps, Features, RuleRequest};
+use rproxy_api::l7::MiddlewareSpec;
+use rproxy_api::core::rule::{Caps, Features, RuleRequest};
 
 fn root() -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -125,7 +125,7 @@ fn failover_services() {
 	let svc = http.services.values().next().unwrap();
 	let urls: Vec<&str> = svc.servers.iter().map(|s| s.url.as_str()).collect();
 	assert_eq!(urls, ["http://10.0.2.1:80", "http://10.0.2.2:80", "http://10.0.3.1:80"], "main first, then the fallback");
-	assert_eq!(svc.balance, rproxy_api::balance::Balance::Failover);
+	assert_eq!(svc.balance, rproxy_api::core::balance::Balance::Failover);
 	assert!(svc.health_check.is_some());
 	assert!(notes.contains("failover service"), "{notes}");
 }

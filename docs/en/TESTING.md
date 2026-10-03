@@ -14,28 +14,28 @@ Integration tests open real sockets on loopback. The control API, the echo serve
 
 | File | Test | What it checks |
 |---|---|---|
-| `rule.rs` | `protocol_is_case_insensitive` | `"TCP"` is also accepted, and `source_ip` defaults to `proxy` |
+| `core/rule.rs` | `protocol_is_case_insensitive` | `"TCP"` is also accepted, and `source_ip` defaults to `proxy` |
 | | `defaults_udp_idle` | The default UDP idle timeout is 30 seconds |
 | | `rejects_hostname_listen_and_zero_ports` | The listen address cannot be a hostname, and port 0 is not allowed |
 | | `proxy_protocol_is_tcp_only` | `proxy_v2` on UDP is `unsupported` |
 | | `transparent_needs_capability_and_ipv4` | `transparent` is rejected without the capability or with IPv6 |
 | | `ipv6_remote_is_bracketed` | An IPv6 target takes the form `[::1]:80` |
-| `resolve.rs` | `keeps_cached_answer_while_dns_is_down` | While name resolution fails, the previous result keeps being used |
+| `core/resolve.rs` | `keeps_cached_answer_while_dns_is_down` | While name resolution fails, the previous result keeps being used |
 | | `empty_answer_is_an_error` | An empty answer is `resolve_failed` |
-| `auth.rs` | `rotates_tokens` | Multiple tokens valid at the same time, reloading, and keeping the current state on an invalid file |
+| `control/auth.rs` | `rotates_tokens` | Multiple tokens valid at the same time, reloading, and keeping the current state on an invalid file |
 | | `disabled_allows_all` | Without a token file there is no authentication |
-| `source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | The bytes of the PROXY protocol headers |
+| `net/source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | The bytes of the PROXY protocol headers |
 | | `port_ranges` | Range validation (reversed order, exceeding the limit, target port exceeding 65535) |
-| `tlsconf.rs` | `wildcard_matches_one_label` | `*.example.com` matches exactly one level |
+| `tls/config.rs` | `wildcard_matches_one_label` | `*.example.com` matches exactly one level |
 | | `validation_rules` | Rejects terminate without a certificate, sni on UDP, STARTTLS without terminate, and mTLS without a CA |
 | | `missing_files_are_reported` | An unreadable certificate file is reported as `tls_config`, including the path |
-| `sni.rs` | `reads_server_name` / `needs_the_whole_record` / `handles_a_hello_split_across_records` / `rejects_plain_text` | Reads the server name from a ClientHello produced by rustls. Partial data, a ClientHello split across multiple records, and non-TLS data |
-| `starttls.rs` | `smtp_ehlo_then_starttls` / `imap_capability_and_starttls` / `pop3_capa_and_stls` / `quit_closes` | The pre-STARTTLS exchange for each protocol. Sending mail or logging in before TLS is refused |
+| `tls/sni.rs` | `reads_server_name` / `needs_the_whole_record` / `handles_a_hello_split_across_records` / `rejects_plain_text` | Reads the server name from a ClientHello produced by rustls. Partial data, a ClientHello split across multiple records, and non-TLS data |
+| `l4/starttls.rs` | `smtp_ehlo_then_starttls` / `imap_capability_and_starttls` / `pop3_capa_and_stls` / `quit_closes` | The pre-STARTTLS exchange for each protocol. Sending mail or logging in before TLS is refused |
 | | `smtp_optional_tls_hands_over_plain_commands` | With `starttls_required: false`, plain-text commands are handed over to the target |
 | | `data_before_the_handshake_is_refused` | Commands smuggled in right after STARTTLS are not accepted |
 | | `ehlo_reply_loses_starttls` | `STARTTLS` is removed from the EHLO reply after TLS |
-| `source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
-| `registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
+| `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
+| `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
 
 ## Integration tests: control API (`tests/api.rs`)

@@ -14,28 +14,28 @@ English: [TESTING.md](en/TESTING.md)
 
 | ファイル | テスト | 確かめること |
 |---|---|---|
-| `rule.rs` | `protocol_is_case_insensitive` | `"TCP"` も受け付け、`source_ip` の既定は `proxy` |
+| `core/rule.rs` | `protocol_is_case_insensitive` | `"TCP"` も受け付け、`source_ip` の既定は `proxy` |
 | | `defaults_udp_idle` | UDP の無通信破棄の既定は 30 秒 |
 | | `rejects_hostname_listen_and_zero_ports` | 待ち受けアドレスはホスト名不可、ポート 0 は不可 |
 | | `proxy_protocol_is_tcp_only` | UDP で `proxy_v2` は `unsupported` |
 | | `transparent_needs_capability_and_ipv4` | 権限がない、または IPv6 のときは `transparent` を拒否 |
 | | `ipv6_remote_is_bracketed` | IPv6 の転送先は `[::1]:80` の形になる |
-| `resolve.rs` | `keeps_cached_answer_while_dns_is_down` | 名前解決に失敗している間も、前回の結果を使い続ける |
+| `core/resolve.rs` | `keeps_cached_answer_while_dns_is_down` | 名前解決に失敗している間も、前回の結果を使い続ける |
 | | `empty_answer_is_an_error` | 空の応答は `resolve_failed` |
-| `auth.rs` | `rotates_tokens` | 複数トークンの同時有効、読み直し、不正なファイルでは現状維持 |
+| `control/auth.rs` | `rotates_tokens` | 複数トークンの同時有効、読み直し、不正なファイルでは現状維持 |
 | | `disabled_allows_all` | トークンファイルなしなら認証なし |
-| `source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | PROXY protocol ヘッダのバイト列 |
+| `net/source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | PROXY protocol ヘッダのバイト列 |
 | | `port_ranges` | 範囲の検証（逆順、上限超え、転送先のポートが 65535 を超える） |
-| `tlsconf.rs` | `wildcard_matches_one_label` | `*.example.com` は 1 階層だけに一致する |
+| `tls/config.rs` | `wildcard_matches_one_label` | `*.example.com` は 1 階層だけに一致する |
 | | `validation_rules` | 証明書なしの terminate、UDP の sni、terminate なしの STARTTLS、CA なしの mTLS を拒否 |
 | | `missing_files_are_reported` | 読めない証明書ファイルは、パスを含めて `tls_config` で返す |
-| `sni.rs` | `reads_server_name` / `needs_the_whole_record` / `handles_a_hello_split_across_records` / `rejects_plain_text` | rustls が作る ClientHello からサーバ名を読む。途中までのデータ、複数レコードに分かれた ClientHello、TLS でないデータ |
-| `starttls.rs` | `smtp_ehlo_then_starttls` / `imap_capability_and_starttls` / `pop3_capa_and_stls` / `quit_closes` | 各プロトコルの STARTTLS 前のやり取り。TLS 前のメール送信・ログインは拒否する |
+| `tls/sni.rs` | `reads_server_name` / `needs_the_whole_record` / `handles_a_hello_split_across_records` / `rejects_plain_text` | rustls が作る ClientHello からサーバ名を読む。途中までのデータ、複数レコードに分かれた ClientHello、TLS でないデータ |
+| `l4/starttls.rs` | `smtp_ehlo_then_starttls` / `imap_capability_and_starttls` / `pop3_capa_and_stls` / `quit_closes` | 各プロトコルの STARTTLS 前のやり取り。TLS 前のメール送信・ログインは拒否する |
 | | `smtp_optional_tls_hands_over_plain_commands` | `starttls_required: false` では、平文のコマンドを転送先へ引き継ぐ |
 | | `data_before_the_handshake_is_refused` | STARTTLS の直後に紛れ込ませたコマンドを受け付けない |
 | | `ehlo_reply_loses_starttls` | TLS 後の EHLO の応答から `STARTTLS` を取り除く |
-| `source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
-| `registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
+| `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
+| `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | 古い世代の監視タスクは、作り直したルールに触らない |
 
 ## 結合テスト：制御 API（`tests/api.rs`）

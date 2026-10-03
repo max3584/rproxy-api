@@ -58,7 +58,7 @@ assets = [
 ]
 
 [package.metadata.cargo-machete]
-# md-5 is used as `md5` (src/http/auth.rs, htpasswd APR1)
+# md-5 is used as `md5` (src/l7/middleware/auth.rs, htpasswd APR1)
 ignored = ["md-5"]
 
 [dependencies]

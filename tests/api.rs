@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use common::*;
-use rproxy_api::auth::Tokens;
+use rproxy_api::control::auth::Tokens;
 
 #[tokio::test]
 async fn tcp_lifecycle_stops_immediately_and_port_is_reusable() {

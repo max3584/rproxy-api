@@ -142,7 +142,7 @@ fn mistakes_are_all_reported() {
 fn a_certificate_close_to_expiry_is_a_warning() {
 	let dir = workdir("expiring");
 	let pki = Pki::new("check-expiring");
-	let soon = pki.server_until("soon", &["soon.test"], rproxy_api::tlsconf::unix_now() + 3 * 86_400);
+	let soon = pki.server_until("soon", &["soon.test"], rproxy_api::tls::config::unix_now() + 3 * 86_400);
 	let file = dir.join("rproxy.yaml");
 	fs::write(
 		&file,
