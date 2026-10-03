@@ -1,6 +1,14 @@
-日本語: [README.md](README.md)
-
 # rproxy-api
+
+[![CI](https://github.com/max3584/rproxy-api/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/ci.yml)
+[![Interop](https://github.com/max3584/rproxy-api/actions/workflows/interop.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/interop.yml)
+[![cargo-deny](https://github.com/max3584/rproxy-api/actions/workflows/deny.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/deny.yml)
+[![Release](https://img.shields.io/github/v/release/max3584/rproxy-api)](https://github.com/max3584/rproxy-api/releases/latest)
+[![apt](https://img.shields.io/badge/apt-max3584.github.io%2Frproxy--api-blue)](https://max3584.github.io/rproxy-api/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Renovate](https://img.shields.io/badge/renovate-enabled-brightgreen?logo=renovatebot)](https://github.com/max3584/rproxy-api/issues?q=is%3Aissue+is%3Aopen+%22Dependency+Dashboard%22)
+
+日本語: [README.md](README.md)
 
 An L4 forwarder that lets you add, change, delete, and query TCP/UDP forwarding while it is running.
 It is controlled through an HTTP API; the management UI is [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui).

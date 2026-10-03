@@ -1,6 +1,14 @@
-English: [README.en.md](README.en.md)
-
 # rproxy-api
+
+[![CI](https://github.com/max3584/rproxy-api/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/ci.yml)
+[![Interop](https://github.com/max3584/rproxy-api/actions/workflows/interop.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/interop.yml)
+[![cargo-deny](https://github.com/max3584/rproxy-api/actions/workflows/deny.yml/badge.svg?branch=master)](https://github.com/max3584/rproxy-api/actions/workflows/deny.yml)
+[![Release](https://img.shields.io/github/v/release/max3584/rproxy-api)](https://github.com/max3584/rproxy-api/releases/latest)
+[![apt](https://img.shields.io/badge/apt-max3584.github.io%2Frproxy--api-blue)](https://max3584.github.io/rproxy-api/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Renovate](https://img.shields.io/badge/renovate-enabled-brightgreen?logo=renovatebot)](https://github.com/max3584/rproxy-api/issues?q=is%3Aissue+is%3Aopen+%22Dependency+Dashboard%22)
+
+English: [README.en.md](README.en.md)
 
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。
 制御は HTTP API で行い、管理 UI は [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) にある。
