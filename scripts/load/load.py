@@ -756,30 +756,42 @@ def soak_one(idx):
 	"""SOAK_SECS of mixed load (iperf3 at SOAK_BW, connection churn, rotating UDP sources); RSS and FDs must not keep growing."""
 	idle = 5
 	rp = Rproxy("soak", ["echo", "iperf", "usink"], udp_idle=idle, idx=idx)
-	procs = {}
+	procs, files = {}, {}
 	samples = []
+
+	def start(key, args):
+		# output to files, not pipes: iperf3 -J writes its whole report at the end, more than a pipe holds,
+		# and would block forever while nobody reads it before every process has ended
+		files[key] = open(os.path.join(WORK, f"soak-{idx}-{key}.out"), "w+")
+		procs[key] = subprocess.Popen(ns(NS_C, args), stdout=files[key], stderr=subprocess.STDOUT, text=True)
 	try:
 		rss0, fd0 = settle(rp.pid)
 		sink = subprocess.Popen(ns(NS_B, [LOADGEN, "udp-sink", "--listen", f"{BACKEND}:9004", "--idle", "30",
 										  "--max-secs", str(SOAK_SECS + 120)]), stdout=subprocess.PIPE, text=True)
 		sink.stdout.readline()
-		procs["iperf3"] = subprocess.Popen(ns(NS_C, ["iperf3", "-c", rp.ip, "-p", str(rp.port("iperf")), "-t", str(SOAK_SECS),
-													 "-b", SOAK_BW, "-J"]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-		procs["churn"] = subprocess.Popen(ns(NS_C, [LOADGEN, "churn", "--connect", hostport(rp.addr("echo")), "--workers", "16",
-													"--secs", str(SOAK_SECS)]), stdout=subprocess.PIPE, text=True)
-		procs["udp"] = subprocess.Popen(ns(NS_C, [LOADGEN, "udp-flood", "--connect", hostport(rp.addr("usink")), "--sources", "64",
-												  "--secs", str(SOAK_SECS), "--pps", "20000", "--rotate", "10"]), stdout=subprocess.PIPE, text=True)
+		start("iperf3", ["iperf3", "-c", rp.ip, "-p", str(rp.port("iperf")), "-t", str(SOAK_SECS), "-b", SOAK_BW, "-J"])
+		start("churn", [LOADGEN, "churn", "--connect", hostport(rp.addr("echo")), "--workers", "16", "--secs", str(SOAK_SECS)])
+		start("udp", [LOADGEN, "udp-flood", "--connect", hostport(rp.addr("usink")), "--sources", "64", "--secs", str(SOAK_SECS),
+					  "--pps", "20000", "--rotate", "10"])
+		deadline = time.monotonic() + SOAK_SECS + 300
 		t0 = time.monotonic()
 		cpu0 = cpu_s(rp.pid)
 		step = max(2, min(30, SOAK_SECS // 60))
-		while any(p.poll() is None for p in procs.values()):
+		while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
 			try:
 				samples.append({"t": round(time.monotonic() - t0, 1), "rss_kib": rss_kib(rp.pid), "fds": fd_count(rp.pid),
 								"cpu_s": round(cpu_s(rp.pid) - cpu0, 2), "conns": rp.connections()})
 			except Exception:  # noqa: BLE001
 				pass
 			time.sleep(step)
-		outs = {k: p.communicate()[0] for k, p in procs.items()}
+		outs = {}
+		for k, p in procs.items():
+			if p.poll() is None:
+				p.kill()
+				check(f"soak via {rp.name}: {k} ended on time", False, "killed")
+			p.wait()
+			files[k].seek(0)
+			outs[k] = files[k].read()
 		sink.terminate()
 		time.sleep(idle + 5)
 		rss_end, fd_end = rss_kib(rp.pid), fd_count(rp.pid)
@@ -814,6 +826,8 @@ def soak_one(idx):
 		for p in procs.values():
 			if p.poll() is None:
 				p.kill()
+		for f in files.values():
+			f.close()
 		rp.stop()
 
 

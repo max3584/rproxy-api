@@ -79,6 +79,8 @@ jobs:
       # bash, unshare / nsenter (util-linux-misc), ip / tc (iproute2), python3, gh (github-cli) for the previous results;
       # iperf3, h2load (nghttp2), socat, openssl, HAProxy for the scenarios
       - name: packages
+        # no bash yet
+        shell: sh
         run: |
           apk add --no-cache bash git tar zstd curl gcc musl-dev python3 github-cli iproute2 iproute2-tc util-linux-misc kmod \
             iperf3 nghttp2 socat openssl haproxy
