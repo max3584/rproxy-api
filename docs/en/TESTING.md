@@ -5,11 +5,27 @@
 | How to run | Scope | CI job |
 |---|---|---|
 | `cargo test` | Unit tests (`src/`) and integration tests (`tests/`) | `test` |
-| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (uses a MariaDB service container) |
+| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (runs Alpine's MariaDB in the same container) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
 | `scripts/load/run.sh` | Load and soak tests with large, long transfers (transfer efficiency; see "Load and soak tests" below) | Load workflow (manual only) |
+
+## CI environment
+
+GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (`container: alpine:3.24`: musl, the same libc as the release binaries and the .deb) (#191). Packages come from apk, Rust is rustup's stable (nightly for fuzzing).
+
+| Workflow / job | Environment |
+|---|---|
+| CI `test` and `package`, Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.24` |
+| CI `transparent` | `alpine:3.24` (privileged: namespaces, veth, nft / iptables) |
+| Load | `alpine:3.24` (privileged: namespaces, veth, tc netem; `sch_netem` is loaded from the host's `/lib/modules`) |
+| Interop `crowdsec` | `crowdsecurity/crowdsec` (CrowdSec's official image, Alpine-based; Alpine has no CrowdSec package), privileged |
+| Cross build and Release `build` | `alpine:3.24`. x86_64 musl natively, the others cross-built with cargo-zigbuild (zig); gnu is linked against glibc 2.17 (`scripts/build-release.sh`) |
+| Release `apt` and Cross build `apt (dry run)` | `debian:13-slim` (apt-ftparchive, which builds the apt repository, is a Debian tool) |
+| CI `deb` and `install` | Directly on the runner VM (Ubuntu). They check installing the .deb, upgrading from an apt repository and purging, and install.sh (which requires systemd), so systemd has to run as PID 1, which a container cannot do. They build no Rust: they check the musl binary and .deb made by the `package` job (Alpine) |
+
+Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc targets; see "Fuzzing" below).
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
@@ -91,6 +107,7 @@ The test CA, server certificates, and client certificates are generated on every
 | `certificates_are_chosen_by_sni` | Chooses among multiple certificates by SNI |
 | `bad_tls_settings_are_reported` | Rejects unreadable files, terminate without a certificate, unknown modes, and sni on UDP, leaving nothing behind |
 | `reload_picks_up_renewed_certificates_and_patch_changes_tls` | After replacing the certificate files and reloading, the new certificate is used. PATCH can switch back to passthrough |
+| `terminate_does_not_stall_under_backpressure` | With a small client send buffer, 16 round trips of 1 MiB through a terminating rule; every byte comes back intact each time (#187) |
 
 ## Integration tests: multi-tier CA (`tests/chain.rs`)
 
@@ -186,6 +203,10 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 
 `.github/workflows/bench.yml` runs on PRs that change `src/`, `benches/`, `tests/common/` or `Cargo.*`. Runners vary in speed, so the merge base (`--save-baseline base`) and the PR (`--baseline-lenient base`) are measured one after the other in the same job, and `scripts/bench-summary.py` puts a table in the job summary and in a PR comment (one comment, updated). A benchmark whose mean got more than 15 % slower, with the whole 95 % confidence interval on the slower side, becomes a warning (not a failure, and not a required check). On a warning, first re-run the job to see whether it happens again.
 
+When one iteration of `dataplane` makes no progress for 30 seconds (`STALL`), the benchmark treats it as a stall and panics with what it was doing (bytes written and read back, whether the TLS client still holds unsent records) and the rule counters (#187). Each workflow step also has a timeout (20 minutes). A TLS stream must be flushed after `write_all`: when the socket was full, the last records stay in rustls until then (the cause of the stall in #187, on the client side; rproxy's `copy_bidirectional` flushes whenever it has nothing to read).
+
+For telling the causes apart there is `examples/stall_probe.rs` (the `stall-probe` job of `bench.yml`). It repeats the same 1 MiB echo hundreds of times with a 3-second timeout per iteration, across L4 TCP, TLS termination and TLS without rproxy, the client flushing or not, the default or a 4 KiB send buffer, and rproxy in the same process or as its own process (`--rproxy target/release/rproxy-api`), and prints how many iterations stalled and how long they took. In #187 only TLS clients that did not flush stalled, just the same without rproxy and with rproxy as its own process, and their rustls still held unsent records (`wants_write = true`). The job fails if a client that flushes stalls. Locally: `cargo run --release --example stall_probe -- --iters 300`.
+
 ## Not yet tested
 
 - Combinations with real mail servers (Postfix / Dovecot) and real WebRTC, TURN, and RTSP clients
@@ -204,9 +225,11 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 | `scripts/interop/mail.sh` | Postfix / Dovecot | With STARTTLS termination + PROXY v2, Submission, SMTP (STARTTLS optional), IMAP, IMAPS, and POP3 work. Sending and logging in before STARTTLS are refused |
 | `scripts/interop/media.sh` | coturn / MediaMTX | Allocation and relaying work with TURN UDP and TCP passthrough, TLS termination, and DTLS termination (the relay addresses go through a range rule). Video can be received via RTSP (TCP interleaved) and RTSPS termination. Time, file count, and memory to create and delete a 10000-port UDP range rule |
 
+| `scripts/interop/crowdsec.sh` | CrowdSec (LAPI, agent, AppSec) | CrowdSec detects and bans from rproxy's logs, and rproxy (L7 `crowdsec`, L4 `crowdsec: true`, AppSec) blocks. Clients with documentation addresses (IPv4 and IPv6) are banned; a private address is whitelisted and never banned |
+
 Results for a 10000-port range rule (UDP) (GitHub Ubuntu runner, 2026-09): creation about 0.2 seconds, file descriptors +10000 (back to the original after deletion), RSS about +94 MiB.
 
-It installs packages with sudo, so do not run it locally.
+They all run as root inside a throwaway container (`alpine:3.24` for mail and media, CrowdSec's official image for crowdsec), and the scripts configure and start the servers themselves. Do not run them on your own machine.
 
 ## Long-running load test (Soak workflow)
 
@@ -216,7 +239,7 @@ It installs packages with sudo, so do not run it locally.
 - UDP: 100 clients that send while changing their source port (with `udp_idle_secs: 5`, sessions are repeatedly created and discarded)
 - Pass criteria: after the load stops, the fd count returns to the original (within +20), RSS in the second half does not exceed 1.5 times that of the first half, and forwarding failures are 0.1% or less
 
-`.github/workflows/soak.yml` runs it for 30 minutes weekly and keeps the CSV as an artifact. To run it for hours, trigger it manually from the Actions page with `duration` (seconds). Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
+`.github/workflows/soak.yml` runs only on demand (no schedule, not on pull requests): trigger it from the Actions page or with `gh workflow run soak.yml -f duration=<seconds>` (default 3600), and the CSV is kept as an artifact. Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
 
 
 ## Load and soak tests (Load workflow, #183)
@@ -292,6 +315,8 @@ Without root it needs user namespaces (on Ubuntu 24.04 and later, `sudo sysctl k
 - `load (clean)`: every scenario without netem (by default 2 GiB × 3, 5000 connections, a 10-minute soak)
 - `load (netem)`: `tcp`, `verify`, `tls`, `http`, `udp` and `latency` with `delay 5ms loss 0.1%` (512 MiB)
 
+The job runs in an Alpine container (musl, the same libc as the release binaries) and builds rproxy with musl too. musl's malloc is slower than glibc's, so the results start with each build's libc and allocator (read from the binary); compare only builds with the same libc and allocator ("Builds compared" warns when they differ).
+
 Results are kept as artifacts (`load-clean` / `load-netem`, 90 days) and in the job summary. The artifact of the last successful manual run (master first, else any branch) is downloaded and the tables show the deltas. The runners are shared 4-core VMs: ignore a single change and look for changes that repeat.
 
 ### Comparing optimization ideas (`perf/<topic>` branches)
@@ -308,7 +333,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 - More refs take longer (the soak runs per build); pick the scenarios you need with `scenarios`
 - Only workflows on the default branch (master) can be dispatched from the Actions page or `gh workflow run`. The scripts (`scripts/load/`) come from the branch the run is started on (`--ref`, master by default)
 
-`scripts/soak.py` (the "Long-running load test" above) is the weekly loopback soak centered on connection churn, and stays as it is.
+`scripts/soak.py` (the "Long-running load test" above) is the (manual) loopback soak centered on connection churn, and stays as it is.
 
 ## Fuzzing (Fuzz workflow)
 
@@ -326,7 +351,7 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 
 The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
 
-`.github/workflows/fuzz.yml` runs each target for 60 seconds on pull requests that change `src/` or `fuzz/`, and for 10 minutes every day (not a required check). The corpus grown by the daily runs is kept in the Actions cache and seeds the next run. When a target crashes, the input is in the `fuzz-artifacts-*` artifact: reproduce it with `cargo +nightly fuzz run <target> <input file>`, and once fixed, add the input to a unit test.
+`.github/workflows/fuzz.yml` runs each target for 60 seconds on pull requests that change `src/` or `fuzz/`, and for 10 minutes every day (not a required check). CI runs on Alpine (musl), so without a sanitizer (`--sanitizer none`; Rust's AddressSanitizer exists only for glibc targets), with debug assertions (integer overflow checks) on. The targeted parsers are Rust without unsafe, so an out-of-bounds access panics on the bounds check even without a sanitizer. The corpus grown by the daily runs is kept in the Actions cache and seeds the next run. When a target crashes, the input is in the `fuzz-artifacts-*` artifact: reproduce it with `cargo +nightly fuzz run <target> <input file>`, and once fixed, add the input to a unit test.
 
 Locally (needs nightly and a C/C++ compiler):
 

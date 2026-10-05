@@ -2,8 +2,10 @@
 
 # Versioning and releases
 
-rproxy-api ([max3584/rproxy-api](https://github.com/max3584/rproxy-api)) and the UI ([max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)) **share one sequence of version numbers**.
-When what runs changes in both, release them together under the same number (UI vX.Y.Z pairs with rproxy-api vX.Y.Z). **When what runs changes in only one of them, release only that one** (the other skips the number; e.g. after a UI-only v0.3.16, rproxy-api's next release is v0.3.17). A release pairs with the newest release of the other at or below its number (UI v0.3.16 pairs with rproxy-api v0.3.15).
+rproxy-api ([max3584/rproxy-api](https://github.com/max3584/rproxy-api)) and the UI ([max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)) **advance their version numbers independently** (their release tags may diverge).
+Each repository bumps its own number and releases only when what runs in it changes.
+
+The UI checks the combination. It knows the oldest rproxy-api it needs and compares it with each node's rproxy-api version (`version` in `GET /capabilities`, since v0.3.18); when a node is older, its version is unknown, or it is a newer minor than the UI knows about, the UI shows a notice. Fine-grained decisions per feature still use `features` in `GET /capabilities`. The UI's release notes state the minimum rproxy-api version it needs.
 
 ## How to bump the version
 
@@ -30,14 +32,15 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 
 ## Release procedure
 
-1. **A version bump PR** (branch `release/vX.Y.Z`, with the same name in both repositories; the UI's e2e tests run against the rproxy-api branch with the same name)
+Done only in the repository being released (the other one's version is not bumped).
+
+1. **A version bump PR** (branch `release/vX.Y.Z`)
    - rproxy-api: `version` in `Cargo.toml` and the rproxy-api entry in `Cargo.lock` (`cargo update -p rproxy-api --offline`). If `Cargo.lock` is not updated, CI and the release, which build with `--locked`, stop
-   - UI: `npm version X.Y.Z --no-git-tag-version` (`package.json` and `package-lock.json`)
-2. **Once merged, release the UI first, then rproxy-api** (because rproxy-api's apt publishing takes the `rproxy-ui` .deb from the UI release with the same number) (`vX.Y.Z`. Tags cannot be deleted or moved because of the ruleset, so verify the commit before tagging)
-   - rproxy-api: pushing the tag makes `release.yml` build the binaries and .deb files, attach them to the GitHub Release, and update the apt repository. It stops if the tag and `version` in `Cargo.toml` differ
-   - UI: create the tag and release with `gh release create vX.Y.Z --target <full ID of the merge commit>`. On publishing, `release.yml` builds and attaches `rproxy-ui_X.Y.Z-1_all.deb`, so wait for it to finish
-   - rproxy-api: push the tag after the UI .deb above has been attached (if it is missing, the apt job emits a warning and publishes only rproxy-api; to add it later, rerun the apt job)
-   - **UI-only release**: once the UI release has its .deb attached, run rproxy-api's `release.yml` by hand to publish it to apt (`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`; rproxy-api is not built). Don't open a version bump PR or push a tag in rproxy-api
-3. **Release notes**: write "Main changes" in Japanese from the PRs merged in that milestone, and add a link to the release of the counterpart it is paired with (for a one-sided release, link the previous release of the other)
+   - UI: `npm version X.Y.Z --no-git-tag-version` (`package.json` and `package-lock.json`). When the UI starts to need a newer rproxy-api feature, also raise the minimum rproxy-api version (`components/version.ts` in the UI)
+   - For a change spanning both repositories, use the same branch name in both (the UI's e2e tests run against the rproxy-api branch with the same name if there is one, otherwise the default branch)
+2. **Once merged, release** (`vX.Y.Z`. Tags cannot be deleted or moved because of the ruleset, so verify the commit before tagging)
+   - rproxy-api: pushing the tag makes `release.yml` build the binaries and .deb files, attach them to the GitHub Release, and publish rproxy-api to the apt repository. It stops if the tag and `version` in `Cargo.toml` differ
+   - UI: create the tag and release with `gh release create vX.Y.Z --target <full ID of the merge commit>`. On publishing, `release.yml` builds and attaches `rproxy-ui_X.Y.Z-1_all.deb`. Once it is attached, run rproxy-api's `release.yml` by hand to publish it to apt (`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`; rproxy-api is not built)
+3. **Release notes**: write "Main changes" in Japanese from the PRs merged in that milestone. The UI's release notes state the minimum rproxy-api version it needs (e.g. "rproxy-api v0.3.18 or later")
 4. **Close the milestone** and create the milestone for the next patch
-5. Confirm that it has been published via apt (the new version is visible with `apt-cache policy rproxy-api`)
+5. Confirm that it has been published via apt (the new version is visible with `apt-cache policy rproxy-api` / `apt-cache policy rproxy-ui`)

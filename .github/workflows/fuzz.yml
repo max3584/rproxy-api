@@ -4,6 +4,10 @@ name: Fuzz
 # PR（src/ か fuzz/ を変えたもの）では各ターゲットを 60 秒、毎日は 10 分、手動では秒数を指定して動かす。
 # debug assertions（整数のあふれの検査を含む）を有効にしてビルドする。見つかった入力（fuzz/artifacts/）は成果物に上げる。直したら、その入力を単体テストに足す（docs/TESTING.md）。
 # 必須のチェックではない。
+# Alpine（musl）のコンテナで動かす（#191）。Rust の sanitizer（AddressSanitizer）は x86_64-unknown-linux-gnu
+# などの glibc のターゲットにしかなく、musl では使えないので、sanitizer なし（--sanitizer none）でビルドする。
+# 見つけたいもの（panic、整数のあふれ、止まらない処理、メモリの使いすぎ）は sanitizer がなくても見つかる：ターゲットの
+# パーサーは unsafe のない Rust なので、範囲外へのアクセスは ASan がなくても境界の検査で panic になる。
 on:
   pull_request:
     paths:
@@ -31,13 +35,19 @@ env:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    container: alpine:3.24
     timeout-minutes: 150
     env:
       SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '600' }}
-      # the cargo-fuzz binary of install-action is built for musl and would make it
-      # the default target (the sanitizer needs the gnu one)
-      FUZZ_FLAGS: --debug-assertions --target x86_64-unknown-linux-gnu
+      # the target is the host (musl); no sanitizer there (see above)
+      FUZZ_FLAGS: --debug-assertions --sanitizer none
+      # link dynamically: in a static musl binary libstdc++ sees no threads (its weak pthread symbols stay
+      # unresolved), and libFuzzer's std::thread (the -rss_limit_mb watcher) aborts at the start of fuzzing
+      RUSTFLAGS: -Ctarget-feature=-crt-static
     steps:
+      # g++: libfuzzer-sys builds libFuzzer (C++)
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc g++ musl-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@v2

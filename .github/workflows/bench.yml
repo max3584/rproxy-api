@@ -4,6 +4,7 @@ name: Benchmarks
 # GitHub のランナーは速さが揺れるので、PR の head とマージベースを同じジョブ（同じランナー）で続けて測って比べる。
 # 閾値（THRESHOLD %）より遅くなり、95 % の信頼区間がすべて遅い側にあるものだけを警告にする。
 # 失敗にはしない（必須のチェックにもしない）。結果はジョブのサマリーと PR のコメント（1 件を更新する）に出す。
+# Alpine（musl）のコンテナで測る（#191。リリースのバイナリ・.deb と同じ libc と malloc）。
 on:
   pull_request:
     paths:
@@ -33,8 +34,16 @@ jobs:
   bench:
     name: criterion (merge base vs. PR)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    container: alpine:3.24
+    # ふだんは 6〜7 分。止まったときは各ステップのタイムアウトで早めに終える（#187）
+    timeout-minutes: 45
     steps:
+      # github-cli: the PR comment, python3: scripts/bench-summary.py
+      - name: packages
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 github-cli
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -52,10 +61,12 @@ jobs:
       # マージベースのベンチマーク（そのときの benches/）を baseline "base" として保存する。
       # ビルドの成果物は PR の側と共有する（依存は 1 回だけビルドされる）
       - name: benchmarks at the merge base
-        working-directory: ${{ runner.temp }}/base
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        timeout-minutes: 20
+        # ${{ runner.temp }} and ${{ github.workspace }} are the paths on the runner, not in the container:
+        # use the environment variables
         run: |
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cd "$RUNNER_TEMP/base"
           ulimit -n "$(ulimit -Hn)" || true
           if [ ! -d benches ]; then
             echo "the merge base has no benches/: nothing to compare with"
@@ -66,7 +77,9 @@ jobs:
           if [ -d "$CRITERION_HOME" ]; then
             find "$CRITERION_HOME" -type d \( -name new -o -name change \) -prune -exec rm -rf {} +
           fi
+      # 1 回の繰り返しが 30 秒進まなければ、ベンチマーク自身が状態を出して panic する（benches/dataplane.rs の STALL）
       - name: benchmarks of the PR
+        timeout-minutes: 20
         run: |
           ulimit -n "$(ulimit -Hn)" || true
           # cargo の成果物の名前は（ワークスペースからの相対パスで決まるので）マージベースと同じになり、
@@ -98,3 +111,26 @@ jobs:
           else
             gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
           fi
+
+  # 止まる原因の切り分け（#187）：ベンチマークと同じ 1 MiB の往復を、1 回ごとのタイムアウトつきで何百回も繰り返す。
+  # rproxy をクライアントと同じプロセス・ランタイムで動かす場合と、別のプロセス（release のバイナリ）で動かす場合、
+  # L4 の TCP・TLS の終端・rproxy を通さない TLS、クライアントの flush の有無、送信バッファの大きさを並べて、
+  # どの組み合わせで止まるかを表にする（examples/stall_probe.rs）。flush するクライアントが止まったら失敗にする
+  stall-probe:
+    name: "stall probe (1 MiB echo loops, #187)"
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    timeout-minutes: 30
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --bin rproxy-api --example stall_probe
+      - name: rproxy in the same process as the clients
+        timeout-minutes: 10
+        run: target/release/examples/stall_probe --iters 300
+      - name: rproxy as its own process
+        timeout-minutes: 10
+        run: target/release/examples/stall_probe --iters 300 --rproxy target/release/rproxy-api

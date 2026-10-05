@@ -5,11 +5,27 @@ English: [TESTING.md](en/TESTING.md)
 | 実行方法 | 対象 | CI のジョブ |
 |---|---|---|
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
-| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（MariaDB のサービスコンテナを使う） |
+| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
 | `scripts/load/run.sh` | 大きな通信を流し続ける負荷・soak のテスト（転送効率。下の「負荷・soak のテスト」） | Load ワークフロー（手動だけ） |
+
+## CI の実行環境
+
+GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine のコンテナ（`container: alpine:3.24`。musl で、リリースのバイナリ・.deb と同じ libc）の中で動かす（#191）。パッケージは apk で入れ、Rust は rustup の stable（fuzz は nightly）。
+
+| ワークフロー / ジョブ | 環境 |
+|---|---|
+| CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.24` |
+| CI の `transparent` | `alpine:3.24`（特権つき。名前空間・veth・nft / iptables） |
+| Load | `alpine:3.24`（特権つき。名前空間・veth・tc netem。`sch_netem` はホストの `/lib/modules` から読む） |
+| Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
+| Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
+| Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
+| CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる |
+
+ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
@@ -91,6 +107,7 @@ English: [TESTING.md](en/TESTING.md)
 | `certificates_are_chosen_by_sni` | 複数の証明書から SNI で選ぶ |
 | `bad_tls_settings_are_reported` | 読めないファイル、証明書なしの terminate、未知の mode、UDP の sni を拒否し、何も残らない |
 | `reload_picks_up_renewed_certificates_and_patch_changes_tls` | 証明書ファイルを差し替えて再読込すると新しい証明書が使われる。PATCH で passthrough に戻せる |
+| `terminate_does_not_stall_under_backpressure` | クライアントの送信バッファを小さくして、終端したルールで 1 MiB の往復を 16 回。どの回も全部のバイトが壊れずに返る（#187） |
 
 ## 結合テスト：多段の CA（`tests/chain.rs`）
 
@@ -186,6 +203,10 @@ English: [TESTING.md](en/TESTING.md)
 
 `.github/workflows/bench.yml` が `src/`・`benches/`・`tests/common/`・`Cargo.*` を変えた PR で動く。ランナーは速さが揺れるので、同じジョブでマージベース（`--save-baseline base`）と PR（`--baseline-lenient base`）を続けて測り、`scripts/bench-summary.py` が表にしてジョブのサマリーと PR のコメント（1 件を更新する）に出す。平均が 15 % より遅くなり、95 % の信頼区間がすべて遅い側にあるものを警告にする（失敗にはしない。必須のチェックでもない）。警告が出たら、まずジョブを再実行して同じ結果になるか確かめる。
 
+`dataplane` の 1 回の繰り返しが 30 秒進まないとき（`STALL`）は、ベンチマークが止まったものとして panic し、何をしていたか（書いた・読み戻したバイト数、TLS のクライアントが送っていないレコードを持っているか）とルールの統計を出す（#187）。ワークフローの各ステップにもタイムアウト（20 分）がある。TLS のストリームは `write_all` のあとに `flush` しないと、ソケットが詰まっていたときの最後のレコードが rustls に残る（#187 の止まった原因。クライアント側の問題で、rproxy は `copy_bidirectional` が読めないときに flush する）。
+
+切り分け用に `examples/stall_probe.rs` がある（`bench.yml` の `stall-probe` ジョブ）。同じ 1 MiB の往復を 1 回 3 秒のタイムアウトで何百回も繰り返し、L4 の TCP・TLS の終端・rproxy を通さない TLS、クライアントの flush の有無、送信バッファ（既定・4 KiB）、rproxy を同じプロセスで動かすか別のプロセス（`--rproxy target/release/rproxy-api`）にするか、を並べて止まった回数と時間を表にする。#187 では、止まるのは flush しない TLS のクライアントだけで、rproxy を通さなくても、別のプロセスにしても同じように止まり、そのときクライアントの rustls は送っていないレコードを持っていた（`wants_write = true`）。flush するクライアントが止まったらジョブは失敗する。手元では `cargo run --release --example stall_probe -- --iters 300`。
+
 ## まだテストしていないこと
 
 - 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ
@@ -204,9 +225,11 @@ English: [TESTING.md](en/TESTING.md)
 | `scripts/interop/mail.sh` | Postfix / Dovecot | STARTTLS の終端 + PROXY v2 で、Submission・SMTP（STARTTLS 任意）・IMAP・IMAPS・POP3 が通る。STARTTLS 前の送信・ログインを拒否する |
 | `scripts/interop/media.sh` | coturn / MediaMTX | TURN の UDP・TCP の素通し、TLS の終端、DTLS の終端で、割り当てと中継ができる（中継アドレスは範囲ルール越し）。RTSP（TCP interleaved）と RTSPS の終端で映像を受け取れる。10000 ポートの UDP の範囲ルールを作って消す時間・ファイル数・メモリ |
 
+| `scripts/interop/crowdsec.sh` | CrowdSec（LAPI・エージェント・AppSec） | rproxy のログから CrowdSec が検知して ban し、rproxy（L7 の `crowdsec`・L4 の `crowdsec: true`・AppSec）が止める。文書用アドレスのクライアント（IPv4・IPv6）は ban され、私用アドレスは whitelist で ban されない |
+
 10000 ポートの範囲ルール（UDP）の結果（GitHub の Ubuntu ランナー、2026-09）: 作成 約 0.2 秒、ファイル記述子 +10000（削除で元に戻る）、RSS 約 +94 MiB。
 
-sudo でパッケージを入れるので、手元では実行しない。
+どれも使い捨てのコンテナ（mail・media は `alpine:3.24`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
 
 ## 長時間の負荷テスト（Soak ワークフロー）
 
@@ -216,7 +239,7 @@ sudo でパッケージを入れるので、手元では実行しない。
 - UDP: 送信元ポートを変えながら送る 100 クライアント（`udp_idle_secs: 5` でセッションの作成と破棄を繰り返す）
 - 合格の条件: 負荷を止めた後に fd の数が元に戻る（+20 以内）、後半の RSS が前半の 1.5 倍を超えない、転送の失敗が 0.1% 以下
 
-`.github/workflows/soak.yml` が毎週 30 分動かし、CSV を artifact に残す。何時間も回すときは Actions の画面から `duration`（秒）を指定して手動で動かす。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
+`.github/workflows/soak.yml` は必要なときだけ手動で動かす（定期の実行も PR での実行もしない）。Actions の画面か `gh workflow run soak.yml -f duration=<秒>` で時間（既定 3600 秒）を指定し、CSV は artifact に残る。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
 
 
 ## 負荷・soak のテスト（Load ワークフロー、#183）
@@ -292,6 +315,8 @@ root なしで動かすにはユーザー名前空間が要る（Ubuntu 24.04 �
 - `load (clean)`：netem なしで全シナリオ（既定 2 GiB × 3、接続 5000、soak 10 分）
 - `load (netem)`：`delay 5ms loss 0.1%` で `tcp`・`verify`・`tls`・`http`・`udp`・`latency`（512 MiB）
 
+ジョブは Alpine のコンテナ（musl。リリースのバイナリと同じ libc）で、rproxy も musl でビルドする。musl の malloc は glibc のより遅いので、結果の頭に各ビルドの libc とアロケータ（バイナリから読む）を書く。比べるのは libc とアロケータが同じもの同士にする（違えば「Builds compared」に注意を出す）。
+
 結果は artifact（`load-clean` / `load-netem`、90 日）とジョブのサマリーに残す。前回の成功した手動の実行（master を先に、なければほかのブランチ）の artifact を取ってきて、差分を表に出す。ランナーは 4 コアの共有の VM なので、1 回だけの差は気にせず、続けて出る変化を見る。
 
 ### 高速化の案を比べる（`perf/<topic>` のブランチ）
@@ -308,7 +333,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 - ref が増えるほど時間がかかる（soak はビルドごと）。必要なシナリオだけを `scenarios` で選ぶ
 - ワークフローの手動実行は、既定のブランチ（master）にあるワークフローだけが Actions の画面・`gh workflow run` に出る。スクリプト（`scripts/load/`）は実行したブランチ（`--ref`。既定は master）のものを使う
 
-`scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした週 1 回の soak で、そのまま残している。
+`scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした soak（手動）で、そのまま残している。
 
 ## ファジング（Fuzz ワークフロー）
 
@@ -326,7 +351,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
 
-`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
+`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。CI は Alpine（musl）なので sanitizer なし（`--sanitizer none`。Rust の AddressSanitizer は glibc のターゲットにしかない）で、debug assertions（整数のあふれの検査）を有効にする。ターゲットのパーサーは unsafe のない Rust なので、範囲外へのアクセスは sanitizer がなくても境界の検査で panic になる。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
 
 手元では（nightly と C/C++ コンパイラが要る）：
 

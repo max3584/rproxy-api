@@ -827,6 +827,41 @@ def tool_version(args):
 		return None
 
 
+def build_info(path):
+	"""The libc and the allocator of a binary: musl's malloc is slower than glibc's, so runs compare only when these match."""
+	try:
+		with open(path, "rb") as f:
+			data = f.read()
+	except OSError:
+		return {}
+	interp = ""
+	if data[:4] == b"\x7fELF" and data[4] == 2:  # 64-bit ELF: look for PT_INTERP
+		import struct
+		phoff, = struct.unpack_from("<Q", data, 0x20)
+		phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+		for i in range(phnum):
+			ptype, = struct.unpack_from("<I", data, phoff + i * phentsize)
+			if ptype == 3:
+				off, = struct.unpack_from("<Q", data, phoff + i * phentsize + 8)
+				size, = struct.unpack_from("<Q", data, phoff + i * phentsize + 32)
+				interp = data[off:off + size].rstrip(b"\0").decode(errors="replace")
+	if "musl" in interp:
+		libc = "musl (dynamic)"
+	elif interp:
+		libc = "glibc (dynamic)"
+	else:
+		libc = "glibc (static)" if b"GNU C Library" in data or b"GLIBC_" in data else "musl (static)"
+	if b"mimalloc" in data:
+		alloc = "mimalloc"
+	elif b"jemalloc" in data or b"_rjem_" in data:
+		alloc = "jemalloc"
+	elif b"snmalloc" in data:
+		alloc = "snmalloc"
+	else:
+		alloc = "libc malloc"
+	return {"libc": libc, "allocator": alloc}
+
+
 def meta():
 	cpu = ""
 	try:
@@ -839,8 +874,8 @@ def meta():
 		"commit": E.get("GITHUB_SHA") or E.get("COMMIT", ""),
 		"ref": E.get("GITHUB_REF_NAME", ""),
 		"rproxy": tool_version([BIN, "--version"]),
-		"builds": [{"target": RP_NAMES[i], "ref": label, "commit": COMMITS.get(label, ""), "version": tool_version([path, "--version"])}
-				   for i, (label, path) in enumerate(BINS)],
+		"builds": [dict({"target": RP_NAMES[i], "ref": label, "commit": COMMITS.get(label, ""),
+						 "version": tool_version([path, "--version"])}, **build_info(path)) for i, (label, path) in enumerate(BINS)],
 		"kernel": platform.release(), "cpu": cpu, "nproc": NPROC,
 		"mem_gib": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30), 1),
 		"netem": E.get("NETEM", ""),

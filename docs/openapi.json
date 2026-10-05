@@ -1440,6 +1440,11 @@
       "Capabilities": {
         "type": "object",
         "properties": {
+          "version": {
+            "type": "string",
+            "description": "The rproxy-api release of this build (Cargo.toml version, e.g. 0.3.18). Added in 0.3.18; absent on older releases",
+            "example": "0.3.18"
+          },
           "source_ip": {
             "type": "array",
             "items": {

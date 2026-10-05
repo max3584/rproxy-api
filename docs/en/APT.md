@@ -32,7 +32,7 @@ Pushing a `v*` tag makes `.github/workflows/release.yml` do the following.
 1. Build the binaries for each target and the amd64 / arm64 / armhf `.deb` files, and attach them to the GitHub Release (it stops if the tag and `version` in `Cargo.toml` differ)
 2. Add the `.deb` files to the apt repository on the `gh-pages` branch with `scripts/apt-repo.sh`, re-sign the index (`dists/stable/`), and push
 
-GitHub Pages serves `https://max3584.github.io/rproxy-api/`. The management UI `rproxy-ui` (Architecture: all) is published in the same repository. The apt job fetches `rproxy-ui_X.Y.Z-1_all.deb` from the [TCP-UDP-rproxy-ui release](https://github.com/max3584/TCP-UDP-rproxy-ui/releases) with the same number (release the UI first; see docs/RELEASING.md). For a UI-only release, running `release.yml` by hand (with the UI tag as `ui_tag`) publishes just rproxy-ui. The layout is as follows.
+GitHub Pages serves `https://max3584.github.io/rproxy-api/`. The management UI `rproxy-ui` (Architecture: all) is published in the same repository. rproxy-ui advances its version independently of rproxy-api (docs/RELEASING.md), so a tag push does not publish it. Once a UI release has `rproxy-ui_X.Y.Z-1_all.deb` attached, running `release.yml` by hand (`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`) fetches it from the [TCP-UDP-rproxy-ui release](https://github.com/max3584/TCP-UDP-rproxy-ui/releases) and publishes just rproxy-ui. The layout is as follows.
 
 ```
 pool/main/r/<package>/<package>_<version>_<arch>.deb   rproxy-api and rproxy-ui. Past versions are kept too

@@ -121,6 +121,9 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	}
 	let names: Vec<&str> = source_ip.iter().map(SourceIp::as_str).collect();
 	Json(json!({
+		// the release of this build (Cargo.toml); the UI compares it with the
+		// oldest rproxy-api it supports (docs/RELEASING.md)
+		"version": env!("CARGO_PKG_VERSION"),
 		"source_ip": names,
 		"transparent": transparent,
 		"transparent_ipv6": state.registry.transparent_ipv6_available(),

@@ -105,7 +105,10 @@ def compare_builds(data):
 	out = ["## Builds compared", "",
 		   "Every scenario ran the builds in turn on the same runner (A, B, A, B, ...); the first is the baseline, "
 		   f"(+x%) is the change against it, bold is more than {WORSE:.0f}% worse.", ""]
-	out += [f"- `{b['target']}`: {b['ref']} `{(b.get('commit') or '')[:10]}` {b.get('version') or ''}" for b in builds]
+	out += [f"- `{b['target']}`: {b['ref']} `{(b.get('commit') or '')[:10]}` {b.get('version') or ''} · "
+			f"{b.get('libc', '?')} · {b.get('allocator', '?')}" for b in builds]
+	if len({(b.get("libc"), b.get("allocator")) for b in builds}) > 1:
+		out += ["", "**The builds differ in libc or allocator**: part of any difference comes from that."]
 	out.append("")
 	by = {(r["scenario"], r["case"], r["target"]): r for r in results}
 	scenarios = []
@@ -144,6 +147,9 @@ def render(data, prev=None):
 	p = m.get("params", {})
 	out = ["# rproxy load test", ""]
 	out.append(f"- {m.get('date', '')} · commit `{(m.get('commit') or '')[:10]}` {m.get('ref', '')} · {m.get('rproxy') or ''}")
+	for b in m.get("builds", []):
+		out.append(f"- {b['target']}: {b.get('ref') or '(local build)'} `{(b.get('commit') or '')[:10]}` · {b.get('version') or ''} · "
+				   f"libc {b.get('libc', '?')} · allocator {b.get('allocator', '?')}")
 	out.append(f"- {m.get('cpu', '')} · {m.get('nproc', '')} CPUs · {m.get('mem_gib', '')} GiB · kernel {m.get('kernel', '')}")
 	out.append(f"- netem: {m.get('netem') or 'none'} · size {p.get('size_mib')} MiB x {p.get('repeat')} · {p.get('duration')} s per run · "
 			   f"{p.get('conns')} conns · {p.get('udp_sessions')} UDP sessions · soak {p.get('soak_secs')} s · rproxy log level {p.get('log_level')}")

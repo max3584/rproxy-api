@@ -146,6 +146,11 @@ def main():
         ]
     ):
         put("matcher", f"expr-{i}", expr + request)
+    # just past the limits (#180): nesting 33 deep, 257 matchers
+    put("matcher", "limit-not", "!" * 33 + "Host(`a`)" + request)
+    put("matcher", "limit-paren", "(" * 33 + "Host(`a`)" + ")" * 33 + request)
+    put("matcher", "limit-terms", " && ".join(["Host(`a`)"] * 257) + request)
+    put("matcher", "limit-deepest", " || ".join(["!" * 31 + "Path(`/`)"] * 256) + request)
 
     # starttls: mode byte (protocol, required, read size), then what the client sends,
     # NUL, and what the mail server sends
@@ -163,6 +168,17 @@ def main():
 
     # config: 0 = YAML, 1 = JSON, then the document
     put("config", "rproxy.example.yaml", b"\x00" + (ROOT / "contrib" / "rproxy.example.yaml").read_bytes())
+    # durations at and past 365 days (#180)
+    put(
+        "config",
+        "durations.yaml",
+        b"\x00version: 1\nrules:\n"
+        b"  - {protocol: tcp, listen_addr: 127.0.0.1, listen_port: 80, remote_addr: a, remote_port: 1, health_check: {interval: 8760h, timeout: 525601m}}\n"
+        b"  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: 81\n    http:\n"
+        b"      routes: [{name: a, match: \"!(Host(`a`) || !Path(`/`))\", to: \"http://b\", middlewares: [rl, cb]}]\n"
+        b"      middlewares:\n        rl: {rate_limit: {average: 1, period: 18446744073709551615ms}}\n"
+        b"        cb: {circuit_breaker: {failure_percent: 50, window: 5124095576030432m, recovery: 31536000s}}\n",
+    )
     n = 0
     for doc in ["API.md", "DESIGN-v0.3.md", "CROWDSEC.md", "MIGRATING-FROM-TRAEFIK.md", "PROFILES.md"]:
         text = (ROOT / "docs" / "en" / doc).read_text()

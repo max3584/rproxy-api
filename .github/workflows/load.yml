@@ -3,6 +3,7 @@ name: Load
 # 大きな通信を流し続ける負荷・soak のテスト（scripts/load/、issue #183）。転送の速さ・遅延・
 # CPU 1 コアあたりの転送量・メモリ（接続 1 本・UDP のセッション 1 つ・ルール 1 件あたり）・FD・UDP の取りこぼしを、
 # プロキシなしの直結と（入っていれば）HAProxy を並べて測る。高速化（#184）・メモリの削減（#185）の前後を比べるための基準。
+# Alpine のコンテナ（musl。リリースと同じ libc）で動かす。結果の頭に rproxy の libc とアロケータを書く（比べるときは揃える）。
 # 重く長いので、オーナーが頼んだときに手動（workflow_dispatch）でだけ動かす（定期・PR では動かさない。必須のチェックではない）。
 # 結果（results.json・summary.md）は artifact とジョブのサマリーに残し、前回の成功した手動の実行と比べる。
 # 失敗にするのは確かめごと（転送したデータが 1 バイトでも違う、シナリオが動かない、soak でメモリ・FD が増え続ける）だけで、
@@ -51,7 +52,14 @@ jobs:
   load:
     name: load (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      # network namespaces, veth and tc netem (the host's kernel); /lib/modules to load sch_netem
+      options: --privileged -v /lib/modules:/lib/modules:ro
     timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -68,24 +76,23 @@ jobs:
       NETEM: ${{ matrix.variant == 'netem' && (inputs.netem || 'delay 5ms loss 0.1%') || '' }}
       SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
     steps:
+      # bash, unshare / nsenter (util-linux-misc), ip / tc (iproute2), python3, gh (github-cli) for the previous results;
+      # iperf3, h2load (nghttp2), socat, openssl, HAProxy for the scenarios
+      - name: packages
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 github-cli iproute2 iproute2-tc util-linux-misc kmod \
+            iperf3 nghttp2 socat openssl haproxy
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
         with:
           # the refs to compare are built from this clone
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: tools (iperf3, h2load, socat, HAProxy)
-        run: |
-          sudo apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q iperf3 nghttp2-client socat haproxy
-          # the packaged HAProxy service is not used (the test starts its own)
-          sudo systemctl disable --now haproxy || true
       - name: netem (sch_netem)
         if: matrix.variant == 'netem'
-        run: |
-          sudo modprobe sch_netem || {
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem
-          }
+        run: modprobe sch_netem
       # each ref is built from its own worktree into the shared target dir (the dependencies are built once)
       # and its binary copied out; the scripts of this checkout drive them all
       - name: build rproxy for each ref (${{ env.REFS }})
@@ -136,7 +143,8 @@ jobs:
             echo "no earlier results to compare with"
           fi
       - name: scripts/load/run.sh
-        run: sudo -E env "PATH=$PATH" OUT="$PWD/load-results" scripts/load/run.sh
+        # root in the container: the limits (open files, socket buffers) can be raised
+        run: OUT="$PWD/load-results" scripts/load/run.sh
       - name: summary
         if: always()
         run: |

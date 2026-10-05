@@ -2,8 +2,10 @@ English: [RELEASING.md](en/RELEASING.md)
 
 # バージョン管理とリリース
 
-rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と UI（[max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)）は、**1 つのバージョン番号の並びを共有する**。
-両方の動くものが変わったら、同じ番号で一緒に出す（UI の vX.Y.Z は rproxy-api の vX.Y.Z と組み合わせる）。**片方の動くものだけが変わったときは、その片方だけを出す**（もう片方はその番号を飛ばす。例：UI だけ v0.3.16 を出したら、rproxy-api の次は v0.3.17）。組み合わせるのは、番号がそれ以下で一番新しいもう片方のリリース（UI v0.3.16 なら rproxy-api v0.3.15）。
+rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と UI（[max3584/TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)）は、**バージョン番号をリポジトリごとに別々に進める**（リリースのタグは両者でずれてよい）。
+それぞれ、自分の動くものが変わったときだけ、自分の番号を上げて出す。
+
+組み合わせは UI が確かめる。UI は動くのに必要な rproxy-api の最小の版を持ち、各ノードの rproxy-api の版（`GET /capabilities` の `version`。v0.3.18 から）と比べて、古い・分からない・UI が知らない新しいマイナーのときは画面に注意を出す。機能ごとの細かい判断は今までどおり `GET /capabilities` の `features` で行う。UI のリリースノートには、必要な rproxy-api の最小の版を書く。
 
 ## バージョンの上げ方
 
@@ -30,14 +32,15 @@ rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と U
 
 ## リリースの手順
 
-1. **バージョンを上げる PR**（ブランチ `release/vX.Y.Z`、両方のリポジトリで同じ名前にする。UI の e2e は同じ名前の rproxy-api のブランチでテストする）
+出すリポジトリだけで行う（もう片方のバージョンは上げない）。
+
+1. **バージョンを上げる PR**（ブランチ `release/vX.Y.Z`）
    - rproxy-api: `Cargo.toml` の `version` と、`Cargo.lock` の rproxy-api の版（`cargo update -p rproxy-api --offline`）。`Cargo.lock` を直し忘れると、`--locked` でビルドする CI とリリースが止まる
-   - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）
-2. **マージされたら、UI → rproxy-api の順にリリースする**（rproxy-api の apt の公開が、同じ番号の UI のリリースから `rproxy-ui` の .deb を取るため）（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
-   - rproxy-api: タグの push で `release.yml` がバイナリ・.deb を作り、GitHub Release に添付し、apt リポジトリを更新する。タグと `Cargo.toml` の `version` が違うと止まる
-   - UI: `gh release create vX.Y.Z --target <マージコミットの完全な ID>` でタグとリリースを作る。公開すると `release.yml` が `rproxy-ui_X.Y.Z-1_all.deb` を作って添付するので、終わるのを待つ
-   - rproxy-api: 上の UI の .deb が添付されてからタグを push する（なければ apt ジョブは警告を出して rproxy-api だけを載せる。後から載せるときは apt ジョブを再実行する）
-   - **UI だけを出すとき**：UI のリリースの .deb が添付されたら、rproxy-api の `release.yml` を手動で実行して apt に載せる（`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`。rproxy-api はビルドしない）。rproxy-api のバージョンを上げる PR・タグは作らない
-3. **リリースノート**: そのマイルストーンでマージした PR から、日本語で「主な変更」を書き、組み合わせるもう片方のリリースへのリンクを付ける（片方だけ出したときは、組み合わせるもう片方の前の版へのリンク）
+   - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）。新しい rproxy-api の機能が要るようになったら、必要な rproxy-api の最小の版（UI の `components/version.ts`）も上げる
+   - 両方のリポジトリにまたがる変更は、両方で同じ名前のブランチにする（UI の e2e は同じ名前の rproxy-api のブランチがあればそれで、なければ既定ブランチでテストする）
+2. **マージされたらリリースする**（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
+   - rproxy-api: タグの push で `release.yml` がバイナリ・.deb を作り、GitHub Release に添付し、apt リポジトリに rproxy-api を載せる。タグと `Cargo.toml` の `version` が違うと止まる
+   - UI: `gh release create vX.Y.Z --target <マージコミットの完全な ID>` でタグとリリースを作る。公開すると `release.yml` が `rproxy-ui_X.Y.Z-1_all.deb` を作って添付する。添付されたら、rproxy-api の `release.yml` を手動で実行して apt に載せる（`gh workflow run release.yml -R max3584/rproxy-api -f ui_tag=vX.Y.Z`。rproxy-api はビルドしない）
+3. **リリースノート**: そのマイルストーンでマージした PR から、日本語で「主な変更」を書く。UI のリリースノートには、必要な rproxy-api の最小の版（例「rproxy-api v0.3.18 以上」）を書く
 4. **マイルストーンを閉じ**、次のパッチのマイルストーンを作る
-5. apt で公開されたこと（`apt-cache policy rproxy-api` で新しいバージョンが見える）を確かめる
+5. apt で公開されたこと（`apt-cache policy rproxy-api` / `apt-cache policy rproxy-ui` で新しいバージョンが見える）を確かめる

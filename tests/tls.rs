@@ -708,3 +708,48 @@ async fn an_expired_client_ca_only_warns() {
 	assert_eq!(tls_roundtrip(&pki, port, "ca.test", None, "1").await.unwrap(), "C:1");
 	assert_eq!(h.registry.check_certificate_expiry().await, 0, "a CA does not stop the rule");
 }
+
+/// Large echoes through `terminate` with a small client send buffer (#187): rproxy
+/// passes every byte on in both directions, round after round. The client must
+/// flush after writing: with a full socket, rustls keeps the last records until
+/// then (what stalled the `tls_terminate/throughput_1MiB` benchmark).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminate_does_not_stall_under_backpressure() {
+	let pki = Pki::new("stall");
+	let cert = pki.server("front", &["big.test"]);
+	let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target = backend.local_addr().unwrap();
+	tokio::spawn(async move {
+		let (mut s, _) = backend.accept().await.unwrap();
+		let (mut r, mut w) = s.split();
+		let _ = tokio::io::copy(&mut r, &mut w).await;
+	});
+	let h = harness().await;
+	let port = free_port();
+	let body = tcp_rule(port, target, json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]}));
+	assert_eq!(h.post(body).await.0, StatusCode::CREATED);
+
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	// (not SO_RCVBUF: a receive window far below the loopback MSS stalls the kernel
+	// itself until the persist timer, whoever the sender is)
+	socket2::SockRef::from(&tcp).set_send_buffer_size(4096).unwrap();
+	let mut tls = pki.connector(None).connect("big.test".try_into().unwrap(), tcp).await.unwrap();
+	let data: Vec<u8> = (0..1usize << 20).map(|i| (i * 31 % 251) as u8).collect();
+	let mut back = vec![0u8; data.len()];
+	for round in 0..16 {
+		let (mut r, mut w) = tokio::io::split(&mut tls);
+		let done = tokio::time::timeout(Duration::from_secs(20), async {
+			let write = async {
+				w.write_all(&data).await?;
+				w.flush().await
+			};
+			let (a, b) = tokio::join!(write, r.read_exact(&mut back));
+			a.and(b.map(|_| ()))
+		})
+		.await;
+		let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+
+		done.unwrap_or_else(|_| panic!("round {round} stalled; rule stats {}", v["stats"])).unwrap();
+		assert!(back == data, "round {round}: corrupted");
+	}
+}

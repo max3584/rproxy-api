@@ -22,10 +22,13 @@ permissions:
 jobs:
   integrity:
     runs-on: ubuntu-latest
+    container: alpine:3.24
     timeout-minutes: 120
     env:
       RPROXY_TEST_INTEGRITY_MB: ${{ inputs.mb || (github.event_name == 'pull_request' && '64') || '512' }}
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

@@ -7,8 +7,9 @@ on:
   push:
     tags:
       - v*
-  # UI だけのリリース（rproxy-api のコードが変わらない版）の rproxy-ui の .deb を
-  # apt リポジトリに載せる。rproxy-api はビルドしない（docs/RELEASING.md）
+  # rproxy-ui の .deb を apt リポジトリに載せる。UI は rproxy-api と別に版を
+  # 進めるので、UI のリリースの後にここを手動で実行する。rproxy-api はビルドしない
+  # （docs/RELEASING.md）
   workflow_dispatch:
     inputs:
       ui_tag:
@@ -16,20 +17,27 @@ on:
         required: true
 
 jobs:
+  # Alpine（musl）のコンテナで 6 つのターゲットをビルドする（#191）。musl の x86_64 はそのまま、ほかは
+  # cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（scripts/build-release.sh）。
+  # .deb は musl の静的リンクのバイナリから作る。同じ手順を cross.yml が PR で確かめる
   build:
     if: github.event_name == 'push'
-    runs-on: ${{ matrix.job.os }}
+    runs-on: ubuntu-latest
+    container: alpine:3.24
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu       , use-cross: false , extension: ""   }
-          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl      , use-cross: true  , extension: ""   , deb: amd64 }
-          - { os: ubuntu-latest  , target: armv7-unknown-linux-gnueabihf  , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: armv7-unknown-linux-musleabihf , use-cross: true  , extension: ""   , deb: armhf }
-          - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu      , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl     , use-cross: true  , extension: ""   , deb: arm64 }
+          - { target: x86_64-unknown-linux-gnu       , extension: "" }
+          - { target: x86_64-unknown-linux-musl      , extension: ""   , deb: amd64 }
+          - { target: armv7-unknown-linux-gnueabihf  , extension: "" }
+          - { target: armv7-unknown-linux-musleabihf , extension: ""   , deb: armhf }
+          - { target: aarch64-unknown-linux-gnu      , extension: "" }
+          - { target: aarch64-unknown-linux-musl     , extension: ""   , deb: arm64 }
     steps:
+      - name: Packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -50,26 +58,13 @@ jobs:
         with:
           targets: ${{ matrix.job.target }}
 
-      - name: Install cross
-        if: matrix.job.use-cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
       - name: Build
-        shell: bash
-        run: |
-          if [ "${{ matrix.job.use-cross }}" = "true" ]; then
-            cross build --locked --release --target ${{ matrix.job.target }}
-          else
-            cargo build --locked --release --target ${{ matrix.job.target }}
-          fi
+        run: scripts/build-release.sh ${{ matrix.job.target }}
 
+      # cargo-deb publishes only a glibc build (a .deb), so build it here
       - name: Install cargo-deb
         if: matrix.job.deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+        run: cargo install --locked cargo-deb
 
       # static musl binaries, so one package works on every Debian / Ubuntu release
       - name: Debian package
@@ -104,6 +99,8 @@ jobs:
   # (https://max3584.github.io/rproxy-api/). Needs the repository secrets
   # APT_GPG_PRIVATE_KEY (ASCII-armored secret key without a passphrase) and
   # APT_GPG_KEY_ID; skipped when they are not set. See docs/APT.md.
+  # apt-ftparchive（apt-utils）は Debian の道具なので、ここだけ debian:13-slim のコンテナで動かす（#191。
+  # 同じ手順を cross.yml の apt (dry run) が使い捨ての鍵で確かめる）
   apt:
     needs: build
     if: >-
@@ -111,14 +108,15 @@ jobs:
       ((github.event_name == 'push' && github.ref_type == 'tag' && needs.build.result == 'success') ||
        github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    container: debian:13-slim
     concurrency:
       group: apt-repository
       cancel-in-progress: false
     env:
       APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
       APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
-      # push のときは rproxy-api と同じタグ、手動のときは入力した UI のタグ
-      UI_TAG: ${{ inputs.ui_tag || github.ref_name }}
+      # 手動のときだけ使う（入力した UI のタグ）
+      UI_TAG: ${{ inputs.ui_tag }}
     steps:
       - name: Check signing key
         id: key
@@ -128,6 +126,14 @@ jobs:
           else
             echo "::warning::APT_GPG_PRIVATE_KEY / APT_GPG_KEY_ID are not set; the apt repository is not updated"
           fi
+
+      - name: Packages
+        if: steps.key.outputs.ok
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates gnupg apt-utils dpkg-dev curl gh
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
 
       - name: Checkout
         if: steps.key.outputs.ok
@@ -151,20 +157,18 @@ jobs:
           path: debs
           merge-multiple: true
 
-      # the UI is released with the same version first (docs/RELEASING.md)
+      # the UI has its own version numbers (docs/RELEASING.md): a tag push
+      # publishes rproxy-api only, and the UI .deb comes by hand with ui_tag
       - name: Download rproxy-ui
-        if: steps.key.outputs.ok
+        if: steps.key.outputs.ok && github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release download "$UI_TAG" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
-            ls debs
-          elif [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if ! gh release download "$UI_TAG" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
             echo "::error::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG"
             exit 1
-          else
-            echo "::warning::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG; publishing rproxy-api only (re-run this job once the UI release has it)"
           fi
+          ls debs
 
       - name: Update the repository
         if: steps.key.outputs.ok
