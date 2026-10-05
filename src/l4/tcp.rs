@@ -216,8 +216,7 @@ async fn run(
 			detail.lease = lease;
 			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
-			let backend = out.as_raw_fd();
-			finish(rt, inbound, &mut out, backend, detail).await
+			finish_plain(rt, inbound, &mut out, detail).await
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::tls::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
@@ -251,8 +250,27 @@ async fn relay_hello(
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
-	let backend = out.as_raw_fd();
-	finish(rt, inbound, &mut out, backend, detail).await
+	finish_plain(rt, inbound, &mut out, detail).await
+}
+
+/// `finish` for two plain TCP sockets (nothing terminated in between): with the
+/// splice experiment on (#184, `l4::splice`), the data is moved by splice(2).
+async fn finish_plain(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> io::Result<()> {
+	#[cfg(target_os = "linux")]
+	if crate::l4::splice::settings().enabled {
+		let (rx, tx) = (AtomicU64::new(0), AtomicU64::new(0));
+		let result = crate::l4::splice::relay(a, b, &rx, &tx, &rt.stats.rx_bytes, &rt.stats.tx_bytes).await;
+		detail.rx += rx.into_inner();
+		detail.tx += tx.into_inner();
+		if result.is_err() {
+			reset_on_close(b);
+		}
+		result?;
+		detail.reason = "closed";
+		return Ok(());
+	}
+	let backend = b.as_raw_fd();
+	finish(rt, a, b, backend, detail).await
 }
 
 /// A stream that first yields bytes already read from it (the ClientHello read
