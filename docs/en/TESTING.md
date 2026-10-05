@@ -71,6 +71,7 @@ Integration tests open real sockets on loopback. The control API, the echo serve
 | `proxy_protocol_v1_header_carries_the_client` | The string of the v1 header received by the target |
 | `concurrent_creates_of_the_same_rule_yield_one_winner` | Even if the same rule is added 10 times concurrently, only one succeeds |
 | `a_silent_api_client_does_not_block_others` | A connection that sends nothing does not make other requests wait (regression test for a bug in the original implementation) |
+| `small_writes_are_not_delayed_by_nagle` | A round trip of small writes sent in two pieces does not wait for a delayed ACK (~40 ms) in either direction (TCP_NODELAY on both hops, #176) |
 
 ## Integration tests: port ranges and TLS (`tests/tls.rs`)
 

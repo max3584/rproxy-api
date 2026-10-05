@@ -423,3 +423,42 @@ async fn udp_proxy_v2_prefixes_every_datagram() {
 	v1["source_ip"] = json!("proxy_v1");
 	assert_eq!(h.post(v1).await.1["code"], "unsupported");
 }
+
+/// TCP_NODELAY on both hops (#176): an answer written in two pieces must not wait
+/// for a delayed ACK (~40 ms) at rproxy, in either direction.
+#[tokio::test]
+async fn small_writes_are_not_delayed_by_nagle() {
+	let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let target = backend.local_addr().unwrap();
+	tokio::spawn(async move {
+		let (mut s, _) = backend.accept().await.unwrap();
+		s.set_nodelay(true).unwrap();
+		let mut two = [0u8; 2];
+		// read a request sent in two writes, answer in two writes
+		while s.read_exact(&mut two).await.is_ok() {
+			s.write_all(b"a").await.unwrap();
+			// apart, so that rproxy relays them as two writes
+			tokio::time::sleep(Duration::from_millis(2)).await;
+			s.write_all(b"b").await.unwrap();
+		}
+	});
+	let h = harness().await;
+	let port = free_port();
+	h.post(rule("tcp", port, target)).await;
+
+	let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	conn.set_nodelay(true).unwrap();
+	let rounds = 20;
+	let start = std::time::Instant::now();
+	for _ in 0..rounds {
+		conn.write_all(b"x").await.unwrap();
+		tokio::time::sleep(Duration::from_millis(2)).await;
+		conn.write_all(b"y").await.unwrap();
+		let mut two = [0u8; 2];
+		tokio::time::timeout(Duration::from_secs(3), conn.read_exact(&mut two)).await.unwrap().unwrap();
+		assert_eq!(&two, b"ab");
+	}
+	let took = start.elapsed();
+	// with Nagle at rproxy each round waits ~40 ms per direction (well over a second in all)
+	assert!(took < Duration::from_millis(600), "{rounds} rounds took {took:?}");
+}

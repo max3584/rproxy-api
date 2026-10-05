@@ -37,6 +37,7 @@ pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: C
 			_ = stop.cancelled() => break,
 			accepted = listener.accept() => match accepted {
 				Ok((inbound, peer)) => {
+					source::nodelay(&inbound);
 					rt.tracker.spawn(handle(inbound, peer, rt.clone(), offset));
 				}
 				Err(e) => {

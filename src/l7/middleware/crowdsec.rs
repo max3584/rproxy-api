@@ -449,7 +449,7 @@ pub(super) async fn call(
 	let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
 	let work = async {
 		let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| format!("{authority}: {e}"))?;
-		let _ = tcp.set_nodelay(true);
+		crate::net::source::nodelay(&tcp);
 		let stream: Box<dyn Stream2> = if https {
 			let name = ServerName::try_from(host.clone()).map_err(|e| e.to_string())?;
 			Box::new(tls.connect(name, tcp).await.map_err(|e| format!("{authority}: TLS: {e}"))?)
