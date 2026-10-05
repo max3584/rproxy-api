@@ -237,7 +237,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 - UDP: 送信元ポートを変えながら送る 100 クライアント（`udp_idle_secs: 5` でセッションの作成と破棄を繰り返す）
 - 合格の条件: 負荷を止めた後に fd の数が元に戻る（+20 以内）、後半の RSS が前半の 1.5 倍を超えない、転送の失敗が 0.1% 以下
 
-`.github/workflows/soak.yml` が毎週 30 分動かし、CSV を artifact に残す。何時間も回すときは Actions の画面から `duration`（秒）を指定して手動で動かす。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
+`.github/workflows/soak.yml` は必要なときだけ手動で動かす（定期の実行も PR での実行もしない）。Actions の画面か `gh workflow run soak.yml -f duration=<秒>` で時間（既定 3600 秒）を指定し、CSV は artifact に残る。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
 
 
 ## ファジング（Fuzz ワークフロー）

@@ -237,7 +237,7 @@ They all run as root inside a throwaway container (`alpine:3.22` for mail and me
 - UDP: 100 clients that send while changing their source port (with `udp_idle_secs: 5`, sessions are repeatedly created and discarded)
 - Pass criteria: after the load stops, the fd count returns to the original (within +20), RSS in the second half does not exceed 1.5 times that of the first half, and forwarding failures are 0.1% or less
 
-`.github/workflows/soak.yml` runs it for 30 minutes weekly and keeps the CSV as an artifact. To run it for hours, trigger it manually from the Actions page with `duration` (seconds). Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
+`.github/workflows/soak.yml` runs only on demand (no schedule, not on pull requests): trigger it from the Actions page or with `gh workflow run soak.yml -f duration=<seconds>` (default 3600), and the CSV is kept as an artifact. Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
 
 
 ## Fuzzing (Fuzz workflow)
