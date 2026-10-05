@@ -10,9 +10,6 @@ name: Load
 on:
   schedule:
     - cron: "0 18 * * *"   # 毎日 3:00（JST）
-  # TEMPORARY (remove before merge): registers the workflow from this branch
-  push:
-    branches: [test/load-soak]
   workflow_dispatch:
     inputs:
       size_mib:

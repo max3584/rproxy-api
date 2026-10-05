@@ -462,14 +462,16 @@ def sc_tls(targets):
 		a = t.addr("tls_echo")
 		try:
 			with Meter(t) as m:
-				p = run(ns(NS_C, ["openssl", "s_time", "-connect", hostport(a), "-new", "-time", str(DURATION)]), timeout=DURATION + 60)
+				# OpenSSL 3.0's s_time exits 1 after a "-new" only run even when it worked: read the output instead
+				p = run(ns(NS_C, ["openssl", "s_time", "-connect", hostport(a), "-new", "-time", str(DURATION)]), timeout=DURATION + 60,
+						check_rc=False)
 			n = secs = None
 			for line in p.stdout.splitlines():
 				w = line.split()
 				if "real seconds" in line and len(w) > 4:
 					n, secs = int(w[0]), float(w[3])
 			if not n:
-				raise RuntimeError(f"no result: {p.stdout[-300:]}")
+				raise RuntimeError(f"no result (exit {p.returncode}): {(p.stdout + p.stderr)[-300:]}")
 			met = {"handshakes_s": n / secs}
 			met.update(m.metrics(units=n, unit_name="handshakes"))
 			record("tls", "new handshakes (openssl s_time)", t.name, met)

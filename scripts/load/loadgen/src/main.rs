@@ -794,17 +794,36 @@ fn cmd_udp_hold(a: &Args) {
 	let addr = a.addr("connect");
 	let n: usize = a.num("sources", 1000);
 	let socks = udp_sockets(addr, n);
-	for s in &socks {
-		let _ = s.send(b"hello");
-	}
-	let mut up = 0;
+	// a burst of thousands of first datagrams overflows the proxy's receive buffer: send in
+	// paced batches, then retry the sources that got no answer (a few rounds)
+	let mut up = vec![false; n];
 	let mut buf = [0u8; 64];
 	for s in &socks {
-		let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-		if s.recv(&mut buf).is_ok() {
-			up += 1;
+		let _ = s.set_nonblocking(true);
+	}
+	for _round in 0..5 {
+		for (i, s) in socks.iter().enumerate() {
+			if !up[i] {
+				let _ = s.send(b"hello");
+				if i % 100 == 99 {
+					thread::sleep(Duration::from_millis(5));
+				}
+			}
+		}
+		let end = Instant::now() + Duration::from_secs(2);
+		while Instant::now() < end && up.iter().any(|u| !u) {
+			for (i, s) in socks.iter().enumerate() {
+				while s.recv(&mut buf).is_ok() {
+					up[i] = true;
+				}
+			}
+			thread::sleep(Duration::from_millis(20));
+		}
+		if up.iter().all(|u| *u) {
+			break;
 		}
 	}
+	let up = up.iter().filter(|u| **u).count();
 	Obj::default().s("state", "ready").n("sessions", up).n("sources", n).print();
 	for line in io::stdin().lock().lines() {
 		match line.as_deref().map(str::trim) {
