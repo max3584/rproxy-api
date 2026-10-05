@@ -9,8 +9,8 @@
 #   scripts/build-release.sh <target>
 #   → target/<target>/release/rproxy-api
 #
-# 必要なもの: rustup の stable（<target> の rust-std）、zig（apk add zig）と cargo-zigbuild 0.23 以降（aarch64 で rustc が渡す
-# --fix-cortex-a53-843419 を zig に渡さない。Alpine 3.22 のパッケージは 0.20 なので、CI は taiki-e/install-action で入れる）
+# 必要なもの: rustup の stable（<target> の rust-std）、zig と cargo-zigbuild 0.23 以降（apk add zig cargo-zigbuild。Alpine 3.24 以降。
+# 古い cargo-zigbuild は aarch64 で rustc が渡す --fix-cortex-a53-843419 を zig に渡してしまい、リンクできない）
 set -eu
 
 target=${1:?usage: $0 <target>}

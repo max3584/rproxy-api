@@ -23,7 +23,7 @@ jobs:
   build:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +36,7 @@ jobs:
           - { target: aarch64-unknown-linux-musl     , extension: ""   , deb: arm64 }
     steps:
       - name: Packages
-        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig dpkg
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,13 +57,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.job.target }}
-
-      # cargo-zigbuild 0.23 or later: it drops the --fix-cortex-a53-843419 linker argument that rustc passes
-      # for aarch64 and zig does not know (Alpine 3.22 has 0.20)
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
 
       - name: Build
         run: scripts/build-release.sh ${{ matrix.job.target }}
@@ -139,6 +132,8 @@ jobs:
         run: |
           apt-get update -q
           apt-get install -y -q --no-install-recommends git ca-certificates gnupg apt-utils dpkg-dev curl gh
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
 
       - name: Checkout
         if: steps.key.outputs.ok

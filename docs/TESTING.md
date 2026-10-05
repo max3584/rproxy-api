@@ -12,14 +12,14 @@ English: [TESTING.md](en/TESTING.md)
 
 ## CI の実行環境
 
-GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine のコンテナ（`container: alpine:3.22`。musl で、リリースのバイナリ・.deb と同じ libc）の中で動かす（#191）。パッケージは apk で入れ、Rust は rustup の stable（fuzz は nightly）。
+GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine のコンテナ（`container: alpine:3.24`。musl で、リリースのバイナリ・.deb と同じ libc）の中で動かす（#191）。パッケージは apk で入れ、Rust は rustup の stable（fuzz は nightly）。
 
 | ワークフロー / ジョブ | 環境 |
 |---|---|
-| CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.22` |
-| CI の `transparent` | `alpine:3.22`（特権つき。名前空間・veth・nft / iptables） |
+| CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.24` |
+| CI の `transparent` | `alpine:3.24`（特権つき。名前空間・veth・nft / iptables） |
 | Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
-| Cross build・Release の `build` | `alpine:3.22`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
+| Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
 | Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
 | CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる |
 
@@ -227,7 +227,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 10000 ポートの範囲ルール（UDP）の結果（GitHub の Ubuntu ランナー、2026-09）: 作成 約 0.2 秒、ファイル記述子 +10000（削除で元に戻る）、RSS 約 +94 MiB。
 
-どれも使い捨てのコンテナ（mail・media は `alpine:3.22`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
+どれも使い捨てのコンテナ（mail・media は `alpine:3.24`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
 
 ## 長時間の負荷テスト（Soak ワークフロー）
 

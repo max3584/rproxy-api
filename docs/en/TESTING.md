@@ -12,14 +12,14 @@
 
 ## CI environment
 
-GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (`container: alpine:3.22`: musl, the same libc as the release binaries and the .deb) (#191). Packages come from apk, Rust is rustup's stable (nightly for fuzzing).
+GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (`container: alpine:3.24`: musl, the same libc as the release binaries and the .deb) (#191). Packages come from apk, Rust is rustup's stable (nightly for fuzzing).
 
 | Workflow / job | Environment |
 |---|---|
-| CI `test` and `package`, Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.22` |
-| CI `transparent` | `alpine:3.22` (privileged: namespaces, veth, nft / iptables) |
+| CI `test` and `package`, Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.24` |
+| CI `transparent` | `alpine:3.24` (privileged: namespaces, veth, nft / iptables) |
 | Interop `crowdsec` | `crowdsecurity/crowdsec` (CrowdSec's official image, Alpine-based; Alpine has no CrowdSec package), privileged |
-| Cross build and Release `build` | `alpine:3.22`. x86_64 musl natively, the others cross-built with cargo-zigbuild (zig); gnu is linked against glibc 2.17 (`scripts/build-release.sh`) |
+| Cross build and Release `build` | `alpine:3.24`. x86_64 musl natively, the others cross-built with cargo-zigbuild (zig); gnu is linked against glibc 2.17 (`scripts/build-release.sh`) |
 | Release `apt` and Cross build `apt (dry run)` | `debian:13-slim` (apt-ftparchive, which builds the apt repository, is a Debian tool) |
 | CI `deb` and `install` | Directly on the runner VM (Ubuntu). They check installing the .deb, upgrading from an apt repository and purging, and install.sh (which requires systemd), so systemd has to run as PID 1, which a container cannot do. They build no Rust: they check the musl binary and .deb made by the `package` job (Alpine) |
 
@@ -227,7 +227,7 @@ For telling the causes apart there is `examples/stall_probe.rs` (the `stall-prob
 
 Results for a 10000-port range rule (UDP) (GitHub Ubuntu runner, 2026-09): creation about 0.2 seconds, file descriptors +10000 (back to the original after deletion), RSS about +94 MiB.
 
-They all run as root inside a throwaway container (`alpine:3.22` for mail and media, CrowdSec's official image for crowdsec), and the scripts configure and start the servers themselves. Do not run them on your own machine.
+They all run as root inside a throwaway container (`alpine:3.24` for mail and media, CrowdSec's official image for crowdsec), and the scripts configure and start the servers themselves. Do not run them on your own machine.
 
 ## Long-running load test (Soak workflow)
 

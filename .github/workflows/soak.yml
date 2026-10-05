@@ -15,7 +15,7 @@ permissions:
 jobs:
   soak:
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     timeout-minutes: 360
     env:
       DURATION: ${{ inputs.duration }}

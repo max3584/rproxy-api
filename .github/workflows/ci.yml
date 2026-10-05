@@ -24,7 +24,7 @@ jobs:
   test:
     name: clippy + tests (with MariaDB)
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring と zstd-sys
       # tests/traefik_convert.rs runs contrib/traefik2rproxy.py (python3, py3-yaml)
@@ -37,7 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      # Alpine の MariaDB（11.4）を同じコンテナで動かす（公式の mariadb のイメージは Ubuntu）
+      # Alpine の MariaDB（11.8）を同じコンテナで動かす（公式の mariadb のイメージは Ubuntu）
       - name: MariaDB
         run: |
           mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld
@@ -49,8 +49,8 @@ jobs:
           mariadb-admin ping --silent || { cat /tmp/mariadb.log; exit 1; }
           mariadb <<'EOF'
           CREATE DATABASE rproxy_test;
-          CREATE USER 'root'@'127.0.0.1' IDENTIFIED BY 'root';
-          GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
+          -- 127.0.0.1 counts as localhost: root also with the password the tests use (over TCP)
+          ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('root');
           EOF
           mariadb -h 127.0.0.1 -P 3306 -u root -proot -e 'SELECT VERSION()'
       - name: unit + integration tests
@@ -63,7 +63,7 @@ jobs:
     name: transparent mode (network namespaces)
     runs-on: ubuntu-latest
     container:
-      image: alpine:3.22
+      image: alpine:3.24
       # 名前空間・veth・nft / iptables（ホストのカーネル）を使う
       options: --privileged
     steps:
@@ -94,7 +94,7 @@ jobs:
   package:
     name: release binary and .deb (musl)
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev shellcheck

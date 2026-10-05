@@ -22,7 +22,7 @@ permissions:
 jobs:
   integrity:
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     timeout-minutes: 120
     env:
       RPROXY_TEST_INTEGRITY_MB: ${{ inputs.mb || (github.event_name == 'pull_request' && '64') || '512' }}

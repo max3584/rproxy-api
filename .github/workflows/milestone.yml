@@ -14,7 +14,7 @@ jobs:
   assign:
     if: github.event.pull_request.milestone == null && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       - name: packages
         run: apk add --no-cache github-cli

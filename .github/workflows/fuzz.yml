@@ -35,7 +35,7 @@ env:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     timeout-minutes: 150
     env:
       SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '600' }}

@@ -29,7 +29,7 @@ jobs:
   build:
     name: build rproxy-api
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev
@@ -48,7 +48,7 @@ jobs:
     name: mail (Postfix / Dovecot behind STARTTLS)
     needs: build
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl python3 openssl postfix dovecot dovecot-pop3d
@@ -64,7 +64,7 @@ jobs:
     name: media (coturn, MediaMTX, 10000-port range)
     needs: build
     runs-on: ubuntu-latest
-    container: alpine:3.22
+    container: alpine:3.24
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl tar openssl iproute2 coturn ffmpeg
