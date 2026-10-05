@@ -1,0 +1,19 @@
+# Traffic generator and test servers for the load / soak suite (scripts/load/, issue #183).
+# A crate of its own with no dependencies (std only): not a member of the rproxy-api
+# package, so cargo build / test / deny at the repository root never see it.
+# See docs/TESTING.md ("Load and soak tests").
+[package]
+name = "rproxy-loadgen"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[dependencies]
+
+# its own workspace, so the repository root's commands do not pick it up
+[workspace]
+members = ["."]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

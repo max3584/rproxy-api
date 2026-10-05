@@ -1,0 +1,118 @@
+name: Load
+
+# 大きな通信を流し続ける負荷・soak のテスト（scripts/load/、issue #183）。転送の速さ・遅延・
+# CPU 1 コアあたりの転送量・メモリ（接続 1 本・UDP のセッション 1 つ・ルール 1 件あたり）・FD・UDP の取りこぼしを、
+# プロキシなしの直結と（入っていれば）HAProxy を並べて測る。高速化（#184）・メモリの削減（#185）の前後を比べるための基準。
+# GitHub のランナーは速さが揺れるので PR では動かさず、毎晩と手動で動かす（必須のチェックではない）。
+# 結果（results.json・summary.md）は artifact とジョブのサマリーに残し、前回の成功した実行（master の）と比べる。
+# 失敗にするのは確かめごと（転送したデータが 1 バイトでも違う、シナリオが動かない、soak でメモリ・FD が増え続ける）だけで、
+# 遅くなったことは表の差分で見る。
+on:
+  schedule:
+    - cron: "0 18 * * *"   # 毎日 3:00（JST）
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: 大きな転送 1 回の大きさ（MiB）
+        default: "2048"
+      repeat:
+        description: 大きな転送の回数
+        default: "3"
+      duration:
+        description: 速さ・遅延を測る 1 回の秒数
+        default: "10"
+      conns:
+        description: 同時に持つ TCP の接続数
+        default: "5000"
+      soak_secs:
+        description: soak の秒数（0 で省く）
+        default: "600"
+      netem:
+        description: netem のジョブの回線の条件（tc netem の引数）
+        default: "delay 5ms loss 0.1%"
+      scenarios:
+        description: 動かすシナリオ（カンマ区切り。空ならすべて）
+        default: ""
+
+permissions:
+  contents: read
+  # 前回の実行の artifact を読む
+  actions: read
+
+concurrency:
+  group: load-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: load (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [clean, netem]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      SIZE_MIB: ${{ matrix.variant == 'netem' && '512' || inputs.size_mib || '2048' }}
+      REPEAT: ${{ inputs.repeat || '3' }}
+      DURATION: ${{ inputs.duration || '10' }}
+      CONNS: ${{ inputs.conns || '5000' }}
+      UDP_SESSIONS: ${{ inputs.conns || '5000' }}
+      SOAK_SECS: ${{ matrix.variant == 'clean' && (inputs.soak_secs || '600') || '0' }}
+      NETEM: ${{ matrix.variant == 'netem' && (inputs.netem || 'delay 5ms loss 0.1%') || '' }}
+      SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: tools (iperf3, h2load, socat, HAProxy)
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q iperf3 nghttp2-client socat haproxy
+          # the packaged HAProxy service is not used (the test starts its own)
+          sudo systemctl disable --now haproxy || true
+      - name: netem (sch_netem)
+        if: matrix.variant == 'netem'
+        run: |
+          sudo modprobe sch_netem || {
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem
+          }
+      - run: cargo build --locked --release
+      - name: build scripts/load/loadgen
+        run: cargo build --locked --release --manifest-path scripts/load/loadgen/Cargo.toml --target-dir target/loadgen
+      - name: results of the last successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the last successful run on master; else the last successful run of this branch
+          id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --branch master --status success -L 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [ -z "$id" ]; then
+            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --branch "$GITHUB_REF_NAME" --status success -L 1 --json databaseId --jq '.[0].databaseId // empty')
+          fi
+          if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "load-$VARIANT" -D previous; then
+            echo "comparing with run $id"
+            echo "PREVIOUS=$PWD/previous/results.json" >> "$GITHUB_ENV"
+          else
+            echo "no earlier results to compare with"
+          fi
+      - name: scripts/load/run.sh
+        run: sudo -E env "PATH=$PATH" OUT="$PWD/load-results" scripts/load/run.sh
+      - name: summary
+        if: always()
+        run: |
+          if [ -f load-results/summary.md ]; then
+            { echo "<details open><summary>load ($VARIANT)</summary>"; echo; cat load-results/summary.md; echo; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no results (the run stopped early; see the log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-${{ matrix.variant }}
+          path: load-results/
+          retention-days: 90
+          if-no-files-found: warn
