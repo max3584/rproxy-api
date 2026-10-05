@@ -11,6 +11,7 @@ cargo test                    # 単体テスト + tests/api.rs（loopback で実
 cargo clippy --all-targets
 cargo bench --bench '*'       # criterion のベンチマーク（benches/）。PR では bench.yml がマージベースと比べて、遅くなったら警告（docs/TESTING.md）
 scripts/test-transparent.sh   # transparent の実経路テスト（root 不要、名前空間を使う。cargo build の後）
+scripts/load/run.sh           # 負荷・soak のテスト（転送効率、#183。名前空間で direct / rproxy / HAProxy を比べる。Load ワークフローが毎晩。docs/TESTING.md）
 cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.example を参照）
 ```
 

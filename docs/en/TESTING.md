@@ -9,6 +9,7 @@
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
+| `scripts/load/run.sh` | Load and soak tests with large, long transfers (transfer efficiency; see "Load and soak tests" below) | Load workflow (nightly, manual) |
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
@@ -189,7 +190,7 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 
 - Combinations with real mail servers (Postfix / Dovecot) and real WebRTC, TURN, and RTSP clients
 
-- Long-running load (hours of continuous forwarding, memory growth)
+- Continuous forwarding for many hours (the Load workflow's soak can do it when run manually with a long `soak_secs`)
 - The control API with TLS enabled (checked manually, no automated test)
 - Reloading tokens and certificates via SIGHUP (checked manually)
 - The transparent routing procedure using iptables (`-m socket`)
@@ -217,6 +218,82 @@ It installs packages with sudo, so do not run it locally.
 
 `.github/workflows/soak.yml` runs it for 30 minutes weekly and keeps the CSV as an artifact. To run it for hours, trigger it manually from the Actions page with `duration` (seconds). Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
 
+
+## Load and soak tests (Load workflow, #183)
+
+Measures transfer efficiency when large transfers run many times and for a long time: throughput, latency, bytes per CPU core, memory, FDs, and UDP drops. These are the baseline numbers for comparing before and after kernel acceleration (#184) and memory reduction (#185); heavier and longer than the criterion benchmarks above. The numbers depend on the machine, so compare them with the previous run on the same kind of machine (runner).
+
+`scripts/load/run.sh` builds three network namespaces and runs `scripts/load/load.py` in the middle one.
+
+```
+client 10.71.1.2 ── 10.71.1.1 [rproxy / HAProxy / router] 10.71.2.1 ── 10.71.2.2 backend
+```
+
+- **direct** (the baseline): no proxy. The kernel of the middle namespace forwards it, so it crosses the same veths and netem
+- **rproxy**: the release build. Logs at `LOG_LEVEL` (default `warn`; use `info` to include the cost of per-connection logs)
+- **haproxy**: when installed, side by side under the same conditions (for reference; not for UDP)
+- `NETEM="delay 5ms loss 0.1%"` applies tc netem to the client link, in both directions
+- Traffic comes from `scripts/load/loadgen/` (a small std-only crate with its own `Cargo.toml`, `Cargo.lock` and workspace; not part of the root build, test or deny). Large transfers carry pseudo-random data that the receiver compares byte by byte with what must have been sent (stricter than a checksum: anything lost, duplicated, reordered or shifted fails)
+
+| Scenario | What it measures | Tools |
+|---|---|---|
+| `tcp` | TCP throughput (upload with 1 and 8 streams, download with 1) | iperf3 |
+| `verify` | `SIZE_MIB` transfers, `REPEAT` times, with 1 and 4 streams; the backend checks every byte | loadgen `send` / `sink` |
+| `tls` | Uploads into TLS termination (`tls.mode: terminate`, every byte checked) and new full handshakes per second | socat, `openssl s_time` |
+| `http` | Small L7 requests (HTTP/1.1, h2c, HTTP/2 over TLS; req/s, p50 / p99) and large downloads (every byte checked) | h2load, curl |
+| `udp` | 1400-byte datagrams at `UDP_BW` (loss, jitter); 64-byte datagrams at full speed and at `UDP_PPS` from 16 sources (delivered pps, loss, rproxy's `stats.dropped`, kernel receive-buffer drops) | iperf3, loadgen `udp-flood` / `udp-sink` |
+| `latency` | 64-byte round trips on 1 and 64 connections (p50 / p99) | loadgen `rtt` |
+| `churn` | Connect → 1 KiB round trip → close, 32 in parallel (connections per second) | loadgen `churn` |
+| `memory` | In freshly started processes: idle, with `RULES` rules (default 100 and 1000), `CONNS` idle connections, the same connections busy (4 KiB round trips), and `UDP_SESSIONS` UDP sessions. RSS and FDs per rule, connection and session | loadgen `hold` / `udp-hold` |
+| `soak` | `SOAK_SECS` seconds of iperf3 (`SOAK_BW`), connection churn, and UDP with ever-changing sources at once; RSS, FDs and CPU are recorded (`soak.csv`) | |
+
+Values in the tables:
+
+- **GiB / proxy CPU-s**: bytes moved per CPU-second of the proxy process (user + system time of all threads). **proxy cores** is the number of cores it used
+- **GiB / system CPU-s**: per CPU-second of the whole machine (client, backend, kernel forwarding, proxy); comparable with direct
+- **vs direct**: the rate (Gbit/s, req/s, pps, conns/s) relative to direct in the same case
+- **peak RSS**: the proxy's highest RSS during the run (memory while L7 requests are in flight shows up here)
+
+Only checks fail the run (exit code 1): transferred data differs by even one byte, a scenario does not run, connections or sessions cannot be established, FDs do not come back after the connections close, or in the soak the FDs do not return to the start (+20), the average RSS of the last quarter exceeds 1.5 times that of the first quarter (after the first 10%), or more than 0.1% of the connections fail. Slower numbers show up as deltas against the previous run (`(+x%)` in the tables; bold when more than 10% worse).
+
+Settings (environment variables):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCENARIOS` | all | Scenarios to run (comma-separated) |
+| `SIZE_MIB` / `REPEAT` | 1024 / 3 | Size and count of the large transfers |
+| `DURATION` | 10 | Seconds per throughput / latency run |
+| `CONNS` / `UDP_SESSIONS` / `RULES` | 2000 / 1000 / 100,1000 | Connections, sessions and rules for `memory` |
+| `UDP_BW` / `UDP_PPS` | 1G / 50000 | iperf3 bandwidth for `udp`, and the fixed rate for 64-byte datagrams |
+| `H2_REQS` / `H2_CONNS` | 200000 / 64 | h2load requests and connections (HTTP/2: 10 concurrent streams per connection) |
+| `SOAK_SECS` / `SOAK_BW` | 0 (skipped) / 1G | Soak duration and its iperf3 bandwidth |
+| `NETEM` | none | tc netem arguments (e.g. `delay 5ms loss 0.1%`) |
+| `HAPROXY` | auto | `0` leaves HAProxy out |
+| `OUT` / `PREVIOUS` | `load-results` / none | Where results go; an earlier `results.json` to compare with |
+
+### Running locally or on a VM
+
+```bash
+sudo apt-get install iperf3 nghttp2-client socat haproxy   # missing tools are skipped (HAProxy is optional)
+cargo build --release
+cargo build --release --locked --manifest-path scripts/load/loadgen/Cargo.toml --target-dir target/loadgen
+SIZE_MIB=256 REPEAT=1 DURATION=5 SOAK_SECS=60 scripts/load/run.sh      # without root (user namespace)
+sudo -E env "PATH=$PATH" SOAK_SECS=3600 scripts/load/run.sh            # can raise open files and socket buffers
+scripts/load/report.py load-results/results.json old/results.json      # compare two runs
+```
+
+Without root it needs user namespaces (on Ubuntu 24.04 and later, `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`). netem needs the `sch_netem` module (on Ubuntu, `linux-modules-extra-$(uname -r)`). Results go to `load-results/`: `results.json` (every value) and `summary.md` (the tables).
+
+### CI
+
+`.github/workflows/load.yml` runs nightly and manually (from the Actions page, with size, count, duration, connections, soak duration, netem conditions and scenarios). It does not run on PRs (runner speed varies) and is not a required check.
+
+- `load (clean)`: every scenario without netem (by default 2 GiB × 3, 5000 connections, a 10-minute soak)
+- `load (netem)`: `tcp`, `verify`, `tls`, `http`, `udp` and `latency` with `delay 5ms loss 0.1%` (512 MiB)
+
+Results are kept as artifacts (`load-clean` / `load-netem`, 90 days) and in the job summary. The artifact of the last successful run on master is downloaded and the tables show the deltas. The runners are shared 4-core VMs: ignore a single change and look for changes that repeat.
+
+`scripts/soak.py` (the "Long-running load test" above) is the weekly loopback soak centered on connection churn, and stays as it is.
 
 ## Fuzzing (Fuzz workflow)
 
