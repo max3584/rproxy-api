@@ -29,6 +29,9 @@ use common::*;
 /// Bytes moved per iteration of the throughput benchmarks.
 const CHUNK: usize = 1024 * 1024;
 const DATAGRAM: usize = 1024;
+/// An iteration that makes no progress for this long is a stall (#187): the bench
+/// panics with what it was doing instead of hanging until the CI job times out.
+const STALL: Duration = Duration::from_secs(30);
 
 fn runtime() -> Runtime {
 	tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
@@ -84,12 +87,69 @@ async fn create(h: &Harness, body: Value) {
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 }
 
-/// Writes `data` and reads the same number of bytes back at the same time.
-async fn echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(s: S, data: &[u8], back: &mut [u8]) {
+/// Panics with `what` stalled, the detail and the rules' counters as rproxy sees them.
+async fn stalled(h: &Harness, what: &str, detail: String) -> ! {
+	let rules = match tokio::time::timeout(Duration::from_secs(5), h.get("/rules")).await {
+		Ok((_, v)) => v
+			.as_array()
+			.map(|rules| {
+				rules
+					.iter()
+					.map(|r| format!("{}:{} state={} stats={}", r["protocol"], r["listen_port"], r["state"], r["stats"]))
+					.collect::<Vec<_>>()
+					.join("; ")
+			})
+			.unwrap_or_default(),
+		Err(_) => "the control API did not answer either".into(),
+	};
+	panic!("{what}: no progress for {STALL:?} (#187). {detail}. rules: {rules}");
+}
+
+/// Runs one iteration of `what`, panicking through `stalled` if it takes longer than `STALL`.
+async fn guard<T>(h: &Harness, what: &str, work: impl std::future::Future<Output = T>) -> T {
+	match tokio::time::timeout(STALL, work).await {
+		Ok(v) => v,
+		Err(_) => stalled(h, what, String::new()).await,
+	}
+}
+
+/// Writes `data` (then flushes: a TLS stream may still hold the last records, #187)
+/// and reads the same number of bytes back at the same time. On a stall, says how
+/// far each side got.
+async fn echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(s: S, data: &[u8], back: &mut [u8]) -> Result<(), String> {
 	let (mut r, mut w) = tokio::io::split(s);
-	let (wrote, read) = tokio::join!(w.write_all(data), r.read_exact(back));
-	wrote.unwrap();
-	read.unwrap();
+	let (mut wrote, mut read) = (0, 0);
+	let len = back.len();
+	let work = async {
+		let write = async {
+			// write_all, counting
+			while wrote < data.len() {
+				match w.write(&data[wrote..]).await? {
+					0 => return Err(std::io::ErrorKind::WriteZero.into()),
+					n => wrote += n,
+				}
+			}
+			w.flush().await
+		};
+		let fill = async {
+			while read < len {
+				match r.read(&mut back[read..]).await? {
+					0 => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed")),
+					n => read += n,
+				}
+			}
+			Ok(())
+		};
+		let (w, r) = tokio::join!(write, fill);
+		w.and(r)
+	};
+	let result = tokio::time::timeout(STALL, work).await;
+	let progress = format!("wrote {wrote} of {} bytes, read back {read}", data.len());
+	match result {
+		Ok(Ok(())) => Ok(()),
+		Ok(Err(e)) => panic!("echo failed: {e} ({progress})"),
+		Err(_) => Err(progress),
+	}
 }
 
 /// Sends `data` and waits for the answer, sending again if a datagram was lost.
@@ -106,7 +166,7 @@ async fn udp_ask(sock: &UdpSocket, data: &[u8], back: &mut [u8]) {
 
 fn l4_tcp(c: &mut Criterion) {
 	let rt = runtime();
-	let (_h, port) = rt.block_on(async {
+	let (h, port) = rt.block_on(async {
 		let h = harness().await;
 		let port = free_port();
 		create(&h, rule("tcp", port, tcp_echo().await)).await;
@@ -124,7 +184,9 @@ fn l4_tcp(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					echo(&mut conn, &data, &mut back).await;
+					if let Err(e) = echo(&mut conn, &data, &mut back).await {
+						stalled(&h, "l4_tcp/throughput_1MiB", e).await;
+					}
 				}
 				start.elapsed()
 			})
@@ -138,10 +200,13 @@ fn l4_tcp(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-					s.write_all(b"x").await.unwrap();
-					let mut one = [0u8; 1];
-					s.read_exact(&mut one).await.unwrap();
+					guard(&h, "l4_tcp/connect", async {
+						let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+						s.write_all(b"x").await.unwrap();
+						let mut one = [0u8; 1];
+						s.read_exact(&mut one).await.unwrap();
+					})
+					.await;
 				}
 				start.elapsed()
 			})
@@ -152,7 +217,7 @@ fn l4_tcp(c: &mut Criterion) {
 
 fn l4_udp(c: &mut Criterion) {
 	let rt = runtime();
-	let (_h, port) = rt.block_on(async {
+	let (h, port) = rt.block_on(async {
 		let h = harness().await;
 		let port = free_udp_port();
 		let mut body = rule("udp", port, udp_echo().await);
@@ -176,7 +241,7 @@ fn l4_udp(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					udp_ask(&sock, &data, &mut back).await;
+					guard(&h, "l4_udp/roundtrip_1KiB", udp_ask(&sock, &data, &mut back)).await;
 				}
 				start.elapsed()
 			})
@@ -190,9 +255,12 @@ fn l4_udp(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-					s.connect(("127.0.0.1", port)).await.unwrap();
-					udp_ask(&s, b"x", &mut back).await;
+					guard(&h, "l4_udp/new_session", async {
+						let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+						s.connect(("127.0.0.1", port)).await.unwrap();
+						udp_ask(&s, b"x", &mut back).await;
+					})
+					.await;
 				}
 				start.elapsed()
 			})
@@ -205,7 +273,7 @@ fn tls_terminate(c: &mut Criterion) {
 	let rt = runtime();
 	let pki = Pki::new("bench");
 	let cert = pki.server("front", &["bench.test"]);
-	let (_h, port) = rt.block_on(async {
+	let (h, port) = rt.block_on(async {
 		let h = harness().await;
 		let port = free_port();
 		let mut body = rule("tcp", port, tcp_echo().await);
@@ -237,10 +305,14 @@ fn tls_terminate(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					let mut s = connect().await;
-					s.write_all(b"x").await.unwrap();
-					let mut one = [0u8; 1];
-					s.read_exact(&mut one).await.unwrap();
+					guard(&h, "tls_terminate/handshake", async {
+						let mut s = connect().await;
+						s.write_all(b"x").await.unwrap();
+						s.flush().await.unwrap();
+						let mut one = [0u8; 1];
+						s.read_exact(&mut one).await.unwrap();
+					})
+					.await;
 				}
 				start.elapsed()
 			})
@@ -256,7 +328,12 @@ fn tls_terminate(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					echo(&mut conn, &data, &mut back).await;
+					if let Err(e) = echo(&mut conn, &data, &mut back).await {
+						// a TLS client holding records it has not sent (`wants_write`) is a client bug,
+						// otherwise rproxy did not pass something on
+						let tls = format!("client TLS wants_write={}", conn.get_ref().1.wants_write());
+						stalled(&h, "tls_terminate/throughput_1MiB", format!("{e}, {tls}")).await;
+					}
 				}
 				start.elapsed()
 			})
@@ -300,7 +377,7 @@ async fn http_rule(h: &Harness, backend: SocketAddr) -> u16 {
 
 fn l7_http1(c: &mut Criterion) {
 	let rt = runtime();
-	let (_h, mut sender) = rt.block_on(async {
+	let (h, mut sender) = rt.block_on(async {
 		let h = harness().await;
 		let port = http_rule(&h, http_backend().await).await;
 		let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -317,12 +394,15 @@ fn l7_http1(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					sender.ready().await.unwrap();
-					let req = hyper::Request::get("/api/v1/items?page=2").header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
-					let resp = sender.send_request(req).await.unwrap();
-					assert_eq!(resp.status(), StatusCode::OK);
-					assert_eq!(resp.headers()["x-served-by"], "rproxy");
-					resp.into_body().collect().await.unwrap();
+					guard(&h, "l7_http1/request", async {
+						sender.ready().await.unwrap();
+						let req = hyper::Request::get("/api/v1/items?page=2").header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
+						let resp = sender.send_request(req).await.unwrap();
+						assert_eq!(resp.status(), StatusCode::OK);
+						assert_eq!(resp.headers()["x-served-by"], "rproxy");
+						resp.into_body().collect().await.unwrap();
+					})
+					.await;
 				}
 				start.elapsed()
 			})
@@ -333,7 +413,7 @@ fn l7_http1(c: &mut Criterion) {
 
 fn l7_http2(c: &mut Criterion) {
 	let rt = runtime();
-	let (_h, sender) = rt.block_on(async {
+	let (h, sender) = rt.block_on(async {
 		let h = harness().await;
 		let port = http_rule(&h, http_backend().await).await;
 		// HTTP/2 with prior knowledge (h2c); the backend side stays HTTP/1.1
@@ -358,7 +438,7 @@ fn l7_http2(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					request(sender.clone()).await;
+					guard(&h, "l7_http2/request", request(sender.clone())).await;
 				}
 				start.elapsed()
 			})
@@ -373,7 +453,7 @@ fn l7_http2(c: &mut Criterion) {
 			rt.block_on(async {
 				let start = Instant::now();
 				for _ in 0..iters {
-					futures_util::future::join_all((0..STREAMS).map(|_| request(sender.clone()))).await;
+					guard(&h, "l7_http2/concurrent_32", futures_util::future::join_all((0..STREAMS).map(|_| request(sender.clone())))).await;
 				}
 				start.elapsed()
 			})
