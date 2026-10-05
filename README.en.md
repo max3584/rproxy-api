@@ -48,6 +48,8 @@ Installing does not start the service. Edit `/etc/rproxy/rproxy.env`, then start
 An API token is generated in `/etc/rproxy/tokens` at install time (set it as the UI's `RPROXY_API_TOKEN`).
 The package contents and how the repository is published are described in [docs/en/APT.md](docs/en/APT.md).
 
+Backup and restore (what to back up, how to take the database and configuration, restore order and checks, moving to a new host, running without the database) is in [docs/en/BACKUP.md](docs/en/BACKUP.md).
+
 ## Running
 
 Configuration is done with environment variables. If there is a `.env` in the working directory, it is loaded (see [.env.example](.env.example) for an example).

@@ -48,6 +48,8 @@ sudo apt update && sudo apt install rproxy-api
 API のトークンはインストール時に `/etc/rproxy/tokens` に生成される（UI の `RPROXY_API_TOKEN` に設定する）。
 パッケージの中身と、リポジトリの公開の仕組みは [docs/APT.md](docs/APT.md)。
 
+バックアップと復旧（何を取るか、DB と設定ファイルの取り方、戻す順番と確かめ方、新しいホストへの移し方、DB なしで動かす方法）は [docs/BACKUP.md](docs/BACKUP.md)。
+
 ## 起動
 
 設定は環境変数で行う。起動ディレクトリに `.env` があれば読み込む（例は [.env.example](.env.example)）。
