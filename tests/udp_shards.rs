@@ -71,17 +71,19 @@ async fn bursts_keep_their_order_and_headers() {
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	client.connect(("127.0.0.1", port)).await.unwrap();
-	const N: u32 = 500;
-	for i in 0..N {
-		client.send(&i.to_be_bytes()).await.unwrap();
-	}
+	// bursts of 100: more could overflow the backend's socket buffer (net.core.rmem_max)
 	let mut buf = [0u8; 256];
-	for i in 0..N {
-		let (n, _) = tokio::time::timeout(Duration::from_secs(3), backend.recv_from(&mut buf)).await.expect("datagram lost").unwrap();
-		// signature (12), ver/cmd, family, length (2), addresses (12), payload
-		assert_eq!(&buf[..12], b"\r\n\r\n\0\r\nQUIT\n");
-		assert_eq!(buf[13], 0x12, "IPv4 DGRAM");
-		assert_eq!(&buf[28..n], &i.to_be_bytes(), "datagram {i} in order");
+	for burst in 0..5u32 {
+		for i in burst * 100..(burst + 1) * 100 {
+			client.send(&i.to_be_bytes()).await.unwrap();
+		}
+		for i in burst * 100..(burst + 1) * 100 {
+			let (n, _) = tokio::time::timeout(Duration::from_secs(3), backend.recv_from(&mut buf)).await.unwrap_or_else(|_| panic!("datagram {i} lost")).unwrap();
+			// signature (12), ver/cmd, family, length (2), addresses (12), payload
+			assert_eq!(&buf[..12], b"\r\n\r\n\0\r\nQUIT\n");
+			assert_eq!(buf[13], 0x12, "IPv4 DGRAM");
+			assert_eq!(&buf[28..n], &i.to_be_bytes(), "datagram {i} in order");
+		}
 	}
 	let (_, v) = h.get(&format!("/rules/udp/127.0.0.1/{port}")).await;
 	assert_eq!(v["stats"]["total_connections"], 1, "{v}");

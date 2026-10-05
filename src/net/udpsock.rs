@@ -236,7 +236,7 @@ mod sys {
 			}
 		}
 		// SAFETY: the headers point at live buffers of the stated sizes
-		let n = unsafe { libc::recvmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
+		let n = unsafe { libc::recvmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT as _, std::ptr::null_mut()) };
 		if n < 0 {
 			return Err(io::Error::last_os_error());
 		}
@@ -268,7 +268,7 @@ mod sys {
 			msgs[i].msg_hdr.msg_iovlen = (k + 1) as _;
 		}
 		// SAFETY: the headers point at live buffers of the stated sizes
-		let n = unsafe { libc::sendmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT) };
+		let n = unsafe { libc::sendmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT as _) };
 		if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 	}
 
