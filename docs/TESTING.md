@@ -8,6 +8,7 @@ English: [TESTING.md](en/TESTING.md)
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（MariaDB のサービスコンテナを使う） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
+| `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
@@ -35,6 +36,7 @@ English: [TESTING.md](en/TESTING.md)
 | | `smtp_optional_tls_hands_over_plain_commands` | `starttls_required: false` では、平文のコマンドを転送先へ引き継ぐ |
 | | `data_before_the_handshake_is_refused` | STARTTLS の直後に紛れ込ませたコマンドを受け付けない |
 | | `ehlo_reply_loses_starttls` | TLS 後の EHLO の応答から `STARTTLS` を取り除く |
+| | `ehlo_reply_with_non_utf8_bytes_does_not_panic` | メールサーバの EHLO の応答に UTF-8 でないバイトや多バイト文字があっても panic しない（ファジングで見つかった入力、#162） |
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | 古い世代の監視タスクは、作り直したルールに触らない |
@@ -215,3 +217,28 @@ sudo でパッケージを入れるので、手元では実行しない。
 
 `.github/workflows/soak.yml` が毎週 30 分動かし、CSV を artifact に残す。何時間も回すときは Actions の画面から `duration`（秒）を指定して手動で動かす。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
 
+
+## ファジング（Fuzz ワークフロー）
+
+インターネットから届くものを自前で読んでいる部分を、[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)（libFuzzer）で確かめる（#162）。panic・範囲外の読み出し・止まらないループ・メモリの使い過ぎを探す。`fuzz/` は独立したクレート（自分の `Cargo.toml`・`Cargo.lock`・workspace）で、リポジトリの直下の `cargo build`・`cargo test`・`cargo deny` には入らない。
+
+| ターゲット | 対象 | 入力の形 |
+|---|---|---|
+| `tls_client_hello` | `tls::sni`：TLS の ClientHello（レコード、ハンドシェイク、本体） | バイト列そのまま |
+| `udp_sni` | `tls::udp_sni` の `Sniffer`：DTLS の ClientHello の断片と QUIC v1 / v2 の Initial | データグラムごとに 16 ビットの長さを前に付ける |
+| `quic_initial` | 同じく QUIC。ファザーが選んだフレームを Initial の鍵で暗号化して渡す（AEAD の内側のフレームの解析と CRYPTO のつなぎ合わせまで届くように） | フラグ（v2）、DCID、（パケット番号、フレーム）の並び |
+| `proxy_header` | `net::source`：PROXY protocol v1 / v2 のヘッダ。rproxy は書くだけなので、どんなアドレス・TLS の情報でも正しい形で、読み戻すと同じになることを確かめる | `arbitrary` |
+| `matcher` | `l7::matcher`：`match` の式の解析と評価 | 式、続けて 1 行ずつホスト・パス・クエリ・メソッド・ヘッダ・クライアントの IP |
+| `starttls` | `l4::starttls`：STARTTLS 前のクライアントとのやり取り、メールサーバの挨拶と EHLO の応答、平文での引き継ぎ | 先頭のバイト（プロトコル・STARTTLS 必須・1 回に読む量）、続けて相手が送るもの |
+| `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |
+
+入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
+
+`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
+
+手元では（nightly と C/C++ コンパイラが要る）：
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run matcher fuzz/corpus/matcher fuzz/seeds/matcher -- -max_total_time=60
+```

@@ -254,7 +254,9 @@ where
 	let reply = tokio::time::timeout(UPSTREAM_TIMEOUT, read_reply(StartTls::Smtp, &mut from_server, upstream))
 		.await
 		.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no EHLO reply from the mail server"))??;
-	let mut kept: Vec<&String> = reply.iter().filter(|l| !l[4.min(l.len())..].eq_ignore_ascii_case("STARTTLS")).collect();
+	// `get`: the line may have a multi-byte character (or U+FFFD for a byte that
+	// is not UTF-8) across byte 4, where slicing would panic (found by fuzzing, #162)
+	let mut kept: Vec<&String> = reply.iter().filter(|l| !l.get(4..).unwrap_or("").eq_ignore_ascii_case("STARTTLS")).collect();
 	if kept.is_empty() {
 		kept = reply.iter().collect();
 	}
@@ -369,5 +371,19 @@ mod tests {
 		let mut sent = vec![0u8; 8];
 		server.read_exact(&mut sent).await.unwrap();
 		assert_eq!(&sent, b"EHLO c\r\n");
+	}
+
+	#[tokio::test]
+	async fn ehlo_reply_with_non_utf8_bytes_does_not_panic() {
+		// the input the starttls fuzz target found (#162): U+FFFD across byte 4
+		let (mut client_side, mut client) = duplex(8192);
+		let (mut up_side, mut server) = duplex(8192);
+		client.write_all(b"EHLO c\r\n").await.unwrap();
+		server.write_all(b"250-\xe2\x82\xac\r\n250\xff\xff\r\n").await.unwrap();
+		relay_first_ehlo(&mut client_side, &mut up_side).await.unwrap();
+		drop(client_side);
+		let mut out = String::new();
+		client.read_to_string(&mut out).await.unwrap();
+		assert_eq!(out, "250-\u{20ac}\r\n250 \r\n");
 	}
 }

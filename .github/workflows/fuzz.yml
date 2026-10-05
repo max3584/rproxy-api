@@ -1,0 +1,89 @@
+name: Fuzz
+
+# 自前で読んでいるパーサーのファジング（fuzz/、cargo-fuzz、issue #162）。
+# PR（src/ か fuzz/ を変えたもの）では各ターゲットを 60 秒、毎日は 10 分、手動では秒数を指定して動かす。
+# debug assertions（整数のあふれの検査を含む）を有効にしてビルドする。見つかった入力（fuzz/artifacts/）は成果物に上げる。直したら、その入力を単体テストに足す（docs/TESTING.md）。
+# 必須のチェックではない。
+on:
+  pull_request:
+    paths:
+      - src/**
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "37 18 * * *"   # 毎日 3:37（JST）
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: ターゲットごとの秒数
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '600' }}
+      # the cargo-fuzz binary of install-action is built for musl and would make it
+      # the default target (the sanitizer needs the gnu one)
+      FUZZ_FLAGS: --debug-assertions --target x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      # 前回までのコーパス（毎日の実行で育てる）
+      - uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: build
+        run: cargo fuzz build $FUZZ_FLAGS
+      - name: run each target for ${{ env.SECONDS_PER_TARGET }} s
+        run: |
+          failed=""
+          for target in $(cargo fuzz list); do
+            echo "::group::$target"
+            mkdir -p "fuzz/corpus/$target"
+            if ! cargo fuzz run $FUZZ_FLAGS "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+                -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1; then
+              failed="$failed $target"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::crashed:$failed (inputs in the fuzz-artifacts artifact)"
+            exit 1
+          fi
+      - name: shrink the corpus
+        if: github.event_name != 'pull_request'
+        run: |
+          for target in $(cargo fuzz list); do
+            cargo fuzz cmin $FUZZ_FLAGS "$target" "fuzz/corpus/$target" -- -rss_limit_mb=2048 || true
+          done
+      - uses: actions/cache/save@v4
+        if: always() && github.event_name != 'pull_request'
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

@@ -8,6 +8,7 @@
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (uses a MariaDB service container) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
+| `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
@@ -35,6 +36,7 @@ Integration tests open real sockets on loopback. The control API, the echo serve
 | | `smtp_optional_tls_hands_over_plain_commands` | With `starttls_required: false`, plain-text commands are handed over to the target |
 | | `data_before_the_handshake_is_refused` | Commands smuggled in right after STARTTLS are not accepted |
 | | `ehlo_reply_loses_starttls` | `STARTTLS` is removed from the EHLO reply after TLS |
+| | `ehlo_reply_with_non_utf8_bytes_does_not_panic` | Non-UTF-8 bytes or multi-byte characters in the mail server's EHLO reply do not cause a panic (an input found by fuzzing, #162) |
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
@@ -215,3 +217,28 @@ It installs packages with sudo, so do not run it locally.
 
 `.github/workflows/soak.yml` runs it for 30 minutes weekly and keeps the CSV as an artifact. To run it for hours, trigger it manually from the Actions page with `duration` (seconds). Locally: `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`.
 
+
+## Fuzzing (Fuzz workflow)
+
+The parts that read what arrives from the internet with rproxy's own code are checked with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) (#162), looking for panics, out-of-bounds reads, endless loops and excessive memory use. `fuzz/` is a crate of its own (its own `Cargo.toml`, `Cargo.lock` and workspace), so `cargo build`, `cargo test` and `cargo deny` at the repository root do not include it.
+
+| Target | What it covers | Input format |
+|---|---|---|
+| `tls_client_hello` | `tls::sni`: the TLS ClientHello (records, handshake, body) | Raw bytes |
+| `udp_sni` | The `Sniffer` of `tls::udp_sni`: DTLS ClientHello fragments and QUIC v1 / v2 Initial packets | Datagrams, each prefixed with a 16-bit length |
+| `quic_initial` | QUIC again, with frames chosen by the fuzzer encrypted with the Initial keys (so the frame parser behind the AEAD and the CRYPTO reassembly are reached) | Flags (v2), DCID, then (packet number, frames) packets |
+| `proxy_header` | `net::source`: PROXY protocol v1 / v2 headers. rproxy only writes them, so the target checks that for any addresses and TLS details the header is well formed and reads back to the same values | `arbitrary` |
+| `matcher` | `l7::matcher`: parsing and evaluating `match` expressions | The expression, then one per line: host, path, query, method, header, client IP |
+| `starttls` | `l4::starttls`: the dialogue with the client before STARTTLS, the mail server's greeting and EHLO reply, the plain-text hand-over | A first byte (protocol, STARTTLS required, bytes per read), then what the peer sends |
+| `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |
+
+The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
+
+`.github/workflows/fuzz.yml` runs each target for 60 seconds on pull requests that change `src/` or `fuzz/`, and for 10 minutes every day (not a required check). The corpus grown by the daily runs is kept in the Actions cache and seeds the next run. When a target crashes, the input is in the `fuzz-artifacts-*` artifact: reproduce it with `cargo +nightly fuzz run <target> <input file>`, and once fixed, add the input to a unit test.
+
+Locally (needs nightly and a C/C++ compiler):
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run matcher fuzz/corpus/matcher fuzz/seeds/matcher -- -max_total_time=60
+```

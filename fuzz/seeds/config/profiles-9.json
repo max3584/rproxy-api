@@ -1,0 +1,5 @@
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 587,
+ "remote_addr": "10.0.0.20", "remote_port": 587, "source_ip": "proxy_v2",
+ "tls": {"mode": "terminate", "certificates": [
+   {"cert_file": "/etc/rproxy/certs/mail.pem", "key_file": "/etc/rproxy/certs/mail.key"}]},
+ "starttls": "smtp"}
