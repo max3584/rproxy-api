@@ -29,7 +29,7 @@ use tokio::net::TcpStream;
 
 const DEFAULT_ENABLED: bool = true;
 const DEFAULT_AFTER: u64 = 0;
-const DEFAULT_FULL_READS: u32 = 0;
+const DEFAULT_FULL_READS: u32 = 4;
 /// User-space buffer before splicing starts or when it cannot be used (as `copy_bidirectional`).
 const BUF_SIZE: usize = 8 * 1024;
 /// Empty pipes kept for the next bursts (shared by all threads; 2 FDs each).
