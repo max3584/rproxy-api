@@ -79,11 +79,14 @@ CONF
 dovecot || { doveconf -n >&2 || true; fail "dovecot did not start"; }
 
 echo "== test CA and the mail.test certificate"
+# the extensions Python 3.13+ checks by default (VERIFY_X509_STRICT): key usage on the CA, key identifiers on both
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=interop-ca \
+	-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
 	-keyout "$WORK/ca.key" -out "$WORK/ca.pem" 2>/dev/null
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=mail.test \
 	-keyout "$WORK/mail.key" -out "$WORK/mail.csr" 2>/dev/null
-printf 'subjectAltName=DNS:mail.test\n' > "$WORK/san.ext"
+printf '%s\n' subjectAltName=DNS:mail.test keyUsage=critical,digitalSignature extendedKeyUsage=serverAuth \
+	subjectKeyIdentifier=hash authorityKeyIdentifier=keyid > "$WORK/san.ext"
 openssl x509 -req -in "$WORK/mail.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key" -CAcreateserial -days 2 \
 	-extfile "$WORK/san.ext" -out "$WORK/mail.pem" 2>/dev/null
 
