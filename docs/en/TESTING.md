@@ -36,6 +36,7 @@ Integration tests open real sockets on loopback. The control API, the echo serve
 | | `smtp_optional_tls_hands_over_plain_commands` | With `starttls_required: false`, plain-text commands are handed over to the target |
 | | `data_before_the_handshake_is_refused` | Commands smuggled in right after STARTTLS are not accepted |
 | | `ehlo_reply_loses_starttls` | `STARTTLS` is removed from the EHLO reply after TLS |
+| | `ehlo_reply_with_non_utf8_bytes_does_not_panic` | Non-UTF-8 bytes or multi-byte characters in the mail server's EHLO reply do not cause a panic (an input found by fuzzing, #162) |
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
