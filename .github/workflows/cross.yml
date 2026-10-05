@@ -1,14 +1,17 @@
 name: Cross build
 
 # Release targets are otherwise built only when a v* tag is pushed. Build them on
-# pull requests that change dependencies (Renovate, manual upgrades) so an update
-# that breaks only arm / musl is caught before it is merged.
+# pull requests that change dependencies (Renovate, manual upgrades) or the release
+# build so an update that breaks only arm / musl / gnu is caught before it is merged.
+# The same steps as release.yml (scripts/build-release.sh on Alpine, the .deb of the
+# musl targets), and the apt repository built from those packages with a throwaway key.
 on:
   pull_request:
     paths:
       - Cargo.toml
       - Cargo.lock
-      - Cross.toml
+      - scripts/build-release.sh
+      - scripts/apt-repo.sh
       - .github/workflows/cross.yml
       - .github/workflows/release.yml
   workflow_dispatch:
@@ -25,25 +28,82 @@ env:
 
 jobs:
   build:
-    name: build ${{ matrix.target }}
+    name: build ${{ matrix.job.target }}
     runs-on: ubuntu-latest
+    container: alpine:3.24
     strategy:
       fail-fast: false
       matrix:
-        # the same targets as release.yml (x86_64-unknown-linux-gnu is covered by ci.yml)
-        target:
-          - x86_64-unknown-linux-musl
-          - armv7-unknown-linux-gnueabihf
-          - armv7-unknown-linux-musleabihf
-          - aarch64-unknown-linux-gnu
-          - aarch64-unknown-linux-musl
+        # the same targets as release.yml
+        job:
+          - { target: x86_64-unknown-linux-gnu }
+          - { target: x86_64-unknown-linux-musl      , deb: amd64 }
+          - { target: armv7-unknown-linux-gnueabihf }
+          - { target: armv7-unknown-linux-musleabihf , deb: armhf }
+          - { target: aarch64-unknown-linux-gnu }
+          - { target: aarch64-unknown-linux-musl     , deb: arm64 }
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@v2
+          targets: ${{ matrix.job.target }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          tool: cross
+          key: ${{ matrix.job.target }}
       - name: Build (release profile, like release.yml)
-        run: cross build --locked --release --target ${{ matrix.target }}
+        run: scripts/build-release.sh ${{ matrix.job.target }}
+      # cargo-deb publishes only a glibc build (a .deb), so build it here
+      - name: Install cargo-deb
+        if: matrix.job.deb
+        run: cargo install --locked cargo-deb
+      - name: Debian package
+        if: matrix.job.deb
+        run: |
+          deb=$(cargo deb --no-build --no-strip --target ${{ matrix.job.target }} --output target/deb/ | tail -n1)
+          [ "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.job.deb }}" ]
+          dpkg-deb --info "$deb"
+      - uses: actions/upload-artifact@v4
+        if: matrix.job.deb
+        with:
+          name: deb-${{ matrix.job.deb }}
+          path: target/deb/*.deb
+          retention-days: 1
+
+  # release.yml の apt ジョブと同じ道具（debian:13-slim の apt-ftparchive）で、使い捨ての鍵で署名した
+  # apt リポジトリを作れることを確かめる（gh-pages には何も push しない）
+  apt:
+    name: apt repository (dry run)
+    needs: build
+    runs-on: ubuntu-latest
+    container: debian:13-slim
+    steps:
+      - name: packages
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates gnupg apt-utils dpkg-dev
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: debs
+          merge-multiple: true
+      - name: scripts/apt-repo.sh
+        run: |
+          GNUPGHOME=$(mktemp -d)
+          export GNUPGHOME
+          gpg --batch --quiet --passphrase '' --quick-gen-key 'rproxy-api CI <ci@example.invalid>' ed25519 sign never
+          # like release.yml: a worktree of the gh-pages branch (here a new orphan one), committed but not pushed
+          git worktree add --orphan -b apt-dry-run pages
+          scripts/apt-repo.sh pages debs/*.deb
+          cp docs/apt-index.html pages/index.html
+          git -C pages -c user.name=ci -c user.email=ci@example.invalid add -A
+          git -C pages -c user.name=ci -c user.email=ci@example.invalid commit -q -m "apt: dry run"
+          git -C pages show --stat --format=%s HEAD
+          for arch in amd64 arm64 armhf; do
+            grep -q "^Architecture: $arch" "pages/dists/stable/main/binary-$arch/Packages"
+          done
+          gpg --verify pages/dists/stable/InRelease

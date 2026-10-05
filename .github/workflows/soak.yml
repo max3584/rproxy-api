@@ -1,19 +1,13 @@
 name: Soak
 
-# 長時間の負荷テスト（scripts/soak.py、issue #8）。毎週 30 分、手動では時間を指定して動かす。
-# スクリプトやこのファイルを変えた PR では 2 分だけ動かして、ワークフローが壊れていないことを確かめる。
+# 長時間の負荷テスト（scripts/soak.py、issue #8）。負荷の試験は必要なときだけ動かす（定期の実行も PR での実行もしない）。
+# Actions の画面か gh workflow run soak.yml -f duration=<秒> で、時間を指定して手動で動かす。
 on:
-  schedule:
-    - cron: "0 19 * * 0"   # 毎週月曜 4:00（JST）
   workflow_dispatch:
     inputs:
       duration:
         description: 負荷をかける秒数
         default: "3600"
-  pull_request:
-    paths:
-      - scripts/soak.py
-      - .github/workflows/soak.yml
 
 permissions:
   contents: read
@@ -21,10 +15,13 @@ permissions:
 jobs:
   soak:
     runs-on: ubuntu-latest
+    container: alpine:3.24
     timeout-minutes: 360
     env:
-      DURATION: ${{ inputs.duration || (github.event_name == 'pull_request' && '120') || '1800' }}
+      DURATION: ${{ inputs.duration }}
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev python3
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

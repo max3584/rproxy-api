@@ -1,5 +1,9 @@
 name: CI
 
+# ジョブは Alpine のコンテナ（musl。リリースのバイナリと同じ）で動かす（#191）。
+# 例外は deb と install.sh の 2 つだけ：確かめる対象が Debian / Ubuntu と systemd そのもの（.deb のインストール・
+# apt リポジトリからの更新・purge、systemd のユニット）で、systemd を PID 1 で動かせるのはランナーの VM だけなので、
+# ランナー（Ubuntu）の上で直接動かす。そこでは Rust をビルドせず、Alpine の package ジョブが作ったものを確かめる。
 on:
   push:
     branches: ["**"]
@@ -20,17 +24,12 @@ jobs:
   test:
     name: clippy + tests (with MariaDB)
     runs-on: ubuntu-latest
-    services:
-      mariadb:
-        image: mariadb:11.8
-        env:
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: rproxy_test
-        ports: ["3306:3306"]
-        options: >-
-          --health-cmd="healthcheck.sh --connect --innodb_initialized"
-          --health-interval=5s --health-timeout=5s --health-retries=20
+    container: alpine:3.24
     steps:
+      # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring と zstd-sys
+      # tests/traefik_convert.rs runs contrib/traefik2rproxy.py (python3, py3-yaml)
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev python3 py3-yaml mariadb mariadb-client
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,9 +37,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      # tests/traefik_convert.rs runs contrib/traefik2rproxy.py
-      - name: python3-yaml
-        run: python3 -c 'import yaml, tomllib' || sudo apt-get install -y python3-yaml
+      # Alpine の MariaDB（11.8）を同じコンテナで動かす（公式の mariadb のイメージは Ubuntu）
+      - name: MariaDB
+        run: |
+          mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld
+          mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db > /dev/null
+          # Alpine's mariadb-server.cnf turns TCP off (skip-networking); the tests connect to 127.0.0.1:3306
+          nohup mariadbd --user=mysql --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 --port=3306 \
+            > /tmp/mariadb.log 2>&1 &
+          for _ in $(seq 60); do mariadb-admin ping --silent 2>/dev/null && break; sleep 1; done
+          mariadb-admin ping --silent || { cat /tmp/mariadb.log; exit 1; }
+          mariadb <<'EOF'
+          CREATE DATABASE rproxy_test;
+          -- 127.0.0.1 counts as localhost: root also with the password the tests use (over TCP)
+          ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('root');
+          EOF
+          mariadb -h 127.0.0.1 -P 3306 -u root -proot -e 'SELECT VERSION()'
       - name: unit + integration tests
         env:
           RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
@@ -50,17 +62,20 @@ jobs:
   transparent:
     name: transparent mode (network namespaces)
     runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      # 名前空間・veth・nft / iptables（ホストのカーネル）を使う
+      options: --privileged
     steps:
+      # the scripts need bash, unshare / nsenter (util-linux-misc), ip (iproute2, not busybox), python3 and curl
+      - name: packages
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 \
+            iproute2 util-linux-misc iptables ip6tables nftables
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
-      # Ubuntu blocks unprivileged user namespaces by default; allow them so the
-      # script can build its isolated namespaces as the normal runner user.
-      - name: allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - name: iptables and nftables
-        run: sudo apt-get install -y iptables nftables
       # IPv4 and IPv6 (a GUA client with a ULA inside), the three ways of routing the return traffic
       # on rproxy, and a backend whose default route is another egress (docs/TRANSPARENT.md)
       - name: scripts/test-transparent.sh
@@ -75,29 +90,71 @@ jobs:
       - name: scripts/test-udp-source.sh
         run: scripts/test-udp-source.sh
 
-  deb:
-    name: Debian package (install, apt repository, purge)
+  # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
+  package:
+    name: release binary and .deb (musl)
     runs-on: ubuntu-latest
+    container: alpine:3.24
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev shellcheck
       - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh scripts/interop/*.sh contrib/rproxy-transparent-routing
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      # cargo-deb publishes only a glibc build (a .deb): build it (cached by rust-cache with ~/.cargo/bin)
+      - run: cargo install --locked cargo-deb
+      - run: cargo build --locked --release
+      - run: cargo deb --no-build --output target/debian/
+      - uses: actions/upload-artifact@v4
         with:
-          tool: cargo-deb
-      - run: cargo deb -- --locked
+          name: package
+          path: |
+            target/release/rproxy-api
+            target/debian/*.deb
+          if-no-files-found: error
+          retention-days: 3
+
+  # Debian / Ubuntu の .deb のインストールそのものを確かめるので、ランナーの VM（Ubuntu、systemd）で動かす
+  deb:
+    name: Debian package (install, apt repository, purge)
+    needs: package
+    # package が失敗しても、必須のチェックの名前のこのジョブが「スキップ」（成功扱い）にならないように
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: the package job
+        if: needs.package.result != 'success'
+        run: |
+          echo "::error::the package job did not succeed (${{ needs.package.result }})"
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: target
       - name: scripts/test-deb.sh
         run: scripts/test-deb.sh target/debian/*.deb
 
+  # install.sh は systemd で起動した Linux が前提（Alpine は OpenRC）。ランナーの VM（Ubuntu、systemd）で動かす
   install:
     name: install.sh (binary and apt, on a systemd VM)
+    needs: package
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: the package job
+        if: needs.package.result != 'success'
+        run: |
+          echo "::error::the package job did not succeed (${{ needs.package.result }})"
+          exit 1
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: shellcheck
-        run: shellcheck scripts/*.sh contrib/rproxy-transparent-routing
-      - run: cargo build --locked --release
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: target
       - name: scripts/test-install.sh
-        run: sudo scripts/test-install.sh target/release/rproxy-api
+        run: |
+          chmod +x target/release/rproxy-api
+          sudo scripts/test-install.sh target/release/rproxy-api

@@ -17,20 +17,27 @@ on:
         required: true
 
 jobs:
+  # Alpine（musl）のコンテナで 6 つのターゲットをビルドする（#191）。musl の x86_64 はそのまま、ほかは
+  # cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（scripts/build-release.sh）。
+  # .deb は musl の静的リンクのバイナリから作る。同じ手順を cross.yml が PR で確かめる
   build:
     if: github.event_name == 'push'
-    runs-on: ${{ matrix.job.os }}
+    runs-on: ubuntu-latest
+    container: alpine:3.24
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { os: ubuntu-latest  , target: x86_64-unknown-linux-gnu       , use-cross: false , extension: ""   }
-          - { os: ubuntu-latest  , target: x86_64-unknown-linux-musl      , use-cross: true  , extension: ""   , deb: amd64 }
-          - { os: ubuntu-latest  , target: armv7-unknown-linux-gnueabihf  , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: armv7-unknown-linux-musleabihf , use-cross: true  , extension: ""   , deb: armhf }
-          - { os: ubuntu-latest  , target: aarch64-unknown-linux-gnu      , use-cross: true  , extension: ""   }
-          - { os: ubuntu-latest  , target: aarch64-unknown-linux-musl     , use-cross: true  , extension: ""   , deb: arm64 }
+          - { target: x86_64-unknown-linux-gnu       , extension: "" }
+          - { target: x86_64-unknown-linux-musl      , extension: ""   , deb: amd64 }
+          - { target: armv7-unknown-linux-gnueabihf  , extension: "" }
+          - { target: armv7-unknown-linux-musleabihf , extension: ""   , deb: armhf }
+          - { target: aarch64-unknown-linux-gnu      , extension: "" }
+          - { target: aarch64-unknown-linux-musl     , extension: ""   , deb: arm64 }
     steps:
+      - name: Packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -51,26 +58,13 @@ jobs:
         with:
           targets: ${{ matrix.job.target }}
 
-      - name: Install cross
-        if: matrix.job.use-cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
       - name: Build
-        shell: bash
-        run: |
-          if [ "${{ matrix.job.use-cross }}" = "true" ]; then
-            cross build --locked --release --target ${{ matrix.job.target }}
-          else
-            cargo build --locked --release --target ${{ matrix.job.target }}
-          fi
+        run: scripts/build-release.sh ${{ matrix.job.target }}
 
+      # cargo-deb publishes only a glibc build (a .deb), so build it here
       - name: Install cargo-deb
         if: matrix.job.deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+        run: cargo install --locked cargo-deb
 
       # static musl binaries, so one package works on every Debian / Ubuntu release
       - name: Debian package
@@ -105,6 +99,8 @@ jobs:
   # (https://max3584.github.io/rproxy-api/). Needs the repository secrets
   # APT_GPG_PRIVATE_KEY (ASCII-armored secret key without a passphrase) and
   # APT_GPG_KEY_ID; skipped when they are not set. See docs/APT.md.
+  # apt-ftparchive（apt-utils）は Debian の道具なので、ここだけ debian:13-slim のコンテナで動かす（#191。
+  # 同じ手順を cross.yml の apt (dry run) が使い捨ての鍵で確かめる）
   apt:
     needs: build
     if: >-
@@ -112,6 +108,7 @@ jobs:
       ((github.event_name == 'push' && github.ref_type == 'tag' && needs.build.result == 'success') ||
        github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    container: debian:13-slim
     concurrency:
       group: apt-repository
       cancel-in-progress: false
@@ -129,6 +126,14 @@ jobs:
           else
             echo "::warning::APT_GPG_PRIVATE_KEY / APT_GPG_KEY_ID are not set; the apt repository is not updated"
           fi
+
+      - name: Packages
+        if: steps.key.outputs.ok
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates gnupg apt-utils dpkg-dev curl gh
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
 
       - name: Checkout
         if: steps.key.outputs.ok

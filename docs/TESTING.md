@@ -5,10 +5,25 @@ English: [TESTING.md](en/TESTING.md)
 | 実行方法 | 対象 | CI のジョブ |
 |---|---|---|
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
-| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（MariaDB のサービスコンテナを使う） |
+| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
+
+## CI の実行環境
+
+GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine のコンテナ（`container: alpine:3.24`。musl で、リリースのバイナリ・.deb と同じ libc）の中で動かす（#191）。パッケージは apk で入れ、Rust は rustup の stable（fuzz は nightly）。
+
+| ワークフロー / ジョブ | 環境 |
+|---|---|
+| CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.24` |
+| CI の `transparent` | `alpine:3.24`（特権つき。名前空間・veth・nft / iptables） |
+| Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
+| Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
+| Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
+| CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる |
+
+ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
@@ -208,9 +223,11 @@ English: [TESTING.md](en/TESTING.md)
 | `scripts/interop/mail.sh` | Postfix / Dovecot | STARTTLS の終端 + PROXY v2 で、Submission・SMTP（STARTTLS 任意）・IMAP・IMAPS・POP3 が通る。STARTTLS 前の送信・ログインを拒否する |
 | `scripts/interop/media.sh` | coturn / MediaMTX | TURN の UDP・TCP の素通し、TLS の終端、DTLS の終端で、割り当てと中継ができる（中継アドレスは範囲ルール越し）。RTSP（TCP interleaved）と RTSPS の終端で映像を受け取れる。10000 ポートの UDP の範囲ルールを作って消す時間・ファイル数・メモリ |
 
+| `scripts/interop/crowdsec.sh` | CrowdSec（LAPI・エージェント・AppSec） | rproxy のログから CrowdSec が検知して ban し、rproxy（L7 の `crowdsec`・L4 の `crowdsec: true`・AppSec）が止める。文書用アドレスのクライアント（IPv4・IPv6）は ban され、私用アドレスは whitelist で ban されない |
+
 10000 ポートの範囲ルール（UDP）の結果（GitHub の Ubuntu ランナー、2026-09）: 作成 約 0.2 秒、ファイル記述子 +10000（削除で元に戻る）、RSS 約 +94 MiB。
 
-sudo でパッケージを入れるので、手元では実行しない。
+どれも使い捨てのコンテナ（mail・media は `alpine:3.24`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
 
 ## 長時間の負荷テスト（Soak ワークフロー）
 
@@ -220,7 +237,7 @@ sudo でパッケージを入れるので、手元では実行しない。
 - UDP: 送信元ポートを変えながら送る 100 クライアント（`udp_idle_secs: 5` でセッションの作成と破棄を繰り返す）
 - 合格の条件: 負荷を止めた後に fd の数が元に戻る（+20 以内）、後半の RSS が前半の 1.5 倍を超えない、転送の失敗が 0.1% 以下
 
-`.github/workflows/soak.yml` が毎週 30 分動かし、CSV を artifact に残す。何時間も回すときは Actions の画面から `duration`（秒）を指定して手動で動かす。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
+`.github/workflows/soak.yml` は必要なときだけ手動で動かす（定期の実行も PR での実行もしない）。Actions の画面か `gh workflow run soak.yml -f duration=<秒>` で時間（既定 3600 秒）を指定し、CSV は artifact に残る。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
 
 
 ## ファジング（Fuzz ワークフロー）
@@ -239,7 +256,7 @@ sudo でパッケージを入れるので、手元では実行しない。
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
 
-`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
+`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。CI は Alpine（musl）なので sanitizer なし（`--sanitizer none`。Rust の AddressSanitizer は glibc のターゲットにしかない）で、debug assertions（整数のあふれの検査）を有効にする。ターゲットのパーサーは unsafe のない Rust なので、範囲外へのアクセスは sanitizer がなくても境界の検査で panic になる。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
 
 手元では（nightly と C/C++ コンパイラが要る）：
 

@@ -4,6 +4,7 @@ name: Benchmarks
 # GitHub のランナーは速さが揺れるので、PR の head とマージベースを同じジョブ（同じランナー）で続けて測って比べる。
 # 閾値（THRESHOLD %）より遅くなり、95 % の信頼区間がすべて遅い側にあるものだけを警告にする。
 # 失敗にはしない（必須のチェックにもしない）。結果はジョブのサマリーと PR のコメント（1 件を更新する）に出す。
+# Alpine（musl）のコンテナで測る（#191。リリースのバイナリ・.deb と同じ libc と malloc）。
 on:
   pull_request:
     paths:
@@ -33,9 +34,16 @@ jobs:
   bench:
     name: criterion (merge base vs. PR)
     runs-on: ubuntu-latest
+    container: alpine:3.24
     # ふだんは 6〜7 分。止まったときは各ステップのタイムアウトで早めに終える（#187）
     timeout-minutes: 45
     steps:
+      # github-cli: the PR comment, python3: scripts/bench-summary.py
+      - name: packages
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 github-cli
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -54,10 +62,11 @@ jobs:
       # ビルドの成果物は PR の側と共有する（依存は 1 回だけビルドされる）
       - name: benchmarks at the merge base
         timeout-minutes: 20
-        working-directory: ${{ runner.temp }}/base
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        # ${{ runner.temp }} and ${{ github.workspace }} are the paths on the runner, not in the container:
+        # use the environment variables
         run: |
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cd "$RUNNER_TEMP/base"
           ulimit -n "$(ulimit -Hn)" || true
           if [ ! -d benches ]; then
             echo "the merge base has no benches/: nothing to compare with"
@@ -110,8 +119,11 @@ jobs:
   stall-probe:
     name: "stall probe (1 MiB echo loops, #187)"
     runs-on: ubuntu-latest
+    container: alpine:3.24
     timeout-minutes: 30
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
