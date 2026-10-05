@@ -1,0 +1,96 @@
+name: Benchmarks
+
+# 性能の回帰に気付くためのベンチマーク（benches/、criterion。issue #163）。
+# GitHub のランナーは速さが揺れるので、PR の head とマージベースを同じジョブ（同じランナー）で続けて測って比べる。
+# 閾値（THRESHOLD %）より遅くなり、95 % の信頼区間がすべて遅い側にあるものだけを警告にする。
+# 失敗にはしない（必須のチェックにもしない）。結果はジョブのサマリーと PR のコメント（1 件を更新する）に出す。
+on:
+  pull_request:
+    paths:
+      - src/**
+      - benches/**
+      - tests/common/**
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/bench-summary.py
+      - .github/workflows/bench.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # PR のコメント（フォークからの PR ではトークンが読み取り専用なので、コメントは飛ばす）
+  pull-requests: write
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  THRESHOLD: "15"
+
+jobs:
+  bench:
+    name: criterion (merge base vs. PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: merge base
+        id: base
+        run: |
+          base=$(git merge-base "${{ github.event.pull_request.base.sha || 'origin/master' }}" HEAD)
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "CRITERION_HOME=$RUNNER_TEMP/criterion" >> "$GITHUB_ENV"
+          git worktree add "$RUNNER_TEMP/base" "$base"
+          echo "merge base: $(git log -1 --format='%h %s' "$base")"
+      # マージベースのベンチマーク（そのときの benches/）を baseline "base" として保存する。
+      # ビルドの成果物は PR の側と共有する（依存は 1 回だけビルドされる）
+      - name: benchmarks at the merge base
+        working-directory: ${{ runner.temp }}/base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          ulimit -n "$(ulimit -Hn)" || true
+          if [ ! -d benches ]; then
+            echo "the merge base has no benches/: nothing to compare with"
+          elif ! cargo bench --locked --bench '*' -- --save-baseline base; then
+            echo "::warning title=Benchmarks::the benchmarks failed at the merge base; no comparison"
+          fi
+          # PR の側が「new」を最初から作るように、マージベースの new / change を消す（base は残す）
+          if [ -d "$CRITERION_HOME" ]; then
+            find "$CRITERION_HOME" -type d \( -name new -o -name change \) -prune -exec rm -rf {} +
+          fi
+      - name: benchmarks of the PR
+        run: |
+          ulimit -n "$(ulimit -Hn)" || true
+          cargo bench --locked --bench '*' -- --baseline-lenient base
+      - name: summary
+        run: |
+          {
+            python3 scripts/bench-summary.py "$CRITERION_HOME" "$THRESHOLD" base
+            echo
+            echo "merge base ${{ steps.base.outputs.sha }} · [job]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          } > "$RUNNER_TEMP/summary.md"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: PR comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          marker='<!-- rproxy-api benchmarks -->'
+          body="$(printf '%s\n%s' "$marker" "$(cat "$RUNNER_TEMP/summary.md")")"
+          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" > /dev/null
+          fi

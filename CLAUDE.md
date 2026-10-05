@@ -9,6 +9,7 @@
 cargo build
 cargo test                    # 単体テスト + tests/api.rs（loopback で実ソケットを使う結合テスト）
 cargo clippy --all-targets
+cargo bench --bench '*'       # criterion のベンチマーク（benches/）。PR では bench.yml がマージベースと比べて、遅くなったら警告（docs/TESTING.md）
 scripts/test-transparent.sh   # transparent の実経路テスト（root 不要、名前空間を使う。cargo build の後）
 cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.example を参照）
 ```
