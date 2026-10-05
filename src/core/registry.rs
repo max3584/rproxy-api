@@ -286,8 +286,9 @@ fn listener_tasks(bound: Bound, rt: &Arc<Runtime>, stop: &CancellationToken) -> 
 			}
 		}
 		Bound::Udp(sockets) => {
+			let ports = u16::try_from(sockets.len()).unwrap_or(u16::MAX);
 			for (offset, group) in sockets.into_iter().enumerate() {
-				let port = Arc::new(udp::Port::default());
+				let port = Arc::new(udp::Port::new(ports));
 				for s in group {
 					let (rt, stop, port) = (rt.clone(), stop.clone(), port.clone());
 					tasks.push(Box::pin(async move {

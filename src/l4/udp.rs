@@ -43,10 +43,20 @@ type Peer = (SocketAddr, Option<Local>);
 type Sessions = Arc<Mutex<HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>>>;
 
 /// What the shards of one port share: how many sessions are reading their
-/// server name (`SNI_MAX_PENDING` is for the port, not for each shard).
-#[derive(Default)]
+/// server name (`SNI_MAX_PENDING` is for the port, not for each shard), and the
+/// size of each shard's receive batch.
 pub struct Port {
 	sniffing: Arc<AtomicUsize>,
+	batch: usize,
+}
+
+impl Port {
+	/// A port of a rule with `ports` ports: a range gets smaller batches (down to
+	/// one datagram), as each slot can hold up to 64 KiB once a large datagram
+	/// came through it (10 000 ports of 32 slots would take GBs).
+	pub fn new(ports: u16) -> Self {
+		Port { sniffing: Arc::default(), batch: (64 / usize::from(ports.max(1))).clamp(1, BATCH) }
+	}
 }
 
 /// Serves one socket of one port of the rule; `offset` is the port's place in a
@@ -58,7 +68,7 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 	let socket = Arc::new(Listener::new(socket));
 	let sessions: Sessions = Arc::default();
 	let next_id = AtomicU64::new(0);
-	let mut batch = Batch::default();
+	let mut batch = Batch::new(port.batch);
 
 	loop {
 		tokio::select! {

@@ -42,23 +42,30 @@ pub struct Meta {
 }
 
 /// Buffers for [`Listener::recv_batch`], one per reading task (not per session).
-/// The memory is only touched as far as datagrams fill it.
+/// `slots` datagrams of up to 64 KiB each; the memory is left uninitialised so
+/// that only the pages datagrams are written to become resident (a zeroed
+/// buffer is written over by some allocators: 10 000 ports of 32 slots took GBs).
 pub struct Batch {
+	/// Capacity `slots * SLOT`; never read beyond what the kernel wrote.
 	buf: Vec<u8>,
+	slots: usize,
 	meta: Vec<Meta>,
 }
 
-impl Default for Batch {
-	fn default() -> Self {
-		// zeroed, so the allocator maps fresh pages that stay untouched until used
-		Batch { buf: vec![0; BATCH * SLOT], meta: Vec::with_capacity(BATCH) }
-	}
-}
-
 impl Batch {
+	pub fn new(slots: usize) -> Self {
+		let slots = slots.clamp(1, BATCH);
+		Batch { buf: Vec::with_capacity(slots * SLOT), slots, meta: Vec::with_capacity(slots) }
+	}
+
 	/// The datagrams of the last receive, in order.
 	pub fn iter(&self) -> impl Iterator<Item = (&[u8], Meta)> {
-		self.meta.iter().enumerate().map(|(i, m)| (&self.buf[i * SLOT..i * SLOT + m.len], *m))
+		let base = self.buf.as_ptr();
+		self.meta.iter().enumerate().map(move |(i, m)| {
+			// SAFETY: within the capacity (slot i of `slots`), and the kernel wrote these `len` bytes
+			let data = unsafe { std::slice::from_raw_parts(base.add(i * SLOT), m.len.min(SLOT)) };
+			(data, *m)
+		})
 	}
 }
 
@@ -104,11 +111,20 @@ impl Listener {
 		batch.meta.clear();
 		#[cfg(target_os = "linux")]
 		{
-			let Batch { buf, meta } = batch;
-			self.socket.async_io(tokio::io::Interest::READABLE, || sys::recv_batch(&self.socket, buf, SLOT, self.pktinfo, meta)).await?;
+			let Batch { buf, slots, meta } = batch;
+			let slots = *slots;
+			self.socket
+				.async_io(tokio::io::Interest::READABLE, || {
+					let base = buf.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+					// SAFETY: `base` has room for `slots` slots of SLOT bytes (the capacity)
+					unsafe { sys::recv_batch(&self.socket, base, slots, SLOT, self.pktinfo, meta) }
+				})
+				.await?;
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
+			// one slot, initialised once
+			batch.buf.resize(SLOT, 0);
 			let (len, from, local) = self.recv(&mut batch.buf[..SLOT]).await?;
 			batch.meta.push(Meta { len, from, local });
 		}
@@ -211,11 +227,15 @@ mod sys {
 		Ok((n as usize, from, local_of(&msg)))
 	}
 
-	/// `recvmmsg`: the datagrams waiting, up to one per `slot` bytes of `buf`
-	/// (at most `super::BATCH`). WouldBlock when there is none.
-	pub fn recv_batch(socket: &UdpSocket, buf: &mut [u8], slot: usize, pktinfo: bool, out: &mut Vec<super::Meta>) -> io::Result<()> {
+	/// `recvmmsg`: the datagrams waiting, up to `slots` (at most `super::BATCH`),
+	/// each into its `slot` bytes from `base` (which may be uninitialised).
+	/// WouldBlock when there is none.
+	///
+	/// # Safety
+	/// `base` must be valid for writes of `slots * slot` bytes.
+	pub unsafe fn recv_batch(socket: &UdpSocket, base: *mut u8, slots: usize, slot: usize, pktinfo: bool, out: &mut Vec<super::Meta>) -> io::Result<()> {
 		const N: usize = super::BATCH;
-		let count = (buf.len() / slot).min(N);
+		let count = slots.min(N);
 		// SAFETY: plain C structs, all-zero is a valid value
 		let mut names: [libc::sockaddr_storage; N] = unsafe { mem::zeroed() };
 		let mut controls: [Control; N] = [[0; 16]; N];
@@ -223,8 +243,9 @@ mod sys {
 		let mut iovs: [libc::iovec; N] = unsafe { mem::zeroed() };
 		// SAFETY: as above
 		let mut msgs: [libc::mmsghdr; N] = unsafe { mem::zeroed() };
-		for (i, chunk) in buf.chunks_exact_mut(slot).take(count).enumerate() {
-			iovs[i] = libc::iovec { iov_base: chunk.as_mut_ptr().cast(), iov_len: slot };
+		for i in 0..count {
+			// the kernel only writes into the slots (base has room for `slots * slot`)
+			iovs[i] = libc::iovec { iov_base: base.wrapping_add(i * slot).cast(), iov_len: slot };
 			let h = &mut msgs[i].msg_hdr;
 			h.msg_name = (&mut names[i] as *mut libc::sockaddr_storage).cast();
 			h.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -532,7 +553,7 @@ mod tests {
 		a.send_to(b"one", ("127.0.0.2", port)).await.unwrap();
 		b.send_to(b"two-two", ("127.0.0.3", port)).await.unwrap();
 		a.send_to(b"", ("127.0.0.2", port)).await.unwrap();
-		let mut batch = Batch::default();
+		let mut batch = Batch::new(BATCH);
 		let mut got = vec![];
 		while got.len() < 3 {
 			tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv_batch(&mut batch)).await.unwrap().unwrap();
