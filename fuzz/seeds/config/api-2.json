@@ -1,0 +1,10 @@
+{
+  "protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 5432,
+  "targets": [
+    {"addr": "10.0.0.11", "port": 5432, "weight": 2},
+    {"addr": "10.0.0.12", "port": 5432},
+    {"addr": "db-backup.internal", "port": 5432, "backup": true}
+  ],
+  "balance": "least_conn",
+  "health_check": {"interval": "10s", "timeout": "3s"}
+}

@@ -1,0 +1,74 @@
+# Fuzz targets for the parsers that read untrusted input (cargo-fuzz, issue #162).
+# A crate of its own: not a member of the rproxy-api package, so cargo build /
+# test / deny at the repository root never see it. See docs/TESTING.md.
+[package]
+name = "rproxy-api-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rproxy-api = { path = ".." }
+# the same versions as the main crate (Cargo.lock)
+ring = "0.17.14"
+tokio = { version = "1.53.1", features = ["rt", "time", "io-util"] }
+
+# its own workspace, so the repository root's commands do not pick it up
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "tls_client_hello"
+path = "fuzz_targets/tls_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_sni"
+path = "fuzz_targets/udp_sni.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_initial"
+path = "fuzz_targets/quic_initial.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_header"
+path = "fuzz_targets/proxy_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "matcher"
+path = "fuzz_targets/matcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "starttls"
+path = "fuzz_targets/starttls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
