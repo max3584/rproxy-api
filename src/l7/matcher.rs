@@ -105,9 +105,19 @@ fn tokenize(src: &str) -> Result<Vec<Token>, ParseError> {
 	Ok(out)
 }
 
+/// Deepest nesting of parentheses and `!` (#180): the parser recurses once per
+/// level, and so do `matches` and drop, on a tokio worker's 2 MiB stack.
+pub const MAX_DEPTH: usize = 32;
+/// Most matchers (`Host(...)` and so on) in one expression (#180). `&&` / `||`
+/// build a tree as deep as the number of matchers, which `matches` and drop walk
+/// recursively; with this and `MAX_DEPTH` a tree is at most a few hundred deep.
+pub const MAX_TERMS: usize = 256;
+
 struct Parser {
 	tokens: Vec<Token>,
 	pos: usize,
+	depth: usize,
+	terms: usize,
 }
 
 impl Parser {
@@ -150,17 +160,34 @@ impl Parser {
 
 	fn unary(&mut self) -> Result<Matcher, ParseError> {
 		match self.next() {
-			Some(Token::Not) => Ok(Matcher::Not(Box::new(self.unary()?))),
-			Some(Token::LParen) => {
-				let inner = self.or()?;
-				match self.next() {
+			Some(Token::Not) => self.nested(|p| Ok(Matcher::Not(Box::new(p.unary()?)))),
+			Some(Token::LParen) => self.nested(|p| {
+				let inner = p.or()?;
+				match p.next() {
 					Some(Token::RParen) => Ok(inner),
 					_ => Err(ParseError("expected )".into())),
 				}
+			}),
+			Some(Token::Ident(name)) => {
+				self.terms += 1;
+				if self.terms > MAX_TERMS {
+					return Err(ParseError(format!("more than {MAX_TERMS} matchers in one expression")));
+				}
+				self.call(&name)
 			}
-			Some(Token::Ident(name)) => self.call(&name),
 			other => Err(ParseError(format!("expected a matcher, got {other:?}"))),
 		}
+	}
+
+	/// One more level of `(` or `!`, at most `MAX_DEPTH`.
+	fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<Matcher, ParseError>) -> Result<Matcher, ParseError> {
+		if self.depth >= MAX_DEPTH {
+			return Err(ParseError(format!("parentheses and ! nested deeper than {MAX_DEPTH} levels")));
+		}
+		self.depth += 1;
+		let m = f(self);
+		self.depth -= 1;
+		m
 	}
 
 	fn call(&mut self, name: &str) -> Result<Matcher, ParseError> {
@@ -264,7 +291,7 @@ fn fmt_range(r: &std::ops::RangeInclusive<usize>) -> String {
 
 impl Matcher {
 	pub fn parse(src: &str) -> Result<Matcher, ParseError> {
-		let mut p = Parser { tokens: tokenize(src)?, pos: 0 };
+		let mut p = Parser { tokens: tokenize(src)?, pos: 0, depth: 0, terms: 0 };
 		if p.tokens.is_empty() {
 			return Err(ParseError("empty match".into()));
 		}
@@ -379,5 +406,48 @@ mod tests {
 			let err = Matcher::parse(src).unwrap_err().0;
 			assert!(err.contains(want), "{src:?}: {err}");
 		}
+	}
+
+	/// Runs `f` on a thread with a tokio worker's stack (2 MiB).
+	fn on_worker_stack(f: impl FnOnce() + Send + 'static) {
+		std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+	}
+
+	#[test]
+	fn deep_nesting_is_an_error_not_a_stack_overflow() {
+		// #180: these overflowed the stack and aborted the process
+		on_worker_stack(|| {
+			for (src, want) in [
+				("!".repeat(100_000) + "Host(`a`)", "nested deeper than 32"),
+				("(".repeat(100_000) + "Host(`a`)" + &")".repeat(100_000), "nested deeper than 32"),
+				("(!".repeat(50_000) + "Host(`a`)", "nested deeper than 32"),
+				("Host(`a`) && ".repeat(100_000) + "Host(`a`)", "more than 256 matchers"),
+				("Host(`a`) || !".repeat(100_000) + "Host(`a`)", "more than 256 matchers"),
+			] {
+				let err = Matcher::parse(&src).unwrap_err().0;
+				assert!(err.contains(want), "{}...: {err}", &src[..20]);
+			}
+		});
+	}
+
+	#[test]
+	fn the_limits_themselves_are_accepted_and_evaluated() {
+		on_worker_stack(|| {
+			let headers = vec![];
+			let r = req("a.example", "GET", "/", "10.0.0.1", &headers);
+			let deep = "(".repeat(MAX_DEPTH) + "Host(`a.example`)" + &")".repeat(MAX_DEPTH);
+			assert!(Matcher::parse(&deep).unwrap().matches(&r));
+			let nots = "!".repeat(MAX_DEPTH) + "Host(`a.example`)";
+			assert!(Matcher::parse(&nots).unwrap().matches(&r));
+			assert!(Matcher::parse(&("!".repeat(MAX_DEPTH + 1) + "Host(`a`)")).is_err());
+			// a deep tree: MAX_TERMS matchers in a chain, each under MAX_DEPTH - 1 (odd) `!`
+			let term = "!".repeat(MAX_DEPTH - 1) + "Host(`b.example`)";
+			let chain = vec![term; MAX_TERMS].join(" && ");
+			let m = Matcher::parse(&chain).unwrap();
+			assert!(m.matches(&r));
+			drop(m);
+			let chain = vec!["Host(`b.example`)"; MAX_TERMS + 1].join(" || ");
+			assert!(Matcher::parse(&chain).unwrap_err().0.contains("more than 256 matchers"));
+		});
 	}
 }

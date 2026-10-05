@@ -214,3 +214,30 @@ fn a_file_that_cannot_be_read_or_parsed() {
 	assert_eq!(code, 1);
 	assert!(text.contains("version 9"), "{text}");
 }
+
+#[test]
+fn deep_match_expressions_and_huge_durations_are_errors() {
+	// #180: a match nested this deep overflowed the stack (the process aborted),
+	// and 5124095576030432m wrapped around to a few minutes
+	let dir = workdir("limits");
+	let (p1, p2, p3) = (free_port(), free_port(), free_port());
+	let deep = "!".repeat(1_000_000) + "Host(`a.test`)";
+	let file = dir.join("rproxy.yaml");
+	fs::write(
+		&file,
+		format!(
+			"version: 1\nrules:\n\
+			   - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {p1}, http: {{routes: [{{name: a, match: \"{deep}\", to: \"http://127.0.0.1:9\"}}]}}}}\n\
+			   - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {p2}, http: {{routes: [{{name: a, match: \"Host(`a.test`)\", to: \"http://127.0.0.1:9\", middlewares: [rl]}}], middlewares: {{rl: {{rate_limit: {{average: 1, period: 5124095576030432m}}}}}}}}}}\n\
+			   - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {p3}, remote_addr: 127.0.0.1, remote_port: 9, health_check: {{interval: 8761h}}}}\n",
+		),
+	)
+	.unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	let errors = messages(&v, "errors");
+	for (rule, want) in [("rule #1", "nested deeper than 32"), ("rule #2", "longer than 365 days"), ("rule #3", "longer than 365 days")] {
+		assert!(errors.lines().any(|l| l.contains(rule) && l.contains(want)), "{rule} / {want}:\n{errors}");
+	}
+	assert_eq!(v["errors"].as_array().unwrap().len(), 3, "{errors}");
+}

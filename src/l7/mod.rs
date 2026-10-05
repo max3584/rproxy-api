@@ -460,17 +460,26 @@ impl MiddlewareSpec {
 }
 
 /// `10s`, `500ms`, `1m`, `2h`
+/// The longest duration accepted (#180): 365 days. Durations are added to
+/// `Instant`s (e.g. the circuit breaker's recovery), which panics on overflow.
+pub const MAX_DURATION: Duration = Duration::from_secs(365 * 24 * 3600);
+
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
+	let not_a_duration = || format!("{s:?} is not a duration (e.g. 10s, 500ms, 1m)");
 	let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
 	let (num, unit) = s.split_at(split);
-	let n: u64 = num.parse().map_err(|_| format!("{s:?} is not a duration (e.g. 10s, 500ms, 1m)"))?;
-	Ok(match unit {
-		"ms" => Duration::from_millis(n),
-		"s" => Duration::from_secs(n),
-		"m" => Duration::from_secs(n * 60),
-		"h" => Duration::from_secs(n * 3600),
-		_ => return Err(format!("{s:?} is not a duration (e.g. 10s, 500ms, 1m)")),
-	})
+	let n: u64 = num.parse().map_err(|_| not_a_duration())?;
+	let d = match unit {
+		"ms" => Some(Duration::from_millis(n)),
+		"s" => Some(Duration::from_secs(n)),
+		"m" => n.checked_mul(60).map(Duration::from_secs),
+		"h" => n.checked_mul(3600).map(Duration::from_secs),
+		_ => return Err(not_a_duration()),
+	};
+	match d {
+		Some(d) if d <= MAX_DURATION => Ok(d),
+		_ => Err(format!("{s:?} is longer than 365 days (8760h)")),
+	}
 }
 
 pub(crate) fn parse_status_range(s: &str) -> Result<(u16, u16), String> {
@@ -622,6 +631,7 @@ middlewares:
 			(json!({"routes": [{"name": "a", "match": "Host(`x`)", "to": "h:80"}]}), "http://"),
 			(json!({"routes": [{"name": "a", "match": "Host(`x`)", "to": "http://h"}, {"name": "a", "match": "Host(`y`)", "to": "http://h"}]}), "unique"),
 			(json!({"middlewares": {"m": {"rate_limit": {"average": 5, "period": "soon"}}}}), "not a duration"),
+			(json!({"routes": [{"name": "a", "match": "(".repeat(1000) + "Host(`x`)" + &")".repeat(1000), "to": "http://h"}]}), "nested deeper than 32"),
 			(json!({"middlewares": {"m": {"ip_allow": {"source_range": ["nope"]}}}}), "middleware m"),
 			(json!({"middlewares": {"m": {"teleport": {}}}}), "unknown variant"),
 			(json!({"middlewares": {"m": {"redirect_scheme": {"scheme": "ftp"}}}}), "http or https"),
@@ -631,5 +641,21 @@ middlewares:
 		}
 		assert!(parse_duration("250ms").unwrap() == Duration::from_millis(250));
 		assert_eq!(parse_status_range("500-599"), Ok((500, 599)));
+	}
+
+	#[test]
+	fn huge_durations_are_errors_not_overflows() {
+		// #180: `n * 60` / `n * 3600` wrapped around in release builds
+		assert_eq!(parse_duration("8760h"), Ok(MAX_DURATION));
+		assert_eq!(parse_duration("525600m"), Ok(MAX_DURATION));
+		for s in ["8761h", "525601m", "31536001s", "31536000001ms", "18446744073709551615h", "5124095576030432m", "18446744073709551615s"] {
+			let err = parse_duration(s).unwrap_err();
+			assert!(err.contains("longer than 365 days"), "{s}: {err}");
+		}
+		assert!(parse_duration("99999999999999999999s").unwrap_err().contains("not a duration"));
+		// in a rule (the API and the settings file)
+		use serde_json::json;
+		let err = spec(json!({"middlewares": {"m": {"rate_limit": {"average": 5, "period": "5124095576030432m"}}}})).unwrap_err();
+		assert!(err.contains("longer than 365 days"), "{err}");
 	}
 }
