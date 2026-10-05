@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "rproxy-api"
-version = "0.3.15"
+version = "0.3.17"
 dependencies = [
  "async-trait",
  "axum",
