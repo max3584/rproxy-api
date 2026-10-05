@@ -188,6 +188,8 @@ English: [TESTING.md](en/TESTING.md)
 
 `dataplane` の 1 回の繰り返しが 30 秒進まないとき（`STALL`）は、ベンチマークが止まったものとして panic し、何をしていたか（書いた・読み戻したバイト数、TLS のクライアントが送っていないレコードを持っているか）とルールの統計を出す（#187）。ワークフローの各ステップにもタイムアウト（20 分）がある。TLS のストリームは `write_all` のあとに `flush` しないと、ソケットが詰まっていたときの最後のレコードが rustls に残る（#187 の止まった原因。クライアント側の問題で、rproxy は `copy_bidirectional` が読めないときに flush する）。
 
+切り分け用に `examples/stall_probe.rs` がある（`bench.yml` の `stall-probe` ジョブ）。同じ 1 MiB の往復を 1 回 3 秒のタイムアウトで何百回も繰り返し、L4 の TCP・TLS の終端・rproxy を通さない TLS、クライアントの flush の有無、送信バッファ（既定・4 KiB）、rproxy を同じプロセスで動かすか別のプロセス（`--rproxy target/release/rproxy-api`）にするか、を並べて止まった回数と時間を表にする。#187 では、止まるのは flush しない TLS のクライアントだけで、rproxy を通さなくても、別のプロセスにしても同じように止まり、そのときクライアントの rustls は送っていないレコードを持っていた（`wants_write = true`）。flush するクライアントが止まったらジョブは失敗する。手元では `cargo run --release --example stall_probe -- --iters 300`。
+
 ## まだテストしていないこと
 
 - 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ

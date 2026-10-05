@@ -188,6 +188,8 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 
 When one iteration of `dataplane` makes no progress for 30 seconds (`STALL`), the benchmark treats it as a stall and panics with what it was doing (bytes written and read back, whether the TLS client still holds unsent records) and the rule counters (#187). Each workflow step also has a timeout (20 minutes). A TLS stream must be flushed after `write_all`: when the socket was full, the last records stay in rustls until then (the cause of the stall in #187, on the client side; rproxy's `copy_bidirectional` flushes whenever it has nothing to read).
 
+For telling the causes apart there is `examples/stall_probe.rs` (the `stall-probe` job of `bench.yml`). It repeats the same 1 MiB echo hundreds of times with a 3-second timeout per iteration, across L4 TCP, TLS termination and TLS without rproxy, the client flushing or not, the default or a 4 KiB send buffer, and rproxy in the same process or as its own process (`--rproxy target/release/rproxy-api`), and prints how many iterations stalled and how long they took. In #187 only TLS clients that did not flush stalled, just the same without rproxy and with rproxy as its own process, and their rustls still held unsent records (`wants_write = true`). The job fails if a client that flushes stalls. Locally: `cargo run --release --example stall_probe -- --iters 300`.
+
 ## Not yet tested
 
 - Combinations with real mail servers (Postfix / Dovecot) and real WebRTC, TURN, and RTSP clients
