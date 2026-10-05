@@ -425,7 +425,7 @@ async fn negotiate(port: u16, name: &str, connector: tokio_rustls::TlsConnector)
 }
 
 fn client_with(pki: &Pki, versions: &[&'static rustls::SupportedProtocolVersion]) -> tokio_rustls::TlsConnector {
-	let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+	let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_protocol_versions(versions)
 		.unwrap()
 		.with_root_certificates(pki.roots())

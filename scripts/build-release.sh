@@ -3,7 +3,7 @@
 # CI の Alpine（musl）のコンテナで動かす前提：
 #
 #   x86_64-unknown-linux-musl  ホストと同じなので cargo build（gcc・musl-dev）
-#   それ以外                   cargo-zigbuild（zig cc がリンカと C コンパイラ。ring の C・アセンブリも zig でビルドする）
+#   それ以外                   cargo-zigbuild（zig cc がリンカと C コンパイラ。aws-lc-sys・ring の C・アセンブリも zig でビルドする）
 #                              gnu は glibc $GLIBC（既定 2.17）向けにリンクする（それより新しい glibc ならどこでも動く）
 #
 #   scripts/build-release.sh <target>

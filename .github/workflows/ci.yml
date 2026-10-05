@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     container: alpine:3.24
     steps:
-      # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring と zstd-sys
+      # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: aws-lc-sys・ring と zstd-sys
       # tests/traefik_convert.rs runs contrib/traefik2rproxy.py (python3, py3-yaml)
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev python3 py3-yaml mariadb mariadb-client

@@ -675,7 +675,7 @@ fn all_expired(spec: &TlsSpec) -> ApiError {
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-	Arc::new(rustls::crypto::ring::default_provider())
+	Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
 /// Picks a certificate by SNI; the first certificate is the fallback.
@@ -706,7 +706,7 @@ fn suite_name(suite: &rustls::SupportedCipherSuite) -> String {
 fn server_crypto(
 	options: Option<&TlsOptions>,
 ) -> Result<(Arc<rustls::crypto::CryptoProvider>, Vec<&'static rustls::SupportedProtocolVersion>), ApiError> {
-	let mut provider = rustls::crypto::ring::default_provider();
+	let mut provider = rustls::crypto::aws_lc_rs::default_provider();
 	let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = vec![&rustls::version::TLS13, &rustls::version::TLS12];
 	let Some(o) = options else { return Ok((Arc::new(provider), versions)) };
 	if o.min_version.as_deref() == Some("1.3") {

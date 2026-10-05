@@ -176,7 +176,7 @@ impl Pki {
 
 	/// A client presenting only its own certificate, without intermediates.
 	pub fn connector_leaf_only(&self, client: &Issued) -> tokio_rustls::TlsConnector {
-		let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+		let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
 			.with_root_certificates(self.roots())
@@ -192,7 +192,7 @@ impl Pki {
 
 	/// Like `connector`, offering the given ALPN protocols.
 	pub fn connector_alpn(&self, client: Option<&Issued>, alpn: &[&str]) -> tokio_rustls::TlsConnector {
-		let builder = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+		let builder = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
 			.with_root_certificates(self.roots());
@@ -206,7 +206,7 @@ impl Pki {
 
 	/// A TLS server with `issued` as its certificate.
 	pub fn acceptor(&self, issued: &Issued) -> tokio_rustls::TlsAcceptor {
-		let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+		let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
 			.with_no_client_auth()

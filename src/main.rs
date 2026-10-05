@@ -299,7 +299,7 @@ async fn run(opts: Options) -> Result<(), String> {
 	// the control API certificate; loaded later by the listener task when it cannot be read yet
 	let tls: Arc<OnceCell<RustlsConfig>> = Arc::default();
 	if let (Some(cert), Some(key)) = (&opts.tls_cert, &opts.tls_key) {
-		let _ = rustls::crypto::ring::default_provider().install_default();
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 		match load_api_tls(cert, key).await {
 			Ok(config) => {
 				let _ = tls.set(config);

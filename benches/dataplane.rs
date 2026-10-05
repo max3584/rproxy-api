@@ -282,7 +282,7 @@ fn tls_terminate(c: &mut Criterion) {
 		(h, port)
 	});
 	// full handshakes every time (no session resumption)
-	let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_safe_default_protocol_versions()
 		.unwrap()
 		.with_root_certificates(pki.roots())

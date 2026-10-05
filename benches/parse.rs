@@ -53,7 +53,7 @@ fn matcher(c: &mut Criterion) {
 
 /// The ClientHello (TLS records included) that rustls sends for `name`.
 fn client_hello(name: &str, alpn: &[&str]) -> Vec<u8> {
-	let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_safe_default_protocol_versions()
 		.unwrap()
 		.with_root_certificates(rustls::RootCertStore::empty())

@@ -25,7 +25,7 @@ const ALPN: &[u8] = b"echo";
 
 /// A QUIC echo server: every bidirectional stream gets `tag` + what was sent.
 async fn quic_backend(issued: &Issued, tag: &'static str) -> SocketAddr {
-	let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_protocol_versions(&[&rustls::version::TLS13])
 		.unwrap()
 		.with_no_client_auth()
@@ -52,7 +52,7 @@ async fn quic_backend(issued: &Issued, tag: &'static str) -> SocketAddr {
 
 /// A QUIC client trusting the test CA; `extra_alpn` makes the ClientHello bigger.
 fn quic_client(pki: &Pki, extra_alpn: usize) -> quinn::Endpoint {
-	let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_protocol_versions(&[&rustls::version::TLS13])
 		.unwrap()
 		.with_root_certificates(pki.roots())

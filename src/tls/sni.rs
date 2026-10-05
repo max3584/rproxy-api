@@ -160,7 +160,7 @@ mod tests {
 
 	/// A ClientHello produced by rustls for `mail.example.com`.
 	fn hello(name: &str) -> Vec<u8> {
-		let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+		let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
 			.with_root_certificates(rustls::RootCertStore::empty())

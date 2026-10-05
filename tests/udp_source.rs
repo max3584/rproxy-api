@@ -161,7 +161,7 @@ fn quic_endpoint(tls: rustls::ClientConfig, to: SocketAddr) -> quinn::Endpoint {
 }
 
 fn client_tls(pki: &Pki, alpn: &[u8]) -> rustls::ClientConfig {
-	let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_protocol_versions(&[&rustls::version::TLS13])
 		.unwrap()
 		.with_root_certificates(pki.roots())
@@ -171,7 +171,7 @@ fn client_tls(pki: &Pki, alpn: &[u8]) -> rustls::ClientConfig {
 }
 
 async fn quic_backend(issued: &Issued) -> SocketAddr {
-	let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+	let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 		.with_protocol_versions(&[&rustls::version::TLS13])
 		.unwrap()
 		.with_no_client_auth()

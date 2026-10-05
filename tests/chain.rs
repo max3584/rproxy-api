@@ -142,7 +142,7 @@ async fn mtls_with_multi_tier_client_certificates() {
 		let stranger_pki = Pki::tiers(&format!("stranger{tiers}"), tiers);
 		let mallory = stranger_pki.client("mallory", "mallory");
 		let with_roots = {
-			let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+			let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
 				.with_safe_default_protocol_versions()
 				.unwrap()
 				.with_root_certificates(pki.roots())

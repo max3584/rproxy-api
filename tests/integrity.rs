@@ -760,7 +760,7 @@ impl Http {
 	}
 
 	async fn h3(&self) -> (h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>, quinn::Endpoint) {
-		let provider = Arc::new(rustls::crypto::ring::default_provider());
+		let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 		let mut tls = rustls::ClientConfig::builder_with_provider(provider)
 			.with_protocol_versions(&[&rustls::version::TLS13])
 			.unwrap()

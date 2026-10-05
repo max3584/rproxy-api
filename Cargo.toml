@@ -68,7 +68,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "i
 tokio-util = { version = "0.7.19", features = ["rt"] }
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "query", "form"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing = "0.1.44"
@@ -80,7 +80,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 dtls = "0.17.2"
 webrtc-util = { version = "0.17.2", default-features = false, features = ["conn"] }
-tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
 webpki-roots = "1.0.9"
 x509-parser = "0.18.1"
 async-trait = "0.1.92"
@@ -100,9 +100,11 @@ sha1 = "0.11.0"
 md-5 = "0.11.0"
 bcrypt = { version = "0.19.3", default-features = false, features = ["std"] }
 base64 = "0.23.1"
+# rustls / quinn use aws-lc-rs (#184); ring stays for dtls (which depends on it anyway) and our own
+# crypto: OIDC JWT verification and session cookies, QUIC Initial decryption, DTLS key conversion
 ring = "0.17.14"
 time = { version = "0.3.55", features = ["formatting"] }
-quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 
