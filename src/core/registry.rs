@@ -46,10 +46,25 @@ type Resolver = (CancellationToken, JoinHandle<()>);
 /// taken off the rule (or the rule stopped), false when it ended on its own.
 type ListenerTask = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 
-/// The sockets of one listening address, one per port of the rule.
+/// The sockets of one listening address, one per port of the rule (UDP: one
+/// group of `SO_REUSEPORT` shards per port).
 enum Bound {
 	Tcp(Vec<tokio::net::TcpListener>),
-	Udp(Vec<tokio::net::UdpSocket>),
+	Udp(Vec<Vec<tokio::net::UdpSocket>>),
+}
+
+/// Sockets per UDP port of a rule (#194): one for each worker thread, so that
+/// that many tasks read the port at once. A range of ports gets fewer, to keep
+/// the sockets of one address within `UDP_SHARD_SOCKETS`. `RPROXY_UDP_SHARDS`
+/// overrides the number of worker threads (an experiment's tunable).
+/// Decided when the sockets are opened only: a group that changes size makes
+/// the kernel send clients to other sockets, where their sessions are not.
+fn udp_shards(ports: u16) -> usize {
+	const UDP_SHARD_SOCKETS: usize = 64;
+	static FORCED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+	let forced = *FORCED.get_or_init(|| std::env::var("RPROXY_UDP_SHARDS").ok().and_then(|v| v.trim().parse().ok()));
+	let workers = forced.unwrap_or_else(|| tokio::runtime::Handle::try_current().map(|h| h.metrics().num_workers()).unwrap_or(1));
+	workers.min(UDP_SHARD_SOCKETS / usize::from(ports.max(1))).clamp(1, UDP_SHARD_SOCKETS)
 }
 
 struct Running {
@@ -241,11 +256,18 @@ fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
 				.map(|addr| crate::net::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
-		Protocol::Udp => Bound::Udp(
-			addrs
-				.map(|addr| crate::net::listen::udp(addr, v6only).and_then(tokio::net::UdpSocket::from_std).map_err(|e| bind_error(addr, e)))
-				.collect::<Result<_, _>>()?,
-		),
+		Protocol::Udp => {
+			let shards = udp_shards(spec.port_count);
+			Bound::Udp(
+				addrs
+					.map(|addr| {
+						crate::net::listen::udp_shards(addr, v6only, shards)
+							.and_then(|group| group.into_iter().map(tokio::net::UdpSocket::from_std).collect())
+							.map_err(|e| bind_error(addr, e))
+					})
+					.collect::<Result<_, _>>()?,
+			)
+		}
 	};
 	Ok(bound)
 }
@@ -264,12 +286,15 @@ fn listener_tasks(bound: Bound, rt: &Arc<Runtime>, stop: &CancellationToken) -> 
 			}
 		}
 		Bound::Udp(sockets) => {
-			for (offset, s) in sockets.into_iter().enumerate() {
-				let (rt, stop) = (rt.clone(), stop.clone());
-				tasks.push(Box::pin(async move {
-					udp::serve(s, rt, offset as u16, stop.clone()).await;
-					stop.is_cancelled()
-				}));
+			for (offset, group) in sockets.into_iter().enumerate() {
+				let port = Arc::new(udp::Port::default());
+				for s in group {
+					let (rt, stop, port) = (rt.clone(), stop.clone(), port.clone());
+					tasks.push(Box::pin(async move {
+						udp::serve(s, port, rt, offset as u16, stop.clone()).await;
+						stop.is_cancelled()
+					}));
+				}
 			}
 		}
 	}

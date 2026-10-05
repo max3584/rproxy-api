@@ -45,11 +45,11 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/core/proxy.rs` | ルールごとの実行時状態 `Runtime`（トークン、watch、統計、`TaskTracker`）。`select` が転送先の候補を良い順に返す（`Target.candidates`） |
 | `src/core/balance.rs` | 複数の宛先（#98）：`targets` / `balance`（round_robin・least_conn・failover）/ `backup` / L4 の `health_check`（TCP の接続）。`Pool` は `Runtime.pool` にあり、宛先が変わったら丸ごと差し替える。接続に失敗した宛先は `FAIL_COOLDOWN` のあいだ飛ばす。`Lease` が宛先ごとの接続数を数える。状態の変化は `Runtime.pool_events` で UDP のセッションに知らせる（落ちた宛先から移る） |
 | `src/core/resolve.rs` | 名前解決と定期再解決。失敗時は前回の結果（watch の中身）を使い続ける。テスト用に差し替え可能 |
-| `src/net/listen.rs` | 待ち受けのソケット（`IPV6_V6ONLY` の有無）と、2 つの待ち受けアドレスが重なるかの判定（`clash`。`::` は V6ONLY がなければ IPv4 も含む）。ルールの `extra_listen_addrs`（#99）はアドレスごとに `Running.listeners` のトークンで止め、PATCH で足したアドレスは `add_listeners` から監視のタスクに渡す |
-| `src/net/udpsock.rs` | ルールの UDP の待ち受けソケット（`Listener`）。`0.0.0.0` / `::` では `IP_PKTINFO` / `IPV6_RECVPKTINFO` で受けた宛先（`Local`）を覚え、返信は `sendmsg` でそこから送る（#137。アドレスが複数のホストで、カーネルに任せると違うアドレスから返ってしまう）。UDP のセッションは（クライアント, `Local`）ごと |
+| `src/net/listen.rs` | 待ち受けのソケット（`IPV6_V6ONLY` の有無）と、2 つの待ち受けアドレスが重なるかの判定（`clash`。`::` は V6ONLY がなければ IPv4 も含む）。ルールの `extra_listen_addrs`（#99）はアドレスごとに `Running.listeners` のトークンで止め、PATCH で足したアドレスは `add_listeners` から監視のタスクに渡す。UDP はポートごとに `SO_REUSEPORT` の組（`udp_shards`。数はワーカースレッドの数で `registry::udp_shards`、#194）と大きめの `SO_RCVBUF`。組は先に `SO_REUSEPORT` なしで 1 回 bind して、ほかのソケットが持つポートに黙って加わらないようにする。数はソケットを開くときにだけ決める（組の大きさが変わるとカーネルの振り分けが変わり、セッションのない shard に移る） |
+| `src/net/udpsock.rs` | ルールの UDP の待ち受けソケット（`Listener`）。`0.0.0.0` / `::` では `IP_PKTINFO` / `IPV6_RECVPKTINFO` で受けた宛先（`Local`）を覚え、返信は `sendmsg` でそこから送る（#137。アドレスが複数のホストで、カーネルに任せると違うアドレスから返ってしまう）。UDP のセッションは（クライアント, `Local`）ごと。受信は `recv_batch`（`recvmmsg`、バッファは shard ごとに 1 つ）、転送先への送信は `send_connected`（`sendmmsg`、PROXY v2 のヘッダは iovec で前に付ける） |
 | `src/net/source.rs` | PROXY protocol v1/v2 ヘッダ（v2 は TLS の TLV つき）、`IP_TRANSPARENT` ソケット、その可否の判定 |
 | `src/net/cidr.rs` | `allow_from` の CIDR（IPv4-mapped IPv6 も IPv4 として扱う） |
-| `src/l4/tcp.rs` / `src/l4/udp.rs` | データプレーン。停止は `CancellationToken`、転送先は `watch` で受け取る |
+| `src/l4/tcp.rs` / `src/l4/udp.rs` | データプレーン。停止は `CancellationToken`、転送先は `watch` で受け取る。UDP は shard（`SO_REUSEPORT` のソケット）ごとに `serve` が 1 つ動き、セッションの表も shard ごと（カーネルが 4 タプルのハッシュで同じクライアントを同じソケットに渡す）。ポートで共有するのは `udp::Port`（名前を読んでいるセッションの数）だけ |
 | `src/l4/starttls.rs` | SMTP / IMAP / POP3 の STARTTLS 前のやり取りと、TLS 後の転送先の挨拶の読み捨て |
 | `src/tls/config.rs` | `tls` の設定の型と検証、証明書・鍵・CA の読み込み（`KeyedCert` / `CertBundle`）、SNI での証明書の選択、rustls / dtls クレート の設定の組み立て（`TlsRuntime::build` は読み込み済みの `RuleCerts` から組み立てる。`TlsRuntime::load` はファイルから直接）。証明書の期限を調べるのは `inspect_certificate` だけ（純粋な関数） |
 | `src/tls/certstore.rs` | 証明書のストア（#115、`Registry.certs`）：ルールが使う証明書をファイルの組（`Source`）ごとに 1 回だけ読み込んで共有する。ファイルの変化（`refresh`、#90）・SIGHUP（`reload_all`）・期限（`newly_expired`）を証明書ごとに扱い、`Registry::apply_certs` が変わった証明書を使うルールだけを組み立て直す。誰も使わなくなった証明書は `retain` で捨てる。期限のログ（`cert.expiring` / `cert.expired`）は状態が変わったときに 1 回 |
