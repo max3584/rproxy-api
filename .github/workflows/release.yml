@@ -7,8 +7,9 @@ on:
   push:
     tags:
       - v*
-  # UI だけのリリース（rproxy-api のコードが変わらない版）の rproxy-ui の .deb を
-  # apt リポジトリに載せる。rproxy-api はビルドしない（docs/RELEASING.md）
+  # rproxy-ui の .deb を apt リポジトリに載せる。UI は rproxy-api と別に版を
+  # 進めるので、UI のリリースの後にここを手動で実行する。rproxy-api はビルドしない
+  # （docs/RELEASING.md）
   workflow_dispatch:
     inputs:
       ui_tag:
@@ -117,8 +118,8 @@ jobs:
     env:
       APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
       APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
-      # push のときは rproxy-api と同じタグ、手動のときは入力した UI のタグ
-      UI_TAG: ${{ inputs.ui_tag || github.ref_name }}
+      # 手動のときだけ使う（入力した UI のタグ）
+      UI_TAG: ${{ inputs.ui_tag }}
     steps:
       - name: Check signing key
         id: key
@@ -151,20 +152,18 @@ jobs:
           path: debs
           merge-multiple: true
 
-      # the UI is released with the same version first (docs/RELEASING.md)
+      # the UI has its own version numbers (docs/RELEASING.md): a tag push
+      # publishes rproxy-api only, and the UI .deb comes by hand with ui_tag
       - name: Download rproxy-ui
-        if: steps.key.outputs.ok
+        if: steps.key.outputs.ok && github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release download "$UI_TAG" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
-            ls debs
-          elif [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if ! gh release download "$UI_TAG" -R max3584/TCP-UDP-rproxy-ui -p 'rproxy-ui_*_all.deb' -D debs; then
             echo "::error::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG"
             exit 1
-          else
-            echo "::warning::no rproxy-ui .deb in TCP-UDP-rproxy-ui $UI_TAG; publishing rproxy-api only (re-run this job once the UI release has it)"
           fi
+          ls debs
 
       - name: Update the repository
         if: steps.key.outputs.ok
