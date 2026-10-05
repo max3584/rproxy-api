@@ -9,7 +9,7 @@
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
-| `scripts/load/run.sh` | Load and soak tests with large, long transfers (transfer efficiency; see "Load and soak tests" below) | Load workflow (nightly, manual) |
+| `scripts/load/run.sh` | Load and soak tests with large, long transfers (transfer efficiency; see "Load and soak tests" below) | Load workflow (manual only) |
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
@@ -286,12 +286,12 @@ Without root it needs user namespaces (on Ubuntu 24.04 and later, `sudo sysctl k
 
 ### CI
 
-`.github/workflows/load.yml` runs nightly and manually (from the Actions page, with size, count, duration, connections, soak duration, netem conditions and scenarios). It does not run on PRs (runner speed varies) and is not a required check.
+`.github/workflows/load.yml` runs only manually (from the Actions page or `gh workflow run load.yml`, with size, count, duration, connections, soak duration, netem conditions and scenarios). It is heavy and long, so it does not run on a schedule or on PRs (run it when the owner asks), and it is not a required check.
 
 - `load (clean)`: every scenario without netem (by default 2 GiB × 3, 5000 connections, a 10-minute soak)
 - `load (netem)`: `tcp`, `verify`, `tls`, `http`, `udp` and `latency` with `delay 5ms loss 0.1%` (512 MiB)
 
-Results are kept as artifacts (`load-clean` / `load-netem`, 90 days) and in the job summary. The artifact of the last successful run on master is downloaded and the tables show the deltas. The runners are shared 4-core VMs: ignore a single change and look for changes that repeat.
+Results are kept as artifacts (`load-clean` / `load-netem`, 90 days) and in the job summary. The artifact of the last successful manual run (master first, else any branch) is downloaded and the tables show the deltas. The runners are shared 4-core VMs: ignore a single change and look for changes that repeat.
 
 `scripts/soak.py` (the "Long-running load test" above) is the weekly loopback soak centered on connection churn, and stays as it is.
 

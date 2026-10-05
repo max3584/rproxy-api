@@ -3,13 +3,11 @@ name: Load
 # 大きな通信を流し続ける負荷・soak のテスト（scripts/load/、issue #183）。転送の速さ・遅延・
 # CPU 1 コアあたりの転送量・メモリ（接続 1 本・UDP のセッション 1 つ・ルール 1 件あたり）・FD・UDP の取りこぼしを、
 # プロキシなしの直結と（入っていれば）HAProxy を並べて測る。高速化（#184）・メモリの削減（#185）の前後を比べるための基準。
-# GitHub のランナーは速さが揺れるので PR では動かさず、毎晩と手動で動かす（必須のチェックではない）。
-# 結果（results.json・summary.md）は artifact とジョブのサマリーに残し、前回の成功した実行（master の）と比べる。
+# 重く長いので、オーナーが頼んだときに手動（workflow_dispatch）でだけ動かす（定期・PR では動かさない。必須のチェックではない）。
+# 結果（results.json・summary.md）は artifact とジョブのサマリーに残し、前回の成功した手動の実行と比べる。
 # 失敗にするのは確かめごと（転送したデータが 1 バイトでも違う、シナリオが動かない、soak でメモリ・FD が増え続ける）だけで、
 # 遅くなったことは表の差分で見る。
 on:
-  schedule:
-    - cron: "0 18 * * *"   # 毎日 3:00（JST）
   workflow_dispatch:
     inputs:
       size_mib:
@@ -88,13 +86,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # the last successful run on master; else the last successful run of this branch
-          id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --branch master --status success -L 1 --json databaseId --jq '.[0].databaseId // empty')
-          if [ -z "$id" ]; then
-            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --branch "$GITHUB_REF_NAME" --status success -L 1 --json databaseId --jq '.[0].databaseId // empty')
-          fi
-          if [ -n "$id" ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "load-$VARIANT" -D previous; then
-            echo "comparing with run $id"
+          # the last earlier manual run whose job for this variant succeeded (master first, then any branch)
+          prev=""
+          for branch in master ""; do
+            ids=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --event workflow_dispatch ${branch:+--branch "$branch"} \
+              -L 30 --json databaseId,status --jq ".[] | select(.status == \"completed\" and .databaseId != $GITHUB_RUN_ID) | .databaseId")
+            for id in $ids; do
+              ok=$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq "[.jobs[] | select(.name == \"load ($VARIANT)\" and .conclusion == \"success\")] | length")
+              if [ "$ok" = 1 ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "load-$VARIANT" -D previous; then
+                prev=$id
+                break 2
+              fi
+            done
+          done
+          if [ -n "$prev" ]; then
+            echo "comparing with run $prev"
             echo "PREVIOUS=$PWD/previous/results.json" >> "$GITHUB_ENV"
           else
             echo "no earlier results to compare with"

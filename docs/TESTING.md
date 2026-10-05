@@ -9,7 +9,7 @@ English: [TESTING.md](en/TESTING.md)
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
-| `scripts/load/run.sh` | 大きな通信を流し続ける負荷・soak のテスト（転送効率。下の「負荷・soak のテスト」） | Load ワークフロー（毎晩・手動） |
+| `scripts/load/run.sh` | 大きな通信を流し続ける負荷・soak のテスト（転送効率。下の「負荷・soak のテスト」） | Load ワークフロー（手動だけ） |
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
@@ -286,12 +286,12 @@ root なしで動かすにはユーザー名前空間が要る（Ubuntu 24.04 �
 
 ### CI
 
-`.github/workflows/load.yml` が毎晩と手動（Actions の画面から。大きさ・回数・秒数・接続数・soak の秒数・netem の条件・シナリオを指定できる）で動かす。PR では動かさない（ランナーの速さが揺れるため）。必須のチェックでもない。
+`.github/workflows/load.yml` は手動（Actions の画面か `gh workflow run load.yml`。大きさ・回数・秒数・接続数・soak の秒数・netem の条件・シナリオを指定できる）でだけ動かす。重く長いので定期や PR では動かさない（オーナーが頼んだときに回す）。必須のチェックでもない。
 
 - `load (clean)`：netem なしで全シナリオ（既定 2 GiB × 3、接続 5000、soak 10 分）
 - `load (netem)`：`delay 5ms loss 0.1%` で `tcp`・`verify`・`tls`・`http`・`udp`・`latency`（512 MiB）
 
-結果は artifact（`load-clean` / `load-netem`、90 日）とジョブのサマリーに残す。master の最後に成功した実行の artifact を取ってきて、差分を表に出す。ランナーは 4 コアの共有の VM なので、1 回だけの差は気にせず、続けて出る変化を見る。
+結果は artifact（`load-clean` / `load-netem`、90 日）とジョブのサマリーに残す。前回の成功した手動の実行（master を先に、なければほかのブランチ）の artifact を取ってきて、差分を表に出す。ランナーは 4 コアの共有の VM なので、1 回だけの差は気にせず、続けて出る変化を見る。
 
 `scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした週 1 回の soak で、そのまま残している。
 
