@@ -69,6 +69,10 @@ jobs:
       - name: benchmarks of the PR
         run: |
           ulimit -n "$(ulimit -Hn)" || true
+          # cargo の成果物の名前は（ワークスペースからの相対パスで決まるので）マージベースと同じになり、
+          # 依存ファイルがマージベースの側を指したまま「新しい」と見なされて作り直されない（#177 で起きた）。
+          # このクレートの分だけ消して、PR のソースから作り直させる（依存はそのまま使う）
+          cargo clean --release -p rproxy-api
           cargo bench --locked --bench '*' -- --baseline-lenient base
       - name: summary
         run: |

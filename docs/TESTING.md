@@ -71,6 +71,7 @@ English: [TESTING.md](en/TESTING.md)
 | `proxy_protocol_v1_header_carries_the_client` | 転送先が受け取る v1 ヘッダの文字列 |
 | `concurrent_creates_of_the_same_rule_yield_one_winner` | 同じルールを 10 本同時に追加しても、成功するのは 1 本だけ |
 | `a_silent_api_client_does_not_block_others` | 何も送らない接続があっても、ほかのリクエストは待たされない（元の実装の不具合の再発防止） |
+| `small_writes_are_not_delayed_by_nagle` | 2 回に分けた小さな書き込みの往復が、どちら向きでも遅延 ACK（約 40 ms）を待たない（両側の TCP_NODELAY、#176） |
 
 ## 結合テスト：ポート範囲と TLS（`tests/tls.rs`）
 

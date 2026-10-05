@@ -84,6 +84,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 停止は `stop`（受け付け停止）→ 任意の drain → `kill`（既存接続の切断）の順。`delete` は listener が閉じ、全接続が終わってから返る。
 - 転送先の変更は `watch` 経由。TCP は新しい接続から、UDP は既存のセッションも切り替わる。宛先が複数のルールでは、UDP のセッションは自分の宛先が down になったときだけ移る（`failover` で上位が戻っても、既存のセッションはそのまま）。
 - 宛先（`remote_addr` か `targets`、`balance`、`health_check`）は PATCH で毎回まとめて置き換える（省いた `balance` は round_robin、`health_check` はなし）。一覧の `remote_addr` / `remote_port` は `targets` の先頭（古いクライアント・ログ用）。DB の `options.targets` があれば `dist_addr` / `dist_port` は読まない。
+- データプレーンの TCP のソケット（受け付けた接続・転送先への接続）はすべて TCP_NODELAY（#176。`net::source::nodelay`、転送先は `connect_tcp` が設定する。失敗は debug のログだけで接続は続ける）。新しく TCP をつなぐ・受け付ける処理を足したら通す。Nagle が両側にあると小さな書き込みが遅延 ACK を待つ（約 40 ms）。確かめるのは tests/dataplane.rs の `small_writes_are_not_delayed_by_nagle`。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
 - 利用者向けの文書は日本語と英語の両方がある（日本語は `README.md`・`docs/*.md`・`docs/architecture/README.md`、英語は `README.en.md`・`docs/en/`）。片方を変えたら、同じ PR でもう片方も直す。文書を足したら英語版も作り、互いの先頭のリンクと `.deb` の assets（英語版は `/usr/share/doc/rproxy-api/en/`）も揃える。

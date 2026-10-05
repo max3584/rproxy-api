@@ -184,16 +184,30 @@ pub fn transparent_v6_available() -> bool {
 	}
 }
 
-/// Connects to `target`, optionally presenting `bind_as` (the client) as the source address.
+/// Turns off Nagle's algorithm on a forwarded connection (#176): a proxy passes
+/// on writes as the sender made them; with Nagle on both hops, small writes wait
+/// for delayed ACKs (~40 ms per round trip). Every TCP socket of the data plane
+/// (accepted from clients and connected to backends) goes through here. A failure
+/// only costs latency, so it is logged and the connection goes on.
+pub fn nodelay(stream: &TcpStream) {
+	if let Err(e) = stream.set_nodelay(true) {
+		tracing::debug!(event = "tcp.nodelay", error = %e);
+	}
+}
+
+/// Connects to `target`, optionally presenting `bind_as` (the client) as the source
+/// address, with TCP_NODELAY set (`nodelay`).
 pub async fn connect_tcp(target: SocketAddr, bind_as: Option<SocketAddr>) -> io::Result<TcpStream> {
-	match bind_as {
-		None => TcpStream::connect(target).await,
+	let stream = match bind_as {
+		None => TcpStream::connect(target).await?,
 		Some(client) => {
 			let src = source_for(target, client)?;
 			let sock = transparent_socket(Domain::for_address(target), Type::STREAM, Protocol::TCP, src)?;
-			TcpSocket::from_std_stream(sock.into()).connect(target).await
+			TcpSocket::from_std_stream(sock.into()).connect(target).await?
 		}
-	}
+	};
+	nodelay(&stream);
+	Ok(stream)
 }
 
 /// Opens the upstream socket of a UDP session, optionally sending as `bind_as` (the client).
@@ -219,6 +233,13 @@ pub async fn udp_upstream(target: SocketAddr, bind_as: Option<SocketAddr>) -> io
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn backend_connections_have_nodelay() {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let stream = connect_tcp(listener.local_addr().unwrap(), None).await.unwrap();
+		assert!(stream.nodelay().unwrap(), "TCP_NODELAY on connections to backends (#176)");
+	}
 
 	#[test]
 	fn transparent_needs_the_clients_family() {

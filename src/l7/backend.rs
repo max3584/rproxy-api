@@ -292,8 +292,7 @@ impl Dialer {
 				Err(e) => last = format!("{addr}: {e}"),
 			}
 		}
-		let tcp = tcp.ok_or(last)?;
-		let _ = tcp.set_nodelay(true);
+		let tcp = tcp.ok_or(last)?; // TCP_NODELAY is set by connect_tcp
 		if !server.https {
 			return Ok(Box::new(tcp));
 		}
