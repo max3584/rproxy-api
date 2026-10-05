@@ -100,7 +100,7 @@ jobs:
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev shellcheck
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck scripts/*.sh scripts/interop/*.sh contrib/rproxy-transparent-routing
+        run: shellcheck scripts/*.sh scripts/interop/*.sh scripts/load/*.sh contrib/rproxy-transparent-routing
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # cargo-deb publishes only a glibc build (a .deb): build it (cached by rust-cache with ~/.cargo/bin)

@@ -1,0 +1,164 @@
+name: Load
+
+# 大きな通信を流し続ける負荷・soak のテスト（scripts/load/、issue #183）。転送の速さ・遅延・
+# CPU 1 コアあたりの転送量・メモリ（接続 1 本・UDP のセッション 1 つ・ルール 1 件あたり）・FD・UDP の取りこぼしを、
+# プロキシなしの直結と（入っていれば）HAProxy を並べて測る。高速化（#184）・メモリの削減（#185）の前後を比べるための基準。
+# Alpine のコンテナ（musl。リリースと同じ libc）で動かす。結果の頭に rproxy の libc とアロケータを書く（比べるときは揃える）。
+# 重く長いので、オーナーが頼んだときに手動（workflow_dispatch）でだけ動かす（定期・PR では動かさない。必須のチェックではない）。
+# 結果（results.json・summary.md）は artifact とジョブのサマリーに残し、前回の成功した手動の実行と比べる。
+# 失敗にするのは確かめごと（転送したデータが 1 バイトでも違う、シナリオが動かない、soak でメモリ・FD が増え続ける）だけで、
+# 遅くなったことは表の差分で見る。
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: 比べる rproxy の git の ref（カンマ区切り。最初が基準。例 master,perf/splice）
+        default: "master"
+      size_mib:
+        description: 大きな転送 1 回の大きさ（MiB）
+        default: "2048"
+      repeat:
+        description: 大きな転送の回数
+        default: "3"
+      duration:
+        description: 速さ・遅延を測る 1 回の秒数
+        default: "10"
+      conns:
+        description: 同時に持つ TCP の接続数
+        default: "5000"
+      soak_secs:
+        description: soak の秒数（0 で省く）
+        default: "600"
+      netem:
+        description: netem のジョブの回線の条件（tc netem の引数）
+        default: "delay 5ms loss 0.1%"
+      scenarios:
+        description: 動かすシナリオ（カンマ区切り。空ならすべて）
+        default: ""
+
+permissions:
+  contents: read
+  # 前回の実行の artifact を読む
+  actions: read
+
+concurrency:
+  group: load-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  load:
+    name: load (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      # network namespaces, veth and tc netem (the host's kernel); /lib/modules to load sch_netem
+      options: --privileged -v /lib/modules:/lib/modules:ro
+    timeout-minutes: 340
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [clean, netem]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      SIZE_MIB: ${{ matrix.variant == 'netem' && '512' || inputs.size_mib || '2048' }}
+      REPEAT: ${{ inputs.repeat || '3' }}
+      REFS: ${{ inputs.refs || 'master' }}
+      DURATION: ${{ inputs.duration || '10' }}
+      CONNS: ${{ inputs.conns || '5000' }}
+      UDP_SESSIONS: ${{ inputs.conns || '5000' }}
+      SOAK_SECS: ${{ matrix.variant == 'clean' && (inputs.soak_secs || '600') || '0' }}
+      NETEM: ${{ matrix.variant == 'netem' && (inputs.netem || 'delay 5ms loss 0.1%') || '' }}
+      SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
+    steps:
+      # bash, unshare / nsenter (util-linux-misc), ip / tc (iproute2), python3, gh (github-cli) for the previous results;
+      # iperf3, h2load (nghttp2), socat, openssl, HAProxy for the scenarios
+      - name: packages
+        # no bash yet
+        shell: sh
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 github-cli iproute2 iproute2-tc util-linux-misc kmod \
+            iperf3 nghttp2 socat openssl haproxy
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+        with:
+          # the refs to compare are built from this clone
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: netem (sch_netem)
+        if: matrix.variant == 'netem'
+        run: modprobe sch_netem
+      # each ref is built from its own worktree into the shared target dir (the dependencies are built once)
+      # and its binary copied out; the scripts of this checkout drive them all
+      - name: build rproxy for each ref (${{ env.REFS }})
+        run: |
+          bins="" commits=""
+          IFS=',' read -ra refs <<< "$REFS"
+          for ref in "${refs[@]}"; do
+            ref=$(echo "$ref" | xargs)
+            [ -n "$ref" ] || continue
+            sha=$(git rev-parse --verify -q "origin/$ref^{commit}" || git rev-parse --verify "$ref^{commit}")
+            name=${ref//\//_}
+            dir="$RUNNER_TEMP/src/$name"
+            git worktree add --detach "$dir" "$sha"
+            echo "::group::$ref ($sha)"
+            (cd "$dir" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --release -p rproxy-api \
+              && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release)
+            echo "::endgroup::"
+            mkdir -p bins
+            cp target/release/rproxy-api "bins/$name"
+            bins+="${bins:+,}$ref=$PWD/bins/$name"
+            commits+="${commits:+,}$ref=$sha"
+          done
+          echo "BINS=$bins" >> "$GITHUB_ENV"
+          echo "REF_COMMITS=$commits" >> "$GITHUB_ENV"
+      - name: build scripts/load/loadgen
+        run: cargo build --locked --release --manifest-path scripts/load/loadgen/Cargo.toml --target-dir target/loadgen
+      - name: results of the last successful run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the last earlier manual run whose job for this variant succeeded (master first, then any branch)
+          prev=""
+          for branch in master ""; do
+            ids=$(gh run list -R "$GITHUB_REPOSITORY" --workflow load.yml --event workflow_dispatch ${branch:+--branch "$branch"} \
+              -L 30 --json databaseId,status --jq ".[] | select(.status == \"completed\" and .databaseId != $GITHUB_RUN_ID) | .databaseId")
+            for id in $ids; do
+              ok=$(gh run view "$id" -R "$GITHUB_REPOSITORY" --json jobs --jq "[.jobs[] | select(.name == \"load ($VARIANT)\" and .conclusion == \"success\")] | length")
+              if [ "$ok" = 1 ] && gh run download "$id" -R "$GITHUB_REPOSITORY" -n "load-$VARIANT" -D previous; then
+                prev=$id
+                break 2
+              fi
+            done
+          done
+          if [ -n "$prev" ]; then
+            echo "comparing with run $prev"
+            echo "PREVIOUS=$PWD/previous/results.json" >> "$GITHUB_ENV"
+          else
+            echo "no earlier results to compare with"
+          fi
+      - name: scripts/load/run.sh
+        # root in the container: the limits (open files, socket buffers) can be raised
+        run: OUT="$PWD/load-results" scripts/load/run.sh
+      - name: summary
+        if: always()
+        run: |
+          if [ -f load-results/summary.md ]; then
+            { echo "<details open><summary>load ($VARIANT)</summary>"; echo; cat load-results/summary.md; echo; echo "</details>"; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no results (the run stopped early; see the log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-${{ matrix.variant }}
+          path: load-results/
+          retention-days: 90
+          if-no-files-found: warn

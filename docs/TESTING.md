@@ -9,6 +9,7 @@ English: [TESTING.md](en/TESTING.md)
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
+| `scripts/load/run.sh` | 大きな通信を流し続ける負荷・soak のテスト（転送効率。下の「負荷・soak のテスト」） | Load ワークフロー（手動だけ） |
 
 ## CI の実行環境
 
@@ -18,6 +19,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 |---|---|
 | CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.24` |
 | CI の `transparent` | `alpine:3.24`（特権つき。名前空間・veth・nft / iptables） |
+| Load | `alpine:3.24`（特権つき。名前空間・veth・tc netem。`sch_netem` はホストの `/lib/modules` から読む） |
 | Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
 | Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
 | Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
@@ -209,7 +211,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 - 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ
 
-- 長時間の負荷（数時間の連続転送、メモリの増え方）
+- 数時間を超える連続転送（Load ワークフローの soak は手動で `soak_secs` を長くすれば回せる）
 - TLS を有効にした制御 API（手動では確認済み、自動テストはない）
 - SIGHUP によるトークン・証明書の再読込（手動では確認済み）
 - iptables（`-m socket`）を使う transparent のルーティング手順
@@ -239,6 +241,99 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 `.github/workflows/soak.yml` は必要なときだけ手動で動かす（定期の実行も PR での実行もしない）。Actions の画面か `gh workflow run soak.yml -f duration=<秒>` で時間（既定 3600 秒）を指定し、CSV は artifact に残る。手元では `cargo build --release && ulimit -n 65536 && scripts/soak.py --duration 600`。
 
+
+## 負荷・soak のテスト（Load ワークフロー、#183）
+
+大きな通信を何度も・長く流したときの転送効率（速さ、遅延、CPU 1 コアあたりの転送量、メモリ、FD、UDP の取りこぼし）を測る。カーネルでの高速化（#184）とメモリの削減（#185）の前後を比べるための基準の数字で、上の criterion のベンチマークより重く長い。数字はマシンで変わるので、同じマシン（ランナー）の前回と比べて見る。
+
+`scripts/load/run.sh` がネットワーク名前空間を 3 つ作り、真ん中で `scripts/load/load.py` を動かす。
+
+```
+client 10.71.1.2 ── 10.71.1.1 [rproxy / HAProxy / ルータ] 10.71.2.1 ── 10.71.2.2 backend
+```
+
+- **direct**（基準）：プロキシなし。真ん中の名前空間のカーネルが転送するので、同じ veth と netem を通る
+- **rproxy**：release ビルド。ログは `LOG_LEVEL`（既定 `warn`。接続ごとのログの重さを測りたいときは `info`）
+- **haproxy**：入っていれば同じ条件で並べる（参考。UDP は対象外）
+- `NETEM="delay 5ms loss 0.1%"` で、クライアント側の回線の両方向に tc netem をかける
+- 送受信は `scripts/load/loadgen/`（std だけの小さなクレート。自分の `Cargo.toml`・`Cargo.lock`・workspace で、直下の build・test・deny には入らない）。大きな転送は擬似乱数のデータで、受け手が 1 バイトずつ送られるはずの中身と比べる（チェックサムより厳しい。抜け・重複・並べ替え・ずれがあれば失敗）
+
+| シナリオ | 測るもの | 道具 |
+|---|---|---|
+| `tcp` | TCP の速さ（上り 1 本・8 本、下り 1 本） | iperf3 |
+| `verify` | `SIZE_MIB` の転送を `REPEAT` 回、1 本と 4 本で。全バイトを転送先で確かめる | loadgen `send` / `sink` |
+| `tls` | TLS 終端（`tls.mode: terminate`）への上り（全バイト確認）と、再開なしの新しいハンドシェイクの数 | socat、`openssl s_time` |
+| `http` | L7 の小さなリクエスト（HTTP/1.1・h2c・TLS 上の HTTP/2。req/s、p50 / p99）と大きなダウンロード（全バイト確認） | h2load、curl |
+| `udp` | 1400 バイトを `UDP_BW` で（取りこぼし・ジッタ）、64 バイトを最大の速さと `UDP_PPS` で 16 の送信元から（届いた pps、取りこぼし、rproxy の `stats.dropped`、カーネルの受信バッファあふれ） | iperf3、loadgen `udp-flood` / `udp-sink` |
+| `latency` | 64 バイトの往復を 1 本と 64 本で（p50 / p99） | loadgen `rtt` |
+| `churn` | 接続 → 1 KiB の往復 → 切断を 32 並列で（1 秒あたりの接続数） | loadgen `churn` |
+| `memory` | 新しく起動したプロセスで：起動直後、ルール `RULES` 件（既定 100・1000）、待機中の接続 `CONNS` 本、転送中（4 KiB の往復）の接続、UDP のセッション `UDP_SESSIONS` 個。1 件・1 本・1 つあたりの RSS と FD | loadgen `hold` / `udp-hold` |
+| `soak` | `SOAK_SECS` 秒、iperf3（`SOAK_BW`）・接続の開け閉め・送信元を変え続ける UDP を同時に。RSS・FD・CPU を記録（`soak.csv`） | |
+
+表の値：
+
+- **GiB / proxy CPU-s**：プロキシのプロセス（全スレッドのユーザー + システム時間）の CPU 1 秒あたりに運んだ量。**proxy cores** は使ったコアの数
+- **GiB / system CPU-s**：マシン全体（クライアント・転送先・カーネルの転送・プロキシ）の CPU 1 秒あたり。direct と比べられる
+- **vs direct**：同じ条件の direct に対する速さ（Gbit/s・req/s・pps・conns/s）の割合
+- **peak RSS**：その間のプロキシの RSS の最大（L7 のリクエスト中のメモリもここに出る）
+
+失敗（終了コード 1）にするのは確かめごとだけ：転送したデータが 1 バイトでも違う、シナリオが動かない、接続・セッションが張れない、接続を閉じた後に FD が戻らない、soak で FD が元（+20）に戻らない・RSS の後半 1/4 の平均が前半 1/4（最初の 1 割を除く）の 1.5 倍を超える・接続の失敗が 0.1 % を超える。遅くなったことは前回との差分（表の `(+x%)`。悪い向きに 10 % を超えると太字）で見る。
+
+設定（環境変数）：
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `SCENARIOS` | すべて | 動かすシナリオ（カンマ区切り） |
+| `SIZE_MIB` / `REPEAT` | 1024 / 3 | 大きな転送 1 回の大きさと回数 |
+| `DURATION` | 10 | 速さ・遅延を測る 1 回の秒数 |
+| `CONNS` / `UDP_SESSIONS` / `RULES` | 2000 / 1000 / 100,1000 | `memory` の接続数・セッション数・ルール数 |
+| `UDP_BW` / `UDP_PPS` | 1G / 50000 | `udp` の iperf3 の帯域と、64 バイトの決まった速さ |
+| `H2_REQS` / `H2_CONNS` | 200000 / 64 | h2load のリクエスト数と接続数（HTTP/2 は接続あたり 10 本同時） |
+| `SOAK_SECS` / `SOAK_BW` | 0（省く）/ 1G | soak の秒数と iperf3 の帯域 |
+| `NETEM` | なし | tc netem の引数（例 `delay 5ms loss 0.1%`） |
+| `HAPROXY` | auto | `0` で HAProxy を並べない |
+| `BINS` | なし（`BIN`、既定 `target/release/rproxy-api`） | 並べて比べる rproxy のビルド（`ラベル=パス,ラベル=パス`。最初が基準） |
+| `OUT` / `PREVIOUS` | `load-results` / なし | 結果の置き場所、比べる前回の `results.json` |
+
+### 手元・VM で動かす
+
+```bash
+sudo apt-get install iperf3 nghttp2-client socat haproxy   # ないものは飛ばす（HAProxy は任意）
+cargo build --release
+cargo build --release --locked --manifest-path scripts/load/loadgen/Cargo.toml --target-dir target/loadgen
+SIZE_MIB=256 REPEAT=1 DURATION=5 SOAK_SECS=60 scripts/load/run.sh      # root なし（ユーザー名前空間）
+sudo -E env "PATH=$PATH" SOAK_SECS=3600 scripts/load/run.sh            # 開けるファイルの数・ソケットのバッファを上げられる
+scripts/load/report.py load-results/results.json old/results.json      # 2 回の結果を比べる
+```
+
+root なしで動かすにはユーザー名前空間が要る（Ubuntu 24.04 以降は `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`）。netem には `sch_netem` のモジュールが要る（Ubuntu では `linux-modules-extra-$(uname -r)`）。結果は `load-results/` の `results.json`（すべての値）と `summary.md`（表）。
+
+### CI
+
+`.github/workflows/load.yml` は手動（Actions の画面か `gh workflow run load.yml`。大きさ・回数・秒数・接続数・soak の秒数・netem の条件・シナリオを指定できる）でだけ動かす。重く長いので定期や PR では動かさない（オーナーが頼んだときに回す）。必須のチェックでもない。
+
+- `load (clean)`：netem なしで全シナリオ（既定 2 GiB × 3、接続 5000、soak 10 分）
+- `load (netem)`：`delay 5ms loss 0.1%` で `tcp`・`verify`・`tls`・`http`・`udp`・`latency`（512 MiB）
+
+ジョブは Alpine のコンテナ（musl。リリースのバイナリと同じ libc）で、rproxy も musl でビルドする。musl の malloc は glibc のより遅いので、結果の頭に各ビルドの libc とアロケータ（バイナリから読む）を書く。比べるのは libc とアロケータが同じもの同士にする（違えば「Builds compared」に注意を出す）。
+
+結果は artifact（`load-clean` / `load-netem`、90 日）とジョブのサマリーに残す。前回の成功した手動の実行（master を先に、なければほかのブランチ）の artifact を取ってきて、差分を表に出す。ランナーは 4 コアの共有の VM なので、1 回だけの差は気にせず、続けて出る変化を見る。
+
+### 高速化の案を比べる（`perf/<topic>` のブランチ）
+
+高速化・メモリの削減の案は、案ごとに `perf/<topic>` のブランチ（例 `perf/splice`・`perf/ktls`・`perf/mimalloc`）にして、Load ワークフローで master と比べる。案が増えればブランチも増える。
+
+```bash
+gh workflow run load.yml -f refs=master,perf/splice,perf/sockmap
+gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -f soak_secs=1800
+```
+
+- `refs`（カンマ区切り。既定 `master`）の各 ref をそれぞれビルドし、同じランナーで同じシナリオを動かす。ランナーの揺れがどれにも同じように効くように、シナリオ（とその中の繰り返し）ごとに ref を順に回す（A, B, C, A, B, C, …）。rproxy はビルドごとに別のアドレス（10.71.1.11〜）で同時に起動しておき、測るものだけに流す（`memory`・`soak` はビルドごとに新しく起動する）
+- `summary.md` の先頭に「Builds compared」：シナリオごとに ref ごとの列を並べ、最初の ref（基準）に対する差分を出す。JSON は全体の `results.json` と ref ごとの `results-<ref>.json`（`/` は `_`）
+- ref が増えるほど時間がかかる（soak はビルドごと）。必要なシナリオだけを `scenarios` で選ぶ
+- ワークフローの手動実行は、既定のブランチ（master）にあるワークフローだけが Actions の画面・`gh workflow run` に出る。スクリプト（`scripts/load/`）は実行したブランチ（`--ref`。既定は master）のものを使う
+
+`scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした soak（手動）で、そのまま残している。
 
 ## ファジング（Fuzz ワークフロー）
 
