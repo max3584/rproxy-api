@@ -7,6 +7,7 @@ English: [TESTING.md](en/TESTING.md)
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（MariaDB のサービスコンテナを使う） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
+| `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
@@ -162,6 +163,24 @@ English: [TESTING.md](en/TESTING.md)
 | TCP / `transparent` | 転送先にはクライアントの IP とポートが見える |
 | UDP / `proxy` | 転送先には rproxy の IP が見える |
 | UDP / `transparent` | 転送先にはクライアントの IP とポートが見える |
+
+## 性能の回帰（Benchmarks ワークフロー、#163）
+
+`benches/` の criterion のベンチマーク。遅くなる変更に気付くためのもので、数字そのものに意味はない（同じマシンで比べたときだけ意味がある）。
+
+| ベンチマーク | 測るもの |
+|---|---|
+| `benches/parse.rs` の `matcher/*` | L7 の `match` の評価（7 本のルートを順に見て最後に一致するリクエスト 1 件）と、7 本の式の解析（正規表現を含む） |
+| `clienthello/*` | rustls が作る ClientHello（約 250 バイトと 3 KiB）からサーバ名を読む（`sni::parse_client_hello`） |
+| `quic_initial/v1` / `v2` | RFC 9001 / 9369 の Initial（`tests/fixtures/quic`）から鍵を計算し、ヘッダの保護と AEAD を外してサーバ名を読む（`udp_sni::Sniffer`） |
+| `benches/dataplane.rs` の `l4_tcp/*` | TCP の転送の 1 MiB の往復（スループット）と、新しい接続（接続 → 1 バイトの往復 → 切断） |
+| `l4_udp/*` | UDP の 1 KiB の往復と、新しいセッション（毎回新しい送信元ポート） |
+| `tls_terminate/*` | TLS の終端の新しい接続（再開なしの完全なハンドシェイク）と、終端した接続での 1 MiB の往復 |
+| `l7_http1/request` / `l7_http2/*` | `http` のルール（ルート 4 本、`headers`・`strip_prefix` のミドルウェア）への HTTP/1.1 の keep-alive のリクエスト、HTTP/2（h2c）の 1 件ずつと 32 件同時 |
+
+`dataplane` は `tests/` と同じハーネス（`tests/common`）で、制御 API からルールを作り、loopback で本物のクライアントと転送先をつなぐ。手元では `cargo bench --bench '*'`（全体で 1〜2 分）、一部だけなら `cargo bench --bench dataplane -- l7_http2`。変更の前後を比べるには、前で `-- --save-baseline before`、後で `-- --baseline before`。
+
+`.github/workflows/bench.yml` が `src/`・`benches/`・`tests/common/`・`Cargo.*` を変えた PR で動く。ランナーは速さが揺れるので、同じジョブでマージベース（`--save-baseline base`）と PR（`--baseline-lenient base`）を続けて測り、`scripts/bench-summary.py` が表にしてジョブのサマリーと PR のコメント（1 件を更新する）に出す。平均が 15 % より遅くなり、95 % の信頼区間がすべて遅い側にあるものを警告にする（失敗にはしない。必須のチェックでもない）。警告が出たら、まずジョブを再実行して同じ結果になるか確かめる。
 
 ## まだテストしていないこと
 
