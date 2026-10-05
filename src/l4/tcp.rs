@@ -314,7 +314,7 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 ) -> io::Result<()> {
 	let mut client = Counted::new(a, &rt.stats.rx_bytes);
 	let mut backend = Counted::new(b, &rt.stats.tx_bytes);
-	let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+	let result = super::relay::bidirectional(&mut client, &mut backend).await;
 	detail.rx += client.count;
 	detail.tx += backend.count;
 	if result.is_err() {

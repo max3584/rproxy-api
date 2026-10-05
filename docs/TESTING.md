@@ -168,6 +168,14 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 | `a_response_cut_off_by_the_backend_never_looks_complete` | 転送先が応答の途中で切れると、HTTP/1.1・HTTP/2・HTTP/3 のクライアントには誤り（途中で終わった）として見える（`Content-Length`・chunked・`compress` を通したもの） |
 | `a_request_cut_off_by_the_client_never_reaches_the_backend_as_complete` | クライアントが本文の途中で切れる（HTTP/1.1 の `Content-Length` と chunked の切断、HTTP/2 の RST_STREAM、HTTP/3 のリセット）と、転送先には完全なリクエストとして届かない |
 
+## 結合テスト：TCP のリレー（`tests/relay.rs`、#185）
+
+`l4::relay` は向きごとのバッファを、送るデータがあるあいだだけスレッドごとのプールから借りる。貸しているバッファの数（`l4::relay::buffers_in_use`）はプロセス全体の値なので、テストは 1 つの関数にまとめている。
+
+| テスト | 確かめること |
+|---|---|
+| `relay_buffers_and_half_closes` | データが通り終わった接続（平文 50 本、TLS の終端 20 本）はバッファを持たない（そのあとも使える）。転送先が読まず詰まっている接続はバッファを持ち、終わったら返す。転送先が先に FIN を送っても（平文・TLS の終端）、クライアントが先に終えても（TLS の終端）、半分閉じとして伝わり、残りの向きのデータが全部届く |
+
 ## DB からの復元（`tests/db_restore.rs`）
 
 | テスト | 確かめること |
@@ -203,7 +211,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 `.github/workflows/bench.yml` が `src/`・`benches/`・`tests/common/`・`Cargo.*` を変えた PR で動く。ランナーは速さが揺れるので、同じジョブでマージベース（`--save-baseline base`）と PR（`--baseline-lenient base`）を続けて測り、`scripts/bench-summary.py` が表にしてジョブのサマリーと PR のコメント（1 件を更新する）に出す。平均が 15 % より遅くなり、95 % の信頼区間がすべて遅い側にあるものを警告にする（失敗にはしない。必須のチェックでもない）。警告が出たら、まずジョブを再実行して同じ結果になるか確かめる。
 
-`dataplane` の 1 回の繰り返しが 30 秒進まないとき（`STALL`）は、ベンチマークが止まったものとして panic し、何をしていたか（書いた・読み戻したバイト数、TLS のクライアントが送っていないレコードを持っているか）とルールの統計を出す（#187）。ワークフローの各ステップにもタイムアウト（20 分）がある。TLS のストリームは `write_all` のあとに `flush` しないと、ソケットが詰まっていたときの最後のレコードが rustls に残る（#187 の止まった原因。クライアント側の問題で、rproxy は `copy_bidirectional` が読めないときに flush する）。
+`dataplane` の 1 回の繰り返しが 30 秒進まないとき（`STALL`）は、ベンチマークが止まったものとして panic し、何をしていたか（書いた・読み戻したバイト数、TLS のクライアントが送っていないレコードを持っているか）とルールの統計を出す（#187）。ワークフローの各ステップにもタイムアウト（20 分）がある。TLS のストリームは `write_all` のあとに `flush` しないと、ソケットが詰まっていたときの最後のレコードが rustls に残る（#187 の止まった原因。クライアント側の問題で、rproxy のリレー（`l4::relay`）は読むものがないときに flush する）。
 
 切り分け用に `examples/stall_probe.rs` がある（`bench.yml` の `stall-probe` ジョブ）。同じ 1 MiB の往復を 1 回 3 秒のタイムアウトで何百回も繰り返し、L4 の TCP・TLS の終端・rproxy を通さない TLS、クライアントの flush の有無、送信バッファ（既定・4 KiB）、rproxy を同じプロセスで動かすか別のプロセス（`--rproxy target/release/rproxy-api`）にするか、を並べて止まった回数と時間を表にする。#187 では、止まるのは flush しない TLS のクライアントだけで、rproxy を通さなくても、別のプロセスにしても同じように止まり、そのときクライアントの rustls は送っていないレコードを持っていた（`wants_write = true`）。flush するクライアントが止まったらジョブは失敗する。手元では `cargo run --release --example stall_probe -- --iters 300`。
 
