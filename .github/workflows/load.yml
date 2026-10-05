@@ -41,8 +41,11 @@ permissions:
   # 前回の実行の artifact を読む
   actions: read
 
+# 同時実行のグループは実行ごとに別にする。github.ref だけだと、同じブランチ（master）から
+# refs を変えて起動した実行どうしが 1 つのグループになり、順番待ちのものが後から来たものに
+# 置き換えられて取り消される（GitHub はグループごとに待ちを 1 つしか持たない）
 concurrency:
-  group: load-${{ github.ref }}
+  group: load-${{ github.run_id }}
   cancel-in-progress: false
 
 env:
