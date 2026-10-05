@@ -2,6 +2,8 @@ name: Interop
 
 # 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX、CrowdSec）を rproxy と組み合わせて通す（scripts/interop/）。
 # 時間がかかるので必須のチェックにはしない。データプレーンや試験を変えた PR、毎週、手動で動かす。
+# どれも Alpine のコンテナで動かす（#191）。rproxy は build ジョブで 1 回だけビルドし（musl の静的リンク）、
+# 各ジョブはそのバイナリを使う。CrowdSec は Alpine のパッケージがないので、CrowdSec の公式のイメージ（Alpine）を使う。
 on:
   pull_request:
     paths:
@@ -20,33 +22,76 @@ concurrency:
   group: interop-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  mail:
-    name: mail (Postfix / Dovecot behind STARTTLS)
+  build:
+    name: build rproxy-api
     runs-on: ubuntu-latest
+    container: alpine:3.22
     steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rproxy-api
+          path: target/debug/rproxy-api
+          if-no-files-found: error
+          retention-days: 1
+
+  mail:
+    name: mail (Postfix / Dovecot behind STARTTLS)
+    needs: build
+    runs-on: ubuntu-latest
+    container: alpine:3.22
+    steps:
+      - name: packages
+        run: apk add --no-cache bash coreutils curl python3 openssl postfix dovecot dovecot-pop3d
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rproxy-api
+          path: target/debug
+      - run: chmod +x target/debug/rproxy-api
       - run: scripts/interop/mail.sh
 
   media:
     name: media (coturn, MediaMTX, 10000-port range)
+    needs: build
     runs-on: ubuntu-latest
+    container: alpine:3.22
     steps:
+      - name: packages
+        run: apk add --no-cache bash coreutils curl tar openssl iproute2 coturn ffmpeg
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: rproxy-api
+          path: target/debug
+      - run: chmod +x target/debug/rproxy-api
       - run: scripts/interop/media.sh
 
   crowdsec:
     name: crowdsec (LAPI, AppSec, detection from rproxy logs, global IPs)
+    needs: build
     runs-on: ubuntu-latest
+    container:
+      # CrowdSec's own image (Alpine; crowdsec and cscli in /usr/local/bin, the configuration in /staging)
+      image: crowdsecurity/crowdsec:v1.8.1-slim
+      # the clients live in a network namespace (ip netns)
+      options: --privileged
     steps:
+      - name: packages
+        run: apk add --no-cache bash coreutils curl python3 iproute2
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: rproxy-api
+          path: target/debug
+      - run: chmod +x target/debug/rproxy-api
       - run: scripts/interop/crowdsec.sh

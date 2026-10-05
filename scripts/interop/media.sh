@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # 実際の coturn（TURN）と MediaMTX（RTSP）を rproxy の後ろに置いて通し、10000 ポートの範囲ルールの
-# 起動時間・メモリ・ファイル数を測る（issue #16）。GitHub の Ubuntu ランナー用（sudo でパッケージを入れる）。
+# 起動時間・メモリ・ファイル数を測る（issue #16）。CI の Alpine のコンテナ用（root で動かす。パッケージは
+# ワークフローが apk で入れる：bash coreutils curl tar openssl iproute2 coturn ffmpeg。MediaMTX はここで落とす）。
 #
 #   cargo build && scripts/interop/media.sh
 #
 # ポートは root のいらない番号にしている（23478 = TURN 3478、25349 = TURNS / DTLS 5349、28554 = RTSP 554、
-# 28322 = RTSPS 322）。rproxy-api を本番で動かしている機械では実行しない。
+# 28322 = RTSPS 322）。使い捨てのコンテナの外（rproxy-api を本番で動かしている機械）では実行しない。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -19,16 +20,15 @@ fail() { echo "FAIL: $*" >&2; tail -n 30 "$WORK"/*.log >&2 || true; ss -ltnup >&
 cleanup() { kill "${PIDS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== packages"
-# the runner image's package lists can be stale (404 on the mirror)
-sudo apt-get update -q >/dev/null
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q coturn ffmpeg openssl >/dev/null
-sudo systemctl stop coturn 2>/dev/null || true
+[ "$(id -u)" = 0 ] || { echo "run as root (in a throwaway container)" >&2; exit 1; }
+
+echo "== MediaMTX"
+# a static Go binary: runs on musl as well
 curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/$MEDIAMTX_VERSION/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" \
 	| tar -xz -C "$WORK" mediamtx mediamtx.yml
 
 echo "== test CA and the media.test certificate"
-grep -q ' media.test$' /etc/hosts || echo '127.0.0.1 media.test' | sudo tee -a /etc/hosts >/dev/null
+grep -q ' media.test$' /etc/hosts || echo '127.0.0.1 media.test' >> /etc/hosts
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=interop-ca \
 	-keyout "$WORK/ca.key" -out "$WORK/ca.pem" 2>/dev/null
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=media.test \
@@ -130,7 +130,7 @@ echo "== a 10000-port range rule"
 # stop the servers above so none of their ports (MediaMTX also listens on 8892, ...) is inside the range
 kill "${PIDS[@]:1}" 2>/dev/null || true
 sleep 1
-fds() { sudo ls "/proc/$RP/fd" | wc -l; }
+fds() { find "/proc/$RP/fd" -mindepth 1 -maxdepth 1 | wc -l; }
 rss() { awk '/VmRSS/ {print $2}' "/proc/$RP/status"; }
 before_fds=$(fds)
 before_rss=$(rss)
@@ -141,7 +141,7 @@ ms=$(( ($(date +%s%N) - start) / 1000000 ))
 during_fds=$(fds)
 during_rss=$(rss)
 # count the rule's own sockets: the fd total also moves when other connections close meanwhile
-range_socks=$(sudo ss -Hunlp 'sport >= :2000 and sport <= :11999' | grep -c 'rproxy-api' || true)
+range_socks=$(ss -Hunlp 'sport >= :2000 and sport <= :11999' | grep -c 'rproxy-api' || true)
 curl -s -o /dev/null -X DELETE "$API/rules/udp/127.0.0.1/2000"
 sleep 1
 after_fds=$(fds)

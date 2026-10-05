@@ -26,8 +26,13 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    container: alpine:3.22
     steps:
+      - name: packages
+        run: apk add --no-cache bash git curl tar
       - uses: actions/checkout@v4
+      # cargo deny reads the dependency graph through cargo metadata
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny

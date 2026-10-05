@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # 実際の Postfix / Dovecot を rproxy の STARTTLS の終端（PROXY v2 つき）の後ろに置き、
-# 送信・受信が通ることを確かめる（issue #15）。GitHub の Ubuntu ランナー用（sudo を使い、パッケージを入れる）。
+# 送信・受信が通ることを確かめる（issue #15）。CI の Alpine のコンテナ用（root で動かす。パッケージは
+# ワークフローが apk で入れる：bash coreutils curl python3 openssl postfix dovecot dovecot-pop3d）。
+# systemd はないので、Postfix と Dovecot はこのスクリプトが起動する。
 #
 #   cargo build && scripts/interop/mail.sh
 #
 #   client ──TLS──▶ rproxy ──平文 + PROXY v2──▶ Postfix（10587 / 10025）/ Dovecot（10143 / 10110）
 #
 # ポートは root のいらない番号にしている（1587 = Submission、1025 = SMTP、1143 = IMAP、1993 = IMAPS、1110 = POP3）。
-# rproxy-api を本番で動かしている機械では実行しない。
+# 使い捨てのコンテナの外（rproxy-api や Postfix・Dovecot を動かしている機械）では実行しない。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -16,49 +18,59 @@ WORK=$(mktemp -d)
 API=http://127.0.0.1:18300
 PASS=mailtest-password
 
-fail() { echo "FAIL: $*" >&2; sudo tail -n 40 /var/log/mail.log 2>/dev/null >&2 || sudo journalctl -u postfix -u dovecot --no-pager -n 40 >&2; cat "$WORK/rproxy.log" >&2; exit 1; }
+fail() { echo "FAIL: $*" >&2; tail -n 40 /var/log/mail.log /var/log/dovecot.log >&2 || true; cat "$WORK/rproxy.log" >&2 || true; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "run as root (in a throwaway container)" >&2; exit 1; }
 
-echo "== packages"
-echo "postfix postfix/main_mailer_type select Local only" | sudo debconf-set-selections
-echo "postfix postfix/mailname string mail.test" | sudo debconf-set-selections
-# the runner image's package lists can be stale (404 on the mirror)
-sudo apt-get update -q >/dev/null
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q postfix dovecot-imapd dovecot-pop3d openssl >/dev/null
-grep -q ' mail.test$' /etc/hosts || echo '127.0.0.1 mail.test' | sudo tee -a /etc/hosts >/dev/null
-id mailtest >/dev/null 2>&1 || sudo useradd -m mailtest
-echo "mailtest:$PASS" | sudo chpasswd
+grep -q ' mail.test$' /etc/hosts || echo '127.0.0.1 mail.test' >> /etc/hosts
+id mailtest >/dev/null 2>&1 || adduser -D mailtest
 
 echo "== postfix: plain listeners that expect PROXY v2 from rproxy"
-sudo postconf -e myhostname=mail.test mydestination='mail.test, localhost' home_mailbox=Maildir/ \
-	inet_interfaces=loopback-only inet_protocols=ipv4
+postconf -e myhostname=mail.test mydestination='mail.test, localhost' home_mailbox=Maildir/ \
+	inet_interfaces=loopback-only inet_protocols=ipv4 maillog_file=/var/log/mail.log
 for port in 10587 10025; do
-	sudo postconf -M "127.0.0.1:$port/inet=127.0.0.1:$port inet n - n - - smtpd"
-	sudo postconf -P "127.0.0.1:$port/inet/smtpd_upstream_proxy_protocol=haproxy" \
+	postconf -M "127.0.0.1:$port/inet=127.0.0.1:$port inet n - n - - smtpd"
+	postconf -P "127.0.0.1:$port/inet/smtpd_upstream_proxy_protocol=haproxy" \
 		"127.0.0.1:$port/inet/smtpd_tls_security_level=none"
 done
-sudo systemctl restart postfix
+newaliases
+postfix start
 
 echo "== dovecot: plain listeners that expect PROXY v2 from rproxy (TLS is terminated at rproxy)"
-sudo tee /etc/dovecot/conf.d/99-rproxy-interop.conf >/dev/null <<'EOF'
-mail_location = maildir:~/Maildir
-haproxy_trusted_networks = 127.0.0.1
+# the whole configuration (Dovecot 2.4), not the distribution's: the user from a file, Maildir in the home
+echo "mailtest:{PLAIN}$PASS:$(id -u mailtest):$(id -g mailtest)::/home/mailtest" > /etc/dovecot/users
+cat > /etc/dovecot/dovecot.conf <<'CONF'
+dovecot_config_version = 2.4.0
+dovecot_storage_version = 2.4.0
+protocols = imap pop3
+listen = 127.0.0.1
+log_path = /var/log/dovecot.log
+mail_driver = maildir
+mail_path = %{home}/Maildir
 ssl = no
+auth_allow_cleartext = yes
+haproxy_trusted_networks = 127.0.0.1
+passdb passwd-file {
+  passwd_file_path = /etc/dovecot/users
+}
+userdb passwd-file {
+  passwd_file_path = /etc/dovecot/users
+}
 service imap-login {
   inet_listener imap-rproxy {
-    address = 127.0.0.1
+    listen = 127.0.0.1
     port = 10143
     haproxy = yes
   }
 }
 service pop3-login {
   inet_listener pop3-rproxy {
-    address = 127.0.0.1
+    listen = 127.0.0.1
     port = 10110
     haproxy = yes
   }
 }
-EOF
-sudo systemctl restart dovecot
+CONF
+dovecot || { doveconf -n >&2 || true; fail "dovecot did not start"; }
 
 echo "== test CA and the mail.test certificate"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=interop-ca \
@@ -182,5 +194,5 @@ print(f"pop3 (STLS): {count} messages")
 EOF
 
 echo "== the backend saw the client address from PROXY v2"
-sudo grep -q 'connect from .*\[127.0.0.1\]' /var/log/mail.log 2>/dev/null || sudo journalctl -u postfix --no-pager | grep -q 'connect from' || fail "no connection in the Postfix log"
+grep -q 'connect from .*\[127.0.0.1\]' /var/log/mail.log || fail "no connection in the Postfix log"
 echo "OK"
