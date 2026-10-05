@@ -269,6 +269,7 @@ client 10.71.1.2 ── 10.71.1.1 [rproxy / HAProxy / ルータ] 10.71.2.1 ─�
 | `SOAK_SECS` / `SOAK_BW` | 0（省く）/ 1G | soak の秒数と iperf3 の帯域 |
 | `NETEM` | なし | tc netem の引数（例 `delay 5ms loss 0.1%`） |
 | `HAPROXY` | auto | `0` で HAProxy を並べない |
+| `BINS` | なし（`BIN`、既定 `target/release/rproxy-api`） | 並べて比べる rproxy のビルド（`ラベル=パス,ラベル=パス`。最初が基準） |
 | `OUT` / `PREVIOUS` | `load-results` / なし | 結果の置き場所、比べる前回の `results.json` |
 
 ### 手元・VM で動かす
@@ -292,6 +293,20 @@ root なしで動かすにはユーザー名前空間が要る（Ubuntu 24.04 �
 - `load (netem)`：`delay 5ms loss 0.1%` で `tcp`・`verify`・`tls`・`http`・`udp`・`latency`（512 MiB）
 
 結果は artifact（`load-clean` / `load-netem`、90 日）とジョブのサマリーに残す。前回の成功した手動の実行（master を先に、なければほかのブランチ）の artifact を取ってきて、差分を表に出す。ランナーは 4 コアの共有の VM なので、1 回だけの差は気にせず、続けて出る変化を見る。
+
+### 高速化の案を比べる（`perf/<topic>` のブランチ）
+
+高速化・メモリの削減の案は、案ごとに `perf/<topic>` のブランチ（例 `perf/splice`・`perf/ktls`・`perf/mimalloc`）にして、Load ワークフローで master と比べる。案が増えればブランチも増える。
+
+```bash
+gh workflow run load.yml -f refs=master,perf/splice,perf/sockmap
+gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -f soak_secs=1800
+```
+
+- `refs`（カンマ区切り。既定 `master`）の各 ref をそれぞれビルドし、同じランナーで同じシナリオを動かす。ランナーの揺れがどれにも同じように効くように、シナリオ（とその中の繰り返し）ごとに ref を順に回す（A, B, C, A, B, C, …）。rproxy はビルドごとに別のアドレス（10.71.1.11〜）で同時に起動しておき、測るものだけに流す（`memory`・`soak` はビルドごとに新しく起動する）
+- `summary.md` の先頭に「Builds compared」：シナリオごとに ref ごとの列を並べ、最初の ref（基準）に対する差分を出す。JSON は全体の `results.json` と ref ごとの `results-<ref>.json`（`/` は `_`）
+- ref が増えるほど時間がかかる（soak はビルドごと）。必要なシナリオだけを `scenarios` で選ぶ
+- ワークフローの手動実行は、既定のブランチ（master）にあるワークフローだけが Actions の画面・`gh workflow run` に出る。スクリプト（`scripts/load/`）は実行したブランチ（`--ref`。既定は master）のものを使う
 
 `scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした週 1 回の soak で、そのまま残している。
 

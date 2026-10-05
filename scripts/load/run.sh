@@ -4,6 +4,9 @@
 #
 #   client 10.71.1.2 --- 10.71.1.1 [rproxy / HAProxy / router] 10.71.2.1 --- 10.71.2.2 backend
 #
+# BINS="master=/path/a,perf/x=/path/b" compares several rproxy builds in one run
+# (each scenario runs them in turn, A B A B ...; the first is the baseline).
+#
 # "direct" (the baseline) is forwarded by the kernel of the middle namespace, so it
 # crosses the same links. NETEM="delay 5ms loss 0.1%" adds tc netem on the client
 # link, in both directions.
@@ -24,7 +27,9 @@ export LOADGEN=${LOADGEN:-$ROOT/target/loadgen/release/rproxy-loadgen}
 export OUT=${OUT:-$PWD/load-results}
 
 if [ -z "${RPROXY_LOAD_NETNS:-}" ]; then
-  [ -x "$BIN" ] || { echo "no $BIN: run cargo build --release first (or set BIN)"; exit 2; }
+  if [ -z "${BINS:-}" ]; then
+    [ -x "$BIN" ] || { echo "no $BIN: run cargo build --release first (or set BIN / BINS)"; exit 2; }
+  fi
   if [ ! -x "$LOADGEN" ]; then
     if [ "$(id -u)" = 0 ]; then echo "no $LOADGEN: build it first (see the top of this file)"; exit 2; fi
     cargo build --release --locked --manifest-path "$ROOT/scripts/load/loadgen/Cargo.toml" --target-dir "$ROOT/target/loadgen"
@@ -62,6 +67,8 @@ ip link add pb type veth peer name vb
 ip link set vc netns "$C"
 ip link set vb netns "$B"
 ip addr add 10.71.1.1/24 dev pc && ip link set pc up
+# one address per rproxy build (BINS: several builds side by side), 10.71.1.11-19
+for i in $(seq 11 19); do ip addr add "10.71.1.$i/24" dev pc; done
 ip addr add 10.71.2.1/24 dev pb && ip link set pb up
 ns "$C" ip link set lo up
 ns "$C" ip addr add 10.71.1.2/24 dev vc

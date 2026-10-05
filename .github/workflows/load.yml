@@ -10,6 +10,9 @@ name: Load
 on:
   workflow_dispatch:
     inputs:
+      refs:
+        description: 比べる rproxy の git の ref（カンマ区切り。最初が基準。例 master,perf/splice）
+        default: "master"
       size_mib:
         description: 大きな転送 1 回の大きさ（MiB）
         default: "2048"
@@ -48,7 +51,7 @@ jobs:
   load:
     name: load (${{ matrix.variant }})
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -57,6 +60,7 @@ jobs:
       VARIANT: ${{ matrix.variant }}
       SIZE_MIB: ${{ matrix.variant == 'netem' && '512' || inputs.size_mib || '2048' }}
       REPEAT: ${{ inputs.repeat || '3' }}
+      REFS: ${{ inputs.refs || 'master' }}
       DURATION: ${{ inputs.duration || '10' }}
       CONNS: ${{ inputs.conns || '5000' }}
       UDP_SESSIONS: ${{ inputs.conns || '5000' }}
@@ -65,6 +69,9 @@ jobs:
       SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # the refs to compare are built from this clone
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: tools (iperf3, h2load, socat, HAProxy)
@@ -79,7 +86,30 @@ jobs:
           sudo modprobe sch_netem || {
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem
           }
-      - run: cargo build --locked --release
+      # each ref is built from its own worktree into the shared target dir (the dependencies are built once)
+      # and its binary copied out; the scripts of this checkout drive them all
+      - name: build rproxy for each ref (${{ env.REFS }})
+        run: |
+          bins="" commits=""
+          IFS=',' read -ra refs <<< "$REFS"
+          for ref in "${refs[@]}"; do
+            ref=$(echo "$ref" | xargs)
+            [ -n "$ref" ] || continue
+            sha=$(git rev-parse --verify -q "origin/$ref^{commit}" || git rev-parse --verify "$ref^{commit}")
+            name=${ref//\//_}
+            dir="$RUNNER_TEMP/src/$name"
+            git worktree add --detach "$dir" "$sha"
+            echo "::group::$ref ($sha)"
+            (cd "$dir" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --release -p rproxy-api \
+              && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release)
+            echo "::endgroup::"
+            mkdir -p bins
+            cp target/release/rproxy-api "bins/$name"
+            bins+="${bins:+,}$ref=$PWD/bins/$name"
+            commits+="${commits:+,}$ref=$sha"
+          done
+          echo "BINS=$bins" >> "$GITHUB_ENV"
+          echo "REF_COMMITS=$commits" >> "$GITHUB_ENV"
       - name: build scripts/load/loadgen
         run: cargo build --locked --release --manifest-path scripts/load/loadgen/Cargo.toml --target-dir target/loadgen
       - name: results of the last successful run

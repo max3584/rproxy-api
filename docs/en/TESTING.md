@@ -269,6 +269,7 @@ Settings (environment variables):
 | `SOAK_SECS` / `SOAK_BW` | 0 (skipped) / 1G | Soak duration and its iperf3 bandwidth |
 | `NETEM` | none | tc netem arguments (e.g. `delay 5ms loss 0.1%`) |
 | `HAPROXY` | auto | `0` leaves HAProxy out |
+| `BINS` | none (`BIN`, default `target/release/rproxy-api`) | rproxy builds to compare side by side (`label=path,label=path`; the first is the baseline) |
 | `OUT` / `PREVIOUS` | `load-results` / none | Where results go; an earlier `results.json` to compare with |
 
 ### Running locally or on a VM
@@ -292,6 +293,20 @@ Without root it needs user namespaces (on Ubuntu 24.04 and later, `sudo sysctl k
 - `load (netem)`: `tcp`, `verify`, `tls`, `http`, `udp` and `latency` with `delay 5ms loss 0.1%` (512 MiB)
 
 Results are kept as artifacts (`load-clean` / `load-netem`, 90 days) and in the job summary. The artifact of the last successful manual run (master first, else any branch) is downloaded and the tables show the deltas. The runners are shared 4-core VMs: ignore a single change and look for changes that repeat.
+
+### Comparing optimization ideas (`perf/<topic>` branches)
+
+Each speed-up or memory-reduction idea gets its own `perf/<topic>` branch (for example `perf/splice`, `perf/ktls`, `perf/mimalloc`) and is compared with master by the Load workflow. More ideas, more branches.
+
+```bash
+gh workflow run load.yml -f refs=master,perf/splice,perf/sockmap
+gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -f soak_secs=1800
+```
+
+- Every ref in `refs` (comma-separated, default `master`) is built, and the same scenarios run for each on the same runner. So that the runner's ups and downs hit them all alike, each scenario (and each repetition within it) goes through the refs in turn (A, B, C, A, B, C, ...). One rproxy per build runs at the same time on its own address (10.71.1.11 and up) and only the one being measured gets traffic (`memory` and `soak` start fresh processes per build)
+- `summary.md` starts with "Builds compared": per scenario, a column per ref and the change against the first ref (the baseline). JSON: the whole `results.json` and one `results-<ref>.json` per ref (`/` becomes `_`)
+- More refs take longer (the soak runs per build); pick the scenarios you need with `scenarios`
+- Only workflows on the default branch (master) can be dispatched from the Actions page or `gh workflow run`. The scripts (`scripts/load/`) come from the branch the run is started on (`--ref`, master by default)
 
 `scripts/soak.py` (the "Long-running load test" above) is the weekly loopback soak centered on connection churn, and stays as it is.
 

@@ -97,6 +97,48 @@ def delta(key, cur, prev):
 	return s
 
 
+def compare_builds(data):
+	"""One table per scenario with a column per build (git ref) and the change against the first."""
+	builds = data.get("meta", {}).get("builds", [])
+	names = [b["target"] for b in builds]
+	results = data.get("results", [])
+	out = ["## Builds compared", "",
+		   "Every scenario ran the builds in turn on the same runner (A, B, A, B, ...); the first is the baseline, "
+		   f"(+x%) is the change against it, bold is more than {WORSE:.0f}% worse.", ""]
+	out += [f"- `{b['target']}`: {b['ref']} `{(b.get('commit') or '')[:10]}` {b.get('version') or ''}" for b in builds]
+	out.append("")
+	by = {(r["scenario"], r["case"], r["target"]): r for r in results}
+	scenarios = []
+	for r in results:
+		if r["target"] in names and r["scenario"] not in scenarios:
+			scenarios.append(r["scenario"])
+	for sc in scenarios:
+		cases = []
+		for r in results:
+			if r["scenario"] == sc and r["target"] in names and r["case"] not in cases:
+				cases.append(r["case"])
+		out += [f"### {TITLES.get(sc, sc)}", "", "| case | metric | " + " | ".join(f"`{b['ref']}`" for b in builds) + " |",
+				"|" + "---|" * (2 + len(builds))]
+		for case in cases:
+			rows = [by.get((sc, case, n)) for n in names]
+			keys = []
+			for r in rows:
+				for k in (r or {}).get("metrics", {}):
+					if k not in keys and k not in HIDDEN and METRICS.get(k, ("", "", 0))[2]:
+						keys.append(k)
+			keys.sort(key=lambda k: list(METRICS).index(k) if k in METRICS else 999)
+			for k in keys:
+				base = (rows[0] or {}).get("metrics", {}).get(k)
+				cells = []
+				for i, r in enumerate(rows):
+					v = (r or {}).get("metrics", {}).get(k)
+					failed = "" if r is None or r.get("ok", True) else " (FAILED)"
+					cells.append(fmt(k, v) + (delta(k, v, base) if i else "") + failed)
+				out.append(f"| {case} | {METRICS.get(k, (k,))[0]} | " + " | ".join(cells) + " |")
+		out.append("")
+	return out
+
+
 def render(data, prev=None):
 	m = data.get("meta", {})
 	p = m.get("params", {})
@@ -123,6 +165,9 @@ def render(data, prev=None):
 	if data.get("skipped"):
 		out.append("")
 
+	if len(data.get("meta", {}).get("builds", [])) > 1:
+		out += compare_builds(data)
+		out += ["# All results", ""]
 	old = {}
 	if prev:
 		for r in prev.get("results", []):

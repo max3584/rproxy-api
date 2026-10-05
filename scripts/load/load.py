@@ -20,6 +20,7 @@ Settings (environment variables; docs/TESTING.md):
   SIZE_MIB=1024 REPEAT=3 DURATION=10 CONNS=2000 UDP_SESSIONS=1000 RULES=100,1000
   UDP_BW=1G UDP_PPS=50000 H2_REQS=200000 H2_CONNS=64 SOAK_SECS=0 HAPROXY=auto
   LOG_LEVEL=warn PREVIOUS=<results.json of an earlier run>
+  BINS=label=path,label=path   several rproxy builds (git refs) side by side; the first is the baseline
 """
 
 import datetime
@@ -39,10 +40,21 @@ import report  # noqa: E402
 
 E = os.environ
 NS_C, NS_B = E["LOAD_NS_CLIENT"], E["LOAD_NS_BACKEND"]
-BIN, LOADGEN = E["BIN"], E["LOADGEN"]
+LOADGEN = E["LOADGEN"]
+# the rproxy builds to compare: BINS="label=path,label=path" (one per git ref; the first is the baseline), else BIN
+BINS = [tuple(x.split("=", 1)) for x in E.get("BINS", "").split(",") if "=" in x] or [("", E["BIN"])]
+BIN = BINS[0][1]
+# target names: "rproxy" with one build, "rproxy@<label>" with several
+COMMITS = dict(x.split("=", 1) for x in E.get("REF_COMMITS", "").split(",") if "=" in x)
+RP_NAMES = ["rproxy"] if len(BINS) == 1 else [f"rproxy@{label}" for label, _ in BINS]
 WORK = E["WORK"]
 OUT = os.path.abspath(E.get("OUT", "load-results"))
 CLIENT, RP_C, RP_B, BACKEND = "10.71.1.2", "10.71.1.1", "10.71.2.1", "10.71.2.2"
+# each rproxy build listens on its own address (run.sh adds 10.71.1.11-19), HAProxy on RP_C
+
+
+def rp_ip(idx):
+	return f"10.71.1.{11 + idx}"
 API = 18080
 
 ALL = ["tcp", "verify", "tls", "http", "udp", "latency", "churn", "memory", "soak"]
@@ -164,32 +176,37 @@ def snmp(which=None):
 
 
 class Meter:
-	"""CPU time (the proxy's and the whole machine's), wall time and peak RSS over a block."""
+	"""CPU time (the proxy's and the whole machine's), wall time and peak RSS over a block.
+	Reused for several blocks, it adds them up (repeated runs interleaved with other targets)."""
 
 	def __init__(self, proxy):
 		self.pid = proxy.pid
+		self.wall = self.sys_cpu = 0.0
+		self.proxy_cpu = 0.0 if self.pid else None
+		self.peak = 0
 
 	def __enter__(self):
 		self.t0, self.sys0 = time.monotonic(), sys_busy()
 		self.cpu0 = cpu_s(self.pid) if self.pid else 0
-		self.peak, self.stop = 0, threading.Event()
+		self.stop = threading.Event()
 		if self.pid:
-			threading.Thread(target=self.sample, daemon=True).start()
+			threading.Thread(target=self.sample, args=(self.stop,), daemon=True).start()
 		return self
 
-	def sample(self):
-		while not self.stop.is_set():
+	def sample(self, stop):
+		while not stop.is_set():
 			try:
 				self.peak = max(self.peak, rss_kib(self.pid))
 			except OSError:
 				return
-			self.stop.wait(0.2)
+			stop.wait(0.2)
 
 	def __exit__(self, *exc):
 		self.stop.set()
-		self.wall = time.monotonic() - self.t0
-		self.sys_cpu = sys_busy() - self.sys0
-		self.proxy_cpu = (cpu_s(self.pid) - self.cpu0) if self.pid else None
+		self.wall += time.monotonic() - self.t0
+		self.sys_cpu += sys_busy() - self.sys0
+		if self.pid:
+			self.proxy_cpu += cpu_s(self.pid) - self.cpu0
 		return False
 
 	def metrics(self, nbytes=None, units=None, unit_name=None):
@@ -228,16 +245,15 @@ class Direct:
 
 
 class Rproxy:
-	name = "rproxy"
-
-	def __init__(self, label, services=(), udp_idle=30):
-		self.label, self.udp_idle = label, udp_idle
-		self.log = open(os.path.join(WORK, f"rproxy-{label}.log"), "w")
-		env = dict(E, RPROXY_API_PORT=str(API), RPROXY_LOG_LEVEL=LOG_LEVEL)
+	def __init__(self, label, services=(), udp_idle=30, idx=0):
+		self.label, self.udp_idle, self.idx = label, udp_idle, idx
+		self.name, self.ip, self.api_port = RP_NAMES[idx], rp_ip(idx), API + idx
+		self.log = open(os.path.join(WORK, f"rproxy-{label}-{idx}.log"), "w")
+		env = dict(E, RPROXY_API_PORT=str(self.api_port), RPROXY_LOG_LEVEL=LOG_LEVEL)
 		for k in list(env):
 			if k.startswith("RPROXY_") and k not in ("RPROXY_API_PORT", "RPROXY_LOG_LEVEL"):
 				del env[k]
-		self.proc = subprocess.Popen([BIN], cwd=WORK, env=env, stdout=self.log, stderr=subprocess.STDOUT)
+		self.proc = subprocess.Popen([BINS[idx][1]], cwd=WORK, env=env, stdout=self.log, stderr=subprocess.STDOUT)
 		self.pid = self.proc.pid
 		for _ in range(100):
 			try:
@@ -251,7 +267,7 @@ class Rproxy:
 			self.add(s)
 
 	def api(self, method, path, body=None):
-		req = urllib.request.Request(f"http://127.0.0.1:{API}{path}", method=method,
+		req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}{path}", method=method,
 									 data=json.dumps(body).encode() if body is not None else None,
 									 headers={"Content-Type": "application/json"})
 		with urllib.request.urlopen(req, timeout=30) as r:
@@ -264,7 +280,7 @@ class Rproxy:
 	def add(self, service, port=None, backend_port=None):
 		kind, bport, _ = SERVICES[service]
 		port = port or self.port(service)
-		body = {"protocol": "udp" if kind == "udp" else "tcp", "listen_addr": RP_C, "listen_port": port}
+		body = {"protocol": "udp" if kind == "udp" else "tcp", "listen_addr": self.ip, "listen_port": port}
 		if kind == "udp":
 			body["udp_idle_secs"] = self.udp_idle
 		if kind in ("http", "https"):
@@ -276,11 +292,11 @@ class Rproxy:
 		self.api("POST", "/rules", body)
 
 	def addr(self, service):
-		return RP_C, self.port(service)
+		return self.ip, self.port(service)
 
 	def url(self, service):
 		scheme = "https" if SERVICES[service][0] == "https" else "http"
-		return f"{scheme}://{RP_C}:{self.port(service)}"
+		return f"{scheme}://{self.ip}:{self.port(service)}"
 
 	def rule_stats(self, service):
 		port = self.port(service)
@@ -298,12 +314,13 @@ class Rproxy:
 		return sum(r.get("connections", 0) for r in rules)
 
 	def stop(self):
-		self.proc.terminate()
-		try:
-			self.proc.wait(timeout=20)
-		except subprocess.TimeoutExpired:
-			self.proc.kill()
-			self.proc.wait()
+		if self.proc.poll() is None:
+			self.proc.terminate()
+			try:
+				self.proc.wait(timeout=20)
+			except subprocess.TimeoutExpired:
+				self.proc.kill()
+				self.proc.wait()
 		self.log.close()
 
 
@@ -359,6 +376,16 @@ def hostport(a):
 
 # ---------------------------------------------------------------- scenarios
 
+def iperf3(a, args):
+	"""iperf3 -J; the server takes one test at a time and may still be finishing the last one: retry a few times."""
+	for attempt in range(4):
+		p = run(ns(NS_C, ["iperf3", "-c", a[0], "-p", str(a[1]), "-J"] + args), timeout=DURATION + 60, check_rc=False)
+		if p.returncode == 0:
+			return p
+		time.sleep(2 + attempt * 2)
+	raise RuntimeError(f"iperf3 exited {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+
+
 def sc_tcp(targets):
 	"""Raw TCP throughput with iperf3 (upload with 1 and 8 streams, download with 1)."""
 	if not have("iperf3"):
@@ -369,7 +396,7 @@ def sc_tcp(targets):
 			a = t.addr("iperf")
 			try:
 				with Meter(t) as m:
-					p = run(ns(NS_C, ["iperf3", "-c", a[0], "-p", str(a[1]), "-t", str(DURATION), "-J"] + extra), timeout=DURATION + 60)
+					p = iperf3(a, ["-t", str(DURATION)] + extra)
 				j = json.loads(p.stdout)
 				recv = j["end"]["sum_received"]
 				met = {"gbps": recv["bits_per_second"] / 1e9, "retransmits": j["end"]["sum_sent"].get("retransmits")}
@@ -380,29 +407,40 @@ def sc_tcp(targets):
 				check(f"tcp {case} via {t.name}", False, str(e)[:300])
 
 
+def repeated(scenario, case, targets, one):
+	"""one(t, i) -> (bytes, Gbit/s, error or None), REPEAT times for every target, interleaved
+	(A, B, C, A, B, C, ...) so that the runner's ups and downs hit every target alike."""
+	st = {t.name: {"m": Meter(t), "total": 0, "gbps": [], "bad": []} for t in targets}
+	for i in range(REPEAT):
+		for t in targets:
+			x = st[t.name]
+			try:
+				with x["m"]:
+					nbytes, gbps, err = one(t, i)
+				x["total"] += nbytes
+				x["gbps"].append(gbps)
+				if err:
+					x["bad"].append(err)
+			except Exception as e:  # noqa: BLE001
+				x["bad"].append(str(e)[:300])
+	for t in targets:
+		x = st[t.name]
+		g, bad = x["gbps"], "; ".join(x["bad"])[:300]
+		met = {"gbps": sum(g) / len(g) if g else None, "gbps_min": min(g) if g else None, "verified_gib": x["total"] / (1 << 30)}
+		met.update(x["m"].metrics(nbytes=x["total"]))
+		record(scenario, f"{case} x{REPEAT} ({SIZE // MIB} MiB)", t.name, met, ok=not x["bad"], note=bad)
+		check(f"{scenario} {case} via {t.name}: every byte arrived unchanged", not x["bad"], bad)
+
+
 def sc_verify(targets):
 	"""Large transfers whose every byte the backend checks (SIZE x REPEAT, 1 and 4 streams)."""
 	for case, streams in (("1 stream", 1), ("4 streams", 4)):
-		per = SIZE // streams
-		for t in targets:
-			a = t.addr("sink")
-			total, bad, gbps = 0, [], []
-			with Meter(t) as m:
-				for i in range(REPEAT):
-					try:
-						p = run(ns(NS_C, [LOADGEN, "send", "--connect", hostport(a), "--bytes", str(per), "--streams", str(streams),
-										  "--seed", str(1000 * i + 1)]), timeout=3600, check_rc=False)
-						r = last_json(p.stdout)
-						gbps.append(r["gbps"])
-						total += r["bytes"]
-						if not r["ok"]:
-							bad.append(r.get("error", "failed"))
-					except Exception as e:  # noqa: BLE001
-						bad.append(str(e)[:300])
-			met = {"gbps": sum(gbps) / len(gbps) if gbps else None, "gbps_min": min(gbps) if gbps else None, "verified_gib": total / (1 << 30)}
-			met.update(m.metrics(nbytes=total))
-			record("verify", f"{case} x{REPEAT} ({SIZE // MIB} MiB)", t.name, met, ok=not bad, note="; ".join(bad)[:300])
-			check(f"verify {case} via {t.name}: every byte arrived unchanged", not bad, "; ".join(bad)[:300])
+		def one(t, i, streams=streams):
+			p = run(ns(NS_C, [LOADGEN, "send", "--connect", hostport(t.addr("sink")), "--bytes", str(SIZE // streams),
+							  "--streams", str(streams), "--seed", str(1000 * i + 1)]), timeout=3600, check_rc=False)
+			r = last_json(p.stdout)
+			return r["bytes"], r["gbps"], None if r["ok"] else r.get("error", "failed")
+		repeated("verify", case, targets, one)
 
 
 class Sink:
@@ -433,29 +471,17 @@ def sc_tls(targets):
 	"""TLS termination: verified uploads through socat (the backend's timing) and full handshakes per second."""
 	tls_targets = [t for t in targets if t.addr("tls_sink")]
 	if have("socat"):
-		for t in tls_targets:
+		with SINK.lock:
+			SINK.lines.clear()
+
+		def one(t, i):
 			a = t.addr("tls_sink")
-			total, bad, gbps = 0, [], []
-			with SINK.lock:
-				SINK.lines.clear()
-			with Meter(t) as m:
-				for i in range(REPEAT):
-					seed = 5000 + i
-					cmd = (f"{LOADGEN} gen --header 1 --bytes {SIZE} --seed {seed} | "
-						   f"socat -u -T 30 - OPENSSL:{a[0]}:{a[1]},verify=0")
-					try:
-						run(ns(NS_C, ["bash", "-o", "pipefail", "-c", cmd]), timeout=3600)
-						r = SINK.take(1)[0]
-						gbps.append(r.get("gbps", 0))
-						total += r.get("bytes", 0)
-						if not r.get("ok"):
-							bad.append(json.dumps(r))
-					except Exception as e:  # noqa: BLE001
-						bad.append(str(e)[:300])
-			met = {"gbps": sum(gbps) / len(gbps) if gbps else None, "verified_gib": total / (1 << 30)}
-			met.update(m.metrics(nbytes=total))
-			record("tls", f"upload x{REPEAT} ({SIZE // MIB} MiB)", t.name, met, ok=not bad, note="; ".join(bad)[:300])
-			check(f"tls upload via {t.name}: every byte arrived unchanged", not bad, "; ".join(bad)[:300])
+			cmd = (f"{LOADGEN} gen --header 1 --bytes {SIZE} --seed {5000 + i} | "
+				   f"socat -u -T 30 - OPENSSL:{a[0]}:{a[1]},verify=0")
+			run(ns(NS_C, ["bash", "-o", "pipefail", "-c", cmd]), timeout=3600)
+			r = SINK.take(1)[0]
+			return r.get("bytes", 0), r.get("gbps", 0), None if r.get("ok") else json.dumps(r)
+		repeated("tls", "upload", tls_targets, one)
 	else:
 		skip("tls uploads: socat is not installed")
 	for t in tls_targets:
@@ -525,29 +551,16 @@ def sc_http(targets):
 	variants = [("HTTP/1.1 download", "http", ["--http1.1"]), ("HTTP/2 h2c download", "http", ["--http2-prior-knowledge"]),
 				("HTTP/2 TLS download", "https", ["-k", "--http2"])]
 	for case, svc, flags in variants:
-		for t in targets:
-			url = t.url(svc)
-			if not url or (t.name == "direct" and "HTTP/2" in case):
-				continue
-			total, bad, gbps = 0, [], []
-			with Meter(t) as m:
-				for i in range(REPEAT):
-					seed = 7000 + i
-					cmd = (f"curl -sS {' '.join(flags)} -o - {url}/stream/{SIZE}/{seed} | "
-						   f"{LOADGEN} verify --bytes {SIZE} --seed {seed}")
-					try:
-						p = run(ns(NS_C, ["bash", "-o", "pipefail", "-c", cmd]), timeout=3600, check_rc=False)
-						r = last_json(p.stdout)
-						gbps.append(r["gbps"])
-						total += r["bytes"]
-						if not r["ok"] or p.returncode:
-							bad.append(f"{r} {p.stderr.strip()[-200:]}")
-					except Exception as e:  # noqa: BLE001
-						bad.append(str(e)[:300])
-			met = {"gbps": sum(gbps) / len(gbps) if gbps else None, "verified_gib": total / (1 << 30)}
-			met.update(m.metrics(nbytes=total))
-			record("http", f"{case} x{REPEAT} ({SIZE // MIB} MiB)", t.name, met, ok=not bad, note="; ".join(bad)[:300])
-			check(f"http {case} via {t.name}: every byte arrived unchanged", not bad, "; ".join(bad)[:300])
+		def one(t, i, svc=svc, flags=flags):
+			seed = 7000 + i
+			cmd = (f"curl -sS {' '.join(flags)} -o - {t.url(svc)}/stream/{SIZE}/{seed} | "
+				   f"{LOADGEN} verify --bytes {SIZE} --seed {seed}")
+			p = run(ns(NS_C, ["bash", "-o", "pipefail", "-c", cmd]), timeout=3600, check_rc=False)
+			r = last_json(p.stdout)
+			err = None if r["ok"] and not p.returncode else f"{r} {p.stderr.strip()[-200:]}"
+			return r["bytes"], r["gbps"], err
+		these = [t for t in targets if t.url(svc) and not (t.name == "direct" and "HTTP/2" in case)]
+		repeated("http", case, these, one)
 
 
 def sc_udp(targets):
@@ -558,8 +571,7 @@ def sc_udp(targets):
 			a = t.addr("iperf_udp")
 			try:
 				with Meter(t) as m:
-					p = run(ns(NS_C, ["iperf3", "-c", a[0], "-p", str(a[1]), "-u", "-b", UDP_BW, "-l", "1400", "-t", str(DURATION), "-J"]),
-							timeout=DURATION + 60)
+					p = iperf3(a, ["-u", "-b", UDP_BW, "-l", "1400", "-t", str(DURATION)])
 				j = json.loads(p.stdout)["end"]
 				s = j.get("sum_received") or j["sum"]
 				met = {"gbps": s["bits_per_second"] / 1e9, "loss_pct": j["sum"].get("lost_percent"), "jitter_ms": j["sum"].get("jitter_ms")}
@@ -677,34 +689,25 @@ def hold_conns(t, n):
 	check(f"memory via {t.name}: FDs return after {n} connections close", fd3 <= fd0 + 5, f"before {fd0}, after {fd3}")
 
 
-def sc_memory(targets):
-	"""Memory of fresh processes: idle, per rule (0/100/1000), per idle / busy connection, per UDP session."""
-	rp = Rproxy("memory-rules")
+def mem_rules(idx):
+	rp = Rproxy("memory-rules", idx=idx)
 	try:
 		rss0, fd0 = settle(rp.pid)
-		record("memory", "idle, 0 rules", "rproxy", {"rss_mib": rss0 / 1024, "fds": fd0})
+		record("memory", "idle, 0 rules", rp.name, {"rss_mib": rss0 / 1024, "fds": fd0})
 		made = 0
 		for count in sorted(RULES):
 			while made < count:
 				rp.add("echo", port=30000 + made)
 				made += 1
 			rss, fds = settle(rp.pid)
-			record("memory", f"idle, {count} TCP rules", "rproxy", {"rss_mib": rss / 1024, "fds": fds,
-																	"kib_per_rule": (rss - rss0) / count})
+			record("memory", f"idle, {count} TCP rules", rp.name, {"rss_mib": rss / 1024, "fds": fds,
+																   "kib_per_rule": (rss - rss0) / count})
 	finally:
 		rp.stop()
-	rp = Rproxy("memory-conns", ["echo"])
-	try:
-		hold_conns(rp, CONNS)
-	finally:
-		rp.stop()
-	if any(isinstance(t, Haproxy) for t in targets):
-		h = Haproxy("memory")
-		try:
-			hold_conns(h, CONNS)
-		finally:
-			h.stop()
-	rp = Rproxy("memory-udp", ["uecho"], udp_idle=600)
+
+
+def mem_udp(idx):
+	rp = Rproxy("memory-udp", ["uecho"], udp_idle=600, idx=idx)
 	try:
 		rss0, fd0 = settle(rp.pid)
 		p = subprocess.Popen(ns(NS_C, [LOADGEN, "udp-hold", "--connect", hostport(rp.addr("uecho")), "--sources", str(UDP_SESSIONS)]),
@@ -712,21 +715,47 @@ def sc_memory(targets):
 		ready = json.loads(p.stdout.readline())
 		rss1, fd1 = settle(rp.pid)
 		n = ready["sessions"]
-		record("memory", f"{UDP_SESSIONS} UDP sessions", "rproxy", {
+		record("memory", f"{UDP_SESSIONS} UDP sessions", rp.name, {
 			"sessions": n, "rss_mib": rss1 / 1024, "kib_per_session": (rss1 - rss0) / n if n else None,
 			"fds_per_session": (fd1 - fd0) / n if n else None}, ok=n == UDP_SESSIONS)
-		check(f"memory: {UDP_SESSIONS} UDP sessions established", n == UDP_SESSIONS, json.dumps(ready))
+		check(f"memory via {rp.name}: {UDP_SESSIONS} UDP sessions established", n == UDP_SESSIONS, json.dumps(ready))
 		p.communicate("quit\n", timeout=60)
 	finally:
 		rp.stop()
 
 
+def sc_memory(targets):
+	"""Memory of fresh processes: idle, per rule (0/100/1000), per idle / busy connection, per UDP session.
+	With several builds, each step runs for every build in turn."""
+	for idx in range(len(BINS)):
+		mem_rules(idx)
+	for idx in range(len(BINS)):
+		rp = Rproxy("memory-conns", ["echo"], idx=idx)
+		try:
+			hold_conns(rp, CONNS)
+		finally:
+			rp.stop()
+	if any(isinstance(t, Haproxy) for t in targets):
+		h = Haproxy("memory")
+		try:
+			hold_conns(h, CONNS)
+		finally:
+			h.stop()
+	for idx in range(len(BINS)):
+		mem_udp(idx)
+
+
 def sc_soak(_targets):
+	"""SOAK_SECS for every build in turn."""
+	if SOAK_SECS > 0:
+		for idx in range(len(BINS)):
+			soak_one(idx)
+
+
+def soak_one(idx):
 	"""SOAK_SECS of mixed load (iperf3 at SOAK_BW, connection churn, rotating UDP sources); RSS and FDs must not keep growing."""
-	if SOAK_SECS <= 0:
-		return
 	idle = 5
-	rp = Rproxy("soak", ["echo", "iperf", "usink"], udp_idle=idle)
+	rp = Rproxy("soak", ["echo", "iperf", "usink"], udp_idle=idle, idx=idx)
 	procs = {}
 	samples = []
 	try:
@@ -734,7 +763,7 @@ def sc_soak(_targets):
 		sink = subprocess.Popen(ns(NS_B, [LOADGEN, "udp-sink", "--listen", f"{BACKEND}:9004", "--idle", "30",
 										  "--max-secs", str(SOAK_SECS + 120)]), stdout=subprocess.PIPE, text=True)
 		sink.stdout.readline()
-		procs["iperf3"] = subprocess.Popen(ns(NS_C, ["iperf3", "-c", RP_C, "-p", str(rp.port("iperf")), "-t", str(SOAK_SECS),
+		procs["iperf3"] = subprocess.Popen(ns(NS_C, ["iperf3", "-c", rp.ip, "-p", str(rp.port("iperf")), "-t", str(SOAK_SECS),
 													 "-b", SOAK_BW, "-J"]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 		procs["churn"] = subprocess.Popen(ns(NS_C, [LOADGEN, "churn", "--connect", hostport(rp.addr("echo")), "--workers", "16",
 													"--secs", str(SOAK_SECS)]), stdout=subprocess.PIPE, text=True)
@@ -760,23 +789,24 @@ def sc_soak(_targets):
 			bulk = ip["bytes"]
 		except Exception:  # noqa: BLE001
 			bulk = 0
-			check("soak: iperf3 ran to the end", False, outs["iperf3"][-300:])
+			check(f"soak via {rp.name}: iperf3 ran to the end", False, outs["iperf3"][-300:])
 		rss = [s["rss_kib"] for s in samples]
 		body = rss[len(rss) // 10:]
 		q = max(1, len(body) // 4)
 		early, late = sum(body[:q]) / q, sum(body[-q:]) / q
 		growth = late / early if early else 0
 		cpu = cpu_s(rp.pid) - cpu0
-		record("soak", f"{SOAK_SECS} s mixed load", "rproxy", {
+		record("soak", f"{SOAK_SECS} s mixed load", rp.name, {
 			"rss_start_mib": rss0 / 1024, "rss_peak_mib": max(rss) / 1024 if rss else None, "rss_end_mib": rss_end / 1024,
 			"rss_growth": growth, "fds_start": fd0, "fds_peak": max(s["fds"] for s in samples) if samples else None, "fds_end": fd_end,
 			"proxy_cpu_s": cpu, "bulk_gib": bulk / (1 << 30), "conns_per_s": churn["conns_per_s"], "failed": churn["failed"]})
-		check("soak: FDs return to the start (+20) after the load", fd_end <= fd0 + 20, f"start {fd0}, end {fd_end}")
-		check("soak: RSS does not keep growing (last quarter <= 1.5x the first)", growth <= 1.5,
+		check(f"soak via {rp.name}: FDs return to the start (+20) after the load", fd_end <= fd0 + 20, f"start {fd0}, end {fd_end}")
+		check(f"soak via {rp.name}: RSS does not keep growing (last quarter <= 1.5x the first)", growth <= 1.5,
 			  f"first quarter {early / 1024:.1f} MiB, last quarter {late / 1024:.1f} MiB")
-		check("soak: connection failures <= 0.1%", churn["failed"] <= max(10, churn["count"] // 1000),
+		check(f"soak via {rp.name}: connection failures <= 0.1%", churn["failed"] <= max(10, churn["count"] // 1000),
 			  f"{churn['failed']} of {churn['count']}")
-		with open(os.path.join(OUT, "soak.csv"), "w") as f:
+		suffix = "" if len(BINS) == 1 else "-" + BINS[idx][0].replace("/", "_")
+		with open(os.path.join(OUT, f"soak{suffix}.csv"), "w") as f:
 			f.write("t,rss_kib,fds,cpu_s,conns\n")
 			for s in samples:
 				f.write(f"{s['t']},{s['rss_kib']},{s['fds']},{s['cpu_s']},{s['conns']}\n")
@@ -809,6 +839,8 @@ def meta():
 		"commit": E.get("GITHUB_SHA") or E.get("COMMIT", ""),
 		"ref": E.get("GITHUB_REF_NAME", ""),
 		"rproxy": tool_version([BIN, "--version"]),
+		"builds": [{"target": RP_NAMES[i], "ref": label, "commit": COMMITS.get(label, ""), "version": tool_version([path, "--version"])}
+				   for i, (label, path) in enumerate(BINS)],
 		"kernel": platform.release(), "cpu": cpu, "nproc": NPROC,
 		"mem_gib": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30), 1),
 		"netem": E.get("NETEM", ""),
@@ -847,7 +879,8 @@ def main():
 
 	targets = [Direct()]
 	try:
-		targets.append(Rproxy("main", [s for s in SERVICES]))
+		for idx in range(len(BINS)):
+			targets.append(Rproxy("main", list(SERVICES), idx=idx))
 	except Exception as e:  # noqa: BLE001
 		check("rproxy starts with every rule", False, str(e)[:500])
 		raise
@@ -887,6 +920,12 @@ def main():
 	data = {"meta": meta(), "results": results, "checks": checks, "skipped": skipped}
 	with open(os.path.join(OUT, "results.json"), "w") as f:
 		json.dump(data, f, indent=1)
+	if len(BINS) > 1:
+		# one file per build too (with direct and HAProxy), named after the ref
+		for i, (label, _) in enumerate(BINS):
+			mine = [r for r in results if not r["target"].startswith("rproxy@") or r["target"] == RP_NAMES[i]]
+			with open(os.path.join(OUT, f"results-{label.replace('/', '_')}.json"), "w") as f:
+				json.dump(dict(data, results=mine, build=data["meta"]["builds"][i]), f, indent=1)
 	prev = None
 	if E.get("PREVIOUS") and os.path.exists(E["PREVIOUS"]):
 		try:
