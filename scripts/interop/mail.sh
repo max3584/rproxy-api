@@ -164,8 +164,10 @@ def imap_subjects(conn):
     _, data = conn.search(None, "SUBJECT", mark)
     subjects = []
     for num in data[0].split():
-        _, msg = conn.fetch(num, "(BODY[HEADER.FIELDS (SUBJECT)])")
-        subjects.append(msg[0][1].decode().strip().removeprefix("Subject: "))
+        # PEEK: no \Seen flag change (Dovecot reports one as a FETCH of its own); the literal is the tuple
+        _, msg = conn.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+        header = next(part[1] for part in msg if isinstance(part, tuple))
+        subjects.append(header.decode().strip().removeprefix("Subject: "))
     return sorted(subjects)
 
 expected = sorted([f"submission {mark}", f"plain-mta {mark}", f"tls-mta {mark}"])
