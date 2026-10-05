@@ -34,6 +34,9 @@ jobs:
     timeout-minutes: 150
     env:
       SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '600' }}
+      # the cargo-fuzz binary of install-action is built for musl and would make it
+      # the default target (the sanitizer needs the gnu one)
+      FUZZ_FLAGS: --debug-assertions --target x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -50,14 +53,14 @@ jobs:
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
       - name: build
-        run: cargo fuzz build --debug-assertions
+        run: cargo fuzz build $FUZZ_FLAGS
       - name: run each target for ${{ env.SECONDS_PER_TARGET }} s
         run: |
           failed=""
           for target in $(cargo fuzz list); do
             echo "::group::$target"
             mkdir -p "fuzz/corpus/$target"
-            if ! cargo fuzz run --debug-assertions "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+            if ! cargo fuzz run $FUZZ_FLAGS "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
                 -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1; then
               failed="$failed $target"
             fi
@@ -71,7 +74,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           for target in $(cargo fuzz list); do
-            cargo fuzz cmin --debug-assertions "$target" "fuzz/corpus/$target" -- -rss_limit_mb=2048 || true
+            cargo fuzz cmin $FUZZ_FLAGS "$target" "fuzz/corpus/$target" -- -rss_limit_mb=2048 || true
           done
       - uses: actions/cache/save@v4
         if: always() && github.event_name != 'pull_request'
