@@ -63,7 +63,14 @@ assets = [
 # md-5 is used as `md5` (src/l7/middleware/auth.rs, htpasswd APR1)
 ignored = ["md-5"]
 
+# the global allocator (#185). Without one of these the binary uses the libc's malloc
+# (musl's malloc in the static release builds, which serialises threads on a lock)
+[features]
+default = ["alloc-mimalloc"]
+alloc-mimalloc = ["dep:mimalloc"]
+
 [dependencies]
+mimalloc = { version = "0.1.52", optional = true }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "query", "form"] }
