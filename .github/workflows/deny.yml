@@ -29,7 +29,8 @@ jobs:
     container: alpine:3.22
     steps:
       - name: packages
-        run: apk add --no-cache bash git curl tar
+        # libgcc: rustc of the rustup toolchain links libgcc_s
+        run: apk add --no-cache bash git curl tar libgcc
       - uses: actions/checkout@v4
       # cargo deny reads the dependency graph through cargo metadata
       - uses: dtolnay/rust-toolchain@stable

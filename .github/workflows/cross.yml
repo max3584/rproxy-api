@@ -54,11 +54,10 @@ jobs:
           key: ${{ matrix.job.target }}
       - name: Build (release profile, like release.yml)
         run: scripts/build-release.sh ${{ matrix.job.target }}
+      # cargo-deb publishes only a glibc build (a .deb), so build it here
       - name: Install cargo-deb
         if: matrix.job.deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+        run: cargo install --locked cargo-deb
       - name: Debian package
         if: matrix.job.deb
         run: |

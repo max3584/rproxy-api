@@ -61,11 +61,10 @@ jobs:
       - name: Build
         run: scripts/build-release.sh ${{ matrix.job.target }}
 
+      # cargo-deb publishes only a glibc build (a .deb), so build it here
       - name: Install cargo-deb
         if: matrix.job.deb
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+        run: cargo install --locked cargo-deb
 
       # static musl binaries, so one package works on every Debian / Ubuntu release
       - name: Debian package

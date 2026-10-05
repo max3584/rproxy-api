@@ -101,9 +101,8 @@ jobs:
         run: shellcheck scripts/*.sh scripts/interop/*.sh contrib/rproxy-transparent-routing
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
+      # cargo-deb publishes only a glibc build (a .deb): build it (cached by rust-cache with ~/.cargo/bin)
+      - run: cargo install --locked cargo-deb
       - run: cargo build --locked --release
       - run: cargo deb --no-build --output target/debian/
       - uses: actions/upload-artifact@v4

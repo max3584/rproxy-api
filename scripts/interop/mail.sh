@@ -18,7 +18,13 @@ WORK=$(mktemp -d)
 API=http://127.0.0.1:18300
 PASS=mailtest-password
 
-fail() { echo "FAIL: $*" >&2; tail -n 40 /var/log/mail.log /var/log/dovecot.log >&2 || true; cat "$WORK/rproxy.log" >&2 || true; exit 1; }
+fail() {
+	echo "FAIL: $*" >&2
+	tail -n 40 /var/log/mail.log /var/log/dovecot.log >&2 || true
+	doveconf -n >&2 || true
+	cat "$WORK/rproxy.log" >&2 || true
+	exit 1
+}
 [ "$(id -u)" = 0 ] || { echo "run as root (in a throwaway container)" >&2; exit 1; }
 
 grep -q ' mail.test$' /etc/hosts || echo '127.0.0.1 mail.test' >> /etc/hosts
@@ -102,7 +108,7 @@ rule 1993 10143 null              # IMAPS
 rule 1110 10110 '"pop3"'          # POP3 + STLS
 
 echo "== clients"
-python3 - "$WORK/ca.pem" "$PASS" <<'EOF'
+python3 - "$WORK/ca.pem" "$PASS" <<'EOF' || fail "the mail clients failed"
 import imaplib, poplib, smtplib, ssl, sys, time, uuid
 ca, password = sys.argv[1], sys.argv[2]
 ctx = ssl.create_default_context(cafile=ca)
