@@ -41,6 +41,9 @@ jobs:
       SECONDS_PER_TARGET: ${{ inputs.seconds || (github.event_name == 'pull_request' && '60') || '600' }}
       # the target is the host (musl); no sanitizer there (see above)
       FUZZ_FLAGS: --debug-assertions --sanitizer none
+      # link dynamically: in a static musl binary libstdc++ sees no threads (its weak pthread symbols stay
+      # unresolved), and libFuzzer's std::thread (the -rss_limit_mb watcher) aborts at the start of fuzzing
+      RUSTFLAGS: -Ctarget-feature=-crt-static
     steps:
       # g++: libfuzzer-sys builds libFuzzer (C++)
       - name: packages

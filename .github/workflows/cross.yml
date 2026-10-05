@@ -44,7 +44,7 @@ jobs:
           - { target: aarch64-unknown-linux-musl     , deb: arm64 }
     steps:
       - name: packages
-        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig dpkg
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,6 +52,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.job.target }}
+      # cargo-zigbuild 0.23 or later: it drops the --fix-cortex-a53-843419 linker argument that rustc passes
+      # for aarch64 and zig does not know (Alpine 3.22 has 0.20)
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: Build (release profile, like release.yml)
         run: scripts/build-release.sh ${{ matrix.job.target }}
       # cargo-deb publishes only a glibc build (a .deb), so build it here

@@ -42,7 +42,8 @@ jobs:
         run: |
           mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld
           mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db > /dev/null
-          nohup mariadbd --user=mysql --datadir=/var/lib/mysql --bind-address=127.0.0.1 --port=3306 \
+          # Alpine's mariadb-server.cnf turns TCP off (skip-networking); the tests connect to 127.0.0.1:3306
+          nohup mariadbd --user=mysql --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 --port=3306 \
             > /tmp/mariadb.log 2>&1 &
           for _ in $(seq 60); do mariadb-admin ping --silent 2>/dev/null && break; sleep 1; done
           mariadb-admin ping --silent || { cat /tmp/mariadb.log; exit 1; }
@@ -51,6 +52,7 @@ jobs:
           CREATE USER 'root'@'127.0.0.1' IDENTIFIED BY 'root';
           GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
           EOF
+          mariadb -h 127.0.0.1 -P 3306 -u root -proot -e 'SELECT VERSION()'
       - name: unit + integration tests
         env:
           RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
