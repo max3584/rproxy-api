@@ -55,6 +55,8 @@ pub struct Pki {
 
 impl Pki {
 	pub fn new(tag: &str) -> Pki {
+		// the dtls clients and servers of the tests use the process-wide rustls provider
+		rproxy_api::tls::config::install_default_provider();
 		let dir = std::env::temp_dir().join(format!("rproxy-pki-{tag}-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let ca_key = KeyPair::generate().unwrap();

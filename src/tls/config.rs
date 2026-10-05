@@ -674,8 +674,20 @@ fn all_expired(spec: &TlsSpec) -> ApiError {
 	tls_error(format!("{CERT_EXPIRED}: every certificate of this rule has expired ({}); renew the files", files.join(", ")))
 }
 
+/// The crypto provider of every rustls / quinn configuration: aws-lc-rs (#184).
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+	install_default_provider();
 	Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+/// Installs aws-lc-rs as the process-wide rustls provider (once). dtls builds its rustls
+/// verifiers without a provider, and with both rustls features on (dtls turns on `ring`)
+/// rustls cannot choose one by itself and panics. Our own configurations name the provider.
+pub fn install_default_provider() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	});
 }
 
 /// Picks a certificate by SNI; the first certificate is the fallback.
@@ -706,7 +718,7 @@ fn suite_name(suite: &rustls::SupportedCipherSuite) -> String {
 fn server_crypto(
 	options: Option<&TlsOptions>,
 ) -> Result<(Arc<rustls::crypto::CryptoProvider>, Vec<&'static rustls::SupportedProtocolVersion>), ApiError> {
-	let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+	let mut provider = provider().as_ref().clone();
 	let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = vec![&rustls::version::TLS13, &rustls::version::TLS12];
 	let Some(o) = options else { return Ok((Arc::new(provider), versions)) };
 	if o.min_version.as_deref() == Some("1.3") {

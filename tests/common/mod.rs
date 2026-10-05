@@ -54,6 +54,7 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 
 /// With `global` settings of `http` rules (trusted proxies, access log).
 pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::HttpGlobal) -> Harness {
+	rproxy_api::tls::config::install_default_provider();
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_millis(100),
