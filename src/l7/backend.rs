@@ -7,7 +7,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
@@ -31,8 +31,13 @@ const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 const DEFAULT_RESPONSE: Duration = Duration::from_secs(60);
 const DEFAULT_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
-/// Idle connections kept per server.
-const MAX_IDLE: usize = 32;
+/// Idle connections kept per server. About as many as requests in progress at
+/// once: with fewer, a busy server gets a new connection for most requests (the
+/// HTTP/2 clients of a rule each have up to `max_concurrent_streams` requests going,
+/// and each of those needs a connection of its own to an HTTP/1.1 backend; #195).
+const MAX_IDLE: usize = 1024;
+/// Idle connections unused for longer are closed (when the pool is next used).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -55,7 +60,8 @@ pub struct Server {
 	up: AtomicBool,
 	/// Requests in progress on this server (for `balance: least_conn`).
 	pub inflight: Arc<AtomicU64>,
-	idle: Mutex<Vec<SendRequest<Body>>>,
+	/// Last used at the end: taken from the end (the warmest), expired from the front.
+	idle: Mutex<Vec<(SendRequest<Body>, Instant)>>,
 }
 
 impl Server {
@@ -91,8 +97,8 @@ impl Server {
 	/// An idle connection that can take a request now.
 	pub fn checkout(&self) -> Option<SendRequest<Body>> {
 		let mut idle = self.idle.lock().unwrap();
-		while let Some(s) = idle.pop() {
-			if !s.is_closed() && s.is_ready() {
+		while let Some((s, since)) = idle.pop() {
+			if !s.is_closed() && s.is_ready() && since.elapsed() < IDLE_TIMEOUT {
 				return Some(s);
 			}
 		}
@@ -104,11 +110,21 @@ impl Server {
 		if sender.is_closed() {
 			return;
 		}
-		let mut idle = self.idle.lock().unwrap();
-		idle.retain(|s| !s.is_closed());
-		if idle.len() < MAX_IDLE {
-			idle.push(sender);
+		let now = Instant::now();
+		// dropped outside the lock (dropping a sender ends its connection)
+		let expired: Vec<_>;
+		{
+			let mut idle = self.idle.lock().unwrap();
+			let old = idle.iter().take_while(|(_, since)| now.duration_since(*since) >= IDLE_TIMEOUT).count();
+			expired = idle.drain(..old).collect();
+			if idle.len() >= MAX_IDLE {
+				idle.retain(|(s, _)| !s.is_closed());
+			}
+			if idle.len() < MAX_IDLE {
+				idle.push((sender, now));
+			}
 		}
+		drop(expired);
 	}
 }
 
