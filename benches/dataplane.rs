@@ -122,9 +122,12 @@ async fn echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(s: S, data: &[u8]
 	let len = back.len();
 	let work = async {
 		let write = async {
-			for chunk in data.chunks(64 * 1024) {
-				w.write_all(chunk).await?;
-				wrote += chunk.len();
+			// write_all, counting
+			while wrote < data.len() {
+				match w.write(&data[wrote..]).await? {
+					0 => return Err(std::io::ErrorKind::WriteZero.into()),
+					n => wrote += n,
+				}
 			}
 			w.flush().await
 		};
