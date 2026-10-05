@@ -758,6 +758,8 @@ fn server_configs(tls: &TlsSpec, loaded: &RuleCerts, now: i64) -> Result<(Arc<Se
 	};
 	let mut config = builder.with_cert_resolver(resolver.clone());
 	config.alpn_protocols = tls.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+	// kTLS (src/l4/ktls.rs) takes the record keys after the handshake
+	config.enable_secret_extraction = true;
 
 	let quic = (|| {
 		let mut quic_provider = (*provider).clone();

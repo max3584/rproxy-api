@@ -753,3 +753,80 @@ async fn terminate_does_not_stall_under_backpressure() {
 		assert!(back == data, "round {round}: corrupted");
 	}
 }
+
+/// A backend that sends back what it reads and closes its side after the client's end.
+async fn echo_backend() -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let (s, _) = listener.accept().await.unwrap();
+			tokio::spawn(async move {
+				let (mut r, mut w) = s.into_split();
+				if tokio::io::copy(&mut r, &mut w).await.is_ok() {
+					let _ = w.shutdown().await;
+				}
+			});
+		}
+	});
+	addr
+}
+
+/// Termination with every TLS version and cipher suite: what the client sends right after the
+/// handshake, a large stream both ways, and the clean end (close_notify both ways) arrive
+/// unchanged. With kernel TLS (src/l4/ktls.rs) the records after the handshake are the kernel's;
+/// `RPROXY_TEST_REQUIRE_KTLS=1` (CI's ktls job) checks that it was used.
+#[tokio::test]
+async fn terminate_carries_every_version_and_cipher_suite() {
+	use rustls::crypto::ring::cipher_suite as cs;
+	let pki = Pki::new("ktls");
+	let cert = pki.server("front", &["ktls.test"]);
+	let h = harness().await;
+	let backend = echo_backend().await;
+	let port = free_port();
+	let files = json!([{"cert_file": cert.cert_file, "key_file": cert.key_file}]);
+	let (status, v) = h.post(tcp_rule(port, backend, json!({"mode": "terminate", "certificates": files}))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let require = std::env::var("RPROXY_TEST_REQUIRE_KTLS").is_ok_and(|v| v == "1");
+	let data: Vec<u8> = (0..(3 << 20) + 12345u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+	for (version, suite) in [
+		(&rustls::version::TLS13, cs::TLS13_AES_128_GCM_SHA256),
+		(&rustls::version::TLS13, cs::TLS13_AES_256_GCM_SHA384),
+		(&rustls::version::TLS13, cs::TLS13_CHACHA20_POLY1305_SHA256),
+		(&rustls::version::TLS12, cs::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+		(&rustls::version::TLS12, cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
+		(&rustls::version::TLS12, cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256),
+	] {
+		let mut provider = rustls::crypto::ring::default_provider();
+		provider.cipher_suites = vec![suite];
+		let Ok(builder) = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider)).with_protocol_versions(&[version])
+		else {
+			continue;
+		};
+		let config = builder.with_root_certificates(pki.roots()).with_no_client_auth();
+		let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+		let before = rproxy_api::l4::ktls::CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed);
+		let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		let label = format!("{:?}", suite.suite());
+		let s = connector.connect("ktls.test".try_into().unwrap(), tcp).await.unwrap_or_else(|e| panic!("{label}: {e}"));
+		let (mut r, mut w) = tokio::io::split(s);
+		let sent = data.clone();
+		let writer = tokio::spawn(async move {
+			// a small write right after the handshake, then the rest in uneven pieces
+			w.write_all(&sent[..100]).await?;
+			for piece in sent[100..].chunks(70_001) {
+				w.write_all(piece).await?;
+			}
+			w.shutdown().await
+		});
+		let mut got = Vec::new();
+		let read = tokio::time::timeout(Duration::from_secs(30), r.read_to_end(&mut got)).await.expect(&label);
+		read.unwrap_or_else(|e| panic!("{label}: the stream must end cleanly: {e}"));
+		writer.await.unwrap().unwrap();
+		assert!(got == data, "{label}: {} of {} bytes, or changed", got.len(), data.len());
+		if require {
+			let after = rproxy_api::l4::ktls::CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed);
+			assert!(after > before, "{label}: kernel TLS was not used");
+		}
+	}
+}

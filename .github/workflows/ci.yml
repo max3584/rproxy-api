@@ -59,6 +59,38 @@ jobs:
           RPROXY_TEST_REQUIRE_PYTHON: "1"
         run: cargo test --locked --all-targets
 
+  ktls:
+    name: kernel TLS (perf/ktls experiment)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      # the host's kernel module `tls` (modprobe needs /lib/modules)
+      options: --privileged -v /lib/modules:/lib/modules:ro
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev kmod
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --tests
+      # the load test does not run modprobe: does setting TCP_ULP load the module by itself (CAP_NET_ADMIN)?
+      - name: module autoload
+        continue-on-error: true
+        run: |
+          grep -w '^tls' /proc/modules || echo "tls is not loaded yet"
+          uname -r
+          RPROXY_TEST_REQUIRE_KTLS=1 cargo test --locked --test tls terminate_carries_every_version_and_cipher_suite -- --nocapture
+          grep -w '^tls' /proc/modules || echo "tls is still not loaded"
+      - run: modprobe tls
+      - name: tests with kernel TLS
+        env:
+          RPROXY_TEST_REQUIRE_KTLS: "1"
+        run: cargo test --locked --lib ktls && cargo test --locked --test tls --test integrity --test starttls --test dataplane --test chain
+      - name: tests with kernel TLS off
+        env:
+          RPROXY_KTLS: "off"
+        run: cargo test --locked --test tls --test integrity
+
   transparent:
     name: transparent mode (network namespaces)
     runs-on: ubuntu-latest

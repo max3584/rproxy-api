@@ -18,6 +18,7 @@ use crate::l7::server::{self as http, Metered};
 use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
 use crate::net::source::{self, TlsInfo};
+use crate::l4::ktls;
 use crate::l4::starttls::{self, Outcome};
 use crate::tls::config::{StartTls, TlsMode, TlsRuntime};
 
@@ -267,6 +268,11 @@ impl<S> Prefixed<S> {
 	fn new(prefix: Vec<u8>, inner: S) -> Self {
 		Prefixed { prefix, pos: 0, inner }
 	}
+
+	/// Whether all of the prefix has been read.
+	fn drained(&self) -> bool {
+		self.pos == self.prefix.len()
+	}
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
@@ -439,7 +445,24 @@ async fn terminate(
 		}
 	}
 
-	let (mut session, info) = accept_tls(Prefixed::new(prefix, &mut *inbound), client, rt, offset, config).await?;
+	// kTLS (src/l4/ktls.rs): not with STARTTLS (the greeting and EHLO go through rustls)
+	let kernel = tls.starttls.is_none() && ktls::enabled();
+	let fd = inbound.as_raw_fd();
+	let (mut session, info) =
+		accept_tls(ktls::Records::new(Prefixed::new(prefix, &mut *inbound), kernel), client, rt, offset, config).await?;
+	let mut early = Vec::new();
+	let mut session: Box<dyn Stream + '_> = if kernel && session.get_ref().0.get_ref().drained() && ktls::prepare(session.get_ref().1, fd) {
+		let (mut records, conn) = session.into_inner();
+		let rest = tokio::time::timeout(HANDSHAKE_TIMEOUT, records.rest())
+			.await
+			.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS record timed out"))??;
+		let (stream, decrypted) = ktls::switch(records.into_inner().inner, conn, rest)?;
+		early = decrypted;
+		Box::new(stream)
+	} else {
+		session.get_mut().0.unbound();
+		Box::new(session)
+	};
 	let target = rt
 		.select(info.server_name.as_deref(), offset)
 		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;
@@ -465,6 +488,12 @@ async fn terminate(
 		}
 		None => Box::new(out),
 	};
+	if !early.is_empty() {
+		// already decrypted by rustls before the switch to kTLS
+		upstream.write_all(&early).await?;
+		detail.rx += early.len() as u64;
+		rt.stats.add_rx(early.len() as u64);
+	}
 
 	if let Some(proto) = tls.starttls {
 		let extra = starttls::skip_greeting(proto, &mut upstream).await?;
