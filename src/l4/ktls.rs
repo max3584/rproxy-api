@@ -42,6 +42,12 @@ const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
 const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+const TLS_RX_EXPECT_NO_PAD: libc::c_int = 4;
+
+/// Relay buffers with kTLS (client to backend, backend to client): a read takes whole records
+/// (the kernel decrypts straight into a buffer that holds the record, instead of into its own
+/// and copying), and a write of 16 KiB is one full record.
+pub const BUFFERS: (usize, usize) = (64 << 10, 16 << 10);
 
 const TLS_1_2_VERSION: u16 = 0x0303;
 const TLS_1_3_VERSION: u16 = 0x0304;
@@ -292,6 +298,15 @@ pub fn switch(sock: &mut TcpStream, mut conn: ServerConnection, rest: Vec<u8>) -
 	let fd = sock.as_raw_fd();
 	Crypto::new(version, secrets.tx.0, &secrets.tx.1)?.set(fd, TLS_TX)?;
 	Crypto::new(version, secrets.rx.0, &secrets.rx.1)?.set(fd, TLS_RX)?;
+	if version == TLS_1_3_VERSION {
+		// TLS 1.3: let the kernel decrypt in place (Linux 6.0+; a padded record is decrypted
+		// again the slow way, so it stays correct). Older kernels: ignored.
+		let one: libc::c_int = 1;
+		// SAFETY: `one` is a valid c_int
+		unsafe {
+			libc::setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, (&one as *const libc::c_int).cast(), size_of::<libc::c_int>() as libc::socklen_t)
+		};
+	}
 	CONNECTIONS.fetch_add(1, Ordering::Relaxed);
 	// leave room for close_notify and a margin
 	let tx_limit = limit.saturating_sub(secrets.tx.0).saturating_sub(1024);

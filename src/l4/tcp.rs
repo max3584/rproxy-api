@@ -318,9 +318,24 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	b_fd: RawFd,
 	detail: &mut Detail,
 ) -> io::Result<()> {
+	finish_with(rt, a, b, b_fd, detail, (COPY_BUF, COPY_BUF)).await
+}
+
+/// tokio's `copy_bidirectional` buffer size.
+const COPY_BUF: usize = 8 << 10;
+
+/// [`finish`] with the buffer sizes (client to backend, backend to client).
+async fn finish_with<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+	rt: &Runtime,
+	a: &mut A,
+	b: &mut B,
+	b_fd: RawFd,
+	detail: &mut Detail,
+	sizes: (usize, usize),
+) -> io::Result<()> {
 	let mut client = Counted::new(a, &rt.stats.rx_bytes);
 	let mut backend = Counted::new(b, &rt.stats.tx_bytes);
-	let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+	let result = tokio::io::copy_bidirectional_with_sizes(&mut client, &mut backend, sizes.0, sizes.1).await;
 	detail.rx += client.count;
 	detail.tx += backend.count;
 	if result.is_err() {
@@ -451,6 +466,7 @@ async fn terminate(
 	let (mut session, info) =
 		accept_tls(ktls::Records::new(Prefixed::new(prefix, &mut *inbound), kernel), client, rt, offset, config).await?;
 	let mut early = Vec::new();
+	let mut sizes = (COPY_BUF, COPY_BUF);
 	let mut session: Box<dyn Stream + '_> = if kernel && session.get_ref().0.get_ref().drained() && ktls::prepare(session.get_ref().1, fd) {
 		let (mut records, conn) = session.into_inner();
 		let rest = tokio::time::timeout(HANDSHAKE_TIMEOUT, records.rest())
@@ -458,6 +474,7 @@ async fn terminate(
 			.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS record timed out"))??;
 		let (stream, decrypted) = ktls::switch(records.into_inner().inner, conn, rest)?;
 		early = decrypted;
+		sizes = ktls::BUFFERS;
 		Box::new(stream)
 	} else {
 		session.get_mut().0.unbound();
@@ -504,7 +521,7 @@ async fn terminate(
 			session.write_all(&to_client).await?;
 		}
 	}
-	finish(rt, &mut session, &mut upstream, backend, detail).await
+	finish_with(rt, &mut session, &mut upstream, backend, detail, sizes).await
 }
 
 /// SMTP client that carried on without STARTTLS (`starttls_required: false`).
