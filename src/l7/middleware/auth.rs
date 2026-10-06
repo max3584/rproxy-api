@@ -247,7 +247,9 @@ pub struct BasicAuth {
 /// What `basic_auth` decided.
 pub enum BasicVerdict {
 	Allow(String),
-	Deny,
+	/// Why, for the access log (`auth_error`): `no_credentials`, `unknown_user` or
+	/// `bad_password`. Neither the password nor the name tried is kept.
+	Deny(&'static str),
 	/// The users file could not be read.
 	Unavailable,
 }
@@ -276,7 +278,7 @@ impl BasicAuth {
 	/// Checks `Authorization: Basic`. bcrypt runs on the blocking pool.
 	pub async fn check(&self, headers: &HeaderMap) -> BasicVerdict {
 		let Some(users) = self.users.get() else { return BasicVerdict::Unavailable };
-		let Some((user, password)) = basic_credentials(headers) else { return BasicVerdict::Deny };
+		let Some((user, password)) = basic_credentials(headers) else { return BasicVerdict::Deny("no_credentials") };
 		let key: [u8; 32] = Sha256::digest(format!("{user}:{password}").as_bytes()).into();
 		let generation = Arc::as_ptr(&users) as usize;
 		{
@@ -285,14 +287,14 @@ impl BasicAuth {
 				return BasicVerdict::Allow(user);
 			}
 		}
-		let Some(hash) = users.get(&user).cloned() else { return BasicVerdict::Deny };
+		let Some(hash) = users.get(&user).cloned() else { return BasicVerdict::Deny("unknown_user") };
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
 			Hash::Apr1 { salt, hash } => constant_time_eq(apr1(password.as_bytes(), salt.as_bytes()).as_bytes(), hash.as_bytes()),
 			Hash::Bcrypt(h) => tokio::task::spawn_blocking(move || bcrypt::verify(password, &h).unwrap_or(false)).await.unwrap_or(false),
 		};
 		if !ok {
-			return BasicVerdict::Deny;
+			return BasicVerdict::Deny("bad_password");
 		}
 		let mut c = self.cache.lock().unwrap();
 		if c.0 != generation || c.1.len() >= CACHE_MAX {
@@ -457,15 +459,15 @@ mod tests {
 		let b = BasicAuth::new("auth", file.to_str().unwrap(), None, false, Some("X-User")).unwrap();
 		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(u) if u == "alice"));
 		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(_)), "cached");
-		assert!(matches!(b.check(&basic("alice", "wrong")).await, BasicVerdict::Deny));
-		assert!(matches!(b.check(&basic("mallory", "secret")).await, BasicVerdict::Deny));
-		assert!(matches!(b.check(&HeaderMap::new()).await, BasicVerdict::Deny));
+		assert!(matches!(b.check(&basic("alice", "wrong")).await, BasicVerdict::Deny("bad_password")));
+		assert!(matches!(b.check(&basic("mallory", "secret")).await, BasicVerdict::Deny("unknown_user")));
+		assert!(matches!(b.check(&HeaderMap::new()).await, BasicVerdict::Deny("no_credentials")));
 		assert_eq!(b.challenge(), "Basic realm=\"rproxy\"");
 
 		// a new file takes over (SIGHUP forces the check); the cache does not outlive it
 		std::fs::write(&file, format!("alice:{}\n", bcrypt::hash("new", 4).unwrap())).unwrap();
 		b.users.reload(true);
-		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Deny));
+		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Deny(_)));
 		assert!(matches!(b.check(&basic("alice", "new")).await, BasicVerdict::Allow(_)));
 		// a broken file keeps the current users
 		std::fs::write(&file, "garbage").unwrap();

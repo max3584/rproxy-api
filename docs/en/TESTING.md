@@ -30,6 +30,8 @@ Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc 
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
+Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
+
 ## Unit tests (`src/`)
 
 | File | Test | What it checks |
@@ -218,12 +220,11 @@ For telling the causes apart there is `examples/stall_probe.rs` (the `stall-prob
 
 ## Not yet tested
 
-- Combinations with real mail servers (Postfix / Dovecot) and real WebRTC, TURN, and RTSP clients
-
+- Real mail clients (Thunderbird etc.) and WebRTC in browsers (checked by hand: #42, #44). Combinations with real mail servers (Postfix / Dovecot), TURN (coturn) and RTSP (MediaMTX) are checked by the Interop workflow (below)
 - Continuous forwarding for many hours (the Load workflow's soak can do it when run manually with a long `soak_secs`)
-- The control API with TLS enabled (checked manually, no automated test)
-- Reloading tokens and certificates via SIGHUP (checked manually)
 - The transparent routing procedure using iptables (`-m socket`)
+
+The control API with TLS enabled and reloading tokens and certificates via SIGHUP are checked in `tests/startup.rs` (`an_unreadable_api_certificate_is_retried`, `sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_files`).
 
 ## Combinations with real servers (Interop workflow)
 

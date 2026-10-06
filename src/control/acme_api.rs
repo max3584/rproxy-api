@@ -15,18 +15,19 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
-use super::api::{AppState, Transport};
+use super::api::{AppState, Client, Transport};
 use super::auth::{Principal, Scope};
 use crate::core::rule::{RuleRequest, UpdateRequest};
 use crate::error::ApiError;
 
 /// `event = "audit"` for ACME operations (no secret in it).
-fn audit(principal: &Principal, action: &str, target: &str, result: &Result<(), ApiError>) {
+fn audit(principal: &Principal, client: &Client, action: &str, target: &str, result: &Result<(), ApiError>) {
 	let (outcome, code) = match result {
 		Ok(()) => ("ok", ""),
+		Err(e) if e.code == "forbidden" => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
-	info!(event = "audit", token = %principal.name, action, rule = "", target, outcome, code);
+	info!(event = "audit", token = %principal.name, client = %client.0, action, rule = "", target, outcome, code);
 }
 
 /// Whether a rule (in a POST or PATCH body) has an ACME certificate.
@@ -74,6 +75,7 @@ struct RenewRequest {
 pub async fn renew(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	transport: Option<Extension<Transport>>,
 	body: Bytes,
 ) -> Response {
@@ -86,7 +88,7 @@ pub async fn renew(
 		target = format!("{}:{}", id.resolver, id.domains.join(","));
 		acme.renew(&id)
 	})();
-	audit(&principal, "acme.renew", &target, &result);
+	audit(&principal, &client, "acme.renew", &target, &result);
 	match result {
 		Ok(()) => (StatusCode::ACCEPTED, Json(json!({}))).into_response(),
 		Err(e) => e.into_response(),
@@ -96,6 +98,7 @@ pub async fn renew(
 pub async fn register(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	transport: Option<Extension<Transport>>,
 	Path(name): Path<String>,
 ) -> Response {
@@ -104,7 +107,7 @@ pub async fn register(
 		acme(&state)?.register(&name).await
 	}
 	.await;
-	audit(&principal, "acme.account.register", &name, &result);
+	audit(&principal, &client, "acme.account.register", &name, &result);
 	match result {
 		Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
 		Err(e) => e.into_response(),
@@ -114,6 +117,7 @@ pub async fn register(
 pub async fn deactivate(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	transport: Option<Extension<Transport>>,
 	Path(name): Path<String>,
 ) -> Response {
@@ -122,7 +126,7 @@ pub async fn deactivate(
 		acme(&state)?.deactivate(&name).await
 	}
 	.await;
-	audit(&principal, "acme.account.deactivate", &name, &result);
+	audit(&principal, &client, "acme.account.deactivate", &name, &result);
 	match result {
 		Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
 		Err(e) => e.into_response(),

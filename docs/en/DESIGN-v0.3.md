@@ -30,7 +30,7 @@ version: 1
 
 # Process-wide settings (no precedence over the RPROXY_* environment variables; write each in only one place)
 global:
-  trusted_proxies: [10.0.0.0/8]          # #67. Trust X-Forwarded-For / PROXY headers from this range
+  trusted_proxies: [10.0.0.0/8]          # #67. Trust X-Forwarded-For from this range (→ as implemented, PROXY headers are not read; see 3.)
   access_log: /var/log/rproxy/access.log # #57. Log of L7 requests (JSON Lines)
   acme:                                  # #17, #208 (reshaped in v0.4.0; docs/en/ACME.md)
     storage: /var/lib/rproxy/acme
@@ -87,7 +87,7 @@ http:
 - The upstream is specified with `service` (a name) or `to: http://host:port` (a shorthand for a single service).
 - `X-Forwarded-For` / `-Proto` / `-Host` / `X-Real-IP` are always added (values from `global.trusted_proxies` are carried over. The client IP is the first untrusted address when reading X-Forwarded-For from the right. PROXY headers are not read). WebSocket is passed through as-is.
 - Redirect-only routes (such as HTTP→HTTPS on port 80) have no `service`; the middleware returns the response.
-- (Decided in v0.3.1) `source_ip` is only `proxy` / `transparent` (PROXY headers do not fit per-request forwarding, so the client is conveyed via `X-Forwarded-For`). `tls.routes` is not used; routing is done with `Host(...)`. Verification of `https://` upstreams uses `ca_file` etc. in `tls.upstream`, not `tls.upstream.tls`. Connections to upstreams are first created per request; reuse will be added later. Detailed behavior is in "Behavior of `http` rules" in docs/API.md.
+- (Decided in v0.3.1) `source_ip` is only `proxy` / `transparent` (PROXY headers do not fit per-request forwarding, so the client is conveyed via `X-Forwarded-For`). `tls.routes` is not used; routing is done with `Host(...)`. Verification of `https://` upstreams uses `ca_file` etc. in `tls.upstream`, not `tls.upstream.tls`. Connections to upstreams are first created per request; reuse will be added later (→ reused since v0.3.2; see 9.). Detailed behavior is in "Behavior of `http` rules" in docs/API.md.
 
 ### Writing match (same as Traefik)
 
@@ -132,7 +132,7 @@ Combine with `&&`, `||`, `!` and parentheses.
 tls:
   mode: terminate
   certificates:
-    - acme: letsencrypt                    # Certificate obtained via ACME (instead of files)
+    - acme: letsencrypt                    # Certificate obtained via ACME (instead of files). → Not available (see the note above; unsupported)
       domains: [gitlab.example.com, cdn.example.com]
     - cert_file: /etc/rproxy/tls/other.pem # Files can still be used as before
       key_file: /etc/rproxy/tls/other.key
@@ -204,7 +204,7 @@ rules:
     tls:
       mode: terminate
       certificates:
-        - acme: letsencrypt
+        - acme: letsencrypt                # → not available (the note in 4.); in practice, cert_file / key_file of files made by certbot etc.
           domains: [gitlab.example.com, cdn.example.com]
     http:
       http3: true
@@ -256,7 +256,7 @@ rules:
 - LAPI decisions are fetched in bulk via the stream (`/v1/decisions/stream`) by a single task and shared by all rules. Decisions are tracked by ID, and an address stays blocked as long as another decision for the same address remains.
 - Captchas cannot be shown, so they are treated the same as bans. Only the `Ip` and `Range` scopes are supported.
 - Only bodies with a `Content-Length` of 1 MiB or less are sent to AppSec (reading a body without a length to the end before forwarding would delay streaming and uploads).
-- Using it to cut connections before TLS in L4 (rules without `http`) is not available yet (remaining part of #55).
+- Cutting connections before TLS in L4 (rules without `http`) was added in v0.3.2 as the rule's `crowdsec: true` ("Rules" in docs/API.md).
 
 ## 8. Undecided items (to be worked out during implementation)
 

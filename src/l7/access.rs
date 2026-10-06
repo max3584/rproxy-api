@@ -136,7 +136,8 @@ impl HttpGlobal {
 				backend = %entry.backend, client = %entry.client, method = %entry.method, host = %entry.host,
 				path = %entry.path, query = %entry.query, protocol = %entry.protocol, status = entry.status, duration_ms = entry.duration_ms,
 				bytes_in = entry.bytes_in, bytes_out = entry.bytes_out, user_agent = %entry.user_agent,
-				sni = %entry.sni, tls_version = %entry.tls_version),
+				sni = %entry.sni, tls_version = %entry.tls_version, refused_by = %entry.refused_by, middleware = %entry.middleware,
+				user = %entry.user, auth_error = %entry.auth_error),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
 				line.push(b'\n');
@@ -193,6 +194,17 @@ pub struct AccessEntry {
 	pub user_agent: String,
 	pub sni: String,
 	pub tls_version: String,
+	/// The kind of the middleware that refused the request (`ip_allow`, `basic_auth`,
+	/// `forward_auth`, `oidc`, `crowdsec`, `rate_limit`, `in_flight`, …): it answered
+	/// with an error status. Empty otherwise.
+	pub refused_by: String,
+	/// The name of that middleware in the settings.
+	pub middleware: String,
+	/// The user `basic_auth` let in.
+	pub user: String,
+	/// Why `basic_auth` refused: `no_credentials`, `unknown_user`, `bad_password` or
+	/// `unavailable` (the users file cannot be read). Never the password.
+	pub auth_error: String,
 }
 
 #[derive(Serialize)]

@@ -650,6 +650,12 @@ pub struct RuleView {
 	pub error: Option<String>,
 	pub resolved: Vec<String>,
 	pub connections: u64,
+	/// Every target is down (#115): rules with several targets or a health check
+	/// (`stats.targets`). False for other rules and while failed.
+	pub all_targets_down: bool,
+	/// `http` services with `health_check` that have no server up (#115).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub down_services: Vec<String>,
 	pub stats: RuleStats,
 	/// When the listener started, in Unix seconds (null while failed).
 	pub started_at: Option<u64>,
@@ -687,6 +693,8 @@ impl RuleView {
 			error,
 			resolved: resolved.iter().map(|a| a.to_string()).collect(),
 			connections,
+			all_targets_down: false,
+			down_services: vec![],
 			stats: RuleStats::default(),
 			started_at: None,
 			cert_status: vec![],

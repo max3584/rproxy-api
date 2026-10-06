@@ -172,12 +172,21 @@ impl Entry {
 					}),
 					targets: if pool.reported { pool.status() } else { vec![] },
 				};
+				view.all_targets_down = pool.all_down();
+				if let Some(http) = &view.stats.http {
+					view.down_services = down_services(&http.services);
+				}
 				view.started_at = Some(r.started_at);
 				view
 			}
 			Entry::Failed(f) => RuleView::new(&f.spec, State::Failed, Some(f.error.clone()), &[], 0),
 		}
 	}
+}
+
+/// Services with health checks that have no server up.
+fn down_services(health: &std::collections::BTreeMap<String, Vec<crate::l7::backend::ServerHealth>>) -> Vec<String> {
+	health.iter().filter(|(_, servers)| !servers.iter().any(|s| s.up)).map(|(name, _)| name.clone()).collect()
 }
 
 /// What a rule needs before it can listen: resolved targets and TLS settings.
@@ -651,6 +660,7 @@ impl Registry {
 			listen: RwLock::new(spec.listen_ips()),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
+			denied_log: Default::default(),
 			stop: kill.child_token(),
 			kill,
 			tracker: TaskTracker::new(),
@@ -1411,7 +1421,19 @@ impl Registry {
 			let _ = writeln!(out, "# HELP rproxy_crowdsec_synced Whether the decisions have been pulled from the LAPI at least once.");
 			let _ = writeln!(out, "# TYPE rproxy_crowdsec_synced gauge");
 			let _ = writeln!(out, "rproxy_crowdsec_synced {}", u8::from(b.synced()));
+			let status = b.status();
+			let _ = writeln!(out, "# HELP rproxy_crowdsec_connected Whether the last pull of the decisions from the LAPI succeeded.");
+			let _ = writeln!(out, "# TYPE rproxy_crowdsec_connected gauge");
+			let _ = writeln!(out, "rproxy_crowdsec_connected {}", u8::from(status.connected));
+			if let Some(at) = status.last_success {
+				let _ = writeln!(out, "# HELP rproxy_crowdsec_last_success_timestamp_seconds Unix time of the last successful pull from the LAPI.");
+				let _ = writeln!(out, "# TYPE rproxy_crowdsec_last_success_timestamp_seconds gauge");
+				let _ = writeln!(out, "rproxy_crowdsec_last_success_timestamp_seconds {at}");
+			}
 		}
+		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals under attack do not flood the log (UDP conn.denied, control API audit).");
+		let _ = writeln!(out, "# TYPE rproxy_log_suppressed_total counter");
+		let _ = writeln!(out, "rproxy_log_suppressed_total {}", crate::logging::suppressed_total());
 		out
 	}
 }
@@ -1456,6 +1478,7 @@ impl Registry {
 fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut up = vec![];
 	let mut conns = vec![];
+	let mut all_down = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
 	for key in keys {
@@ -1464,6 +1487,7 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		if !pool.reported {
 			continue;
 		}
+		all_down.push(format!("rproxy_rule_all_targets_down{{protocol=\"{}\",listen=\"{}\"}} {}", key.protocol, key.listen, u8::from(pool.all_down())));
 		for t in pool.status() {
 			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false }.remote();
 			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, target.replace('"', "\\\""));
@@ -1474,6 +1498,11 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_target_up Targets of rules with several targets or a health check: 1 up, 0 down.");
 	let _ = writeln!(out, "# TYPE rproxy_target_up gauge");
 	for line in up {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_rule_all_targets_down Rules with several targets or a health check: 1 when every target is down.");
+	let _ = writeln!(out, "# TYPE rproxy_rule_all_targets_down gauge");
+	for line in all_down {
 		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_target_connections Open TCP connections or UDP sessions per target.");
@@ -1492,6 +1521,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut limited = vec![];
 	let mut blocked = vec![];
 	let mut up = vec![];
+	let mut service_down = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
 	for key in keys {
@@ -1536,6 +1566,13 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		}
 		if let Some(router) = r.rt.http_router() {
 			for (service, servers) in router.health() {
+				service_down.push(format!(
+					"rproxy_http_service_down{{protocol=\"{}\",listen=\"{}\",service=\"{}\"}} {}",
+					key.protocol,
+					key.listen,
+					esc(&service),
+					u8::from(!servers.iter().any(|s| s.up))
+				));
 				for s in servers {
 					up.push(format!(
 						"rproxy_http_server_up{{protocol=\"{}\",listen=\"{}\",service=\"{}\",server=\"{}\"}} {}",
@@ -1552,6 +1589,11 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_server_up Servers of http services with health_check: 1 up, 0 down.");
 	let _ = writeln!(out, "# TYPE rproxy_http_server_up gauge");
 	for line in up {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_service_down Services of http rules with health_check: 1 when no server is up.");
+	let _ = writeln!(out, "# TYPE rproxy_http_service_down gauge");
+	for line in service_down {
 		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_requests_total HTTP requests of http rules by route and status class.");

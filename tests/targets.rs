@@ -194,10 +194,38 @@ async fn backups_serve_only_while_every_other_target_is_down() {
 	for _ in 0..3 {
 		assert_eq!(which(port).await, "A:");
 	}
-	a_task.abort();
 	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	assert_eq!(h.get(&path).await.1["all_targets_down"], false);
+	a_task.abort();
 	wait_view(&h, &path, "A is checked down", |v| v["stats"]["targets"][0]["up"] == false).await;
 	assert_eq!(which(port).await, "B:");
+	assert_eq!(h.get(&path).await.1["all_targets_down"], false, "the backup is up");
+}
+
+/// A rule whose every target is down says so (#115), in the rule and in /metrics.
+#[tokio::test]
+async fn a_rule_with_every_target_down_says_so() {
+	let h = harness().await;
+	let (a, a_task) = tcp_backend_on("127.0.0.1", 0, "A:").await;
+	let (b, b_task) = tcp_backend_on("127.0.0.1", 0, "B:").await;
+	let port = free_port();
+	let body = multi("tcp", port, vec![target(a), target(b)], json!({"health_check": {"interval": "100ms", "timeout": "200ms"}}));
+	assert_eq!(h.post(body).await.0, StatusCode::CREATED);
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let metric = |n: u8| format!("rproxy_rule_all_targets_down{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\"}} {n}");
+	let metrics = || async { h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap() };
+	assert_eq!(h.get(&path).await.1["all_targets_down"], false);
+	assert!(metrics().await.contains(&metric(0)));
+
+	a_task.abort();
+	b_task.abort();
+	let v = wait_view(&h, &path, "every target down", |v| v["all_targets_down"] == true).await;
+	assert_eq!(v["stats"]["targets"][0]["up"], false, "{v}");
+	assert!(metrics().await.contains(&metric(1)));
+
+	// back when one answers again
+	let (_, _a) = tcp_backend_on("127.0.0.1", a.port(), "A:").await;
+	wait_view(&h, &path, "a target back", |v| v["all_targets_down"] == false).await;
 }
 
 #[tokio::test]

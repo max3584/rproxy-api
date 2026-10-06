@@ -30,6 +30,8 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
+SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
+
 ## 単体テスト（`src/`）
 
 | ファイル | テスト | 確かめること |
@@ -218,12 +220,11 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 ## まだテストしていないこと
 
-- 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ
-
+- 実際のメールクライアント（Thunderbird など）と、ブラウザの WebRTC（手動で確かめる：#42・#44）。実際のメールサーバ（Postfix / Dovecot）・TURN（coturn）・RTSP（MediaMTX）との組み合わせは Interop ワークフロー（下）で確かめている
 - 数時間を超える連続転送（Load ワークフローの soak は手動で `soak_secs` を長くすれば回せる）
-- TLS を有効にした制御 API（手動では確認済み、自動テストはない）
-- SIGHUP によるトークン・証明書の再読込（手動では確認済み）
 - iptables（`-m socket`）を使う transparent のルーティング手順
+
+TLS を有効にした制御 API と、SIGHUP によるトークン・証明書の再読込は `tests/startup.rs`（`an_unreadable_api_certificate_is_retried`・`sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_files`）で確かめている。
 
 ## 実際のサーバとの組み合わせ（Interop ワークフロー）
 

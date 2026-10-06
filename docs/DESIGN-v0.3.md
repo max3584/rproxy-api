@@ -30,7 +30,7 @@ version: 1
 
 # プロセス全体の設定（環境変数の RPROXY_* より優先しない。どちらか片方で書く）
 global:
-  trusted_proxies: [10.0.0.0/8]          # #67。この範囲からの X-Forwarded-For / PROXY ヘッダを信用する
+  trusted_proxies: [10.0.0.0/8]          # #67。この範囲からの X-Forwarded-For を信用する（→ 実装では PROXY ヘッダは読まない。3. を参照）
   access_log: /var/log/rproxy/access.log # #57。L7 のリクエストのログ（JSON Lines）
   acme:                                  # #17・#208（v0.4.0 で形を決め直した。docs/ACME.md）
     storage: /var/lib/rproxy/acme
@@ -87,7 +87,7 @@ http:
 - 転送先は `service`（名前）か、`to: http://host:port`（サービスを 1 つだけ書く省略形）で指定する。
 - `X-Forwarded-For` / `-Proto` / `-Host` / `X-Real-IP` は常に付ける（`global.trusted_proxies` からの値は引き継ぐ。クライアントの IP は X-Forwarded-For を右から見て最初の信頼しないアドレス。PROXY ヘッダは読まない）。WebSocket はそのまま通す。
 - リダイレクトだけのルート（80 番の HTTP→HTTPS など）は `service` を書かず、ミドルウェアが応答を返す。
-- （v0.3.1 で決めたこと）`source_ip` は `proxy` / `transparent` だけ（PROXY ヘッダはリクエスト単位の転送に合わないので `X-Forwarded-For` で渡す）。`tls.routes` は使わず `Host(...)` で振り分ける。`https://` の転送先の検証には `tls.upstream` の `ca_file` などを使い、`tls.upstream.tls` は使わない。転送先への接続はまずリクエストごとに作り、再利用は後で足す。細かい動きは docs/API.md の「`http` のルールの動き」。
+- （v0.3.1 で決めたこと）`source_ip` は `proxy` / `transparent` だけ（PROXY ヘッダはリクエスト単位の転送に合わないので `X-Forwarded-For` で渡す）。`tls.routes` は使わず `Host(...)` で振り分ける。`https://` の転送先の検証には `tls.upstream` の `ca_file` などを使い、`tls.upstream.tls` は使わない。転送先への接続はまずリクエストごとに作り、再利用は後で足す（→ v0.3.2 で使い回すようにした。9.）。細かい動きは docs/API.md の「`http` のルールの動き」。
 
 ### match の書き方（Traefik と同じ）
 
@@ -132,7 +132,7 @@ http:
 tls:
   mode: terminate
   certificates:
-    - acme: letsencrypt                    # ACME で取る証明書（ファイルの代わり）
+    - acme: letsencrypt                    # ACME で取る証明書（ファイルの代わり）。→ 使えない（上の注記。unsupported）
       domains: [gitlab.example.com, cdn.example.com]
     - cert_file: /etc/rproxy/tls/other.pem # 今までどおりファイルも使える
       key_file: /etc/rproxy/tls/other.key
@@ -204,7 +204,7 @@ rules:
     tls:
       mode: terminate
       certificates:
-        - acme: letsencrypt
+        - acme: letsencrypt                # → 使えない（4. の注記）。実際には certbot などが作るファイルを cert_file / key_file に書く
           domains: [gitlab.example.com, cdn.example.com]
     http:
       http3: true
@@ -256,7 +256,7 @@ rules:
 - LAPI の判定は stream（`/v1/decisions/stream`）で 1 つのタスクがまとめて取り、全ルールで共有する。判定は ID ごとに覚え、同じアドレスの別の判定が残っていれば止め続ける。
 - captcha は出せないので ban と同じに扱う。scope は `Ip` と `Range` だけ。
 - AppSec には、`Content-Length` が 1 MiB 以下の本文だけを送る（長さのない本文を読み切ってから転送すると、ストリーミングやアップロードを遅らせるため）。
-- L4（`http` のないルール）で TLS より前に切る使い方は、まだない（#55 の残り）。
+- L4（`http` のないルール）で TLS より前に切る使い方は、v0.3.2 でルールの `crowdsec: true` として入れた（docs/API.md の「ルール」）。
 
 ## 8. 決めていないこと（実装しながら詰める）
 
