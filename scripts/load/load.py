@@ -20,6 +20,9 @@ Settings (environment variables; docs/TESTING.md):
   SIZE_MIB=1024 REPEAT=3 DURATION=10 CONNS=2000 UDP_SESSIONS=1000 RULES=100,1000
   UDP_BW=1G UDP_PPS=50000 H2_REQS=200000 H2_CONNS=64 SOAK_SECS=0 HAPROXY=auto
   LOG_LEVEL=warn PREVIOUS=<results.json of an earlier run>
+  PROFILE=1   perf record -g of each rproxy during the small HTTP requests: OUT/profile/<case>-<target>.svg
+              (flame graph; FLAMEGRAPH=<dir of brendangregg/FlameGraph>) and .txt (top functions). Build
+              with frame pointers (RUSTFLAGS="-C force-frame-pointers=yes") and symbols for useful stacks
   BINS=label=path,label=path   several rproxy builds (git refs) side by side; the first is the baseline
 """
 
@@ -75,6 +78,8 @@ H2_CONNS = int(E.get("H2_CONNS", "64"))
 SOAK_SECS = int(E.get("SOAK_SECS", "0"))
 SOAK_BW = E.get("SOAK_BW", "1G")
 LOG_LEVEL = E.get("LOG_LEVEL", "warn")
+PROFILE = E.get("PROFILE", "") not in ("", "0")
+FLAMEGRAPH = E.get("FLAMEGRAPH", "")
 CLK = os.sysconf("SC_CLK_TCK")
 NPROC = os.cpu_count() or 1
 
@@ -506,10 +511,66 @@ def sc_tls(targets):
 			check(f"tls handshakes via {t.name}", False, str(e)[:300])
 
 
+class Profile:
+	"""PROFILE=1: perf record -g of an rproxy while the block runs, then a flame graph
+	(OUT/profile/<name>.svg, with FLAMEGRAPH) and the top functions (<name>.txt)."""
+
+	def __init__(self, t, name):
+		self.pid = t.pid if PROFILE and t.name.startswith("rproxy") and have("perf") else None
+		self.name = name
+
+	def __enter__(self):
+		if self.pid:
+			self.dir = os.path.join(OUT, "profile")
+			os.makedirs(self.dir, exist_ok=True)
+			self.data = os.path.join(WORK, f"{self.name}.perf")
+			self.proc = subprocess.Popen(["perf", "record", "-F", "499", "-g", "-p", str(self.pid), "-o", self.data],
+										 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+			time.sleep(0.5)
+		return self
+
+	def __exit__(self, *exc):
+		if not self.pid:
+			return
+		self.proc.send_signal(2)
+		try:
+			self.proc.wait(timeout=60)
+		except subprocess.TimeoutExpired:
+			self.proc.kill()
+		base = os.path.join(self.dir, self.name)
+		try:
+			with open(base + ".txt", "w") as f:
+				for args in (["--no-children"], ["--children"]):
+					f.write(f"# perf report {' '.join(args)}\n")
+					f.flush()
+					subprocess.run(["perf", "report", "-i", self.data, "--stdio", "--no-inline", "-g", "none", "--percent-limit", "0.3"]
+								   + args, stdout=f, stderr=subprocess.DEVNULL, timeout=600)
+			if FLAMEGRAPH:
+				script = subprocess.run(["perf", "script", "-i", self.data, "--no-inline"], capture_output=True, timeout=600).stdout
+				folded = subprocess.run([os.path.join(FLAMEGRAPH, "stackcollapse-perf.pl")], input=script, capture_output=True,
+										timeout=600).stdout
+				with open(base + ".folded", "wb") as f:
+					f.write(folded)
+				with open(base + ".svg", "wb") as f:
+					f.write(subprocess.run([os.path.join(FLAMEGRAPH, "flamegraph.pl"), "--title", self.name, "--width", "1600"],
+										   input=folded, capture_output=True, timeout=600).stdout)
+			log(f"profile: {base}.svg / .txt")
+		except Exception as e:  # noqa: BLE001
+			log(f"profile {self.name} failed: {e}")
+		finally:
+			if os.path.exists(self.data):
+				os.remove(self.data)
+
+
 def h2load(t, case, url, args):
-	logf = os.path.join(WORK, "h2load.log")
 	threads = str(min(4, NPROC))
-	with Meter(t) as m:
+	slug = "".join(c if c.isalnum() else "-" for c in f"{case}-{t.name}").strip("-")
+	# a new file per run: h2load appends to --log-file, so a shared one mixed the latencies
+	# of every earlier run into the later ones (p50 / p99 grew with each target; #195)
+	logf = os.path.join(WORK, f"h2load-{slug}.log")
+	if os.path.exists(logf):
+		os.remove(logf)
+	with Profile(t, slug), Meter(t) as m:
 		p = run(ns(NS_C, ["h2load", "-n", str(H2_REQS), "-c", str(H2_CONNS), "-t", threads, "--log-file", logf] + args + [url + "/small"]),
 				timeout=1800, check_rc=False)
 	out = p.stdout
@@ -895,7 +956,7 @@ def meta():
 		"netem": E.get("NETEM", ""),
 		"params": {"scenarios": SCENARIOS, "size_mib": SIZE // MIB, "repeat": REPEAT, "duration": DURATION, "conns": CONNS,
 				   "udp_sessions": UDP_SESSIONS, "rules": RULES, "udp_bw": UDP_BW, "udp_pps": UDP_PPS, "h2_reqs": H2_REQS,
-				   "h2_conns": H2_CONNS, "soak_secs": SOAK_SECS, "log_level": LOG_LEVEL},
+				   "h2_conns": H2_CONNS, "soak_secs": SOAK_SECS, "log_level": LOG_LEVEL, "profile": PROFILE},
 		"tools": {t: tool_version(a) for t, a in {"iperf3": ["iperf3", "--version"], "h2load": ["h2load", "--version"],
 												  "curl": ["curl", "--version"], "socat": ["socat", "-V"], "openssl": ["openssl", "version"],
 												  "haproxy": ["haproxy", "-v"]}.items() if have(a[0])},

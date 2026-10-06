@@ -339,6 +339,10 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 - Every ref in `refs` (comma-separated, default `master`) is built, and the same scenarios run for each on the same runner. So that the runner's ups and downs hit them all alike, each scenario (and each repetition within it) goes through the refs in turn (A, B, C, A, B, C, ...). One rproxy per build runs at the same time on its own address (10.71.1.11 and up) and only the one being measured gets traffic (`memory` and `soak` start fresh processes per build)
 - `summary.md` starts with "Builds compared": per scenario, a column per ref and the change against the first ref (the baseline). JSON: the whole `results.json` and one `results-<ref>.json` per ref (`/` becomes `_`)
 - More refs take longer (the soak runs per build); pick the scenarios you need with `scenarios`
+- `profile: true` (#195): `load (clean)` records rproxy with `perf record -g` (499 Hz) during the small HTTP requests (HTTP/1.1, h2c, h2 over TLS) and keeps flame graphs (`<case>-<target>.svg`) and the heaviest functions (`.txt`, `perf report` self and children) in `profile/` of the artifact. So that stacks can be walked, this job alone builds with frame pointers (`-C force-frame-pointers=yes`), symbols and line tables (releases stay stripped). Recording costs something too, so do not compare its numbers with ordinary runs (measure without `profile` in a separate run). Locally: `PROFILE=1 FLAMEGRAPH=<dir of brendangregg/FlameGraph>` (needs `perf`)
+  ```bash
+  gh workflow run load.yml --ref perf/h2-cpu -f refs=master,perf/h2-cpu -f scenarios=http -f profile=true
+  ```
 - Only workflows on the default branch (master) can be dispatched from the Actions page or `gh workflow run`. The scripts (`scripts/load/`) come from the branch the run is started on (`--ref`, master by default)
 
 `scripts/soak.py` (the "Long-running load test" above) is the (manual) loopback soak centered on connection churn, and stays as it is.

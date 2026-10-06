@@ -339,6 +339,10 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 - `refs`（カンマ区切り。既定 `master`）の各 ref をそれぞれビルドし、同じランナーで同じシナリオを動かす。ランナーの揺れがどれにも同じように効くように、シナリオ（とその中の繰り返し）ごとに ref を順に回す（A, B, C, A, B, C, …）。rproxy はビルドごとに別のアドレス（10.71.1.11〜）で同時に起動しておき、測るものだけに流す（`memory`・`soak` はビルドごとに新しく起動する）
 - `summary.md` の先頭に「Builds compared」：シナリオごとに ref ごとの列を並べ、最初の ref（基準）に対する差分を出す。JSON は全体の `results.json` と ref ごとの `results-<ref>.json`（`/` は `_`）
 - ref が増えるほど時間がかかる（soak はビルドごと）。必要なシナリオだけを `scenarios` で選ぶ
+- `profile: true`（#195）：`load (clean)` で HTTP の小さなリクエスト（HTTP/1.1・h2c・h2 over TLS）の間、rproxy を `perf record -g`（499 Hz）で記録し、artifact の `profile/` にフレームグラフ（`<ケース>-<ターゲット>.svg`）と重い関数の一覧（`.txt`、`perf report` の self と children）を残す。スタックを辿れるように、このジョブだけフレームポインタ（`-C force-frame-pointers=yes`）・シンボル・行の情報つきでビルドする（リリースは今までどおり strip）。記録の負荷もあるので、数字はふだんの実行と比べない（比べる計測は `profile` なしで別に回す）。手元では `PROFILE=1 FLAMEGRAPH=<brendangregg/FlameGraph のディレクトリ>`（`perf` が要る）
+  ```bash
+  gh workflow run load.yml --ref perf/h2-cpu -f refs=master,perf/h2-cpu -f scenarios=http -f profile=true
+  ```
 - ワークフローの手動実行は、既定のブランチ（master）にあるワークフローだけが Actions の画面・`gh workflow run` に出る。スクリプト（`scripts/load/`）は実行したブランチ（`--ref`。既定は master）のものを使う
 
 `scripts/soak.py`（上の「長時間の負荷テスト」）は loopback で接続の開け閉めを中心にした soak（手動）で、そのまま残している。
