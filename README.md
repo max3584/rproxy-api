@@ -61,6 +61,8 @@ cp .env.example .env   # 値を環境に合わせて書き換える
 ./target/release/rproxy-api
 ```
 
+メモリの割り当てには既定で mimalloc を使う（cargo の機能 `alloc-mimalloc`。C コンパイラでビルドする）。libc の malloc に戻すときは `cargo build --locked --release --no-default-features`。
+
 systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ内容を渡せる。
 
 | 環境変数 | 引数 | 既定 | 説明 |

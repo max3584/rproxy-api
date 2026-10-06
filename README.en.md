@@ -61,6 +61,8 @@ cp .env.example .env   # edit the values to match your environment
 ./target/release/rproxy-api
 ```
 
+Memory is allocated with mimalloc by default (the cargo feature `alloc-mimalloc`, built with the C compiler). To use the libc's malloc instead, build with `cargo build --locked --release --no-default-features`.
+
 When running under systemd, you can pass the same content with `EnvironmentFile=/etc/rproxy/rproxy.env`.
 
 | Environment variable | Argument | Default | Description |
