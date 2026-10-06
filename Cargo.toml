@@ -63,10 +63,11 @@ assets = [
 # md-5 is used as `md5` (src/l7/middleware/auth.rs, htpasswd APR1)
 ignored = ["md-5"]
 
-# the global allocator (#185). Without one of these the binary uses the libc's malloc
-# (musl's malloc in the static release builds, which serialises threads on a lock)
+# the global allocator (#185). Off by default: the binary uses the libc's malloc (musl's in the
+# static release builds), which takes the least memory. alloc-mimalloc trades memory for CPU
+# (HTTP/2 and small HTTP requests: +20-30% req/s, +25-170% per CPU-second; idle RSS +6 MiB)
 [features]
-default = ["alloc-mimalloc"]
+default = []
 alloc-mimalloc = ["dep:mimalloc"]
 
 [dependencies]

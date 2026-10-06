@@ -23,8 +23,9 @@ use rproxy_api::core::registry::{Config, ConfigStatus, Registry};
 use rproxy_api::tls::config::CertRole;
 use rproxy_api::{config::db, core::resolve, logging, net::source};
 
-/// mimalloc instead of the libc's malloc (`alloc-mimalloc`, on by default. #185): musl's malloc takes a
+/// mimalloc instead of the libc's malloc (`alloc-mimalloc`, off by default. #185): musl's malloc takes a
 /// global lock, and the data plane (hyper, h2, rustls, tokio) allocates small objects from every worker thread.
+/// It is faster for L7 but uses more memory, so the default stays the libc's malloc.
 #[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

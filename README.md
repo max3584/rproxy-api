@@ -61,7 +61,7 @@ cp .env.example .env   # 値を環境に合わせて書き換える
 ./target/release/rproxy-api
 ```
 
-メモリの割り当てには既定で mimalloc を使う（cargo の機能 `alloc-mimalloc`。C コンパイラでビルドする）。libc の malloc に戻すときは `cargo build --locked --release --no-default-features`。
+メモリの割り当ては既定で libc の malloc（リリースのバイナリは musl の malloc。メモリが最も少ない）。L7（HTTP/2・小さいリクエストの多い HTTP）で CPU を減らしたいときは、mimalloc でビルドできる：`cargo build --locked --release --features alloc-mimalloc`（C コンパイラでビルドする）。手元の測定では HTTP/2 と小さい HTTP のリクエストが 20〜30% 速く、CPU 秒あたりの処理が 25〜170% 増えるかわりに、起動直後のメモリが約 6 MiB、負荷時のピークが 15〜40 MiB 増える。
 
 systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ内容を渡せる。
 
