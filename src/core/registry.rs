@@ -53,18 +53,31 @@ enum Bound {
 	Udp(Vec<Vec<tokio::net::UdpSocket>>),
 }
 
-/// Sockets per UDP port of a rule (#194): one for each worker thread, so that
-/// that many tasks read the port at once. A range of ports gets fewer, to keep
-/// the sockets of one address within `UDP_SHARD_SOCKETS`. `RPROXY_UDP_SHARDS`
-/// overrides the number of worker threads (an experiment's tunable).
+/// Sockets per UDP port of a rule (#194). One by default: batching
+/// (`recvmmsg` / `sendmmsg`) gave most of the gain, while more sockets cost CPU
+/// and only moved the bottleneck to the sessions in the load test. More are
+/// opt-in through `RPROXY_UDP_SHARDS` (an experiment's tunable; the setting's
+/// shape is for v0.4.0). A range of ports gets fewer, to keep the sockets of
+/// one address within `UDP_SHARD_SOCKETS`.
 /// Decided when the sockets are opened only: a group that changes size makes
 /// the kernel send clients to other sockets, where their sessions are not.
 fn udp_shards(ports: u16) -> usize {
 	const UDP_SHARD_SOCKETS: usize = 64;
-	static FORCED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-	let forced = *FORCED.get_or_init(|| std::env::var("RPROXY_UDP_SHARDS").ok().and_then(|v| v.trim().parse().ok()));
-	let workers = forced.unwrap_or_else(|| tokio::runtime::Handle::try_current().map(|h| h.metrics().num_workers()).unwrap_or(1));
-	workers.min(UDP_SHARD_SOCKETS / usize::from(ports.max(1))).clamp(1, UDP_SHARD_SOCKETS)
+	static FROM_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+	let forced = match FORCED_UDP_SHARDS.load(Ordering::Relaxed) {
+		0 => *FROM_ENV.get_or_init(|| std::env::var("RPROXY_UDP_SHARDS").ok().and_then(|v| v.trim().parse().ok())),
+		n => Some(n),
+	};
+	forced.unwrap_or(1).min(UDP_SHARD_SOCKETS / usize::from(ports.max(1))).clamp(1, UDP_SHARD_SOCKETS)
+}
+
+static FORCED_UDP_SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the number of UDP shards for rules created from now on, over
+/// `RPROXY_UDP_SHARDS` (tests; 0 goes back to the environment).
+#[doc(hidden)]
+pub fn force_udp_shards(n: usize) {
+	FORCED_UDP_SHARDS.store(n, Ordering::Relaxed);
 }
 
 struct Running {
@@ -1563,6 +1576,17 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 mod tests {
 	use super::*;
 	use crate::core::rule::RuleRequest;
+
+	/// One socket per UDP port unless asked for more (#194); a range is capped.
+	#[test]
+	fn udp_shards_default_to_one() {
+		if std::env::var_os("RPROXY_UDP_SHARDS").is_none() {
+			assert_eq!(udp_shards(1), 1);
+		}
+		force_udp_shards(8);
+		assert_eq!((udp_shards(1), udp_shards(16), udp_shards(10_000)), (8, 4, 1));
+		force_udp_shards(0);
+	}
 
 	fn registry() -> Arc<Registry> {
 		Registry::new(Config {

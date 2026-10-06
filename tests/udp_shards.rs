@@ -3,8 +3,8 @@
 //! hash of the datagram's addresses and ports, so a client keeps reaching the
 //! same one: its session must not be opened twice, replies must still leave
 //! from the address it sent to (#137), and the counters add up over the shards.
-//! The other UDP tests run on one worker thread (one socket per port); these use
-//! four.
+//! One socket per port is the default; these tests ask for four
+//! (`RPROXY_UDP_SHARDS`, here through `force_udp_shards`).
 
 #![cfg(target_os = "linux")]
 
@@ -19,6 +19,12 @@ use tokio::net::UdpSocket;
 
 use common::*;
 
+/// A harness whose UDP rules get four sockets per port.
+async fn sharded() -> Harness {
+	rproxy_api::core::registry::force_udp_shards(4);
+	harness().await
+}
+
 /// Sockets bound to `port` (UDP over IPv4), from /proc/net/udp.
 fn sockets_on(port: u16) -> usize {
 	let table = std::fs::read_to_string("/proc/net/udp").unwrap();
@@ -28,7 +34,7 @@ fn sockets_on(port: u16) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clients_keep_one_session_across_shards() {
-	let h = harness().await;
+	let h = sharded().await;
 	let backend = udp_backend("U:").await;
 	let port = free_udp_port();
 	let (status, v) = h.post(rule("udp", port, backend)).await;
@@ -63,7 +69,7 @@ async fn clients_keep_one_session_across_shards() {
 async fn bursts_keep_their_order_and_headers() {
 	let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let backend_addr = backend.local_addr().unwrap();
-	let h = harness().await;
+	let h = sharded().await;
 	let port = free_udp_port();
 	let mut r = rule("udp", port, backend_addr);
 	r["source_ip"] = json!("proxy_v2");
@@ -93,7 +99,7 @@ async fn bursts_keep_their_order_and_headers() {
 /// answers from there (#137); `allow_from` and its counter hold on every shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wildcard_replies_and_allow_from_on_every_shard() {
-	let h = harness().await;
+	let h = sharded().await;
 	let backend = udp_backend("W:").await;
 	let port = free_udp_port();
 	let mut r = rule("udp", port, backend);
@@ -128,7 +134,7 @@ async fn a_port_held_by_another_reuseport_socket_is_in_use() {
 	let other = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
 	other.set_reuse_port(true).unwrap();
 	other.bind(&SocketAddr::from(([127, 0, 0, 1], port)).into()).unwrap();
-	let h = harness().await;
+	let h = sharded().await;
 	let (status, v) = h.post(rule("udp", port, "127.0.0.1:9".parse().unwrap())).await;
 	assert_ne!(status, StatusCode::CREATED, "{v}");
 	assert_eq!(sockets_on(port), 1, "only the other socket");
