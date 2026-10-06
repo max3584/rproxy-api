@@ -709,6 +709,50 @@ async fn an_expired_client_ca_only_warns() {
 	assert_eq!(h.registry.check_certificate_expiry().await, 0, "a CA does not stop the rule");
 }
 
+/// Every certificate file a rule uses is reported with its role: the client
+/// CA's intermediates (`client_chain`) and both files towards the backend.
+#[tokio::test]
+async fn cert_status_names_every_role() {
+	let pki = Pki::three_tier("roles");
+	let server = pki.server("front", &["roles.test"]);
+	let to_backend = pki.client("to-backend", "rproxy");
+	let upstream_ca = pki.bundle_file();
+	let chain = pki.chain_file.clone().unwrap();
+	let h = harness().await;
+	let port = free_port();
+	let backend = tcp_backend("R:").await;
+	let tls = json!({"mode": "terminate",
+		"certificates": [{"cert_file": server.cert_file, "chain_file": chain, "key_file": server.key_file}],
+		"client_auth": {"mode": "optional", "ca_file": pki.ca_file, "chain_file": chain},
+		"upstream": {"tls": true, "ca_file": upstream_ca, "cert_file": to_backend.cert_file, "key_file": to_backend.key_file}});
+	let (status, v) = h.post(tcp_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let roles: Vec<(String, String)> = v["cert_status"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|c| (c["role"].as_str().unwrap().to_string(), c["file"].as_str().unwrap().to_string()))
+		.collect();
+	for (role, file) in [
+		("certificate", &server.cert_file),
+		("client_ca", &pki.ca_file),
+		("client_chain", &chain),
+		("upstream_ca", &upstream_ca),
+		("upstream_certificate", &to_backend.cert_file),
+	] {
+		assert!(roles.contains(&(role.to_string(), file.clone())), "{role} {file} not in {roles:?}");
+	}
+	for c in v["cert_status"].as_array().unwrap() {
+		assert_eq!(c["state"], "ok", "{c}");
+		assert!(c["days_left"].as_i64().unwrap() > 300, "{c}");
+	}
+	let text = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	for role in ["client_chain", "upstream_ca", "upstream_certificate"] {
+		let labels = format!("protocol=\"tcp\",listen=\"127.0.0.1:{port}\",role=\"{role}\"");
+		assert!(text.lines().any(|l| l.starts_with(&format!("rproxy_cert_expiry_seconds{{{labels}"))), "{role}: {text}");
+	}
+}
+
 /// Large echoes through `terminate` with a small client send buffer (#187): rproxy
 /// passes every byte on in both directions, round after round. The client must
 /// flush after writing: with a full socket, rustls keeps the last records until

@@ -710,7 +710,8 @@ impl ApiListener {
 		// error can hang: axum-server notifies only the waiters present at that moment.
 		let listener = std::net::TcpListener::bind(self.addr).map_err(|e| e.to_string())?;
 		listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-		let app = self.app.clone().into_make_service();
+		// the peer's address for the audit log (api::Client)
+		let app = self.app.clone().into_make_service_with_connect_info::<SocketAddr>();
 		let handle = Handle::new();
 		let addr = self.addr;
 		match tls {

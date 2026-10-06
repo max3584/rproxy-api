@@ -278,6 +278,11 @@ impl Pool {
 		self.members.iter().any(|m| Arc::ptr_eq(m, member))
 	}
 
+	/// Every target is down (only meaningful when `reported`).
+	pub fn all_down(&self) -> bool {
+		self.reported && !self.members.is_empty() && !self.members.iter().any(|m| m.is_up())
+	}
+
 	pub fn status(&self) -> Vec<TargetStatus> {
 		self.members
 			.iter()

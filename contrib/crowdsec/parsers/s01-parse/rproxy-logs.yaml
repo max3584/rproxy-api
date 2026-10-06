@@ -53,6 +53,12 @@ nodes:
         expression: "JsonExtractUnescape(evt.Parsed.message, 'rule')"
       - meta: rproxy_route
         expression: "JsonExtractUnescape(evt.Parsed.message, 'route')"
+      # the middleware that refused the request (ip_allow, basic_auth, crowdsec, rate_limit, …; empty when none),
+      # and why basic_auth refused (unknown_user, bad_password, …). rproxy v0.3.20 and later
+      - meta: rproxy_refused_by
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'refused_by')"
+      - meta: rproxy_auth_error
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'auth_error')"
   # L4: client is "IP:port" or "[IPv6]:port"
   - filter: "JsonExtract(evt.Parsed.message, 'event') in ['conn.open', 'conn.denied']"
     grok:

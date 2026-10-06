@@ -16,7 +16,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -162,6 +162,35 @@ pub enum Verdict {
 	Error(String),
 }
 
+/// How the last pulls from the LAPI went.
+#[derive(Debug, Default)]
+struct Link {
+	/// Unix seconds of the last successful pull.
+	last_success: Option<u64>,
+	/// The last failure and when (Unix seconds).
+	last_error: Option<(u64, String)>,
+	/// Failures in a row since the last success.
+	failures: u32,
+}
+
+/// The LAPI connection as shown in `GET /config` (`crowdsec`).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct LapiStatus {
+	/// The last pull succeeded.
+	pub connected: bool,
+	/// The decisions have been pulled at least once.
+	pub synced: bool,
+	/// Unix seconds of the last successful pull.
+	pub last_success: Option<u64>,
+	pub last_error: Option<String>,
+	/// Unix seconds of `last_error`.
+	pub last_error_at: Option<u64>,
+	/// Failed pulls in a row.
+	pub failures: u32,
+	/// Addresses and ranges blocked now.
+	pub decisions: usize,
+}
+
 /// The process-wide bouncer.
 pub struct Bouncer {
 	lapi: Uri,
@@ -173,6 +202,8 @@ pub struct Bouncer {
 	synced: AtomicBool,
 	/// Successful pulls, for tests and logs.
 	pulls: AtomicU64,
+	/// The LAPI as last asked (#115): `GET /config` `crowdsec`, `/metrics`.
+	link: RwLock<Link>,
 	tls: tokio_rustls::TlsConnector,
 	stop: CancellationToken,
 }
@@ -234,6 +265,7 @@ impl Bouncer {
 			decisions: RwLock::default(),
 			synced: AtomicBool::new(false),
 			pulls: AtomicU64::new(0),
+			link: RwLock::default(),
 			tls: tokio_rustls::TlsConnector::from(tls),
 			stop: CancellationToken::new(),
 		}))
@@ -267,6 +299,20 @@ impl Bouncer {
 		self.pulls.load(Ordering::Relaxed)
 	}
 
+	/// The connection to the LAPI now (#115).
+	pub fn status(&self) -> LapiStatus {
+		let link = self.link.read().unwrap();
+		LapiStatus {
+			connected: link.last_success.is_some() && link.failures == 0,
+			synced: self.synced(),
+			last_success: link.last_success,
+			last_error: link.last_error.as_ref().map(|(_, e)| e.clone()),
+			last_error_at: link.last_error.as_ref().map(|(at, _)| *at),
+			failures: link.failures,
+			decisions: self.decision_count(),
+		}
+	}
+
 	/// Starts pulling decisions until `stop`.
 	pub fn spawn(self: &Arc<Self>) {
 		let me = self.clone();
@@ -281,7 +327,21 @@ impl Bouncer {
 		let mut startup = true;
 		let mut failures: u32 = 0;
 		loop {
-			let wait = match self.pull(startup).await {
+			let pulled = self.pull(startup).await;
+			{
+				let mut link = self.link.write().unwrap();
+				match &pulled {
+					Ok(_) => {
+						link.last_success = Some(crate::tls::config::unix_now().max(0) as u64);
+						link.failures = 0;
+					}
+					Err(e) => {
+						link.last_error = Some((crate::tls::config::unix_now().max(0) as u64, e.clone()));
+						link.failures = link.failures.saturating_add(1);
+					}
+				}
+			}
+			let wait = match pulled {
 				Ok((added, deleted)) => {
 					if startup || added > 0 || deleted > 0 {
 						info!(event = "crowdsec.sync", startup, added, deleted, decisions = self.decision_count());

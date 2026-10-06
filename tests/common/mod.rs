@@ -1,6 +1,7 @@
 //! Shared test harness: a real control API on loopback plus echo backends.
 #![allow(dead_code)]
 
+pub mod logs;
 pub mod pki;
 
 use std::collections::HashMap;
@@ -67,7 +68,7 @@ pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::H
 	let app = router(Arc::new(AppState { registry: registry.clone(), tokens: Arc::new(tokens), reloader: None, reload_unix_only: true }));
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let base = format!("http://{}", listener.local_addr().unwrap());
-	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	tokio::spawn(async move { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap() });
 	Harness { base, http: reqwest::Client::new(), registry, names }
 }
 

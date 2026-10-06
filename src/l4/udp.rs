@@ -78,14 +78,12 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 					let mut map = sessions.lock().unwrap();
 					for (data, Meta { from: client, local, .. }) in batch.iter() {
 						if !rt.allowed(client.ip()) {
-							rt.stats.denied();
-							debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "allow_from");
+							denied(&rt, client, "allow_from");
 							continue;
 						}
 						// also datagrams of sessions that were open before the ban
 						if rt.crowdsec_blocks(client.ip()) {
-							rt.stats.denied();
-							debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "crowdsec");
+							denied(&rt, client, "crowdsec");
 							continue;
 						}
 						let tx = match map.get(&(client, local)) {
@@ -110,6 +108,16 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 				}
 			}
 		}
+	}
+}
+
+/// A refused datagram: counted always, logged like TCP's refusals but at most
+/// `Throttle`'s rate per client (`suppressed`: lines left out before this one).
+fn denied(rt: &Runtime, client: SocketAddr, reason: &'static str) {
+	rt.stats.denied();
+	match rt.denied_log.check(&client.ip()) {
+		Some(suppressed) => info!(event = "conn.denied", rule = %rt.key, client = %client, reason, sni = "", suppressed),
+		None => debug!(event = "conn.denied", rule = %rt.key, client = %client, reason, throttled = true),
 	}
 }
 

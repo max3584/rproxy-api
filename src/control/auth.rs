@@ -212,24 +212,30 @@ impl Tokens {
 
 	/// Checks an `Authorization` header value; `None` if it is missing, unknown or expired.
 	pub fn authenticate(&self, header: Option<&str>) -> Option<Principal> {
+		self.check(header).ok()
+	}
+
+	/// Like `authenticate`, with why a request is refused (for the audit log; never
+	/// the token): `missing` (no bearer token), `invalid` (unknown) or `expired`.
+	pub fn check(&self, header: Option<&str>) -> Result<Principal, &'static str> {
 		self.authenticate_on(header, time::OffsetDateTime::now_utc().date())
 	}
 
-	fn authenticate_on(&self, header: Option<&str>, today: time::Date) -> Option<Principal> {
+	fn authenticate_on(&self, header: Option<&str>, today: time::Date) -> Result<Principal, &'static str> {
 		if !self.enabled() {
-			return Some(Principal::anonymous());
+			return Ok(Principal::anonymous());
 		}
-		let presented = header.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim)?;
+		let presented = header.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim).ok_or("missing")?;
 		let hash: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
 		// check every token so the time taken does not reveal which one matched
-		let mut found = None;
+		let mut found = Err("invalid");
 		for t in self.tokens.read().unwrap().iter() {
 			let ok = match &t.secret {
 				Secret::Plain(s) => constant_time_eq(s.as_bytes(), presented.as_bytes()),
 				Secret::Sha256(h) => constant_time_eq(h, &hash),
 			};
-			if ok && found.is_none() && t.expires.is_none_or(|d| today <= d) {
-				found = Some(t.principal.clone());
+			if ok && found.is_err() {
+				found = if t.expires.is_none_or(|d| today <= d) { Ok(t.principal.clone()) } else { Err("expired") };
 			}
 		}
 		found
@@ -297,7 +303,11 @@ mod tests {
 		let ci = tokens.authenticate_on(Some("Bearer ci-secret"), day("2027-03-31")).unwrap();
 		assert!(!ci.has(Scope::RulesRead));
 		assert!(ci.may_use_ports(20000, 20010) && !ci.may_use_ports(19999, 20000) && !ci.may_use_ports(29999, 30000));
-		assert!(tokens.authenticate_on(Some("Bearer ci-secret"), day("2027-04-01")).is_none(), "expired");
+		assert_eq!(tokens.authenticate_on(Some("Bearer ci-secret"), day("2027-04-01")).err(), Some("expired"));
+		// why a request is refused, for the audit log
+		assert_eq!(tokens.check(None).err(), Some("missing"));
+		assert_eq!(tokens.check(Some("Basic dTpw")).err(), Some("missing"));
+		assert_eq!(tokens.check(Some("Bearer nope")).err(), Some("invalid"));
 		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 	}
 

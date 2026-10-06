@@ -415,6 +415,7 @@ async fn redirects_and_fixed_answers() {
 
 #[tokio::test]
 async fn ip_allow_headers_and_paths() {
+	logs::capture();
 	let h = harness().await;
 	let a = echo_backend("A").await;
 	let port = free_port();
@@ -446,6 +447,8 @@ async fn ip_allow_headers_and_paths() {
 
 	let (status, _) = get(port, "x.test", "/internal/x").await;
 	assert_eq!(status, StatusCode::FORBIDDEN, "127.0.0.1 is outside 10.0.0.0/8");
+	let v = access_line(port, "/internal/x", 403).await;
+	assert_eq!((v["refused_by"].as_str(), v["middleware"].as_str()), (Some("ip_allow"), Some("lan")), "{v}");
 
 	let r = raw(port, reqwest::Method::GET, "x.test", "/api/users?id=1", &[("x-b", "drop me"), ("origin", "https://app.test")]).await;
 	assert_eq!(r.headers()["x-served-by"], "rproxy");
@@ -606,8 +609,18 @@ async fn requests_are_counted_by_route_and_status() {
 	assert!(text.contains("# TYPE rproxy_http_request_duration_seconds histogram"), "{text}");
 }
 
+/// The access line of `path` on the rule at `port` with `status`.
+async fn access_line(port: u16, path: &str, status: u16) -> Value {
+	let rule = format!("tcp/127.0.0.1:{port}");
+	logs::wait_for(&format!("http.access {path} {status}"), |v| {
+		v["event"] == "http.access" && v["rule"] == rule.as_str() && v["path"] == path && v["status"] == status
+	})
+	.await
+}
+
 #[tokio::test]
 async fn rate_limits_and_in_flight() {
+	logs::capture();
 	let h = harness().await;
 	let a = echo_backend("A").await;
 	let port = free_port();
@@ -659,6 +672,11 @@ async fn rate_limits_and_in_flight() {
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 	assert_eq!(again, StatusCode::OK, "the place is freed when the response has been sent");
+	// the access log says which middleware refused
+	let v = access_line(port, "/login", 429).await;
+	assert_eq!((v["refused_by"].as_str(), v["middleware"].as_str()), (Some("rate_limit"), Some("per-ip")), "{v}");
+	let v = access_line(port, "/slow", 429).await;
+	assert_eq!((v["refused_by"].as_str(), v["middleware"].as_str()), (Some("in_flight"), Some("one-at-a-time")), "{v}");
 
 	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
 	let stats = &v["stats"]["http"];
@@ -681,4 +699,87 @@ async fn rate_limits_and_in_flight() {
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
 	bad["http"]["middlewares"]["l"] = json!({"in_flight": {"amount": 0}});
 	assert_eq!(h.post(bad).await.0, StatusCode::BAD_REQUEST);
+}
+
+/// `csp` and `referrer_policy` of `headers`, and the matchers that look at the
+/// method, the path by regex, headers and query parameters, through real requests.
+#[tokio::test]
+async fn security_headers_and_matchers_by_method_header_and_query() {
+	let h = harness().await;
+	let (a, b, c, d, e) = (echo_backend("A").await, echo_backend("B").await, echo_backend("C").await, echo_backend("D").await, echo_backend("E").await);
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [
+					{"name": "staging", "match": "HeaderRegexp(`X-Env`, `^stag(e|ing)$`)", "to": url(b), "priority": 50},
+					{"name": "versioned", "match": "QueryRegexp(`v`, `^[0-9]+$`)", "to": url(c), "priority": 40},
+					{"name": "writes", "match": "Method(`POST`, `PUT`)", "to": url(d), "priority": 30},
+					{"name": "regex", "match": "PathRegexp(`^/re/[a-z]+$`)", "to": url(e), "priority": 20},
+					{"name": "all", "match": "PathPrefix(`/`)", "to": url(a), "middlewares": ["sec"], "priority": 1},
+				],
+				"middlewares": {"sec": {"headers": {"csp": "default-src 'self'", "referrer_policy": "no-referrer", "content_type_nosniff": true}}},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let tag = |r: reqwest::Response| async move { r.json::<Value>().await.unwrap()["tag"].as_str().unwrap_or("").to_string() };
+
+	let r = raw(port, reqwest::Method::GET, "m.test", "/page", &[]).await;
+	assert_eq!(r.headers()["content-security-policy"], "default-src 'self'");
+	assert_eq!(r.headers()["referrer-policy"], "no-referrer");
+	assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+	assert_eq!(tag(r).await, "A");
+
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/", &[("X-Env", "staging")]).await).await, "B");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/", &[("X-Env", "stage")]).await).await, "B");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/", &[("X-Env", "production")]).await).await, "A");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/x?v=12", &[]).await).await, "C");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/x?v=1a", &[]).await).await, "A", "the value must match");
+	assert_eq!(tag(raw(port, reqwest::Method::POST, "m.test", "/x", &[]).await).await, "D");
+	assert_eq!(tag(raw(port, reqwest::Method::PUT, "m.test", "/x", &[]).await).await, "D");
+	assert_eq!(tag(raw(port, reqwest::Method::DELETE, "m.test", "/x", &[]).await).await, "A");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/re/abc", &[]).await).await, "E");
+	assert_eq!(tag(raw(port, reqwest::Method::GET, "m.test", "/re/abc1", &[]).await).await, "A");
+	let r = raw(port, reqwest::Method::GET, "m.test", "/re/abc", &[]).await;
+	assert!(r.headers().get("content-security-policy").is_none(), "only on routes with the middleware");
+}
+
+/// `tls.upstream.insecure_skip_verify` accepts an https backend whose
+/// certificate cannot be verified; without it such a backend is a 502.
+#[tokio::test]
+async fn upstream_insecure_skip_verify() {
+	let pki = Pki::new("l7-insecure");
+	let front = pki.server("front", &["front.test"]);
+	let secure = https_backend(&pki).await;
+	let h = harness().await;
+	let port = free_port();
+	let tls = |upstream: Value| {
+		json!({"mode": "terminate", "certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}], "upstream": upstream})
+	};
+	let http = json!({"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("https://{secure}")}]});
+	let mut body = http_rule(port, http.clone());
+	body["tls"] = tls(json!({"insecure_skip_verify": true}));
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["tls"]["upstream"]["insecure_skip_verify"], true, "{v}");
+
+	let get = || async {
+		let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		let tls = pki.connector(None).connect(ServerName::try_from("front.test").unwrap(), tcp).await.unwrap();
+		let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+		tokio::spawn(conn);
+		let req = hyper::Request::get("/").header("host", "front.test").body(Empty::<Bytes>::new()).unwrap();
+		let resp = sender.send_request(req).await.unwrap();
+		let status = resp.status();
+		(status, resp.into_body().collect().await.unwrap().to_bytes())
+	};
+	let (status, body) = get().await;
+	assert_eq!((status, &body[..]), (StatusCode::OK, &b"secure"[..]), "the test CA is not trusted, but verification is off");
+
+	// verified again (Mozilla's roots, which do not know the test CA): refused
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{port}"), json!({"http": http, "tls": tls(json!({}))})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(get().await.0, StatusCode::BAD_GATEWAY);
 }

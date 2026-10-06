@@ -90,6 +90,34 @@ pub enum Middleware {
 	Oidc(Arc<Oidc>),
 }
 
+impl Middleware {
+	/// The kind as written in the settings (`refused_by` of the access log).
+	pub fn kind(&self) -> &'static str {
+		match self {
+			Middleware::RedirectScheme { .. } => "redirect_scheme",
+			Middleware::RedirectRegex { .. } => "redirect_regex",
+			Middleware::Respond { .. } => "respond",
+			Middleware::IpAllow(_) => "ip_allow",
+			Middleware::Headers(_) => "headers",
+			Middleware::StripPrefix(_) => "strip_prefix",
+			Middleware::AddPrefix(_) => "add_prefix",
+			Middleware::ReplacePath(_) => "replace_path",
+			Middleware::ReplacePathRegex { .. } => "replace_path_regex",
+			Middleware::RateLimit { .. } => "rate_limit",
+			Middleware::InFlight { .. } => "in_flight",
+			Middleware::Crowdsec { .. } => "crowdsec",
+			Middleware::Compress { .. } => "compress",
+			Middleware::Buffering { .. } => "buffering",
+			Middleware::Retry(_) => "retry",
+			Middleware::CircuitBreaker(_) => "circuit_breaker",
+			Middleware::Errors { .. } => "errors",
+			Middleware::BasicAuth(_) => "basic_auth",
+			Middleware::ForwardAuth(_) => "forward_auth",
+			Middleware::Oidc(_) => "oidc",
+		}
+	}
+}
+
 fn value(v: &str, what: &str) -> Result<HeaderValue, ApiError> {
 	HeaderValue::from_str(v).map_err(|_| ApiError::invalid(format!("{what}: {v:?} is not a valid header value")))
 }

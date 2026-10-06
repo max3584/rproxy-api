@@ -1416,6 +1416,17 @@
           "connections": {
             "type": "integer"
           },
+          "all_targets_down": {
+            "type": "boolean",
+            "description": "Every destination is down (rules with several targets or a health_check; false otherwise) (v0.3.20)"
+          },
+          "down_services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "http services with health_check that have no server up; omitted when none (v0.3.20)"
+          },
           "stats": {
             "$ref": "#/components/schemas/RuleStats"
           },
@@ -1613,6 +1624,9 @@
             "items": {
               "type": "string"
             }
+          },
+          "crowdsec": {
+            "$ref": "#/components/schemas/CrowdsecStatus"
           }
         }
       },
@@ -1821,6 +1835,43 @@
           "code",
           "error"
         ]
+      },
+      "CrowdsecStatus": {
+        "type": "object",
+        "description": "The connection to the CrowdSec LAPI (only with global.crowdsec) (v0.3.20)",
+        "properties": {
+          "connected": {
+            "type": "boolean",
+            "description": "The last pull of the decisions succeeded"
+          },
+          "synced": {
+            "type": "boolean",
+            "description": "The decisions have been pulled at least once"
+          },
+          "last_success": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Unix seconds of the last successful pull"
+          },
+          "last_error": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_error_at": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Unix seconds of last_error"
+          },
+          "failures": {
+            "type": "integer",
+            "description": "Failed pulls in a row"
+          },
+          "decisions": {
+            "type": "integer",
+            "description": "Addresses and ranges blocked now"
+          }
+        },
+        "additionalProperties": false
       }
     }
   },
