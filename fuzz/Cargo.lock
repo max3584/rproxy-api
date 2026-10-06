@@ -827,6 +827,9 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "digest"
@@ -1594,7 +1597,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "time",
  "tokio",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
@@ -2423,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "rproxy-api"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "async-trait",
  "axum",
