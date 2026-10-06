@@ -58,6 +58,13 @@ struct Options {
 	extra_listen_addrs: Vec<String>,
 	/// `false`: paused in the UI; kept in the table but not started (#116).
 	enabled: Option<bool>,
+	/// v0.4 (docs/DESIGN-v0.4.md): the same shape as in the API.
+	#[serde(default)]
+	labels: crate::core::ruleset::Labels,
+	limits: Option<crate::core::limits::LimitsSpec>,
+	bandwidth: Option<crate::core::bandwidth::BandwidthSpec>,
+	geoip: Option<crate::net::geoip::GeoipSpec>,
+	outlier_detection: Option<crate::core::outlier::L4OutlierSpec>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -88,6 +95,11 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		allow_from: vec![],
 		http: None,
 		crowdsec: false,
+		labels: Default::default(),
+		limits: None,
+		bandwidth: None,
+		geoip: None,
+		outlier_detection: None,
 	};
 	if schema != Schema::Legacy {
 		req.source_ip = get_str("source_ip")?.parse().map_err(parse_err)?;
@@ -120,6 +132,11 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		req.balance = options.balance;
 		req.health_check = options.health_check;
 		req.extra_listen_addrs = options.extra_listen_addrs;
+		req.labels = options.labels;
+		req.limits = options.limits;
+		req.bandwidth = options.bandwidth;
+		req.geoip = options.geoip;
+		req.outlier_detection = options.outlier_detection;
 	}
 	Ok(Some(req))
 }
@@ -172,4 +189,27 @@ pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
 		info!(event = "restore.paused", rules = paused, "rules paused in the UI are not started");
 	}
 	Ok(rules)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The `options` column of 0.3 rows still reads, and the v0.4 keys read in the API's shape.
+	#[test]
+	fn options_of_0_3_rows_and_v0_4_keys() {
+		let old: Options = serde_json::from_str(
+			r#"{"tls": {"mode": "passthrough"}, "starttls": null, "starttls_required": true, "allow_from": ["10.0.0.0/8"], "crowdsec": true, "enabled": true}"#,
+		)
+		.unwrap();
+		assert!(old.labels.is_empty() && old.limits.is_none() && old.geoip.is_none());
+		let new: Options = serde_json::from_str(
+			r#"{"labels": {"tenant": "act"}, "limits": {"max_connections": 10}, "bandwidth": {"download": "10Mbps"},
+			   "geoip": {"allow_countries": ["JP"]}, "outlier_detection": {"consecutive_failures": 3}}"#,
+		)
+		.unwrap();
+		assert_eq!(new.labels["tenant"], "act");
+		assert_eq!(new.limits.unwrap().max_connections, Some(10));
+		assert!(serde_json::from_str::<Options>(r#"{"limitz": {}}"#).is_err(), "unknown keys are still refused");
+	}
 }

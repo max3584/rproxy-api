@@ -90,6 +90,9 @@ pub struct ServiceSpec {
 	/// least_conn (fewest requests in progress) or failover (the first that is up).
 	#[serde(default, skip_serializing_if = "crate::core::balance::Balance::is_default")]
 	pub balance: crate::core::balance::Balance,
+	/// Passive health checks: servers failing in real traffic are ejected for a while (#170, v0.4).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outlier_detection: Option<crate::core::outlier::HttpOutlierSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +284,8 @@ pub enum MiddlewareSpec {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		content_type: Option<String>,
 	},
+	/// Country / ASN allow and deny lists for the client IP (#168, v0.4).
+	Geoip(crate::net::geoip::GeoipSpec),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +358,7 @@ impl MiddlewareSpec {
 			MiddlewareSpec::CircuitBreaker { .. } => "circuit_breaker",
 			MiddlewareSpec::Errors { .. } => "errors",
 			MiddlewareSpec::Respond { .. } => "respond",
+			MiddlewareSpec::Geoip(_) => "geoip",
 		}
 	}
 
@@ -431,6 +437,7 @@ impl MiddlewareSpec {
 				parse_duration(d).map(|_| ()).map_err(|e| invalid(format!("middleware {name}: initial_interval: {e}")))
 			}
 			MiddlewareSpec::Respond { status, .. } if !(100..=599).contains(status) => bad(format!("status {status} is not an HTTP status")),
+			MiddlewareSpec::Geoip(g) => g.validate(&format!("middleware {name}")),
 			MiddlewareSpec::ForwardAuth { address, timeout, .. } => {
 				check_url(address, &format!("middleware {name}"))?;
 				if let Some(t) = timeout {
@@ -529,6 +536,9 @@ impl HttpSpec {
 				for d in [&t.connect, &t.response].into_iter().flatten() {
 					parse_duration(d).map_err(|e| invalid(format!("service {name}: {e}")))?;
 				}
+			}
+			if let Some(o) = &svc.outlier_detection {
+				o.validate(&format!("service {name}: outlier_detection"))?;
 			}
 		}
 		for (name, mw) in &self.middlewares {

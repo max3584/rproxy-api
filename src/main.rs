@@ -117,6 +117,75 @@ struct Options {
 	/// Output of --check-config: text or json
 	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
 	check_config_format: String,
+	/// With --check-config: also ask the running rproxy what would change (v0.4, #169)
+	#[arg(long, requires = "check_config")]
+	diff: bool,
+	/// Where --diff asks: unix:/path or http(s)://host:port (default: RPROXY_API_SOCKET, else the control API)
+	#[arg(long, env = "RPROXY_DIFF_API")]
+	diff_api: Option<String>,
+	/// File with the token (one plain line) --diff asks with
+	#[arg(long, env = "RPROXY_DIFF_TOKEN_FILE")]
+	diff_token_file: Option<PathBuf>,
+	/// CA (PEM) that verifies client certificates of the control API; re-read on SIGHUP (v0.4, #167)
+	#[arg(long, env = "RPROXY_TLS_CLIENT_CA")]
+	tls_client_ca: Option<PathBuf>,
+	/// Client certificates for the control API: none (default), optional or required (v0.4, #167)
+	#[arg(long, env = "RPROXY_TLS_CLIENT_AUTH", value_enum)]
+	tls_client_auth: Option<rproxy_api::control::hardening::ClientAuth>,
+	/// Report tokens whose expires is closer than this many days [default: 14] (v0.4, #167)
+	#[arg(long, env = "RPROXY_TOKEN_WARN_DAYS")]
+	token_warn_days: Option<u64>,
+	/// Lock out a source after this many failed authentications within the window; 0: never [default: 20] (v0.4, #167)
+	#[arg(long, env = "RPROXY_API_LOCKOUT_FAILURES")]
+	api_lockout_failures: Option<u32>,
+	/// Window of --api-lockout-failures [default: 1m]
+	#[arg(long, env = "RPROXY_API_LOCKOUT_WINDOW")]
+	api_lockout_window: Option<String>,
+	/// How long a source stays locked out [default: 5m]
+	#[arg(long, env = "RPROXY_API_LOCKOUT_DURATION")]
+	api_lockout_duration: Option<String>,
+	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
+	#[arg(long, env = "RPROXY_NODE_NAME")]
+	node_name: Option<String>,
+	/// Unix socket for live upgrades [default: /run/rproxy/handoff.sock] (v0.4, #174)
+	#[arg(long, env = "RPROXY_HANDOFF_SOCKET")]
+	handoff_socket: Option<PathBuf>,
+	/// How long a live upgrade waits for the new process [default: 30s]
+	#[arg(long, env = "RPROXY_HANDOFF_TIMEOUT")]
+	handoff_timeout: Option<String>,
+	/// Longest the old process waits for its connections after a live upgrade [default: 5m]
+	#[arg(long, env = "RPROXY_HANDOFF_DRAIN")]
+	handoff_drain: Option<String>,
+	/// Self-update: off (default), check or auto (v0.4, #174)
+	#[arg(long, env = "RPROXY_UPDATE", value_enum)]
+	update: Option<rproxy_api::control::upgrade::UpdateMode>,
+	/// Pin the self-update to this version (X.Y.Z within this build's X.Y)
+	#[arg(long, env = "RPROXY_UPDATE_PIN")]
+	update_pin: Option<String>,
+	/// Where releases are fetched from (https://) [default: https://github.com/max3584/rproxy-api/releases]
+	#[arg(long, env = "RPROXY_UPDATE_SOURCE")]
+	update_source: Option<String>,
+	/// Cache of fetched releases [default: /var/cache/rproxy/update]
+	#[arg(long, env = "RPROXY_UPDATE_CACHE")]
+	update_cache: Option<PathBuf>,
+	/// How often to look for a new patch; 0s: at start and through the API only [default: 6h]
+	#[arg(long, env = "RPROXY_UPDATE_INTERVAL")]
+	update_interval: Option<String>,
+	/// minisign public key that verifies releases (default: the release key built in)
+	#[arg(long, env = "RPROXY_UPDATE_PUBKEY")]
+	update_pubkey: Option<PathBuf>,
+	/// A new version that runs this long is kept [default: 60s]
+	#[arg(long, env = "RPROXY_UPDATE_HEALTHY")]
+	update_healthy: Option<String>,
+	/// tokio worker threads (default: the number of CPUs); global.performance.workers wins (v0.4, #194)
+	#[arg(long, env = "RPROXY_WORKERS")]
+	workers: Option<u32>,
+	/// Pin the workers to CPUs: none, auto or a list such as 0-3,6; global.performance.cpu_affinity wins
+	#[arg(long, env = "RPROXY_CPU_AFFINITY")]
+	cpu_affinity: Option<String>,
+	/// SO_BUSY_POLL of data-plane sockets in microseconds, 0 = off; global.performance.busy_poll_usecs wins
+	#[arg(long, env = "RPROXY_BUSY_POLL_USECS")]
+	busy_poll_usecs: Option<u32>,
 	#[command(subcommand)]
 	command: Option<Command>,
 }
@@ -220,6 +289,77 @@ fn raise_nofile_limit() -> Option<u64> {
 #[cfg(not(unix))]
 fn raise_nofile_limit() -> Option<u64> {
 	None
+}
+
+/// The v0.4 options (docs/DESIGN-v0.4.md): mistakes and settings that would
+/// weaken the control API if ignored are errors; options this build cannot
+/// apply yet are returned to be logged as `degraded`.
+fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
+	use rproxy_api::control::{hardening::HardeningOptions, upgrade::UpgradeOptions};
+	let features = rproxy_api::core::rule::Features::CURRENT;
+	let hardening = HardeningOptions {
+		tls_client_ca: opts.tls_client_ca.clone(),
+		tls_client_auth: opts.tls_client_auth,
+		has_tls_cert: opts.tls_cert.is_some(),
+		token_warn_days: opts.token_warn_days,
+		lockout_failures: opts.api_lockout_failures,
+		lockout_window: opts.api_lockout_window.clone(),
+		lockout_duration: opts.api_lockout_duration.clone(),
+	}
+	.check(&features);
+	let upgrade = UpgradeOptions {
+		handoff_socket: opts.handoff_socket.clone(),
+		handoff_timeout: opts.handoff_timeout.clone(),
+		handoff_drain: opts.handoff_drain.clone(),
+		update: opts.update,
+		update_pin: opts.update_pin.clone(),
+		update_source: opts.update_source.clone(),
+		update_cache: opts.update_cache.clone(),
+		update_interval: opts.update_interval.clone(),
+		update_pubkey: opts.update_pubkey.clone(),
+		update_healthy: opts.update_healthy.clone(),
+	}
+	.check(&features);
+	let mut errors: Vec<String> = hardening.errors.into_iter().chain(upgrade.errors).collect();
+	let perf = rproxy_api::config::performance::PerformanceSpec {
+		workers: opts.workers,
+		udp_shards: None,
+		cpu_affinity: opts.cpu_affinity.clone(),
+		busy_poll_usecs: opts.busy_poll_usecs,
+		splice: None,
+	};
+	if let Err(e) = perf.check() {
+		errors.push(e.replace("global.performance.", "--").replace('_', "-"));
+	}
+	if opts.node_name.as_deref().is_some_and(|n| n.trim().is_empty() || n.len() > 255) {
+		errors.push("--node-name must be 1-255 characters".into());
+	}
+	if !errors.is_empty() {
+		return Err(errors.join("; "));
+	}
+	let mut ignored: Vec<&'static str> = hardening.ignored.into_iter().chain(upgrade.ignored).collect();
+	if opts.node_name.is_some() && !features.persistence {
+		ignored.push("--node-name");
+	}
+	for (flag, key, set) in [
+		("--workers", "workers", opts.workers.is_some()),
+		("--cpu-affinity", "cpu_affinity", opts.cpu_affinity.is_some()),
+		("--busy-poll-usecs", "busy_poll_usecs", opts.busy_poll_usecs.is_some()),
+	] {
+		if set && !features.performance.contains(&key) {
+			ignored.push(flag);
+		}
+	}
+	Ok(ignored)
+}
+
+/// `--diff-api`: `unix:/path` or an http(s) URL.
+fn check_diff_api(api: &str) -> Result<(), String> {
+	match api.strip_prefix("unix:") {
+		Some(path) if path.starts_with('/') => Ok(()),
+		None if api.starts_with("http://") || api.starts_with("https://") => Ok(()),
+		_ => Err(format!("--diff-api {api:?} must be unix:/path or an http(s):// URL")),
+	}
 }
 
 fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
@@ -334,7 +474,18 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		Ok(rt) => rt,
 		Err(e) => return fail(e.to_string()),
 	};
-	let report = runtime.block_on(rproxy_api::config::check::check(&input));
+	let mut report = runtime.block_on(rproxy_api::config::check::check(&input));
+	if opts.diff {
+		// v0.4 (#169): asks the running rproxy with POST /config/plan
+		let mut problem = opts.diff_api.as_deref().map(check_diff_api).transpose().err();
+		if problem.is_none() && !rproxy_api::core::rule::Features::CURRENT.dry_run {
+			problem = Some("--diff is not available in this version (see GET /capabilities features)".into());
+		}
+		if let Some(message) = problem {
+			report.errors.push(rproxy_api::config::check::Finding { rule: String::new(), message });
+			report.ok = false;
+		}
+	}
 	if json {
 		println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
 	} else {
@@ -353,6 +504,9 @@ async fn run(opts: Options) -> Result<(), String> {
 		return Err("--api-port 0 turns TCP off; give --api-socket (RPROXY_API_SOCKET) for the control API".into());
 	}
 	check_exposure(&opts, &addrs)?;
+	for flag in check_v04_options(&opts)? {
+		warn!(event = "degraded", part = flag, "not available in this version yet; ignored (see GET /capabilities features)");
+	}
 	#[cfg(unix)]
 	let socket = match &opts.api_socket {
 		Some(path) => Some(rproxy_api::control::unix_api::SocketOptions {
@@ -384,6 +538,13 @@ async fn run(opts: Options) -> Result<(), String> {
 			}
 		},
 	});
+
+	if !rproxy_api::core::rule::Features::CURRENT.persistence {
+		for name in tokens.persisting() {
+			warn!(event = "degraded", part = "tokens", token = %name,
+				"persist is not available in this version yet; the token's rules are not stored (see GET /capabilities features)");
+		}
+	}
 
 	// the control API certificate; loaded later by the listener task when it cannot be read yet
 	let tls: Arc<OnceCell<RustlsConfig>> = Arc::default();
@@ -419,6 +580,11 @@ async fn run(opts: Options) -> Result<(), String> {
 					"running without the rules of the settings file until it can be read");
 				config_unread = Some(e.to_string());
 			}
+		}
+	}
+	if let Some((_, d)) = &doc {
+		for part in d.global.unsupported(&rproxy_api::core::rule::Features::CURRENT) {
+			warn!(event = "degraded", part = %part, "not available in this version yet; ignored (see GET /capabilities features)");
 		}
 	}
 	let http_global = match &doc {

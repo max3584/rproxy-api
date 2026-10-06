@@ -237,6 +237,7 @@ impl Middleware {
 						response: Some(timeout.clone().unwrap_or_else(|| format!("{}s", auth::DEFAULT_FORWARD_AUTH_TIMEOUT.as_secs()))),
 					}),
 					balance: Default::default(),
+					outlier_detection: None,
 				};
 				let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
 				let path = match uri.path_and_query().map(|p| p.as_str()) {

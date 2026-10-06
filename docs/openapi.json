@@ -43,7 +43,11 @@
               "resolve_failed",
               "unauthorized",
               "forbidden",
-              "internal"
+              "internal",
+              "owned",
+              "precondition_failed",
+              "stale_generation",
+              "locked_out"
             ]
           }
         },
@@ -370,6 +374,9 @@
           },
           "balance": {
             "$ref": "#/components/schemas/Balance"
+          },
+          "outlier_detection": {
+            "$ref": "#/components/schemas/HttpOutlierDetection"
           }
         },
         "required": [
@@ -1015,6 +1022,18 @@
               "respond"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "geoip": {
+                "$ref": "#/components/schemas/Geoip"
+              }
+            },
+            "required": [
+              "geoip"
+            ],
+            "additionalProperties": false
           }
         ]
       },
@@ -1131,6 +1150,21 @@
           "crowdsec": {
             "type": "boolean",
             "description": "Refuse clients in the global.crowdsec decisions right after accepting (L4)."
+          },
+          "labels": {
+            "$ref": "#/components/schemas/Labels"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "bandwidth": {
+            "$ref": "#/components/schemas/Bandwidth"
+          },
+          "geoip": {
+            "$ref": "#/components/schemas/Geoip"
+          },
+          "outlier_detection": {
+            "$ref": "#/components/schemas/L4OutlierDetection"
           }
         },
         "required": [
@@ -1208,6 +1242,21 @@
             },
             "maxItems": 16,
             "description": "Replaces the extra listen addresses when present ([] removes them all; left out keeps them)."
+          },
+          "labels": {
+            "$ref": "#/components/schemas/Labels"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "bandwidth": {
+            "$ref": "#/components/schemas/Bandwidth"
+          },
+          "geoip": {
+            "$ref": "#/components/schemas/Geoip"
+          },
+          "outlier_detection": {
+            "$ref": "#/components/schemas/L4OutlierDetection"
           }
         },
         "additionalProperties": false,
@@ -1315,6 +1364,14 @@
               "$ref": "#/components/schemas/TargetStatus"
             },
             "description": "Rules with several targets or a health_check."
+          },
+          "limited": {
+            "type": "integer",
+            "description": "Refused by limits (v0.4, #165)"
+          },
+          "counters_since": {
+            "type": "integer",
+            "description": "When the counters started, Unix seconds; kept over a live upgrade (v0.4, #166)"
           }
         }
       },
@@ -1394,8 +1451,10 @@
             "type": "string",
             "enum": [
               "dynamic",
-              "static"
-            ]
+              "static",
+              "api"
+            ],
+            "description": "api: created through the API and stored in rproxy_rules (v0.4, #144); treat unknown values like dynamic"
           },
           "state": {
             "type": "string",
@@ -1452,6 +1511,44 @@
             "items": {
               "$ref": "#/components/schemas/AcmeCertStatus"
             }
+          },
+          "labels": {
+            "$ref": "#/components/schemas/Labels"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "bandwidth": {
+            "$ref": "#/components/schemas/Bandwidth"
+          },
+          "geoip": {
+            "$ref": "#/components/schemas/Geoip"
+          },
+          "outlier_detection": {
+            "$ref": "#/components/schemas/L4OutlierDetection"
+          },
+          "ruleset": {
+            "type": "string",
+            "description": "The rule set it belongs to (v0.4, #28)"
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Condition"
+            },
+            "description": "Gateway API style (v0.4, #28): features.conditions"
+          },
+          "persisted": {
+            "type": "boolean",
+            "description": "Stored in rproxy_rules (v0.4, #144)"
+          },
+          "created_by": {
+            "type": "string",
+            "description": "Token that created the stored rule (v0.4, #144)"
+          },
+          "created_at": {
+            "type": "integer",
+            "description": "Unix seconds (v0.4, #144)"
           }
         },
         "description": "Fields may be added in patch releases."
@@ -1520,6 +1617,58 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "rulesets": {
+                "type": "boolean"
+              },
+              "labels": {
+                "type": "boolean"
+              },
+              "conditions": {
+                "type": "boolean"
+              },
+              "readyz": {
+                "type": "boolean"
+              },
+              "limits": {
+                "type": "boolean"
+              },
+              "bandwidth": {
+                "type": "boolean"
+              },
+              "geoip": {
+                "type": "boolean"
+              },
+              "outlier_detection": {
+                "type": "boolean"
+              },
+              "dry_run": {
+                "type": "boolean"
+              },
+              "persistence": {
+                "type": "boolean"
+              },
+              "client_cert_auth": {
+                "type": "boolean"
+              },
+              "token_expiry": {
+                "type": "boolean"
+              },
+              "api_lockout": {
+                "type": "boolean"
+              },
+              "handoff": {
+                "type": "boolean"
+              },
+              "self_update": {
+                "type": "boolean"
+              },
+              "performance": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Keys of global.performance applied from the settings file"
               }
             }
           }
@@ -1717,6 +1866,15 @@
             "items": {
               "type": "string"
             }
+          },
+          "ejected_until": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Ejected by outlier_detection until (Unix seconds) (v0.4, #170)"
+          },
+          "ejections": {
+            "type": "integer",
+            "description": "v0.4, #170"
           }
         }
       },
@@ -2060,6 +2218,608 @@
             "description": "DNS-01 records are written by the ACME helper (global.acme.helper), which holds the DNS secrets"
           }
         }
+      },
+      "Labels": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 253
+        },
+        "maxProperties": 16,
+        "description": "Free-form marks (owner, tenant, controller); keys [A-Za-z0-9]([A-Za-z0-9._/-]{0,61}[A-Za-z0-9])?. v0.4 (#28, #166): features.labels"
+      },
+      "Limits": {
+        "type": "object",
+        "description": "Connection / datagram limits (v0.4, #165): features.limits. {} removes them in PATCH.",
+        "properties": {
+          "max_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000000,
+            "description": "Concurrent connections of the whole rule (UDP: sessions)"
+          },
+          "per_source": {
+            "type": "object",
+            "properties": {
+              "prefix_v4": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32
+              },
+              "prefix_v6": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 128
+              },
+              "max_connections": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000
+              },
+              "new_connections": {
+                "type": "object",
+                "properties": {
+                  "average": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "period": {
+                    "type": "string",
+                    "description": "1ms-1h, default 1s"
+                  },
+                  "burst": {
+                    "type": "integer",
+                    "description": "At least average (default average)"
+                  }
+                },
+                "required": [
+                  "average"
+                ],
+                "additionalProperties": false
+              },
+              "packets": {
+                "type": "object",
+                "properties": {
+                  "average": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "period": {
+                    "type": "string",
+                    "description": "1ms-1h, default 1s"
+                  },
+                  "burst": {
+                    "type": "integer",
+                    "description": "At least average (default average)"
+                  }
+                },
+                "required": [
+                  "average"
+                ],
+                "additionalProperties": false,
+                "description": "UDP only"
+              },
+              "max_sources": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000,
+                "description": "Default 65536"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "Bandwidth": {
+        "type": "object",
+        "description": "Bandwidth limits (v0.4, #166): features.bandwidth. TCP waits, UDP drops. {} removes them in PATCH.",
+        "properties": {
+          "upload": {
+            "type": "string",
+            "description": "bits per second: 8kbps-100Gbps, e.g. 10Mbps",
+            "example": "10Mbps"
+          },
+          "download": {
+            "type": "string",
+            "description": "bits per second: 8kbps-100Gbps, e.g. 10Mbps",
+            "example": "10Mbps"
+          },
+          "burst": {
+            "type": "string",
+            "description": "1KiB-1GiB, default 100 ms worth",
+            "example": "1MiB"
+          },
+          "per_source": {
+            "type": "object",
+            "properties": {
+              "upload": {
+                "type": "string",
+                "description": "bits per second: 8kbps-100Gbps, e.g. 10Mbps",
+                "example": "10Mbps"
+              },
+              "download": {
+                "type": "string",
+                "description": "bits per second: 8kbps-100Gbps, e.g. 10Mbps",
+                "example": "10Mbps"
+              },
+              "prefix_v4": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32
+              },
+              "prefix_v6": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 128
+              },
+              "max_sources": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "Geoip": {
+        "type": "object",
+        "description": "Country / ASN lists (v0.4, #168): features.geoip (rules) or geoip in features.middlewares. Needs global.geoip databases.",
+        "properties": {
+          "allow_countries": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Z]{2}$"
+            }
+          },
+          "deny_countries": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Z]{2}$"
+            }
+          },
+          "allow_asns": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "deny_asns": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "unknown": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny"
+            ],
+            "description": "Default allow"
+          }
+        },
+        "additionalProperties": false
+      },
+      "L4OutlierDetection": {
+        "type": "object",
+        "description": "Passive health checks of the targets (v0.4, #170): features.outlier_detection. Not on http rules.",
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "description": "Default 1"
+          },
+          "short_lived": {
+            "type": "string",
+            "description": "0s-1m, default 0s (off)"
+          },
+          "ejection_time": {
+            "type": "string",
+            "description": "1s-1h, default 10s"
+          },
+          "max_ejection_time": {
+            "type": "string",
+            "description": "At least ejection_time; default ejection_time"
+          },
+          "max_ejected_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Default 100"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HttpOutlierDetection": {
+        "type": "object",
+        "description": "Passive health checks of the servers (v0.4, #170): outlier_detection in features.services.",
+        "properties": {
+          "consecutive_5xx": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Default 5; 0 ignores"
+          },
+          "consecutive_gateway_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Default 3; 0 ignores"
+          },
+          "failure_percent": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "min_requests": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Default 20"
+          },
+          "window": {
+            "type": "string",
+            "description": "Default 30s"
+          },
+          "ejection_time": {
+            "type": "string",
+            "description": "Default 30s"
+          },
+          "max_ejection_time": {
+            "type": "string",
+            "description": "Default 5m"
+          },
+          "max_ejected_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Default 50"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Condition": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "Accepted",
+              "Programmed",
+              "ResolvedRefs",
+              "BackendsHealthy"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "True",
+              "False"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "last_transition": {
+            "type": "integer",
+            "description": "Unix seconds"
+          }
+        },
+        "required": [
+          "type",
+          "status",
+          "reason",
+          "message",
+          "last_transition"
+        ]
+      },
+      "RulesetRequest": {
+        "type": "object",
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuleRequest"
+            },
+            "maxItems": 10000
+          }
+        },
+        "required": [
+          "generation",
+          "rules"
+        ],
+        "additionalProperties": false
+      },
+      "Ruleset": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Rule"
+            }
+          }
+        }
+      },
+      "RulesetSummary": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "updated_by": {
+            "type": "string"
+          }
+        }
+      },
+      "ApplyResult": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "delete",
+              "none"
+            ]
+          },
+          "change": {
+            "type": "string",
+            "enum": [
+              "none",
+              "in_place",
+              "recreate"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "failed"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "RulesetApplied": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApplyResult"
+            }
+          }
+        }
+      },
+      "DiffEntry": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "before": {},
+          "after": {}
+        },
+        "required": [
+          "path",
+          "before",
+          "after"
+        ]
+      },
+      "RulePlan": {
+        "type": "object",
+        "description": "The answer of a dry run (v0.4, #169)",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "delete",
+              "none"
+            ]
+          },
+          "change": {
+            "type": "string",
+            "enum": [
+              "none",
+              "in_place",
+              "recreate"
+            ]
+          },
+          "rule": {
+            "type": "string"
+          },
+          "before": {
+            "type": "object",
+            "nullable": true
+          },
+          "after": {
+            "type": "object",
+            "nullable": true
+          },
+          "diff": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffEntry"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ConfigPlan": {
+        "type": "object",
+        "description": "What applying settings would change (v0.4, #169)",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "added": {
+            "type": "integer"
+          },
+          "removed": {
+            "type": "integer"
+          },
+          "changed": {
+            "type": "integer"
+          },
+          "unchanged": {
+            "type": "integer"
+          },
+          "failed": {
+            "type": "integer"
+          },
+          "restart_needed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "rule": {
+                  "type": "string"
+                },
+                "action": {
+                  "type": "string"
+                },
+                "change": {
+                  "type": "string"
+                },
+                "diff": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DiffEntry"
+                  }
+                }
+              }
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            }
+          }
+        }
+      },
+      "UpdateStatus": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "check",
+              "auto"
+            ]
+          },
+          "current": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string"
+              }
+            }
+          },
+          "available": {
+            "type": "object",
+            "nullable": true,
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string"
+              }
+            }
+          },
+          "last_check": {
+            "type": "integer",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "bad_versions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       }
     }
   },
@@ -2285,7 +3045,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Answer what applying the file would change (ConfigPlan) without changing anything. unsupported until GET /capabilities features.dry_run is true (v0.4)"
+          }
+        ]
       }
     },
     "/rules": {
@@ -2400,7 +3171,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+          }
+        ]
       }
     },
     "/rules/{protocol}/{listen_addr}/{listen_port}": {
@@ -2551,7 +3333,18 @@
               }
             }
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+          }
+        ]
       },
       "delete": {
         "summary": "Delete a rule (rules:write)",
@@ -2564,6 +3357,15 @@
               "minimum": 0
             },
             "description": "Wait this long for connections to finish before closing them"
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
           }
         ],
         "responses": {
@@ -2970,6 +3772,540 @@
           },
           "500": {
             "description": "The CA refused or could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness (no token; v0.4, #28): 200 when the startup restore is done, 503 while starting or draining. unsupported until GET /capabilities features.readyz is true (v0.4)",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ready": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ready": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "starting",
+                        "draining"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rulesets": {
+      "get": {
+        "summary": "Rule sets (rules:read; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RulesetSummary"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rulesets/{name}": {
+      "get": {
+        "summary": "One rule set (rules:read; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ruleset"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Make the set's rules exactly these (rules:write; v0.4, #28). If-Match: <etag> for optimistic concurrency. unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RulesetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RulesetApplied"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "stale_generation / static / already_exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete every rule of the set (rules:write; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+          },
+          {
+            "name": "drain_secs",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Done"
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config/plan": {
+      "post": {
+        "summary": "Compare the settings in the body (settings file shape, JSON) with what runs (admin; by default only over the Unix socket; v0.4, #169). unsupported until GET /capabilities features.dry_run is true (v0.4)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "version, global, rules"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigPlan"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/upgrade": {
+      "post": {
+        "summary": "Live upgrade: hand the sockets over to the binary now on disk (admin; by default only over the Unix socket; v0.4, #174). unsupported until GET /capabilities features.handoff is true (v0.4)",
+        "responses": {
+          "202": {
+            "description": "Done"
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/update": {
+      "get": {
+        "summary": "Self-update state (admin; v0.4, #174). unsupported until GET /capabilities features.self_update is true (v0.4)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Look for a new patch now and, with RPROXY_UPDATE=auto, swap it in (admin; by default only over the Unix socket; v0.4, #174). unsupported until GET /capabilities features.self_update is true (v0.4)",
+        "responses": {
+          "202": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid / unsupported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
             "content": {
               "application/json": {
                 "schema": {

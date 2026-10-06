@@ -381,6 +381,30 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec", "targets", "balance", "health_check"}`。`crowdsec` は v0.3.2、`targets` / `balance` / `health_check` は v0.3.3 から）。`targets` が空でなければ `dist_addr` / `dist_port` は読まない（UI は `''` / `0` を入れる）。
 
+## v0.4 の設定
+
+v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の中身が入ってから 1 回で出す。それまでの master では、まだ動かない設定は `GET /capabilities` の `features` が false で、使うルールは形を検証したうえで `400 unsupported`（形が不正なら `400 invalid`）、新しいエンドポイントは認証・スコープを通ったあと `400 unsupported`。設定ファイルのルールは `failed` に登録し（`--check-config` は警告）、`global` の項目と引数・環境変数は `event = "degraded"` を出して無視する。ただし制御 API のクライアント証明書（`--tls-client-auth`・`--tls-client-ca`、トークンの `client_cert`）は、無視すると守りが弱くなるので起動を止める設定のエラーにする。どれも省略でき、省略したときの動きは v0.3 と同じ。
+
+| 項目 | 場所 | 形 | features |
+|---|---|---|---|
+| ラベル（#28・#166） | ルールの `labels` | `{キー: 値}`。キーは英数字と `._/-`（63 文字まで）、値は 253 文字まで、16 個まで。動きには使わない（ログ・`/metrics`） | `labels` |
+| L4 の制限（#165） | ルールの `limits` | `max_connections`、`per_source`（`prefix_v4`・`prefix_v6`・`max_connections`・`new_connections`・`packets`（udp だけ）・`max_sources`）。速さは `{average, period, burst}`（L7 の `rate_limit` と同じ） | `limits` |
+| 帯域（#166） | ルールの `bandwidth` | `upload`・`download`（`"10Mbps"`、8kbps〜100Gbps）、`burst`（`"1MiB"`）、`per_source`（`upload`・`download`・`prefix_v4`・`prefix_v6`・`max_sources`）。TCP は待たせ、UDP は捨てる | `bandwidth` |
+| GeoIP（#168） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
+| 受け身のヘルスチェック（#170） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
+| performance（#194・#184） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）。環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` より設定ファイルが先。再起動まで効かない | `performance`（効く項目の名前） |
+| ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「エンドポイント」 | `rulesets` |
+| 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy` | `conditions` |
+| readiness（#28） | `GET /readyz` | 認証なし。`200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
+| 変更前の差分（#169） | `?dry_run=true`（`POST /rules`・`PATCH`・`DELETE`・`PUT /rulesets/{name}`・`POST /config/reload`）、`POST /config/plan`、`--check-config --diff` | 応答は `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`。`change` は `none`・`in_place`・`recreate` | `dry_run` |
+| API で作ったルールの保存（#144） | トークンの `persist: true`、テーブル `rproxy_rules`、`--node-name` | 表示に `origin: "api"`・`persisted`・`created_by`・`created_at` | `persistence` |
+| 制御 API の守り（#167） | `--tls-client-ca`・`--tls-client-auth`、トークンの `client_cert`、`--token-warn-days`、`--api-lockout-failures`・`--api-lockout-window`・`--api-lockout-duration` | `client_cert` はトークンの `sha256` の代わり、両方あれば両方が要る。期限が近いトークンは `token.expiring`、続けて失敗した送信元は `429 locked_out` | `client_cert_auth`、`token_expiry`、`api_lockout` |
+| 再起動なしの更新・自動更新（#174） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから | `handoff`、`self_update` |
+
+- `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。DB の `options` でも同じ形で読む。
+- ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）、`stats.targets[]` に `ejected_until`・`ejections`（#170）が、動くようになったら出る。
+- トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -401,6 +425,15 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
 | `POST /acme/accounts/{name}/register` | | 200 | アカウントを CA に作る（鍵があればそのアカウントを探す）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
 | `POST /acme/accounts/{name}/deactivate` | | 200 | アカウントを CA で無効にし、鍵を `<key_file>.deactivated` に退ける（次の注文で新しいアカウントを作る）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
+| `GET /readyz` | | 200 / 503 | v0.4（#28）：認証不要の readiness。上の「v0.4 の設定」（`features.readyz` が false の間は `400 unsupported`） |
+| `GET /rulesets` | | 200 | v0.4（#28）：ルールの組の一覧 `[{"name","generation","etag","rules","updated_at","updated_by"}]`。`rules:read` |
+| `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
+| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。docs/DESIGN-v0.4.md 3. |
+| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて消す。`rules:write` |
+| `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |
+| `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ）。`admin`、既定では Unix ソケットからだけ |
+| `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current","available","last_check","error","bad_versions"}`。`admin` |
+| `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ、`RPROXY_UPDATE=auto` なら入れ替える。`admin`、既定では Unix ソケットからだけ |
 | `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total` |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
@@ -426,6 +459,10 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `reserved` | 409 | rproxy 自身の制御 API のアドレスとポートに重なる（`0.0.0.0` / `::` とポート範囲も含めて判定する） |
 | `bind_failed` | 409 | 待ち受けポートを開けない |
 | `resolve_failed` | 502 | 転送先の名前解決に失敗し、キャッシュもない |
+| `owned` | 409 | v0.4：ルールが組（`ruleset`）に属するので個別には変えられない |
+| `precondition_failed` | 412 | v0.4：`If-Match` の etag が今の組と違う |
+| `stale_generation` | 409 | v0.4：組の `generation` が今より古い |
+| `locked_out` | 429 | v0.4：認証の失敗が続いたので、この送信元を一時的に止めている（`Retry-After`） |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係
@@ -447,4 +484,4 @@ rproxy のルールには 3 つの出どころがある。どれも `GET /rules`
 `--database-url mysql://user:pass@host:port/db` を指定すると、起動時に `forward_rules` テーブルの全ルールを読み込んで開始する。DB ユーザーには `SELECT` 権限だけを与えればよい。失敗したルールは `failed` として登録し、残りのルールは開始する。名前解決に失敗して `failed` になったルールは、再解決に成功した時点で自動的に開始する。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
-`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。
+`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。

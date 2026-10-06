@@ -2,6 +2,9 @@
 
 pub mod check;
 pub mod db;
+pub mod performance;
+pub mod persist;
+pub mod plan;
 pub mod reload;
 
 use serde::de::DeserializeOwned;
@@ -57,6 +60,27 @@ pub struct GlobalSpec {
 	pub access_log: Option<String>,
 	pub acme: Option<AcmeGlobal>,
 	pub crowdsec: Option<CrowdsecGlobal>,
+	/// MaxMind databases for the `geoip` lists (#168, v0.4).
+	pub geoip: Option<crate::net::geoip::GeoipGlobal>,
+	/// Worker threads, UDP sockets per port, CPU pinning, busy poll, splice (#194, #184, v0.4).
+	pub performance: Option<performance::PerformanceSpec>,
+}
+
+impl GlobalSpec {
+	/// `global` settings this build cannot apply yet: they are ignored with a
+	/// `degraded` line (startup) and a warning (`--check-config`).
+	pub fn unsupported(&self, features: &crate::core::rule::Features) -> Vec<String> {
+		let mut out = vec![];
+		if self.geoip.is_some() && !features.geoip {
+			out.push("global.geoip".to_string());
+		}
+		for key in self.performance.iter().flat_map(|p| p.keys()) {
+			if !features.performance.contains(&key) {
+				out.push(format!("global.performance.{key}"));
+			}
+		}
+		out
+	}
 }
 
 pub use crate::acme::config::AcmeGlobal;
@@ -121,6 +145,19 @@ impl ConfigDoc {
 	/// checked here; the rules are validated when they are created.
 	pub fn parse(path: &Path, text: &str) -> Result<ConfigDoc, String> {
 		let (doc, _) = ConfigDoc::parse_unchecked(path, text)?;
+		doc.check()?;
+		Ok(doc)
+	}
+
+	/// A document given as JSON (`POST /config/plan`); checked as a file would be.
+	pub fn from_value(value: serde_json::Value) -> Result<ConfigDoc, String> {
+		let mut doc = if value.is_array() {
+			ConfigDoc { version: 1, rules: serde_json::from_value(value).map_err(|e| format!("rules: {e}"))?, ..Default::default() }
+		} else {
+			serde_json::from_value::<ConfigDoc>(value).map_err(|e| e.to_string())?
+		};
+		doc.labels = (1..=doc.rules.len()).map(|i| format!("rule #{i}")).collect();
+		doc.check_duplicates()?;
 		doc.check()?;
 		Ok(doc)
 	}
@@ -224,6 +261,12 @@ impl ConfigDoc {
 		if a.crowdsec != b.crowdsec {
 			out.push("global.crowdsec");
 		}
+		if a.geoip != b.geoip {
+			out.push("global.geoip");
+		}
+		if a.performance != b.performance {
+			out.push("global.performance");
+		}
 		out
 	}
 
@@ -240,6 +283,24 @@ impl ConfigDoc {
 		if let Some(cs) = &self.global.crowdsec {
 			if let Some(i) = &cs.update_interval {
 				crate::l7::parse_duration(i).map_err(|e| format!("global.crowdsec.update_interval: {e}"))?;
+			}
+		}
+		if let Some(g) = &self.global.geoip {
+			g.check()?;
+		}
+		if let Some(p) = &self.global.performance {
+			p.check()?;
+		}
+		// geoip lists (rules and middlewares) need the databases of global.geoip
+		for (i, r) in self.rules.iter().enumerate() {
+			let geoip = self.global.geoip.as_ref();
+			if let Some(g) = &r.geoip {
+				g.check_databases(&format!("{}: geoip", self.label(i)), geoip)?;
+			}
+			for (name, m) in r.http.iter().flat_map(|h| &h.middlewares) {
+				if let crate::l7::MiddlewareSpec::Geoip(g) = m {
+					g.check_databases(&format!("{}: middleware {name}", self.label(i)), geoip)?;
+				}
 			}
 		}
 		// crowdsec middlewares need global.crowdsec (and appsec_url for appsec)
@@ -323,6 +384,16 @@ rules:
 		assert_eq!(doc.rules.len(), 2);
 		for r in doc.rules {
 			r.validate(&caps).unwrap_or_else(|e| panic!("{}", e.message));
+		}
+		// docs/DESIGN-v0.4.md and its English version, 2.: the combined v0.4 example
+		for design in [include_str!("../../docs/DESIGN-v0.4.md"), include_str!("../../docs/en/DESIGN-v0.4.md")] {
+			let section = &design[design.find("## 2.").unwrap()..];
+			let yaml = section.split("```yaml").nth(1).unwrap().split("```").next().unwrap();
+			let doc = ConfigDoc::parse(Path::new("design-v0.4.yaml"), yaml).unwrap_or_else(|e| panic!("{e}"));
+			assert!(doc.global.geoip.is_some() && doc.global.performance.is_some());
+			for r in doc.rules {
+				r.validate(&caps).unwrap_or_else(|e| panic!("{}", e.message));
+			}
 		}
 		// docs/ACME.md and docs/en/ACME.md: the settings example
 		for doc in [include_str!("../../docs/ACME.md"), include_str!("../../docs/en/ACME.md")] {

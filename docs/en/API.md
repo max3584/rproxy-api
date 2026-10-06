@@ -381,6 +381,30 @@ rproxy talks HTTP/1.1, HTTP/2 and HTTP/3 with clients and HTTP/1.1 with destinat
 - Connection stats (`stats`) are per client connection: `rx_bytes` is bytes from the client and `tx_bytes` bytes to the client.
 - `http` can also be stored in the JSON of the DB `options` column (`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec", "targets", "balance", "health_check"}`; `crowdsec` since v0.3.2, `targets` / `balance` / `health_check` since v0.3.3). If `targets` is non-empty, `dist_addr` / `dist_port` are not read (the UI writes `''` / `0`).
 
+## v0.4 settings
+
+Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released once, with everything implemented. Until then, on master, settings that cannot run yet are false in `features` of `GET /capabilities`; rules using them are validated and then refused with `400 unsupported` (`400 invalid` when the shape is wrong); new endpoints answer `400 unsupported` after authentication and the scope check. Settings-file rules are registered as `failed` (`--check-config` warns); `global` keys, flags and environment variables are ignored with an `event = "degraded"` line. Exception: client certificates for the control API (`--tls-client-auth`, `--tls-client-ca`, a token's `client_cert`) are configuration errors that stop the startup, since ignoring them would weaken protection. Everything is optional; leaving it out behaves as v0.3.
+
+| Item | Where | Shape | features |
+|---|---|---|---|
+| Labels (#28, #166) | a rule's `labels` | `{key: value}`. Keys: letters, digits and `._/-` (up to 63), values up to 253 characters, at most 16. No effect on behaviour (logs, `/metrics`) | `labels` |
+| L4 limits (#165) | a rule's `limits` | `max_connections`, `per_source` (`prefix_v4`, `prefix_v6`, `max_connections`, `new_connections`, `packets` (udp only), `max_sources`). Rates are `{average, period, burst}` (as the L7 `rate_limit`) | `limits` |
+| Bandwidth (#166) | a rule's `bandwidth` | `upload`, `download` (`"10Mbps"`, 8kbps-100Gbps), `burst` (`"1MiB"`), `per_source` (`upload`, `download`, `prefix_v4`, `prefix_v6`, `max_sources`). TCP waits, UDP drops | `bandwidth` |
+| GeoIP (#168) | a rule's `geoip`, the `geoip` middleware, `global.geoip` | `allow_countries`, `deny_countries` (ISO 3166-1 alpha-2), `allow_asns`, `deny_asns`, `unknown` (`allow` / `deny`). `global.geoip`: `country_db`, `asn_db` (mmdb), `check_interval`, `log_country`. Country lists need `country_db`, ASN lists need `asn_db` | `geoip`, `geoip` in `middlewares` |
+| Passive health checks (#170) | a rule's `outlier_detection` (L4; `invalid` on `http` rules), `http.services.<name>.outlier_detection` | L4: `consecutive_failures`, `short_lived`, `ejection_time`, `max_ejection_time`, `max_ejected_percent`. L7: `consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`, `min_requests`, `window`, `ejection_time`, `max_ejection_time`, `max_ejected_percent` | `outlier_detection`, `outlier_detection` in `services` |
+| Performance (#194, #184) | `global.performance` | `workers`, `udp_shards` (1-64 or `auto`), `cpu_affinity` (`none` / `auto` / `"0-3,6"`), `busy_poll_usecs`, `splice` (`enabled`, `after`, `full_reads`, `pipe_size`). The settings file wins over `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE*`. Effective after a restart | `performance` (names of the keys that take effect) |
+| Rule sets (#28) | `GET /rulesets`, `GET` / `PUT` / `DELETE /rulesets/{name}` | See "Endpoints" | `rulesets` |
+| Conditions (#28) | `conditions` in the rule view | `[{"type","status","reason","message","last_transition"}]`; types `Accepted`, `Programmed`, `ResolvedRefs`, `BackendsHealthy` | `conditions` |
+| Readiness (#28) | `GET /readyz` | No token. `200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
+| Diff before change (#169) | `?dry_run=true` (`POST /rules`, `PATCH`, `DELETE`, `PUT /rulesets/{name}`, `POST /config/reload`), `POST /config/plan`, `--check-config --diff` | Answer `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`; `change` is `none`, `in_place` or `recreate` | `dry_run` |
+| Storing API-created rules (#144) | a token's `persist: true`, table `rproxy_rules`, `--node-name` | The view shows `origin: "api"`, `persisted`, `created_by`, `created_at` | `persistence` |
+| Control API hardening (#167) | `--tls-client-ca`, `--tls-client-auth`, a token's `client_cert`, `--token-warn-days`, `--api-lockout-failures`, `--api-lockout-window`, `--api-lockout-duration` | `client_cert` instead of a token's `sha256`; with both, both are required. Tokens close to expiry: `token.expiring`; sources failing repeatedly: `429 locked_out` | `client_cert_auth`, `token_expiry`, `api_lockout` |
+| Live upgrade, self-update (#174) | SIGUSR2, `POST /admin/upgrade`, `--handoff-*`, `RPROXY_UPDATE*`, `GET` / `POST /admin/update` | Hands the listening sockets to a new process within one minor. Self-update verifies signatures (minisign) first | `handoff`, `self_update` |
+
+- `limits`, `bandwidth`, `geoip`, `outlier_detection` and `labels` given to `PATCH` replace the current value as a whole (`{}` removes it; left out keeps it). The DB `options` carry the same shape.
+- Once they run, a rule's `stats` gets `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff), and `stats.targets[]` gets `ejected_until` and `ejections` (#170).
+- Token rotation: add the new token and SIGHUP, switch the clients, then remove the old token and SIGHUP (with `expires`, `token.expiring` reminds you).
+
 ## Endpoints
 
 | Method and path | Body | On success | Description |
@@ -401,6 +425,15 @@ rproxy talks HTTP/1.1, HTTP/2 and HTTP/3 with clients and HTTP/1.1 with destinat
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | Revokes the issued certificate at the CA and orders a new one at once. Scope and Unix socket as for `POST /acme/renew`. `event=audit` (`action: acme.revoke`). docs/en/ACME.md |
 | `POST /acme/accounts/{name}/register` | | 200 | Creates the account at the CA (or finds the one of its key). Scope and Unix socket as for `POST /acme/renew` |
 | `POST /acme/accounts/{name}/deactivate` | | 200 | Deactivates the account at the CA and moves its key aside (`<key_file>.deactivated`; the next order creates a new account). Scope and Unix socket as for `POST /acme/renew` |
+| `GET /readyz` | | 200 / 503 | v0.4 (#28): readiness without a token. See "v0.4 settings" above (`400 unsupported` while `features.readyz` is false) |
+| `GET /rulesets` | | 200 | v0.4 (#28): rule sets `[{"name","generation","etag","rules","updated_at","updated_by"}]`. `rules:read` |
+| `GET /rulesets/{name}` | | 200 | v0.4 (#28): `{"name","generation","etag","rules":[...]}` (and an `ETag` header). Slashes in the name may be written as they are. `rules:read` |
+| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<rule>...]}` | 200 | v0.4 (#28): makes the set's rules exactly the body (create, change, delete). `If-Match` differing from the current etag is `412 precondition_failed`, an older `generation` is `409 stale_generation`, a key taken by a rule outside the set is `409 already_exists` / `static`. Any rule with a wrong shape changes nothing (`400`, `rules[i]: ...`). Answer `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`. `rules:write`; every rule within `allow_listen_ports`. A single `PATCH` / `DELETE` of a set's rule is `409 owned`. docs/en/DESIGN-v0.4.md 3. |
+| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4 (#28): deletes every rule of the set. `rules:write` |
+| `POST /config/plan` | JSON in the settings file's shape | 200 | v0.4 (#169): compares the settings in the body with what runs and answers the difference (changes nothing; used by `--check-config --diff`). `admin`; by default only over the Unix socket |
+| `POST /admin/upgrade` | | 202 | v0.4 (#174): hands over to the binary now on disk (as SIGUSR2). `admin`; by default only over the Unix socket |
+| `GET /admin/update` | | 200 | v0.4 (#174): self-update state `{"mode","current","available","last_check","error","bad_versions"}`. `admin` |
+| `POST /admin/update` | | 202 | v0.4 (#174): looks for a new patch now and swaps it in under `RPROXY_UPDATE=auto`. `admin`; by default only over the Unix socket |
 | `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total` |
 
 When putting an IPv6 `listen_addr` in a path, URL-encode it.
@@ -426,6 +459,10 @@ On failure, responses take the following shape.
 | `reserved` | 409 | Overlaps the address and port of rproxy's own control API (checked including `0.0.0.0` / `::` and port ranges) |
 | `bind_failed` | 409 | The listen port cannot be opened |
 | `resolve_failed` | 502 | Name resolution of the destination failed and there is no cache |
+| `owned` | 409 | v0.4: the rule belongs to a set (`ruleset`) and cannot be changed alone |
+| `precondition_failed` | 412 | v0.4: the `If-Match` etag differs from the set's current one |
+| `stale_generation` | 409 | v0.4: the set's `generation` is older than the current one |
+| `locked_out` | 429 | v0.4: this source is locked out for a while after repeated authentication failures (`Retry-After`) |
 | `internal` | 500 | Other |
 
 ## Relationship between the API, config file and UI (DB)
@@ -447,4 +484,4 @@ rproxy rules have three origins. All appear in `GET /rules`.
 With `--database-url mysql://user:pass@host:port/db`, all rules in the `forward_rules` table are loaded and started at startup. The DB user only needs the `SELECT` privilege. Rules that fail are registered as `failed`, and the remaining rules are started. Rules that became `failed` because of a name resolution failure start automatically once re-resolution succeeds.
 
 The table definition is managed in `db/` of the UI repository. The columns rproxy reads are `protocol`, `src_addr`, `src_port`, `src_port_end`, `dist_addr`, `dist_port`, `source_ip`, `udp_idle_secs`, `options`. If `options.targets` (multiple destinations) is present, `dist_addr` / `dist_port` are not used. Rows with `options.enabled` set to `false` (rules paused in the UI) are not created at startup (counted in the `restore.paused` log).
-`options` is JSON: `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}` (`allow_from`, `http` and `crowdsec` can be omitted). If an old table lacks these columns, default values are used.
+`options` is JSON: `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}` (`allow_from`, `http` and `crowdsec` can be omitted). If an old table lacks these columns, default values are used. The v0.4 `labels`, `limits`, `bandwidth`, `geoip` and `outlier_detection` are read in the API's shape as well (optional; "v0.4 settings" above).
