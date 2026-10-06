@@ -168,6 +168,14 @@ Streams tens of MiB of pseudo-random data (slices of a 1 MiB block at positions 
 | `a_response_cut_off_by_the_backend_never_looks_complete` | When the target cuts off in the middle of a response, HTTP/1.1, HTTP/2, and HTTP/3 clients see an error (truncated) (for `Content-Length`, chunked, and through `compress`) |
 | `a_request_cut_off_by_the_client_never_reaches_the_backend_as_complete` | When the client cuts off in the middle of the body (HTTP/1.1 `Content-Length` and chunked truncation, HTTP/2 RST_STREAM, HTTP/3 reset), the target never receives it as a complete request |
 
+## Integration tests: the TCP relay (`tests/relay.rs`, #185)
+
+`l4::relay` borrows each direction's buffer from a per-thread pool only while it has data to pass on. The number of lent buffers (`l4::relay::buffers_in_use`) is process-wide, so the test is a single function.
+
+| Test | What it checks |
+|---|---|
+| `relay_buffers_and_half_closes` | Connections whose data has passed (50 plain, 20 with TLS terminated) hold no buffer (and still work afterwards). A connection stuck on a backend that does not read holds one, and gives it back when it ends. When the backend sends its FIN first (plain and TLS termination) or the client ends first (TLS termination), it is passed on as a half-close and the data of the other direction all arrives |
+
 ## Restoring from the DB (`tests/db_restore.rs`)
 
 | Test | What it checks |
@@ -203,7 +211,7 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 
 `.github/workflows/bench.yml` runs on PRs that change `src/`, `benches/`, `tests/common/` or `Cargo.*`. Runners vary in speed, so the merge base (`--save-baseline base`) and the PR (`--baseline-lenient base`) are measured one after the other in the same job, and `scripts/bench-summary.py` puts a table in the job summary and in a PR comment (one comment, updated). A benchmark whose mean got more than 15 % slower, with the whole 95 % confidence interval on the slower side, becomes a warning (not a failure, and not a required check). On a warning, first re-run the job to see whether it happens again.
 
-When one iteration of `dataplane` makes no progress for 30 seconds (`STALL`), the benchmark treats it as a stall and panics with what it was doing (bytes written and read back, whether the TLS client still holds unsent records) and the rule counters (#187). Each workflow step also has a timeout (20 minutes). A TLS stream must be flushed after `write_all`: when the socket was full, the last records stay in rustls until then (the cause of the stall in #187, on the client side; rproxy's `copy_bidirectional` flushes whenever it has nothing to read).
+When one iteration of `dataplane` makes no progress for 30 seconds (`STALL`), the benchmark treats it as a stall and panics with what it was doing (bytes written and read back, whether the TLS client still holds unsent records) and the rule counters (#187). Each workflow step also has a timeout (20 minutes). A TLS stream must be flushed after `write_all`: when the socket was full, the last records stay in rustls until then (the cause of the stall in #187, on the client side; rproxy's relay (`l4::relay`) flushes whenever it has nothing to read).
 
 For telling the causes apart there is `examples/stall_probe.rs` (the `stall-probe` job of `bench.yml`). It repeats the same 1 MiB echo hundreds of times with a 3-second timeout per iteration, across L4 TCP, TLS termination and TLS without rproxy, the client flushing or not, the default or a 4 KiB send buffer, and rproxy in the same process or as its own process (`--rproxy target/release/rproxy-api`), and prints how many iterations stalled and how long they took. In #187 only TLS clients that did not flush stalled, just the same without rproxy and with rproxy as its own process, and their rustls still held unsent records (`wants_write = true`). The job fails if a client that flushes stalls. Locally: `cargo run --release --example stall_probe -- --iters 300`.
 

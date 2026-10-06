@@ -883,6 +883,7 @@ impl Conn {
 			if let Some(client_upgrade) = client_upgrade {
 				let backend_upgrade = hyper::upgrade::on(&mut resp);
 				let rt = self.rt.clone();
+				let client_read = if self.https { crate::l4::relay::TLS_READ_SIZE } else { crate::l4::relay::BUFFER_SIZE };
 				// an upgraded connection keeps its in_flight places until it ends
 				let holds = std::mem::take(holds);
 				self.rt.tracker.spawn(async move {
@@ -890,7 +891,7 @@ impl Conn {
 					let relay = async {
 						let (client, backend) = tokio::try_join!(client_upgrade, backend_upgrade).ok()?;
 						let (mut client, mut backend) = (TokioIo::new(client), TokioIo::new(backend));
-						tokio::io::copy_bidirectional(&mut client, &mut backend).await.ok()
+						crate::l4::relay::bidirectional_reading(&mut client, &mut backend, client_read, crate::l4::relay::BUFFER_SIZE).await.ok()
 					};
 					tokio::select! {
 						_ = rt.kill.cancelled() => {}
