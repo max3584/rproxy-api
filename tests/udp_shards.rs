@@ -25,12 +25,41 @@ async fn sharded() -> Harness {
 	harness().await
 }
 
-/// Sockets bound to `port` (UDP over IPv4), from /proc/net/udp.
-fn sockets_on(port: u16) -> usize {
-	let table = std::fs::read_to_string("/proc/net/udp").unwrap();
-	let want = format!(":{port:04X}");
-	table.lines().skip(1).filter(|l| l.split_whitespace().nth(1).is_some_and(|local| local.ends_with(&want))).count()
+/// Sockets bound to exactly `ip:port` (UDP over IPv4), from /proc/net/udp.
+/// Only the exact local address counts: tests run in parallel, and their
+/// clients' ephemeral ports (on 127.0.0.1) can happen to equal `port`.
+///
+/// The file is not a snapshot: the kernel hands it out about a page per read
+/// and finds where to go on by counting lines again, so sockets that other tests
+/// open or close meanwhile make lines repeat or go missing (#206). Sockets are
+/// counted by inode, and the table is read until two reads agree.
+fn sockets_on(ip: [u8; 4], port: u16) -> usize {
+	// /proc shows the address as a little-endian u32 in hex
+	let want = format!("{:08X}:{port:04X}", u32::from_le_bytes(ip));
+	let read = || {
+		let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+		table
+			.lines()
+			.skip(1)
+			.filter_map(|l| {
+				let f: Vec<&str> = l.split_whitespace().collect();
+				(f.get(1) == Some(&want.as_str())).then(|| f[9].to_string())
+			})
+			.collect::<std::collections::BTreeSet<_>>()
+	};
+	let mut last = read();
+	for _ in 0..50 {
+		let next = read();
+		if next == last {
+			return next.len();
+		}
+		last = next;
+	}
+	panic!("/proc/net/udp kept changing");
 }
+
+const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
+const ANY: [u8; 4] = [0, 0, 0, 0];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clients_keep_one_session_across_shards() {
@@ -39,7 +68,7 @@ async fn clients_keep_one_session_across_shards() {
 	let port = free_udp_port();
 	let (status, v) = h.post(rule("udp", port, backend)).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
-	assert_eq!(sockets_on(port), 4, "one socket per worker thread");
+	assert_eq!(sockets_on(LOOPBACK, port), 4, "one socket per worker thread");
 
 	// many clients, so that every shard gets some; several round trips each
 	let mut clients = vec![];
@@ -59,7 +88,7 @@ async fn clients_keep_one_session_across_shards() {
 
 	// deleting the rule closes every socket of the group
 	assert_eq!(h.delete(&format!("udp/127.0.0.1/{port}")).await, StatusCode::NO_CONTENT);
-	assert_eq!(sockets_on(port), 0);
+	assert_eq!(sockets_on(LOOPBACK, port), 0);
 	std::net::UdpSocket::bind(("127.0.0.1", port)).expect("the port is free again");
 }
 
@@ -108,13 +137,17 @@ async fn wildcard_replies_and_allow_from_on_every_shard() {
 	r["allow_from"] = json!(["127.0.0.1/32"]);
 	let (status, v) = h.post(r).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
-	assert_eq!(sockets_on(port), 4);
+	assert_eq!(sockets_on(ANY, port), 4);
 	let to = SocketAddr::from(([127, 0, 0, 2], port));
+	// keep every client open: a dropped socket's ephemeral port can be handed
+	// to the next client, which is then (rightly) the same session
+	let mut clients = Vec::new();
 	for i in 0..32 {
 		// connected: hears only from 127.0.0.2
 		let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		s.connect(to).await.unwrap();
 		assert_eq!(udp_roundtrip(&s, &format!("{i}")).await, format!("W:{i}"), "reply from the address sent to");
+		clients.push(s);
 	}
 	let mut denied = 0;
 	for _ in 0..32 {
@@ -137,5 +170,5 @@ async fn a_port_held_by_another_reuseport_socket_is_in_use() {
 	let h = sharded().await;
 	let (status, v) = h.post(rule("udp", port, "127.0.0.1:9".parse().unwrap())).await;
 	assert_ne!(status, StatusCode::CREATED, "{v}");
-	assert_eq!(sockets_on(port), 1, "only the other socket");
+	assert_eq!(sockets_on(LOOPBACK, port), 1, "only the other socket");
 }
