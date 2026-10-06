@@ -268,9 +268,7 @@ where
 	let conn = Arc::new(Conn::new(rt, client, local, tls, false));
 	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
 		let conn = conn.clone();
-		// boxed: the handler's future is large, and hyper moves the stream's future
-		// (into a task of its own for each HTTP/2 stream) several times; a pointer is cheaper (#195)
-		async move { Ok::<_, Infallible>(Box::pin(conn.handle(req.map(|b| b.map_err(boxed_error).boxed()))).await) }
+		async move { Ok::<_, Infallible>(conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await) }
 	});
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 	builder.http1().timer(TokioTimer::new());
@@ -487,7 +485,7 @@ impl Conn {
 			.unwrap_or_else(|| host.clone());
 		// sign-in callbacks and logout of `oidc`, whichever route matched
 		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
-			answer = Some(oidc_response(Box::pin(o.handle(&parts, self.https, &authority)).await));
+			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
 		}
 		for (i, m) in chain.iter().enumerate() {
 			if answer.is_some() {
@@ -495,8 +493,7 @@ impl Conn {
 			}
 			ran += 1;
 			let resp = match m.as_ref() {
-				// the middlewares that wait are boxed: their futures would make every request's larger
-				Middleware::BasicAuth(b) => match Box::pin(b.check(&parts.headers)).await {
+				Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
 					BasicVerdict::Allow(user) => {
 						if !b.keep_authorization {
 							parts.headers.remove(header::AUTHORIZATION);
@@ -516,8 +513,8 @@ impl Conn {
 					}
 					BasicVerdict::Unavailable => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 				},
-				Middleware::ForwardAuth(fa) => Box::pin(self.forward_auth(&router, fa, &mut parts, client_ip, &host)).await,
-				Middleware::Oidc(o) => match Box::pin(o.handle(&parts, self.https, &authority)).await {
+				Middleware::ForwardAuth(fa) => self.forward_auth(&router, fa, &mut parts, client_ip, &host).await,
+				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
 					oidc::Outcome::Pass { session, set_cookie } => {
 						o.pass_identity(&mut parts.headers, &session);
 						set_cookies.extend(set_cookie);
@@ -526,11 +523,11 @@ impl Conn {
 					answer => Some(oidc_response(answer)),
 				},
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
-					Box::pin(self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host)).await
+					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
 				Middleware::Buffering { max } => {
 					let taken = std::mem::replace(&mut body, empty_body());
-					match Box::pin(resilience::buffer(&parts.headers, taken, *max)).await {
+					match resilience::buffer(&parts.headers, taken, *max).await {
 						Ok(bytes) => {
 							body = full_body(bytes.clone());
 							replay = Some(bytes);
@@ -584,7 +581,7 @@ impl Conn {
 		}
 		// response side in reverse, also for answers of the middlewares
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
-			resp = Box::pin(self.on_response(&router, m, i, resp, &ctx, &mut sent)).await;
+			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
 		entry.status = resp.status().as_u16();
 		// tell HTTP/1.1 and HTTP/2 clients that HTTP/3 is answered on the same port
@@ -921,8 +918,7 @@ impl Conn {
 				},
 			}
 		}
-		// boxed: dialing (TCP, TLS) is a large future, needed only without a kept connection
-		let mut sender = Box::pin(self.connect(router, service, index)).await?;
+		let mut sender = self.connect(router, service, index).await?;
 		let resp = within(service.response, sent, sender.send_request(req))
 			.await
 			.ok_or_else(timed_out)?
