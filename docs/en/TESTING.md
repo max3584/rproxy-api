@@ -219,12 +219,11 @@ For telling the causes apart there is `examples/stall_probe.rs` (the `stall-prob
 
 ## Not yet tested
 
-- Combinations with real mail servers (Postfix / Dovecot) and real WebRTC, TURN, and RTSP clients
-
+- Real mail clients (Thunderbird etc.) and WebRTC in browsers (checked by hand: #42, #44). Combinations with real mail servers (Postfix / Dovecot), TURN (coturn) and RTSP (MediaMTX) are checked by the Interop workflow (below)
 - Continuous forwarding for many hours (the Load workflow's soak can do it when run manually with a long `soak_secs`)
-- The control API with TLS enabled (checked manually, no automated test)
-- Reloading tokens and certificates via SIGHUP (checked manually)
 - The transparent routing procedure using iptables (`-m socket`)
+
+The control API with TLS enabled and reloading tokens and certificates via SIGHUP are checked in `tests/startup.rs` (`an_unreadable_api_certificate_is_retried`, `sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_files`).
 
 ## Combinations with real servers (Interop workflow)
 

@@ -219,12 +219,11 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 
 ## まだテストしていないこと
 
-- 実際のメールサーバ（Postfix / Dovecot）と、実際の WebRTC・TURN・RTSP のクライアントとの組み合わせ
-
+- 実際のメールクライアント（Thunderbird など）と、ブラウザの WebRTC（手動で確かめる：#42・#44）。実際のメールサーバ（Postfix / Dovecot）・TURN（coturn）・RTSP（MediaMTX）との組み合わせは Interop ワークフロー（下）で確かめている
 - 数時間を超える連続転送（Load ワークフローの soak は手動で `soak_secs` を長くすれば回せる）
-- TLS を有効にした制御 API（手動では確認済み、自動テストはない）
-- SIGHUP によるトークン・証明書の再読込（手動では確認済み）
 - iptables（`-m socket`）を使う transparent のルーティング手順
+
+TLS を有効にした制御 API と、SIGHUP によるトークン・証明書の再読込は `tests/startup.rs`（`an_unreadable_api_certificate_is_retried`・`sighup_reloads_tokens_and_the_api_certificate_and_keeps_them_on_bad_files`）で確かめている。
 
 ## 実際のサーバとの組み合わせ（Interop ワークフロー）
 

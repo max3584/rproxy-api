@@ -302,7 +302,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 ## 開発
 
 ```bash
-cargo test     # 単体テストと、実際にソケットを使う結合テスト（tests/api.rs）
+cargo test     # 単体テスト（src/）と、実際にソケットを使う結合テスト（tests/。一覧は docs/TESTING.md）
 cargo clippy --all-targets
 ```
 
