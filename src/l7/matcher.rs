@@ -302,16 +302,27 @@ impl Matcher {
 		Ok(m)
 	}
 
+	/// Whether the expression looks at headers (`RequestInfo.headers` is only
+	/// filled for rules that have such a route).
+	pub fn uses_headers(&self) -> bool {
+		match self {
+			Matcher::And(a, b) | Matcher::Or(a, b) => a.uses_headers() || b.uses_headers(),
+			Matcher::Not(a) => a.uses_headers(),
+			Matcher::Header(..) | Matcher::HeaderRegexp(..) => true,
+			_ => false,
+		}
+	}
+
 	pub fn matches(&self, r: &RequestInfo) -> bool {
 		match self {
 			Matcher::And(a, b) => a.matches(r) && b.matches(r),
 			Matcher::Or(a, b) => a.matches(r) || b.matches(r),
 			Matcher::Not(a) => !a.matches(r),
 			Matcher::Host(hosts) => {
-				let host = strip_port(r.host).to_ascii_lowercase();
+				let host = lower(strip_port(r.host));
 				hosts.iter().any(|h| crate::tls::config::name_matches(h, &host))
 			}
-			Matcher::HostRegexp(re) => re.is_match(&strip_port(r.host).to_ascii_lowercase()),
+			Matcher::HostRegexp(re) => re.is_match(&lower(strip_port(r.host))),
 			Matcher::Path(paths) => paths.iter().any(|p| p == r.path),
 			Matcher::PathPrefix(prefixes) => prefixes.iter().any(|p| r.path.starts_with(p.as_str())),
 			Matcher::PathRegexp(re) => re.is_match(r.path),
@@ -327,6 +338,15 @@ impl Matcher {
 	/// Traefik's default priority: the length of the expression.
 	pub fn default_priority(src: &str) -> i64 {
 		src.len() as i64
+	}
+}
+
+/// In lower case; copied only when it is not already (the server passes it lowered).
+fn lower(s: &str) -> std::borrow::Cow<'_, str> {
+	if s.bytes().any(|b| b.is_ascii_uppercase()) {
+		std::borrow::Cow::Owned(s.to_ascii_lowercase())
+	} else {
+		std::borrow::Cow::Borrowed(s)
 	}
 }
 
