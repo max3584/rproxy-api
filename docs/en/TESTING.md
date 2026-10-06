@@ -29,6 +29,8 @@ Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc 
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
+Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
+
 ## Unit tests (`src/`)
 
 | File | Test | What it checks |

@@ -408,3 +408,73 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	let (status, v) = h.post(acme).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
 }
+
+/// Refused requests are in the audit log with the client and why (never the
+/// token), at most 20 at once per client; changes carry the client too.
+#[tokio::test]
+async fn refusals_and_changes_are_audited_with_the_client() {
+	logs::capture();
+	let dir = std::env::temp_dir().join(format!("rproxy-it-audit-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let file = dir.join("tokens.yaml");
+	use sha2::{Digest, Sha256};
+	let hex = |t: &str| Sha256::digest(t.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+	std::fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: reader, sha256: {}, scopes: [rules:read]}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+			hex("read-secret"),
+			hex("root-secret")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(file).unwrap()).await;
+	let port = free_port();
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let send = |method: reqwest::Method, token: Option<&str>| {
+		let mut r = h.http.request(method, format!("{}{path}", h.base));
+		if let Some(t) = token {
+			r = r.bearer_auth(t);
+		}
+		async move { r.send().await.unwrap().status() }
+	};
+	let audit = |outcome: &'static str| {
+		let path = path.clone();
+		move |v: &serde_json::Value| v["event"] == "audit" && v["outcome"] == outcome && v["path"] == path.as_str()
+	};
+
+	assert_eq!(send(reqwest::Method::GET, None).await, StatusCode::UNAUTHORIZED);
+	let v = logs::wait_for("401 without a token", audit("unauthorized")).await;
+	assert_eq!((v["client"].as_str(), v["reason"].as_str(), v["method"].as_str()), (Some("127.0.0.1"), Some("missing"), Some("GET")), "{v}");
+	assert_eq!(send(reqwest::Method::GET, Some("wrong-secret")).await, StatusCode::UNAUTHORIZED);
+	let v = logs::wait_for("401 with a bad token", |v| audit("unauthorized")(v) && v["reason"] == "invalid").await;
+	assert!(!v.to_string().contains("wrong-secret"), "the token is never logged: {v}");
+
+	assert_eq!(send(reqwest::Method::DELETE, Some("read-secret")).await, StatusCode::FORBIDDEN);
+	let v = logs::wait_for("403", audit("forbidden")).await;
+	assert_eq!((v["client"].as_str(), v["token"].as_str(), v["scope"].as_str()), (Some("127.0.0.1"), Some("reader"), Some("rules:write")), "{v}");
+	assert!(!v.to_string().contains("read-secret"), "{v}");
+
+	// a change: who (token) and from where (client)
+	let backend = tcp_backend("A:").await;
+	let r = h.http.post(format!("{}/rules", h.base)).bearer_auth("root-secret").json(&rule("tcp", port, backend)).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::CREATED);
+	let rule_key = format!("tcp/127.0.0.1:{port}");
+	let v = logs::wait_for("the create audit", |v| v["event"] == "audit" && v["action"] == "create" && v["rule"] == rule_key.as_str()).await;
+	assert_eq!((v["client"].as_str(), v["token"].as_str(), v["outcome"].as_str()), (Some("127.0.0.1"), Some("root"), Some("ok")), "{v}");
+
+	// a flood of bad tokens: 20 lines at once (minus those above), then the next says how many were left out
+	for _ in 0..30 {
+		assert_eq!(send(reqwest::Method::GET, Some("flood")).await, StatusCode::UNAUTHORIZED);
+	}
+	let logged = logs::lines(|v| audit("unauthorized")(v) || audit("forbidden")(v)).len();
+	assert!((20..=28).contains(&logged), "{logged} lines");
+	tokio::time::sleep(Duration::from_millis(1100)).await;
+	assert_eq!(send(reqwest::Method::GET, Some("flood")).await, StatusCode::UNAUTHORIZED);
+	let v = logs::wait_for("the line after the flood", |v| audit("unauthorized")(v) && v["suppressed"].as_u64() > Some(0)).await;
+	assert!(v["suppressed"].as_u64().unwrap() >= 3, "{v}");
+	let text = h.http.get(format!("{}/metrics", h.base)).bearer_auth("root-secret").send().await.unwrap().text().await.unwrap();
+	let n: u64 = text.lines().find_map(|l| l.strip_prefix("rproxy_log_suppressed_total ")).unwrap().parse().unwrap();
+	assert!(n >= 3, "{text}");
+	std::fs::remove_dir_all(dir).unwrap();
+}

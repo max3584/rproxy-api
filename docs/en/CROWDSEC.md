@@ -63,9 +63,10 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.target_fqdn` / `evt.Parsed.target_fqdn` | `host` |
 | `evt.Parsed.http_version`, `body_bytes_sent` | `protocol`, `bytes_out` |
 | `evt.Meta.rproxy_rule`, `rproxy_route` | `rule`, `route` |
+| `evt.Meta.rproxy_refused_by`, `rproxy_auth_error` | `refused_by` (the kind of middleware that refused: `basic_auth`, `ip_allow`, …), `auth_error` (why `basic_auth` refused: `bad_password`, …). Since v0.3.20 |
 | `evt.StrTime` | `timestamp` |
 
-**L4 (`event: conn.open` / `conn.denied`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (`allow_from` / `crowdsec`, etc.), `rproxy_rule`.
+**L4 (`event: conn.open` / `conn.denied`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (`allow_from` / `crowdsec`, etc.), `rproxy_rule`. UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams).
 
 ## 3. Blocking from rproxy (bouncer)
 
@@ -110,7 +111,7 @@ rules:
 
 `scripts/interop/crowdsec.sh` installs CrowdSec (LAPI, agent, AppSec) from the official packages on a GitHub Ubuntu runner and, from clients in network namespaces going through rproxy, verifies the following:
 
-1. `cscli explain`: the parser reads all 4 lines of the sample log (`scripts/interop/crowdsec-samples.log`); the HTTP lines reach `crowdsecurity/http-logs` and the scenarios (`http-sensitive-files`, `http-probing`, etc.), and the L4 lines reach `max3584/rproxy-conn-denied`
+1. `cscli explain`: the parser reads all 6 lines of the sample log (`scripts/interop/crowdsec-samples.log`); the HTTP lines reach `crowdsecurity/http-logs` and the scenarios (`http-sensitive-files`, `http-probing`, etc.), and the L4 lines reach `max3584/rproxy-conn-denied`
 2. Detection: a global client probes nonexistent paths → CrowdSec detects it from rproxy's logs and bans it → that client is blocked by rproxy with 403, while other clients pass (IPv4 and IPv6)
 3. L4: a client that repeatedly makes connections refused by `allow_from` is banned by `max3584/rproxy-conn-denied`, and its connections are cut by an L4 rule with `crowdsec: true`
 4. AppSec: `GET /.env` (`crowdsecurity/vpatch-env-access`) is blocked with 403, while normal requests pass

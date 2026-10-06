@@ -108,6 +108,63 @@ async fn basic_auth() {
 	std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// `keep_authorization` passes the client's Authorization on; the access log
+/// names the user let in, or why one was refused (never the password).
+#[tokio::test]
+async fn basic_auth_keep_authorization_and_the_access_log() {
+	logs::capture();
+	let dir = workdir("basic-keep");
+	let users = dir.join("users");
+	std::fs::write(&users, format!("carol:{}\n", bcrypt::hash("s3cret-pw", 4).unwrap())).unwrap();
+	let h = harness().await;
+	let backend = echo_backend().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["staff"]}],
+				"middlewares": {"staff": {"basic_auth": {"users_file": users, "keep_authorization": true}}},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let url = format!("http://127.0.0.1:{port}");
+	let rule_key = format!("tcp/127.0.0.1:{port}");
+	let access = |path: &'static str| {
+		let rule_key = rule_key.clone();
+		move |v: &Value| v["event"] == "http.access" && v["rule"] == rule_key.as_str() && v["path"] == path
+	};
+
+	let r = client().get(format!("{url}/ok")).basic_auth("carol", Some("s3cret-pw")).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK);
+	let v = body(r).await;
+	assert_eq!(v["authorization"], format!("Basic {}", STANDARD.encode("carol:s3cret-pw")), "kept for the backend: {v}");
+	assert_eq!(v["user"], "", "no user_header: {v}");
+	let line = logs::wait_for("the access line of carol", access("/ok")).await;
+	assert_eq!((line["user"].as_str(), line["refused_by"].as_str(), line["auth_error"].as_str()), (Some("carol"), Some(""), Some("")), "{line}");
+
+	for (path, user, password, why) in [
+		("/bad-password", "carol", Some("guess"), "bad_password"),
+		("/unknown-user", "mallory", Some("s3cret-pw"), "unknown_user"),
+		("/no-credentials", "", None, "no_credentials"),
+	] {
+		let mut req = client().get(format!("{url}{path}"));
+		if password.is_some() {
+			req = req.basic_auth(user, password);
+		}
+		assert_eq!(req.send().await.unwrap().status(), StatusCode::UNAUTHORIZED, "{path}");
+		let line = logs::wait_for(path, access(path)).await;
+		assert_eq!(
+			(line["status"].as_u64(), line["refused_by"].as_str(), line["middleware"].as_str(), line["auth_error"].as_str(), line["user"].as_str()),
+			(Some(401), Some("basic_auth"), Some("staff"), Some(why), Some("")),
+			"{line}"
+		);
+		assert!(!line.to_string().contains("guess") && !line.to_string().contains("s3cret"), "no password in the log: {line}");
+	}
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A ForwardAuth server: `X-Token: good` passes with X-User / X-Other; `login` redirects; others get 401.
 async fn auth_server(seen: Arc<Mutex<Vec<HashMap<String, String>>>>) -> SocketAddr {
 	let app = axum::Router::new().fallback(move |req: axum::extract::Request| {

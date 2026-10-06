@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -17,6 +18,7 @@ use crate::control::auth::{Principal, Scope, Tokens};
 use crate::config::check::Finding;
 use crate::config::reload::{ConfigReloader, Outcome};
 use crate::error::ApiError;
+use crate::logging::Throttle;
 use crate::core::registry::Registry;
 use crate::core::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
 
@@ -38,6 +40,26 @@ pub enum Transport {
 
 type AppResult<T> = Result<T, ApiError>;
 
+/// Who sent a request, for the audit log: the peer's IP address (TCP; the server
+/// must give `ConnectInfo<SocketAddr>`), `unix` (the Unix socket) or `unknown`.
+#[derive(Clone, Debug)]
+pub struct Client(pub String);
+
+impl Client {
+	fn of(req: &Request) -> Client {
+		if req.extensions().get::<Transport>().is_some() {
+			return Client("unix".into());
+		}
+		match req.extensions().get::<ConnectInfo<SocketAddr>>() {
+			Some(ConnectInfo(addr)) => Client(crate::l7::access::canonical(addr.ip()).to_string()),
+			None => Client("unknown".into()),
+		}
+	}
+}
+
+/// State of the token check: the app, and the refusals logged per client.
+type Guard = (Arc<AppState>, Arc<Throttle<String>>);
+
 pub fn router(state: Arc<AppState>) -> Router {
 	let protected = Router::new()
 		.route("/capabilities", get(capabilities))
@@ -48,7 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
 		.route("/metrics", get(metrics))
-		.route_layer(middleware::from_fn_with_state(state.clone(), require_token));
+		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
 
 	Router::new()
 		.route("/healthz", get(|| async { "ok" }))
@@ -69,19 +91,32 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 	}
 }
 
-async fn require_token(State(state): State<Arc<AppState>>, mut req: Request, next: Next) -> Response {
+/// Checks the bearer token and the scope. Refusals are logged as `event = "audit"`
+/// with the client (never the token), at most `Throttle`'s rate per client.
+async fn require_token(State((state, refusals)): State<Guard>, mut req: Request, next: Next) -> Response {
+	let client = Client::of(&req);
 	let header = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-	let Some(principal) = state.tokens.authenticate(header) else {
-		return ApiError::unauthorized().into_response();
+	let principal = match state.tokens.check(header) {
+		Ok(p) => p,
+		Err(reason) => {
+			if let Some(suppressed) = refusals.check(&client.0) {
+				info!(event = "audit", client = %client.0, method = %req.method(), path = %req.uri().path(),
+					outcome = "unauthorized", reason, suppressed);
+			}
+			return ApiError::unauthorized().into_response();
+		}
 	};
 	if let Some(scope) = required_scope(req.method(), req.uri().path()) {
 		if !principal.has(scope) {
-			info!(event = "audit", token = %principal.name, method = %req.method(), path = %req.uri().path(),
-				outcome = "forbidden", scope = scope.as_str());
+			if let Some(suppressed) = refusals.check(&client.0) {
+				info!(event = "audit", token = %principal.name, client = %client.0, method = %req.method(), path = %req.uri().path(),
+					outcome = "forbidden", scope = scope.as_str(), suppressed);
+			}
 			return ApiError::forbidden(format!("this token lacks the {} scope", scope.as_str())).into_response();
 		}
 	}
 	req.extensions_mut().insert(principal);
+	req.extensions_mut().insert(client);
 	next.run(req).await
 }
 
@@ -95,12 +130,14 @@ fn check_ports(principal: &Principal, first: u16, last: Option<u16>) -> AppResul
 }
 
 /// `event = "audit"`: who changed which rule, and how it went.
-fn audit<T>(principal: &Principal, action: &str, rule: &str, result: &AppResult<T>) {
+fn audit<T>(principal: &Principal, client: &Client, action: &str, rule: &str, result: &AppResult<T>) {
 	let (outcome, code) = match result {
 		Ok(_) => ("ok", ""),
+		// refused by the token's allow_listen_ports
+		Err(e) if e.code == "forbidden" => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
-	info!(event = "audit", token = %principal.name, action, rule, outcome, code);
+	info!(event = "audit", token = %principal.name, client = %client.0, action, rule, outcome, code);
 }
 
 /// Parses a JSON body, reporting failures in the API's own error format.
@@ -145,14 +182,19 @@ async fn openapi() -> impl IntoResponse {
 
 /// How the settings file (`RPROXY_CONFIG`) was last read.
 async fn config_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-	match state.registry.config_status() {
+	let mut v = match state.registry.config_status() {
 		Some(status) => {
 			let mut v = serde_json::to_value(status).unwrap_or_default();
 			v["configured"] = json!(true);
-			Json(v)
+			v
 		}
-		None => Json(json!({"configured": false})),
+		None => json!({"configured": false}),
+	};
+	// global.crowdsec: whether the LAPI answers now (#115)
+	if let Some(b) = state.registry.http_global().crowdsec() {
+		v["crowdsec"] = serde_json::to_value(b.status()).unwrap_or_default();
 	}
+	Json(v)
 }
 
 /// Applies the settings file again now and answers what happened (the same as
@@ -160,10 +202,11 @@ async fn config_status(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 async fn config_reload(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	transport: Option<Extension<Transport>>,
 ) -> Response {
 	let audit = |outcome: &str, code: &str| {
-		info!(event = "audit", token = %principal.name, action = "config.reload", rule = "", outcome, code);
+		info!(event = "audit", token = %principal.name, client = %client.0, action = "config.reload", rule = "", outcome, code);
 	};
 	if state.reload_unix_only && transport.is_none() {
 		audit("forbidden", "unix_only");
@@ -241,6 +284,7 @@ async fn get_rule(
 async fn create(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	body: Bytes,
 ) -> AppResult<impl IntoResponse> {
 	let req: RuleRequest = parse_body(&body)?;
@@ -251,7 +295,7 @@ async fn create(
 		state.registry.create(req).await
 	}
 	.await;
-	audit(&principal, "create", &rule, &result);
+	audit(&principal, &client, "create", &rule, &result);
 	Ok((StatusCode::CREATED, Json(result?)))
 }
 
@@ -267,6 +311,7 @@ async fn check_rule_ports(state: &AppState, principal: &Principal, key: &Key) ->
 async fn update(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	Path((protocol, addr, port)): Path<(String, String, String)>,
 	body: Bytes,
 ) -> AppResult<impl IntoResponse> {
@@ -277,13 +322,14 @@ async fn update(
 		state.registry.update(&key, req).await
 	}
 	.await;
-	audit(&principal, "update", &key.to_string(), &result);
+	audit(&principal, &client, "update", &key.to_string(), &result);
 	Ok(Json(result?))
 }
 
 async fn delete(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
 	Path((protocol, addr, port)): Path<(String, String, String)>,
 	Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<impl IntoResponse> {
@@ -300,7 +346,7 @@ async fn delete(
 		state.registry.delete(&key, drain).await
 	}
 	.await;
-	audit(&principal, "delete", &key.to_string(), &result);
+	audit(&principal, &client, "delete", &key.to_string(), &result);
 	result?;
 	Ok(StatusCode::NO_CONTENT)
 }

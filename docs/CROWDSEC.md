@@ -63,9 +63,10 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.target_fqdn` / `evt.Parsed.target_fqdn` | `host` |
 | `evt.Parsed.http_version`・`body_bytes_sent` | `protocol`・`bytes_out` |
 | `evt.Meta.rproxy_rule`・`rproxy_route` | `rule`・`route` |
+| `evt.Meta.rproxy_refused_by`・`rproxy_auth_error` | `refused_by`（断ったミドルウェアの種類。`basic_auth`・`ip_allow` など）・`auth_error`（`basic_auth` が断った理由。`bad_password` など）。v0.3.20 から |
 | `evt.StrTime` | `timestamp` |
 
-**L4（`event: conn.open` / `conn.denied`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`allow_from` / `crowdsec` など）、`rproxy_rule`。
+**L4（`event: conn.open` / `conn.denied`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`allow_from` / `crowdsec` など）、`rproxy_rule`。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
 
 ## 3. rproxy から止める（bouncer）
 
@@ -110,7 +111,7 @@ rules:
 
 `scripts/interop/crowdsec.sh` は、GitHub の Ubuntu のランナーで CrowdSec（LAPI・エージェント・AppSec）を公式のパッケージから入れ、ネットワーク名前空間のクライアントから rproxy を通して、次を確かめます。
 
-1. `cscli explain`：見本のログ（`scripts/interop/crowdsec-samples.log`）の 4 行すべてをパーサーが読み、HTTP の行が `crowdsecurity/http-logs` とシナリオ（`http-sensitive-files`・`http-probing` など）へ、L4 の行が `max3584/rproxy-conn-denied` へ届く
+1. `cscli explain`：見本のログ（`scripts/interop/crowdsec-samples.log`）の 6 行すべてをパーサーが読み、HTTP の行が `crowdsecurity/http-logs` とシナリオ（`http-sensitive-files`・`http-probing` など）へ、L4 の行が `max3584/rproxy-conn-denied` へ届く
 2. 検知：global なクライアントが存在しないパスを探索する → CrowdSec が rproxy のログから見つけて ban → そのクライアントは rproxy に 403 で止められ、ほかのクライアントは通る（IPv4 と IPv6）
 3. L4：`allow_from` で断られる接続を繰り返したクライアントが `max3584/rproxy-conn-denied` で ban され、`crowdsec: true` の L4 のルールで接続を切られる
 4. AppSec：`GET /.env`（`crowdsecurity/vpatch-env-access`）を 403 で止め、ふつうのリクエストは通す

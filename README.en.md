@@ -269,17 +269,25 @@ You can check availability with `GET /capabilities`.
 
 ## Logs
 
-One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `rule` (in the form `tcp/0.0.0.0:8888`).
+One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `rule` (in the form `tcp/0.0.0.0:8888`). These appear with the default `RPROXY_LOG_LEVEL=info` (the last row is `debug` only). For a SIEM or CrowdSec, start with `audit`, `conn.denied`, `http.access`, `tls.error`, `target.down`, `cert.*` and `crowdsec.error`. Fields are in docs/API.md.
 
 | `event` | Content |
 |---|---|
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop |
 | `config.reload` / `config.error` | Application of the configuration file (counts, `global` changes that need a restart) and the reason it could not be applied |
-| `audit` | Changes through the control API (token name, operation, rule, result) and requests rejected for insufficient permissions |
+| `start` / `shutdown` / `fatal` | Startup (`version`, whether transparent, authentication and TLS are on, …) / exit / a configuration mistake that stops the startup |
+| `degraded` | Part of rproxy was left out because of the environment and the rest runs (`part`: `api`, `api_tls`, `tokens`, `log`, `global.*`, …) |
+| `api.listening` / `api.retry` / `api.stopped` | The control API started listening / cannot listen and retries / stopped |
+| `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`). Lines of refused requests are thinned out per sender (`suppressed`) |
+| `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP re-read the tokens, the control API's certificate, the rules' certificates, the CrowdSec key (the current ones stay if a file cannot be read) |
+| `static.loaded` / `rule.listen` / `rule.duplicate` | Static rules were loaded / a rule's listen addresses changed / a rule with the same key was skipped |
 | `conn.open` / `conn.close` | Start and end of a connection (session for UDP). `client`, `target`, `rx_bytes`, `tx_bytes`, `duration_ms`, `reason`. When TLS is terminated, `tls_version`, `tls_cipher`, etc. HTTP/3 QUIC connections have `transport: quic` |
-| `http3.listening` | An `http.http3` rule started accepting HTTP/3 over UDP |
+| `conn.denied` | A refused connection (for UDP, datagram): `reason` is `allow_from`, `crowdsec` or `unmatched`; `client` (`IP:port`), `sni`. For UDP thinned out per source (`suppressed`: lines left out before it). HTTP/3 has `transport: quic` |
+| `conn.error` / `tls.error` / `accept.error` / `recv.error` | A failed connection (the target cannot be reached, the ClientHello cannot be read, …) / a failed TLS or DTLS handshake / accepting or receiving failed |
+| `http3.listening` / `http3.error` | An `http.http3` rule started accepting HTTP/3 over UDP / the QUIC certificates cannot be rebuilt |
 | `http.error` | An `http` rule could not connect to the target or timed out (`route`, `service`, `backend`, `status`, and `attempt` for `retry`). Requests of `http` rules go to `http.access` (access log; a separate file if `global.access_log` is set; fields are in docs/API.md) |
-| `oidc.login` / `oidc.refresh` / `oidc.error` | Sign-in through the `oidc` middleware (`user`), refresh failure, failure communicating with the provider |
+| `http.access` | A request of an `http` rule (access log), with the middleware that refused it (`refused_by`, `middleware`) and `basic_auth`'s user (`user`) or why it refused (`auth_error`) |
+| `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | Sign-in through the `oidc` middleware (`user`), refresh failure, failure communicating with the provider, a session too large to keep the refresh token |
 | `reload.secret` | A secret file of an authentication middleware (htpasswd, OIDC secret) was reloaded, or could not be reloaded and the current content continues to be used |
 | `http.health` / `http.breaker` | A target became down / up in a health check (`service`, `server`, `up`); a `circuit_breaker` opened / closed (`middleware`, `state`) |
 | `crowdsec.sync` / `crowdsec.error` | Decisions were fetched from the CrowdSec LAPI (`added`, `deleted`, `decisions`) / could not be fetched or AppSec could not be queried (the previous decisions continue to be used) |
@@ -289,6 +297,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `restore.*` | Restoration from the DB at startup (`restore.paused` is the number of rules not created because they are paused in the UI) |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |
 | `cert.check` | Periodic expiry check (`rules_updated`: number of rules from which expired certificates were removed or that were stopped) |
+| (`debug` only) `udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` | A UDP datagram was dropped (counted in `stats.dropped`) / sending or receiving failed / TCP_NODELAY could not be set |
 
 ## Development
 
