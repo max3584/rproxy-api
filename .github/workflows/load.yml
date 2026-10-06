@@ -35,6 +35,10 @@ on:
       scenarios:
         description: 動かすシナリオ（カンマ区切り。空ならすべて）
         default: ""
+      profile:
+        description: clean のジョブで HTTP の小さなリクエストの間の rproxy を perf で記録し、フレームグラフ（SVG）を残す（フレームポインタとデバッグ情報つきでビルドするので、数字はふだんの実行と比べない）
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -78,6 +82,8 @@ jobs:
       SOAK_SECS: ${{ matrix.variant == 'clean' && (inputs.soak_secs || '600') || '0' }}
       NETEM: ${{ matrix.variant == 'netem' && (inputs.netem || 'delay 5ms loss 0.1%') || '' }}
       SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
+      # perf record of rproxy during the small HTTP requests (clean only; scripts/load/load.py writes load-results/profile/)
+      PROFILE: ${{ inputs.profile && matrix.variant == 'clean' && '1' || '' }}
     steps:
       # bash, unshare / nsenter (util-linux-misc), ip / tc (iproute2), python3, gh (github-cli) for the previous results;
       # iperf3, h2load (nghttp2), socat, openssl, HAProxy for the scenarios
@@ -89,6 +95,12 @@ jobs:
             iperf3 nghttp2 socat openssl haproxy
           # the workspace belongs to the runner's user, not to root in the container
           git config --global --add safe.directory '*'
+          # profile: perf, and Brendan Gregg's FlameGraph scripts (perl) for the SVGs
+          if [ -n "$PROFILE" ]; then
+            apk add --no-cache perf perl
+            git clone --depth 1 https://github.com/brendangregg/FlameGraph "$RUNNER_TEMP/FlameGraph"
+            echo "FLAMEGRAPH=$RUNNER_TEMP/FlameGraph" >> "$GITHUB_ENV"
+          fi
       - uses: actions/checkout@v4
         with:
           # the refs to compare are built from this clone
@@ -102,6 +114,10 @@ jobs:
       # and its binary copied out; the scripts of this checkout drive them all
       - name: build rproxy for each ref (${{ env.REFS }})
         run: |
+          if [ -n "$PROFILE" ]; then
+            # stacks for perf: frame pointers, symbols and line tables (this job only; releases stay stripped)
+            export RUSTFLAGS="-C force-frame-pointers=yes" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=false
+          fi
           bins="" commits=""
           IFS=',' read -ra refs <<< "$REFS"
           for ref in "${refs[@]}"; do

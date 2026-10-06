@@ -16,6 +16,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper::client::conn::http1::SendRequest;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
+use hyper::http::uri::PathAndQuery;
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig;
@@ -98,6 +99,8 @@ pub struct Router {
 	oidc: Vec<Arc<Oidc>>,
 	/// Middlewares with secret files, re-read on SIGHUP.
 	secrets: Vec<Arc<Middleware>>,
+	/// Some route looks at headers (`RequestInfo.headers` is filled only then).
+	match_headers: bool,
 }
 
 impl Drop for Router {
@@ -162,9 +165,18 @@ impl Router {
 		for s in &all {
 			backend::start_health_checks(s.clone(), dialer.clone(), health_stop.clone());
 		}
+		// every service with kept connections: those named, and the single ones of `to`
+		let mut pooled: Vec<Arc<Service>> = all.clone();
+		for s in routes.iter().filter_map(|r| r.service.as_ref()).chain(default_service.as_ref()) {
+			if !pooled.iter().any(|p| Arc::ptr_eq(p, s)) {
+				pooled.push(s.clone());
+			}
+		}
+		backend::start_idle_sweep(pooled, health_stop.clone());
 		let oidc = middlewares.values().filter_map(|m| if let Middleware::Oidc(o) = m.as_ref() { Some(o.clone()) } else { None }).collect();
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
-		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop, oidc, secrets })
+		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
+		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop, oidc, secrets, match_headers })
 	}
 
 	/// SIGHUP: read the secret files of the authentication middlewares again.
@@ -414,11 +426,11 @@ impl Conn {
 		let peer = canonical(self.client.ip());
 		let global = &self.rt.global;
 		let client_ip = global.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
-		let headers: Vec<(String, String)> = req
-			.headers()
-			.iter()
-			.map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
-			.collect();
+		let headers: Vec<(String, String)> = if router.match_headers {
+			req.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
+		} else {
+			vec![]
+		};
 		let info = RequestInfo {
 			host: &host,
 			path: req.uri().path(),
@@ -432,20 +444,27 @@ impl Conn {
 			None => ("", router.default_service.clone(), &[][..]),
 		};
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-		let mut entry = AccessEntry {
-			rule: self.rt.key.to_string(),
-			route: if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() },
-			client: client_ip.to_string(),
-			method: req.method().to_string(),
-			host: host.clone(),
-			path: req.uri().path().to_string(),
-			query: super::access::redact_query(req.uri().query().unwrap_or("")),
-			protocol: format!("{:?}", req.version()),
-			bytes_in: header_text(header::CONTENT_LENGTH).parse().unwrap_or(0),
-			user_agent: header_text(header::USER_AGENT),
-			sni: self.tls.as_ref().and_then(|t| t.server_name.clone()).unwrap_or_default(),
-			tls_version: self.tls.as_ref().and_then(|t| t.version.clone()).unwrap_or_default(),
-			..Default::default()
+		// the access log line is put together only when it is written (the statistics need just the route)
+		let log = global.logging();
+		let route_label = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
+		let mut entry = if log {
+			AccessEntry {
+				rule: self.rt.key.to_string(),
+				route: route_label,
+				client: client_ip.to_string(),
+				method: req.method().to_string(),
+				host: host.clone(),
+				path: req.uri().path().to_string(),
+				query: super::access::redact_query(req.uri().query().unwrap_or("")),
+				protocol: format!("{:?}", req.version()),
+				bytes_in: header_text(header::CONTENT_LENGTH).parse().unwrap_or(0),
+				user_agent: header_text(header::USER_AGENT),
+				sni: self.tls.as_ref().and_then(|t| t.server_name.clone()).unwrap_or_default(),
+				tls_version: self.tls.as_ref().and_then(|t| t.version.clone()).unwrap_or_default(),
+				..Default::default()
+			}
+		} else {
+			AccessEntry { route: route_label, ..Default::default() }
 		};
 		let ctx = Ctx {
 			client: client_ip,
@@ -555,8 +574,10 @@ impl Conn {
 		let mut resp = match (answer, service) {
 			(Some(resp), _) => resp,
 			(None, Some(service)) => {
-				entry.service = service.name.clone();
-				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip };
+				if log {
+					entry.service = service.name.clone();
+				}
+				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log };
 				self.forward(target, req, replay, retry, &mut entry.backend, &mut holds).await
 			}
 			(None, None) if route_name.is_empty() => error_response(router.default_status),
@@ -581,7 +602,7 @@ impl Conn {
 		}
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
-		resp.map(|body| Logged { inner: body, bytes: 0, entry, rt, started, _holds: holds }.boxed())
+		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, started, _holds: holds }.boxed())
 	}
 
 	/// The response side of one middleware.
@@ -733,7 +754,7 @@ impl Conn {
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
-		let Target { router, service, route, host, client_ip } = target;
+		let Target { router, service, route, host, client_ip, log } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
 		let original_host = request_authority(req.uri(), req.headers());
@@ -783,9 +804,9 @@ impl Conn {
 		} else if !host.is_empty() {
 			set(&mut parts.headers, "x-forwarded-host", host);
 		}
-		let path_and_query = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
-		let method = parts.method.clone();
-		let headers = parts.headers.clone();
+		let path_and_query = parts.uri.path_and_query().cloned().unwrap_or_else(|| PathAndQuery::from_static("/"));
+		// kept for further attempts only
+		let again = (attempts > 1).then(|| (parts.method.clone(), parts.headers.clone()));
 		let mut first = Some((parts, body));
 
 		let mut attempt = 0;
@@ -796,10 +817,16 @@ impl Conn {
 				return error_response(StatusCode::SERVICE_UNAVAILABLE);
 			};
 			let server = &service.servers[index];
-			*backend = server.addr();
-			let uri: Uri = match format!("{}{}", server.prefix, path_and_query).parse() {
-				Ok(u) => u,
-				Err(_) => return error_response(StatusCode::BAD_REQUEST),
+			if log {
+				*backend = server.addr();
+			}
+			let uri: Uri = if server.prefix.is_empty() {
+				Uri::from(path_and_query.clone())
+			} else {
+				match format!("{}{}", server.prefix, path_and_query).parse() {
+					Ok(u) => u,
+					Err(_) => return error_response(StatusCode::BAD_REQUEST),
+				}
 			};
 			let host_value = match (&original_host, service.pass_host) {
 				(Some(h), true) => h.clone(),
@@ -817,6 +844,9 @@ impl Conn {
 					Request::from_parts(parts, body)
 				}
 				None => {
+					let Some((method, headers)) = &again else {
+						return error_response(StatusCode::BAD_GATEWAY);
+					};
 					let mut req = Request::new(replay.clone().map(full_body).unwrap_or_else(empty_body));
 					*req.method_mut() = method.clone();
 					*req.uri_mut() = uri;
@@ -934,6 +964,8 @@ struct Target<'a> {
 	route: &'a str,
 	host: &'a str,
 	client_ip: IpAddr,
+	/// The access log needs the backend's address.
+	log: bool,
 }
 
 fn empty_body() -> Body {
@@ -941,19 +973,29 @@ fn empty_body() -> Body {
 }
 
 /// Tells (through the returned receiver) when the request body has been sent to the end.
-fn until_sent(req: Request<Body>) -> (Request<Body>, tokio::sync::watch::Receiver<bool>) {
-	let (tx, rx) = tokio::sync::watch::channel(req.body().is_end_stream());
-	(req.map(|inner| EndSignal { inner, done: Some(tx) }.boxed()), rx)
+/// None for a request without a body (most of them), which is sent already.
+fn until_sent(req: Request<Body>) -> (Request<Body>, Option<tokio::sync::watch::Receiver<bool>>) {
+	if req.body().is_end_stream() {
+		return (req, None);
+	}
+	let (tx, rx) = tokio::sync::watch::channel(false);
+	(req.map(|inner| EndSignal { inner, done: Some(tx) }.boxed()), Some(rx))
 }
 
 /// `fut` (the backend's response headers), allowed `limit` once the request body has
 /// been sent; None when that runs out. While the body is still going up, no limit.
-async fn within<T>(limit: std::time::Duration, mut sent: tokio::sync::watch::Receiver<bool>, fut: impl std::future::Future<Output = T>) -> Option<T> {
+async fn within<T>(
+	limit: std::time::Duration,
+	sent: Option<tokio::sync::watch::Receiver<bool>>,
+	fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
 	tokio::pin!(fut);
-	tokio::select! {
-		out = &mut fut => return Some(out),
-		// sent to the end, or the body is gone (hyper dropped it): the clock starts
-		_ = sent.wait_for(|done| *done) => {}
+	if let Some(mut sent) = sent {
+		tokio::select! {
+			out = &mut fut => return Some(out),
+			// sent to the end, or the body is gone (hyper dropped it): the clock starts
+			_ = sent.wait_for(|done| *done) => {}
+		}
 	}
 	tokio::time::timeout(limit, fut).await.ok()
 }
@@ -1027,6 +1069,8 @@ struct Logged {
 	inner: Body,
 	bytes: u64,
 	entry: AccessEntry,
+	/// The entry is complete and the line is written (`HttpGlobal::logging` when the request came).
+	log: bool,
 	rt: Arc<Runtime>,
 	started: Instant,
 	/// `in_flight` places, freed with the response.
@@ -1065,7 +1109,9 @@ impl Drop for Logged {
 		self.entry.duration_ms = elapsed.as_millis() as u64;
 		self.entry.bytes_out = self.bytes;
 		self.rt.http_stats.record(&self.entry.route, self.entry.status, elapsed);
-		self.rt.global.log(&self.entry);
+		if self.log {
+			self.rt.global.log(&self.entry);
+		}
 	}
 }
 
