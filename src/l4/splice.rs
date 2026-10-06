@@ -13,17 +13,16 @@
 //!   heuristic of HAProxy's `splice-auto`). 0 does not wait.
 //! - `RPROXY_SPLICE_PIPE_SIZE=<bytes>`: F_SETPIPE_SZ for new pipes (0: the kernel's, 64 KiB)
 //!
-//! A pipe is taken only when a direction first splices (an idle connection has
-//! none) and given back to a small per-thread pool when the connection ends with
-//! the pipe empty. A side that cannot be spliced (EINVAL / ENOSYS) or a pipe that
+//! A pipe is taken when a direction has data to splice and given back, empty, to
+//! a small shared pool when the direction waits for more (so an idle connection
+//! holds no pipe, as HAProxy does); a pipe with data left is closed. A side that cannot be spliced (EINVAL / ENOSYS) or a pipe that
 //! cannot be made (EMFILE) falls back to the user-space copy for that direction.
 
-use std::cell::RefCell;
 use std::io;
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -33,8 +32,8 @@ const DEFAULT_AFTER: u64 = 0;
 const DEFAULT_FULL_READS: u32 = 0;
 /// User-space buffer before splicing starts or when it cannot be used (as `copy_bidirectional`).
 const BUF_SIZE: usize = 8 * 1024;
-/// Pipes kept per thread for the next connections.
-const POOL_MAX: usize = 32;
+/// Empty pipes kept for the next bursts (shared by all threads; 2 FDs each).
+const POOL_MAX: usize = 8;
 /// The most asked of one splice into the pipe (the pipe's room limits it anyway).
 const SPLICE_LEN: usize = 1 << 20;
 
@@ -64,9 +63,7 @@ struct PipeFds {
 	write: OwnedFd,
 }
 
-thread_local! {
-	static POOL: RefCell<Vec<PipeFds>> = const { RefCell::new(Vec::new()) };
-}
+static POOL: Mutex<Vec<PipeFds>> = Mutex::new(Vec::new());
 
 /// A pipe in use by one direction; `pending` bytes are in it.
 struct Pipe {
@@ -76,7 +73,7 @@ struct Pipe {
 
 impl Pipe {
 	fn take() -> io::Result<Pipe> {
-		if let Some(fds) = POOL.with(|p| p.borrow_mut().pop()) {
+		if let Some(fds) = POOL.lock().ok().and_then(|mut p| p.pop()) {
 			return Ok(Pipe { fds: Some(fds), pending: 0 });
 		}
 		let mut fds = [0 as libc::c_int; 2];
@@ -108,12 +105,11 @@ impl Drop for Pipe {
 	fn drop(&mut self) {
 		// a pipe with data left (the relay was cut off) is closed, never reused
 		if let (Some(fds), 0) = (self.fds.take(), self.pending) {
-			POOL.with(|p| {
-				let mut pool = p.borrow_mut();
+			if let Ok(mut pool) = POOL.lock() {
 				if pool.len() < POOL_MAX {
 					pool.push(fds);
 				}
-			});
+			}
 		}
 	}
 }
@@ -150,8 +146,15 @@ async fn direction(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &
 	let mut pipe: Option<Pipe> = None;
 	let mut buf: Option<Box<[u8]>> = None;
 	let mut user_space = false;
+	// splicing once started goes on (the pipe itself is given back while idle)
+	let mut spliced = false;
 	loop {
-		if !user_space && (pipe.is_some() || (count.load(Ordering::Relaxed) >= after && streak >= full_reads)) {
+		if !user_space && (spliced || (count.load(Ordering::Relaxed) >= after && streak >= full_reads)) {
+			spliced = true;
+			// the user-space buffer is empty here (each read is written out in full)
+			buf = None;
+			// wait without a pipe; take one only when there is something to move
+			src.readable().await?;
 			let p = match pipe.as_mut() {
 				Some(p) => p,
 				None => match Pipe::take() {
@@ -162,14 +165,16 @@ async fn direction(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &
 					}
 				},
 			};
-			// the user-space buffer is empty here (each read is written out in full)
-			buf = None;
-			src.readable().await?;
 			// the pipe is empty, so EAGAIN is the socket's and clears its readiness
 			let n = match src.try_io(Interest::READABLE, || splice(src_fd, p.write_fd(), SPLICE_LEN)) {
 				Ok(0) => break,
 				Ok(n) => n,
-				Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+				Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+					// nothing to read and the pipe empty: give it back while waiting
+					// (an idle connection holds no pipe)
+					pipe = None;
+					continue;
+				}
 				Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
 					user_space = true;
 					continue;
