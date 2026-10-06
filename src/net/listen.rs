@@ -33,6 +33,61 @@ pub fn udp(addr: SocketAddr, v6only: bool) -> io::Result<std::net::UdpSocket> {
 	Ok(sock.into())
 }
 
+/// Bytes asked for as `SO_RCVBUF` of UDP listening sockets (the kernel caps it at
+/// `net.core.rmem_max`). The default (`net.core.rmem_default`, about 208 KiB)
+/// holds only a few hundred small datagrams: a 64-byte datagram takes several
+/// hundred bytes of buffer (its skb), so bursts were dropped by the kernel.
+/// `RPROXY_UDP_RCVBUF` overrides it (0 keeps the kernel's default; an
+/// experiment's tunable, #194).
+const UDP_RCVBUF: usize = 4 << 20;
+
+fn udp_rcvbuf() -> usize {
+	static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+	*V.get_or_init(|| std::env::var("RPROXY_UDP_RCVBUF").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(UDP_RCVBUF))
+}
+
+/// UDP listening sockets of one address and port: `shards` of them in one
+/// `SO_REUSEPORT` group (#194), so that several tasks can read the port at once.
+/// The kernel hands each datagram to one of them by a hash of its addresses and
+/// ports, so a client keeps reaching the same socket while the group stays the
+/// same (it changes only when the rule's sockets are opened again).
+///
+/// Before the group, the port is bound once without `SO_REUSEPORT` and closed
+/// again: a group would otherwise join another process's group on the same
+/// port (of the same user) silently, where a single socket fails with
+/// "address in use" as it always did.
+pub fn udp_shards(addr: SocketAddr, v6only: bool, shards: usize) -> io::Result<Vec<std::net::UdpSocket>> {
+	let shards = shards.max(1);
+	let rcvbuf = udp_rcvbuf();
+	let open = |reuse: bool, addr: SocketAddr| -> io::Result<Socket> {
+		let sock = socket(addr, Type::DGRAM, v6only)?;
+		#[cfg(target_os = "linux")]
+		if reuse {
+			sock.set_reuse_port(true)?;
+		}
+		#[cfg(not(target_os = "linux"))]
+		let _ = reuse;
+		if rcvbuf > 0 {
+			// best effort: the kernel's cap applies, and a smaller buffer still works
+			let _ = sock.set_recv_buffer_size(rcvbuf);
+		}
+		sock.set_nonblocking(true)?;
+		sock.bind(&addr.into())?;
+		Ok(sock)
+	};
+	if shards == 1 || !cfg!(target_os = "linux") {
+		return Ok(vec![open(false, addr)?.into()]);
+	}
+	// port 0: the group shares the port the first socket was given
+	let addr = {
+		let probe = open(false, addr)?;
+		let bound = probe.local_addr()?.as_socket().unwrap_or(addr);
+		drop(probe);
+		bound
+	};
+	(0..shards).map(|_| open(true, addr).map(Into::into)).collect()
+}
+
 /// Whether sockets on `a` and `b` (same protocol and port) would clash: the same
 /// address, or a wildcard that covers the other. A `::` without `IPV6_V6ONLY`
 /// also takes IPv4, as Linux does by default.
