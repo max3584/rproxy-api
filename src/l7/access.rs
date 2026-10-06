@@ -121,6 +121,15 @@ impl HttpGlobal {
 		client
 	}
 
+	/// Whether access log lines are written now: always to a file of their own, else
+	/// while the main log takes `info` (the server fills an entry only then; #195).
+	pub fn logging(&self) -> bool {
+		match self.sink {
+			Sink::Log => tracing::enabled!(tracing::Level::INFO),
+			Sink::File { .. } => true,
+		}
+	}
+
 	pub fn log(&self, entry: &AccessEntry) {
 		match &self.sink {
 			Sink::Log => info!(event = "http.access", rule = %entry.rule, route = %entry.route, service = %entry.service,
