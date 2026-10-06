@@ -22,9 +22,8 @@ use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
 use crate::net::source;
 use crate::tls::config::{TlsMode, TlsRuntime};
-use crate::net::udpsock::{Batch, Listener, Local, Meta, BATCH};
+use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
 
-const MAX_DATAGRAM: usize = 65_535;
 const SESSION_QUEUE: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `tls.mode: sni`: how long, and how many datagrams / bytes, a new session's
@@ -223,7 +222,7 @@ async fn session(
 	// the datagrams held while reading the server name, in order
 	rx_bytes += forward(rt, &upstream, &header, client, &first).await;
 	drop(first);
-	let mut buf = vec![0u8; MAX_DATAGRAM];
+	let mut buf = RecvBuf::new();
 	// datagrams taken from the queue at once, sent on with one `sendmmsg`
 	let (mut inbox, mut out) = (Vec::new(), Vec::new());
 	let mut deadline = tokio::time::Instant::now() + idle;
@@ -624,7 +623,7 @@ async fn dtls_session(
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
-	let (mut buf, mut ubuf) = (vec![0u8; MAX_DATAGRAM], vec![0u8; MAX_DATAGRAM]);
+	let (mut buf, mut ubuf) = (RecvBuf::new(), RecvBuf::new());
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {

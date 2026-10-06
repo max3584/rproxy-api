@@ -37,6 +37,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # the optional mimalloc allocator (off by default, #185) still builds
+      - name: clippy (alloc-mimalloc)
+        run: cargo clippy --locked --bin rproxy-api --features alloc-mimalloc -- -D warnings
       # Alpine の MariaDB（11.8）を同じコンテナで動かす（公式の mariadb のイメージは Ubuntu）
       - name: MariaDB
         run: |

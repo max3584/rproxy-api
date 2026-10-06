@@ -61,6 +61,8 @@ cp .env.example .env   # edit the values to match your environment
 ./target/release/rproxy-api
 ```
 
+Memory is allocated with the libc's malloc by default (musl's malloc in the release binaries; it uses the least memory). To spend less CPU on L7 (HTTP/2, HTTP with many small requests), build with mimalloc: `cargo build --locked --release --features alloc-mimalloc` (built with the C compiler). In our measurements HTTP/2 and small HTTP requests were 20-30% faster and the work per CPU-second rose by 25-170%, while memory grew by about 6 MiB at idle and 15-40 MiB at peak under load.
+
 When running under systemd, you can pass the same content with `EnvironmentFile=/etc/rproxy/rproxy.env`.
 
 | Environment variable | Argument | Default | Description |

@@ -658,3 +658,72 @@ mod tests {
 		assert_eq!(local, None);
 	}
 }
+
+/// A zeroed receive buffer for one UDP datagram (64 KiB), taken from the libc's allocator rather than the global one.
+///
+/// Every UDP session (and DTLS session) holds such buffers, but most of their bytes are never written (datagrams are
+/// small). The libc's calloc returns fresh pages from the kernel for blocks this large, so the untouched part costs no
+/// memory. mimalloc (`alloc-mimalloc`, #185) hands them out of its heap and they count in full (74 KiB instead of
+/// 20 KiB per session). The listeners' receive batches are `Batch` (mmap), outside any allocator.
+pub struct RecvBuf(std::ptr::NonNull<[u8; RecvBuf::LEN]>);
+
+impl RecvBuf {
+	/// The largest UDP payload.
+	pub const LEN: usize = 65_535;
+	const LAYOUT: std::alloc::Layout = std::alloc::Layout::new::<[u8; RecvBuf::LEN]>();
+
+	pub fn new() -> Self {
+		// SAFETY: the layout has a non-zero size; the block is zeroed, so it is a valid [u8; LEN]
+		let p = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, Self::LAYOUT) };
+		match std::ptr::NonNull::new(p.cast()) {
+			Some(p) => RecvBuf(p),
+			None => std::alloc::handle_alloc_error(Self::LAYOUT),
+		}
+	}
+}
+
+impl Default for RecvBuf {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Drop for RecvBuf {
+	fn drop(&mut self) {
+		// SAFETY: allocated by `System` with the same layout in `new`
+		unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, self.0.as_ptr().cast(), Self::LAYOUT) }
+	}
+}
+
+impl std::ops::Deref for RecvBuf {
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		// SAFETY: owned, initialised (zeroed) and alive until drop
+		unsafe { self.0.as_ref() }
+	}
+}
+
+impl std::ops::DerefMut for RecvBuf {
+	fn deref_mut(&mut self) -> &mut [u8] {
+		// SAFETY: owned and borrowed mutably through `self`
+		unsafe { self.0.as_mut() }
+	}
+}
+
+// SAFETY: a uniquely owned heap block, like Box<[u8; LEN]>
+unsafe impl Send for RecvBuf {}
+unsafe impl Sync for RecvBuf {}
+
+#[cfg(test)]
+mod recv_buf_tests {
+	use super::RecvBuf;
+
+	#[test]
+	fn zeroed_writable_and_full_size() {
+		let mut b = RecvBuf::new();
+		assert_eq!(b.len(), RecvBuf::LEN);
+		assert!(b.iter().all(|&x| x == 0));
+		b[RecvBuf::LEN - 1] = 7;
+		assert_eq!(b[RecvBuf::LEN - 1], 7);
+	}
+}
