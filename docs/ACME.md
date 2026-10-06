@@ -79,7 +79,7 @@ rules:
 
 1. ルールが ACME の証明書を使い始めると（作成・変更・設定ファイル・DB からの復元）、まだ取っていない証明書は、すぐに注文します。取れるまでは自己署名の仮の証明書（`rproxy ACME placeholder`）を返します（ディスクには書きません）。ルールの表示の `acme` は `pending`。
 2. challenge に答え、CA が確かめたら、鍵（`key.pem`）と証明書（`cert.pem`、中間 CA つき）を `<storage>/certs/<resolver>/<最初の名前>-<ハッシュ>/` に 0600 で書きます。証明書のストアがファイルの変化として読み直し、その証明書を使うルールだけを組み立て直します（接続は切りません）。
-3. 期限の 30 日前（寿命の 1/3 のほうが短ければそちら。`renew_before` で変えられる）に更新します。失敗したら 1 分から倍々に、最大 6 時間の間をあけて再試行し、それまでの証明書を使い続けます（`acme` は `error`、`next_attempt` に次の時刻）。
+3. CA が ACME の更新の情報（ARI、RFC 9773）を出していれば、その窓（`suggestedWindow`）の中のランダムな時刻に更新します（窓は CA の `Retry-After` に従って 1〜24 時間ごとに聞き直す。大量の失効の前など、CA が早めの更新を求めたときもそれに従う。更新の注文には `replaces` で前の証明書を示す）。ARI がない CA では、期限の 30 日前（寿命の 1/3 のほうが短ければそちら。`renew_before` で変えられる）に更新します。失敗したら 1 分から倍々に、最大 6 時間の間をあけて再試行し、それまでの証明書を使い続けます（`acme` は `error`、`next_attempt` に次の時刻）。
 4. 再起動しても、保存した証明書をすぐに使います（新しい注文はしません）。どのルールも使わなくなった証明書は更新しません（ファイルは残します）。
 5. 発行の回数は `rate_limit`（既定 1 時間に 10 回、プロセス全体）までです。超えたら注文を後に回します（`acme.rate_limited`）。CA のレート制限（Let's Encrypt は名前ごと・アカウントごと）を使い切らないためです。
 
@@ -119,12 +119,13 @@ rules:
 | `POST /rules`・`PATCH /rules/...` で ACME の証明書を使う | `rules:write` と `acme:write` | `acme:write` がなければ `403`。名前が許可の外なら `400 invalid` |
 | `GET /acme` | `rules:read` | アカウント（`directory`・`contact`・`allowed_names`・`registered`）、DNS のプロバイダ（名前・`type`・`zones`・`allowed_names`）、resolver、証明書の状態、`rate_limit` の使った回数。秘密も、秘密のファイルの場所も出さない |
 | `POST /acme/renew` `{"resolver", "domains"}` | `acme:write`、既定は Unix ソケットからだけ | 今すぐ更新する（`rate_limit` の内で）。`202` |
+| `POST /acme/revoke` `{"resolver", "domains", "reason"?}` | 同上 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する（`rate_limit` の内で）。新しい証明書が書かれるまでは失効した証明書を返す。`reason` は `unspecified`・`key_compromise`・`affiliation_changed`・`superseded`・`cessation_of_operation` |
 | `POST /acme/accounts/{name}/register` | 同上 | アカウントを CA に作る（鍵があればそのアカウントを探す） |
 | `POST /acme/accounts/{name}/deactivate` | 同上 | アカウントを CA で無効にし、鍵を `<key_file>.deactivated` に退ける。次の注文で新しいアカウントを作る |
 
 - 強い操作（`POST /acme/...`）は `POST /config/reload` と同じく、既定では Unix ソケット（`RPROXY_API_SOCKET`）からだけ受け付けます。TCP からも受けるには `RPROXY_API_RELOAD_UNIX_ONLY=false`（両方に効きます）。
-- ルールの表示には `acme`（その証明書の `state`：`pending` / `valid` / `renewing` / `error`、`not_after`、`renew_at`、`next_attempt`、`error`）が加わります。
-- 操作は `event: "audit"`（`action: acme.renew` / `acme.account.register` / `acme.account.deactivate`）に残ります。
+- ルールの表示には `acme`（その証明書の `state`：`pending` / `valid` / `renewing` / `error`、`not_after`、`renew_at`、`next_attempt`、`error`、CA の更新の窓 `ari`（`start`・`end`））が加わります。
+- 操作は `event: "audit"`（`action: acme.renew` / `acme.revoke` / `acme.account.register` / `acme.account.deactivate`）に残ります。
 
 ## ログ
 
@@ -133,6 +134,8 @@ rules:
 | `acme.order` | 注文を始めた（`resolver`・`domains`・`renewal`） |
 | `acme.issue` / `acme.renew` | 証明書を取った・更新した（`not_after`） |
 | `acme.error` | 注文が失敗した（`error`・`retry_at`・`failures`） |
+| `acme.ari` | CA の更新の窓を受け取った（`start`・`end`・`renew_at`。変わったときだけ） |
+| `acme.revoke` | 証明書を失効させた（`reason`） |
 | `acme.rate_limited` | `rate_limit` で注文を後に回した（`retry_at`） |
 | `acme.account` | アカウントを作った・見つけた・無効にした |
 | `acme.challenge` / `acme.answer` | challenge を用意した・CA に答えた（debug / info） |

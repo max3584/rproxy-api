@@ -651,6 +651,33 @@ async fn issues_certificates_from_pebble() {
 	.await;
 	assert!(rp.log().contains(r#""action":"acme.renew""#), "audited: {}", logs());
 
+	// ARI (RFC 9773): Pebble offers renewal windows; renew_at falls in the window
+	wait_until("the renewal window", 20, &logs, || async {
+		get("/acme".into()).await.is_some_and(|v| v["certificates"].as_array().unwrap().iter().all(|c| c["ari"]["start"].is_string()))
+	})
+	.await;
+	let v = get("/acme".into()).await.unwrap();
+	for c in v["certificates"].as_array().unwrap() {
+		let (start, end, at) = (c["ari"]["start"].as_str().unwrap(), c["ari"]["end"].as_str().unwrap(), c["renew_at"].as_str().unwrap());
+		assert!(start <= at && at <= end, "{c}");
+	}
+	assert!(rp.log().contains(r#""event":"acme.ari""#), "{}", logs());
+
+	// revoke: over TCP refused; over the socket the certificate is revoked and replaced
+	let body = r#"{"resolver": "dns", "domains": ["*.wild.example.test", "wild.example.test"], "reason": "superseded"}"#;
+	let r = client.post(format!("http://127.0.0.1:{api}/acme/revoke")).bearer_auth("e2e-token").body(body).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	let bad = unix_post(&socket, "/acme/revoke", r#"{"resolver": "dns", "domains": ["wild.example.test"], "reason": "nope"}"#).await;
+	assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+	let before = served_cert(p_dns, "x.wild.example.test", &[]).await.unwrap().0;
+	let r = unix_post(&socket, "/acme/revoke", body).await;
+	assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+	assert!(rp.log().contains(r#""event":"acme.revoke""#) && rp.log().contains(r#""action":"acme.revoke""#), "{}", logs());
+	wait_until("the replacement of the revoked certificate", 60, &logs, || async {
+		served_cert(p_dns, "x.wild.example.test", &[]).await.is_some_and(|(leaf, _)| leaf != before)
+	})
+	.await;
+
 	// after a restart the stored certificates are used at once (no new order)
 	drop(rp);
 	let rp = Rproxy::start(&dir, api, &config_file, &socket);

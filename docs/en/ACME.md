@@ -79,7 +79,7 @@ rules:
 
 1. When a rule starts using an ACME certificate (created, changed, from the settings file or the database), a certificate not obtained yet is ordered at once. Until then the rule serves a self-signed stand-in (`rproxy ACME placeholder`, never written to disk); the rule's `acme` shows `pending`.
 2. Once the challenges are answered and the CA has validated them, the key (`key.pem`) and the certificate (`cert.pem`, with its intermediates) are written (0600) to `<storage>/certs/<resolver>/<first name>-<hash>/`. The certificate store sees the files change and rebuilds only the rules that use the certificate (connections stay).
-3. It is renewed 30 days before expiry (or a third of its lifetime if that is shorter; `renew_before` changes it). A failure is retried after 1 minute, doubling up to 6 hours, and the certificate in use stays (`acme` shows `error` and `next_attempt`).
+3. When the CA offers ACME renewal information (ARI, RFC 9773), the certificate is renewed at a random time in its window (`suggestedWindow`; asked again every 1 to 24 hours as the CA's `Retry-After` says, so an early renewal the CA asks for, e.g. before a mass revocation, is followed; the renewal order names the old certificate with `replaces`). With a CA without ARI, it is renewed 30 days before expiry (or a third of its lifetime if that is shorter; `renew_before` changes it). A failure is retried after 1 minute, doubling up to 6 hours, and the certificate in use stays (`acme` shows `error` and `next_attempt`).
 4. After a restart, stored certificates are used at once (no new order). A certificate no rule uses any more is not renewed (its files stay).
 5. Orders are limited by `rate_limit` (10 per hour for the process by default); beyond that, an order waits (`acme.rate_limited`), so the CA's own limits (Let's Encrypt counts per name and per account) are not used up.
 
@@ -119,12 +119,13 @@ Possible later: RFC 2136 (TSIG dynamic updates), acme-dns, and running ACME and 
 | `POST /rules` / `PATCH /rules/...` with an ACME certificate | `rules:write` and `acme:write` | `403` without `acme:write`; `400 invalid` for names outside the allowlists |
 | `GET /acme` | `rules:read` | Accounts (`directory`, `contact`, `allowed_names`, `registered`), DNS providers (name, `type`, `zones`, `allowed_names`), resolvers, certificate states, orders used of `rate_limit`. No secret, and not where secrets are kept |
 | `POST /acme/renew` `{"resolver", "domains"}` | `acme:write`; only over the Unix socket by default | Renews now (within `rate_limit`). `202` |
+| `POST /acme/revoke` `{"resolver", "domains", "reason"?}` | same | Revokes the issued certificate at the CA and orders a new one at once (within `rate_limit`); the revoked one is served until the new one is written. `reason`: `unspecified`, `key_compromise`, `affiliation_changed`, `superseded`, `cessation_of_operation` |
 | `POST /acme/accounts/{name}/register` | same | Creates the account at the CA (or finds the one of its key) |
 | `POST /acme/accounts/{name}/deactivate` | same | Deactivates the account at the CA and moves its key aside (`<key_file>.deactivated`); the next order creates a new account |
 
 - The strong operations (`POST /acme/...`) are, like `POST /config/reload`, accepted only over the Unix socket (`RPROXY_API_SOCKET`) by default. `RPROXY_API_RELOAD_UNIX_ONLY=false` allows them over TCP too (it covers both).
-- Rule views get `acme`: the certificate's `state` (`pending` / `valid` / `renewing` / `error`), `not_after`, `renew_at`, `next_attempt`, `error`.
-- Operations are logged as `event: "audit"` (`action: acme.renew` / `acme.account.register` / `acme.account.deactivate`).
+- Rule views get `acme`: the certificate's `state` (`pending` / `valid` / `renewing` / `error`), `not_after`, `renew_at`, `next_attempt`, `error`, and the CA's renewal window `ari` (`start`, `end`).
+- Operations are logged as `event: "audit"` (`action: acme.renew` / `acme.revoke` / `acme.account.register` / `acme.account.deactivate`).
 
 ## Logs
 
@@ -133,6 +134,8 @@ Possible later: RFC 2136 (TSIG dynamic updates), acme-dns, and running ACME and 
 | `acme.order` | An order started (`resolver`, `domains`, `renewal`) |
 | `acme.issue` / `acme.renew` | A certificate was obtained / renewed (`not_after`) |
 | `acme.error` | An order failed (`error`, `retry_at`, `failures`) |
+| `acme.ari` | The CA's renewal window was received (`start`, `end`, `renew_at`; only when it changes) |
+| `acme.revoke` | A certificate was revoked (`reason`) |
 | `acme.rate_limited` | `rate_limit` held an order back (`retry_at`) |
 | `acme.account` | An account was created, found or deactivated |
 | `acme.challenge` / `acme.answer` | A challenge was set up / answered to the CA (debug / info) |

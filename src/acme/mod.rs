@@ -87,8 +87,33 @@ pub struct CertStatus {
 	pub next_attempt: Option<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
+	/// The renewal window the CA suggests (ACME renewal information, RFC 9773),
+	/// when it offers one; `renew_at` is a random point in it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ari: Option<AriWindow>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AriWindow {
+	/// RFC 3339.
+	pub start: String,
+	pub end: String,
+}
+
+/// A renewal window from the CA (Unix seconds) and the point chosen in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ari {
+	start: i64,
+	end: i64,
+	at: i64,
+}
+
+/// ARI is asked again after the CA's Retry-After, within these bounds; after an error, `ARI_RETRY`.
+const ARI_MIN_RECHECK: i64 = 3600;
+const ARI_MAX_RECHECK: i64 = 24 * 3600;
+const ARI_RETRY: i64 = 6 * 3600;
+
+#[derive(Default)]
 struct Managed {
 	/// Validity of the issued certificate on disk (Unix seconds).
 	issued: Option<(i64, i64)>,
@@ -96,13 +121,35 @@ struct Managed {
 	next_try: i64,
 	failures: u32,
 	error: Option<String>,
-	/// Renew now (`POST /acme/renew`).
+	/// Renew now (`POST /acme/renew`, `POST /acme/revoke`).
 	force: bool,
+	/// The CA's renewal window (RFC 9773), when it has one.
+	ari: Option<Ari>,
+	/// When to ask the CA for the renewal window (Unix seconds; `i64::MAX`: the CA has no ARI).
+	ari_check: i64,
+}
+
+/// A uniformly random point in `[start, end]`.
+fn random_in(start: i64, end: i64) -> i64 {
+	if end <= start {
+		return start;
+	}
+	let mut b = [0u8; 8];
+	let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b);
+	start + (u64::from_le_bytes(b) % ((end - start) as u64 + 1)) as i64
 }
 
 impl Managed {
+	fn new(issued: Option<(i64, i64)>) -> Managed {
+		Managed { issued, ..Default::default() }
+	}
+
 	fn renew_at(&self, renew_before: Option<Duration>) -> Option<i64> {
 		let (not_before, not_after) = self.issued?;
+		// the CA's suggestion first (it may ask for an early renewal, e.g. before a mass revocation)
+		if let Some(ari) = self.ari {
+			return Some(ari.at.min(not_after - 3600));
+		}
 		let before = match renew_before {
 			Some(d) => d.as_secs() as i64,
 			None => RENEW_BEFORE.min((not_after - not_before).max(0) / 3),
@@ -340,8 +387,7 @@ impl Acme {
 					continue;
 				}
 				let (cert, _) = self.files(&id);
-				let issued = validity(&cert);
-				state.certs.insert(id, Managed { issued, next_try: 0, failures: 0, error: None, force: false });
+				state.certs.insert(id, Managed::new(validity(&cert)));
 				changed = true;
 			}
 		}
@@ -367,6 +413,7 @@ impl Acme {
 			renew_at: renew_at.map(rfc3339),
 			next_attempt: (m.next_try > t).then(|| rfc3339(m.next_try)),
 			error: m.error.clone(),
+			ari: m.ari.map(|a| AriWindow { start: rfc3339(a.start), end: rfc3339(a.end) }),
 		}
 	}
 
@@ -569,15 +616,34 @@ impl Acme {
 			dns::remove_all(&self.providers, &self.journal, &leftover, "left over").await;
 		}
 		loop {
-			let t = now();
-			let next = {
+			// the CA's renewal windows (RFC 9773) for issued certificates
+			let ari_due: Vec<CertId> = {
+				let t = now();
 				let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-				state.certs.iter().map(|(id, m)| (m.due(self.renew_before), id.clone())).min()
+				state.certs.iter().filter(|(_, m)| m.issued.is_some() && m.ari_check <= t).map(|(id, _)| id.clone()).collect()
+			};
+			for id in ari_due {
+				tokio::select! {
+					_ = self.stop.cancelled() => return,
+					_ = self.check_ari(&id) => {}
+				}
+			}
+			let t = now();
+			let (next, next_ari) = {
+				let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+				let next = state.certs.iter().map(|(id, m)| (m.due(self.renew_before), id.clone())).min();
+				let ari = state.certs.values().filter(|m| m.issued.is_some()).map(|m| m.ari_check).min();
+				(next, ari)
 			};
 			let wait = match &next {
 				Some((due, _)) if *due <= t => Duration::ZERO,
 				Some((due, _)) => Duration::from_secs((due - t) as u64).min(MAX_SLEEP),
 				None => MAX_SLEEP,
+			};
+			let wait = match next_ari {
+				Some(at) if at > t => wait.min(Duration::from_secs((at - t) as u64)),
+				Some(_) if !wait.is_zero() => continue,
+				_ => wait,
 			};
 			if !wait.is_zero() {
 				tokio::select! {
@@ -612,6 +678,11 @@ impl Acme {
 					m.error = None;
 					m.force = false;
 					m.next_try = 0;
+					// a new certificate: ask for its renewal window (unless the CA has none)
+					m.ari = None;
+					if m.ari_check != i64::MAX {
+						m.ari_check = 0;
+					}
 					let event = if renewal { "acme.renew" } else { "acme.issue" };
 					info!(event, resolver = %id.resolver, domains = ?id.domains, not_after = %rfc3339(not_after));
 					drop(state);
@@ -631,6 +702,82 @@ impl Acme {
 		}
 	}
 
+	/// The issued certificate on disk (leaf).
+	fn issued_cert(&self, id: &CertId) -> Result<CertificateDer<'static>, String> {
+		let (cert, _) = self.files(id);
+		let data = std::fs::read(&cert).map_err(|e| format!("{cert}: {e}"))?;
+		CertificateDer::pem_slice_iter(&data).next().ok_or("no certificate")?.map_err(|e| e.to_string())
+	}
+
+	/// The certificate's ARI identifier (authority key identifier and serial).
+	fn cert_identifier(&self, id: &CertId) -> Result<instant_acme::CertificateIdentifier<'static>, String> {
+		let der = self.issued_cert(id)?;
+		instant_acme::CertificateIdentifier::try_from(&der).map(|c| c.into_owned())
+	}
+
+	/// Asks the CA for the certificate's renewal window (RFC 9773) and picks
+	/// the time to renew in it. A CA without ARI is not asked again.
+	async fn check_ari(&self, id: &CertId) {
+		let result: Result<(instant_acme::RenewalInfo, Duration), (bool, String)> = async {
+			let r = self.resolvers.get(&id.resolver).ok_or((false, "the resolver is no longer configured".to_string()))?;
+			let cid = self.cert_identifier(id).map_err(|e| (false, e))?;
+			let account = self.account(&r.account).await.map_err(|e| (false, e))?;
+			account.renewal_info(&cid).await.map_err(|e| (matches!(e, instant_acme::Error::Unsupported(_)), e.to_string()))
+		}
+		.await;
+		let t = now();
+		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		let Some(m) = state.certs.get_mut(id) else { return };
+		match result {
+			Ok((info, retry)) => {
+				let (start, end) = (info.suggested_window.start.unix_timestamp(), info.suggested_window.end.unix_timestamp());
+				let at = match m.ari {
+					// the same window: keep the point chosen before
+					Some(a) if a.start == start && a.end == end => a.at,
+					_ => random_in(start, end),
+				};
+				if m.ari.is_none_or(|a| a.at != at) {
+					info!(event = "acme.ari", resolver = %id.resolver, domains = ?id.domains, start = %rfc3339(start), end = %rfc3339(end), renew_at = %rfc3339(at));
+				}
+				m.ari = Some(Ari { start, end, at });
+				m.ari_check = t + (retry.as_secs() as i64).clamp(ARI_MIN_RECHECK, ARI_MAX_RECHECK);
+			}
+			Err((true, _)) => m.ari_check = i64::MAX,
+			Err((false, e)) => {
+				debug!(event = "acme.ari", resolver = %id.resolver, domains = ?id.domains, error = %e);
+				m.ari_check = t + ARI_RETRY;
+			}
+		}
+	}
+
+	/// `POST /acme/revoke`: revokes the issued certificate at the CA, then
+	/// orders a new one at once (within the rate limit). The revoked one is
+	/// served until the new one is written.
+	pub async fn revoke(&self, id: &CertId, reason: Option<instant_acme::RevocationReason>) -> Result<(), ApiError> {
+		if self.status(id).is_none() {
+			return Err(ApiError::not_found("no rule uses this acme certificate"));
+		}
+		let der = self.issued_cert(id).map_err(|_| ApiError::not_found("this acme certificate has not been issued"))?;
+		let r = self.resolvers.get(&id.resolver).ok_or_else(|| ApiError::not_found("the resolver is no longer configured"))?;
+		let account = self.account(&r.account).await.map_err(ApiError::internal)?;
+		let reason_text = reason.as_ref().map(|r| format!("{r:?}")).unwrap_or_default();
+		account
+			.revoke(&instant_acme::RevocationRequest { certificate: &der, reason })
+			.await
+			.map_err(|e| ApiError::internal(format!("revoke: {e}")))?;
+		info!(event = "acme.revoke", resolver = %id.resolver, domains = ?id.domains, reason = %reason_text);
+		{
+			let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+			if let Some(m) = state.certs.get_mut(id) {
+				m.force = true;
+				m.next_try = 0;
+				m.ari = None;
+			}
+		}
+		self.wake.notify_one();
+		Ok(())
+	}
+
 	/// One order: answer the challenges, finalize, write the certificate.
 	/// Returns its validity.
 	async fn issue(&self, id: &CertId) -> Result<(i64, i64), String> {
@@ -639,7 +786,24 @@ impl Acme {
 		self.global.check_names(&id.resolver, &id.domains)?;
 		let account = self.account(&r.account).await?;
 		let identifiers: Vec<Identifier> = id.domains.iter().map(|d| Identifier::Dns(d.clone())).collect();
-		let mut order = account.new_order(&NewOrder::new(&identifiers)).await.map_err(|e| format!("new order: {e}"))?;
+		// a renewal names the certificate it replaces when the CA has ARI (RFC 9773 5.)
+		let replaces = {
+			let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+			state.certs.get(id).is_some_and(|m| m.ari.is_some())
+		}
+		.then(|| self.cert_identifier(id).ok())
+		.flatten();
+		let mut order = match replaces {
+			Some(cid) => match account.new_order(&NewOrder::new(&identifiers).replaces(cid)).await {
+				Ok(o) => o,
+				// the CA may refuse it (already replaced): order without it
+				Err(e) => {
+					debug!(event = "acme.order", resolver = %id.resolver, error = %e, "ordering without replaces");
+					account.new_order(&NewOrder::new(&identifiers)).await.map_err(|e| format!("new order: {e}"))?
+				}
+			},
+			None => account.new_order(&NewOrder::new(&identifiers)).await.map_err(|e| format!("new order: {e}"))?,
+		};
 		let kind = match r.challenge {
 			Challenge::Http01 => ChallengeType::Http01,
 			Challenge::TlsAlpn01 => ChallengeType::TlsAlpn01,
@@ -774,7 +938,7 @@ mod tests {
 	#[test]
 	fn renewal_is_due_30_days_or_a_third_of_the_lifetime_before_expiry() {
 		let day = 86_400;
-		let m = |nb, na| Managed { issued: Some((nb, na)), next_try: 0, failures: 0, error: None, force: false };
+		let m = |nb, na| Managed::new(Some((nb, na)));
 		assert_eq!(m(0, 90 * day).due(None), 60 * day);
 		assert_eq!(m(0, 6 * day).due(None), 4 * day, "short-lived: a third of the lifetime");
 		assert_eq!(m(0, 90 * day).due(Some(Duration::from_secs(10 * day as u64))), 80 * day);
@@ -783,8 +947,19 @@ mod tests {
 		assert_eq!(failed.due(None), 70 * day, "a failure waits");
 		failed.force = true;
 		assert_eq!(failed.due(None), 70 * day);
-		let fresh = Managed { issued: None, next_try: 0, failures: 0, error: None, force: false };
+		let fresh = Managed::new(None);
 		assert_eq!(fresh.due(None), 0, "not issued: now");
+		// the CA's window (ARI) wins over the default rule, but not past expiry
+		let mut ari = m(0, 90 * day);
+		ari.ari = Some(Ari { start: 20 * day, end: 21 * day, at: 20 * day + 5 });
+		assert_eq!(ari.due(None), 20 * day + 5);
+		ari.ari = Some(Ari { start: 95 * day, end: 96 * day, at: 95 * day });
+		assert_eq!(ari.due(None), 90 * day - 3600);
+		for _ in 0..100 {
+			let p = random_in(10, 20);
+			assert!((10..=20).contains(&p));
+		}
+		assert_eq!(random_in(5, 5), 5);
 	}
 
 	#[test]

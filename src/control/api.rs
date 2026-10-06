@@ -72,6 +72,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/metrics", get(metrics))
 		.route("/acme", get(super::acme_api::view))
 		.route("/acme/renew", post(super::acme_api::renew))
+		.route("/acme/revoke", post(super::acme_api::revoke))
 		.route("/acme/accounts/{name}/register", post(super::acme_api::register))
 		.route("/acme/accounts/{name}/deactivate", post(super::acme_api::deactivate))
 		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));

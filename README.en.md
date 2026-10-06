@@ -295,7 +295,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `target.down` / `target.up` | In a rule with multiple targets (`targets`) or `health_check`, a target went down / up (`reason: health_check` / `connect`) |
 | `dns.change` / `dns.stale` | The name resolution result of a target changed / resolution failed (the previous result continues to be used) |
 | `restore.*` | Restoration from the DB at startup (`restore.paused` is the number of rules not created because they are paused in the UI) |
-| `acme.order` / `acme.issue` / `acme.renew` / `acme.error` / `acme.rate_limited` | An ACME order started / a certificate was obtained / renewed / an order failed (`retry_at`) / the issuance limit held an order back (docs/en/ACME.md) |
+| `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | An ACME order started / a certificate was obtained / renewed / an order failed (`retry_at`) / the issuance limit held an order back (docs/en/ACME.md) |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | An ACME account was created or deactivated / a DNS-01 TXT record was written or removed / a challenge was set up or answered / `http01_listen` started listening. No secret is logged |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |
 | `cert.check` | Periodic expiry check (`rules_updated`: number of rules from which expired certificates were removed or that were stopped) |

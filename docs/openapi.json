@@ -1919,6 +1919,20 @@
           },
           "error": {
             "type": "string"
+          },
+          "ari": {
+            "type": "object",
+            "description": "The renewal window the CA suggests (ACME renewal information, RFC 9773); renew_at is a random point in it",
+            "properties": {
+              "start": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "end": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
           }
         },
         "required": [
@@ -2732,6 +2746,102 @@
           },
           "404": {
             "description": "No rule uses this certificate, or global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/acme/revoke": {
+      "post": {
+        "summary": "Revoke the issued ACME certificate at the CA and order a new one at once (acme:write; by default only over the Unix socket)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "resolver": {
+                    "type": "string"
+                  },
+                  "domains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "reason": {
+                    "type": "string",
+                    "enum": [
+                      "unspecified",
+                      "key_compromise",
+                      "affiliation_changed",
+                      "superseded",
+                      "cessation_of_operation"
+                    ]
+                  }
+                },
+                "required": [
+                  "resolver",
+                  "domains"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked; a new certificate is being ordered (see GET /acme)"
+          },
+          "400": {
+            "description": "Unknown resolver, names outside the allowlists, or an unknown reason",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the acme:write scope, or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rule uses this certificate, it has not been issued, or global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The CA refused or could not be reached",
             "content": {
               "application/json": {
                 "schema": {

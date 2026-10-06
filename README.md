@@ -295,7 +295,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
-| `acme.order` / `acme.issue` / `acme.renew` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
+| `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |

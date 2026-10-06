@@ -95,6 +95,57 @@ pub async fn renew(
 	}
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeRequest {
+	resolver: String,
+	domains: Vec<String>,
+	/// RFC 5280 reason: unspecified, key_compromise, affiliation_changed,
+	/// superseded, cessation_of_operation (left out: none given).
+	reason: Option<String>,
+}
+
+fn revocation_reason(s: &str) -> Result<instant_acme::RevocationReason, ApiError> {
+	use instant_acme::RevocationReason as R;
+	Ok(match s {
+		"unspecified" => R::Unspecified,
+		"key_compromise" => R::KeyCompromise,
+		"affiliation_changed" => R::AffiliationChanged,
+		"superseded" => R::Superseded,
+		"cessation_of_operation" => R::CessationOfOperation,
+		_ => {
+			return Err(ApiError::invalid(format!(
+				"reason {s:?}: unspecified, key_compromise, affiliation_changed, superseded or cessation_of_operation"
+			)))
+		}
+	})
+}
+
+pub async fn revoke(
+	State(state): State<Arc<AppState>>,
+	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
+	transport: Option<Extension<Transport>>,
+	body: Bytes,
+) -> Response {
+	let mut target = String::new();
+	let result = async {
+		check_strong(&state, &principal, transport, "POST /acme/revoke")?;
+		let req: RevokeRequest = serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("invalid body: {e}")))?;
+		let reason = req.reason.as_deref().map(revocation_reason).transpose()?;
+		let acme = acme(&state)?;
+		let id = acme.check(&req.resolver, &req.domains)?;
+		target = format!("{}:{}", id.resolver, id.domains.join(","));
+		acme.revoke(&id, reason).await
+	}
+	.await;
+	audit(&principal, &client, "acme.revoke", &target, &result);
+	match result {
+		Ok(()) => (StatusCode::OK, Json(json!({}))).into_response(),
+		Err(e) => e.into_response(),
+	}
+}
+
 pub async fn register(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
