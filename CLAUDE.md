@@ -7,7 +7,7 @@
 
 ```bash
 cargo build
-cargo test                    # 単体テスト + tests/api.rs（loopback で実ソケットを使う結合テスト）
+cargo test                    # 単体テスト（src/）と、loopback で実ソケットを使う結合テスト（tests/。一覧は docs/TESTING.md）
 cargo clippy --all-targets
 cargo bench --bench '*'       # criterion のベンチマーク（benches/）。PR では bench.yml がマージベースと比べて、遅くなったら警告（docs/TESTING.md）
 scripts/test-transparent.sh   # transparent の実経路テスト（root 不要、名前空間を使う。cargo build の後）
@@ -78,7 +78,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | `src/l7/middleware/oidc.rs` | `oidc`：認可コード + PKCE、discovery と JWKS のキャッシュ、ID トークンの検証（ring。RS/PS/ES）、AES-256-GCM で暗号化したセッションのクッキー、リフレッシュ、ログアウト。コールバックとログアウトのパスは `server.rs` がルーティングの前に渡す。プロバイダへの HTTP は `crowdsec::call` |
 | `src/l7/middleware/crowdsec.rs` | `global.crowdsec` の bouncer（`Bouncer`。LAPI の stream を 1 つのタスクで取り、判定を ID ごとに覚える。API キーは SIGHUP で読み直す）と AppSec への問い合わせ。`crowdsec` ミドルウェアは非同期なので `server.rs` が直接呼ぶ |
 | `src/l7/middleware/limit.rs` | `rate_limit`（送信元ごとのトークンバケット。覚える送信元は上限つき）と `in_flight`（`Hold` を応答の本文が終わるまで持つ）。状態は組み立てた `Router` にあり、`http` を変えると最初からになる |
-| `src/logging.rs` | tracing の JSON Lines 出力（日次ローテーション） |
+| `src/logging.rs` | tracing の JSON Lines 出力（日次ローテーション）。`Throttle`：攻撃で同じ行があふれないよう、送信元ごと・全体でログを間引く（UDP の `conn.denied`、制御 API の 401 / 403。省いた数は次の行の `suppressed` と `rproxy_log_suppressed_total`） |
 
 構成図は `docs/architecture/`（SVG だけ。PlantUML のソースはリポジトリに置かない）。モジュールや状態を変えたら図も直す。
 
