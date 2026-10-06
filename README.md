@@ -204,7 +204,7 @@ curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" 
 | `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
 | `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
 
-証明書はファイルで指定するか、ACME（Let's Encrypt など。HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・RFC 2136・acme-dns・汎用の REST））で rproxy に取らせます（`{acme: <resolver>, domains: [...]}`、[docs/ACME.md](docs/ACME.md)）。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。ACME で取った証明書も期限の前に自分で更新し、同じ仕組みで差し替えます。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
+証明書はファイルで指定するか、ACME（Let's Encrypt など。HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・RFC 2136・acme-dns・汎用の REST））で rproxy に取らせます（`{acme: <resolver>, domains: [...]}`、[docs/ACME.md](docs/ACME.md)）。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。ACME で取った証明書も期限の前に自分で更新し、同じ仕組みで差し替えます。DNS-01 の秘密は、別のユーザーで動かす補助プロセス `rproxy-api acme-helper`（`rproxy-acme-helper.service`）だけに持たせることもできます。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
 ## CrowdSec
 

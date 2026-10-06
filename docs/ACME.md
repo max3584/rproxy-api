@@ -66,6 +66,7 @@ global:
     # dns_servers: ['10.0.0.53']                  # CNAME・ゾーン・TXT を調べる DNS（既定は /etc/resolv.conf）
     # dns_propagation_timeout: 2m                 # TXT が見えるまで待つ時間（過ぎたら CA に頼む）
     # http01_listen: ['0.0.0.0:80']               # 80 番に http のルールがないときの HTTP-01 の応答役
+    # helper: {socket: /run/rproxy-acme/helper.sock}  # DNS の秘密を別のユーザーの補助プロセスに持たせる（下の「補助プロセス」）
 rules:
   - protocol: tcp
     listen_addr: 0.0.0.0
@@ -158,6 +159,34 @@ DNS の秘密を本体から外に出すには、下の「補助プロセス（�
 | `acme.listening` | `http01_listen` で待ち受けを始めた |
 
 秘密（API キー、トークン、EAB の鍵、アカウントの鍵）はログにも API の応答にも出しません。プロバイダの誤りの応答は 200 文字までに切り、秘密を伏せてから出します。
+
+## 補助プロセス（秘密を分ける）
+
+DNS のプロバイダの秘密（API キー・TSIG の鍵・acme-dns のパスワード・汎用の REST のトークン）を rproxy-api の本体に持たせたくないときは、補助プロセス `rproxy-api acme-helper` を別のユーザーで動かし、`global.acme.helper` でその Unix ソケットを指します。
+
+```yaml
+global:
+  acme:
+    helper: {socket: /run/rproxy-acme/helper.sock}
+    dns_providers:
+      pdns: {type: powerdns, api_url: 'http://127.0.0.1:8081', api_key_file: /etc/rproxy/acme-helper/pdns.key, allowed_names: ['*.example.com']}
+```
+
+- `helper` があると、本体は DNS のプロバイダの秘密のファイルを開かず、あるかどうかも確かめません（本体のユーザーには見えない場所に置けます）。TXT を書く場所を決める（CNAME をたどる・ゾーン）・書く・消すは、すべて補助プロセスがします。アカウントの鍵と証明書は今までどおり本体が持ちます。
+- 補助プロセスは同じ設定ファイルの `global.acme` を読み、送られてきたものを信用しません：名前がプロバイダの `allowed_names` の内か、値が DNS-01 の値の形か、書く・消す記録が自分で求めた `_acme-challenge` の場所（CNAME の先、`zones`）と同じかを確かめます。ソケットに届く者ができるのは、許された名前の `_acme-challenge` の TXT を書くことだけです。`--allow-user` を付けると、相手のユーザーも SO_PEERCRED で確かめます。
+- やり取りは 1 行に 1 つの JSON（`locate`・`present`・`cleanup`）。`src/acme/helper.rs` に形があります。
+- .deb には `rproxy-acme-helper.service`（有効にはしない）と、そのユーザー `rproxy-acme` が入ります。
+
+```sh
+install -d -o root -g rproxy-acme -m 0750 /etc/rproxy/acme-helper
+install -o root -g rproxy-acme -m 0640 pdns.key /etc/rproxy/acme-helper/pdns.key
+# rproxy.yaml に global.acme.helper を書いてから
+systemctl enable --now rproxy-acme-helper
+systemctl restart rproxy-api
+```
+
+  ユニットは `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy` を `rproxy-acme` ユーザー（補助のグループ `rproxy`：設定ファイルを読み、ソケットを rproxy に渡すため）で動かします。acme-dns の `credentials_file` は補助プロセスが書くので、`/var/lib/rproxy-acme/`（`StateDirectory`）に置いてください。
+- 補助プロセスが動いていない・応答しないときは、DNS-01 の注文が失敗して再試行されます（HTTP-01・TLS-ALPN-01 には影響しません）。補助プロセスのログは `acme.dns`（`part: helper`）と `acme.helper`（断った要求）。
 
 ## 権限と保存場所
 

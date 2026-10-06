@@ -66,6 +66,7 @@ global:
     # dns_servers: ['10.0.0.53']                  # DNS for CNAME, zone and TXT lookups (default: /etc/resolv.conf)
     # dns_propagation_timeout: 2m                 # how long to wait for the TXT record (then the CA is asked anyway)
     # http01_listen: ['0.0.0.0:80']               # HTTP-01 responder when no http rule listens on port 80
+    # helper: {socket: /run/rproxy-acme/helper.sock}  # DNS secrets held by a helper process of another user ("Helper process" below)
 rules:
   - protocol: tcp
     listen_addr: 0.0.0.0
@@ -158,6 +159,34 @@ To keep DNS secrets out of the main process, use the helper process below ("Help
 | `acme.listening` | `http01_listen` started listening |
 
 Secrets (API keys, tokens, EAB keys, account keys) never appear in logs or API answers. Error answers of a provider are cut to 200 characters and have the secret masked before they are logged.
+
+## Helper process (separating secrets)
+
+To keep the DNS providers' secrets (API keys, TSIG keys, acme-dns passwords, generic REST tokens) out of rproxy-api's main process, run the helper `rproxy-api acme-helper` as another user and point `global.acme.helper` at its Unix socket.
+
+```yaml
+global:
+  acme:
+    helper: {socket: /run/rproxy-acme/helper.sock}
+    dns_providers:
+      pdns: {type: powerdns, api_url: 'http://127.0.0.1:8081', api_key_file: /etc/rproxy/acme-helper/pdns.key, allowed_names: ['*.example.com']}
+```
+
+- With `helper`, the main process neither opens the DNS providers' secret files nor checks that they exist (they can be where its user cannot see them). Finding where the TXT record goes (CNAMEs, zone), writing and removing it are all done by the helper. Account keys and certificates stay with the main process.
+- The helper reads `global.acme` from the same settings file and trusts nothing it is sent: the name must be within the provider's `allowed_names`, the value must look like a DNS-01 value, and a record to write or remove must be where the helper itself finds `_acme-challenge` (after CNAMEs, within `zones`). Whoever reaches the socket can only write `_acme-challenge` TXT records for allowed names. With `--allow-user`, the peer's user is checked too (SO_PEERCRED).
+- The protocol is one JSON object per line (`locate`, `present`, `cleanup`); the shapes are in `src/acme/helper.rs`.
+- The .deb ships `rproxy-acme-helper.service` (not enabled) and its user `rproxy-acme`.
+
+```sh
+install -d -o root -g rproxy-acme -m 0750 /etc/rproxy/acme-helper
+install -o root -g rproxy-acme -m 0640 pdns.key /etc/rproxy/acme-helper/pdns.key
+# after adding global.acme.helper to rproxy.yaml
+systemctl enable --now rproxy-acme-helper
+systemctl restart rproxy-api
+```
+
+  The unit runs `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy` as `rproxy-acme` (with the supplementary group `rproxy`, to read the settings file and give the socket to rproxy). The helper writes acme-dns's `credentials_file`, so keep it in `/var/lib/rproxy-acme/` (`StateDirectory`).
+- While the helper is down or not answering, DNS-01 orders fail and are retried (HTTP-01 and TLS-ALPN-01 are not affected). The helper logs `acme.dns` (`part: helper`) and `acme.helper` (refused requests).
 
 ## Permissions and storage
 

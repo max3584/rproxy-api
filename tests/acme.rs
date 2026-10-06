@@ -256,6 +256,55 @@ async fn the_api_guards_acme() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
+/// The helper refuses peers it does not know, names outside the allowlist,
+/// values that are not DNS-01 values, and records it would not write there.
+#[tokio::test]
+async fn the_helper_checks_what_it_is_asked() {
+	use rproxy_api::acme::dns::Written;
+	use rproxy_api::acme::helper::{call, Helper, Request};
+	let dir = workdir("helper");
+	fs::write(dir.join("pdns.key"), "k\n").unwrap();
+	let yaml = format!(
+		"accounts: {{a: {{allowed_names: ['**.example.test']}}}}\ndns_providers:\n  pdns: {{type: powerdns, api_url: 'http://127.0.0.1:1', api_key_file: {}/pdns.key, zones: [example.test], allowed_names: ['*.example.test']}}\ndns_servers: ['127.0.0.1:1']\n",
+		dir.display()
+	);
+	let global: rproxy_api::acme::config::AcmeGlobal = rproxy_api::config::from_yaml(&yaml).unwrap();
+	// SAFETY: plain syscall
+	let me = unsafe { libc::getuid() };
+	let start = |allow: Vec<u32>, name: &str| {
+		let path = dir.join(name);
+		let listener = tokio::net::UnixListener::bind(&path).unwrap();
+		let helper = Arc::new(Helper::new(&global, allow).unwrap());
+		tokio::spawn(helper.serve(listener, tokio_util::sync::CancellationToken::new()));
+		path
+	};
+	let value = "qYdUfkaTCkVSY0mW0UjdUs7f-1xYODPyuo3uF0ktZnc".to_string();
+	let locate = |domain: &str, value: &str| Request::Locate { provider: "pdns".into(), domain: domain.into(), value: value.into() };
+	let other = start(vec![me + 1], "other.sock");
+	let e = call(&other, &locate("a.example.test", &value)).await.unwrap_err();
+	assert!(e.contains("may not use the helper"), "{e}");
+
+	let ours = start(vec![me], "ours.sock");
+	let rec = call(&ours, &locate("a.example.test", &value)).await.unwrap().record.unwrap();
+	assert_eq!((rec.fqdn.as_str(), rec.zone.as_str()), ("_acme-challenge.a.example.test", "example.test"));
+	for (domain, v, want) in [
+		("evil.example.org", value.as_str(), "not in allowed_names"),
+		("a.b.example.test", value.as_str(), "not in allowed_names"),
+		("a.example.test", "x\"},{\"y", "not a DNS-01 value"),
+		("*.example.test", value.as_str(), "not a name"),
+	] {
+		let e = call(&ours, &locate(domain, v)).await.unwrap_err();
+		assert!(e.contains(want), "{domain} {v}: {e}");
+	}
+	// a record somewhere else than where the helper puts it is refused before any call
+	let moved = Written { fqdn: "www.example.test".into(), ..rec.clone() };
+	let e = call(&ours, &Request::Present { provider: "pdns".into(), records: vec![moved] }).await.unwrap_err();
+	assert!(e.contains("would go to"), "{e}");
+	let e = call(&ours, &Request::Cleanup { provider: "nope".into(), records: vec![rec] }).await.unwrap_err();
+	assert!(e.contains("not configured"), "{e}");
+	let _ = fs::remove_dir_all(&dir);
+}
+
 // ---- Pebble and PowerDNS ----
 
 struct Proc(Child, PathBuf);
@@ -804,6 +853,54 @@ async fn issues_certificates_from_pebble() {
 	tokio::time::sleep(Duration::from_secs(1)).await;
 	assert!(!rp.log().contains(r#""event":"acme.order""#), "{}", rp.log());
 	drop(rp);
+
+	// the helper (global.acme.helper): it holds the DNS secrets; this rproxy's
+	// settings name files that do not exist, so it cannot have read them
+	let helper_socket = dir.join("helper.sock");
+	// SAFETY: plain syscall
+	let uid = unsafe { libc::getuid() }.to_string();
+	let helper = spawn(
+		"helper",
+		&dir,
+		env!("CARGO_BIN_EXE_rproxy-api"),
+		&["acme-helper", "--config", config_file.to_str().unwrap(), "--socket", helper_socket.to_str().unwrap(), "--socket-mode", "600", "--allow-user", &uid],
+		&[],
+	);
+	let helper_log = || fs::read_to_string(dir.join("helper.log")).unwrap_or_default();
+	wait_until("the helper", 20, &helper_log, || async { helper_socket.exists() }).await;
+	let mut global_b = global.replace(&format!("storage: {}", dir.join("acme").display()), &format!("storage: {}", dir.join("acme-b").display()));
+	for f in ["pdns.key", "tsig-256.key", "tsig-512.key", "relay.token", "acme-dns.json"] {
+		global_b = global_b.replace(&format!("{}/{f}", dir.display()), &format!("/nonexistent/{f}"));
+	}
+	global_b.push_str(&format!("    helper: {{socket: {}}}\n", helper_socket.display()));
+	let p_helper = free_port();
+	let config_b = dir.join("rproxy-b.yaml");
+	fs::write(&config_b, format!("version: 1\nglobal:\n  acme:\n{global_b}rules:\n{}", rule(p_helper, "dns", &["helper.example.test"]))).unwrap();
+	let check = Command::new(env!("CARGO_BIN_EXE_rproxy-api")).arg("--check-config").arg(&config_b).env_clear().output().unwrap();
+	assert!(check.status.success(), "{}{}", String::from_utf8_lossy(&check.stdout), String::from_utf8_lossy(&check.stderr));
+	let api_b = free_port();
+	let rp = Rproxy::start(&dir, api_b, &config_b, &dir.join("api-b.sock"));
+	let logs = || format!("{}\n--- helper ---\n{}", rp.log(), helper_log());
+	wait_until("helper.example.test through the helper", 60, &logs, || async {
+		let r = client.get(format!("http://127.0.0.1:{api_b}/rules/tcp/127.0.0.1/{p_helper}")).bearer_auth("e2e-token").send().await;
+		match r {
+			Ok(r) => r.json::<Value>().await.unwrap_or_default()["acme"][0]["state"] == "valid",
+			Err(_) => false,
+		}
+	})
+	.await;
+	let hl = helper_log();
+	assert!(hl.contains(r#""action":"add""#) && hl.contains(r#""action":"remove""#) && hl.contains(r#""fqdn":"_acme-challenge.helper.example.test""#), "{hl}");
+	assert!(pdns.txt("example.test").await.is_empty());
+	let acme_b = client.get(format!("http://127.0.0.1:{api_b}/acme")).bearer_auth("e2e-token").send().await.unwrap().json::<Value>().await.unwrap();
+	assert_eq!(acme_b["helper"], true, "{acme_b}");
+	for text in [hl.as_str(), &rp.log()] {
+		for secret in [PDNS_KEY, TSIG_256, ADNS_PASSWORD] {
+			assert!(!text.contains(secret), "a secret in a log");
+		}
+	}
+	drop(rp);
+	drop(helper);
 	drop(pebble_proc);
 	let _ = fs::remove_dir_all(&dir);
 }

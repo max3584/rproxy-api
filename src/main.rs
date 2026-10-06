@@ -117,6 +117,85 @@ struct Options {
 	/// Output of --check-config: text or json
 	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
 	check_config_format: String,
+	#[command(subcommand)]
+	command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+	/// The ACME helper (global.acme.helper): holds the DNS providers' secrets and
+	/// writes DNS-01 records for rproxy-api over a Unix socket. Run it as
+	/// another user (docs/ACME.md, docs/PERMISSIONS.md)
+	AcmeHelper {
+		/// The settings file (or directory) with global.acme
+		#[arg(long, env = "RPROXY_ACME_HELPER_CONFIG")]
+		config: PathBuf,
+		/// The socket to listen on (global.acme.helper.socket)
+		#[arg(long, env = "RPROXY_ACME_HELPER_SOCKET")]
+		socket: PathBuf,
+		/// Mode of the socket file (octal)
+		#[arg(long, env = "RPROXY_ACME_HELPER_SOCKET_MODE", default_value = "660")]
+		socket_mode: String,
+		/// Group of the socket file (name or id): rproxy-api's group
+		#[arg(long, env = "RPROXY_ACME_HELPER_SOCKET_GROUP")]
+		socket_group: Option<String>,
+		/// Users (name or uid) allowed to use the helper, checked with SO_PEERCRED;
+		/// comma-separated or repeated (default: whoever the socket's mode lets in)
+		#[arg(long, env = "RPROXY_ACME_HELPER_ALLOW_USER", value_delimiter = ',')]
+		allow_user: Vec<String>,
+	},
+}
+
+/// A user name or uid.
+fn user_id(name: &str) -> Result<u32, String> {
+	if let Ok(uid) = name.parse() {
+		return Ok(uid);
+	}
+	let c = std::ffi::CString::new(name).map_err(|_| format!("invalid user name: {name:?}"))?;
+	// SAFETY: getpwnam returns a pointer to static storage or null; the uid is copied at once
+	unsafe {
+		let pw = libc::getpwnam(c.as_ptr());
+		if pw.is_null() {
+			return Err(format!("no such user: {name}"));
+		}
+		Ok((*pw).pw_uid)
+	}
+}
+
+/// `rproxy-api acme-helper` (logs to stdout, JSON Lines).
+fn acme_helper(opts: &Options) -> ExitCode {
+	let Some(Command::AcmeHelper { config, socket, socket_mode, socket_group, allow_user }) = &opts.command else {
+		return ExitCode::FAILURE;
+	};
+	let _guard = match logging::init(&opts.log_level, None, opts.log_keep) {
+		Ok((guard, _)) => guard,
+		Err(e) => {
+			eprintln!("rproxy-api: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let setup = || -> Result<rproxy_api::acme::helper::HelperOptions, String> {
+		Ok(rproxy_api::acme::helper::HelperOptions {
+			config: config.clone(),
+			socket: rproxy_api::control::unix_api::SocketOptions {
+				path: socket.clone(),
+				mode: rproxy_api::control::unix_api::parse_mode(socket_mode)?,
+				group: socket_group.clone(),
+			},
+			allow_uids: allow_user.iter().map(|u| user_id(u)).collect::<Result<_, _>>()?,
+		})
+	};
+	let result = setup().and_then(|helper| {
+		let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+		runtime.block_on(rproxy_api::acme::helper::run(helper))
+	});
+	match result {
+		Ok(()) => ExitCode::SUCCESS,
+		Err(e) => {
+			error!(event = "fatal", part = "acme-helper", error = %e);
+			ExitCode::FAILURE
+		}
+	}
 }
 
 /// Port ranges open one socket per port; lift the soft file limit to the hard one.
@@ -178,6 +257,9 @@ fn main() -> ExitCode {
 		}
 	}
 	let opts = Options::parse();
+	if opts.command.is_some() {
+		return acme_helper(&opts);
+	}
 	if let Some(path) = &opts.check_config {
 		return check_config(&opts, path.clone());
 	}

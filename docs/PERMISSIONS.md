@@ -35,6 +35,18 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `PrivateTmp=yes` | `/tmp` はサービス専用。ホストの `/tmp` のファイルは見えない |
 | `LimitNOFILE=65536` | ポート範囲のルールは 1 ポートに 1 つのソケットを使う（起動時に上限まで引き上げる） |
 
+### ACME の補助プロセス（`rproxy-acme-helper.service`、任意）
+
+`global.acme.helper` を使うとき（docs/ACME.md の「補助プロセス」）。DNS のプロバイダの秘密はこのプロセスだけが読みます。
+
+| 項目 | 値 |
+|---|---|
+| ユーザー | `rproxy-acme`（.deb の postinst が作る）。補助のグループ `rproxy`（設定ファイルを読み、ソケットのグループにする） |
+| capability | なし（`CapabilityBoundingSet=` は空） |
+| ソケット | `/run/rproxy-acme/helper.sock`（`rproxy-acme:rproxy` 660。`RuntimeDirectory=rproxy-acme`）。`--allow-user rproxy` で相手のユーザーも確かめる |
+| 秘密のファイル | 例 `/etc/rproxy/acme-helper/`（`root:rproxy-acme` 750、ファイルは 640）。rproxy ユーザーには読めない |
+| 書くもの | `/var/lib/rproxy-acme/`（`StateDirectory`、700）：acme-dns の `credentials_file` |
+
 ## ホスト側の設定（root）
 
 | 作業 | 方法 |

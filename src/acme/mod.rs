@@ -17,6 +17,7 @@ pub mod challenge;
 pub mod config;
 pub mod dns;
 pub mod dnsq;
+pub mod helper;
 pub mod http;
 pub mod rfc2136;
 pub mod store;
@@ -207,7 +208,8 @@ pub struct Acme {
 	global: AcmeGlobal,
 	storage: PathBuf,
 	accounts: BTreeMap<String, AccountCfg>,
-	providers: BTreeMap<String, dns::Provider>,
+	/// Who writes DNS-01 records (this process, or the helper).
+	dns: dns::Backend,
 	resolvers: BTreeMap<String, ResolverCfg>,
 	orders_limit: u32,
 	period: Duration,
@@ -279,10 +281,17 @@ impl Acme {
 		for (name, a) in &global.accounts {
 			http::connector(a.ca_file.as_deref()).map_err(|e| format!("global.acme.accounts.{name}.ca_file: {e}"))?;
 		}
-		let mut providers = BTreeMap::new();
-		for (name, p) in &global.dns_providers {
-			providers.insert(name.clone(), dns::Provider::new(name, p).map_err(|e| format!("global.acme.dns_providers.{name}: {e}"))?);
-		}
+		// with the helper, the DNS providers (and their secrets) are its business
+		let dns = match &global.helper {
+			Some(h) => dns::Backend::Helper(PathBuf::from(&h.socket)),
+			None => {
+				let mut providers = BTreeMap::new();
+				for (name, p) in &global.dns_providers {
+					providers.insert(name.clone(), dns::Provider::new(name, p).map_err(|e| format!("global.acme.dns_providers.{name}: {e}"))?);
+				}
+				dns::Backend::Local(providers)
+			}
+		};
 		let resolvers = global
 			.resolvers
 			.iter()
@@ -304,7 +313,7 @@ impl Acme {
 		Ok(Arc::new(Acme {
 			storage: storage.clone(),
 			accounts,
-			providers,
+			dns,
 			resolvers,
 			orders_limit: global.rate_limit.as_ref().map_or(config::DEFAULT_ORDERS, |l| l.orders),
 			period: duration(&global.rate_limit.as_ref().and_then(|l| l.period.clone()), config::DEFAULT_PERIOD)?,
@@ -334,7 +343,8 @@ impl Acme {
 	/// Files the settings name (where, file): secrets and CA certificates.
 	fn named_files(global: &AcmeGlobal) -> Vec<(String, String)> {
 		let mut out = vec![];
-		for (name, p) in &global.dns_providers {
+		// with the helper, these files are its own (this process may not even see them)
+		for (name, p) in global.dns_providers.iter().filter(|_| global.helper.is_none()) {
 			out.extend(dns::Provider::required_files(p).into_iter().map(|f| (format!("dns_providers.{name}"), f)));
 		}
 		for (name, a) in &global.accounts {
@@ -347,7 +357,9 @@ impl Acme {
 	/// Files read while running, for `--check-config`'s readability warnings.
 	pub fn secret_files(&self) -> Vec<String> {
 		let mut out: Vec<String> = Self::named_files(&self.global).into_iter().map(|(_, f)| f).collect();
-		out.extend(self.global.dns_providers.values().filter_map(|p| p.credentials_file.clone()));
+		if self.global.helper.is_none() {
+			out.extend(self.global.dns_providers.values().filter_map(|p| p.credentials_file.clone()));
+		}
 		out
 	}
 
@@ -444,9 +456,10 @@ impl Acme {
 			})
 			.collect();
 		let providers: Vec<serde_json::Value> = self
-			.providers
+			.global
+			.dns_providers
 			.iter()
-			.map(|(name, p)| serde_json::json!({"name": name, "type": p.kind(), "zones": p.zones(), "allowed_names": p.allowed_names()}))
+			.map(|(name, p)| serde_json::json!({"name": name, "type": p.kind, "zones": p.zones, "allowed_names": p.allowed_names}))
 			.collect();
 		let resolvers: Vec<serde_json::Value> = self
 			.resolvers
@@ -462,6 +475,7 @@ impl Acme {
 			"resolvers": resolvers,
 			"certificates": certificates,
 			"rate_limit": {"orders": self.orders_limit, "period_secs": self.period.as_secs(), "used": used},
+			"helper": matches!(self.dns, dns::Backend::Helper(_)),
 		})
 	}
 
@@ -616,7 +630,7 @@ impl Acme {
 		// TXT records a crash or a failed removal left behind
 		let leftover = self.journal.read();
 		if !leftover.is_empty() {
-			dns::remove_all(&self.providers, &self.journal, &leftover, "left over").await;
+			dns::remove_all(&self.dns, &self.journal, &leftover, "left over").await;
 		}
 		loop {
 			// the CA's renewal windows (RFC 9773) for issued certificates
@@ -812,10 +826,7 @@ impl Acme {
 			Challenge::TlsAlpn01 => ChallengeType::TlsAlpn01,
 			Challenge::Dns01 => ChallengeType::Dns01,
 		};
-		let provider = match &r.dns_provider {
-			Some(p) => Some(self.providers.get(p).ok_or_else(|| format!("dns provider {p:?} is not configured"))?),
-			None => None,
-		};
+		let provider = r.dns_provider.as_deref();
 
 		// first the answers for every authorization, then tell the CA
 		let mut answers = challenge::Answers::default();
@@ -839,7 +850,7 @@ impl Acme {
 					Challenge::TlsAlpn01 => answers.add_tls_alpn(&domain, key_auth.digest().as_ref())?,
 					Challenge::Dns01 => {
 						let p = provider.ok_or("dns-01 without a dns provider")?;
-						records.push(p.locate(&domain, &key_auth.dns_value(), &self.dns_servers).await?);
+						records.push(self.dns.locate(p, &domain, &key_auth.dns_value(), &self.dns_servers).await?);
 					}
 				}
 				debug!(event = "acme.challenge", resolver = %id.resolver, domain, challenge = r.challenge.as_str());
@@ -848,7 +859,7 @@ impl Acme {
 		let result = self.validate_and_finalize(&mut order, kind, &records, id).await;
 		drop(answers);
 		if !records.is_empty() {
-			dns::remove_all(&self.providers, &self.journal, &records, "validated").await;
+			dns::remove_all(&self.dns, &self.journal, &records, "validated").await;
 		}
 		result
 	}
@@ -863,8 +874,7 @@ impl Acme {
 		if !records.is_empty() {
 			self.journal.add(records);
 			for ((provider, fqdn), group) in dns::by_name(records) {
-				let p = self.providers.get(&provider).ok_or("dns provider disappeared")?;
-				p.present(&group).await.map_err(|e| format!("dns provider {provider}: {e}"))?;
+				self.dns.present(&provider, &group).await.map_err(|e| format!("dns provider {provider}: {e}"))?;
 				info!(event = "acme.dns", action = "add", provider, fqdn, zone = %group[0].zone, outcome = "ok");
 			}
 			if !dns::wait_visible(&self.dns_servers, records, self.propagation).await {

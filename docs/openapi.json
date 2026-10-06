@@ -2054,6 +2054,10 @@
                 "type": "integer"
               }
             }
+          },
+          "helper": {
+            "type": "boolean",
+            "description": "DNS-01 records are written by the ACME helper (global.acme.helper), which holds the DNS secrets"
           }
         }
       }

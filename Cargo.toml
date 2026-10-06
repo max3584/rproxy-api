@@ -36,6 +36,7 @@ systemd-units = { enable = false, start = false }
 assets = [
     ["target/release/rproxy-api", "usr/bin/", "755"],
     ["debian/rproxy.env", "etc/rproxy/rproxy.env", "640"],
+    ["debian/rproxy-acme-helper.service", "lib/systemd/system/", "644"],
     ["contrib/rproxy.example.yaml", "usr/share/doc/rproxy-api/examples/", "644"],
     ["README.md", "usr/share/doc/rproxy-api/", "644"],
     ["README.en.md", "usr/share/doc/rproxy-api/", "644"],

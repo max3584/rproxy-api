@@ -51,6 +51,16 @@ pub struct AcmeGlobal {
 	/// without an `http` rule on port 80. It answers nothing else.
 	#[serde(default)]
 	pub http01_listen: Vec<String>,
+	/// The ACME helper (`rproxy-api acme-helper`): DNS-01 records are written by
+	/// that process, which holds the DNS providers' secrets; this one never reads them.
+	pub helper: Option<HelperSpec>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HelperSpec {
+	/// The helper's Unix socket (e.g. /run/rproxy-acme/helper.sock).
+	pub socket: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -419,6 +429,11 @@ impl AcmeGlobal {
 		}
 		for s in &self.dns_servers {
 			parse_dns_server(s).map_err(|e| at(format!("dns_servers: {e}")))?;
+		}
+		if let Some(h) = &self.helper {
+			if !h.socket.starts_with('/') {
+				return Err(at("helper.socket must be an absolute path".into()));
+			}
 		}
 		for s in &self.http01_listen {
 			s.parse::<SocketAddr>().map_err(|_| at(format!("http01_listen: {s:?} is not ip:port")))?;

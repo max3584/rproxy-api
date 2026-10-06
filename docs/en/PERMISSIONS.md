@@ -35,6 +35,18 @@ rproxy-api starts even if either permission is removed, and the other rules keep
 | `PrivateTmp=yes` | `/tmp` is private to the service. Files in the host's `/tmp` are not visible |
 | `LimitNOFILE=65536` | Port range rules use one socket per port (the limit is raised to the maximum at startup) |
 
+### The ACME helper (`rproxy-acme-helper.service`, optional)
+
+With `global.acme.helper` (docs/en/ACME.md, "Helper process"). Only this process reads the DNS providers' secrets.
+
+| Item | Value |
+|---|---|
+| User | `rproxy-acme` (created by the .deb's postinst), with the supplementary group `rproxy` (to read the settings file and own the socket's group) |
+| Capabilities | None (`CapabilityBoundingSet=` empty) |
+| Socket | `/run/rproxy-acme/helper.sock` (`rproxy-acme:rproxy` 660; `RuntimeDirectory=rproxy-acme`). `--allow-user rproxy` checks the peer's user too |
+| Secret files | e.g. `/etc/rproxy/acme-helper/` (`root:rproxy-acme` 750, files 640); not readable by the rproxy user |
+| What it writes | `/var/lib/rproxy-acme/` (`StateDirectory`, 700): acme-dns's `credentials_file` |
+
 ## Host configuration (root)
 
 | Task | How |

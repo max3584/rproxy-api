@@ -5,6 +5,10 @@ if [ "$1" = "configure" ]; then
 	if ! getent passwd rproxy >/dev/null; then
 		useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy
 	fi
+	# the ACME helper's user (rproxy-acme-helper.service, docs/ACME.md): holds DNS-01 secrets
+	if ! getent passwd rproxy-acme >/dev/null; then
+		useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy-acme
+	fi
 	chgrp rproxy /etc/rproxy
 	chmod 0750 /etc/rproxy
 	# RPROXY_LOG_FILE の既定の置き場所（systemd の LogsDirectory も同じ場所を使う）

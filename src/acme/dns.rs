@@ -407,15 +407,50 @@ pub fn by_name(records: &[Written]) -> BTreeMap<(String, String), Vec<Written>> 
 	out
 }
 
+/// Who writes the TXT records: the DNS providers in this process, or the ACME
+/// helper (`global.acme.helper`), which holds their secrets.
+pub enum Backend {
+	Local(BTreeMap<String, Provider>),
+	Helper(PathBuf),
+}
+
+impl Backend {
+	pub async fn locate(&self, provider: &str, domain: &str, value: &str, servers: &[SocketAddr]) -> Result<Written, String> {
+		match self {
+			Backend::Local(all) => all.get(provider).ok_or_else(|| format!("dns provider {provider:?} is not configured"))?.locate(domain, value, servers).await,
+			Backend::Helper(socket) => {
+				let req = super::helper::Request::Locate { provider: provider.into(), domain: domain.into(), value: value.into() };
+				super::helper::call(socket, &req).await?.record.ok_or_else(|| "acme helper: no record in the answer".to_string())
+			}
+		}
+	}
+
+	pub async fn present(&self, provider: &str, records: &[Written]) -> Result<(), String> {
+		match self {
+			Backend::Local(all) => all.get(provider).ok_or_else(|| format!("dns provider {provider:?} is not configured"))?.present(records).await,
+			Backend::Helper(socket) => {
+				let req = super::helper::Request::Present { provider: provider.into(), records: records.to_vec() };
+				super::helper::call(socket, &req).await.map(|_| ())
+			}
+		}
+	}
+
+	pub async fn cleanup(&self, provider: &str, records: &[Written]) -> Result<(), String> {
+		match self {
+			Backend::Local(all) => all.get(provider).ok_or_else(|| "the provider is no longer configured".to_string())?.cleanup(records).await,
+			Backend::Helper(socket) => {
+				let req = super::helper::Request::Cleanup { provider: provider.into(), records: records.to_vec() };
+				super::helper::call(socket, &req).await.map(|_| ())
+			}
+		}
+	}
+}
+
 /// Removes records and takes them out of the journal; failures stay in it
 /// (and are tried again after a restart).
-pub async fn remove_all(providers: &BTreeMap<String, Provider>, journal: &Journal, records: &[Written], reason: &str) {
+pub async fn remove_all(backend: &Backend, journal: &Journal, records: &[Written], reason: &str) {
 	for ((provider, fqdn), group) in by_name(records) {
-		let Some(p) = providers.get(&provider) else {
-			warn!(event = "acme.dns", action = "remove", provider, fqdn, outcome = "error", error = "the provider is no longer configured");
-			continue;
-		};
-		match p.cleanup(&group).await {
+		match backend.cleanup(&provider, &group).await {
 			Ok(()) => {
 				info!(event = "acme.dns", action = "remove", provider, fqdn, zone = %group[0].zone, reason, outcome = "ok");
 				journal.remove(&group);
