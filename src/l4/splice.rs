@@ -15,13 +15,14 @@
 //!
 //! A pipe is taken when a direction has data to splice and given back, empty, to
 //! a small shared pool when the direction waits for more (so an idle connection
-//! holds no pipe, as HAProxy does); a pipe with data left is closed. A side that cannot be spliced (EINVAL / ENOSYS) or a pipe that
+//! holds no pipe, as HAProxy does); a pipe with data left is closed. The pool
+//! is emptied when no direction is splicing any more. A side that cannot be spliced (EINVAL / ENOSYS) or a pipe that
 //! cannot be made (EMFILE) falls back to the user-space copy for that direction.
 
 use std::io;
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tokio::io::Interest;
@@ -64,6 +65,37 @@ struct PipeFds {
 }
 
 static POOL: Mutex<Vec<PipeFds>> = Mutex::new(Vec::new());
+/// Directions that have started splicing and not ended. When the last one ends,
+/// the pool is emptied, so no pipe outlives the connections that used them.
+static SPLICING: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one direction in `SPLICING` while it lives.
+struct Splicing;
+
+impl Splicing {
+	fn start() -> Splicing {
+		SPLICING.fetch_add(1, Ordering::AcqRel);
+		Splicing
+	}
+}
+
+impl Drop for Splicing {
+	fn drop(&mut self) {
+		if SPLICING.fetch_sub(1, Ordering::AcqRel) == 1 {
+			if let Ok(mut pool) = POOL.lock() {
+				// another direction may have started meanwhile; it makes new pipes
+				if SPLICING.load(Ordering::Acquire) == 0 {
+					pool.clear();
+				}
+			}
+		}
+	}
+}
+
+/// Pipes kept in the pool (2 FDs each), for tests and the load test.
+pub fn pooled() -> usize {
+	POOL.lock().map_or(0, |p| p.len())
+}
 
 /// A pipe in use by one direction; `pending` bytes are in it.
 struct Pipe {
@@ -143,14 +175,15 @@ async fn direction(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &
 	let (src_fd, dst_fd) = (src.as_raw_fd(), dst.as_raw_fd());
 	// user-space reads in a row that filled the buffer
 	let mut streak = 0u32;
+	// splicing once started goes on (the pipe itself is given back while idle);
+	// declared before `pipe` so the pipe is given back before this ends (and may empty the pool)
+	let mut spliced: Option<Splicing> = None;
 	let mut pipe: Option<Pipe> = None;
 	let mut buf: Option<Box<[u8]>> = None;
 	let mut user_space = false;
-	// splicing once started goes on (the pipe itself is given back while idle)
-	let mut spliced = false;
 	loop {
-		if !user_space && (spliced || (count.load(Ordering::Relaxed) >= after && streak >= full_reads)) {
-			spliced = true;
+		if !user_space && (spliced.is_some() || (count.load(Ordering::Relaxed) >= after && streak >= full_reads)) {
+			spliced.get_or_insert_with(Splicing::start);
 			// the user-space buffer is empty here (each read is written out in full)
 			buf = None;
 			// wait without a pipe; take one only when there is something to move
@@ -220,4 +253,54 @@ async fn direction(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &
 	}
 	// end of this direction: pass the FIN on (what poll_shutdown of a TcpStream does)
 	socket2::SockRef::from(dst).shutdown(Shutdown::Write)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	use tokio::net::TcpListener;
+
+	async fn pair() -> (TcpStream, TcpStream) {
+		let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+		let (s, _) = l.accept().await.unwrap();
+		(c, s)
+	}
+
+	#[tokio::test]
+	async fn relays_every_byte_with_half_close_and_leaves_no_pipe() {
+		// client <-> (a | relay | b) <-> backend
+		let (mut client, a) = pair().await;
+		let (b, mut backend) = pair().await;
+		let (rx, tx, rt, tt) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+		let data: Vec<u8> = (0..4u32 << 20).map(|i| (i * 7 + i / 251) as u8).collect();
+		let sent = data.clone();
+		let relay = relay(&a, &b, &rx, &tx, &rt, &tt);
+		let peers = async {
+			let up = async {
+				client.write_all(&sent).await.unwrap();
+				client.shutdown().await.unwrap();
+				let mut back = Vec::new();
+				client.read_to_end(&mut back).await.unwrap();
+				back
+			};
+			let down = async {
+				let mut got = Vec::new();
+				backend.read_to_end(&mut got).await.unwrap();
+				// answer after the client's FIN (half-close)
+				backend.write_all(&got[..100_000]).await.unwrap();
+				backend.shutdown().await.unwrap();
+				got
+			};
+			tokio::join!(up, down)
+		};
+		let (r, (back, got)) = tokio::join!(relay, peers);
+		r.unwrap();
+		assert!(got == data, "upload changed");
+		assert!(back[..] == data[..100_000], "download changed");
+		assert_eq!(rx.into_inner(), data.len() as u64);
+		assert_eq!(tx.into_inner(), 100_000);
+		assert_eq!(pooled(), 0, "pipes kept after the last splicing connection");
+	}
 }
