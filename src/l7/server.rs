@@ -82,6 +82,8 @@ struct Route {
 	matcher: Matcher,
 	service: Option<Arc<Service>>,
 	middlewares: Vec<Arc<Middleware>>,
+	/// Names of `middlewares` as in the settings (access log).
+	names: Vec<String>,
 }
 
 /// The compiled `http` of a rule. Replaced as a whole when the rule changes,
@@ -139,7 +141,7 @@ impl Router {
 				(None, None) => None,
 			};
 			let priority = r.priority.unwrap_or_else(|| Matcher::default_priority(&r.rule));
-			routes.push((priority, i, Route { name: r.name.clone(), matcher, service, middlewares: chain }));
+			routes.push((priority, i, Route { name: r.name.clone(), matcher, service, middlewares: chain, names: r.middlewares.clone() }));
 		}
 		// higher priority first; the order in the settings breaks ties
 		routes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -439,9 +441,9 @@ impl Conn {
 			headers: &headers,
 			client: client_ip,
 		};
-		let (route_name, service, chain) = match router.route(&info) {
-			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice()),
-			None => ("", router.default_service.clone(), &[][..]),
+		let (route_name, service, chain, names) = match router.route(&info) {
+			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice()),
+			None => ("", router.default_service.clone(), &[][..], &[][..]),
 		};
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
 		// the access log line is put together only when it is written (the statistics need just the route)
@@ -491,9 +493,12 @@ impl Conn {
 		let authority = request_authority(&parts.uri, &parts.headers)
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.clone());
+		// which middleware answered (kind, name), for `refused_by` in the access log
+		let mut answered_by: Option<(&'static str, &str)> = None;
 		// sign-in callbacks and logout of `oidc`, whichever route matched
 		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
 			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
+			answered_by = Some(("oidc", o.name.as_str()));
 		}
 		for (i, m) in chain.iter().enumerate() {
 			if answer.is_some() {
@@ -503,6 +508,9 @@ impl Conn {
 			let resp = match m.as_ref() {
 				Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
 					BasicVerdict::Allow(user) => {
+						if log {
+							entry.user = user.clone();
+						}
 						if !b.keep_authorization {
 							parts.headers.remove(header::AUTHORIZATION);
 						}
@@ -514,12 +522,20 @@ impl Conn {
 						}
 						None
 					}
-					BasicVerdict::Deny => {
+					BasicVerdict::Deny(why) => {
+						if log {
+							entry.auth_error = why.to_string();
+						}
 						let mut resp = error_response(StatusCode::UNAUTHORIZED);
 						resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
 						Some(resp)
 					}
-					BasicVerdict::Unavailable => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+					BasicVerdict::Unavailable => {
+						if log {
+							entry.auth_error = "unavailable".into();
+						}
+						Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
+					}
 				},
 				Middleware::ForwardAuth(fa) => self.forward_auth(&router, fa, &mut parts, client_ip, &host).await,
 				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
@@ -560,7 +576,17 @@ impl Conn {
 			};
 			if let Some(resp) = resp {
 				answer = Some(resp);
+				answered_by = Some((m.kind(), names.get(i).map_or("", String::as_str)));
 				break;
+			}
+		}
+		// a middleware that refused the request (an error status; not redirects or answers like `respond` 200)
+		if log {
+			if let (Some(resp), Some((kind, name))) = (&answer, answered_by) {
+				if resp.status().is_client_error() || resp.status().is_server_error() {
+					entry.refused_by = kind.to_string();
+					entry.middleware = name.to_string();
+				}
 			}
 		}
 		let req = Request::from_parts(parts, body);

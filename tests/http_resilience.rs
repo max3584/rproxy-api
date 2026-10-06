@@ -127,9 +127,16 @@ async fn health_checks_take_servers_out_and_back() {
 	let metrics = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
 	assert!(metrics.contains(&format!("rproxy_http_server_up{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",service=\"app\",server=\"{}\"}} 0", url(&b))), "{metrics}");
 
+	assert!(rule_view(&h, port).await.get("down_services").is_none(), "one server is still up");
+	assert!(metrics.contains(&format!("rproxy_http_service_down{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",service=\"app\"}} 0")), "{metrics}");
+
 	a.health.store(500, Ordering::Relaxed);
 	eventually("A marked down", || async { rule_view(&h, port).await["stats"]["http"]["services"]["app"][0]["up"] == false }).await;
 	assert_eq!(get(port, "/x").await.0, StatusCode::SERVICE_UNAVAILABLE, "no server is up");
+	// the service is down as a whole (#115)
+	assert_eq!(rule_view(&h, port).await["down_services"], json!(["app"]));
+	let metrics = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	assert!(metrics.contains(&format!("rproxy_http_service_down{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",service=\"app\"}} 1")), "{metrics}");
 
 	b.health.store(200, Ordering::Relaxed);
 	eventually("B back", || async { rule_view(&h, port).await["stats"]["http"]["services"]["app"][1]["up"] == true }).await;

@@ -88,7 +88,7 @@ echo "== parser (cscli explain on sample lines)"
 explain=$(cscli explain --file "$ROOT/scripts/interop/crowdsec-samples.log" --type rproxy 2>&1) || fail "cscli explain: $explain"
 echo "$explain"
 parsed=$(grep -c '🟢 max3584/rproxy-logs' <<<"$explain" || true)
-[ "$parsed" = 4 ] || fail "our parser handled $parsed of 4 sample lines"
+[ "$parsed" = 6 ] || fail "our parser handled $parsed of 6 sample lines"
 grep -q '🟢 crowdsecurity/http-logs' <<<"$explain" || fail "http.access lines did not reach crowdsecurity/http-logs"
 grep -q '🟢 crowdsecurity/http-sensitive-files' <<<"$explain" || fail "http scenarios did not see GET /.env"
 grep -q 'max3584/rproxy-conn-denied' <<<"$explain" || fail "conn.denied did not reach max3584/rproxy-conn-denied"

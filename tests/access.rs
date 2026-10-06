@@ -254,3 +254,39 @@ async fn rules_needing_a_missing_capability_fail_with_the_reason() {
 	let err = h.registry.load_static(requests(json!([bad]))).await.unwrap_err();
 	assert!(err.contains("static rule #1"), "{err}");
 }
+
+/// Refused UDP datagrams are logged at info like TCP's refusals (CrowdSec's
+/// `rproxy-conn-denied` reads them), but a flood from one client is cut down to
+/// 20 lines at once, then one a second; the next line says how many were left out.
+#[tokio::test]
+async fn refused_udp_datagrams_are_logged_without_flooding_the_log() {
+	logs::capture();
+	let h = harness().await;
+	let port = free_udp_port();
+	let mut body = rule("udp", port, udp_backend("U:").await);
+	body["allow_from"] = json!(["192.0.2.0/24"]);
+	assert_eq!(h.post(body).await.0, StatusCode::CREATED);
+	let key = format!("udp/127.0.0.1:{port}");
+	let mine = |v: &Value| v["event"] == "conn.denied" && v["rule"] == key.as_str();
+
+	let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	c.connect(("127.0.0.1", port)).await.unwrap();
+	c.send(b"first").await.unwrap();
+	let v = logs::wait_for("conn.denied", mine).await;
+	assert_eq!(v["level"], "INFO", "{v}");
+	assert_eq!((v["reason"].as_str(), v["suppressed"].as_u64()), (Some("allow_from"), Some(0)), "{v}");
+	assert_eq!(v["client"], c.local_addr().unwrap().to_string(), "IP:port, as the CrowdSec parser reads it: {v}");
+
+	for _ in 0..40 {
+		c.send(b"flood").await.unwrap();
+	}
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	wait_for(&h, &path, |v| v["stats"]["denied"] == 41).await;
+	let logged = logs::lines(mine).len();
+	// 20 at once, and one a second after them (more on a slow machine)
+	assert!((20..=30).contains(&logged), "{logged} lines for 41 datagrams");
+	tokio::time::sleep(Duration::from_millis(1100)).await;
+	c.send(b"later").await.unwrap();
+	let v = logs::wait_for("the line after the flood", |v| mine(v) && v["suppressed"].as_u64() > Some(0)).await;
+	assert!(v["suppressed"].as_u64().unwrap() >= 5, "{v}");
+}

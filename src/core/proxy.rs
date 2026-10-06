@@ -123,6 +123,9 @@ pub struct Runtime {
 	pub listen: RwLock<Vec<std::net::IpAddr>>,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
+	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
+	/// datagrams (whose sources may be spoofed) must not flood the log.
+	pub denied_log: crate::logging::Throttle<std::net::IpAddr>,
 	/// Stops accepting new connections.
 	pub stop: CancellationToken,
 	/// Closes established connections. `stop` is its child, so this stops everything.

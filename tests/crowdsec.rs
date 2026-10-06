@@ -158,6 +158,7 @@ fn decision(id: i64, scope: &str, value: &str, kind: &str) -> Value {
 
 #[tokio::test]
 async fn lapi_decisions_block_and_expire() {
+	logs::capture();
 	let lapi = Shared::default();
 	{
 		let mut l = lapi.lock().unwrap();
@@ -207,6 +208,26 @@ async fn lapi_decisions_block_and_expire() {
 	assert!(metrics.contains("rproxy_http_blocked_total{protocol=\"tcp\""), "{metrics}");
 	assert!(metrics.contains("rproxy_crowdsec_decisions 3"), "{metrics}");
 	assert!(metrics.contains("rproxy_crowdsec_synced 1"), "{metrics}");
+	// connected now (#115)
+	assert!(metrics.contains("rproxy_crowdsec_connected 1"), "{metrics}");
+	assert!(metrics.contains("rproxy_crowdsec_last_success_timestamp_seconds 1"), "{metrics}");
+	let (_, config) = h.get("/config").await;
+	let cs = &config["crowdsec"];
+	assert_eq!((cs["connected"].as_bool(), cs["synced"].as_bool(), cs["failures"].as_u64()), (Some(true), Some(true), Some(0)), "{config}");
+	assert!(cs["last_success"].as_u64().unwrap() > 1_700_000_000 && cs["last_error"].is_null(), "{config}");
+
+	// the access log says which middleware refused
+	let rule_key = format!("tcp/127.0.0.1:{port}");
+	let v = logs::wait_for("http.access of a refused request", |v| {
+		v["event"] == "http.access" && v["rule"] == rule_key.as_str() && v["status"] == 403
+	})
+	.await;
+	assert_eq!((v["refused_by"].as_str(), v["middleware"].as_str()), (Some("crowdsec"), Some("cs")), "{v}");
+	let v = logs::wait_for("http.access of a request let through", |v| {
+		v["event"] == "http.access" && v["rule"] == rule_key.as_str() && v["status"] == 200
+	})
+	.await;
+	assert_eq!((v["refused_by"].as_str(), v["middleware"].as_str()), (Some(""), Some("")), "{v}");
 	b.stop();
 }
 
@@ -238,6 +259,15 @@ async fn on_error_decides_until_the_lapi_answers() {
 	assert_eq!(send(port, reqwest::Method::GET, "/open", "192.0.2.1", "").await.0, StatusCode::OK);
 	assert_eq!(send(port, reqwest::Method::GET, "/closed", "192.0.2.1", "").await.0, StatusCode::FORBIDDEN);
 	assert!(!b.synced());
+	// the LAPI cannot be reached: shown in GET /config and /metrics (#115)
+	eventually("a failed pull", || async { b.status().failures >= 1 }).await;
+	let (_, config) = h.get("/config").await;
+	let cs = &config["crowdsec"];
+	assert_eq!((cs["connected"].as_bool(), cs["synced"].as_bool()), (Some(false), Some(false)), "{config}");
+	assert!(cs["last_success"].is_null() && cs["last_error"].is_string() && cs["last_error_at"].as_u64().is_some(), "{config}");
+	let metrics = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	assert!(metrics.contains("rproxy_crowdsec_connected 0"), "{metrics}");
+	assert!(!metrics.contains("rproxy_crowdsec_last_success_timestamp_seconds"), "{metrics}");
 	b.stop();
 }
 
@@ -373,6 +403,7 @@ async fn udp_passes(sock: &tokio::net::UdpSocket) -> bool {
 
 #[tokio::test]
 async fn l4_rules_with_crowdsec_refuse_banned_clients() {
+	logs::capture();
 	let lapi = Shared::default();
 	{
 		let mut l = lapi.lock().unwrap();
@@ -404,6 +435,11 @@ async fn l4_rules_with_crowdsec_refuse_banned_clients() {
 	let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	client.connect(("127.0.0.1", udp)).await.unwrap();
 	assert!(!udp_passes(&client).await, "datagrams of banned clients are dropped");
+	// logged at info like TCP's (CrowdSec's own scenarios and SIEMs read them)
+	for key in [format!("tcp/127.0.0.1:{guarded}"), format!("udp/127.0.0.1:{udp}")] {
+		let v = logs::wait_for(&key, |v| v["event"] == "conn.denied" && v["rule"] == key.as_str()).await;
+		assert_eq!((v["level"].as_str(), v["reason"].as_str()), (Some("INFO"), Some("crowdsec")), "{v}");
+	}
 	let (_, view) = h.get(&format!("/rules/tcp/127.0.0.1/{guarded}")).await;
 	assert!(view["stats"]["denied"].as_u64().unwrap() >= 1, "{view}");
 
