@@ -84,7 +84,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
-| `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | `POST /config/reload`（設定ファイルをその場で読み直して結果を返す）を Unix ソケットからだけ受け付ける。`false` で TCP の制御 API でも受け付ける（どちらも `admin` のトークンが要る） |
+| `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | `POST /config/reload`（設定ファイルをその場で読み直して結果を返す）と ACME の強い操作（`POST /acme/...`。docs/ACME.md）を Unix ソケットからだけ受け付ける。`false` で TCP の制御 API でも受け付ける（`admin` / `acme:write` のトークンが要る） |
 | — | `--check-config [PATH]` | — | 設定ファイル（PATH、なければ `RPROXY_CONFIG`）を確かめて終わる。問題がなければ 0、誤りがあれば 1。`--check-config-format json` で JSON（下の「設定を確かめる」） |
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
@@ -204,7 +204,7 @@ curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" 
 | `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
 | `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
 
-証明書はファイルで指定します。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
+証明書はファイルで指定するか、ACME（Let's Encrypt など。HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・汎用の REST））で rproxy に取らせます（`{acme: <resolver>, domains: [...]}`、[docs/ACME.md](docs/ACME.md)）。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。ACME で取った証明書も期限の前に自分で更新し、同じ仕組みで差し替えます。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
 ## CrowdSec
 
@@ -287,6 +287,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
+| `acme.order` / `acme.issue` / `acme.renew` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
+| `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
 

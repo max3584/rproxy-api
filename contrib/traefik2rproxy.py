@@ -926,7 +926,7 @@ class Converter:
             if not names and not rule.certificates:
                 NOTES.add(where, f"certResolver {resolver}: no domain to name the certificate by; add it by hand")
         for main, names in self.lineage_names.items():
-            NOTES.add("certificates", f"rproxy does not run ACME: get {', '.join(names)} with certbot (or cert-manager) "
+            NOTES.add("certificates", f"get {', '.join(names)} with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) "
                       f"into {self.certbot_live}/{main}/; rproxy re-reads renewed files by itself")
 
     def apply_tls_options(self, rule, name, where):
@@ -1252,7 +1252,7 @@ class Converter:
         self.tcp_routers()
         self.assign_certificates()
         for name in g(self.static, "certificatesResolvers") or {}:
-            NOTES.add("certificatesResolvers", f"{name}: rproxy does not run ACME; use certbot / cert-manager and point cert_file / key_file at the files")
+            NOTES.add("certificatesResolvers", f"{name}: not converted; use certbot / cert-manager and point cert_file / key_file at the files, or set up rproxy's own ACME by hand (global.acme, docs/en/ACME.md)")
         if g(self.static, "api") is not None:
             NOTES.add("api", "Traefik's dashboard has no equivalent; use the rproxy UI (TCP-UDP-rproxy-ui)")
         if g(self.static, "metrics") is not None:

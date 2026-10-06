@@ -32,15 +32,14 @@ version: 1
 global:
   trusted_proxies: [10.0.0.0/8]          # #67。この範囲からの X-Forwarded-For / PROXY ヘッダを信用する
   access_log: /var/log/rproxy/access.log # #57。L7 のリクエストのログ（JSON Lines）
-  acme:                                  # #17
-    resolvers:
-      letsencrypt:
-        email: admin@example.com
-        directory: https://acme-v02.api.letsencrypt.org/directory
-        challenge: tls-alpn-01           # http-01 / tls-alpn-01 / dns-01
-        # dns-01 のとき: provider と、秘密の値を置いたファイル
-        # dns: {provider: cloudflare, credentials_file: /etc/rproxy/acme/cloudflare.env}
+  acme:                                  # #17・#208（v0.4.0 で形を決め直した。docs/ACME.md）
     storage: /var/lib/rproxy/acme
+    accounts:
+      le: {contact: ['mailto:admin@example.com'], allowed_names: ['**.example.com']}
+    dns_providers:                       # dns-01 のとき。秘密はファイルで指す
+      pdns: {type: powerdns, api_url: 'http://127.0.0.1:8081', api_key_file: /etc/rproxy/acme/pdns.key, allowed_names: ['*.example.com']}
+    resolvers:
+      letsencrypt: {account: le, challenge: tls-alpn-01}   # http-01 / tls-alpn-01 / dns-01（dns_provider）
   crowdsec:                              # #55
     lapi_url: http://127.0.0.1:8080
     api_key_file: /etc/rproxy/crowdsec.key
@@ -127,7 +126,7 @@ http:
 
 ## 4. TLS の追加（#17、#66）
 
-> ACME（#17）は v0.3.2 の時点で**内蔵しない**ことにした。証明書の取得・更新は certbot / cert-manager などに任せ、rproxy はファイルの変更を検知して読み直す（`RPROXY_CERT_CHECK_SECS`）。下の `acme` の形は v0.3.0 で決めたので残すが、`features.acme` は false のままで、指定すると `unsupported` になる。
+> ACME（#17）は v0.3.2 の時点でいったん内蔵しないことにしたが、v0.4.0 で内蔵する方針に変えた（#208。docs/ACME.md）。ルールの側の形（`acme` と `domains`）は v0.3.0 で決めたまま。`global.acme` は、v0.3.0 の resolver ごとの `email`・`directory`・`dns` を、`accounts`（CA・連絡先・アカウントの鍵・許可する名前）と `dns_providers`（名前つきのプロバイダ、秘密はファイル、許可する名前）に分け、`resolvers` はそれらを名前で組み合わせる形にした（API のルールは resolver を名前で指すだけで、秘密や許可の範囲は固定の設定にだけ置くため）。v0.3 の `global.acme` は一度も動いていない（`unsupported`）ので、互換は持たない。証明書のファイルを certbot / cert-manager などで取るやり方も、そのまま使える。
 
 ```yaml
 tls:
@@ -149,7 +148,7 @@ tls:
 - `GET /capabilities` に、この版で使える機能を返す。
 
 ```json
-{"features": {"http": true, "http3": true, "acme": false, "tls_options": true,
+{"features": {"http": true, "http3": true, "acme": true, "tls_options": true,
               "middlewares": ["redirect_scheme", "redirect_regex", "ip_allow", "headers"],
               "services": ["health_check"]}}
 ```

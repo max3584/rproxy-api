@@ -92,7 +92,7 @@ Depending on the rproxy version, some middleware and service settings cannot run
 
 | Traefik | rproxy |
 |---|---|
-| `certResolver` (ACME) | **rproxy has no built-in ACME.** Obtain certificates with certbot / acme.sh / cert-manager and specify the files. The converter writes certbot's locations (`--certbot-live`, default `/etc/letsencrypt/live/<name>/fullchain.pem` and `privkey.pem`) and lists the names to obtain. The `main` / `sans` of `tls.domains` become one certificate, and other routers whose names are covered by it use the same certificate |
+| `certResolver` (ACME) | rproxy can obtain certificates through ACME too (from v0.4.0: `global.acme` and `{acme: <resolver>, domains: [...]}`, docs/en/ACME.md; the allowed names and the rest are written by hand). For now the converter points at files obtained with certbot / acme.sh / cert-manager. The converter writes certbot's locations (`--certbot-live`, default `/etc/letsencrypt/live/<name>/fullchain.pem` and `privkey.pem`) and lists the names to obtain. The `main` / `sans` of `tls.domains` become one certificate, and other routers whose names are covered by it use the same certificate |
 | `tls.certificates` | `tls.certificates` of every TLS-terminating rule (rproxy selects by SNI) |
 | `tls.options.<name>.minVersion` / `cipherSuites` | `tls.options.min_version` / `cipher_suites` (Go names to rustls names; ciphers not in rustls, such as CBC, are dropped) |
 | `tls.options.<name>.clientAuth` | `tls.client_auth` (only the first of `caFiles`) |

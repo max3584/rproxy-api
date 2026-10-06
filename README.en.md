@@ -84,7 +84,7 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | Filter such as `debug` |
 | `RPROXY_CONFIG` | `--config` | none | Configuration file (YAML / JSON with `version`, `global`, `rules`) or a directory of them. The rules start as static rules, and when the file changes the difference is applied without a restart ("Configuration file" in docs/API.md). If the content is invalid at startup, rproxy does not start |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | Interval (seconds) for checking whether the configuration file has changed. `0` reloads only on SIGHUP |
-| `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | Accept `POST /config/reload` (reload the configuration file on the spot and return the result) only from the Unix socket. `false` also accepts it on the TCP control API (both require an `admin` token) |
+| `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | Accept `POST /config/reload` (reload the configuration file on the spot and return the result) and the strong ACME operations (`POST /acme/...`; docs/en/ACME.md) only from the Unix socket. `false` also accepts them on the TCP control API (an `admin` / `acme:write` token is required) |
 | — | `--check-config [PATH]` | — | Check the configuration file (PATH, or `RPROXY_CONFIG` if omitted) and exit. Exits 0 if there are no problems, 1 if there are errors. `--check-config-format json` for JSON (see "Checking the configuration" below) |
 | `RPROXY_STATIC_RULES` | `--static-rules` | none | The 0.2 name of `RPROXY_CONFIG` (a JSON array of rules can also be read). Both cannot be specified |
 | `RPROXY_DATABASE_URL` | `--database-url` | none | MariaDB/MySQL from which rules are restored at startup (`mysql://user:pass@host:port/db`) |
@@ -204,7 +204,7 @@ For each rule you can choose how the content is handled (details in [docs/en/API
 | `starttls: smtp / imap / pop3` | rproxy answers the plaintext exchange before STARTTLS and terminates TLS |
 | `listen_port_end` | Forwards a whole port range (RTP, TURN relays, WebRTC media, FTP passive mode) |
 
-Certificates are specified as files. When a file changes it is reloaded automatically (`RPROXY_CERT_CHECK_SECS`), so certificates renewed by certbot or cert-manager are used as-is (you can also reload immediately with SIGHUP). Combined with `source_ip: proxy_v2`, the SNI, ALPN, and client certificate CN are passed to the target in PROXY v2 TLVs.
+Certificates are specified as files, or obtained by rproxy itself through ACME (Let's Encrypt and others; HTTP-01, TLS-ALPN-01 and DNS-01 (PowerDNS, generic REST)): `{acme: <resolver>, domains: [...]}`, see [docs/en/ACME.md](docs/en/ACME.md). When a file changes it is reloaded automatically (`RPROXY_CERT_CHECK_SECS`), so certificates renewed by certbot or cert-manager are used as-is (you can also reload immediately with SIGHUP). Certificates obtained through ACME are renewed before they expire and swapped in the same way. Combined with `source_ip: proxy_v2`, the SNI, ALPN, and client certificate CN are passed to the target in PROXY v2 TLVs.
 
 ## CrowdSec
 
@@ -287,6 +287,8 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `target.down` / `target.up` | In a rule with multiple targets (`targets`) or `health_check`, a target went down / up (`reason: health_check` / `connect`) |
 | `dns.change` / `dns.stale` | The name resolution result of a target changed / resolution failed (the previous result continues to be used) |
 | `restore.*` | Restoration from the DB at startup (`restore.paused` is the number of rules not created because they are paused in the UI) |
+| `acme.order` / `acme.issue` / `acme.renew` / `acme.error` / `acme.rate_limited` | An ACME order started / a certificate was obtained / renewed / an order failed (`retry_at`) / the issuance limit held an order back (docs/en/ACME.md) |
+| `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | An ACME account was created or deactivated / a DNS-01 TXT record was written or removed / a challenge was set up or answered / `http01_listen` started listening. No secret is logged |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |
 | `cert.check` | Periodic expiry check (`rules_updated`: number of rules from which expired certificates were removed or that were stopped) |
 

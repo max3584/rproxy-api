@@ -126,13 +126,14 @@
           },
           "acme": {
             "type": "string",
-            "description": "Not built in (always unsupported); use files from certbot / cert-manager."
+            "description": "A resolver of global.acme.resolvers (settings file): the certificate is obtained and renewed by ACME instead of cert_file / key_file. Needs the acme:write scope; every name must be in the allowed_names of the resolver's account (and DNS provider), else 400 invalid."
           },
           "domains": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Names of the ACME certificate (with acme); *.example.com needs a dns-01 resolver."
           }
         },
         "additionalProperties": false
@@ -1433,6 +1434,13 @@
             "items": {
               "$ref": "#/components/schemas/CertStatus"
             }
+          },
+          "acme": {
+            "type": "array",
+            "description": "State of the rule's ACME certificates (left out when there are none).",
+            "items": {
+              "$ref": "#/components/schemas/AcmeCertStatus"
+            }
           }
         },
         "description": "Fields may be added in patch releases."
@@ -1821,6 +1829,166 @@
           "code",
           "error"
         ]
+      },
+      "AcmeCertStatus": {
+        "type": "object",
+        "description": "State of an ACME certificate.",
+        "properties": {
+          "resolver": {
+            "type": "string"
+          },
+          "domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "valid",
+              "renewing",
+              "error"
+            ],
+            "description": "pending: not issued yet (a self-signed stand-in is served); renewing: due for renewal; error: the last attempt failed (a certificate issued earlier stays in use)"
+          },
+          "not_after": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "renew_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "next_attempt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "After a failure, or while the rate limit holds the order back"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "resolver",
+          "domains",
+          "state"
+        ]
+      },
+      "Acme": {
+        "type": "object",
+        "description": "global.acme: names and states only. Secrets (DNS API keys, EAB keys) and their files are never shown.",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "directory": {
+                  "type": "string"
+                },
+                "contact": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "eab": {
+                  "type": "boolean"
+                },
+                "allowed_names": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "registered": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "dns_providers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "powerdns",
+                    "http"
+                  ]
+                },
+                "zones": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "allowed_names": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "resolvers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "account": {
+                  "type": "string"
+                },
+                "challenge": {
+                  "type": "string",
+                  "enum": [
+                    "http-01",
+                    "tls-alpn-01",
+                    "dns-01"
+                  ]
+                },
+                "dns_provider": {
+                  "type": "string",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "certificates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AcmeCertStatus"
+            }
+          },
+          "rate_limit": {
+            "type": "object",
+            "properties": {
+              "orders": {
+                "type": "integer"
+              },
+              "period_secs": {
+                "type": "integer"
+              },
+              "used": {
+                "type": "integer"
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -2089,7 +2257,7 @@
         }
       },
       "post": {
-        "summary": "Create a rule (rules:write)",
+        "summary": "Create a rule (rules:write; with an acme certificate also acme:write)",
         "requestBody": {
           "required": true,
           "content": {
@@ -2240,7 +2408,7 @@
         }
       },
       "patch": {
-        "summary": "Change a rule; new connections use it at once (rules:write)",
+        "summary": "Change a rule; new connections use it at once (rules:write; with an acme certificate also acme:write)",
         "requestBody": {
           "required": true,
           "content": {
@@ -2400,6 +2568,241 @@
           },
           "403": {
             "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/acme": {
+      "get": {
+        "summary": "ACME accounts, DNS providers, resolvers and certificates (rules:read); names and states only, never a secret",
+        "responses": {
+          "200": {
+            "description": "global.acme",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Acme"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/acme/renew": {
+      "post": {
+        "summary": "Renew an ACME certificate now, within the rate limit (acme:write; by default only over the Unix socket)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "resolver": {
+                    "type": "string"
+                  },
+                  "domains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": [
+                  "resolver",
+                  "domains"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The renewal is started in the background (see GET /acme)"
+          },
+          "400": {
+            "description": "Unknown resolver, or names outside the allowlists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the acme:write scope, or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rule uses this certificate, or global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/acme/accounts/{name}/register": {
+      "post": {
+        "summary": "Create the account at the CA, or find the existing one for its key (acme:write; by default only over the Unix socket)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "An account of global.acme.accounts"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Done"
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the acme:write scope, or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account, or global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The CA refused or could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/acme/accounts/{name}/deactivate": {
+      "post": {
+        "summary": "Deactivate the account at the CA and set its key aside; the next order creates a new account (acme:write; by default only over the Unix socket)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "An account of global.acme.accounts"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Done"
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the acme:write scope, or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account, or global.acme is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The CA refused or could not be reached",
             "content": {
               "application/json": {
                 "schema": {

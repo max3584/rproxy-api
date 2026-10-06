@@ -21,7 +21,6 @@ pub fn from_file_text<T: DeserializeOwned>(path: &std::path::Path, text: &str) -
 	}
 }
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -60,29 +59,7 @@ pub struct GlobalSpec {
 	pub crowdsec: Option<CrowdsecGlobal>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AcmeGlobal {
-	pub resolvers: BTreeMap<String, AcmeResolver>,
-	pub storage: Option<String>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AcmeResolver {
-	pub email: String,
-	pub directory: Option<String>,
-	/// http-01, tls-alpn-01 or dns-01
-	pub challenge: String,
-	pub dns: Option<AcmeDns>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AcmeDns {
-	pub provider: String,
-	pub credentials_file: String,
-}
+pub use crate::acme::config::AcmeGlobal;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -258,14 +235,7 @@ impl ConfigDoc {
 			c.parse::<Cidr>().map_err(|e| format!("global.trusted_proxies: {}", e.message))?;
 		}
 		if let Some(acme) = &self.global.acme {
-			for (name, r) in &acme.resolvers {
-				if !["http-01", "tls-alpn-01", "dns-01"].contains(&r.challenge.as_str()) {
-					return Err(format!("global.acme.resolvers.{name}: challenge must be http-01, tls-alpn-01 or dns-01"));
-				}
-				if (r.challenge == "dns-01") != r.dns.is_some() {
-					return Err(format!("global.acme.resolvers.{name}: dns is needed with dns-01 and only then"));
-				}
-			}
+			acme.check()?;
 		}
 		if let Some(cs) = &self.global.crowdsec {
 			if let Some(i) = &cs.update_interval {
@@ -286,14 +256,13 @@ impl ConfigDoc {
 				}
 			}
 		}
-		// acme certificates must name a resolver defined here
-		let resolvers: Vec<&String> = self.global.acme.iter().flat_map(|a| a.resolvers.keys()).collect();
+		// acme certificates must name a resolver defined here, for names its allowlists permit
 		for (i, r) in self.rules.iter().enumerate() {
 			for c in r.tls.iter().flat_map(|t| &t.certificates) {
-				if let Some(name) = &c.acme {
-					if !resolvers.contains(&name) {
-						return Err(format!("{}: acme resolver {name:?} is not defined in global.acme.resolvers", self.label(i)));
-					}
+				let Some(resolver) = &c.acme else { continue };
+				match &self.global.acme {
+					None => return Err(format!("{}: acme resolver {resolver:?} is not defined in global.acme.resolvers", self.label(i))),
+					Some(acme) => acme.check_names(resolver, &c.domains).map_err(|e| format!("{}: {e}", self.label(i)))?,
 				}
 			}
 		}
@@ -302,12 +271,7 @@ impl ConfigDoc {
 
 	/// Global settings present in the file that this build cannot run yet.
 	pub fn unsupported_globals(&self) -> Vec<&'static str> {
-		let g = &self.global;
-		let mut out = vec![];
-		if g.acme.is_some() {
-			out.push("acme");
-		}
-		out
+		vec![]
 	}
 }
 
@@ -324,8 +288,10 @@ version: 1
 global:
   trusted_proxies: [10.0.0.0/8]
   acme:
+    accounts:
+      le: {contact: ['mailto:admin@example.com'], allowed_names: [dashboard.example.com]}
     resolvers:
-      letsencrypt: {email: admin@example.com, challenge: tls-alpn-01}
+      letsencrypt: {account: le, challenge: tls-alpn-01}
 rules:
   - protocol: tcp
     listen_addr: 0.0.0.0
@@ -341,7 +307,7 @@ rules:
 "#;
 		let doc = ConfigDoc::parse(Path::new("rproxy.yaml"), yaml).unwrap();
 		assert_eq!(doc.rules.len(), 1);
-		assert_eq!(doc.unsupported_globals(), ["acme"]);
+		assert!(doc.unsupported_globals().is_empty());
 		assert!(doc.rules[0].http.is_some());
 	}
 
@@ -358,11 +324,20 @@ rules:
 		let section = &design[design.find("## 7.").unwrap()..];
 		let yaml = section.split("```yaml").nth(1).unwrap().split("```").next().unwrap();
 		// the example refers to a resolver defined elsewhere in the document
-		let yaml = yaml.replacen("version: 1", "version: 1\nglobal: {acme: {resolvers: {letsencrypt: {email: a@example.com, challenge: tls-alpn-01}}}, crowdsec: {lapi_url: 'http://127.0.0.1:8080', api_key_file: /etc/rproxy/crowdsec.key, appsec_url: 'http://127.0.0.1:7422'}}", 1);
+		let yaml = yaml.replacen("version: 1", "version: 1\nglobal: {acme: {accounts: {le: {allowed_names: ['**.example.com']}}, resolvers: {letsencrypt: {account: le, challenge: tls-alpn-01}}}, crowdsec: {lapi_url: 'http://127.0.0.1:8080', api_key_file: /etc/rproxy/crowdsec.key, appsec_url: 'http://127.0.0.1:7422'}}", 1);
 		let doc = ConfigDoc::parse(Path::new("design.yaml"), &yaml).unwrap();
 		assert_eq!(doc.rules.len(), 2);
 		for r in doc.rules {
 			r.validate(&caps).unwrap_or_else(|e| panic!("{}", e.message));
+		}
+		// docs/ACME.md and docs/en/ACME.md: the settings example
+		for doc in [include_str!("../../docs/ACME.md"), include_str!("../../docs/en/ACME.md")] {
+			let yaml = doc.split("```yaml").nth(1).unwrap().split("```").next().unwrap();
+			let parsed = ConfigDoc::parse(Path::new("acme.yaml"), yaml).unwrap_or_else(|e| panic!("{e}"));
+			assert_eq!(parsed.global.acme.as_ref().unwrap().resolvers.len(), 3);
+			for r in parsed.rules {
+				r.validate(&caps).unwrap_or_else(|e| panic!("{}", e.message));
+			}
 		}
 	}
 
@@ -422,7 +397,12 @@ rules:
 		for (text, want) in [
 			("version: 2", "version 2"),
 			("version: 1\nglobal: {trusted_proxies: [nope]}", "trusted_proxies"),
-			("version: 1\nglobal: {acme: {resolvers: {le: {email: a, challenge: dns-01}}}}", "dns is needed"),
+			("version: 1\nglobal: {acme: {accounts: {a: {allowed_names: [a.example]}}, resolvers: {le: {account: a, challenge: dns-01}}}}", "dns-01 needs dns_provider"),
+			("version: 1\nglobal: {acme: {resolvers: {le: {email: a, challenge: dns-01}}}}", "unknown field"),
+			(
+				"version: 1\nglobal: {acme: {accounts: {a: {allowed_names: [a.example]}}, resolvers: {le: {account: a, challenge: http-01}}}}\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 443, remote_addr: a, remote_port: 1, tls: {mode: terminate, certificates: [{acme: le, domains: [evil.example.org]}]}}]",
+				"not in allowed_names",
+			),
 			("version: 1\nglobl: {}", "unknown field"),
 			(
 				"version: 1\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 443, remote_addr: a, remote_port: 1, tls: {mode: terminate, certificates: [{acme: le, domains: [a]}]}}]",

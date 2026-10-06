@@ -50,6 +50,8 @@ assets = [
     ["contrib/traefik2rproxy.py", "usr/bin/rproxy-traefik-convert", "755"],
     ["docs/CROWDSEC.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/en/CROWDSEC.md", "usr/share/doc/rproxy-api/en/", "644"],
+    ["docs/ACME.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/en/ACME.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["docs/BACKUP.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/en/BACKUP.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["docs/PERFORMANCE.md", "usr/share/doc/rproxy-api/", "644"],
@@ -115,13 +117,16 @@ time = { version = "0.3.55", features = ["formatting"] }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+# ACME (global.acme, src/acme/): the client, with our own HTTP client (src/acme/http.rs) and ring
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 rcgen = { version = "0.14.10", features = ["x509-parser"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 
 # criterion benchmarks (docs/TESTING.md); CI compares a PR with its merge base (.github/workflows/bench.yml)

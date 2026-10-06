@@ -52,7 +52,7 @@ struct Options {
 	/// Group of the socket file (name or id), e.g. the UI's user group
 	#[arg(long, env = "RPROXY_API_SOCKET_GROUP")]
 	api_socket_group: Option<String>,
-	/// Accept POST /config/reload only over the Unix socket (true / false)
+	/// Accept POST /config/reload and the strong ACME operations (POST /acme/...) only over the Unix socket (true / false)
 	#[arg(long, env = "RPROXY_API_RELOAD_UNIX_ONLY", default_value_t = true, action = clap::ArgAction::Set)]
 	api_reload_unix_only: bool,
 	/// File of bearer tokens (one per line, or YAML with scopes); re-read on SIGHUP
@@ -369,6 +369,17 @@ async fn run(opts: Options) -> Result<(), String> {
 		b.spawn();
 	}
 	let http_global = http_global.with_crowdsec(crowdsec.clone());
+	// global.acme: certificates of `tls.certificates[].acme`, obtained and renewed in the background
+	let acme = match doc.as_ref().and_then(|(path, d)| d.global.acme.as_ref().map(|a| (path, a))) {
+		Some((path, a)) => Some(rproxy_api::acme::Acme::new(a).map_err(|e| format!("{}: {e}", path.display()))?),
+		None => None,
+	};
+	if let Some(e) = acme.as_ref().and_then(|a| a.storage_problem()) {
+		warn!(event = "degraded", part = "global.acme.storage", error = %e,
+			"certificates cannot be stored; rules with acme certificates serve a self-signed one until this is fixed");
+	}
+	let mut reserved: Vec<SocketAddr> = addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect();
+	reserved.extend(acme.iter().flat_map(|a| a.http01_listen().to_vec()));
 
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
@@ -378,10 +389,13 @@ async fn run(opts: Options) -> Result<(), String> {
 		transparent,
 		transparent_ipv6,
 		max_range_ports: opts.max_range_ports.max(1),
-		reserved: addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect(),
+		reserved,
 		http: Arc::new(http_global),
 	});
 	registry.certs().set_warn_days(opts.cert_warn_days);
+	if let Some(a) = &acme {
+		registry.set_acme(a.clone());
+	}
 	if let Some(cert) = &opts.tls_cert {
 		note_api_cert(&registry, cert);
 	}
@@ -401,6 +415,12 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 	if let (Some(path), Some(error)) = (&config_path, config_unread) {
 		registry.set_config_status(ConfigStatus { path: path.display().to_string(), error: Some(error), ..Default::default() });
+	}
+	if let Some(a) = &acme {
+		for (addr, e) in a.spawn().await {
+			warn!(event = "degraded", part = "global.acme.http01_listen", addr = %addr, error = %e,
+				"HTTP-01 is answered only by http rules on this address");
+		}
 	}
 
 	if let Some(url) = &opts.database_url {
@@ -503,6 +523,9 @@ async fn run(opts: Options) -> Result<(), String> {
 	}
 	if let Some(b) = &crowdsec {
 		b.stop();
+	}
+	if let Some(a) = &acme {
+		a.shutdown();
 	}
 	registry.shutdown().await;
 	Ok(())

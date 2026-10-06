@@ -129,6 +129,25 @@ pub async fn check(input: &CheckInput) -> Report {
 		None => None,
 	};
 	let http = HttpGlobal::without_file(&doc.global.trusted_proxies).with_crowdsec(bouncer);
+	// global.acme: built as at startup (nothing is started, nothing is written)
+	let acme = match &doc.global.acme {
+		Some(a) => match crate::acme::Acme::new(a) {
+			Ok(acme) => {
+				secrets.extend(acme.secret_files());
+				if acme.storage().exists() {
+					warn_unreadable(&mut report, acme.storage(), "global.acme.storage", true);
+				}
+				Some(acme)
+			}
+			Err(e) => {
+				report.error("", e);
+				None
+			}
+		},
+		None => None,
+	};
+	let mut reserved = input.reserved.clone();
+	reserved.extend(acme.iter().flat_map(|a| a.http01_listen().to_vec()));
 
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_secs(30),
@@ -136,10 +155,13 @@ pub async fn check(input: &CheckInput) -> Report {
 		transparent: crate::net::source::transparent_available(),
 		transparent_ipv6: crate::net::source::transparent_v6_available(),
 		max_range_ports: input.max_range_ports.max(1),
-		reserved: input.reserved.clone(),
+		reserved,
 		http: Arc::new(http),
 	});
 	registry.certs().set_warn_days(input.warn_days);
+	if let Some(a) = acme {
+		registry.set_acme(a);
+	}
 	let checked = registry.check_rules(doc.labeled_rules());
 	for (rule, message) in checked.errors {
 		report.error(rule, message);

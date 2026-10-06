@@ -92,7 +92,7 @@ rproxy のバージョンによって、まだ動かせないミドルウェア�
 
 | Traefik | rproxy |
 |---|---|
-| `certResolver`（ACME） | **rproxy は ACME を内蔵しない**。certbot / acme.sh / cert-manager で証明書を取り、そのファイルを指定する。変換ツールは certbot の置き場所（`--certbot-live`、既定 `/etc/letsencrypt/live/<名前>/fullchain.pem`・`privkey.pem`）を書き、取るべき名前を一覧に出す。`tls.domains` の `main` / `sans` が 1 つの証明書になり、ほかのルーターの名前がそれに含まれていれば同じ証明書を使う |
+| `certResolver`（ACME） | rproxy も ACME で証明書を取れる（v0.4.0 から。`global.acme` と `{acme: <resolver>, domains: [...]}`、docs/ACME.md。許可する名前などは手で書く）。変換ツールは今のところ certbot / acme.sh / cert-manager で取ったファイルを指定する形にする。変換ツールは certbot の置き場所（`--certbot-live`、既定 `/etc/letsencrypt/live/<名前>/fullchain.pem`・`privkey.pem`）を書き、取るべき名前を一覧に出す。`tls.domains` の `main` / `sans` が 1 つの証明書になり、ほかのルーターの名前がそれに含まれていれば同じ証明書を使う |
 | `tls.certificates` | すべての TLS 終端のルールの `tls.certificates`（rproxy は SNI で選ぶ） |
 | `tls.options.<名前>.minVersion` / `cipherSuites` | `tls.options.min_version` / `cipher_suites`（Go の名前を rustls の名前に。CBC など rustls にない暗号は外す） |
 | `tls.options.<名前>.clientAuth` | `tls.client_auth`（`caFiles` は先頭の 1 つ） |

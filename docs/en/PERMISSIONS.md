@@ -30,7 +30,7 @@ rproxy-api starts even if either permission is removed, and the other rules keep
 
 | Setting | Effect |
 |---|---|
-| `ProtectSystem=strict` | `/usr`, `/etc`, etc. are read-only. Only `/var/log/rproxy` (`LogsDirectory`) is writable |
+| `ProtectSystem=strict` | `/usr`, `/etc`, etc. are read-only. Only `/var/log/rproxy` (`LogsDirectory`) and `/var/lib/rproxy` (`StateDirectory`; ACME storage) are writable |
 | `ProtectHome=yes` | `/home` and `/root` are not visible. Certificates, keys and static rules files placed there cannot be read |
 | `PrivateTmp=yes` | `/tmp` is private to the service. Files in the host's `/tmp` are not visible |
 | `LimitNOFILE=65536` | Port range rules use one socket per port (the limit is raised to the maximum at startup) |
@@ -56,6 +56,8 @@ rproxy-api starts even if either permission is removed, and the other rules keep
 | Static rules (`RPROXY_STATIC_RULES`) | e.g. `root:rproxy` 640 | Same as above. install.sh checks that the rproxy user can read it |
 | `/run/rproxy/api.sock` (`RPROXY_API_SOCKET`) | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660 (default) | Unix socket for the control API. Only the owner and group can connect. The unit's `RuntimeDirectory=rproxy` creates `/run/rproxy` (create it yourself when not using systemd) |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | Policy routing configuration for transparent |
+| `/var/lib/rproxy/` (default `global.acme.storage` is `/var/lib/rproxy/acme`) | `rproxy:rproxy` 750 (below `acme/`: directories 700, files 600) | ACME account keys (`accounts/<name>.key`), certificates obtained and their keys (`certs/`), DNS-01 TXT records not removed yet (`dns-pending.json`). Created by the unit's `StateDirectory=rproxy`. A leaked account key lets someone order and revoke certificates with that account. Removed on purge (docs/en/ACME.md) |
+| Secrets of ACME DNS providers (`api_key_file` / `secret_file` of `global.acme.dns_providers`, EAB `hmac_key_file`; e.g. `/etc/rproxy/acme/`) | `root:rproxy` 640 (directory 750) | Must be readable by the rproxy user; do not let other users read them (they can change DNS records; delegating `_acme-challenge` to a zone of its own and using a key limited to that zone narrows the damage). Not readable through the API |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | Logs. They contain client IPs, SNI and client certificate CNs, so restrict who can view them |
 
 ## Control API

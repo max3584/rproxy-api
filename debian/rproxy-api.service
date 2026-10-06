@@ -34,6 +34,9 @@ PrivateTmp=yes
 ReadOnlyPaths=/etc/rproxy
 LogsDirectory=rproxy
 LogsDirectoryMode=0750
+# /var/lib/rproxy: global.acme.storage (ACME account keys and certificates, docs/ACME.md)
+StateDirectory=rproxy
+StateDirectoryMode=0750
 # /run/rproxy for RPROXY_API_SOCKET (the socket's own mode and group limit access)
 RuntimeDirectory=rproxy
 RuntimeDirectoryMode=0755

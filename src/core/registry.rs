@@ -235,6 +235,8 @@ pub struct Registry {
 	config_status: RwLock<Option<ConfigStatus>>,
 	/// Every certificate the rules use, loaded once and shared.
 	certs: CertStore,
+	/// `global.acme`: certificates of `tls.certificates[].acme` (set once at startup).
+	acme: std::sync::OnceLock<Arc<crate::acme::Acme>>,
 }
 
 /// What `Registry::apply_certs` does with one rule.
@@ -359,7 +361,48 @@ impl Registry {
 			next_generation: AtomicU64::new(1),
 			config_status: RwLock::default(),
 			certs: CertStore::default(),
+			acme: std::sync::OnceLock::new(),
 		})
+	}
+
+	/// Sets `global.acme` (before rules are loaded). A certificate written by
+	/// ACME is swapped in like a certificate file that changed.
+	pub fn set_acme(self: &Arc<Self>, acme: Arc<crate::acme::Acme>) {
+		let weak = Arc::downgrade(self);
+		acme.set_on_change(Box::new(move || {
+			if let Some(registry) = weak.upgrade() {
+				tokio::spawn(async move {
+					let (ok, failed) = registry.reload_changed_tls().await;
+					info!(event = "reload.tls", part = "acme", reloaded = ok, failed);
+				});
+			}
+		}));
+		let _ = self.acme.set(acme);
+	}
+
+	pub fn acme(&self) -> Option<&Arc<crate::acme::Acme>> {
+		self.acme.get()
+	}
+
+	/// The certificate files a rule's TLS settings use (ACME ones included).
+	fn sources(&self, tls: &tlsconf::TlsSpec) -> Vec<(tlsconf::CertRole, Source)> {
+		certstore::sources_with(tls, self.acme().map(|a| a.as_ref()))
+	}
+
+	/// Checks the ACME certificates of a rule: `global.acme` is set, the
+	/// resolver exists, the names are allowed, and the rule is TCP.
+	fn check_acme(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+		for c in &spec.tls.certificates {
+			let Some(resolver) = &c.acme else { continue };
+			let acme = self.acme().ok_or_else(|| {
+				ApiError::invalid(format!("acme resolver {resolver:?}: global.acme is not configured in the settings file (RPROXY_CONFIG)"))
+			})?;
+			if spec.key.protocol != Protocol::Tcp {
+				return Err(ApiError::tls_config("acme certificates are for tcp rules (DTLS takes cert_file / key_file)"));
+			}
+			acme.check(resolver, &c.domains)?;
+		}
+		Ok(())
 	}
 
 	/// The certificate store (#115).
@@ -372,7 +415,15 @@ impl Registry {
 		let mut view = entry.view();
 		let now = tlsconf::unix_now();
 		let warn = self.certs.warn_secs();
-		view.cert_status = certstore::sources(&entry.spec().tls)
+		let sources = self.sources(&entry.spec().tls);
+		view.acme = sources
+			.iter()
+			.filter_map(|(_, s)| match s {
+				Source::Acme { id, .. } => self.acme()?.status(id),
+				_ => None,
+			})
+			.collect();
+		view.cert_status = sources
 			.into_iter()
 			.filter_map(|(role, source)| {
 				let not_after = self.certs.not_after(&source)?;
@@ -385,14 +436,26 @@ impl Registry {
 	/// The rule's TLS settings, with its certificates from the store.
 	fn build_tls(&self, spec: &RuleSpec) -> Result<TlsRuntime, ApiError> {
 		let tls = spec.runtime_tls();
-		let loaded = self.certs.rule_certs(&tls)?;
+		self.check_acme(spec)?;
+		let loaded = self.certs.rule_certs_with(&tls, self.acme().map(|a| a.as_ref()))?;
 		TlsRuntime::build(spec.key.protocol, &tls, spec.starttls, spec.starttls_required, &loaded)
 	}
 
-	/// Forgets certificates no rule uses any more.
+	/// Forgets certificates no rule uses any more, and tells ACME which
+	/// certificates the rules use now.
 	async fn gc_certs(&self) {
 		let used: HashSet<Source> =
-			self.rules.lock().await.values().flat_map(|e| certstore::sources(&e.spec().tls)).map(|(_, s)| s).collect();
+			self.rules.lock().await.values().flat_map(|e| self.sources(&e.spec().tls)).map(|(_, s)| s).collect();
+		if let Some(acme) = self.acme() {
+			acme.set_wanted(
+				used.iter()
+					.filter_map(|s| match s {
+						Source::Acme { id, .. } => Some(id.clone()),
+						_ => None,
+					})
+					.collect(),
+			);
+		}
 		self.certs.retain(&used);
 	}
 
@@ -660,6 +723,10 @@ impl Registry {
 		let entry = Entry::Running(self.start(spec, prepared)?);
 		let view = self.view_of(&entry);
 		rules.insert(key, entry);
+		drop(rules);
+		// ACME learns about new certificates (their state is in the view)
+		self.gc_certs().await;
+		let view = self.get(&key).await.unwrap_or(view);
 		info!(event = "rule.create", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
 			ports = view.listen_port_end.map(|e| e - view.listen_port + 1).unwrap_or(1),
 			source_ip = view.source_ip, tls = ?view.tls.mode, starttls = view.starttls.map(|s| s.as_str()).unwrap_or(""),
@@ -895,7 +962,7 @@ impl Registry {
 	/// expired is taken out of service (failed, listeners closed); a rule
 	/// stopped for that starts again once a renewed certificate loads.
 	async fn apply_certs(self: &Arc<Self>, changes: &certstore::Changes, all: bool) -> (usize, usize) {
-		let uses = |spec: &RuleSpec, set: &HashSet<Source>| certstore::sources(&spec.tls).iter().any(|(_, s)| set.contains(s));
+		let uses = |spec: &RuleSpec, set: &HashSet<Source>| self.sources(&spec.tls).iter().any(|(_, s)| set.contains(s));
 		let (mut ok, mut failed) = (0, 0);
 		let mut stopped = vec![];
 		let mut restart = vec![];
@@ -1100,6 +1167,7 @@ impl Registry {
 		for (spec, missing) in specs {
 			self.start_static(spec, missing, "static").await;
 		}
+		self.gc_certs().await;
 		info!(event = "static.loaded", rules = count);
 		Ok(count)
 	}
@@ -1164,7 +1232,7 @@ impl Registry {
 		let warn = self.certs.warn_secs();
 		let mut seen = HashSet::new();
 		for (spec, label) in &specs {
-			for (role, source) in certstore::sources(&spec.tls) {
+			for (role, source) in self.sources(&spec.tls) {
 				if !seen.insert(source.clone()) {
 					continue;
 				}
@@ -1277,6 +1345,7 @@ impl Registry {
 				}
 			}
 		}
+		self.gc_certs().await;
 		Ok(counts)
 	}
 
@@ -1355,7 +1424,7 @@ impl Registry {
 		let now = tlsconf::unix_now();
 		let mut samples = vec![];
 		for (key, entry) in rules {
-			for (role, source) in certstore::sources(&entry.spec().tls) {
+			for (role, source) in self.sources(&entry.spec().tls) {
 				if let Some(not_after) = self.certs.not_after(&source) {
 					samples.push(format!(
 						"{{protocol=\"{}\",listen=\"{}\",role=\"{}\",file=\"{}\"}} {}",

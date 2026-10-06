@@ -241,3 +241,50 @@ fn deep_match_expressions_and_huge_durations_are_errors() {
 	}
 	assert_eq!(v["errors"].as_array().unwrap().len(), 3, "{errors}");
 }
+
+#[test]
+fn acme_settings_and_names_are_checked_without_writing_anything() {
+	let dir = workdir("acme");
+	fs::write(dir.join("pdns.key"), "k\n").unwrap();
+	let storage = dir.join("acme-storage");
+	let global = format!(
+		"global:\n  acme:\n    storage: {}\n    accounts:\n      le: {{allowed_names: ['*.example.com']}}\n    dns_providers:\n      pdns: {{type: powerdns, api_url: 'http://127.0.0.1:8081', api_key_file: {}/pdns.key, allowed_names: ['*.example.com']}}\n    resolvers:\n      web: {{account: le, challenge: tls-alpn-01}}\n      dns: {{account: le, challenge: dns-01, dns_provider: pdns}}\n",
+		storage.display(),
+		dir.display()
+	);
+	let acme_rule = |port: u16, resolver: &str, name: &str| {
+		format!("  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {port}, remote_addr: 127.0.0.1, remote_port: 9, tls: {{mode: terminate, certificates: [{{acme: {resolver}, domains: ['{name}']}}]}}}}\n")
+	};
+	let file = dir.join("rproxy.yaml");
+	fs::write(&file, format!("version: 1\n{global}rules:\n{}", acme_rule(free_port(), "web", "www.example.com"))).unwrap();
+	let (code, text) = check(&dir, &[file.to_str().unwrap()], &[]);
+	assert_eq!(code, 0, "{text}");
+	assert!(!storage.exists(), "the check writes nothing (no account, no certificate)");
+
+	// a name outside the allowlist, a wildcard without dns-01, an unknown resolver
+	for (rule, want) in [
+		(acme_rule(free_port(), "web", "www.example.org"), "not in allowed_names of account \\\"le\\\""),
+		(acme_rule(free_port(), "web", "*.example.com"), "needs a resolver with challenge dns-01"),
+		(acme_rule(free_port(), "nope", "www.example.com"), "not defined in global.acme.resolvers"),
+	] {
+		fs::write(&file, format!("version: 1\n{global}rules:\n{rule}")).unwrap();
+		let (code, v) = check_json(&dir, &file);
+		assert_eq!(code, 1, "{rule}: {v}");
+		assert!(messages(&v, "errors").contains(want), "{want}:\n{}", messages(&v, "errors"));
+	}
+	fs::write(&file, format!("version: 1\n{global}rules:\n{}", acme_rule(free_port(), "dns", "*.example.com"))).unwrap();
+	assert_eq!(check(&dir, &[file.to_str().unwrap()], &[]).0, 0, "a wildcard through dns-01");
+
+	// a secret file that does not exist, a mistake in global.acme
+	for (from, to, want) in [
+		("pdns.key", "missing.key", "missing.key does not exist"),
+		("challenge: tls-alpn-01", "challenge: http-02", "challenge must be"),
+		("allowed_names: ['*.example.com']}\n    dns", "allowed_names: []}\n    dns", "allowed_names is required"),
+	] {
+		fs::write(&file, format!("version: 1\n{}rules: []\n", global.replacen(from, to, 1))).unwrap();
+		let (code, v) = check_json(&dir, &file);
+		assert_eq!(code, 1, "{from}: {v}");
+		assert!(messages(&v, "errors").contains(want), "{want}:\n{}", messages(&v, "errors"));
+	}
+	let _ = fs::remove_dir_all(&dir);
+}

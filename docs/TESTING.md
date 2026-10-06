@@ -6,6 +6,7 @@ English: [TESTING.md](en/TESTING.md)
 |---|---|---|
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
+| `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME（docs/ACME.md）：Pebble（ACME の試験用の CA）と PowerDNS を起動して、HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・CNAME の委任・汎用の REST）で実際に証明書を取る。変数がなければその部分はスキップ（API の守りの試験はいつも動く）。`RPROXY_TEST_REQUIRE_ACME=1` でスキップを失敗にする | `test`（同じコンテナで Alpine の `pebble`・`pdns`・`pdns-backend-sqlite3`・`pdns-doc`・`sqlite`。`RPROXY_TEST_REQUIRE_ACME=1`） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
@@ -362,6 +363,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 | `matcher` | `l7::matcher`：`match` の式の解析と評価 | 式、続けて 1 行ずつホスト・パス・クエリ・メソッド・ヘッダ・クライアントの IP |
 | `starttls` | `l4::starttls`：STARTTLS 前のクライアントとのやり取り、メールサーバの挨拶と EHLO の応答、平文での引き継ぎ | 先頭のバイト（プロトコル・STARTTLS 必須・1 回に読む量）、続けて相手が送るもの |
 | `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |
+| `dns_response` | `acme::dnsq::parse_response`：DNS-01 で読む DNS の応答（CNAME・SOA・TXT、名前の圧縮とそのループ） | バイト列そのまま |
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
 
