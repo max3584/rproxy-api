@@ -50,6 +50,8 @@ API のトークンはインストール時に `/etc/rproxy/tokens` に生成さ
 
 バックアップと復旧（何を取るか、DB と設定ファイルの取り方、戻す順番と確かめ方、新しいホストへの移し方、DB なしで動かす方法）は [docs/BACKUP.md](docs/BACKUP.md)。
 
+性能の改善の記録（採用したもの・採用しなかったものとその理由、測り方の注意）は [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+
 ## 起動
 
 設定は環境変数で行う。起動ディレクトリに `.env` があれば読み込む（例は [.env.example](.env.example)）。

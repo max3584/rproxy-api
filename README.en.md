@@ -50,6 +50,8 @@ The package contents and how the repository is published are described in [docs/
 
 Backup and restore (what to back up, how to take the database and configuration, restore order and checks, moving to a new host, running without the database) is in [docs/en/BACKUP.md](docs/en/BACKUP.md).
 
+The performance work log (what was adopted, what was not and why, measurement caveats) is in [docs/en/PERFORMANCE.md](docs/en/PERFORMANCE.md).
+
 ## Running
 
 Configuration is done with environment variables. If there is a `.env` in the working directory, it is loaded (see [.env.example](.env.example) for an example).

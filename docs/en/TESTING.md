@@ -252,6 +252,8 @@ They all run as root inside a throwaway container (`alpine:3.24` for mail and me
 
 ## Load and soak tests (Load workflow, #183)
 
+Optimizations tried and their results (including the ones not adopted) are recorded in [PERFORMANCE.md](PERFORMANCE.md).
+
 Measures transfer efficiency when large transfers run many times and for a long time: throughput, latency, bytes per CPU core, memory, FDs, and UDP drops. These are the baseline numbers for comparing before and after kernel acceleration (#184) and memory reduction (#185); heavier and longer than the criterion benchmarks above. The numbers depend on the machine, so compare them with the previous run on the same kind of machine (runner).
 
 `scripts/load/run.sh` builds three network namespaces and runs `scripts/load/load.py` in the middle one.
