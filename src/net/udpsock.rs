@@ -42,12 +42,13 @@ pub struct Meta {
 }
 
 /// Buffers for [`Listener::recv_batch`], one per reading task (not per session).
-/// `slots` datagrams of up to 64 KiB each; the memory is left uninitialised so
-/// that only the pages datagrams are written to become resident (a zeroed
-/// buffer is written over by some allocators: 10 000 ports of 32 slots took GBs).
+/// `slots` datagrams of up to 64 KiB each. Only the pages datagrams are written
+/// to should become resident: on Linux the memory is mapped directly, without
+/// huge pages (a 2 MiB batch was otherwise resident from the start, even on an
+/// idle port; with a zeroed buffer 10 000 ports took GBs).
 pub struct Batch {
-	/// Capacity `slots * SLOT`; never read beyond what the kernel wrote.
-	buf: Vec<u8>,
+	/// Room for `slots * SLOT` bytes; never read beyond what the kernel wrote.
+	buf: Region,
 	slots: usize,
 	meta: Vec<Meta>,
 }
@@ -55,17 +56,83 @@ pub struct Batch {
 impl Batch {
 	pub fn new(slots: usize) -> Self {
 		let slots = slots.clamp(1, BATCH);
-		Batch { buf: Vec::with_capacity(slots * SLOT), slots, meta: Vec::with_capacity(slots) }
+		Batch { buf: Region::new(slots * SLOT), slots, meta: Vec::with_capacity(slots) }
 	}
 
 	/// The datagrams of the last receive, in order.
 	pub fn iter(&self) -> impl Iterator<Item = (&[u8], Meta)> {
-		let base = self.buf.as_ptr();
+		let base = self.buf.ptr();
 		self.meta.iter().enumerate().map(move |(i, m)| {
 			// SAFETY: within the capacity (slot i of `slots`), and the kernel wrote these `len` bytes
 			let data = unsafe { std::slice::from_raw_parts(base.add(i * SLOT), m.len.min(SLOT)) };
 			(data, *m)
 		})
+	}
+}
+
+/// Memory for a [`Batch`]: an anonymous mapping without huge pages (Linux), so
+/// pages become resident only when the kernel writes datagrams into them.
+#[cfg(target_os = "linux")]
+struct Region {
+	ptr: *mut u8,
+	len: usize,
+}
+
+// SAFETY: the mapping is owned by the Region alone; access goes through &self / &mut self
+#[cfg(target_os = "linux")]
+unsafe impl Send for Region {}
+// SAFETY: as above
+#[cfg(target_os = "linux")]
+unsafe impl Sync for Region {}
+
+#[cfg(target_os = "linux")]
+impl Region {
+	fn new(len: usize) -> Self {
+		// SAFETY: a fresh private anonymous mapping; checked for failure
+		let ptr = unsafe {
+			libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+		};
+		if ptr == libc::MAP_FAILED {
+			// out of address space: as an allocation failure would
+			std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(len, 4096).unwrap_or(std::alloc::Layout::new::<u8>()));
+		}
+		// SAFETY: the mapping just made; failing only leaves huge pages allowed
+		unsafe { libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE) };
+		Region { ptr: ptr.cast(), len }
+	}
+
+	fn ptr(&self) -> *const u8 {
+		self.ptr
+	}
+
+	fn ptr_mut(&mut self) -> *mut u8 {
+		self.ptr
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Region {
+	fn drop(&mut self) {
+		// SAFETY: the mapping made in `new`, unmapped once
+		unsafe { libc::munmap(self.ptr.cast(), self.len) };
+	}
+}
+
+#[cfg(not(target_os = "linux"))]
+struct Region(Vec<u8>);
+
+#[cfg(not(target_os = "linux"))]
+impl Region {
+	fn new(len: usize) -> Self {
+		Region(vec![0; len])
+	}
+
+	fn ptr(&self) -> *const u8 {
+		self.0.as_ptr()
+	}
+
+	fn first_slot(&mut self) -> &mut [u8] {
+		&mut self.0[..SLOT]
 	}
 }
 
@@ -115,7 +182,7 @@ impl Listener {
 			let slots = *slots;
 			self.socket
 				.async_io(tokio::io::Interest::READABLE, || {
-					let base = buf.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+					let base = buf.ptr_mut();
 					// SAFETY: `base` has room for `slots` slots of SLOT bytes (the capacity)
 					unsafe { sys::recv_batch(&self.socket, base, slots, SLOT, self.pktinfo, meta) }
 				})
@@ -123,9 +190,7 @@ impl Listener {
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
-			// one slot, initialised once
-			batch.buf.resize(SLOT, 0);
-			let (len, from, local) = self.recv(&mut batch.buf[..SLOT]).await?;
+			let (len, from, local) = self.recv(batch.buf.first_slot()).await?;
 			batch.meta.push(Meta { len, from, local });
 		}
 		Ok(batch.meta.len())
