@@ -92,13 +92,13 @@ rproxy のバージョンによって、まだ動かせないミドルウェア�
 
 | Traefik | rproxy |
 |---|---|
-| `certResolver`（ACME） | rproxy も ACME で証明書を取れる（v0.3.21 から。`global.acme` と `{acme: <resolver>, domains: [...]}`、docs/ACME.md。許可する名前などは手で書く）。変換ツールは今のところ certbot / acme.sh / cert-manager で取ったファイルを指定する形にする。変換ツールは certbot の置き場所（`--certbot-live`、既定 `/etc/letsencrypt/live/<名前>/fullchain.pem`・`privkey.pem`）を書き、取るべき名前を一覧に出す。`tls.domains` の `main` / `sans` が 1 つの証明書になり、ほかのルーターの名前がそれに含まれていれば同じ証明書を使う |
+| `certResolver`（ACME） | rproxy の ACME（v0.3.21 から。docs/ACME.md）に変換する：Traefik の resolver ごとに `global.acme` のアカウントと resolver を作り（`email` → `contact`、`caServer` → `directory`、`eab` → `eab`（鍵は `hmac_key_file` に書く。写さない））、ルールの証明書は `{acme: <resolver>, domains: [...]}`。`tlsChallenge` → `tls-alpn-01`、`httpChallenge` → `http-01`、`dnsChallenge` → `dns-01` と DNS のプロバイダの雛形（`pdns` → `powerdns`、`rfc2136` → `rfc2136`、`acme-dns` → `acme_dns`、ほか（route53 など）→ 汎用の REST の雛形。`resolvers` → `dns_servers`）。`allowed_names` はルーターから集めた名前。`CHANGE-ME` と秘密のファイルは埋める。`acme.json`（Traefik のアカウントと証明書）は読まない（新しいアカウントで取り直す）。`--certs certbot` で以前の形（certbot のファイル、`--certbot-live`、既定 `/etc/letsencrypt/live/<名前>/fullchain.pem`・`privkey.pem`）にもできる。`tls.domains` の `main` / `sans` が 1 つの証明書になり、ほかのルーターの名前がそれに含まれていれば同じ証明書を使う |
 | `tls.certificates` | すべての TLS 終端のルールの `tls.certificates`（rproxy は SNI で選ぶ） |
 | `tls.options.<名前>.minVersion` / `cipherSuites` | `tls.options.min_version` / `cipher_suites`（Go の名前を rustls の名前に。CBC など rustls にない暗号は外す） |
 | `tls.options.<名前>.clientAuth` | `tls.client_auth`（`caFiles` は先頭の 1 つ） |
 | `tls.options.<名前>.alpnProtocols` | `tls.alpn` |
 
-証明書のファイルは rproxy が変更を検知して読み直します（`RPROXY_CERT_CHECK_SECS`）。certbot の更新をそのまま反映できます。certbot の http-01 を使うときは、80 番のルールに `/.well-known/acme-challenge/` を certbot（webroot を配る Web サーバや `--standalone` のポート）へ振り分けるルートを、リダイレクトより高い優先度で足してください。
+rproxy の ACME の HTTP-01 は、80 番の `http` のルールがリダイレクトより先に自分で答えます（下のルートは要りません）。`--certs certbot` で証明書のファイルを使うときは、rproxy が変更を検知して読み直します（`RPROXY_CERT_CHECK_SECS`）。certbot の更新をそのまま反映できます。certbot の http-01 を使うときは、80 番のルールに `/.well-known/acme-challenge/` を certbot（webroot を配る Web サーバや `--standalone` のポート）へ振り分けるルートを、リダイレクトより高い優先度で足してください。
 
 ```yaml
 - protocol: tcp

@@ -54,11 +54,20 @@ fn gitlab_and_cdn_behind_crowdsec() {
 	assert_eq!(http.routes.len(), 1);
 	assert!(matches!(http.middlewares["redirect"], MiddlewareSpec::RedirectScheme { permanent: true, port: None, .. }));
 
-	// 443: the routers of both hosts on one rule, with one certificate from certbot
+	// 443: the routers of both hosts on one rule, with one certificate from rproxy's ACME
 	let r = rule(&doc, 443);
 	let tls = r.tls.as_ref().unwrap();
 	assert_eq!(tls.certificates.len(), 1, "cdn.example.com is a SAN of the gitlab certificate");
-	assert_eq!(tls.certificates[0].cert_file, "/etc/letsencrypt/live/gitlab.example.com/fullchain.pem");
+	assert_eq!(tls.certificates[0].acme.as_deref(), Some("letsencrypt"));
+	assert_eq!(tls.certificates[0].domains, ["gitlab.example.com", "cdn.example.com"]);
+	let acme = doc.global.acme.as_ref().unwrap();
+	assert_eq!(acme.accounts["letsencrypt"].contact, ["mailto:admin@example.com"]);
+	assert_eq!(acme.resolvers["letsencrypt"].challenge, "tls-alpn-01", "tlsChallenge");
+	// the old way: certbot's files
+	let (old, _) = convert(&["--static", "tests/fixtures/traefik/gitlab-cdn/traefik.yml", "--certs", "certbot"]);
+	let old_tls = rule(&old, 443).tls.as_ref().unwrap();
+	assert_eq!(old_tls.certificates[0].cert_file, "/etc/letsencrypt/live/gitlab.example.com/fullchain.pem");
+	assert!(old.global.acme.is_none());
 	let http = r.http.as_ref().unwrap();
 	let names: Vec<&str> = http.routes.iter().map(|r| r.name.as_str()).collect();
 	for want in ["gitlab-login", "gitlab-api", "gitlab-assets", "gitlab-internal", "gitlab", "cdn-allowed", "cdn-block", "metrics"] {
@@ -160,4 +169,42 @@ fn docker_labels_with_middlewares() {
 	let MiddlewareSpec::BasicAuth { keep_authorization, .. } = &http.middlewares["auth"] else { panic!() };
 	assert!(*keep_authorization, "Traefik passes Authorization on unless removeHeader");
 	assert!(!notes.contains("$apr1$"), "password hashes are not copied");
+}
+
+#[test]
+fn cert_resolvers_become_acme_resolvers() {
+	if !python_ready() {
+		return;
+	}
+	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/acme/traefik.yml"]);
+	let acme = doc.global.acme.as_ref().unwrap();
+	// every challenge: dnsChallenge (pdns, a provider rproxy lacks), httpChallenge
+	let challenges: Vec<(&str, &str, Option<&str>)> =
+		acme.resolvers.iter().map(|(n, r)| (n.as_str(), r.challenge.as_str(), r.dns_provider.as_deref())).collect();
+	assert_eq!(
+		challenges,
+		[("cloud", "dns-01", Some("cloud-dns")), ("web", "http-01", None), ("wildcard", "dns-01", Some("wildcard-dns"))]
+	);
+	assert_eq!(acme.dns_providers["wildcard-dns"].kind, "powerdns");
+	assert_eq!(acme.dns_providers["cloud-dns"].kind, "http", "route53: a REST template to fill in");
+	assert!(notes.contains("route53"), "{notes}");
+	let account = &acme.accounts["wildcard"];
+	assert_eq!(account.directory.as_deref(), Some("https://acme-staging-v02.api.letsencrypt.org/directory"));
+	assert_eq!(account.allowed_names, ["apps.example.org", "*.apps.example.org"]);
+	assert_eq!(account.eab.as_ref().unwrap().kid, "kid-123");
+	assert_eq!(acme.dns_servers, ["10.0.0.53:53"]);
+	// secrets are not copied; the wildcard comes with its apex in one certificate
+	let text = std::fs::read_to_string(root().join("tests/fixtures/traefik/acme/traefik.yml")).unwrap();
+	assert!(text.contains("not-a-real-hmac-SECRET"));
+	let out = Command::new("python3")
+		.arg(root().join("contrib/traefik2rproxy.py"))
+		.args(["--static", "tests/fixtures/traefik/acme/traefik.yml"])
+		.current_dir(root())
+		.output()
+		.unwrap();
+	assert!(!String::from_utf8_lossy(&out.stdout).contains("SECRET") && !notes.contains("SECRET"));
+	let certs = &rule(&doc, 443).tls.as_ref().unwrap().certificates;
+	let got: Vec<(Option<&str>, usize)> = certs.iter().map(|c| (c.acme.as_deref(), c.domains.len())).collect();
+	assert_eq!(got, [(Some("wildcard"), 2), (Some("web"), 2), (Some("cloud"), 1)]);
+	assert!(notes.contains("acme.json") && notes.contains("CHANGE-ME"), "{notes}");
 }

@@ -1,0 +1,33 @@
+# certResolvers with every challenge (tests/traefik_convert.rs)
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  wildcard:
+    acme:
+      email: ops@example.org
+      caServer: https://acme-staging-v02.api.letsencrypt.org/directory
+      storage: /letsencrypt/acme.json
+      eab:
+        kid: kid-123
+        hmacEncoded: not-a-real-hmac-SECRET
+      dnsChallenge:
+        provider: pdns
+        resolvers: ["10.0.0.53:53"]
+  web:
+    acme:
+      email: ops@example.org
+      httpChallenge:
+        entryPoint: web
+  cloud:
+    acme:
+      email: ops@example.org
+      dnsChallenge:
+        provider: route53
+
+providers:
+  file:
+    filename: dynamic.yml

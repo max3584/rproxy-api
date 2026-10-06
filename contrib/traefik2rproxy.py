@@ -684,12 +684,41 @@ def parse_address(address, where):
     return host, int(m.group(2)), m.group(3) or "tcp"
 
 
+def acme_name(resolver):
+    """A Traefik resolver name as an rproxy account / resolver name (letters, digits, - and _)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", resolver)[:64] or "acme"
+
+
+def dns_provider_skeleton(provider, name, names, where):
+    """A global.acme.dns_providers entry for a lego DNS provider, with placeholders."""
+    base = {"allowed_names": list(names)}
+    if provider == "pdns":
+        NOTES.add(where, f"dnsChallenge pdns: set api_url and write the API key into /etc/rproxy/acme/{name}-pdns.key")
+        return {"type": "powerdns", "api_url": "http://CHANGE-ME.invalid:8081", "api_key_file": f"/etc/rproxy/acme/{name}-pdns.key", **base}
+    if provider == "rfc2136":
+        NOTES.add(where, f"dnsChallenge rfc2136: set server and tsig_key_name, and write the TSIG secret into /etc/rproxy/acme/{name}-tsig.key")
+        return {"type": "rfc2136", "server": "127.0.0.1:53", "tsig_key_name": "CHANGE-ME", "tsig_secret_file": f"/etc/rproxy/acme/{name}-tsig.key", **base}
+    if provider in ("acme-dns", "acmedns"):
+        NOTES.add(where, "dnsChallenge acme-dns: set api_url; existing lego accounts (ACME_DNS_STORAGE_PATH) can be used as credentials_file")
+        return {"type": "acme_dns", "api_url": "https://CHANGE-ME.invalid", "credentials_file": "/var/lib/rproxy/acme/acme-dns.json", **base}
+    NOTES.add(where, f"dnsChallenge {provider or '?'}: rproxy has no such provider; a generic REST template (type http) "
+              "with placeholders is written: point it at the provider's API or a small relay (docs/en/ACME.md)")
+    call = {"url": "https://CHANGE-ME.invalid/{fqdn}", "headers": {"Authorization": "Bearer {secret}"}, "body": '{"value":"{value}"}'}
+    add = dict(call, method="POST", headers=dict(call["headers"]))
+    remove = dict(call, method="DELETE", headers=dict(call["headers"]))
+    return {"type": "http", "add": add, "remove": remove,
+            "secret_file": f"/etc/rproxy/acme/{name}-dns.token", **base}
+
+
 class Converter:
-    def __init__(self, static, dynamic, listen_addr, certbot_live):
+    def __init__(self, static, dynamic, listen_addr, certbot_live, certs="acme"):
         self.static = static or {}
         self.dynamic = dynamic or {}
         self.listen_addr = listen_addr
         self.certbot_live = certbot_live.rstrip("/")
+        # "acme": certResolver -> rproxy's own ACME (global.acme); "certbot": certbot's files
+        self.certs = certs
+        self.acme = None
         self.rules = {}
         self.global_state = {}
         self.http = g(self.dynamic, "http") or {}
@@ -908,8 +937,10 @@ class Converter:
         self.apply_tls_options(rule, options, where)
 
     def assign_certificates(self):
-        """certResolver routers -> certbot's files. Like Traefik, a certificate that already
-        covers a router's names is reused; names given in tls.domains come first."""
+        """certResolver routers -> rproxy's ACME (or certbot's files). Like Traefik, a certificate
+        that already covers a router's names is reused; names given in tls.domains come first."""
+        if self.certs == "acme":
+            return self.assign_acme()
         lineages = []  # (main, names)
         for rule, names, explicit, resolver, where in sorted(self.cert_requests, key=lambda r: not r[2]):
             if not names:
@@ -928,6 +959,71 @@ class Converter:
         for main, names in self.lineage_names.items():
             NOTES.add("certificates", f"get {', '.join(names)} with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) "
                       f"into {self.certbot_live}/{main}/; rproxy re-reads renewed files by itself")
+
+    def assign_acme(self):
+        """certResolver routers -> {acme: <resolver>, domains: [...]} and a global.acme skeleton:
+        an account and a resolver per Traefik resolver, DNS providers with placeholders. No
+        secret is copied (EAB keys, DNS credentials, acme.json): files to fill in are named."""
+        resolvers = g(self.static, "certificatesResolvers") or {}
+        lineages = {}  # resolver -> [(names list, set)]
+        names_of = {}  # resolver -> every name it is asked for
+        for rule, names, explicit, resolver, where in sorted(self.cert_requests, key=lambda r: not r[2]):
+            if not names:
+                NOTES.add(where, f"certResolver {resolver}: no domain to name the certificate by; add it by hand")
+                continue
+            if resolver not in resolvers:
+                NOTES.add(where, f"certResolver {resolver} is not in certificatesResolvers; left out")
+                continue
+            have = lineages.setdefault(resolver, [])
+            found = next((lst for lst, st in have if set(names) <= st), None)
+            if found is None:
+                found = list(dict.fromkeys(names))
+                have.append((found, set(found)))
+            names_of.setdefault(resolver, [])
+            names_of[resolver] += [n for n in found if n not in names_of[resolver]]
+            cert = {"acme": acme_name(resolver), "domains": found}
+            if cert not in rule.certificates:
+                rule.certificates.append(cert)
+        if not names_of:
+            return
+        acme = {"accounts": {}, "resolvers": {}}
+        providers = {}
+        for resolver, names in names_of.items():
+            cfg = g(resolvers, resolver, "acme") or {}
+            name = acme_name(resolver)
+            where = f"certificatesResolvers.{resolver}"
+            account = {}
+            if g(cfg, "caServer"):
+                account["directory"] = g(cfg, "caServer")
+            if g(cfg, "email"):
+                account["contact"] = [f"mailto:{g(cfg, 'email')}"]
+            account["allowed_names"] = list(names)
+            eab = g(cfg, "eab")
+            if eab:
+                account["eab"] = {"kid": g(eab, "kid") or "CHANGE-ME", "hmac_key_file": f"/etc/rproxy/acme/{name}-eab.key"}
+                NOTES.add(where, f"eab: write the HMAC key (hmacEncoded) into /etc/rproxy/acme/{name}-eab.key (not copied here)")
+            acme["accounts"][name] = account
+            if g(cfg, "storage"):
+                NOTES.add(where, f"storage {g(cfg, 'storage')} (acme.json) is not read: rproxy creates a new account and obtains the certificates again")
+            if g(cfg, "dnsChallenge") is not None:
+                dns = g(cfg, "dnsChallenge") or {}
+                provider = f"{name}-dns"
+                providers[provider] = dns_provider_skeleton(g(dns, "provider") or "", name, names, where)
+                acme["resolvers"][name] = {"account": name, "challenge": "dns-01", "dns_provider": provider}
+                servers = [r for r in as_list(g(dns, "resolvers")) if r]
+                if servers:
+                    acme.setdefault("dns_servers", [])
+                    acme["dns_servers"] += [r for r in servers if r not in acme["dns_servers"]]
+            elif g(cfg, "httpChallenge") is not None:
+                acme["resolvers"][name] = {"account": name, "challenge": "http-01"}
+                NOTES.add(where, "httpChallenge: rproxy's http rules on port 80 answer HTTP-01 before their routes (or set global.acme.http01_listen)")
+            else:
+                acme["resolvers"][name] = {"account": name, "challenge": "tls-alpn-01"}
+        if providers:
+            acme["dns_providers"] = providers
+        self.acme = acme
+        NOTES.add("global.acme", "check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; "
+                  "then rproxy-api --check-config (docs/en/ACME.md)")
 
     def apply_tls_options(self, rule, name, where):
         opts = g(self.dynamic, "tls", "options", name)
@@ -1241,6 +1337,8 @@ class Converter:
                 NOTES.add("accessLog", "Traefik logs to stdout; rproxy writes http.access lines to its own log unless global.access_log is set")
         if self.global_state.get("crowdsec"):
             out["crowdsec"] = self.global_state["crowdsec"]
+        if self.acme:
+            out["acme"] = self.acme
         return out
 
     def convert(self):
@@ -1251,8 +1349,9 @@ class Converter:
         self.http_routers()
         self.tcp_routers()
         self.assign_certificates()
-        for name in g(self.static, "certificatesResolvers") or {}:
-            NOTES.add("certificatesResolvers", f"{name}: not converted; use certbot / cert-manager and point cert_file / key_file at the files, or set up rproxy's own ACME by hand (global.acme, docs/en/ACME.md)")
+        if self.certs != "acme":
+            for name in g(self.static, "certificatesResolvers") or {}:
+                NOTES.add("certificatesResolvers", f"{name}: not converted (--certs certbot); use certbot / cert-manager and point cert_file / key_file at the files")
         if g(self.static, "api") is not None:
             NOTES.add("api", "Traefik's dashboard has no equivalent; use the rproxy UI (TCP-UDP-rproxy-ui)")
         if g(self.static, "metrics") is not None:
@@ -1289,8 +1388,10 @@ def main(argv=None):
     p.add_argument("--docker", help="output of `docker inspect <containers...>` (JSON) to read labels from")
     p.add_argument("-o", "--output", help="write here instead of stdout")
     p.add_argument("--listen-addr", default="0.0.0.0", help="address for entry points written as :port (default 0.0.0.0)")
+    p.add_argument("--certs", choices=["acme", "certbot"], default="acme",
+                   help="routers with a certResolver: rproxy's own ACME (global.acme, default) or certbot's files")
     p.add_argument("--certbot-live", default="/etc/letsencrypt/live",
-                   help="where certbot keeps certificates, for routers with a certResolver")
+                   help="with --certs certbot: where certbot keeps certificates")
     p.add_argument("--capabilities", help="GET /capabilities of the target rproxy (JSON file), to check what it runs")
     p.add_argument("--json", action="store_true", help="write JSON instead of YAML")
     args = p.parse_args(argv)
@@ -1318,7 +1419,7 @@ def main(argv=None):
         print(f"traefik2rproxy: {e}", file=sys.stderr)
         return 2
 
-    doc = Converter(static, dynamic, args.listen_addr, args.certbot_live).convert()
+    doc = Converter(static, dynamic, args.listen_addr, args.certbot_live, args.certs).convert()
 
     mws, opts, http3 = used_features(doc)
     if capabilities is not None:
