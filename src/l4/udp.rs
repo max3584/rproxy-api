@@ -22,9 +22,8 @@ use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
 use crate::net::source;
 use crate::tls::config::{TlsMode, TlsRuntime};
-use crate::net::udpsock::{Listener, Local};
+use crate::net::udpsock::{Listener, Local, RecvBuf};
 
-const MAX_DATAGRAM: usize = 65_535;
 const SESSION_QUEUE: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `tls.mode: sni`: how long, and how many datagrams / bytes, a new session's
@@ -49,7 +48,7 @@ pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16, stop: Cance
 	let sessions: Sessions = Arc::default();
 	let sniffing: Arc<AtomicUsize> = Arc::default();
 	let next_id = AtomicU64::new(0);
-	let mut buf = vec![0u8; MAX_DATAGRAM];
+	let mut buf = RecvBuf::new();
 
 	loop {
 		tokio::select! {
@@ -208,7 +207,7 @@ async fn session(
 		rx_bytes += data.len() as u64;
 		rt.stats.add_rx(data.len() as u64);
 	}
-	let mut buf = vec![0u8; MAX_DATAGRAM];
+	let mut buf = RecvBuf::new();
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {
@@ -591,7 +590,7 @@ async fn dtls_session(
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
-	let (mut buf, mut ubuf) = (vec![0u8; MAX_DATAGRAM], vec![0u8; MAX_DATAGRAM]);
+	let (mut buf, mut ubuf) = (RecvBuf::new(), RecvBuf::new());
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {
