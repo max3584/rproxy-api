@@ -563,9 +563,13 @@ class Profile:
 
 
 def h2load(t, case, url, args):
-	logf = os.path.join(WORK, "h2load.log")
 	threads = str(min(4, NPROC))
 	slug = "".join(c if c.isalnum() else "-" for c in f"{case}-{t.name}").strip("-")
+	# a new file per run: h2load appends to --log-file, so a shared one mixed the latencies
+	# of every earlier run into the later ones (p50 / p99 grew with each target; #195)
+	logf = os.path.join(WORK, f"h2load-{slug}.log")
+	if os.path.exists(logf):
+		os.remove(logf)
 	with Profile(t, slug), Meter(t) as m:
 		p = run(ns(NS_C, ["h2load", "-n", str(H2_REQS), "-c", str(H2_CONNS), "-t", threads, "--log-file", logf] + args + [url + "/small"]),
 				timeout=1800, check_rc=False)

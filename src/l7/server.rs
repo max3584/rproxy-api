@@ -165,6 +165,14 @@ impl Router {
 		for s in &all {
 			backend::start_health_checks(s.clone(), dialer.clone(), health_stop.clone());
 		}
+		// every service with kept connections: those named, and the single ones of `to`
+		let mut pooled: Vec<Arc<Service>> = all.clone();
+		for s in routes.iter().filter_map(|r| r.service.as_ref()).chain(default_service.as_ref()) {
+			if !pooled.iter().any(|p| Arc::ptr_eq(p, s)) {
+				pooled.push(s.clone());
+			}
+		}
+		backend::start_idle_sweep(pooled, health_stop.clone());
 		let oidc = middlewares.values().filter_map(|m| if let Middleware::Oidc(o) = m.as_ref() { Some(o.clone()) } else { None }).collect();
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());

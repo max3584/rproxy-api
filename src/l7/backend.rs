@@ -36,8 +36,14 @@ const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// HTTP/2 clients of a rule each have up to `max_concurrent_streams` requests going,
 /// and each of those needs a connection of its own to an HTTP/1.1 backend; #195).
 const MAX_IDLE: usize = 1024;
-/// Idle connections unused for longer are closed (when the pool is next used).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Idle connections unused for longer are closed (by `start_idle_sweep`, and when the
+/// pool is next used). Short, like HAProxy's `pool-purge-delay` (5 s): connections in
+/// steady use are reused long before, and after a burst the surplus (each with its
+/// buffers and a task) goes soon. Also shorter than common backends' keep-alive
+/// timeouts (Node.js 5 s, nginx 75 s), so a kept connection is rarely closed under us.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
+/// How often `start_idle_sweep` looks.
+const IDLE_SWEEP: Duration = Duration::from_secs(1);
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -97,9 +103,15 @@ impl Server {
 	/// An idle connection that can take a request now.
 	pub fn checkout(&self) -> Option<SendRequest<Body>> {
 		let mut idle = self.idle.lock().unwrap();
-		while let Some((s, since)) = idle.pop() {
-			if !s.is_closed() && s.is_ready() && since.elapsed() < IDLE_TIMEOUT {
-				return Some(s);
+		let now = Instant::now();
+		// the newest first; one handed back before its connection has finished the last
+		// response is not ready yet, and stays for a later request
+		for i in (0..idle.len()).rev() {
+			let (s, since) = &idle[i];
+			if s.is_closed() || now.duration_since(*since) >= IDLE_TIMEOUT {
+				idle.remove(i);
+			} else if s.is_ready() {
+				return Some(idle.remove(i).0);
 			}
 		}
 		None
@@ -111,21 +123,41 @@ impl Server {
 			return;
 		}
 		let now = Instant::now();
-		// dropped outside the lock (dropping a sender ends its connection)
-		let expired: Vec<_>;
-		{
-			let mut idle = self.idle.lock().unwrap();
-			let old = idle.iter().take_while(|(_, since)| now.duration_since(*since) >= IDLE_TIMEOUT).count();
-			expired = idle.drain(..old).collect();
-			if idle.len() >= MAX_IDLE {
-				idle.retain(|(s, _)| !s.is_closed());
+		let mut idle = self.idle.lock().unwrap();
+		// the oldest are at the front
+		let expired = idle.iter().take_while(|(_, since)| now.duration_since(*since) >= IDLE_TIMEOUT).count();
+		idle.drain(..expired);
+		if idle.len() >= MAX_IDLE {
+			idle.retain(|(s, _)| !s.is_closed());
+		}
+		if idle.len() < MAX_IDLE {
+			idle.push((sender, now));
+		}
+	}
+
+	/// Closes the idle connections unused for `IDLE_TIMEOUT`, and those the server closed.
+	fn prune_idle(&self) {
+		let now = Instant::now();
+		self.idle.lock().unwrap().retain(|(s, since)| !s.is_closed() && now.duration_since(*since) < IDLE_TIMEOUT);
+	}
+}
+
+/// Closes idle backend connections of `services` once unused for `IDLE_TIMEOUT`, until `stop`.
+pub fn start_idle_sweep(services: Vec<Arc<Service>>, stop: CancellationToken) {
+	if services.is_empty() || tokio::runtime::Handle::try_current().is_err() {
+		return;
+	}
+	tokio::spawn(async move {
+		loop {
+			tokio::select! {
+				_ = stop.cancelled() => return,
+				_ = tokio::time::sleep(IDLE_SWEEP) => {}
 			}
-			if idle.len() < MAX_IDLE {
-				idle.push((sender, now));
+			for server in services.iter().flat_map(|s| s.servers.iter()) {
+				server.prune_idle();
 			}
 		}
-		drop(expired);
-	}
+	});
 }
 
 #[derive(Debug)]
