@@ -14,6 +14,10 @@ pub enum Scope {
 	RulesWrite,
 	#[serde(rename = "metrics:read")]
 	MetricsRead,
+	/// Rules with ACME certificates (`tls.certificates[].acme`), and the ACME
+	/// operations (`POST /acme/...`, over the Unix socket by default).
+	#[serde(rename = "acme:write")]
+	AcmeWrite,
 	/// Everything.
 	#[serde(rename = "admin")]
 	Admin,
@@ -25,6 +29,7 @@ impl Scope {
 			Scope::RulesRead => "rules:read",
 			Scope::RulesWrite => "rules:write",
 			Scope::MetricsRead => "metrics:read",
+			Scope::AcmeWrite => "acme:write",
 			Scope::Admin => "admin",
 		}
 	}

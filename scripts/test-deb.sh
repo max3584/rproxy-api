@@ -51,6 +51,12 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" 
 	"http://127.0.0.1:$PORT/rules")
 [ "$code" = 201 ] || fail "could not open port 25 (HTTP $code)"
 [ "$(ps -o user= -C rproxy-api | tr -d ' ')" = rproxy ] || fail "not running as rproxy"
+# StateDirectory: where global.acme keeps account keys and certificates (docs/ACME.md)
+[ "$(stat -c %U /var/lib/rproxy)" = rproxy ] || fail "/var/lib/rproxy is not the rproxy user's"
+# the ACME helper: its user and unit are installed, not enabled (docs/ACME.md)
+getent passwd rproxy-acme >/dev/null || fail "no rproxy-acme user"
+[ -f /lib/systemd/system/rproxy-acme-helper.service ] || [ -f /usr/lib/systemd/system/rproxy-acme-helper.service ] || fail "no rproxy-acme-helper.service"
+! systemctl is-enabled --quiet rproxy-acme-helper || fail "the ACME helper is enabled by default"
 # the default configuration logs to /var/log/rproxy (JSON Lines, rotated by rproxy itself)
 sudo sh -c 'head -n1 /var/log/rproxy/rproxy.*.log' | grep -q '"event"' || fail "no JSON log in /var/log/rproxy"
 curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/capabilities" | grep -q '"transparent":true' ||
@@ -95,5 +101,6 @@ sudo apt-get purge -y rproxy-api
 ! systemctl is-active --quiet rproxy-api || fail "still running after purge"
 [ ! -e /etc/rproxy ] || fail "/etc/rproxy left behind after purge"
 [ ! -e /var/log/rproxy ] || fail "/var/log/rproxy left behind after purge"
+[ ! -e /var/lib/rproxy ] || fail "/var/lib/rproxy (ACME storage) left behind after purge"
 sudo rm -f /etc/apt/sources.list.d/rproxy-api.list /usr/share/keyrings/rproxy-archive-keyring.gpg
 echo "OK"

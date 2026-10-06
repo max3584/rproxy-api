@@ -1,0 +1,33 @@
+# installed by the Debian package (not enabled); override with systemctl edit rproxy-acme-helper
+# The ACME helper (global.acme.helper, docs/ACME.md): holds the DNS providers'
+# secrets and writes DNS-01 records for rproxy-api, as its own user. Optional:
+# enable it only with global.acme.helper in the settings file.
+[Unit]
+Description=rproxy-api ACME helper (DNS-01 secrets)
+Before=rproxy-api.service
+
+[Service]
+Type=simple
+User=rproxy-acme
+Group=rproxy-acme
+# reads the settings file in /etc/rproxy (group rproxy) and gives the socket to group rproxy
+SupplementaryGroups=rproxy
+ExecStart=/usr/bin/rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy
+Restart=on-failure
+RestartSec=2
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/rproxy
+# /run/rproxy-acme/helper.sock (mode 660, group rproxy; --allow-user checks the peer too)
+RuntimeDirectory=rproxy-acme
+RuntimeDirectoryMode=0755
+# /var/lib/rproxy-acme: what the helper writes (acme-dns's credentials_file)
+StateDirectory=rproxy-acme
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

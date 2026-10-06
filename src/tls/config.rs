@@ -495,6 +495,8 @@ pub fn is_cert_expired_text(message: &str) -> bool {
 /// When one certificate stops being valid. Pure: `now` is Unix seconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CertCheck {
+	/// notBefore, Unix seconds (for the lifetime of ACME certificates).
+	pub not_before: i64,
 	/// notAfter, Unix seconds.
 	pub not_after: i64,
 	pub seconds_left: i64,
@@ -506,7 +508,8 @@ pub struct CertCheck {
 pub fn inspect_certificate(der: &[u8], now: i64) -> Result<CertCheck, String> {
 	let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| e.to_string())?;
 	let not_after = cert.validity().not_after.timestamp();
-	Ok(CertCheck { not_after, seconds_left: not_after - now, expired: not_after <= now })
+	let not_before = cert.validity().not_before.timestamp();
+	Ok(CertCheck { not_before, not_after, seconds_left: not_after - now, expired: not_after <= now })
 }
 
 /// The earliest notAfter of `certs` (a chain or a bundle), through `inspect_certificate`.
@@ -586,6 +589,20 @@ impl KeyedCert {
 	pub fn load(cert_file: &str, chain_file: Option<&str>, key_file: &str) -> Result<KeyedCert, ApiError> {
 		let chain = load_full_chain(cert_file, chain_file)?;
 		let key = load_key(key_file)?;
+		Self::from_parts(chain, key, cert_file, key_file)
+	}
+
+	/// A certificate already in memory (the stand-in of an ACME certificate
+	/// that has not been issued yet); `cert_file` / `key_file` name it in messages.
+	pub fn from_parts(
+		chain: Vec<CertificateDer<'static>>,
+		key: PrivateKeyDer<'static>,
+		cert_file: &str,
+		key_file: &str,
+	) -> Result<KeyedCert, ApiError> {
+		if chain.is_empty() {
+			return Err(tls_error(format!("{cert_file}: no CERTIFICATE block")));
+		}
 		let signing = provider()
 			.key_provider
 			.load_private_key(key.clone_key())
@@ -1142,7 +1159,7 @@ mod tests {
 		params.not_after = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
 		let cert = params.self_signed(&key).unwrap();
 		let check = inspect_certificate(cert.der(), 1_999_999_000).unwrap();
-		assert_eq!(check, CertCheck { not_after: 2_000_000_000, seconds_left: 1000, expired: false });
+		assert_eq!(check, CertCheck { not_before: 1_000_000, not_after: 2_000_000_000, seconds_left: 1000, expired: false });
 		assert!(inspect_certificate(cert.der(), 2_000_000_000).unwrap().expired, "expired at notAfter");
 		assert_eq!(earliest_expiry(&[cert.der().clone()]), Some(2_000_000_000));
 		assert!(inspect_certificate(b"not a certificate", 0).is_err());

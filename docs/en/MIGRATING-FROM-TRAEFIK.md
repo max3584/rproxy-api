@@ -92,13 +92,13 @@ Depending on the rproxy version, some middleware and service settings cannot run
 
 | Traefik | rproxy |
 |---|---|
-| `certResolver` (ACME) | **rproxy has no built-in ACME.** Obtain certificates with certbot / acme.sh / cert-manager and specify the files. The converter writes certbot's locations (`--certbot-live`, default `/etc/letsencrypt/live/<name>/fullchain.pem` and `privkey.pem`) and lists the names to obtain. The `main` / `sans` of `tls.domains` become one certificate, and other routers whose names are covered by it use the same certificate |
+| `certResolver` (ACME) | Converted to rproxy's ACME (from v0.3.21; docs/en/ACME.md): an account and a resolver in `global.acme` per Traefik resolver (`email` → `contact`, `caServer` → `directory`, `eab` → `eab` with the key in `hmac_key_file`, not copied), and `{acme: <resolver>, domains: [...]}` in the rules' certificates. `tlsChallenge` → `tls-alpn-01`, `httpChallenge` → `http-01`, `dnsChallenge` → `dns-01` with a DNS provider skeleton (`pdns` → `powerdns`, `rfc2136` → `rfc2136`, `acme-dns` → `acme_dns`, others (route53, ...) → a generic REST skeleton; `resolvers` → `dns_servers`). `allowed_names` are the names found in the routers. Fill in `CHANGE-ME` and the secret files. `acme.json` (Traefik's account and certificates) is not read: certificates are obtained again with a new account. `--certs certbot` keeps the old way (certbot's files, `--certbot-live`, default `/etc/letsencrypt/live/<name>/fullchain.pem` and `privkey.pem`). The `main` / `sans` of `tls.domains` become one certificate, and other routers whose names are covered by it use the same certificate |
 | `tls.certificates` | `tls.certificates` of every TLS-terminating rule (rproxy selects by SNI) |
 | `tls.options.<name>.minVersion` / `cipherSuites` | `tls.options.min_version` / `cipher_suites` (Go names to rustls names; ciphers not in rustls, such as CBC, are dropped) |
 | `tls.options.<name>.clientAuth` | `tls.client_auth` (only the first of `caFiles`) |
 | `tls.options.<name>.alpnProtocols` | `tls.alpn` |
 
-rproxy detects changes to certificate files and reloads them (`RPROXY_CERT_CHECK_SECS`), so certbot renewals are picked up as-is. When using certbot's http-01, add a route to the port 80 rule that sends `/.well-known/acme-challenge/` to certbot (a web server serving the webroot, or the `--standalone` port), with a higher priority than the redirect.
+With rproxy's ACME, HTTP-01 is answered by the `http` rule on port 80 itself, before the redirect (the route below is not needed). With certificate files (`--certs certbot`), rproxy detects changes to them and reloads them (`RPROXY_CERT_CHECK_SECS`), so certbot renewals are picked up as-is. When using certbot's http-01, add a route to the port 80 rule that sends `/.well-known/acme-challenge/` to certbot (a web server serving the webroot, or the `--standalone` port), with a higher priority than the redirect.
 
 ```yaml
 - protocol: tcp

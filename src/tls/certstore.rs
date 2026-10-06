@@ -24,13 +24,17 @@ pub enum Source {
 	Keyed { cert: String, chain: Option<String>, key: String },
 	/// CA certificates: `client_auth.ca_file` / `chain_file`, `upstream.ca_file`.
 	Bundle(String),
+	/// A certificate obtained through ACME (`tls.certificates[].acme`): the files
+	/// under `global.acme.storage`, or a self-signed stand-in for `id`'s names
+	/// until they are written.
+	Acme { cert: String, key: String, id: crate::acme::CertId },
 }
 
 impl Source {
 	/// The certificate file, as shown in views, metrics and logs.
 	pub fn file(&self) -> &str {
 		match self {
-			Source::Keyed { cert, .. } => cert,
+			Source::Keyed { cert, .. } | Source::Acme { cert, .. } => cert,
 			Source::Bundle(file) => file,
 		}
 	}
@@ -40,6 +44,7 @@ impl Source {
 		match self {
 			Source::Keyed { cert, chain, key } => [Some(cert.as_str()), chain.as_deref(), Some(key.as_str())].into_iter().flatten().collect(),
 			Source::Bundle(file) => vec![file],
+			Source::Acme { cert, key, .. } => vec![cert, key],
 		}
 	}
 
@@ -51,13 +56,27 @@ impl Source {
 /// The certificate files a rule's TLS settings use, with what each is for.
 /// Only `terminate` reads certificates.
 pub fn sources(spec: &TlsSpec) -> Vec<(CertRole, Source)> {
+	sources_with(spec, None)
+}
+
+/// `sources`, with the ACME certificates' files under `acme`'s storage (left
+/// out without `global.acme`; such a rule does not build).
+pub fn sources_with(spec: &TlsSpec, acme: Option<&crate::acme::Acme>) -> Vec<(CertRole, Source)> {
 	if spec.mode != TlsMode::Terminate {
 		return vec![];
 	}
 	let mut out: Vec<(CertRole, Source)> = spec
 		.certificates
 		.iter()
-		.map(|c| (CertRole::Certificate, Source::keyed(&c.cert_file, c.chain_file.as_deref(), &c.key_file)))
+		.filter_map(|c| match (&c.acme, acme) {
+			(None, _) => Some((CertRole::Certificate, Source::keyed(&c.cert_file, c.chain_file.as_deref(), &c.key_file))),
+			(Some(resolver), Some(acme)) => {
+				let id = crate::acme::CertId::new(resolver, &c.domains);
+				let (cert, key) = acme.files(&id);
+				Some((CertRole::Certificate, Source::Acme { cert, key, id }))
+			}
+			(Some(_), None) => None,
+		})
 		.collect();
 	if spec.client_auth.mode != ClientAuthMode::None {
 		out.extend(spec.client_auth.ca_file.clone().map(|f| (CertRole::ClientCa, Source::Bundle(f))));
@@ -137,6 +156,21 @@ impl Material {
 		Ok(match source {
 			Source::Keyed { cert, chain, key } => Material::Keyed(Arc::new(KeyedCert::load(cert, chain.as_deref(), key)?)),
 			Source::Bundle(file) => Material::Bundle(Arc::new(CertBundle::load(file)?)),
+			Source::Acme { cert, key, id } => {
+				let stored = match std::path::Path::new(cert).exists() {
+					true => Some(KeyedCert::load(cert, None, key)?),
+					false => None,
+				};
+				match stored {
+					// expired on disk (rproxy was stopped past the renewal): the stand-in until it is renewed
+					Some(k) if !k.expired(tlsconf::unix_now()) => Material::Keyed(Arc::new(k)),
+					// not issued yet: a self-signed stand-in (never written to disk)
+					_ => {
+						let (chain, der) = crate::acme::placeholder(&id.domains).map_err(ApiError::tls_config)?;
+						Material::Keyed(Arc::new(KeyedCert::from_parts(chain, der, cert, key)?))
+					}
+				}
+			}
 		})
 	}
 
@@ -230,8 +264,13 @@ impl CertStore {
 	/// The certificates one rule's TLS settings use, shared with other rules
 	/// that name the same files.
 	pub fn rule_certs(&self, spec: &TlsSpec) -> Result<RuleCerts, ApiError> {
+		self.rule_certs_with(spec, None)
+	}
+
+	/// `rule_certs` with ACME certificates (`sources_with`).
+	pub fn rule_certs_with(&self, spec: &TlsSpec, acme: Option<&crate::acme::Acme>) -> Result<RuleCerts, ApiError> {
 		let mut certs = RuleCerts::default();
-		for (role, source) in sources(spec) {
+		for (role, source) in sources_with(spec, acme) {
 			match (role, &source) {
 				(CertRole::Certificate, _) => certs.servers.push(self.keyed(&source)?),
 				(CertRole::ClientCa, s) => certs.client_ca = Some(self.bundle(s.file())?),

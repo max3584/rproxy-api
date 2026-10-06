@@ -1,0 +1,30 @@
+http:
+  routers:
+    apps:
+      entryPoints: [websecure]
+      rule: HostRegexp(`^.+\.apps\.example\.org$`)
+      service: apps
+      tls:
+        certResolver: wildcard
+        domains:
+          - main: apps.example.org
+            sans: ["*.apps.example.org"]
+    site:
+      entryPoints: [websecure]
+      rule: Host(`www.example.net`) || Host(`example.net`)
+      service: site
+      tls:
+        certResolver: web
+    shop:
+      entryPoints: [websecure]
+      rule: Host(`shop.example.com`)
+      service: site
+      tls:
+        certResolver: cloud
+  services:
+    apps:
+      loadBalancer:
+        servers: [{url: "http://10.0.5.1:8080"}]
+    site:
+      loadBalancer:
+        servers: [{url: "http://10.0.5.2:8080"}]

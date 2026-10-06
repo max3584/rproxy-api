@@ -368,6 +368,13 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 	let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
 		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
 		let name = start.client_hello().server_name().map(str::to_string);
+		// an ACME CA validating TLS-ALPN-01 (global.acme): answer with the challenge certificate, then close
+		if let Some(acme) = crate::acme::challenge::tls_alpn_config(&start.client_hello()) {
+			let mut session = start.into_stream(acme).await?;
+			let _ = tokio::io::AsyncWriteExt::shutdown(&mut session).await;
+			info!(event = "acme.answer", challenge = "tls-alpn-01", rule = %rt.key, client = %client, sni = name.as_deref().unwrap_or(""));
+			return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+		}
 		if rt.select(name.as_deref(), offset).is_none() {
 			return Err(denied(rt, client, "unmatched", name.as_deref()));
 		}

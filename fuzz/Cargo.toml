@@ -72,3 +72,17 @@ path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dns_response"
+path = "fuzz_targets/dns_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tsig_answer"
+path = "fuzz_targets/tsig_answer.rs"
+test = false
+doc = false
+bench = false

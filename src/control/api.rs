@@ -70,6 +70,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
 		.route("/metrics", get(metrics))
+		.route("/acme", get(super::acme_api::view))
+		.route("/acme/renew", post(super::acme_api::renew))
+		.route("/acme/revoke", post(super::acme_api::revoke))
+		.route("/acme/accounts/{name}/register", post(super::acme_api::register))
+		.route("/acme/accounts/{name}/deactivate", post(super::acme_api::deactivate))
 		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
 
 	Router::new()
@@ -86,6 +91,8 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 		"/metrics" => Some(Scope::MetricsRead),
 		// re-reads files on the host: only for administrators
 		"/config/reload" => Some(Scope::Admin),
+		// the handlers check acme:write (and the Unix socket) themselves, to answer why
+		_ if path.starts_with("/acme/") && method == Method::POST => None,
 		_ if method == Method::GET => Some(Scope::RulesRead),
 		_ => Some(Scope::RulesWrite),
 	}
@@ -292,6 +299,7 @@ async fn create(
 	let rule = format!("{}/{rule}", req.protocol);
 	let result = async {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
+		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
 		state.registry.create(req).await
 	}
 	.await;
@@ -319,6 +327,7 @@ async fn update(
 	let req: UpdateRequest = parse_body(&body)?;
 	let result = async {
 		check_rule_ports(&state, &principal, &key).await?;
+		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
 		state.registry.update(&key, req).await
 	}
 	.await;

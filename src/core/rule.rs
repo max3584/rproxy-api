@@ -142,7 +142,7 @@ impl Features {
 		Features {
 		http: true,
 		http3: true,
-		acme: false,
+		acme: true,
 		tls_options: true,
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
@@ -662,6 +662,9 @@ pub struct RuleView {
 	/// Expiry of the certificates the rule uses (terminate); filled in by the registry.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub cert_status: Vec<crate::tls::certstore::CertStatusView>,
+	/// State of the rule's ACME certificates (`tls.certificates[].acme`); filled in by the registry.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub acme: Vec<crate::acme::CertStatus>,
 }
 
 impl RuleView {
@@ -695,6 +698,7 @@ impl RuleView {
 			stats: RuleStats::default(),
 			started_at: None,
 			cert_status: vec![],
+			acme: vec![],
 		}
 	}
 }

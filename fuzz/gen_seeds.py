@@ -188,6 +188,35 @@ def main():
             n += 1
             put("config", f"{doc.lower().removesuffix('.md')}-{n}.{lang}", (b"\x00" if lang == "yaml" else b"\x01") + block.encode())
 
+    # dns_response: answers DNS-01 reads (CNAME of _acme-challenge, SOA, TXT), with name compression
+    def name(n):
+        return b"".join(bytes([len(l)]) + l.encode() for l in n.split(".")) + b"\0"
+
+    def rr(owner, rtype, rdata):
+        return owner + struct.pack(">HHIH", rtype, 1, 60, len(rdata)) + rdata
+
+    def response(qname, qtype, answers, authority=b"", an=0, ns=0, rcode=0):
+        head = struct.pack(">HHHHHH", 0x1234, 0x8180 | rcode, 1, an, ns, 0)
+        return head + name(qname) + struct.pack(">HH", qtype, 1) + answers + authority
+
+    q = "_acme-challenge.www.example.com"
+    cname = rr(b"\xc0\x0c", 5, name("www.acme.example.net"))
+    put("dns_response", "cname", response(q, 5, cname, an=1))
+    target = 12 + len(name(q)) + 4 + 12  # the CNAME's target, after its record header
+    txt = rr(bytes([0xC0, target]), 16, b"\x05hello\x03 me")
+    put("dns_response", "cname-txt", response(q, 16, cname + txt, an=2))
+    soa = rr(name("acme.example.net"), 6, b"\xc0\x0c\xc0\x0c" + bytes(20))
+    put("dns_response", "nxdomain-soa", response(q, 6, b"", soa, ns=1, rcode=3))
+    put("dns_response", "pointer-loop", response(q, 5, b"\xc0\x2f", an=1))
+    # tsig_answer: an UPDATE answer with a TSIG record (the MAC is not the right one)
+    tsig = name("rproxy") + struct.pack(">HHIH", 250, 255, 0, 0)
+    alg = name("hmac-sha256")
+    rdata = alg + b"\x00\x00\x65\x53\xf1\x00" + struct.pack(">HH", 300, 32) + bytes(32) + struct.pack(">HHH", 0x1234, 0, 0)
+    tsig = tsig[:-2] + struct.pack(">H", len(rdata)) + rdata
+    head = struct.pack(">HHHHHH", 0x1234, 0xA800, 1, 0, 0, 1)
+    put("tsig_answer", "signed", head + name("example.com") + struct.pack(">HH", 6, 1) + tsig)
+    put("tsig_answer", "unsigned-notauth", struct.pack(">HHHHHH", 0x1234, 0xA809, 1, 0, 0, 0) + name("example.com") + struct.pack(">HH", 6, 1))
+
 
 if __name__ == "__main__":
     main()

@@ -16,7 +16,6 @@ fuzz_target!(|data: &[u8]| {
 	let Ok(text) = std::str::from_utf8(text) else { return };
 	let path = Path::new(if kind & 1 == 0 { "fuzz.yaml" } else { "fuzz.json" });
 	let Ok(doc) = ConfigDoc::parse(path, text) else { return };
-	let _ = doc.unsupported_globals();
 	assert!(doc.restart_needed(&doc).is_empty());
 	let all = Caps { transparent: true, transparent_ipv6: true, features: Features::ALL, ..Caps::default() };
 	for (_, rule) in doc.labeled_rules() {

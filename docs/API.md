@@ -26,7 +26,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           expires: 2027-03-31               # この日（UTC）まで有効
       ```
 
-    - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
+    - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
     - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`）、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
@@ -170,7 +170,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
 - 期限の `RPROXY_CERT_WARN_DAYS`（既定 14 日）前から `expiring`。状態が変わったときに 1 回だけ、ログ `cert.expiring`（警告）・`cert.expired`（エラー）・`cert.ok`（更新された）を出す。
 - `/metrics` の `rproxy_cert_expiry_seconds{protocol,listen,role,file}`（制御 API の証明書は `{role="api",file}`）：期限までの秒数（切れたら負）。
 
-ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・acme.sh・cert-manager などに任せ、そのファイルを `cert_file` / `key_file` に指定する（更新は上のとおり自動で反映される）。certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。
+証明書は ACME で rproxy に取らせることもできる（v0.3.21 から。`tls.certificates[]` に `{"acme": "<resolver>", "domains": [...]}`、設定ファイルの `global.acme`。取った証明書も同じ証明書のストアで読み込み、更新は上と同じく自動で反映される）。詳しくは docs/ACME.md。certbot・acme.sh・cert-manager などで取ったファイルを `cert_file` / `key_file` に指定するやり方もそのまま使える（certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。rproxy 自身が答えているトークンでなければルートに渡る）。
 
 応答で返すルールには、次の稼働情報が加わる（`allow_from` は正規化した CIDR の形で返す。例：`10.0.0.5` → `10.0.0.5/32`）。
 
@@ -185,6 +185,7 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
 | `all_targets_down` | 宛先がすべて down（v0.3.20。下の「複数の宛先」） |
 | `down_services` | `http` のルールで、`health_check` のあるサービスのうち、up の転送先が 1 つもないものの名前（v0.3.20）。なければ省く |
 | `cert_status` | `terminate` のルールが使う証明書の期限（下の「証明書の期限」）。証明書がなければ省く。各要素は `role`（`certificate` / `client_ca` / `client_chain` / `upstream_ca` / `upstream_certificate`）、`file`（証明書のファイル）、`not_after`（RFC 3339、UTC）、`days_left`（残りの日数。切れたら負）、`state`（`ok` / `expiring` / `expired`） |
+| `acme` | ACME の証明書（`tls.certificates[].acme`）の状態。なければ省く。各要素は `resolver`、`domains`、`state`（`pending`：まだ取れていない（自己署名の仮の証明書を返す）／`valid`／`renewing`：更新の時期／`error`：最後の試みが失敗（取れていた証明書はそのまま使う））、`not_after`・`renew_at`（RFC 3339）、`next_attempt`（失敗や `rate_limit` で待っている次の時刻）、`error`、`ari`（CA の更新の窓 `start`・`end`。ARI、RFC 9773） |
 | `origin` | `dynamic`（API で作ったルール、または DB から復元したルール）か `static`（固定ルール。下を参照） |
 
 `stats` には `denied`（`allow_from` の範囲外、`crowdsec` の判定、または `unmatched: reject` で切断した接続の数）と、`dropped`（UDP で rproxy が転送できずに捨てたデータグラムの数：セッションの待ち行列があふれた、送信に失敗した、名前を読んでいるセッションが多すぎる。v0.3.9 から。カーネルのソケットの受信バッファがあふれて捨てたものは rproxy からは見えないので数えない）も含む。`GET /metrics` では `rproxy_udp_dropped_total{protocol,listen}`（UDP のルールだけ）。
@@ -216,7 +217,8 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
   - `{"version": 1, "global": {...}, "rules": [...]}`（v0.3）
   - ルールの配列（0.2 の形）
 - `rules` の各要素は `POST /rules` の本文と同じ形。
-- `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。この版で動かせない項目（`acme`）は、ログに `"event":"degraded"`（`part: global.<項目>`）を出して読み飛ばす。
+- `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。
+  - `acme`: ACME のアカウント・DNS のプロバイダ・resolver・許可する名前（docs/ACME.md）。秘密はファイルで指し、API からは触れない。
   - `trusted_proxies`: CIDR の配列。`http` のルールで、接続元がこの範囲なら `X-Forwarded-For` を信用する（API で作ったルールにも効く）。
   - `crowdsec`: CrowdSec の bouncer（`crowdsec` ミドルウェアと、ルールの `crowdsec: true` が使う。書かずにそれらを使うと `invalid`、設定ファイルなら起動しない）。
     - `lapi_url`（例 `http://127.0.0.1:8080`）の `GET /v1/decisions/stream` を `update_interval`（既定 `10s`）ごとに呼び、判定を覚えておく（最初と、失敗した後は `startup=true` で全部を取り直す）。`X-Api-Key` は `api_key_file` の中身（`cscli bouncers add rproxy` で作ったキー。SIGHUP で読み直す）。
@@ -237,11 +239,11 @@ ACME は rproxy に内蔵しない。証明書の取得と更新は certbot・ac
     - 変わったルールは、PATCH で変えられる項目（転送先、`udp_idle_secs`、`tls`、`starttls`、`allow_from`、`http`）だけの違いなら、そのまま変える（既存の接続は切らない。TCP は新しい接続から）。ポート範囲・`source_ip` などが変わったときは、停止してから作り直す。
     - 変わっていないルールには触らない（接続も切らない）。
     - 同じキーのルールが API（DB）から作られていれば、そちらを残してファイルのルールを `rule.failed` としてログに出す。
-  - `global` の変更は再起動するまで効かない（`trusted_proxies`・`access_log`・`crowdsec`。起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
+  - `global` の変更は再起動するまで効かない（`trusted_proxies`・`access_log`・`acme`・`crowdsec`。起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
   - 状態は `GET /config` で見える：`{"configured":true,"path":"/etc/rproxy/conf.d","files":[...],"loaded_at":1790000000,"rules":5,"last_reload":{"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0},"error":null,"restart_needed":[]}`（設定ファイルを使っていなければ `{"configured":false}`）。`error` は最新の版を反映できなかった理由（それまでの版が動いている）。
 - 反映する前に確かめる：`rproxy-api --check-config [PATH]` が、起動時・再読み込みと同じ検証（書式、ルールの値、待ち受けの重なり・制御 API との重なり、証明書・鍵・CA のファイルと期限、`global`、ミドルウェアの秘密のファイル）をして、問題がなければ 0、誤りがあれば 1 で終わる（待ち受けも DB も開かない。`--check-config-format json` で `{"ok","path","files","rules","errors":[{"rule","message"}],"warnings":[...]}`）。名前解決はしない。パッケージのユニットの `ExecReload` は、先にこの確認をする（誤りがあれば reload は失敗し、SIGHUP を送らない）。
 - 同じキーや重なるポートのルールを API や DB から作ろうとすると、`already_exists` になる。
-- ファイルが存在しない、書式や形が不正（知らないキー、`version` が 1 以外、存在しない ACME の resolver の参照など）の場合は、rproxy は起動しない。読めない（権限）ときは、固定ルールなしで起動する。
+- ファイルが存在しない、書式や形が不正（知らないキー、`version` が 1 以外、存在しない ACME の resolver の参照、`global.acme` の許可の外の名前、ない秘密のファイルなど）の場合は、rproxy は起動しない。読めない（権限）ときは、固定ルールなしで起動する。
 - この版で動かせない機能（`GET /capabilities` の `features` が false）を使うルールは、`failed`（理由つき）として登録し、設定の内容は `GET /rules` で見える。名前解決や bind の失敗はほかのルールと同じ扱いになる。
 
 例：ダッシュボード（Web UI）を `dashboard.proxy.home` だけで、社内から公開する。
@@ -277,7 +279,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky`、`balance` | `http`。`health_check` / `sticky` / `balance` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
-| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。**内蔵しない方針にしたため使えない**（常に `unsupported`）。外部のツールで取ったファイルを使う（上の「TLS」） | `acme`（常に false） |
+| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。resolver は設定ファイルの `global.acme.resolvers`。`acme:write` のスコープが要り、名前は resolver のアカウント（と DNS のプロバイダ）の `allowed_names` の内だけ（外なら `400 invalid`）。tcp の `terminate` だけ（udp は `tls_config`）。docs/ACME.md | `acme`（v0.3.21 から true） |
 | TLS のオプション | `tls.options` | `min_version`（`"1.2"` / `"1.3"`）、`cipher_suites`（下） | `tls_options`（v0.3.2 から true） |
 
 - `tls.options`（v0.3.2）は tcp の `terminate`（`http` のルールを含む）の、クライアントとの TLS に効く。転送先への TLS（`upstream`）には効かない。UDP（DTLS）では使えない（`unsupported`）。
@@ -384,7 +386,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.3.20","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":false,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc"],"services":["health_check","sticky","balance"]}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"version":"0.3.20","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc"],"services":["health_check","sticky","balance"]}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
@@ -394,6 +396,11 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている接続はそのまま）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
+| `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
+| `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |
+| `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
+| `POST /acme/accounts/{name}/register` | | 200 | アカウントを CA に作る（鍵があればそのアカウントを探す）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
+| `POST /acme/accounts/{name}/deactivate` | | 200 | アカウントを CA で無効にし、鍵を `<key_file>.deactivated` に退ける（次の注文で新しいアカウントを作る）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
 | `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total` |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。

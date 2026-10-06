@@ -6,6 +6,7 @@
 |---|---|---|
 | `cargo test` | Unit tests (`src/`) and integration tests (`tests/`) | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (runs Alpine's MariaDB in the same container) |
+| `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME (docs/en/ACME.md): starts Pebble (the ACME test CA) and PowerDNS and obtains real certificates through HTTP-01, TLS-ALPN-01 and DNS-01 (the PowerDNS API, RFC 2136 (PowerDNS's DNS UPDATE, TSIG HMAC-SHA256 and SHA512), acme-dns (a small stand-in), CNAME delegation, generic REST). That part is skipped without the variables (the tests of the API's guards always run); `RPROXY_TEST_REQUIRE_ACME=1` turns the skip into a failure | `test` (Alpine's `pebble`, `pdns`, `pdns-backend-sqlite3`, `pdns-doc` and `sqlite` in the same container; `RPROXY_TEST_REQUIRE_ACME=1`) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
@@ -363,6 +364,8 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `matcher` | `l7::matcher`: parsing and evaluating `match` expressions | The expression, then one per line: host, path, query, method, header, client IP |
 | `starttls` | `l4::starttls`: the dialogue with the client before STARTTLS, the mail server's greeting and EHLO reply, the plain-text hand-over | A first byte (protocol, STARTTLS required, bytes per read), then what the peer sends |
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |
+| `dns_response` | `acme::dnsq::parse_response`: DNS answers read for DNS-01 (CNAME, SOA, TXT, name compression and its loops) | The bytes as they are |
+| `tsig_answer` | `acme::rfc2136::verify_answer`: the TSIG of answers to RFC 2136 updates (nothing unsigned or forged passes) | The bytes as they are |
 
 The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
 

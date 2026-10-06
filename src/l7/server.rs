@@ -422,6 +422,14 @@ impl Conn {
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
+		// an ACME CA validating HTTP-01 (global.acme): before routes and middlewares, so a
+		// redirect to HTTPS or an ip_allow does not get in the way
+		if req.uri().path().starts_with(crate::acme::challenge::HTTP_PREFIX) {
+			if let Some(answer) = crate::acme::challenge::http_answer(req.uri().path()) {
+				tracing::info!(event = "acme.answer", challenge = "http-01", rule = %self.rt.key, client = %self.client, path = req.uri().path());
+				return crate::acme::challenge::http_response::<Full<Bytes>>(answer).map(|b| b.map_err(|never| match never {}).boxed());
+			}
+		}
 		let started = Instant::now();
 		let host = request_host(&req).unwrap_or_default();
 		// the client: the peer, or what a trusted proxy in front says (global.trusted_proxies)

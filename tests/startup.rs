@@ -358,7 +358,7 @@ async fn the_access_log_goes_to_its_own_file() {
 }
 
 #[tokio::test]
-async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
+async fn a_yaml_settings_file_starts_with_global_settings_and_acme() {
 	let dir = workdir("yaml");
 	let backend = tcp_backend("Y:").await;
 	let (plain, l7) = (free_port(), free_port());
@@ -371,7 +371,7 @@ async fn a_yaml_settings_file_starts_and_marks_unavailable_features_failed() {
 version: 1
 global:
   trusted_proxies: [10.0.0.0/8]
-  acme: {{resolvers: {{le: {{email: a@example.com, challenge: tls-alpn-01}}}}}}
+  acme: {{storage: {storage}, accounts: {{le: {{directory: 'https://127.0.0.1:1/dir', allowed_names: [a.example.com]}}}}, resolvers: {{le: {{account: le, challenge: tls-alpn-01}}}}}}
 rules:
   - protocol: tcp
     listen_addr: 127.0.0.1
@@ -381,14 +381,15 @@ rules:
   - protocol: tcp
     listen_addr: 127.0.0.1
     listen_port: {l7}
-    tls: {{mode: terminate, certificates: [{{acme: le, domains: [a.example]}}]}}
+    tls: {{mode: terminate, certificates: [{{acme: le, domains: [a.example.com]}}]}}
     http:
       routes:
         - name: all
           match: PathPrefix(`/`)
           to: http://127.0.0.1:{bp}
 "#,
-			bp = backend.port()
+			bp = backend.port(),
+			storage = dir.join("acme").display()
 		),
 	)
 	.unwrap();
@@ -397,16 +398,20 @@ rules:
 	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
 	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{plain}")).await;
 	assert_eq!((v["state"].as_str(), v["origin"].as_str()), (Some("running"), Some("static")), "{v}");
+	// the CA cannot be reached: the rule runs with a self-signed stand-in, and the error is shown
 	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{l7}")).await;
-	assert_eq!(v["state"], "failed", "{v}");
-	assert!(v["error"].as_str().unwrap().contains("acme"), "{v}");
+	assert_eq!(v["state"], "running", "{v}");
+	assert_eq!(v["acme"][0]["domains"], serde_json::json!(["a.example.com"]), "{v}");
 	assert_eq!(v["http"]["routes"][0]["name"], "all", "the settings are kept and shown: {v}");
-	wait_for("the ignored global setting", &rp, || async { rp.log().contains(r#""part":"global.acme""#) }).await;
-	assert!(!rp.log().contains(r#""part":"global.trusted_proxies""#), "trusted_proxies works now:\n{}", rp.log());
+	wait_for("the failed order", &rp, || async { rp.log().contains(r#""event":"acme.error""#) }).await;
+	let (_, v) = get_json(port, &format!("/rules/tcp/127.0.0.1/{l7}")).await;
+	assert_eq!(v["acme"][0]["state"], "error", "{v}");
+	assert!(v["acme"][0]["next_attempt"].is_string(), "{v}");
+	assert!(!rp.log().contains(r#""event":"degraded""#), "nothing is degraded:\n{}", rp.log());
 	let (_, caps) = get_json(port, "/capabilities").await;
 	let kinds = caps["features"]["middlewares"].as_array().unwrap();
 	assert!(kinds.contains(&serde_json::json!("oidc")), "{caps}");
-	assert_eq!(caps["features"]["acme"], false, "{caps}");
+	assert_eq!(caps["features"]["acme"], true, "{caps}");
 
 	// an unknown version is a mistake
 	fs::write(&cfg, "version: 9\n").unwrap();

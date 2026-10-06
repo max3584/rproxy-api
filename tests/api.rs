@@ -359,10 +359,10 @@ async fn interfaces_and_reserved_addresses() {
 	assert_ne!(v["code"], "reserved", "{v}");
 }
 
-/// v0.3 settings: the shape is checked, features this build cannot run are
-/// refused with `unsupported` and reported in `features`.
+/// v0.3 settings: the shape is checked, and `features` says what this build
+/// runs (everything, now that ACME is built in).
 #[tokio::test]
-async fn v0_3_settings_are_validated_and_refused_until_available() {
+async fn v0_3_settings_are_validated() {
 	let h = harness().await;
 	let backend = tcp_backend("H:").await;
 	let (_, caps) = h.get("/capabilities").await;
@@ -403,10 +403,13 @@ async fn v0_3_settings_are_validated_and_refused_until_available() {
 	body["http"] = json!({"routes": [], "teleport": true});
 	assert_eq!(h.post(body).await.0, StatusCode::BAD_REQUEST, "unknown fields are refused");
 
+	// acme certificates need global.acme in the settings file (tests/acme.rs)
+	assert_eq!(caps["features"]["acme"], true, "{caps}");
 	let mut acme = rule("tcp", free_port(), backend);
-	acme["tls"] = json!({"mode": "terminate", "certificates": [{"acme": "le", "domains": ["a.example"]}]});
+	acme["tls"] = json!({"mode": "terminate", "certificates": [{"acme": "le", "domains": ["a.example.com"]}]});
 	let (status, v) = h.post(acme).await;
-	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("global.acme is not configured"), "{v}");
 }
 
 /// Refused requests are in the audit log with the client and why (never the
