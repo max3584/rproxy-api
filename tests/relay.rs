@@ -2,7 +2,11 @@
 //! busy one does, and an end (FIN, close_notify) is passed on as a half-close in
 //! either direction, on plain TCP and through TLS termination.
 //!
-//! One test function: the buffer count is process-wide, so nothing else may run
+//! A plain TCP direction that carries a bulk transfer moves on to splice
+//! (`l4::splice`, #184) and then holds a pipe instead of a buffer, so "holds"
+//! counts both.
+//!
+//! One test function: the counts are process-wide, so nothing else may run
 //! relays at the same time in this binary.
 
 mod common;
@@ -24,11 +28,19 @@ async fn plain(port: u16) -> TcpStream {
 	TcpStream::connect(("127.0.0.1", port)).await.unwrap()
 }
 
-/// Waits until `cond` holds on the number of lent relay buffers.
+/// Relay buffers and splice pipes held by connections right now.
+fn held() -> usize {
+	#[cfg(target_os = "linux")]
+	return buffers_in_use() + rproxy_api::l4::splice::pipes_in_use();
+	#[cfg(not(target_os = "linux"))]
+	return buffers_in_use();
+}
+
+/// Waits until `cond` holds on the number of relay buffers and pipes held.
 async fn buffers_become(what: &str, cond: impl Fn(usize) -> bool) {
 	let deadline = Instant::now() + Duration::from_secs(5);
-	while !cond(buffers_in_use()) {
-		assert!(Instant::now() < deadline, "{what}: {} relay buffers in use", buffers_in_use());
+	while !cond(held()) {
+		assert!(Instant::now() < deadline, "{what}: {} relay buffers / pipes held", held());
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
 }
@@ -117,7 +129,7 @@ async fn relay_buffers_and_half_closes() {
 	buffers_become("idle again", |n| n == 0).await;
 	drop((plain_conns, tls_conns));
 
-	// a busy connection (the backend does not read) holds a buffer until it ends
+	// a busy connection (the backend does not read) holds a buffer (or a pipe) until it ends
 	let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let stalled_addr = stalled.local_addr().unwrap();
 	let port = free_port();

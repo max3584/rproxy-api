@@ -67,8 +67,26 @@ fn give_back(buf: Box<[u8]>) {
 	});
 }
 
+/// When a direction may hand over to another way of copying (splice for plain
+/// TCP, `l4::splice`): after `full_reads` reads in a row that filled the
+/// buffer, and at least `after` bytes.
+#[derive(Clone, Copy)]
+pub struct Handover {
+	pub full_reads: u32,
+	pub after: u64,
+}
+
+/// What `Copy::poll_copy` ended with.
+pub enum Step {
+	/// The reader ended (and the writer was flushed); the bytes copied.
+	Done(u64),
+	/// Everything read was written and the buffer given back, and the
+	/// `Handover` condition holds; the bytes copied so far.
+	Handover(u64),
+}
+
 /// One direction: what was read and not yet written.
-struct Copy {
+pub struct Copy {
 	buf: Option<Box<[u8]>>,
 	pos: usize,
 	cap: usize,
@@ -77,6 +95,9 @@ struct Copy {
 	amt: u64,
 	/// The most this direction reads into its buffer.
 	limit: usize,
+	handover: Option<Handover>,
+	/// Reads in a row that filled the buffer.
+	full_streak: u32,
 }
 
 impl Drop for Copy {
@@ -88,8 +109,24 @@ impl Drop for Copy {
 }
 
 impl Copy {
-	fn new(limit: usize) -> Self {
-		Copy { buf: None, pos: 0, cap: 0, read_done: false, need_flush: false, amt: 0, limit: limit.clamp(1, BUFFER_SIZE) }
+	pub fn new(limit: usize) -> Self {
+		Copy {
+			buf: None,
+			pos: 0,
+			cap: 0,
+			read_done: false,
+			need_flush: false,
+			amt: 0,
+			limit: limit.clamp(1, BUFFER_SIZE),
+			handover: None,
+			full_streak: 0,
+		}
+	}
+
+	/// Makes `poll_copy` return `Step::Handover` once `h` holds.
+	pub fn with_handover(mut self, h: Option<Handover>) -> Self {
+		self.handover = h;
+		self
 	}
 
 	/// Gives the buffer back once everything in it has been written.
@@ -111,12 +148,15 @@ impl Copy {
 		if let Poll::Ready(Ok(())) = res {
 			let filled = rb.filled().len();
 			self.read_done = filled == self.cap;
+			if filled > self.cap {
+				self.full_streak = if filled == self.limit { self.full_streak.saturating_add(1) } else { 0 };
+			}
 			self.cap = filled;
 		}
 		res
 	}
 
-	fn poll_copy<R, W>(&mut self, cx: &mut Context<'_>, mut reader: Pin<&mut R>, mut writer: Pin<&mut W>) -> Poll<io::Result<u64>>
+	pub fn poll_copy<R, W>(&mut self, cx: &mut Context<'_>, mut reader: Pin<&mut R>, mut writer: Pin<&mut W>) -> Poll<io::Result<Step>>
 	where
 		R: AsyncRead + ?Sized,
 		W: AsyncWrite + ?Sized,
@@ -179,7 +219,15 @@ impl Copy {
 				self.release_if_empty();
 				ready!(writer.as_mut().poll_flush(cx))?;
 				coop.made_progress();
-				return Poll::Ready(Ok(self.amt));
+				return Poll::Ready(Ok(Step::Done(self.amt)));
+			}
+			if let Some(h) = self.handover {
+				if self.full_streak >= h.full_reads && self.amt >= h.after {
+					self.release_if_empty();
+					ready!(writer.as_mut().poll_flush(cx))?;
+					self.need_flush = false;
+					return Poll::Ready(Ok(Step::Handover(self.amt)));
+				}
 			}
 		}
 	}
@@ -201,7 +249,8 @@ where
 	loop {
 		match state {
 			State::Running(copy) => {
-				let count = ready!(copy.poll_copy(cx, r.as_mut(), w.as_mut()))?;
+				// no handover is set here, so the copy runs until the reader ends
+				let (Step::Done(count) | Step::Handover(count)) = ready!(copy.poll_copy(cx, r.as_mut(), w.as_mut()))?;
 				// the reader ended (FIN, or close_notify on TLS): pass it on as a half-close
 				*state = State::ShuttingDown(count);
 			}
