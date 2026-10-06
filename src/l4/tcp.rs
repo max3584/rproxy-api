@@ -18,9 +18,12 @@ use crate::l7::server::{self as http, Metered};
 use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
 use crate::net::source::{self, TlsInfo};
+use crate::l4::relay;
 use crate::l4::starttls::{self, Outcome};
 use crate::tls::config::{StartTls, TlsMode, TlsRuntime};
 
+/// Read sizes for a relay between two plain TCP streams.
+const PLAIN: (usize, usize) = (relay::BUFFER_SIZE, relay::BUFFER_SIZE);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// With other targets to fall back on, a target that does not answer is given up after this.
 const FAILOVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -217,7 +220,7 @@ async fn run(
 			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			let backend = out.as_raw_fd();
-			finish(rt, inbound, &mut out, backend, detail).await
+			finish(rt, inbound, &mut out, backend, PLAIN, detail).await
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::tls::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
@@ -252,7 +255,7 @@ async fn relay_hello(
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
 	let backend = out.as_raw_fd();
-	finish(rt, inbound, &mut out, backend, detail).await
+	finish(rt, inbound, &mut out, backend, PLAIN, detail).await
 }
 
 /// A stream that first yields bytes already read from it (the ClientHello read
@@ -305,16 +308,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 /// when the relay fails (a side reset, or could not be written), the backend's
 /// connection is reset (RST) rather than closed cleanly, so it does not take a
 /// cut-off stream for a complete one (the client's is reset by `handle`).
+/// `reads` is how much is read at a time from `a` and from `b`
+/// (`relay::TLS_READ_SIZE` for TLS streams).
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 	rt: &Runtime,
 	a: &mut A,
 	b: &mut B,
 	b_fd: RawFd,
+	reads: (usize, usize),
 	detail: &mut Detail,
 ) -> io::Result<()> {
 	let mut client = Counted::new(a, &rt.stats.rx_bytes);
 	let mut backend = Counted::new(b, &rt.stats.tx_bytes);
-	let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+	let result = relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1).await;
 	detail.rx += client.count;
 	detail.tx += backend.count;
 	if result.is_err() {
@@ -475,7 +481,8 @@ async fn terminate(
 			session.write_all(&to_client).await?;
 		}
 	}
-	finish(rt, &mut session, &mut upstream, backend, detail).await
+	let upstream_read = if tls.connector.is_some() { relay::TLS_READ_SIZE } else { relay::BUFFER_SIZE };
+	finish(rt, &mut session, &mut upstream, backend, (relay::TLS_READ_SIZE, upstream_read), detail).await
 }
 
 /// SMTP client that carried on without STARTTLS (`starttls_required: false`).
@@ -501,5 +508,5 @@ async fn plain_smtp(
 	inbound.write_all(&extra).await?;
 	inbound.write_all(&after).await?;
 	let backend = out.as_raw_fd();
-	finish(rt, inbound, &mut out, backend, detail).await
+	finish(rt, inbound, &mut out, backend, PLAIN, detail).await
 }

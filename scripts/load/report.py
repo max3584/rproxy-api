@@ -153,6 +153,9 @@ def render(data, prev=None):
 	out.append(f"- {m.get('cpu', '')} · {m.get('nproc', '')} CPUs · {m.get('mem_gib', '')} GiB · kernel {m.get('kernel', '')}")
 	out.append(f"- netem: {m.get('netem') or 'none'} · size {p.get('size_mib')} MiB x {p.get('repeat')} · {p.get('duration')} s per run · "
 			   f"{p.get('conns')} conns · {p.get('udp_sessions')} UDP sessions · soak {p.get('soak_secs')} s · rproxy log level {p.get('log_level')}")
+	if p.get("profile"):
+		out.append("- **profiled** (perf record, frame pointers, symbols): the numbers are not comparable with ordinary runs; "
+				   "flame graphs in `profile/` of the artifact")
 	if prev:
 		pm = prev.get("meta", {})
 		out.append(f"- compared with {pm.get('date', '?')} (commit `{(pm.get('commit') or '')[:10]}`): (+x%) is the change; "
