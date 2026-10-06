@@ -328,10 +328,6 @@ async fn run(opts: Options) -> Result<(), String> {
 	if let Some(path) = &config_path {
 		match ConfigDoc::load(path) {
 			Ok(parsed) => {
-				for part in parsed.unsupported_globals() {
-					warn!(event = "degraded", part = %format!("global.{part}"),
-						"not available in this version yet; ignored (see GET /capabilities features)");
-				}
 				doc = Some((path.clone(), parsed));
 			}
 			Err(LoadError::Invalid(e)) => return Err(e),

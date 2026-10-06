@@ -268,11 +268,6 @@ impl ConfigDoc {
 		}
 		Ok(())
 	}
-
-	/// Global settings present in the file that this build cannot run yet.
-	pub fn unsupported_globals(&self) -> Vec<&'static str> {
-		vec![]
-	}
 }
 
 #[cfg(test)]
@@ -307,7 +302,6 @@ rules:
 "#;
 		let doc = ConfigDoc::parse(Path::new("rproxy.yaml"), yaml).unwrap();
 		assert_eq!(doc.rules.len(), 1);
-		assert!(doc.unsupported_globals().is_empty());
 		assert!(doc.rules[0].http.is_some());
 	}
 

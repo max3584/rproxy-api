@@ -32,7 +32,7 @@ version: 1
 global:
   trusted_proxies: [10.0.0.0/8]          # #67。この範囲からの X-Forwarded-For を信用する（→ 実装では PROXY ヘッダは読まない。3. を参照）
   access_log: /var/log/rproxy/access.log # #57。L7 のリクエストのログ（JSON Lines）
-  acme:                                  # #17・#208（v0.4.0 で形を決め直した。docs/ACME.md）
+  acme:                                  # #17・#208（v0.3.21 で形を決め直した。docs/ACME.md）
     storage: /var/lib/rproxy/acme
     accounts:
       le: {contact: ['mailto:admin@example.com'], allowed_names: ['**.example.com']}
@@ -126,7 +126,7 @@ http:
 
 ## 4. TLS の追加（#17、#66）
 
-> ACME（#17）は v0.3.2 の時点でいったん内蔵しないことにしたが、v0.4.0 で内蔵する方針に変えた（#208。docs/ACME.md）。ルールの側の形（`acme` と `domains`）は v0.3.0 で決めたまま。`global.acme` は、v0.3.0 の resolver ごとの `email`・`directory`・`dns` を、`accounts`（CA・連絡先・アカウントの鍵・許可する名前）と `dns_providers`（名前つきのプロバイダ、秘密はファイル、許可する名前）に分け、`resolvers` はそれらを名前で組み合わせる形にした（API のルールは resolver を名前で指すだけで、秘密や許可の範囲は固定の設定にだけ置くため）。v0.3 の `global.acme` は一度も動いていない（`unsupported`）ので、互換は持たない。証明書のファイルを certbot / cert-manager などで取るやり方も、そのまま使える。
+> ACME（#17）は v0.3.2 の時点でいったん内蔵しないことにしたが、v0.3.21 で内蔵する方針に変えた（#208。docs/ACME.md）。ルールの側の形（`acme` と `domains`）は v0.3.0 で決めたまま。`global.acme` は、v0.3.0 の resolver ごとの `email`・`directory`・`dns` を、`accounts`（CA・連絡先・アカウントの鍵・許可する名前）と `dns_providers`（名前つきのプロバイダ、秘密はファイル、許可する名前）に分け、`resolvers` はそれらを名前で組み合わせる形にした（API のルールは resolver を名前で指すだけで、秘密や許可の範囲は固定の設定にだけ置くため）。v0.3 の `global.acme` は一度も動いていない（`unsupported`）ので、互換は持たない。証明書のファイルを certbot / cert-manager などで取るやり方も、そのまま使える。
 
 ```yaml
 tls:

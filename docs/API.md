@@ -170,7 +170,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
 - 期限の `RPROXY_CERT_WARN_DAYS`（既定 14 日）前から `expiring`。状態が変わったときに 1 回だけ、ログ `cert.expiring`（警告）・`cert.expired`（エラー）・`cert.ok`（更新された）を出す。
 - `/metrics` の `rproxy_cert_expiry_seconds{protocol,listen,role,file}`（制御 API の証明書は `{role="api",file}`）：期限までの秒数（切れたら負）。
 
-証明書は ACME で rproxy に取らせることもできる（v0.4.0 から。`tls.certificates[]` に `{"acme": "<resolver>", "domains": [...]}`、設定ファイルの `global.acme`。取った証明書も同じ証明書のストアで読み込み、更新は上と同じく自動で反映される）。詳しくは docs/ACME.md。certbot・acme.sh・cert-manager などで取ったファイルを `cert_file` / `key_file` に指定するやり方もそのまま使える（certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。rproxy 自身が答えているトークンでなければルートに渡る）。
+証明書は ACME で rproxy に取らせることもできる（v0.3.21 から。`tls.certificates[]` に `{"acme": "<resolver>", "domains": [...]}`、設定ファイルの `global.acme`。取った証明書も同じ証明書のストアで読み込み、更新は上と同じく自動で反映される）。詳しくは docs/ACME.md。certbot・acme.sh・cert-manager などで取ったファイルを `cert_file` / `key_file` に指定するやり方もそのまま使える（certbot の http-01 は、80 番の `http` のルールで `/.well-known/acme-challenge/` を certbot の webroot / standalone のポートへ振り分ければよい。rproxy 自身が答えているトークンでなければルートに渡る）。
 
 応答で返すルールには、次の稼働情報が加わる（`allow_from` は正規化した CIDR の形で返す。例：`10.0.0.5` → `10.0.0.5/32`）。
 
@@ -279,7 +279,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 | サービス | `http.services.<名前>` | `servers`（`url`、`weight`）、`pass_host_header`、`timeouts`（`connect`、`response`）、`health_check`、`sticky`、`balance` | `http`。`health_check` / `sticky` / `balance` は `services` に含まれるもの |
 | `match` | `http.routes[].match` | Traefik と同じ式。`Host`・`HostRegexp`・`Path`・`PathPrefix`・`PathRegexp`・`Method`・`Header`・`HeaderRegexp`・`Query`・`QueryRegexp`・`ClientIP` を `&&`・`\|\|`・`!`・括弧で組み合わせる | `http` |
 | ミドルウェア | `http.middlewares.<名前>` | `{種類: {設定}}`。種類は `redirect_scheme`・`redirect_regex`・`rate_limit`・`in_flight`・`crowdsec`・`ip_allow`・`headers`・`forward_auth`・`oidc`・`basic_auth`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・`respond` | `middlewares` に種類が含まれるもの |
-| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。resolver は設定ファイルの `global.acme.resolvers`。`acme:write` のスコープが要り、名前は resolver のアカウント（と DNS のプロバイダ）の `allowed_names` の内だけ（外なら `400 invalid`）。tcp の `terminate` だけ（udp は `tls_config`）。docs/ACME.md | `acme`（v0.4.0 から true） |
+| ACME の証明書 | `tls.certificates[]` | `{"acme": "<resolver>", "domains": [...]}`（`cert_file` / `key_file` の代わり）。resolver は設定ファイルの `global.acme.resolvers`。`acme:write` のスコープが要り、名前は resolver のアカウント（と DNS のプロバイダ）の `allowed_names` の内だけ（外なら `400 invalid`）。tcp の `terminate` だけ（udp は `tls_config`）。docs/ACME.md | `acme`（v0.3.21 から true） |
 | TLS のオプション | `tls.options` | `min_version`（`"1.2"` / `"1.3"`）、`cipher_suites`（下） | `tls_options`（v0.3.2 から true） |
 
 - `tls.options`（v0.3.2）は tcp の `terminate`（`http` のルールを含む）の、クライアントとの TLS に効く。転送先への TLS（`upstream`）には効かない。UDP（DTLS）では使えない（`unsupported`）。

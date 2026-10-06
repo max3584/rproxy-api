@@ -2,7 +2,7 @@
 
 # Certificates through ACME (#208)
 
-rproxy can obtain certificates through ACME (Let's Encrypt and others) and renew them itself before they expire (from v0.4.0). Write `{acme: <resolver>, domains: [...]}` in a rule's `tls.certificates` instead of `cert_file` / `key_file`; the certificate obtained is loaded through the same mechanism as certificate files (the certificate store, #115), and a renewed one is swapped in without dropping connections. Pointing at files obtained with certbot, cert-manager and the like still works as before.
+rproxy can obtain certificates through ACME (Let's Encrypt and others) and renew them itself before they expire (from v0.3.21). Write `{acme: <resolver>, domains: [...]}` in a rule's `tls.certificates` instead of `cert_file` / `key_file`; the certificate obtained is loaded through the same mechanism as certificate files (the certificate store, #115), and a renewed one is swapped in without dropping connections. Pointing at files obtained with certbot, cert-manager and the like still works as before.
 
 | challenge | When | What in rproxy answers |
 |---|---|---|

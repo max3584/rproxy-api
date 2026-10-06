@@ -103,9 +103,6 @@ pub async fn check(input: &CheckInput) -> Report {
 	};
 	report.files = doc.files.iter().map(|f| f.display().to_string()).collect();
 	report.rules = doc.rules.len();
-	for part in doc.unsupported_globals() {
-		report.warning("", format!("global.{part} is not available in this version and is ignored"));
-	}
 
 	// global: what startup builds, without starting anything
 	let mut secrets: Vec<String> = vec![];

@@ -2,7 +2,7 @@ English: [ACME.md](en/ACME.md)
 
 # ACME で証明書を取る（#208）
 
-rproxy は ACME（Let's Encrypt など）で証明書を取り、期限の前に自分で更新できます（v0.4.0 から）。ルールの `tls.certificates` に `cert_file` / `key_file` の代わりに `{acme: <resolver>, domains: [...]}` を書くだけで、取った証明書は今までの証明書ファイルと同じ仕組み（証明書のストア、#115）で読み込まれ、更新されると接続を切らずに差し替わります。certbot・cert-manager などで取ったファイルを指定するやり方も、今までどおり使えます。
+rproxy は ACME（Let's Encrypt など）で証明書を取り、期限の前に自分で更新できます（v0.3.21 から）。ルールの `tls.certificates` に `cert_file` / `key_file` の代わりに `{acme: <resolver>, domains: [...]}` を書くだけで、取った証明書は今までの証明書ファイルと同じ仕組み（証明書のストア、#115）で読み込まれ、更新されると接続を切らずに差し替わります。certbot・cert-manager などで取ったファイルを指定するやり方も、今までどおり使えます。
 
 | challenge | 使う場面 | rproxy の何が答えるか |
 |---|---|---|

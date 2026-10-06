@@ -32,7 +32,7 @@ version: 1
 global:
   trusted_proxies: [10.0.0.0/8]          # #67. Trust X-Forwarded-For from this range (→ as implemented, PROXY headers are not read; see 3.)
   access_log: /var/log/rproxy/access.log # #57. Log of L7 requests (JSON Lines)
-  acme:                                  # #17, #208 (reshaped in v0.4.0; docs/en/ACME.md)
+  acme:                                  # #17, #208 (reshaped in v0.3.21; docs/en/ACME.md)
     storage: /var/lib/rproxy/acme
     accounts:
       le: {contact: ['mailto:admin@example.com'], allowed_names: ['**.example.com']}
@@ -126,7 +126,7 @@ Combine with `&&`, `||`, `!` and parentheses.
 
 ## 4. TLS additions (#17, #66)
 
-> ACME (#17) was first left out in v0.3.2, then built in from v0.4.0 (#208; docs/en/ACME.md). The rule side (`acme` and `domains`) keeps the v0.3.0 shape. `global.acme` splits v0.3.0's per-resolver `email`, `directory` and `dns` into `accounts` (CA, contact, account key, allowed names) and `dns_providers` (named providers, secrets in files, allowed names), and `resolvers` combine them by name (rules made through the API only name a resolver; secrets and what may be obtained stay in the fixed settings). The v0.3 `global.acme` never ran (`unsupported`), so there is no compatibility. Files obtained with certbot / cert-manager and the like still work.
+> ACME (#17) was first left out in v0.3.2, then built in from v0.3.21 (#208; docs/en/ACME.md). The rule side (`acme` and `domains`) keeps the v0.3.0 shape. `global.acme` splits v0.3.0's per-resolver `email`, `directory` and `dns` into `accounts` (CA, contact, account key, allowed names) and `dns_providers` (named providers, secrets in files, allowed names), and `resolvers` combine them by name (rules made through the API only name a resolver; secrets and what may be obtained stay in the fixed settings). The v0.3 `global.acme` never ran (`unsupported`), so there is no compatibility. Files obtained with certbot / cert-manager and the like still work.
 
 ```yaml
 tls:
