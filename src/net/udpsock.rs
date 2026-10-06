@@ -27,6 +27,115 @@ impl Local {
 	}
 }
 
+/// Datagrams read from a listening socket with one system call (`recvmmsg`).
+pub const BATCH: usize = 32;
+/// Room for any UDP payload.
+const SLOT: usize = 65_535;
+
+/// One received datagram of a [`Batch`].
+#[derive(Clone, Copy, Debug)]
+pub struct Meta {
+	pub len: usize,
+	pub from: SocketAddr,
+	/// Where it was sent to (wildcard sockets only).
+	pub local: Option<Local>,
+}
+
+/// Buffers for [`Listener::recv_batch`], one per reading task (not per session).
+/// `slots` datagrams of up to 64 KiB each. Only the pages datagrams are written
+/// to should become resident: on Linux the memory is mapped directly, without
+/// huge pages (a 2 MiB batch was otherwise resident from the start, even on an
+/// idle port; with a zeroed buffer 10 000 ports took GBs).
+pub struct Batch {
+	/// Room for `slots * SLOT` bytes; never read beyond what the kernel wrote.
+	buf: Region,
+	slots: usize,
+	meta: Vec<Meta>,
+}
+
+impl Batch {
+	pub fn new(slots: usize) -> Self {
+		let slots = slots.clamp(1, BATCH);
+		Batch { buf: Region::new(slots * SLOT), slots, meta: Vec::with_capacity(slots) }
+	}
+
+	/// The datagrams of the last receive, in order.
+	pub fn iter(&self) -> impl Iterator<Item = (&[u8], Meta)> {
+		let base = self.buf.ptr();
+		self.meta.iter().enumerate().map(move |(i, m)| {
+			// SAFETY: within the capacity (slot i of `slots`), and the kernel wrote these `len` bytes
+			let data = unsafe { std::slice::from_raw_parts(base.add(i * SLOT), m.len.min(SLOT)) };
+			(data, *m)
+		})
+	}
+}
+
+/// Memory for a [`Batch`]: an anonymous mapping without huge pages (Linux), so
+/// pages become resident only when the kernel writes datagrams into them.
+#[cfg(target_os = "linux")]
+struct Region {
+	ptr: *mut u8,
+	len: usize,
+}
+
+// SAFETY: the mapping is owned by the Region alone; access goes through &self / &mut self
+#[cfg(target_os = "linux")]
+unsafe impl Send for Region {}
+// SAFETY: as above
+#[cfg(target_os = "linux")]
+unsafe impl Sync for Region {}
+
+#[cfg(target_os = "linux")]
+impl Region {
+	fn new(len: usize) -> Self {
+		// SAFETY: a fresh private anonymous mapping; checked for failure
+		let ptr = unsafe {
+			libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+		};
+		if ptr == libc::MAP_FAILED {
+			// out of address space: as an allocation failure would
+			std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(len, 4096).unwrap_or(std::alloc::Layout::new::<u8>()));
+		}
+		// SAFETY: the mapping just made; failing only leaves huge pages allowed
+		unsafe { libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE) };
+		Region { ptr: ptr.cast(), len }
+	}
+
+	fn ptr(&self) -> *const u8 {
+		self.ptr
+	}
+
+	fn ptr_mut(&mut self) -> *mut u8 {
+		self.ptr
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Region {
+	fn drop(&mut self) {
+		// SAFETY: the mapping made in `new`, unmapped once
+		unsafe { libc::munmap(self.ptr.cast(), self.len) };
+	}
+}
+
+#[cfg(not(target_os = "linux"))]
+struct Region(Vec<u8>);
+
+#[cfg(not(target_os = "linux"))]
+impl Region {
+	fn new(len: usize) -> Self {
+		Region(vec![0; len])
+	}
+
+	fn ptr(&self) -> *const u8 {
+		self.0.as_ptr()
+	}
+
+	fn first_slot(&mut self) -> &mut [u8] {
+		&mut self.0[..SLOT]
+	}
+}
+
 pub struct Listener {
 	socket: UdpSocket,
 	/// Whether destinations are learnt and replies sent from them (a wildcard bind).
@@ -64,6 +173,29 @@ impl Listener {
 		self.socket.async_io(tokio::io::Interest::READABLE, || sys::recv(&self.socket, buf)).await
 	}
 
+	/// Receives up to [`BATCH`] datagrams that are waiting (at least one).
+	pub async fn recv_batch(&self, batch: &mut Batch) -> io::Result<usize> {
+		batch.meta.clear();
+		#[cfg(target_os = "linux")]
+		{
+			let Batch { buf, slots, meta } = batch;
+			let slots = *slots;
+			self.socket
+				.async_io(tokio::io::Interest::READABLE, || {
+					let base = buf.ptr_mut();
+					// SAFETY: `base` has room for `slots` slots of SLOT bytes (the capacity)
+					unsafe { sys::recv_batch(&self.socket, base, slots, SLOT, self.pktinfo, meta) }
+				})
+				.await?;
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let (len, from, local) = self.recv(batch.buf.first_slot()).await?;
+			batch.meta.push(Meta { len, from, local });
+		}
+		Ok(batch.meta.len())
+	}
+
 	/// Sends to `client`, from `local` when known (the address the client sent to).
 	pub async fn send_to(&self, data: &[u8], client: SocketAddr, local: Option<Local>) -> io::Result<usize> {
 		if let (true, Some(local)) = (self.pktinfo, local) {
@@ -74,6 +206,33 @@ impl Listener {
 			}
 		}
 		self.socket.send_to(data, client).await
+	}
+}
+
+/// Sends `datagrams` on a connected socket (to a backend), each behind `header`
+/// when there is one (PROXY v2), with as few system calls as it can (`sendmmsg`).
+/// A datagram that cannot be sent is passed to `failed` and skipped.
+pub async fn send_connected(socket: &UdpSocket, header: Option<&[u8]>, datagrams: &[Vec<u8>], mut failed: impl FnMut(&io::Error)) {
+	let mut start = 0;
+	while start < datagrams.len() {
+		#[cfg(target_os = "linux")]
+		let sent = socket.async_io(tokio::io::Interest::WRITABLE, || sys::send_batch(socket, header, &datagrams[start..])).await;
+		#[cfg(not(target_os = "linux"))]
+		let sent = {
+			let d = &datagrams[start];
+			let data = match header {
+				Some(h) => std::borrow::Cow::Owned([h, d.as_slice()].concat()),
+				None => std::borrow::Cow::Borrowed(d.as_slice()),
+			};
+			socket.send(&data).await.map(|_| 1)
+		};
+		match sent {
+			Ok(n) => start += n.max(1),
+			Err(e) => {
+				failed(&e);
+				start += 1;
+			}
+		}
 	}
 }
 
@@ -131,6 +290,72 @@ mod sys {
 		}
 		let from = from_sockaddr(&name).ok_or_else(|| io::Error::other("recvmsg: unknown address family"))?;
 		Ok((n as usize, from, local_of(&msg)))
+	}
+
+	/// `recvmmsg`: the datagrams waiting, up to `slots` (at most `super::BATCH`),
+	/// each into its `slot` bytes from `base` (which may be uninitialised).
+	/// WouldBlock when there is none.
+	///
+	/// # Safety
+	/// `base` must be valid for writes of `slots * slot` bytes.
+	pub unsafe fn recv_batch(socket: &UdpSocket, base: *mut u8, slots: usize, slot: usize, pktinfo: bool, out: &mut Vec<super::Meta>) -> io::Result<()> {
+		const N: usize = super::BATCH;
+		let count = slots.min(N);
+		// SAFETY: plain C structs, all-zero is a valid value
+		let mut names: [libc::sockaddr_storage; N] = unsafe { mem::zeroed() };
+		let mut controls: [Control; N] = [[0; 16]; N];
+		// SAFETY: as above
+		let mut iovs: [libc::iovec; N] = unsafe { mem::zeroed() };
+		// SAFETY: as above
+		let mut msgs: [libc::mmsghdr; N] = unsafe { mem::zeroed() };
+		for i in 0..count {
+			// the kernel only writes into the slots (base has room for `slots * slot`)
+			iovs[i] = libc::iovec { iov_base: base.wrapping_add(i * slot).cast(), iov_len: slot };
+			let h = &mut msgs[i].msg_hdr;
+			h.msg_name = (&mut names[i] as *mut libc::sockaddr_storage).cast();
+			h.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+			h.msg_iov = &mut iovs[i];
+			h.msg_iovlen = 1;
+			if pktinfo {
+				h.msg_control = controls[i].as_mut_ptr().cast();
+				h.msg_controllen = mem::size_of::<Control>() as _;
+			}
+		}
+		// SAFETY: the headers point at live buffers of the stated sizes
+		let n = unsafe { libc::recvmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT as _, std::ptr::null_mut()) };
+		if n < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		for (i, m) in msgs.iter().take(n as usize).enumerate() {
+			let from = from_sockaddr(&names[i]).ok_or_else(|| io::Error::other("recvmmsg: unknown address family"))?;
+			let local = if pktinfo { local_of(&m.msg_hdr) } else { None };
+			out.push(super::Meta { len: m.msg_len as usize, from, local });
+		}
+		Ok(())
+	}
+
+	/// `sendmmsg` on a connected socket: how many of `datagrams` went out (at
+	/// least one), or the error of the first.
+	pub fn send_batch(socket: &UdpSocket, header: Option<&[u8]>, datagrams: &[Vec<u8>]) -> io::Result<usize> {
+		const N: usize = super::BATCH;
+		let count = datagrams.len().min(N);
+		// SAFETY: plain C structs, all-zero is a valid value
+		let mut iovs: [[libc::iovec; 2]; N] = unsafe { mem::zeroed() };
+		// SAFETY: as above
+		let mut msgs: [libc::mmsghdr; N] = unsafe { mem::zeroed() };
+		for (i, d) in datagrams.iter().take(count).enumerate() {
+			let mut k = 0;
+			if let Some(h) = header {
+				iovs[i][k] = libc::iovec { iov_base: h.as_ptr() as *mut libc::c_void, iov_len: h.len() };
+				k += 1;
+			}
+			iovs[i][k] = libc::iovec { iov_base: d.as_ptr() as *mut libc::c_void, iov_len: d.len() };
+			msgs[i].msg_hdr.msg_iov = iovs[i].as_mut_ptr();
+			msgs[i].msg_hdr.msg_iovlen = (k + 1) as _;
+		}
+		// SAFETY: the headers point at live buffers of the stated sizes
+		let n = unsafe { libc::sendmmsg(socket.as_raw_fd(), msgs.as_mut_ptr(), count as _, libc::MSG_DONTWAIT as _) };
+		if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 	}
 
 	/// The destination from the control messages of a received datagram.
@@ -382,6 +607,45 @@ mod tests {
 		}
 	}
 
+	/// A batch holds several datagrams, each with its sender and destination.
+	#[tokio::test]
+	async fn batches_keep_each_datagram_and_where_it_was_sent() {
+		let std = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+		std.set_nonblocking(true).unwrap();
+		let listener = Listener::new(UdpSocket::from_std(std).unwrap());
+		let port = listener.local_addr().unwrap().port();
+		let (a, b) = (UdpSocket::bind("127.0.0.1:0").await.unwrap(), UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		a.send_to(b"one", ("127.0.0.2", port)).await.unwrap();
+		b.send_to(b"two-two", ("127.0.0.3", port)).await.unwrap();
+		a.send_to(b"", ("127.0.0.2", port)).await.unwrap();
+		let mut batch = Batch::new(BATCH);
+		let mut got = vec![];
+		while got.len() < 3 {
+			tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv_batch(&mut batch)).await.unwrap().unwrap();
+			got.extend(batch.iter().map(|(d, m)| (d.to_vec(), m.from, m.local.map(|l| l.canonical()))));
+		}
+		let (pa, pb) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+		let (two, three): (IpAddr, IpAddr) = ("127.0.0.2".parse().unwrap(), "127.0.0.3".parse().unwrap());
+		assert_eq!(got, vec![(b"one".to_vec(), pa, Some(two)), (b"two-two".to_vec(), pb, Some(three)), (vec![], pa, Some(two))]);
+	}
+
+	/// Datagrams sent at once arrive whole and in order, behind the header.
+	#[tokio::test]
+	async fn connected_sends_put_the_header_in_front() {
+		let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		up.connect(backend.local_addr().unwrap()).await.unwrap();
+		let datagrams: Vec<Vec<u8>> = (0..(BATCH as u16 + 5)).map(|i| i.to_be_bytes().to_vec()).collect();
+		for header in [None, Some(&b"HDR"[..])] {
+			send_connected(&up, header, &datagrams, |e| panic!("{e}")).await;
+			let mut buf = [0u8; 16];
+			for d in &datagrams {
+				let n = backend.recv(&mut buf).await.unwrap();
+				assert_eq!(&buf[..n], [header.unwrap_or_default(), d.as_slice()].concat().as_slice());
+			}
+		}
+	}
+
 	#[tokio::test]
 	async fn specific_addresses_keep_the_plain_path() {
 		let listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -397,10 +661,10 @@ mod tests {
 
 /// A zeroed receive buffer for one UDP datagram (64 KiB), taken from the libc's allocator rather than the global one.
 ///
-/// Every port of a UDP rule and every UDP session holds such buffers, but most of their bytes are never written
-/// (datagrams are small). The libc's calloc returns fresh pages from the kernel for blocks this large, so the untouched
-/// part costs no memory. mimalloc (`alloc-mimalloc`, #185) hands them out of its heap and they count in full:
-/// a 10000-port range took 650 MiB instead of a few MiB.
+/// Every UDP session (and DTLS session) holds such buffers, but most of their bytes are never written (datagrams are
+/// small). The libc's calloc returns fresh pages from the kernel for blocks this large, so the untouched part costs no
+/// memory. mimalloc (`alloc-mimalloc`, #185) hands them out of its heap and they count in full (74 KiB instead of
+/// 20 KiB per session). The listeners' receive batches are `Batch` (mmap), outside any allocator.
 pub struct RecvBuf(std::ptr::NonNull<[u8; RecvBuf::LEN]>);
 
 impl RecvBuf {

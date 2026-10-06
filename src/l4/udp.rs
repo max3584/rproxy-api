@@ -22,7 +22,7 @@ use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
 use crate::net::source;
 use crate::tls::config::{TlsMode, TlsRuntime};
-use crate::net::udpsock::{Listener, Local, RecvBuf};
+use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
 
 const SESSION_QUEUE: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,46 +41,67 @@ const SNI_MAX_PENDING: usize = 4096;
 type Peer = (SocketAddr, Option<Local>);
 type Sessions = Arc<Mutex<HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>>>;
 
-/// Serves one port of the rule; `offset` is its place in a range.
+/// What the shards of one port share: how many sessions are reading their
+/// server name (`SNI_MAX_PENDING` is for the port, not for each shard), and the
+/// size of each shard's receive batch.
+pub struct Port {
+	sniffing: Arc<AtomicUsize>,
+	batch: usize,
+}
+
+impl Port {
+	/// A port of a rule with `ports` ports: a range gets smaller batches (down to
+	/// one datagram), as each slot can hold up to 64 KiB once a large datagram
+	/// came through it (10 000 ports of 32 slots would take GBs).
+	pub fn new(ports: u16) -> Self {
+		Port { sniffing: Arc::default(), batch: (64 / usize::from(ports.max(1))).clamp(1, BATCH) }
+	}
+}
+
+/// Serves one socket of one port of the rule; `offset` is the port's place in a
+/// range. A port has one socket per shard (`SO_REUSEPORT`, #194), each with its
+/// own sessions: the kernel sends a client's datagrams to the same socket, so
+/// the shards share no table and take no lock of each other.
 /// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
-pub async fn serve(socket: UdpSocket, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
+pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
 	let socket = Arc::new(Listener::new(socket));
 	let sessions: Sessions = Arc::default();
-	let sniffing: Arc<AtomicUsize> = Arc::default();
 	let next_id = AtomicU64::new(0);
-	let mut buf = RecvBuf::new();
+	let mut batch = Batch::new(port.batch);
 
 	loop {
 		tokio::select! {
 			biased;
 			_ = stop.cancelled() => break,
-			received = socket.recv(&mut buf) => match received {
-				Ok((_, client, _)) if !rt.allowed(client.ip()) => {
-					rt.stats.denied();
-					debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "allow_from");
-				}
-				// also datagrams of sessions that were open before the ban
-				Ok((_, client, _)) if rt.crowdsec_blocks(client.ip()) => {
-					rt.stats.denied();
-					debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "crowdsec");
-				}
-				Ok((n, client, local)) => {
-					let tx = {
-						let mut map = sessions.lock().unwrap();
-						match map.get(&(client, local)) {
+			received = socket.recv_batch(&mut batch) => match received {
+				Ok(_) => {
+					let mut map = sessions.lock().unwrap();
+					for (data, Meta { from: client, local, .. }) in batch.iter() {
+						if !rt.allowed(client.ip()) {
+							rt.stats.denied();
+							debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "allow_from");
+							continue;
+						}
+						// also datagrams of sessions that were open before the ban
+						if rt.crowdsec_blocks(client.ip()) {
+							rt.stats.denied();
+							debug!(event = "conn.denied", rule = %rt.key, client = %client, reason = "crowdsec");
+							continue;
+						}
+						let tx = match map.get(&(client, local)) {
 							Some((_, tx)) if !tx.is_closed() => tx.clone(),
 							_ => {
 								let id = next_id.fetch_add(1, Ordering::Relaxed);
 								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
 								map.insert((client, local), (id, tx.clone()));
-								rt.tracker.spawn(run_session(id, (client, local), rx, socket.clone(), rt.clone(), sessions.clone(), offset, sniffing.clone()));
+								rt.tracker.spawn(run_session(id, (client, local), rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone()));
 								tx
 							}
+						};
+						if tx.try_send(data.to_vec()).is_err() {
+							rt.stats.dropped();
+							debug!(event = "udp.drop", rule = %rt.key, client = %client);
 						}
-					};
-					if tx.try_send(buf[..n].to_vec()).is_err() {
-						rt.stats.dropped();
-						debug!(event = "udp.drop", rule = %rt.key, client = %client);
 					}
 				}
 				Err(e) => {
@@ -199,15 +220,11 @@ async fn session(
 
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	// the datagrams held while reading the server name, in order
-	for data in &first {
-		if let Err(e) = upstream.send(&with_header(&header, data)).await {
-			rt.stats.dropped();
-			debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
-		}
-		rx_bytes += data.len() as u64;
-		rt.stats.add_rx(data.len() as u64);
-	}
+	rx_bytes += forward(rt, &upstream, &header, client, &first).await;
+	drop(first);
 	let mut buf = RecvBuf::new();
+	// datagrams taken from the queue at once, sent on with one `sendmmsg`
+	let (mut inbox, mut out) = (Vec::new(), Vec::new());
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {
@@ -215,40 +232,41 @@ async fn session(
 			_ = sleep_until(deadline) => break "idle",
 			// a new QUIC connection that did not show its name in time: treat it as ours
 			_ = async { match &probe { Some(p) => sleep_until(p.until).await, None => std::future::pending().await } } => {
-				for data in probe.take().map(|p| p.held).unwrap_or_default() {
-					if let Err(e) = upstream.send(&with_header(&header, &data)).await {
-						rt.stats.dropped();
-						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
-					}
-					rx_bytes += data.len() as u64;
-					rt.stats.add_rx(data.len() as u64);
-				}
+				let held = probe.take().map(|p| p.held).unwrap_or_default();
+				rx_bytes += forward(rt, &upstream, &header, client, &held).await;
 			},
-			datagram = from_client.recv() => match datagram {
-				Some(data) => {
-					deadline = tokio::time::Instant::now() + idle;
-					let forward = if by_name {
-						match renamed(&mut probe, &mut quic_dcid, sni.as_deref(), data) {
-							Step::Forward(d) => d,
-							Step::Hold => continue,
-							Step::Restart(held) => {
-								restart = Some(held);
-								break "new connection";
-							}
+			received = from_client.recv_many(&mut inbox, BATCH) => {
+				if received == 0 {
+					break "closed";
+				}
+				deadline = tokio::time::Instant::now() + idle;
+				if !by_name {
+					rx_bytes += forward(rt, &upstream, &header, client, &inbox).await;
+					inbox.clear();
+					continue;
+				}
+				let mut datagrams = inbox.drain(..);
+				for data in datagrams.by_ref() {
+					match renamed(&mut probe, &mut quic_dcid, sni.as_deref(), data) {
+						Step::Forward(d) => out.extend(d),
+						Step::Hold => {}
+						Step::Restart(held) => {
+							// the new session starts with these, then what is still queued
+							restart = Some(held);
+							break;
 						}
-					} else {
-						vec![data]
-					};
-					for data in forward {
-						if let Err(e) = upstream.send(&with_header(&header, &data)).await {
-							rt.stats.dropped();
-							debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
-						}
-						rx_bytes += data.len() as u64;
-						rt.stats.add_rx(data.len() as u64);
 					}
 				}
-				None => break "closed",
+				if let Some(held) = restart.as_mut() {
+					held.extend(datagrams);
+				} else {
+					drop(datagrams);
+				}
+				rx_bytes += forward(rt, &upstream, &header, client, &out).await;
+				out.clear();
+				if restart.is_some() {
+					break "new connection";
+				}
 			},
 			received = upstream.recv(&mut buf) => match received {
 				Ok(n) => {
@@ -471,6 +489,21 @@ async fn drain(rt: &Runtime, from_client: &mut mpsc::Receiver<Vec<u8>>, idle: Du
 /// (learnt on a wildcard listener).
 fn proxy_header(rt: &Runtime, client: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
 	(rt.source_ip == SourceIp::ProxyV2).then(|| source::proxy_v2_dgram_header(client, local))
+}
+
+/// Sends a client's datagrams on to its backend; their bytes.
+async fn forward(rt: &Runtime, upstream: &UdpSocket, header: &Option<Vec<u8>>, client: SocketAddr, datagrams: &[Vec<u8>]) -> u64 {
+	if datagrams.is_empty() {
+		return 0;
+	}
+	crate::net::udpsock::send_connected(upstream, header.as_deref(), datagrams, |e| {
+		rt.stats.dropped();
+		debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
+	})
+	.await;
+	let bytes = datagrams.iter().map(|d| d.len() as u64).sum();
+	rt.stats.add_rx(bytes);
+	bytes
 }
 
 fn with_header<'a>(header: &Option<Vec<u8>>, data: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {

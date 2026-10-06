@@ -46,10 +46,38 @@ type Resolver = (CancellationToken, JoinHandle<()>);
 /// taken off the rule (or the rule stopped), false when it ended on its own.
 type ListenerTask = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 
-/// The sockets of one listening address, one per port of the rule.
+/// The sockets of one listening address, one per port of the rule (UDP: one
+/// group of `SO_REUSEPORT` shards per port).
 enum Bound {
 	Tcp(Vec<tokio::net::TcpListener>),
-	Udp(Vec<tokio::net::UdpSocket>),
+	Udp(Vec<Vec<tokio::net::UdpSocket>>),
+}
+
+/// Sockets per UDP port of a rule (#194). One by default: batching
+/// (`recvmmsg` / `sendmmsg`) gave most of the gain, while more sockets cost CPU
+/// and only moved the bottleneck to the sessions in the load test. More are
+/// opt-in through `RPROXY_UDP_SHARDS` (an experiment's tunable; the setting's
+/// shape is for v0.4.0). A range of ports gets fewer, to keep the sockets of
+/// one address within `UDP_SHARD_SOCKETS`.
+/// Decided when the sockets are opened only: a group that changes size makes
+/// the kernel send clients to other sockets, where their sessions are not.
+fn udp_shards(ports: u16) -> usize {
+	const UDP_SHARD_SOCKETS: usize = 64;
+	static FROM_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+	let forced = match FORCED_UDP_SHARDS.load(Ordering::Relaxed) {
+		0 => *FROM_ENV.get_or_init(|| std::env::var("RPROXY_UDP_SHARDS").ok().and_then(|v| v.trim().parse().ok())),
+		n => Some(n),
+	};
+	forced.unwrap_or(1).min(UDP_SHARD_SOCKETS / usize::from(ports.max(1))).clamp(1, UDP_SHARD_SOCKETS)
+}
+
+static FORCED_UDP_SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the number of UDP shards for rules created from now on, over
+/// `RPROXY_UDP_SHARDS` (tests; 0 goes back to the environment).
+#[doc(hidden)]
+pub fn force_udp_shards(n: usize) {
+	FORCED_UDP_SHARDS.store(n, Ordering::Relaxed);
 }
 
 struct Running {
@@ -241,11 +269,18 @@ fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
 				.map(|addr| crate::net::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
-		Protocol::Udp => Bound::Udp(
-			addrs
-				.map(|addr| crate::net::listen::udp(addr, v6only).and_then(tokio::net::UdpSocket::from_std).map_err(|e| bind_error(addr, e)))
-				.collect::<Result<_, _>>()?,
-		),
+		Protocol::Udp => {
+			let shards = udp_shards(spec.port_count);
+			Bound::Udp(
+				addrs
+					.map(|addr| {
+						crate::net::listen::udp_shards(addr, v6only, shards)
+							.and_then(|group| group.into_iter().map(tokio::net::UdpSocket::from_std).collect())
+							.map_err(|e| bind_error(addr, e))
+					})
+					.collect::<Result<_, _>>()?,
+			)
+		}
 	};
 	Ok(bound)
 }
@@ -264,12 +299,16 @@ fn listener_tasks(bound: Bound, rt: &Arc<Runtime>, stop: &CancellationToken) -> 
 			}
 		}
 		Bound::Udp(sockets) => {
-			for (offset, s) in sockets.into_iter().enumerate() {
-				let (rt, stop) = (rt.clone(), stop.clone());
-				tasks.push(Box::pin(async move {
-					udp::serve(s, rt, offset as u16, stop.clone()).await;
-					stop.is_cancelled()
-				}));
+			let ports = u16::try_from(sockets.len()).unwrap_or(u16::MAX);
+			for (offset, group) in sockets.into_iter().enumerate() {
+				let port = Arc::new(udp::Port::new(ports));
+				for s in group {
+					let (rt, stop, port) = (rt.clone(), stop.clone(), port.clone());
+					tasks.push(Box::pin(async move {
+						udp::serve(s, port, rt, offset as u16, stop.clone()).await;
+						stop.is_cancelled()
+					}));
+				}
 			}
 		}
 	}
@@ -1537,6 +1576,17 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 mod tests {
 	use super::*;
 	use crate::core::rule::RuleRequest;
+
+	/// One socket per UDP port unless asked for more (#194); a range is capped.
+	#[test]
+	fn udp_shards_default_to_one() {
+		if std::env::var_os("RPROXY_UDP_SHARDS").is_none() {
+			assert_eq!(udp_shards(1), 1);
+		}
+		force_udp_shards(8);
+		assert_eq!((udp_shards(1), udp_shards(16), udp_shards(10_000)), (8, 4, 1));
+		force_udp_shards(0);
+	}
 
 	fn registry() -> Arc<Registry> {
 		Registry::new(Config {
