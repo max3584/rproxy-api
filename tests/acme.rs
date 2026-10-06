@@ -749,6 +749,7 @@ async fn issues_certificates_from_pebble() {
 	assert!(calls.iter().any(|c| c.starts_with("present _acme-challenge.rest.example.test ")), "{calls:?}");
 	assert!(calls.iter().any(|c| c.starts_with("cleanup _acme-challenge.rest.example.test ")), "{calls:?}");
 	// RFC 2136: HMAC-SHA256 into example.test, HMAC-SHA512 through the CNAME into challenges.test
+	// (send() takes only answers PowerDNS signed with the same key, so these were checked too)
 	assert!(log.contains(r#""provider":"rfc256","fqdn":"_acme-challenge.rfc.example.test","zone":"example.test""#), "{}", logs());
 	assert!(log.contains(r#""provider":"rfc512","fqdn":"rfc512.challenges.test","zone":"challenges.test""#), "{}", logs());
 
@@ -759,6 +760,7 @@ async fn issues_certificates_from_pebble() {
 	let e = rfc2136::send(server, "example.test", &[rfc2136::Change::Add { name: "_acme-challenge.x.example.test", value: "x", ttl: 60 }], &wrong)
 		.await
 		.unwrap_err();
+	// PowerDNS answers a wrong key with an unsigned REFUSED (BIND: NOTAUTH with BADSIG)
 	assert!(e.contains("refused"), "{e}");
 	assert!(pdns.txt("example.test").await.is_empty());
 

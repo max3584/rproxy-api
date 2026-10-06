@@ -85,7 +85,7 @@ rules:
 
 - `allowed_names`：`example.com`（その名前だけ）、`*.example.com`（1 階層下。ワイルドカード `*.example.com` そのものも含む）、`**.example.com`（何階層でも）。アカウントにも DNS のプロバイダにも必須で、`dns-01` では両方に含まれる名前だけを取れます。それ以外の名前を使うルールは、API では `400 invalid`、設定ファイルでは起動しない・反映しない誤りです。
 - ワイルドカードは `dns-01` の resolver だけで取れます（`400 invalid`）。
-- `rfc2136`：TSIG の HMAC-SHA256 / HMAC-SHA512 で署名した UPDATE を `server` に UDP で送ります（切り詰められたら TCP）。書き込むゾーンは `zones`、なければ `server` に SOA を聞きます。サーバ側では、その鍵にそのゾーン（委任した challenge 用のゾーン）の TXT だけを書かせてください（BIND の `update-policy { grant <鍵> zonesub TXT; }`、PowerDNS の `TSIG-ALLOW-DNSUPDATE` など）。
+- `rfc2136`：TSIG の HMAC-SHA256 / HMAC-SHA512 で署名した UPDATE を `server` に UDP で送ります（切り詰められたら TCP）。応答も TSIG で確かめます（RFC 8945：同じ鍵で、要求の MAC を含めて署名されていること、時刻が fudge の内であること。署名のない応答・合わない署名は失敗。BADSIG・BADKEY・BADTIME はそのまま誤りの文に出します）。書き込むゾーンは `zones`、なければ `server` に SOA を聞きます。サーバ側では、その鍵にそのゾーン（委任した challenge 用のゾーン）の TXT だけを書かせてください（BIND の `update-policy { grant <鍵> zonesub TXT; }`、PowerDNS の `TSIG-ALLOW-DNSUPDATE` など）。
 - `acme_dns`：名前ごとの acme-dns のアカウントを `credentials_file`（JSON：`{"<名前>": {"username","password","fulldomain","subdomain"}}`）から使います。ない名前は最初の注文のときに `POST /register` で登録して書き込み（0600）、`_acme-challenge.<名前>` から `fulldomain` への CNAME を作るように知らせて、その注文は失敗にします（`acme.dns` の `action: register`）。CNAME を作ったら `POST /acme/renew` か次の再試行で取れます。TXT は `POST /update`（`X-Api-User` / `X-Api-Key`）で書き、消しません（acme-dns は最新の 2 つだけを持つ）。
 - 汎用の REST のテンプレートでは `{fqdn}`（`_acme-challenge.…` の書き込み先。CNAME をたどった後。末尾の `.` なし）・`{value}`（TXT の値）・`{zone}`（ゾーン）・`{secret}`（`secret_file` の中身）を差し込めます。`{secret}` は URL には書けません（URL はログに出るため。ヘッダか本文に）。2xx 以外は失敗です。
 - 秘密のファイル（`api_key_file`・`secret_file`・`hmac_key_file`）と `ca_file` がなければ起動しません（設定の誤り）。読めない（権限）ときは、使うときに失敗して再試行します。

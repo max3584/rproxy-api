@@ -365,6 +365,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 | `starttls` | `l4::starttls`：STARTTLS 前のクライアントとのやり取り、メールサーバの挨拶と EHLO の応答、平文での引き継ぎ | 先頭のバイト（プロトコル・STARTTLS 必須・1 回に読む量）、続けて相手が送るもの |
 | `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |
 | `dns_response` | `acme::dnsq::parse_response`：DNS-01 で読む DNS の応答（CNAME・SOA・TXT、名前の圧縮とそのループ） | バイト列そのまま |
+| `tsig_answer` | `acme::rfc2136::verify_answer`：RFC 2136 の UPDATE への応答の TSIG（署名のないもの・作ったものが通らないこと） | バイト列そのまま |
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
 

@@ -365,6 +365,7 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `starttls` | `l4::starttls`: the dialogue with the client before STARTTLS, the mail server's greeting and EHLO reply, the plain-text hand-over | A first byte (protocol, STARTTLS required, bytes per read), then what the peer sends |
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |
 | `dns_response` | `acme::dnsq::parse_response`: DNS answers read for DNS-01 (CNAME, SOA, TXT, name compression and its loops) | The bytes as they are |
+| `tsig_answer` | `acme::rfc2136::verify_answer`: the TSIG of answers to RFC 2136 updates (nothing unsigned or forged passes) | The bytes as they are |
 
 The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
 
