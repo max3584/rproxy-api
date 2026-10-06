@@ -27,6 +27,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Size of a relay buffer.
 pub const BUFFER_SIZE: usize = 32 * 1024;
 
+/// How much is read from a TLS stream at a time. A TLS stream gives at most one
+/// record (16 KiB) per read anyway, and reading it into more than 8 KiB cost
+/// about 15 % more CPU per byte in the load test (#185), so data read from TLS
+/// moves in 8 KiB pieces as with tokio's `copy_bidirectional`.
+pub const TLS_READ_SIZE: usize = 8 * 1024;
+
 /// Free buffers kept per thread; more given back than this are freed.
 const POOL_PER_THREAD: usize = 32;
 
@@ -69,6 +75,8 @@ struct Copy {
 	read_done: bool,
 	need_flush: bool,
 	amt: u64,
+	/// The most this direction reads into its buffer.
+	limit: usize,
 }
 
 impl Drop for Copy {
@@ -80,8 +88,8 @@ impl Drop for Copy {
 }
 
 impl Copy {
-	fn new() -> Self {
-		Copy { buf: None, pos: 0, cap: 0, read_done: false, need_flush: false, amt: 0 }
+	fn new(limit: usize) -> Self {
+		Copy { buf: None, pos: 0, cap: 0, read_done: false, need_flush: false, amt: 0, limit: limit.clamp(1, BUFFER_SIZE) }
 	}
 
 	/// Gives the buffer back once everything in it has been written.
@@ -97,7 +105,7 @@ impl Copy {
 
 	fn poll_fill<R: AsyncRead + ?Sized>(&mut self, cx: &mut Context<'_>, reader: Pin<&mut R>) -> Poll<io::Result<()>> {
 		let buf = self.buf.get_or_insert_with(take);
-		let mut rb = ReadBuf::new(buf);
+		let mut rb = ReadBuf::new(&mut buf[..self.limit]);
 		rb.set_filled(self.cap);
 		let res = reader.poll_read(cx, &mut rb);
 		if let Poll::Ready(Ok(())) = res {
@@ -116,7 +124,7 @@ impl Copy {
 		let coop = ready!(tokio::task::coop::poll_proceed(cx));
 		loop {
 			// read more while there is room, for larger writes
-			if !self.read_done && self.cap < BUFFER_SIZE {
+			if !self.read_done && self.cap < self.limit {
 				match self.poll_fill(cx, reader.as_mut()) {
 					Poll::Ready(Ok(())) => coop.made_progress(),
 					Poll::Ready(Err(e)) => {
@@ -145,7 +153,7 @@ impl Copy {
 				match writer.as_mut().poll_write(cx, &buf[self.pos..self.cap]) {
 					Poll::Pending => {
 						// top up the buffer while the writer is full, for a larger write
-						if !self.read_done && self.cap < BUFFER_SIZE {
+						if !self.read_done && self.cap < self.limit {
 							ready!(self.poll_fill(cx, reader.as_mut()))?;
 						}
 						return Poll::Pending;
@@ -216,8 +224,18 @@ where
 	A: AsyncRead + AsyncWrite + Unpin + ?Sized,
 	B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-	let mut a_to_b = State::Running(Copy::new());
-	let mut b_to_a = State::Running(Copy::new());
+	bidirectional_reading(a, b, BUFFER_SIZE, BUFFER_SIZE).await
+}
+
+/// `bidirectional`, reading at most `a_read` bytes at a time from `a` and
+/// `b_read` from `b` (`TLS_READ_SIZE` for a TLS stream).
+pub async fn bidirectional_reading<A, B>(a: &mut A, b: &mut B, a_read: usize, b_read: usize) -> io::Result<(u64, u64)>
+where
+	A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+	B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+	let mut a_to_b = State::Running(Copy::new(a_read));
+	let mut b_to_a = State::Running(Copy::new(b_read));
 	poll_fn(|cx| {
 		let a_to_b = transfer(cx, &mut a_to_b, a, b)?;
 		let b_to_a = transfer(cx, &mut b_to_a, b, a)?;
