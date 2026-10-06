@@ -57,7 +57,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
 | `/var/lib/rproxy/`（`global.acme.storage` の既定 `/var/lib/rproxy/acme`） | `rproxy:rproxy` 750（`acme/` の下はディレクトリ 700・ファイル 600） | ACME のアカウントの鍵（`accounts/<名前>.key`）、取った証明書と鍵（`certs/`）、消していない DNS-01 の TXT の記録（`dns-pending.json`）。ユニットの `StateDirectory=rproxy` が作る。アカウントの鍵が漏れると、そのアカウントで証明書の失効・注文ができる。purge で消える（docs/ACME.md） |
-| ACME の DNS のプロバイダの秘密（`global.acme.dns_providers` の `api_key_file` / `secret_file`、EAB の `hmac_key_file`。例 `/etc/rproxy/acme/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（DNS のレコードを書き換えられる。`_acme-challenge` を専用のゾーンに委任し、そのゾーンだけに書ける鍵にすると被害を狭められる）。API からは読めない |
+| ACME の DNS のプロバイダの秘密（`global.acme.dns_providers` の `api_key_file` / `secret_file` / `tsig_secret_file` / `credentials_file`（acme-dns。rproxy が書く）、EAB の `hmac_key_file`。例 `/etc/rproxy/acme/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（DNS のレコードを書き換えられる。`_acme-challenge` を専用のゾーンに委任し、そのゾーンだけに書ける鍵にすると被害を狭められる）。API からは読めない |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
 
 ## 制御 API

@@ -44,6 +44,19 @@ global:
         remove: {method: POST, url: 'https://dns-relay.example.net/cleanup', headers: {Authorization: 'Bearer {secret}'}, body: '{"fqdn":"{fqdn}","value":"{value}"}'}
         secret_file: /etc/rproxy/acme/relay.token
         allowed_names: [intranet.example.com]
+      bind:
+        type: rfc2136                             # DNS UPDATE（RFC 2136）。BIND・Knot・PowerDNS など
+        server: 10.0.0.53                         # プライマリ（ip か ip:port）
+        tsig_key_name: rproxy-acme
+        tsig_algorithm: hmac-sha256               # 既定。hmac-sha512 も
+        tsig_secret_file: /etc/rproxy/acme/tsig.key   # base64 の秘密（BIND の key の secret と同じ）
+        zones: [acme.example.net]
+        allowed_names: ['*.example.org']
+      acmedns:
+        type: acme_dns                            # acme-dns（joohoi/acme-dns）
+        api_url: https://auth.acme-dns.example.net
+        credentials_file: /var/lib/rproxy/acme/acme-dns.json   # 名前ごとのアカウント（lego と同じ形）。なければ登録して書く（0600）
+        allowed_names: [vpn.example.com]
     resolvers:                                    # ルールが名前で指すもの：アカウント + challenge
       le-http: {account: letsencrypt, challenge: http-01}
       le-alpn: {account: letsencrypt, challenge: tls-alpn-01}
@@ -71,6 +84,8 @@ rules:
 
 - `allowed_names`：`example.com`（その名前だけ）、`*.example.com`（1 階層下。ワイルドカード `*.example.com` そのものも含む）、`**.example.com`（何階層でも）。アカウントにも DNS のプロバイダにも必須で、`dns-01` では両方に含まれる名前だけを取れます。それ以外の名前を使うルールは、API では `400 invalid`、設定ファイルでは起動しない・反映しない誤りです。
 - ワイルドカードは `dns-01` の resolver だけで取れます（`400 invalid`）。
+- `rfc2136`：TSIG の HMAC-SHA256 / HMAC-SHA512 で署名した UPDATE を `server` に UDP で送ります（切り詰められたら TCP）。書き込むゾーンは `zones`、なければ `server` に SOA を聞きます。サーバ側では、その鍵にそのゾーン（委任した challenge 用のゾーン）の TXT だけを書かせてください（BIND の `update-policy { grant <鍵> zonesub TXT; }`、PowerDNS の `TSIG-ALLOW-DNSUPDATE` など）。
+- `acme_dns`：名前ごとの acme-dns のアカウントを `credentials_file`（JSON：`{"<名前>": {"username","password","fulldomain","subdomain"}}`）から使います。ない名前は最初の注文のときに `POST /register` で登録して書き込み（0600）、`_acme-challenge.<名前>` から `fulldomain` への CNAME を作るように知らせて、その注文は失敗にします（`acme.dns` の `action: register`）。CNAME を作ったら `POST /acme/renew` か次の再試行で取れます。TXT は `POST /update`（`X-Api-User` / `X-Api-Key`）で書き、消しません（acme-dns は最新の 2 つだけを持つ）。
 - 汎用の REST のテンプレートでは `{fqdn}`（`_acme-challenge.…` の書き込み先。CNAME をたどった後。末尾の `.` なし）・`{value}`（TXT の値）・`{zone}`（ゾーン）・`{secret}`（`secret_file` の中身）を差し込めます。`{secret}` は URL には書けません（URL はログに出るため。ヘッダか本文に）。2xx 以外は失敗です。
 - 秘密のファイル（`api_key_file`・`secret_file`・`hmac_key_file`）と `ca_file` がなければ起動しません（設定の誤り）。読めない（権限）ときは、使うときに失敗して再試行します。
 - アカウントは最初の注文のときに CA に作ります（鍵は `key_file`、0600）。鍵が既にあれば、その鍵のアカウントを使います。ほかのツールで作ったアカウントの鍵（PKCS#8 の PEM、ECDSA P-256）も使えます。
@@ -110,7 +125,7 @@ rules:
 4. 検証が終わったら、成功しても失敗しても TXT を消します。消せなかったもの（と、途中でプロセスが止まったもの）は記録に残り、次の起動のときに消します（`acme.dns` の `reason: left over`）。
 5. PowerDNS は `PATCH /api/v1/servers/{server_id}/zones/{zone}` で TXT の RRset を `REPLACE` / `DELETE` します（同じ名前の値は 1 回でまとめて。ワイルドカードとその親を一緒に取るときは 2 つの値）。
 
-将来の候補：RFC 2136（TSIG の動的更新）、acme-dns、ACME と DNS の処理を秘密を持つ別のプロセスに分けること。
+DNS の秘密を本体から外に出すには、下の「補助プロセス（秘密を分ける）」を使います。
 
 ## API
 
@@ -152,4 +167,4 @@ rules:
 
 ## 試験
 
-CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます（docs/TESTING.md）。
+CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS の API、RFC 2136（TSIG の SHA256・SHA512、違う鍵は断られること）、acme-dns（登録と CNAME の案内を含む）、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます（docs/TESTING.md）。

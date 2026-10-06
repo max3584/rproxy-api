@@ -44,6 +44,19 @@ global:
         remove: {method: POST, url: 'https://dns-relay.example.net/cleanup', headers: {Authorization: 'Bearer {secret}'}, body: '{"fqdn":"{fqdn}","value":"{value}"}'}
         secret_file: /etc/rproxy/acme/relay.token
         allowed_names: [intranet.example.com]
+      bind:
+        type: rfc2136                             # DNS UPDATE (RFC 2136): BIND, Knot, PowerDNS, ...
+        server: 10.0.0.53                         # the primary (ip or ip:port)
+        tsig_key_name: rproxy-acme
+        tsig_algorithm: hmac-sha256               # default; hmac-sha512 too
+        tsig_secret_file: /etc/rproxy/acme/tsig.key   # the secret in base64 (as BIND's key secret)
+        zones: [acme.example.net]
+        allowed_names: ['*.example.org']
+      acmedns:
+        type: acme_dns                            # acme-dns (joohoi/acme-dns)
+        api_url: https://auth.acme-dns.example.net
+        credentials_file: /var/lib/rproxy/acme/acme-dns.json   # an account per name (lego's format); registered and written (0600) when missing
+        allowed_names: [vpn.example.com]
     resolvers:                                    # what rules name: an account + a challenge
       le-http: {account: letsencrypt, challenge: http-01}
       le-alpn: {account: letsencrypt, challenge: tls-alpn-01}
@@ -71,6 +84,8 @@ rules:
 
 - `allowed_names`: `example.com` (that name), `*.example.com` (one label below, and the wildcard `*.example.com` itself), `**.example.com` (any depth). Required for accounts and DNS providers; with `dns-01` a name must be in both. A rule with any other name is `400 invalid` through the API, and a mistake in the settings file (no start, no reload).
 - Wildcards need a `dns-01` resolver (`400 invalid`).
+- `rfc2136`: sends an UPDATE signed with TSIG (HMAC-SHA256 / HMAC-SHA512) to `server` over UDP (TCP when truncated). The zone is from `zones`, or the SOA as `server` answers it. On the server, let the key write only TXT records of that zone (the delegated challenge zone): BIND's `update-policy { grant <key> zonesub TXT; }`, PowerDNS's `TSIG-ALLOW-DNSUPDATE`, and so on.
+- `acme_dns`: uses an acme-dns account per name from `credentials_file` (JSON: `{"<name>": {"username","password","fulldomain","subdomain"}}`). A name without one is registered on its first order (`POST /register`, written 0600), and the order fails with a message to create the CNAME from `_acme-challenge.<name>` to `fulldomain` (`acme.dns` with `action: register`); once the CNAME is there, `POST /acme/renew` or the next retry obtains it. TXT values are written with `POST /update` (`X-Api-User` / `X-Api-Key`) and not removed (acme-dns keeps the latest two).
 - Generic REST templates can use `{fqdn}` (the `_acme-challenge.…` name written, after following CNAMEs, without the final dot), `{value}` (the TXT value), `{zone}` and `{secret}` (the content of `secret_file`). `{secret}` may not be in the URL (URLs end up in logs; use a header or the body). Anything but 2xx is a failure.
 - Secret files (`api_key_file`, `secret_file`, `hmac_key_file`) and `ca_file` that do not exist stop the startup (a mistake in the settings). One that cannot be read (permissions) fails when used, and is retried.
 - The account is created at the CA on the first order (its key in `key_file`, 0600). With a key already there, the account of that key is used, so a key from another tool works too (PKCS#8 PEM, ECDSA P-256).
@@ -110,7 +125,7 @@ Orders are made one at a time. Expiry checks and warnings (`cert.expiring` and s
 4. After validation, successful or not, the TXT record is removed. Records that could not be removed (or a process that stopped half way) stay in the journal and are removed on the next start (`acme.dns` with `reason: left over`).
 5. PowerDNS: `PATCH /api/v1/servers/{server_id}/zones/{zone}` with a TXT RRset, `REPLACE` / `DELETE` (all values of one name in one call: a wildcard and its parent need two values).
 
-Possible later: RFC 2136 (TSIG dynamic updates), acme-dns, and running ACME and DNS in a separate process that holds the secrets.
+To keep DNS secrets out of the main process, use the helper process below ("Helper process (separating secrets)").
 
 ## API
 
@@ -152,4 +167,4 @@ Secrets (API keys, tokens, EAB keys, account keys) never appear in logs or API a
 
 ## Tests
 
-CI's `clippy + tests` job runs Alpine's Pebble (the ACME test CA) and PowerDNS in the same container; tests/acme.rs obtains real certificates through HTTP-01 (`http01_listen`), TLS-ALPN-01 and DNS-01 (PowerDNS, CNAME delegation, a small relay for generic REST), and checks that TXT records are removed, that records left over from an earlier run are cleaned up, renewal over the Unix socket, use of stored certificates after a restart, and that no secret appears in answers or logs (docs/en/TESTING.md).
+CI's `clippy + tests` job runs Alpine's Pebble (the ACME test CA) and PowerDNS in the same container; tests/acme.rs obtains real certificates through HTTP-01 (`http01_listen`), TLS-ALPN-01 and DNS-01 (the PowerDNS API, RFC 2136 (TSIG SHA256 and SHA512, and a wrong key refused), acme-dns (with registration and the CNAME notice), CNAME delegation, a small relay for generic REST), and checks that TXT records are removed, that records left over from an earlier run are cleaned up, renewal over the Unix socket, use of stored certificates after a restart, and that no secret appears in answers or logs (docs/en/TESTING.md).

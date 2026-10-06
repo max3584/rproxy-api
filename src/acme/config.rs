@@ -124,6 +124,44 @@ pub struct DnsProviderSpec {
 	pub allowed_names: Vec<String>,
 	/// TTL of the TXT record (60 by default).
 	pub ttl: Option<u32>,
+	/// rfc2136: the primary server for DNS UPDATE (`ip` or `ip:port`).
+	pub server: Option<String>,
+	/// rfc2136: the TSIG key's name, algorithm (`hmac-sha256` by default, or
+	/// `hmac-sha512`) and secret (base64, as in BIND's key files) in a file.
+	pub tsig_key_name: Option<String>,
+	pub tsig_algorithm: Option<String>,
+	pub tsig_secret_file: Option<String>,
+	/// acme_dns: the accounts of acme-dns (JSON, `{"<name>": {"username",
+	/// "password", "fulldomain", "subdomain"}}`, as lego keeps them). A name
+	/// without one is registered (`POST /register`) and written here (0600).
+	pub credentials_file: Option<String>,
+}
+
+impl DnsProviderSpec {
+	/// The fields that are set, by name (for checking which belong to the type).
+	fn set_fields(&self) -> Vec<&'static str> {
+		let mut out = vec![];
+		for (name, set) in [
+			("api_url", self.api_url.is_some()),
+			("server_id", self.server_id.is_some()),
+			("api_key_file", self.api_key_file.is_some()),
+			("add", self.add.is_some()),
+			("remove", self.remove.is_some()),
+			("secret_file", self.secret_file.is_some()),
+			("zones", !self.zones.is_empty()),
+			("ttl", self.ttl.is_some()),
+			("server", self.server.is_some()),
+			("tsig_key_name", self.tsig_key_name.is_some()),
+			("tsig_algorithm", self.tsig_algorithm.is_some()),
+			("tsig_secret_file", self.tsig_secret_file.is_some()),
+			("credentials_file", self.credentials_file.is_some()),
+		] {
+			if set {
+				out.push(name);
+			}
+		}
+		out
+	}
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -271,26 +309,52 @@ impl AcmeGlobal {
 		}
 		for (name, p) in &self.dns_providers {
 			let here = |m: &str| at(format!("dns_providers.{name}: {m}"));
+			let fields: &[&str] = match p.kind.as_str() {
+				"powerdns" => &["api_url", "server_id", "api_key_file", "zones", "ttl"],
+				"http" => &["add", "remove", "secret_file", "zones"],
+				"rfc2136" => &["server", "tsig_key_name", "tsig_algorithm", "tsig_secret_file", "zones", "ttl"],
+				"acme_dns" => &["api_url", "credentials_file"],
+				other => return Err(here(&format!("type {other:?} is not known (powerdns, rfc2136, acme_dns or http)"))),
+			};
+			if let Some(f) = p.set_fields().into_iter().find(|f| !fields.contains(f)) {
+				return Err(here(&format!("{f} is not used with type {} (it takes {})", p.kind, fields.join(", "))));
+			}
+			let http_url = |u: &str| u.starts_with("http://") || u.starts_with("https://");
 			match p.kind.as_str() {
 				"powerdns" => {
 					if p.api_url.is_none() || p.api_key_file.is_none() {
 						return Err(here("type powerdns needs api_url and api_key_file"));
 					}
-					if p.add.is_some() || p.remove.is_some() || p.secret_file.is_some() {
-						return Err(here("add, remove and secret_file are for type http"));
-					}
-					let url = p.api_url.as_deref().unwrap_or_default();
-					if !(url.starts_with("http://") || url.starts_with("https://")) {
+					if !http_url(p.api_url.as_deref().unwrap_or_default()) {
 						return Err(here("api_url must be an http(s) URL"));
 					}
 				}
-				"http" => {
+				"rfc2136" => {
+					let (Some(server), Some(key), Some(_)) = (&p.server, &p.tsig_key_name, &p.tsig_secret_file) else {
+						return Err(here("type rfc2136 needs server, tsig_key_name and tsig_secret_file"));
+					};
+					parse_dns_server(server).map_err(|e| here(&format!("server: {e}")))?;
+					if key.is_empty() {
+						return Err(here("tsig_key_name is empty"));
+					}
+					if let Some(a) = &p.tsig_algorithm {
+						if super::rfc2136::Algorithm::parse(a).is_none() {
+							return Err(here(&format!("tsig_algorithm {a:?} must be hmac-sha256 or hmac-sha512")));
+						}
+					}
+				}
+				"acme_dns" => {
+					if p.api_url.is_none() || p.credentials_file.is_none() {
+						return Err(here("type acme_dns needs api_url and credentials_file"));
+					}
+					if !http_url(p.api_url.as_deref().unwrap_or_default()) {
+						return Err(here("api_url must be an http(s) URL"));
+					}
+				}
+				_ => {
 					let (Some(add), Some(remove)) = (&p.add, &p.remove) else {
 						return Err(here("type http needs add and remove"));
 					};
-					if p.api_url.is_some() || p.api_key_file.is_some() || p.server_id.is_some() {
-						return Err(here("api_url, api_key_file and server_id are for type powerdns"));
-					}
 					for (what, call) in [("add", add), ("remove", remove)] {
 						if !(call.url.starts_with("http://") || call.url.starts_with("https://")) {
 							return Err(here(&format!("{what}.url must be an http(s) URL")));
@@ -311,7 +375,6 @@ impl AcmeGlobal {
 						}
 					}
 				}
-				other => return Err(here(&format!("type {other:?} is not known (powerdns or http)"))),
 			}
 			if p.allowed_names.is_empty() {
 				return Err(here("allowed_names is required (the names this provider may prove)"));
@@ -486,11 +549,25 @@ resolvers:
 			(("'http://127.0.0.1:1/add'", "'http://127.0.0.1:1/add?t={secret}'"), "not the URL"),
 			(("{method: DELETE", "{method: 'NO PE'"), "not an HTTP method"),
 			(("['mailto:a@example.com']", "[a@example.com]"), "mailto:"),
+			(("api_key_file: /k, ", "api_key_file: /k, server: '10.0.0.1', "), "server is not used with type powerdns"),
 		] {
 			let yaml = BASE.replacen(change.0, change.1, 1);
 			assert_ne!(yaml, BASE, "{change:?}");
 			let e = parse(&yaml).check().unwrap_err();
 			assert!(e.contains(want), "{change:?}: {e}");
+		}
+		let ok = "accounts: {le: {allowed_names: [a.example.com]}}\ndns_providers:\n  r: {type: rfc2136, server: '10.0.0.53', tsig_key_name: rproxy, tsig_algorithm: hmac-sha512, tsig_secret_file: /k, zones: [example.com], allowed_names: [a.example.com]}\n  d: {type: acme_dns, api_url: 'https://auth.example.org', credentials_file: /c, allowed_names: [a.example.com]}\n";
+		parse(ok).check().unwrap();
+		for (from, to, want) in [
+			("server: '10.0.0.53', ", "", "needs server, tsig_key_name"),
+			("hmac-sha512", "hmac-md5", "hmac-sha256 or hmac-sha512"),
+			("server: '10.0.0.53'", "server: 'dns.example.com'", "server:"),
+			("credentials_file: /c, ", "", "needs api_url and credentials_file"),
+			("credentials_file: /c, ", "credentials_file: /c, zones: [x.example.com], ", "zones is not used with type acme_dns"),
+			("type: acme_dns", "type: route53", "is not known"),
+		] {
+			let e = parse(&ok.replacen(from, to, 1)).check().unwrap_err();
+			assert!(e.contains(want), "{from}: {e}");
 		}
 		let e = parse("rate_limit: {orders: 0}").check().unwrap_err();
 		assert!(e.contains("rate_limit"), "{e}");

@@ -18,6 +18,7 @@ pub mod config;
 pub mod dns;
 pub mod dnsq;
 pub mod http;
+pub mod rfc2136;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -334,7 +335,7 @@ impl Acme {
 	fn named_files(global: &AcmeGlobal) -> Vec<(String, String)> {
 		let mut out = vec![];
 		for (name, p) in &global.dns_providers {
-			out.extend(dns::Provider::secret_files(p).into_iter().map(|f| (format!("dns_providers.{name}"), f)));
+			out.extend(dns::Provider::required_files(p).into_iter().map(|f| (format!("dns_providers.{name}"), f)));
 		}
 		for (name, a) in &global.accounts {
 			out.extend(a.eab.as_ref().map(|e| (format!("accounts.{name}.eab"), e.hmac_key_file.clone())));
@@ -345,7 +346,9 @@ impl Acme {
 
 	/// Files read while running, for `--check-config`'s readability warnings.
 	pub fn secret_files(&self) -> Vec<String> {
-		Self::named_files(&self.global).into_iter().map(|(_, f)| f).collect()
+		let mut out: Vec<String> = Self::named_files(&self.global).into_iter().map(|(_, f)| f).collect();
+		out.extend(self.global.dns_providers.values().filter_map(|p| p.credentials_file.clone()));
+		out
 	}
 
 	/// Whether the storage directory can be written; the error for `degraded`.
@@ -836,13 +839,7 @@ impl Acme {
 					Challenge::TlsAlpn01 => answers.add_tls_alpn(&domain, key_auth.digest().as_ref())?,
 					Challenge::Dns01 => {
 						let p = provider.ok_or("dns-01 without a dns provider")?;
-						let name = format!("_acme-challenge.{domain}");
-						let fqdn = dnsq::follow_cname(&self.dns_servers, &name).await.unwrap_or_else(|e| {
-							debug!(event = "acme.dns", action = "cname", name, error = %e, "using the name itself");
-							name.clone()
-						});
-						let zone = p.zone_for(&fqdn, &self.dns_servers).await?;
-						records.push(dns::Written { provider: p.name.clone(), fqdn, zone, value: key_auth.dns_value() });
+						records.push(p.locate(&domain, &key_auth.dns_value(), &self.dns_servers).await?);
 					}
 				}
 				debug!(event = "acme.challenge", resolver = %id.resolver, domain, challenge = r.challenge.as_str());

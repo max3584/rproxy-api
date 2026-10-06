@@ -1,6 +1,6 @@
 //! DNS-01: writing and removing the TXT record through a DNS provider
-//! (`global.acme.dns_providers`): the PowerDNS HTTP API, or a generic REST
-//! template. Secrets are read from files when a call is made and never logged;
+//! (`global.acme.dns_providers`): the PowerDNS HTTP API, DNS UPDATE (RFC 2136,
+//! TSIG), acme-dns, or a generic REST template. Secrets are read from files when a call is made and never logged;
 //! error texts from a provider are cut short and have the secret masked.
 //!
 //! Every record is noted in a journal (`dns-pending.json`) before it is
@@ -29,12 +29,28 @@ pub struct Provider {
 	pub name: String,
 	spec: DnsProviderSpec,
 	tls: tokio_rustls::TlsConnector,
+	/// acme_dns: one registration at a time (the credentials file is rewritten).
+	register: tokio::sync::Mutex<()>,
+}
+
+/// An acme-dns account (one per name), as lego keeps them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AcmeDnsAccount {
+	pub username: String,
+	pub password: String,
+	pub fulldomain: String,
+	pub subdomain: String,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub allowfrom: Vec<String>,
 }
 
 /// A TXT record rproxy wrote (or is about to): enough to remove it later.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct Written {
 	pub provider: String,
+	/// The name being validated (without `*.`), for the helper to check.
+	#[serde(default)]
+	pub domain: String,
 	/// Where the record is (after following CNAMEs), without the final dot.
 	pub fqdn: String,
 	pub zone: String,
@@ -61,7 +77,12 @@ fn excerpt(body: &[u8], secret: &str) -> String {
 
 impl Provider {
 	pub fn new(name: &str, spec: &DnsProviderSpec) -> Result<Provider, String> {
-		Ok(Provider { name: name.to_string(), spec: spec.clone(), tls: http::connector(spec.ca_file.as_deref())? })
+		Ok(Provider {
+			name: name.to_string(),
+			spec: spec.clone(),
+			tls: http::connector(spec.ca_file.as_deref())?,
+			register: tokio::sync::Mutex::new(()),
+		})
 	}
 
 	pub fn kind(&self) -> &str {
@@ -76,9 +97,115 @@ impl Provider {
 		&self.spec.allowed_names
 	}
 
-	/// Secret files this provider reads (for `--check-config`'s readability warnings).
+	/// Files this provider reads (for `--check-config`'s readability warnings).
 	pub fn secret_files(spec: &DnsProviderSpec) -> Vec<String> {
-		[&spec.api_key_file, &spec.secret_file, &spec.ca_file].into_iter().flatten().cloned().collect()
+		let mut out = Self::required_files(spec);
+		out.extend(spec.credentials_file.clone());
+		out
+	}
+
+	/// Files that must exist (acme-dns's credentials file is created when missing).
+	pub fn required_files(spec: &DnsProviderSpec) -> Vec<String> {
+		[&spec.api_key_file, &spec.secret_file, &spec.ca_file, &spec.tsig_secret_file].into_iter().flatten().cloned().collect()
+	}
+
+	/// Where the TXT record for `domain` goes: `_acme-challenge.<domain>` after
+	/// following CNAMEs (acme-dns: the account's `fulldomain`), and its zone.
+	pub async fn locate(&self, domain: &str, value: &str, servers: &[SocketAddr]) -> Result<Written, String> {
+		let name = format!("_acme-challenge.{domain}");
+		let fqdn = dnsq::follow_cname(servers, &name).await.unwrap_or_else(|e| {
+			tracing::debug!(event = "acme.dns", action = "cname", name, error = %e, "using the name itself");
+			name.clone()
+		});
+		if self.spec.kind == "acme_dns" {
+			let account = self.acme_dns_account(domain).await?;
+			let full = normalize_name(&account.fulldomain);
+			// acme-dns answers only for its own names: _acme-challenge must point there
+			if fqdn != full {
+				return Err(format!(
+					"acme-dns: create the CNAME record {name}. -> {full}. (dns provider {:?}); it is not there yet",
+					self.name
+				));
+			}
+			return Ok(Written { provider: self.name.clone(), domain: domain.to_string(), fqdn, zone: String::new(), value: value.to_string() });
+		}
+		let zone = self.zone_for(&fqdn, servers).await?;
+		Ok(Written { provider: self.name.clone(), domain: domain.to_string(), fqdn, zone, value: value.to_string() })
+	}
+
+	fn tsig_key(&self) -> Result<super::rfc2136::TsigKey, String> {
+		use base64::Engine;
+		let file = self.spec.tsig_secret_file.as_deref().unwrap_or_default();
+		let text = read_secret(file)?;
+		let secret = base64::engine::general_purpose::STANDARD
+			.decode(text.trim())
+			.map_err(|_| format!("{file}: the TSIG secret is not base64"))?;
+		Ok(super::rfc2136::TsigKey {
+			name: self.spec.tsig_key_name.clone().unwrap_or_default(),
+			algorithm: super::rfc2136::Algorithm::parse(self.spec.tsig_algorithm.as_deref().unwrap_or("hmac-sha256"))
+				.unwrap_or(super::rfc2136::Algorithm::HmacSha256),
+			secret,
+		})
+	}
+
+	fn rfc2136_server(&self) -> Result<SocketAddr, String> {
+		super::config::parse_dns_server(self.spec.server.as_deref().unwrap_or_default())
+	}
+
+	fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
+		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
+		match std::fs::read(file) {
+			Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{file}: {e}")),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+			Err(e) => Err(format!("{file}: {e}")),
+		}
+	}
+
+	/// The acme-dns account of `domain`, registered (and kept, 0600) when there is none.
+	async fn acme_dns_account(&self, domain: &str) -> Result<AcmeDnsAccount, String> {
+		let _one = self.register.lock().await;
+		let mut all = self.acme_dns_accounts()?;
+		if let Some(a) = all.get(domain) {
+			return Ok(a.clone());
+		}
+		let base = self.spec.api_url.as_deref().unwrap_or_default().trim_end_matches('/');
+		let req = Request::builder()
+			.method(Method::POST)
+			.uri(format!("{base}/register"))
+			.header("Content-Type", "application/json")
+			.body(Bytes::from_static(b"{}"))
+			.map_err(|e| e.to_string())?;
+		let resp = http::send(&self.tls, req).await?;
+		if !resp.status().is_success() {
+			return Err(format!("acme-dns {base}/register: {} {}", resp.status(), excerpt(resp.body(), "")));
+		}
+		let account: AcmeDnsAccount = serde_json::from_slice(resp.body()).map_err(|e| format!("acme-dns register: {e}"))?;
+		all.insert(domain.to_string(), account.clone());
+		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
+		super::store::write_private(Path::new(file), &serde_json::to_vec_pretty(&all).unwrap_or_default())
+			.map_err(|e| format!("{file}: {e} (registered at acme-dns, but the account could not be kept)"))?;
+		info!(event = "acme.dns", action = "register", provider = %self.name, domain, fulldomain = %account.fulldomain,
+			"registered at acme-dns; create the CNAME _acme-challenge.{domain} -> {}", account.fulldomain);
+		Ok(account)
+	}
+
+	async fn acme_dns_update(&self, r: &Written) -> Result<(), String> {
+		let account = self.acme_dns_accounts()?.get(&r.domain).cloned().ok_or_else(|| format!("acme-dns: no account for {}", r.domain))?;
+		let base = self.spec.api_url.as_deref().unwrap_or_default().trim_end_matches('/');
+		let body = serde_json::json!({"subdomain": account.subdomain, "txt": r.value}).to_string();
+		let req = Request::builder()
+			.method(Method::POST)
+			.uri(format!("{base}/update"))
+			.header("X-Api-User", &account.username)
+			.header("X-Api-Key", &account.password)
+			.header("Content-Type", "application/json")
+			.body(Bytes::from(body))
+			.map_err(|e| excerpt(e.to_string().as_bytes(), &account.password))?;
+		let resp = http::send(&self.tls, req).await?;
+		if !resp.status().is_success() {
+			return Err(format!("acme-dns {base}/update: {} {}", resp.status(), excerpt(resp.body(), &account.password)));
+		}
+		Ok(())
 	}
 
 	/// The zone a record goes into: the longest of `zones` that holds it; or
@@ -94,6 +221,10 @@ impl Provider {
 				.filter(|z| within(z))
 				.max_by_key(|z| z.len())
 				.ok_or_else(|| format!("{fqdn} is not in the zones of dns provider {:?} ({})", self.name, self.spec.zones.join(", ")));
+		}
+		if self.spec.kind == "rfc2136" {
+			// the primary server knows its zones
+			return dnsq::find_zone(&[self.rfc2136_server()?], fqdn).await;
 		}
 		if self.spec.kind == "powerdns" {
 			let zones = self.powerdns_zones().await?;
@@ -153,6 +284,18 @@ impl Provider {
 				let url = format!("{}/zones/{}.", self.powerdns_base(), first.zone);
 				self.powerdns(Method::PATCH, url, Some(rrset)).await.map(|_| ())
 			}
+			"rfc2136" => {
+				let ttl = self.spec.ttl.unwrap_or(DEFAULT_TTL);
+				let changes: Vec<_> =
+					records.iter().map(|r| super::rfc2136::Change::Add { name: &r.fqdn, value: &r.value, ttl }).collect();
+				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key()?).await
+			}
+			"acme_dns" => {
+				for r in records {
+					self.acme_dns_update(r).await?;
+				}
+				Ok(())
+			}
 			_ => {
 				for r in records {
 					self.template(self.spec.add.as_ref(), r).await?;
@@ -171,6 +314,12 @@ impl Provider {
 				let url = format!("{}/zones/{}.", self.powerdns_base(), first.zone);
 				self.powerdns(Method::PATCH, url, Some(rrset)).await.map(|_| ())
 			}
+			"rfc2136" => {
+				let changes: Vec<_> = records.iter().map(|r| super::rfc2136::Change::Delete { name: &r.fqdn, value: &r.value }).collect();
+				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key()?).await
+			}
+			// acme-dns keeps the two latest values and has no removal
+			"acme_dns" => Ok(()),
 			_ => {
 				let mut first_error = None;
 				for r in records {
@@ -307,7 +456,7 @@ mod tests {
 
 	#[test]
 	fn templates_and_excerpts() {
-		let w = Written { provider: "p".into(), fqdn: "_acme-challenge.a.example".into(), zone: "a.example".into(), value: "v4lue".into() };
+		let w = Written { provider: "p".into(), domain: "a.example".into(), fqdn: "_acme-challenge.a.example".into(), zone: "a.example".into(), value: "v4lue".into() };
 		assert_eq!(fill("{\"fqdn\":\"{fqdn}\",\"value\":\"{value}\",\"zone\":\"{zone}\"}", &w, "s"), r#"{"fqdn":"_acme-challenge.a.example","value":"v4lue","zone":"a.example"}"#);
 		assert_eq!(fill("Bearer {secret}", &w, "tok"), "Bearer tok");
 		assert_eq!(excerpt(b"bad token tok\nend", "tok"), "bad ***en *** end");
@@ -319,7 +468,7 @@ mod tests {
 		let dir = std::env::temp_dir().join(format!("rproxy-acme-journal-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
 		let j = Journal::new(&dir);
-		let a = Written { provider: "p".into(), fqdn: "a".into(), zone: "z".into(), value: "1".into() };
+		let a = Written { provider: "p".into(), domain: "a.example".into(), fqdn: "a".into(), zone: "z".into(), value: "1".into() };
 		let b = Written { value: "2".into(), ..a.clone() };
 		j.add(&[a.clone(), b.clone()]);
 		assert_eq!(Journal::new(&dir).read(), [a.clone(), b.clone()]);

@@ -26,6 +26,11 @@ use rproxy_api::control::auth::Tokens;
 
 const PDNS_KEY: &str = "pdns-api-key-SECRET-1d9f";
 const RELAY_SECRET: &str = "relay-token-SECRET-77ab";
+/// TSIG secrets (base64) of the RFC 2136 providers.
+const TSIG_256: &str = "c2VjcmV0LXRzaWctMjU2LWtleS1mb3ItcnByb3h5LXRlc3Q=";
+const TSIG_512: &str = "c2VjcmV0LXRzaWctNTEyLWtleS1mb3ItcnByb3h5LXRlc3QtYWJjZGVmZ2hpams=";
+/// The password the acme-dns mock hands out.
+const ADNS_PASSWORD: &str = "acme-dns-password-SECRET-5c1e";
 
 fn workdir(tag: &str) -> PathBuf {
 	let dir = std::env::temp_dir().join(format!("rproxy-acme-{tag}-{}", std::process::id()));
@@ -333,7 +338,7 @@ async fn start_pdns(dir: &Path, pdns: &str, schema: &str, sqlite3: &str) -> Pdns
 	let dns = free_udp_port();
 	let web = free_port();
 	let conf = format!(
-		"launch=gsqlite3\ngsqlite3-database={}\nlocal-address=127.0.0.1\nlocal-port={dns}\napi=yes\napi-key={PDNS_KEY}\nwebserver=yes\nwebserver-address=127.0.0.1\nwebserver-port={web}\nwebserver-allow-from=127.0.0.0/8\nsocket-dir={}\nguardian=no\ndaemon=no\ndisable-syslog=yes\nloglevel=5\nzone-cache-refresh-interval=0\n",
+		"launch=gsqlite3\ngsqlite3-database={}\nlocal-address=127.0.0.1\nlocal-port={dns}\napi=yes\napi-key={PDNS_KEY}\nwebserver=yes\nwebserver-address=127.0.0.1\nwebserver-port={web}\nwebserver-allow-from=127.0.0.0/8\nsocket-dir={}\nguardian=no\ndaemon=no\ndisable-syslog=yes\nloglevel=5\nzone-cache-refresh-interval=0\ndnsupdate=yes\nallow-dnsupdate-from=127.0.0.0/8\n",
 		db.display(),
 		dir.display()
 	);
@@ -348,10 +353,19 @@ async fn start_pdns(dir: &Path, pdns: &str, schema: &str, sqlite3: &str) -> Pdns
 	.await;
 	let a = |name: &str| json!({"name": name, "type": "A", "ttl": 60, "changetype": "REPLACE", "records": [{"content": "127.0.0.1", "disabled": false}]});
 	let zone = |name: &str, rrsets: Vec<Value>| json!({"name": name, "kind": "Native", "nameservers": [format!("ns.{name}")], "rrsets": rrsets});
-	let cname = json!({"name": "_acme-challenge.deleg.example.test.", "type": "CNAME", "ttl": 60, "records": [{"content": "deleg.challenges.test.", "disabled": false}]});
-	for z in [zone("example.test.", vec![a("example.test."), a("*.example.test."), cname]), zone("challenges.test.", vec![])] {
+	let cname = |from: &str, to: &str| json!({"name": from, "type": "CNAME", "ttl": 60, "records": [{"content": to, "disabled": false}]});
+	let deleg = cname("_acme-challenge.deleg.example.test.", "deleg.challenges.test.");
+	let rfc512 = cname("_acme-challenge.rfc512.example.test.", "rfc512.challenges.test.");
+	for z in [zone("example.test.", vec![a("example.test."), a("*.example.test."), deleg, rfc512]), zone("challenges.test.", vec![])] {
 		let (status, body) = p.call(reqwest::Method::POST, "/zones", Some(z)).await;
 		assert!(status.is_success(), "PowerDNS zone: {status} {body}");
+	}
+	// DNS UPDATE (RFC 2136) with TSIG: one key per zone
+	for (key, alg, secret, zone) in [("rproxy-256", "hmac-sha256", TSIG_256, "example.test."), ("rproxy-512", "hmac-sha512", TSIG_512, "challenges.test.")] {
+		let (status, body) = p.call(reqwest::Method::POST, "/tsigkeys", Some(json!({"name": key, "algorithm": alg, "key": secret}))).await;
+		assert!(status.is_success(), "PowerDNS TSIG key: {status} {body}");
+		let (status, body) = p.call(reqwest::Method::PUT, &format!("/zones/{zone}/metadata/TSIG-ALLOW-DNSUPDATE"), Some(json!({"metadata": [key]}))).await;
+		assert!(status.is_success(), "PowerDNS metadata: {status} {body}");
 	}
 	p
 }
@@ -407,6 +421,61 @@ async fn start_relay(pdns_api: String) -> (u16, Arc<Mutex<Vec<String>>>) {
 	);
 	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 	(port, calls)
+}
+
+/// An acme-dns server: `/register` hands out an account, `/update` (with its
+/// credentials) sets the TXT record of the account's name (the latest two)
+/// through PowerDNS's API.
+async fn start_acme_dns(pdns_api: String) -> u16 {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	let values: Arc<Mutex<Vec<String>>> = Arc::default();
+	let app = axum::Router::new()
+		.route(
+			"/register",
+			axum::routing::post(|| async {
+				(
+					axum::http::StatusCode::CREATED,
+					axum::Json(json!({"username": "adns-user", "password": ADNS_PASSWORD, "fulldomain": "b7f4.challenges.test", "subdomain": "b7f4", "allowfrom": []})),
+				)
+			}),
+		)
+		.route(
+			"/update",
+			axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+				let (values, api) = (values.clone(), pdns_api.clone());
+				async move {
+					let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+					if h("x-api-user") != "adns-user" || h("x-api-key") != ADNS_PASSWORD {
+						return axum::http::StatusCode::UNAUTHORIZED;
+					}
+					let v: Value = serde_json::from_str(&body).unwrap_or_default();
+					if v["subdomain"] != "b7f4" {
+						return axum::http::StatusCode::BAD_REQUEST;
+					}
+					let records = {
+						let mut all = values.lock().unwrap();
+						all.push(v["txt"].as_str().unwrap_or("").to_string());
+						let n = all.len();
+						all[n.saturating_sub(2)..].to_vec()
+					};
+					let rrset = json!({"name": "b7f4.challenges.test.", "type": "TXT", "ttl": 60, "changetype": "REPLACE",
+						"records": records.iter().map(|r| json!({"content": format!("\"{r}\""), "disabled": false})).collect::<Vec<_>>()});
+					let r = reqwest::Client::new()
+						.patch(format!("{api}/api/v1/servers/localhost/zones/challenges.test."))
+						.header("X-API-Key", PDNS_KEY)
+						.json(&json!({"rrsets": [rrset]}))
+						.send()
+						.await;
+					match r {
+						Ok(r) if r.status().is_success() => axum::http::StatusCode::OK,
+						_ => axum::http::StatusCode::BAD_GATEWAY,
+					}
+				}
+			}),
+		);
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	port
 }
 
 /// Pebble with its own HTTPS certificate (the package ships none).
@@ -514,6 +583,7 @@ async fn issues_certificates_from_pebble() {
 	let dir = workdir("pebble");
 	let pdns = start_pdns(&dir, &pdns_bin, &schema, &sqlite3).await;
 	let (relay_port, relay_calls) = start_relay(pdns.api.clone()).await;
+	let adns_port = start_acme_dns(pdns.api.clone()).await;
 	let http01 = free_port();
 	let alpn_port = free_port();
 	let (pebble_proc, directory, ca_file) = start_pebble(&dir, &pebble, pdns.dns, http01, alpn_port);
@@ -536,7 +606,7 @@ async fn issues_certificates_from_pebble() {
 
 	// the settings: every challenge, CNAME delegation, the generic REST provider
 	let extra = format!(
-		"  deleg: {{account: test, challenge: dns-01, dns_provider: pdns-deleg}}\ndns_servers: ['127.0.0.1:{dns}']\ndns_propagation_timeout: 20s\nhttp01_listen: ['127.0.0.1:{http01}']\nrate_limit: {{orders: 50, period: 1h}}\n",
+		"  deleg: {{account: test, challenge: dns-01, dns_provider: pdns-deleg}}\n  rfc256: {{account: test, challenge: dns-01, dns_provider: rfc256}}\n  rfc512: {{account: test, challenge: dns-01, dns_provider: rfc512}}\n  adns: {{account: test, challenge: dns-01, dns_provider: adns}}\ndns_servers: ['127.0.0.1:{dns}']\ndns_propagation_timeout: 20s\nhttp01_listen: ['127.0.0.1:{http01}']\nrate_limit: {{orders: 50, period: 1h}}\n",
 		dns = pdns.dns
 	);
 	let mut settings = acme_settings(&dir, &directory, &extra);
@@ -550,9 +620,10 @@ async fn issues_certificates_from_pebble() {
 		(
 			"  relay:\n".to_string(),
 			format!(
-				"  pdns-deleg:\n    type: powerdns\n    api_url: '{}'\n    api_key_file: {}/pdns.key\n    zones: [challenges.test]\n    allowed_names: [deleg.example.test]\n  relay:\n",
+				"  pdns-deleg:\n    type: powerdns\n    api_url: '{}'\n    api_key_file: {d}/pdns.key\n    zones: [challenges.test]\n    allowed_names: [deleg.example.test]\n  rfc256: {{type: rfc2136, server: '127.0.0.1:{dns}', tsig_key_name: rproxy-256, tsig_secret_file: {d}/tsig-256.key, allowed_names: [rfc.example.test]}}\n  rfc512: {{type: rfc2136, server: '127.0.0.1:{dns}', tsig_key_name: rproxy-512, tsig_algorithm: hmac-sha512, tsig_secret_file: {d}/tsig-512.key, zones: [challenges.test], allowed_names: [rfc512.example.test]}}\n  adns: {{type: acme_dns, api_url: 'http://127.0.0.1:{adns_port}', credentials_file: {d}/acme-dns.json, allowed_names: [adns.example.test]}}\n  relay:\n",
 				pdns.api,
-				dir.display()
+				d = dir.display(),
+				dns = pdns.dns,
 			),
 		),
 	] {
@@ -561,8 +632,11 @@ async fn issues_certificates_from_pebble() {
 	}
 	settings = settings.replace("http://127.0.0.1:1/", &format!("http://127.0.0.1:{relay_port}/"));
 	let global: String = settings.lines().map(|l| format!("    {l}\n")).collect();
+	fs::write(dir.join("tsig-256.key"), format!("{TSIG_256}\n")).unwrap();
+	fs::write(dir.join("tsig-512.key"), format!("{TSIG_512}\n")).unwrap();
 	let backend = tcp_backend("app:").await;
 	let (p_http, p_dns, p_deleg, p_rest) = (free_port(), free_port(), free_port(), free_port());
+	let (p_rfc, p_rfc512, p_adns) = (free_port(), free_port(), free_port());
 	let rule = |port: u16, resolver: &str, domains: &[&str]| {
 		format!(
 			"  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {port}, remote_addr: 127.0.0.1, remote_port: {}, tls: {{mode: terminate, certificates: [{{acme: {resolver}, domains: {domains:?}}}]}}}}\n",
@@ -570,12 +644,15 @@ async fn issues_certificates_from_pebble() {
 		)
 	};
 	let config = format!(
-		"version: 1\nglobal:\n  acme:\n{global}rules:\n{}{}{}{}{}",
+		"version: 1\nglobal:\n  acme:\n{global}rules:\n{}{}{}{}{}{}{}{}",
 		rule(alpn_port, "alpn", &["alpn.example.test"]),
 		rule(p_http, "http", &["http.example.test", "www.http.example.test"]),
 		rule(p_dns, "dns", &["*.wild.example.test", "wild.example.test"]),
 		rule(p_deleg, "deleg", &["deleg.example.test"]),
 		rule(p_rest, "rest", &["rest.example.test"]),
+		rule(p_rfc, "rfc256", &["rfc.example.test"]),
+		rule(p_rfc512, "rfc512", &["rfc512.example.test"]),
+		rule(p_adns, "adns", &["adns.example.test"]),
 	);
 	let config_file = dir.join("rproxy.yaml");
 	fs::write(&config_file, &config).unwrap();
@@ -597,7 +674,7 @@ async fn issues_certificates_from_pebble() {
 			Some(r.json::<Value>().await.unwrap_or_default())
 		}
 	};
-	for (port, name) in [(alpn_port, "alpn.example.test"), (p_http, "www.http.example.test"), (p_dns, "x.wild.example.test"), (p_deleg, "deleg.example.test"), (p_rest, "rest.example.test")] {
+	for (port, name) in [(alpn_port, "alpn.example.test"), (p_http, "www.http.example.test"), (p_dns, "x.wild.example.test"), (p_deleg, "deleg.example.test"), (p_rest, "rest.example.test"), (p_rfc, "rfc.example.test"), (p_rfc512, "rfc512.example.test")] {
 		wait_until(name, 90, &logs, || async {
 			get(format!("/rules/tcp/127.0.0.1/{port}")).await.is_some_and(|v| v["acme"][0]["state"] == "valid")
 		})
@@ -622,9 +699,45 @@ async fn issues_certificates_from_pebble() {
 	let calls = relay_calls.lock().unwrap().clone();
 	assert!(calls.iter().any(|c| c.starts_with("present _acme-challenge.rest.example.test ")), "{calls:?}");
 	assert!(calls.iter().any(|c| c.starts_with("cleanup _acme-challenge.rest.example.test ")), "{calls:?}");
+	// RFC 2136: HMAC-SHA256 into example.test, HMAC-SHA512 through the CNAME into challenges.test
+	assert!(log.contains(r#""provider":"rfc256","fqdn":"_acme-challenge.rfc.example.test","zone":"example.test""#), "{}", logs());
+	assert!(log.contains(r#""provider":"rfc512","fqdn":"rfc512.challenges.test","zone":"challenges.test""#), "{}", logs());
+
+	// a wrong TSIG key is refused by the server
+	use rproxy_api::acme::rfc2136;
+	let wrong = rfc2136::TsigKey { name: "rproxy-256".into(), algorithm: rfc2136::Algorithm::HmacSha256, secret: b"not-the-key".to_vec() };
+	let server: std::net::SocketAddr = format!("127.0.0.1:{}", pdns.dns).parse().unwrap();
+	let e = rfc2136::send(server, "example.test", &[rfc2136::Change::Add { name: "_acme-challenge.x.example.test", value: "x", ttl: 60 }], &wrong)
+		.await
+		.unwrap_err();
+	assert!(e.contains("refused"), "{e}");
+	assert!(pdns.txt("example.test").await.is_empty());
+
+	// acme-dns: the first order registers the name (kept 0600) and asks for the CNAME
+	let adns_file = dir.join("acme-dns.json");
+	wait_until("the acme-dns registration", 30, &logs, || async { adns_file.exists() && rp.log().contains("create the CNAME record _acme-challenge.adns.example.test") }).await;
+	use std::os::unix::fs::PermissionsExt;
+	assert_eq!(fs::metadata(&adns_file).unwrap().permissions().mode() & 0o777, 0o600);
+	let creds: Value = serde_json::from_slice(&fs::read(&adns_file).unwrap()).unwrap();
+	assert_eq!(creds["adns.example.test"]["fulldomain"], "b7f4.challenges.test");
+	pdns.call(
+		reqwest::Method::PATCH,
+		"/zones/example.test.",
+		Some(json!({"rrsets": [{"name": "_acme-challenge.adns.example.test.", "type": "CNAME", "ttl": 60, "changetype": "REPLACE", "records": [{"content": "b7f4.challenges.test.", "disabled": false}]}]})),
+	)
+	.await;
+	let r = unix_post(&socket, "/acme/renew", r#"{"resolver": "adns", "domains": ["adns.example.test"]}"#).await;
+	assert!(r.starts_with("HTTP/1.1 202"), "{r}");
+	wait_until("adns.example.test", 60, &logs, || async {
+		get(format!("/rules/tcp/127.0.0.1/{p_adns}")).await.is_some_and(|v| v["acme"][0]["state"] == "valid")
+	})
+	.await;
+	let log = rp.log();
+	for secret in [ADNS_PASSWORD, TSIG_256, TSIG_512] {
+		assert!(!log.contains(secret), "a secret in the log");
+	}
 
 	// files: 0600 keys, and no secret in any answer or the log
-	use std::os::unix::fs::PermissionsExt;
 	let key = dir.join("acme/accounts/test.key");
 	assert_eq!(fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
 	let acme = client.get(format!("http://127.0.0.1:{api}/acme")).bearer_auth("e2e-token").send().await.unwrap().text().await.unwrap();
@@ -632,7 +745,7 @@ async fn issues_certificates_from_pebble() {
 	let account_key = fs::read_to_string(&key).unwrap();
 	let key_body = account_key.lines().nth(1).unwrap();
 	for text in [&acme, &rules, &rp.log()] {
-		for secret in [PDNS_KEY, RELAY_SECRET, key_body] {
+		for secret in [PDNS_KEY, RELAY_SECRET, key_body, ADNS_PASSWORD, TSIG_256, TSIG_512] {
 			assert!(!text.contains(secret), "a secret leaked: {secret}");
 		}
 	}

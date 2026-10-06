@@ -204,7 +204,7 @@ For each rule you can choose how the content is handled (details in [docs/en/API
 | `starttls: smtp / imap / pop3` | rproxy answers the plaintext exchange before STARTTLS and terminates TLS |
 | `listen_port_end` | Forwards a whole port range (RTP, TURN relays, WebRTC media, FTP passive mode) |
 
-Certificates are specified as files, or obtained by rproxy itself through ACME (Let's Encrypt and others; HTTP-01, TLS-ALPN-01 and DNS-01 (PowerDNS, generic REST)): `{acme: <resolver>, domains: [...]}`, see [docs/en/ACME.md](docs/en/ACME.md). When a file changes it is reloaded automatically (`RPROXY_CERT_CHECK_SECS`), so certificates renewed by certbot or cert-manager are used as-is (you can also reload immediately with SIGHUP). Certificates obtained through ACME are renewed before they expire and swapped in the same way. Combined with `source_ip: proxy_v2`, the SNI, ALPN, and client certificate CN are passed to the target in PROXY v2 TLVs.
+Certificates are specified as files, or obtained by rproxy itself through ACME (Let's Encrypt and others; HTTP-01, TLS-ALPN-01 and DNS-01 (PowerDNS, RFC 2136, acme-dns, generic REST)): `{acme: <resolver>, domains: [...]}`, see [docs/en/ACME.md](docs/en/ACME.md). When a file changes it is reloaded automatically (`RPROXY_CERT_CHECK_SECS`), so certificates renewed by certbot or cert-manager are used as-is (you can also reload immediately with SIGHUP). Certificates obtained through ACME are renewed before they expire and swapped in the same way. Combined with `source_ip: proxy_v2`, the SNI, ALPN, and client certificate CN are passed to the target in PROXY v2 TLVs.
 
 ## CrowdSec
 
