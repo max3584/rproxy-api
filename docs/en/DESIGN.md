@@ -232,9 +232,9 @@ so implementing it first covers a wider range of uses.
 
 ---
 
-## 5. Known bugs
+## 5. Known bugs (as of 0.2, kept as a record)
 
-In priority order.
+In priority order. File locations are those of the code of 2026-09-25 (`829521a`), and all of these have been fixed (the current layout is under "Layout" in CLAUDE.md).
 
 | Location | Description |
 |---|---|

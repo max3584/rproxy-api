@@ -293,7 +293,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 ## Development
 
 ```bash
-cargo test     # unit tests and integration tests that use real sockets (tests/api.rs)
+cargo test     # unit tests (src/) and integration tests that use real sockets (tests/; listed in docs/en/TESTING.md)
 cargo clippy --all-targets
 ```
 
