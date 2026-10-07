@@ -119,6 +119,29 @@ fn yes() -> bool {
 pub struct Trial {
 	pub version: String,
 	pub started_at: u64,
+	/// Times the container stopped abruptly (SIGKILL, OOM) while this version was on trial;
+	/// at `MAX_INTERRUPTED` it counts as bad (security review M1).
+	#[serde(default, skip_serializing_if = "is_zero")]
+	pub interrupted: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+	*n == 0
+}
+
+/// Abrupt stops on trial before a version counts as bad: one could be anyone's
+/// `docker kill`, three in a row look like the version.
+pub const MAX_INTERRUPTED: u32 = 3;
+
+/// Takes versions off the bad list (`DELETE /admin/update/bad`, `rproxy-api update-clear-bad`):
+/// all of them, or `version`. Returns the ones taken off.
+pub fn clear_bad(cfg: &UpdateConfig, version: Option<Version>) -> Result<Vec<String>, String> {
+	cfg.update_state(|s| {
+		let (gone, kept): (Vec<String>, Vec<String>) =
+			s.bad.drain(..).partition(|b| version.is_none_or(|v| Version::parse(b) == Some(v)));
+		s.bad = kept;
+		gone
+	})
 }
 
 /// `<cache>/state.json`.
@@ -689,7 +712,7 @@ impl Updater {
 		}
 		let Some(upgrader) = self.upgrader.get() else { return Ok(fetched) };
 		let v = f.version;
-		self.cfg.update_state(|s| s.trial = Some(Trial { version: v.to_string(), started_at: unix_now() }))?;
+		self.cfg.update_state(|s| s.trial = Some(Trial { version: v.to_string(), started_at: unix_now(), interrupted: 0 }))?;
 		if let Err(e) = upgrader.start(Some(f.path.clone()), "self-update") {
 			self.cfg.update_state(|s| s.trial = None)?;
 			return Err(e);
@@ -826,7 +849,14 @@ mod tests {
 		// state: bad versions and promotion
 		mark_bad(&c, v, "test");
 		assert_eq!(c.load_state().bad, ["0.4.9"]);
-		c.update_state(|s| s.trial = Some(Trial { version: Version::own().to_string(), started_at: 1 })).unwrap();
+		// marks can be taken off (security review M1)
+		mark_bad(&c, Version::parse("0.4.8").unwrap(), "test");
+		assert_eq!(clear_bad(&c, Version::parse("0.4.8")).unwrap(), ["0.4.8"]);
+		assert_eq!(c.load_state().bad, ["0.4.9"]);
+		assert_eq!(clear_bad(&c, None).unwrap(), ["0.4.9"]);
+		assert!(c.load_state().bad.is_empty());
+		mark_bad(&c, v, "test");
+		c.update_state(|s| s.trial = Some(Trial { version: Version::own().to_string(), started_at: 1, interrupted: 0 })).unwrap();
 		promote(&c);
 		let s = c.load_state();
 		assert_eq!((s.trial, s.good), (None, Some(Version::own().to_string())));

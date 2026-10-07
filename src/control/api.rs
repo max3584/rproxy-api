@@ -81,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/config/plan", post(config_plan))
 		.route("/admin/upgrade", post(super::upgrade::upgrade))
 		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))
+		.route("/admin/update/bad", axum::routing::delete(super::upgrade::clear_bad))
 		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
 
 	Router::new()

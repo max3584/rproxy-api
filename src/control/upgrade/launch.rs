@@ -10,8 +10,12 @@
 //!   the old process drains and exits, and the successor is followed instead
 //!   (orphans come to this process: `PR_SET_CHILD_SUBREAPER`);
 //! - when the server exits, so does the launcher, with its status. A version on
-//!   trial (swapped in, not `RPROXY_UPDATE_HEALTHY` yet) that exits is marked
-//!   bad and the previous good version is started instead (rollback).
+//!   trial (swapped in, not `RPROXY_UPDATE_HEALTHY` yet) that exits on its own is
+//!   marked bad and the previous good version is started instead (rollback). One
+//!   stopped by a signal to the launcher (docker stop, a rolling restart) is not:
+//!   its trial ends, and it is tried again on the next start. A trial cut short
+//!   without the launcher seeing it (SIGKILL, OOM of the container) counts against
+//!   the version only `MAX_INTERRUPTED` times in a row (security review M1).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -20,7 +24,7 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use super::update::{mark_bad, Fetcher, Trial, UpdateConfig, Version};
+use super::update::{mark_bad, Fetcher, Trial, UpdateConfig, Version, MAX_INTERRUPTED};
 use super::UpdateMode;
 
 /// The binary the launcher starts, and whether it is on trial.
@@ -49,10 +53,19 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 		}
 	};
 	let _ = std::fs::create_dir_all(&cfg.cache);
-	// a version still on trial did not last: it never became good
-	let stale = cfg.load_state().trial;
-	if let Some(t) = stale.and_then(|t| Version::parse(&t.version)) {
-		mark_bad(cfg, t, "it stopped before RPROXY_UPDATE_HEALTHY");
+	// a version still on trial: the container stopped without the launcher seeing it
+	// (SIGKILL, OOM); counted, and bad only when it keeps happening
+	let mut interrupted = 0;
+	if let Some(t) = cfg.load_state().trial {
+		if let Some(v) = Version::parse(&t.version) {
+			interrupted = t.interrupted + 1;
+			if interrupted >= MAX_INTERRUPTED {
+				mark_bad(cfg, v, &format!("stopped {interrupted} times before RPROXY_UPDATE_HEALTHY"));
+				interrupted = 0;
+			} else {
+				warn!(event = "update.interrupted", version = %v, times = interrupted, "the trial of this version was cut short; trying it again");
+			}
+		}
 	}
 	let bad = cfg.load_state().bad;
 	let is_bad = |v: &Version| bad.iter().any(|b| Version::parse(b) == Some(*v));
@@ -75,7 +88,13 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 				// not known to be good yet: on trial until RPROXY_UPDATE_HEALTHY
 				if cfg.load_state().good.as_deref().and_then(Version::parse) != Some(v) {
 					let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-					let _ = cfg.update_state(|s| s.trial = Some(Trial { version: v.to_string(), started_at: now }));
+					let _ = cfg.update_state(|s| {
+						// the count goes on for the same version only
+						let count = if s.trial.as_ref().is_some_and(|t| t.version == v.to_string()) { interrupted } else { 0 };
+						s.trial = Some(Trial { version: v.to_string(), started_at: now, interrupted: count });
+					});
+				} else {
+					let _ = cfg.update_state(|s| s.trial = None);
 				}
 				return Ok(Choice { exe, version: v });
 			}
@@ -85,6 +104,7 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 	if let Some(pin) = cfg.pin.filter(|p| *p != image.version) {
 		warn!(event = "update.error", version = %pin, "the pinned version is not available; running the image's version");
 	}
+	let _ = cfg.update_state(|s| s.trial = None);
 	Ok(image)
 }
 
@@ -210,6 +230,9 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 					}
 					let code = exit_code(status);
 					if stopping {
+						// stopped by us (docker stop, a rolling restart): proves nothing about
+						// the version; its trial ends and it is tried again next time
+						let _ = cfg.update_state(|s| s.trial = None);
 						return Ok(code);
 					}
 					// a version on trial that stops is rolled back

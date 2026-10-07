@@ -223,6 +223,14 @@ enum Command {
 		#[arg(long, env = "RPROXY_ACME_HELPER_ALLOW_USER", value_delimiter = ',')]
 		allow_user: Vec<String>,
 	},
+	/// Lets versions the self-update marked bad be chosen again (v0.4, security
+	/// review M1): all of them, or --version. Edits the cache's state
+	/// (RPROXY_UPDATE_CACHE); the same as DELETE /admin/update/bad
+	UpdateClearBad {
+		/// Only this version (X.Y.Z)
+		#[arg(long)]
+		version: Option<String>,
+	},
 }
 
 /// A user name or uid.
@@ -357,6 +365,29 @@ fn upgrade_options(opts: &Options) -> rproxy_api::control::upgrade::UpgradeOptio
 	}
 }
 
+/// `rproxy-api update-clear-bad` (security review M1).
+fn update_clear_bad(opts: &Options, version: Option<&str>) -> ExitCode {
+	let version = match version.map(|v| rproxy_api::control::upgrade::update::Version::parse(v).ok_or(v)) {
+		Some(Err(v)) => {
+			eprintln!("rproxy-api: version {v:?} is not X.Y.Z");
+			return ExitCode::FAILURE;
+		}
+		Some(Ok(v)) => Some(v),
+		None => None,
+	};
+	let cfg = upgrade_options(opts).update_config();
+	match rproxy_api::control::upgrade::update::clear_bad(&cfg, version) {
+		Ok(cleared) => {
+			println!("{}", serde_json::json!({"cleared": cleared}));
+			ExitCode::SUCCESS
+		}
+		Err(e) => {
+			eprintln!("rproxy-api: {e}");
+			ExitCode::FAILURE
+		}
+	}
+}
+
 /// `rproxy-api launch` (#174): the container's entry point.
 fn launch(opts: &Options) -> ExitCode {
 	let _guard = match logging::init(&opts.log_level, None, opts.log_keep) {
@@ -480,6 +511,9 @@ fn main() -> ExitCode {
 	let opts = Options::parse();
 	if let Some(Command::Launch { .. }) = &opts.command {
 		return launch(&opts);
+	}
+	if let Some(Command::UpdateClearBad { version }) = &opts.command {
+		return update_clear_bad(&opts, version.as_deref());
 	}
 	if opts.command.is_some() {
 		return acme_helper(&opts);
