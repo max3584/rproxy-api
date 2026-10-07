@@ -1271,10 +1271,8 @@ impl Conn {
 			Sender::Http1(s) => s,
 			// protocol: auto, and the server picked HTTP/2 by ALPN
 			Sender::Http2(h2) => {
-				if pooled {
-					*server.h2_sender().await = Some(h2.clone());
-				}
-				return self.h2_request(h2, server, req, sent, response_limit).await;
+				let hold = pooled.then(|| server.h2_add(h2.clone()));
+				return self.h2_request(h2, server, req, sent, response_limit, service.connect, hold).await;
 			}
 		};
 		let resp = within(response_limit, sent, sender.send_request(req))
@@ -1290,21 +1288,29 @@ impl Conn {
 		if req.headers().contains_key(header::UPGRADE) {
 			return Err(Failure::Status(StatusCode::BAD_GATEWAY, "an upgrade cannot go to an HTTP/2 backend".into()));
 		}
-		let sender = if self.rt.bind_as(self.client).is_none() {
-			let mut slot = server.h2_sender().await;
-			match slot.as_ref() {
-				Some(s) => s.clone(),
-				None => {
-					let s = self.connect_h2(router, service, index).await?;
-					*slot = Some(s.clone());
-					s
+		// connections from the client's address (transparent) are not shared
+		let (sender, hold) = if self.rt.bind_as(self.client).is_none() {
+			match server.h2_take() {
+				backend::H2Pick::Use(s, hold) => (s, Some(hold)),
+				// one opens at a time; the others look again once it is there. Requests with
+				// room on a kept connection never wait for this (security review L15)
+				backend::H2Pick::Open => {
+					let _opening = server.h2_opening.lock().await;
+					match server.h2_take() {
+						backend::H2Pick::Use(s, hold) => (s, Some(hold)),
+						backend::H2Pick::Open => {
+							let s = self.connect_h2(router, service, index).await?;
+							let hold = server.h2_add(s.clone());
+							(s, Some(hold))
+						}
+					}
 				}
 			}
 		} else {
-			self.connect_h2(router, service, index).await?
+			(self.connect_h2(router, service, index).await?, None)
 		};
 		let (req, sent) = until_sent(req);
-		self.h2_request(sender, server, req, sent, limit).await
+		self.h2_request(sender, server, req, sent, limit, service.connect, hold).await
 	}
 
 	async fn connect_h2(&self, router: &Router, service: &Service, index: usize) -> Result<hyper::client::conn::http2::SendRequest<Body>, Failure> {
@@ -1314,6 +1320,11 @@ impl Conn {
 		}
 	}
 
+	/// One request on an HTTP/2 connection. A request with a body must get a stream
+	/// (its body starts being read) within `stream_wait`: on a connection whose streams
+	/// are all taken it would wait for ever, and the response clock (`within`) only
+	/// starts once the body has been sent (security review M6).
+	#[allow(clippy::too_many_arguments)]
 	async fn h2_request(
 		&self,
 		mut sender: hyper::client::conn::http2::SendRequest<Body>,
@@ -1321,17 +1332,37 @@ impl Conn {
 		req: Request<Body>,
 		sent: Option<tokio::sync::watch::Receiver<bool>>,
 		limit: std::time::Duration,
+		stream_wait: std::time::Duration,
+		hold: Option<Hold>,
 	) -> Result<Response<Body>, Failure> {
 		let trailers = req.extensions().get::<backend::WantsTrailers>().is_some();
 		let req = backend::to_h2(req, server.https, trailers);
-		let resp = within(limit, sent, async {
-			sender.ready().await?;
-			sender.send_request(req).await
-		})
-		.await
-		.ok_or_else(|| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))?
-		.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
-		Ok(resp.map(|b| b.map_err(boxed_error).boxed()))
+		let (req, started) = if req.body().is_end_stream() {
+			(req, None)
+		} else {
+			let (tx, rx) = tokio::sync::watch::channel(false);
+			(req.map(|inner| StartSignal { inner, started: Some(tx) }.boxed()), Some(rx))
+		};
+		let fut = async {
+			tokio::time::timeout(stream_wait, sender.ready())
+				.await
+				.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "the HTTP/2 connection did not get ready".into()))?
+				.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
+			sender.send_request(req).await.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))
+		};
+		tokio::pin!(fut);
+		if let Some(mut started) = started {
+			tokio::select! {
+				out = &mut fut => return out.map(|resp| hold_body(resp, hold)),
+				waited = tokio::time::timeout(stream_wait, started.wait_for(|s| *s)) => {
+					if waited.is_err() {
+						return Err(Failure::Status(StatusCode::GATEWAY_TIMEOUT, "no HTTP/2 stream became free".into()));
+					}
+				}
+			}
+		}
+		let resp = within(limit, sent, fut).await.ok_or_else(|| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))??;
+		Ok(hold_body(resp, hold))
 	}
 
 	fn returning(&self, resp: Response<Incoming>, sender: SendRequest<Body>, service: &Arc<Service>, index: usize, keep: bool) -> Response<Body> {
@@ -1415,6 +1446,62 @@ async fn within<T>(
 		}
 	}
 	tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// An HTTP/2 response whose body keeps `hold` (the stream counted on its connection) until it ends.
+fn hold_body(resp: Response<Incoming>, hold: Option<Hold>) -> Response<Body> {
+	match hold {
+		Some(hold) => resp.map(|b| Holding { inner: b.map_err(boxed_error).boxed(), _hold: hold }.boxed()),
+		None => resp.map(|b| b.map_err(boxed_error).boxed()),
+	}
+}
+
+struct Holding {
+	inner: Body,
+	_hold: Hold,
+}
+
+impl hyper::body::Body for Holding {
+	type Data = Bytes;
+	type Error = BoxError;
+
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+		Pin::new(&mut self.inner).poll_frame(cx)
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
+	}
+}
+
+/// A request body that signals when it is first read (its HTTP/2 stream is open).
+struct StartSignal {
+	inner: Body,
+	started: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl hyper::body::Body for StartSignal {
+	type Data = Bytes;
+	type Error = BoxError;
+
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+		if let Some(tx) = self.started.take() {
+			let _ = tx.send(true);
+		}
+		Pin::new(&mut self.inner).poll_frame(cx)
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
+	}
 }
 
 /// A request body that signals when it has been read to the end.

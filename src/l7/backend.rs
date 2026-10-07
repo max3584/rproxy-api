@@ -77,8 +77,12 @@ pub struct Server {
 	pub status: Option<StatusCode>,
 	/// `middlewares` of this server (#229), run after the route's.
 	pub middlewares: Vec<Arc<Middleware>>,
-	/// The shared HTTP/2 connection (#233); taken under the lock while connecting.
-	h2: tokio::sync::Mutex<Option<http2::SendRequest<Body>>>,
+	/// The HTTP/2 connections (#233): another is opened when every one carries
+	/// `H2_STREAMS_PER_CONN` requests, up to `H2_MAX_CONNS` (security review M6).
+	h2: Mutex<Vec<H2Conn>>,
+	/// Held while an HTTP/2 connection is being opened: requests that need a new one
+	/// wait for it (one opening at a time); those with room on a kept one do not.
+	pub h2_opening: tokio::sync::Mutex<()>,
 	/// `protocol: auto`: what the server picked by ALPN (0 not known yet, 1 HTTP/1.1, 2 HTTP/2).
 	alpn: std::sync::atomic::AtomicU8,
 }
@@ -114,18 +118,42 @@ impl Server {
 			idle: Mutex::new(vec![]),
 			status: None,
 			middlewares: vec![],
-			h2: tokio::sync::Mutex::new(None),
+			h2: Mutex::new(vec![]),
+			h2_opening: tokio::sync::Mutex::new(()),
 			alpn: Default::default(),
 		})
 	}
 
-	/// The kept HTTP/2 connection, if it is still open.
-	pub async fn h2_sender(&self) -> tokio::sync::MutexGuard<'_, Option<http2::SendRequest<Body>>> {
-		let mut slot = self.h2.lock().await;
-		if slot.as_ref().is_some_and(|s| s.is_closed()) {
-			*slot = None;
+	/// A kept HTTP/2 connection with room for one more request, counted while the
+	/// returned hold lives. None: open another (`h2_add`) or wait.
+	pub fn h2_take(&self) -> H2Pick {
+		let mut conns = self.h2.lock().unwrap_or_else(|e| e.into_inner());
+		conns.retain(|c| !c.sender.is_closed());
+		if let Some(c) = conns.iter().min_by_key(|c| c.streams.load(Ordering::Relaxed)).filter(|c| c.streams.load(Ordering::Relaxed) < H2_STREAMS_PER_CONN) {
+			return H2Pick::Use(c.sender.clone(), crate::l7::middleware::limit::Hold::counting(c.streams.clone()));
 		}
-		slot
+		if conns.len() < H2_MAX_CONNS {
+			H2Pick::Open
+		} else {
+			// all full: the least busy one; the request waits for a stream (bounded by the caller)
+			match conns.iter().min_by_key(|c| c.streams.load(Ordering::Relaxed)) {
+				Some(c) => H2Pick::Use(c.sender.clone(), crate::l7::middleware::limit::Hold::counting(c.streams.clone())),
+				None => H2Pick::Open,
+			}
+		}
+	}
+
+	/// Keeps a new HTTP/2 connection; the hold counts the request that opened it.
+	pub fn h2_add(&self, sender: http2::SendRequest<Body>) -> crate::l7::middleware::limit::Hold {
+		let streams: Arc<AtomicU64> = Arc::default();
+		let hold = crate::l7::middleware::limit::Hold::counting(streams.clone());
+		self.h2.lock().unwrap_or_else(|e| e.into_inner()).push(H2Conn { sender, streams });
+		hold
+	}
+
+	/// Open HTTP/2 connections (tests).
+	pub fn h2_conns(&self) -> usize {
+		self.h2.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|c| !c.sender.is_closed()).count()
 	}
 
 	/// `protocol: auto`: the server picked HTTP/2 by ALPN on the last connection.
@@ -527,6 +555,25 @@ pub async fn handshake(
 		}
 	}));
 	Ok(Sender::Http1(sender))
+}
+
+/// Requests on one HTTP/2 connection before another is opened (below the usual
+/// SETTINGS_MAX_CONCURRENT_STREAMS of 100-250).
+pub const H2_STREAMS_PER_CONN: u64 = 100;
+/// HTTP/2 connections per server at most.
+pub const H2_MAX_CONNS: usize = 8;
+
+/// One kept HTTP/2 connection and the requests it carries now.
+#[derive(Debug)]
+struct H2Conn {
+	sender: http2::SendRequest<Body>,
+	streams: Arc<AtomicU64>,
+}
+
+/// What `Server::h2_take` found.
+pub enum H2Pick {
+	Use(http2::SendRequest<Body>, crate::l7::middleware::limit::Hold),
+	Open,
 }
 
 /// Pings on an idle HTTP/2 connection, so one the server or a middlebox dropped is noticed.

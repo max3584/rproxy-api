@@ -658,3 +658,63 @@ async fn client_certificate_headers_never_pass_without_client_auth() {
 	let v: Value = serde_json::from_slice(&body).unwrap();
 	assert!(received(&v, "x-client-verify").is_empty() && received(&v, "x-forwarded-client-cert").is_empty(), "{v}");
 }
+
+/// An h2c backend that takes `streams` requests at once (SETTINGS_MAX_CONCURRENT_STREAMS);
+/// `/slow` answers after 1.5 s. The second value counts its connections.
+async fn h2c_limited(streams: u32) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let count = conns.clone();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { return };
+			count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			tokio::spawn(async move {
+				let service = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					if req.uri().path() == "/slow" {
+						tokio::time::sleep(Duration::from_millis(1500)).await;
+					}
+					let _ = req.into_body().collect().await;
+					Ok::<_, std::convert::Infallible>(hyper::Response::new(boxed(Full::new(Bytes::from_static(b"ok")).map_err(|never| match never {}))))
+				});
+				let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+					.max_concurrent_streams(streams)
+					.serve_connection(TokioIo::new(tcp), service)
+					.await;
+			});
+		}
+	});
+	(addr, conns)
+}
+
+#[tokio::test]
+async fn http2_backends_do_not_stall_when_their_streams_are_taken() {
+	// security review M6: a request waiting for a stream gives up after timeouts.connect
+	let (b, _) = h2c_limited(1).await;
+	let s = h2_setup("sem-h2-streams", json!({"g": {"protocol": "h2c", "servers": [{"url": format!("http://{b}")}], "timeouts": {"connect": "300ms"}}})).await;
+	let mut h2 = s.h2().await;
+	let mut slow = h2.clone();
+	let first = tokio::spawn(async move { h2_send(&mut slow, hyper::Request::get("https://a.test/g/slow").body(empty()).unwrap()).await.0 });
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let started = std::time::Instant::now();
+	let req = hyper::Request::post("https://a.test/g/x").body(boxed(Full::new(Bytes::from_static(b"body")).map_err(|never| match never {}))).unwrap();
+	let (status, _, _) = h2_send(&mut h2, req).await;
+	assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "no stream within timeouts.connect");
+	assert!(started.elapsed() < Duration::from_millis(1200), "{:?}", started.elapsed());
+	assert_eq!(first.await.unwrap(), StatusCode::OK);
+
+	// past H2_STREAMS_PER_CONN requests at once, another connection is opened
+	let (b, conns) = h2c_limited(1000).await;
+	let s = h2_setup("sem-h2-conns", json!({"g": {"protocol": "h2c", "servers": [{"url": format!("http://{b}")}]}})).await;
+	let h2 = s.h2().await;
+	let mut tasks = vec![];
+	for _ in 0..150 {
+		let mut sender = h2.clone();
+		tasks.push(tokio::spawn(async move { h2_send(&mut sender, hyper::Request::get("https://a.test/g/slow").body(empty()).unwrap()).await.0 }));
+	}
+	for t in tasks {
+		assert_eq!(t.await.unwrap(), StatusCode::OK);
+	}
+	assert_eq!(conns.load(std::sync::atomic::Ordering::SeqCst), 2, "100 streams on the first, the rest on a second");
+}
