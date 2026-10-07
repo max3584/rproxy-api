@@ -238,6 +238,7 @@ impl Service {
 			pass_host_header: None,
 			timeouts: None,
 			balance: Default::default(),
+			outlier_detection: None,
 		};
 		Service::compile(url, &spec)
 	}

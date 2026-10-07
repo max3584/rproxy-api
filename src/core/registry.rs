@@ -164,6 +164,8 @@ impl Entry {
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
 					denied: s.denied.load(Ordering::Relaxed),
 					dropped: s.dropped.load(Ordering::Relaxed),
+					limited: None,
+					counters_since: None,
 					http: r.spec.http.is_some().then(|| {
 						let mut v = crate::l7::access::HttpStatsView::from_stats(&r.rt.http_stats);
 						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
@@ -829,8 +831,24 @@ impl Registry {
 		if let Some(h) = &spec.http {
 			crate::core::rule::check_http_tls(&spec.tls, spec.source_ip, h)?;
 		}
+		// v0.4: each replaces the current value when present (`{}` removes it)
+		if let Some(labels) = req.labels {
+			spec.labels = labels;
+		}
+		let v04 = crate::core::rule::V04Settings {
+			limits: req.limits.or_else(|| spec.limits.take()),
+			bandwidth: req.bandwidth.or_else(|| spec.bandwidth.take()),
+			geoip: req.geoip.or_else(|| spec.geoip.take()),
+			outlier_detection: req.outlier_detection.or_else(|| spec.outlier_detection.take()),
+		}
+		.validate(key.protocol, spec.http.is_some(), &spec.labels)?;
+		spec.limits = v04.limits;
+		spec.bandwidth = v04.bandwidth;
+		spec.geoip = v04.geoip;
+		spec.outlier_detection = v04.outlier_detection;
 		// whatever was replaced, the rule must stay within what this build can run
 		self.caps().features.check(&spec.tls, spec.http.as_ref())?;
+		self.caps().features.check_v04(&spec)?;
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), &self.caps())?;
 		}
@@ -1224,6 +1242,7 @@ impl Registry {
 				out.errors.push((label, format!("{} would take the control API ({api})", spec.key)));
 				continue;
 			}
+			let missing_reported = missing.is_some();
 			if let Some(missing) = missing {
 				out.warnings.push((
 					label.clone(),
@@ -1232,6 +1251,8 @@ impl Registry {
 			}
 			match self.build_parts(&spec) {
 				Ok(_) => out.ok += 1,
+				// the part this build cannot run is the warning above
+				Err(e) if missing_reported && e.code == "unsupported" => {}
 				Err(e) => out.errors.push((label.clone(), e.message)),
 			}
 			specs.push((spec, label));

@@ -91,6 +91,20 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | Maximum size of the port range one rule can open |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | Interval (seconds) for re-resolving target host names. If resolution fails, the previous result continues to be used |
 
+Added in v0.4 (shape only; until implemented, setting them logs `degraded` and they are ignored, except client certificates for the control API, which stop the startup. "v0.4 settings" in docs/en/API.md):
+
+| Environment variable | Flag | Default | Description |
+|---|---|---|---|
+| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | none | CA (PEM) verifying control API client certificates (#167) |
+| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | `none`, `optional`, `required` (#167) |
+| `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | Days before a token's expiry from which `token.expiring` is logged (#167) |
+| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | Lock out sources that keep failing authentication (`0`: never) (#167) |
+| `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules` (#144) |
+| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174) |
+| `RPROXY_UPDATE` | `--update` | `off` | Self-update: `off`, `check`, `auto` (#174); also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY` |
+| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | number of CPUs / `none` / `0` | Performance (#194; `global.performance` in the settings file wins) |
+| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | — | `--check-config --diff`: difference from the running rproxy (#169) |
+
 If `RPROXY_API_ADDR` includes a non-loopback address, a token file and a TLS certificate are required. If any of them is missing, rproxy does not start.
 
 ### When some parts cannot start

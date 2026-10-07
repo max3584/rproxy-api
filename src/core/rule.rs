@@ -6,6 +6,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::core::balance::{self, Balance, HealthCheckSpec, TargetSpec};
+use crate::core::bandwidth::BandwidthSpec;
+use crate::core::limits::LimitsSpec;
+use crate::core::outlier::L4OutlierSpec;
+use crate::core::ruleset::Labels;
+use crate::net::geoip::GeoipSpec;
 use crate::net::cidr::{self, Cidr};
 use crate::error::ApiError;
 use crate::l7::HttpSpec;
@@ -119,9 +124,10 @@ impl Default for Caps {
 	}
 }
 
-/// Which of the v0.3 settings (docs/DESIGN-v0.3.md) this build can run.
-/// Reported in `GET /capabilities` as `features`; a rule that uses anything
-/// else is refused with `unsupported`. Patch releases turn these on.
+/// Which of the v0.3 / v0.4 settings (docs/DESIGN-v0.3.md, docs/DESIGN-v0.4.md)
+/// this build can run. Reported in `GET /capabilities` as `features`; a rule
+/// that uses anything else is refused with `unsupported`. The implementation
+/// of each item turns its flag on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Features {
 	/// L7 routing (`http` in a rule)
@@ -133,8 +139,41 @@ pub struct Features {
 	pub tls_options: bool,
 	/// Middleware kinds (`http.middlewares`) that can run
 	pub middlewares: &'static [&'static str],
-	/// Options of `http.services` that can run (`health_check`, `sticky`, `balance`)
+	/// Options of `http.services` that can run (`health_check`, `sticky`, `balance`, `outlier_detection`)
 	pub services: &'static [&'static str],
+	// v0.4 (docs/DESIGN-v0.4.md)
+	/// `PUT /rulesets/{name}` and the other rule set endpoints (#28)
+	pub rulesets: bool,
+	/// `labels` of a rule (#28, #166)
+	pub labels: bool,
+	/// `conditions` in the rule view (#28)
+	pub conditions: bool,
+	/// `GET /readyz` (#28)
+	pub readyz: bool,
+	/// `limits` of a rule (#165)
+	pub limits: bool,
+	/// `bandwidth` of a rule (#166)
+	pub bandwidth: bool,
+	/// `geoip` of a rule and `global.geoip` (#168; the middleware is in `middlewares`)
+	pub geoip: bool,
+	/// `outlier_detection` of an L4 rule (#170; services' is in `services`)
+	pub outlier_detection: bool,
+	/// `dry_run`, `POST /config/plan`, `--check-config --diff` (#169)
+	pub dry_run: bool,
+	/// Storing API-created rules in `rproxy_rules` (#144)
+	pub persistence: bool,
+	/// Client certificates for the control API (#167)
+	pub client_cert_auth: bool,
+	/// `token.expiring` / `token.expired` (#167)
+	pub token_expiry: bool,
+	/// Locking out sources that keep failing authentication (#167)
+	pub api_lockout: bool,
+	/// Live upgrade by handing the sockets over (#174)
+	pub handoff: bool,
+	/// Container self-update (#174)
+	pub self_update: bool,
+	/// Keys of `global.performance` applied from the settings file (#194, #184)
+	pub performance: &'static [&'static str],
 }
 
 impl Features {
@@ -150,6 +189,22 @@ impl Features {
 			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 		],
 		services: &["health_check", "sticky", "balance"],
+		rulesets: false,
+		labels: false,
+		conditions: false,
+		readyz: false,
+		limits: false,
+		bandwidth: false,
+		geoip: false,
+		outlier_detection: false,
+		dry_run: false,
+		persistence: false,
+		client_cert_auth: false,
+		token_expiry: false,
+		api_lockout: false,
+		handoff: false,
+		self_update: false,
+		performance: &[],
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -162,9 +217,25 @@ impl Features {
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "rate_limit", "in_flight", "crowdsec", "ip_allow", "headers",
 			"forward_auth", "oidc", "basic_auth", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
-			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond",
+			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond", "geoip",
 		],
-		services: &["health_check", "sticky", "balance"],
+		services: &["health_check", "sticky", "balance", "outlier_detection"],
+		rulesets: true,
+		labels: true,
+		conditions: true,
+		readyz: true,
+		limits: true,
+		bandwidth: true,
+		geoip: true,
+		outlier_detection: true,
+		dry_run: true,
+		persistence: true,
+		client_cert_auth: true,
+		token_expiry: true,
+		api_lockout: true,
+		handoff: true,
+		self_update: true,
+		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -189,7 +260,11 @@ impl Features {
 				return missing(&format!("the {kind} middleware"));
 			}
 			for (name, s) in &h.services {
-				for (option, used) in [("health_check", s.health_check.is_some()), ("sticky", s.sticky.is_some())] {
+				for (option, used) in [
+					("health_check", s.health_check.is_some()),
+					("sticky", s.sticky.is_some()),
+					("outlier_detection", s.outlier_detection.is_some()),
+				] {
 					if used && !self.services.contains(&option) {
 						return missing(&format!("service {name}: {option}"));
 					}
@@ -197,6 +272,62 @@ impl Features {
 			}
 		}
 		Ok(())
+	}
+
+	/// The first v0.4 setting of a rule (docs/DESIGN-v0.4.md) that this build cannot run.
+	pub fn check_v04(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+		for (what, used, available) in [
+			("labels", !spec.labels.is_empty(), self.labels),
+			("limits", spec.limits.is_some(), self.limits),
+			("bandwidth", spec.bandwidth.is_some(), self.bandwidth),
+			("geoip", spec.geoip.is_some(), self.geoip),
+			("outlier_detection", spec.outlier_detection.is_some(), self.outlier_detection),
+		] {
+			if used && !available {
+				return Err(ApiError::unsupported(format!(
+					"{what} is not available in this version (see GET /capabilities features)"
+				)));
+			}
+		}
+		Ok(())
+	}
+}
+
+/// The v0.4 settings of a rule (docs/DESIGN-v0.4.md), validated; `{}` (no
+/// limits, no lists) becomes `None`.
+#[derive(Clone, Debug, Default)]
+pub struct V04Settings {
+	pub limits: Option<LimitsSpec>,
+	pub bandwidth: Option<BandwidthSpec>,
+	pub geoip: Option<GeoipSpec>,
+	pub outlier_detection: Option<L4OutlierSpec>,
+}
+
+impl V04Settings {
+	pub fn validate(self, protocol: Protocol, http: bool, labels: &Labels) -> Result<V04Settings, ApiError> {
+		crate::core::ruleset::validate_labels(labels)?;
+		let limits = self.limits.filter(|l| !l.is_empty());
+		if let Some(l) = &limits {
+			l.validate(protocol)?;
+		}
+		let bandwidth = self.bandwidth.filter(|b| !b.is_empty());
+		if let Some(b) = &bandwidth {
+			b.validate()?;
+		}
+		let geoip = self.geoip.filter(|g| !g.is_empty());
+		if let Some(g) = &geoip {
+			g.validate("geoip")?;
+		}
+		let outlier_detection = self.outlier_detection.filter(|o| !o.is_empty());
+		if let Some(o) = &outlier_detection {
+			if http {
+				return Err(ApiError::invalid(
+					"outlier_detection of a rule is not used with http; use http.services.<name>.outlier_detection",
+				));
+			}
+			o.validate()?;
+		}
+		Ok(V04Settings { limits, bandwidth, geoip, outlier_detection })
 	}
 }
 
@@ -243,6 +374,21 @@ pub struct RuleRequest {
 	/// after accepting them, before TLS (UDP: drop their datagrams).
 	#[serde(default)]
 	pub crowdsec: bool,
+	/// Free-form marks (owner, tenant, controller) shown in logs and `/metrics` (#28, #166).
+	#[serde(default)]
+	pub labels: Labels,
+	/// Connection / datagram limits, whole rule and per source (#165).
+	#[serde(default)]
+	pub limits: Option<LimitsSpec>,
+	/// Bandwidth limits, whole rule and per source (#166).
+	#[serde(default)]
+	pub bandwidth: Option<BandwidthSpec>,
+	/// Country / ASN allow and deny lists, checked right after accepting (#168).
+	#[serde(default)]
+	pub geoip: Option<GeoipSpec>,
+	/// Passive health checks of the targets (#170).
+	#[serde(default)]
+	pub outlier_detection: Option<L4OutlierSpec>,
 }
 
 /// Where a rule came from.
@@ -254,6 +400,8 @@ pub enum Origin {
 	Dynamic,
 	/// From the static rules file; the API cannot change it.
 	Static,
+	/// Created through the API and stored in rproxy's own table (#144, v0.4).
+	Api,
 }
 
 /// A validated rule.
@@ -279,6 +427,11 @@ pub struct RuleSpec {
 	pub allow_from: Vec<Cidr>,
 	pub http: Option<HttpSpec>,
 	pub crowdsec: bool,
+	pub labels: Labels,
+	pub limits: Option<LimitsSpec>,
+	pub bandwidth: Option<BandwidthSpec>,
+	pub geoip: Option<GeoipSpec>,
+	pub outlier_detection: Option<L4OutlierSpec>,
 	pub origin: Origin,
 }
 
@@ -512,6 +665,13 @@ impl RuleRequest {
 			check_http_tls(&tls, self.source_ip, http)?;
 			http.validate()?;
 		}
+		let v04 = V04Settings {
+			limits: self.limits,
+			bandwidth: self.bandwidth,
+			geoip: self.geoip,
+			outlier_detection: self.outlier_detection,
+		}
+		.validate(self.protocol, self.http.is_some(), &self.labels)?;
 		caps.features.check(&tls, self.http.as_ref())?;
 		match (self.protocol, self.source_ip) {
 			(Protocol::Udp, SourceIp::ProxyV1) => {
@@ -551,11 +711,17 @@ impl RuleRequest {
 			allow_from,
 			http: self.http,
 			crowdsec: self.crowdsec,
+			labels: self.labels,
+			limits: v04.limits,
+			bandwidth: v04.bandwidth,
+			geoip: v04.geoip,
+			outlier_detection: v04.outlier_detection,
 			origin: Origin::Dynamic,
 		};
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), caps)?;
 		}
+		caps.features.check_v04(&spec)?;
 		Ok(spec)
 	}
 }
@@ -589,6 +755,12 @@ pub struct UpdateRequest {
 	pub crowdsec: Option<bool>,
 	/// Replaces the extra listen addresses when present (`[]` removes them all).
 	pub extra_listen_addrs: Option<Vec<String>>,
+	/// v0.4: each replaces the current value when present (`{}` removes it).
+	pub labels: Option<Labels>,
+	pub limits: Option<LimitsSpec>,
+	pub bandwidth: Option<BandwidthSpec>,
+	pub geoip: Option<GeoipSpec>,
+	pub outlier_detection: Option<L4OutlierSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -609,6 +781,12 @@ pub struct RuleStats {
 	pub denied: u64,
 	/// UDP datagrams rproxy dropped (a session's queue full, or sending failed).
 	pub dropped: u64,
+	/// Connections / datagrams refused by `limits` (#165, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub limited: Option<u64>,
+	/// When these counters started, in Unix seconds; kept over a handoff (#166, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub counters_since: Option<u64>,
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::l7::access::HttpStatsView>,
@@ -645,7 +823,30 @@ pub struct RuleView {
 	pub http: Option<HttpSpec>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub crowdsec: bool,
+	#[serde(skip_serializing_if = "Labels::is_empty")]
+	pub labels: Labels,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub limits: Option<LimitsSpec>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub bandwidth: Option<BandwidthSpec>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub geoip: Option<GeoipSpec>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub outlier_detection: Option<L4OutlierSpec>,
 	pub origin: Origin,
+	/// The rule set (`PUT /rulesets/{name}`) the rule belongs to (#28, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ruleset: Option<String>,
+	/// Gateway API style conditions (#28, v0.4).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub conditions: Vec<crate::core::ruleset::Condition>,
+	/// Whether the rule is stored in `rproxy_rules`, by whom and when (#144, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub persisted: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub created_by: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub created_at: Option<u64>,
 	pub state: State,
 	pub error: Option<String>,
 	pub resolved: Vec<String>,
@@ -688,7 +889,17 @@ impl RuleView {
 			allow_from: spec.allow_from.iter().map(|c| c.to_string()).collect(),
 			http: spec.http.clone(),
 			crowdsec: spec.crowdsec,
+			labels: spec.labels.clone(),
+			limits: spec.limits.clone(),
+			bandwidth: spec.bandwidth.clone(),
+			geoip: spec.geoip.clone(),
+			outlier_detection: spec.outlier_detection.clone(),
 			origin: spec.origin,
+			ruleset: None,
+			conditions: vec![],
+			persisted: None,
+			created_by: None,
+			created_at: None,
 			state,
 			error,
 			resolved: resolved.iter().map(|a| a.to_string()).collect(),
@@ -727,6 +938,11 @@ mod tests {
 			allow_from: vec![],
 			http: None,
 			crowdsec: false,
+			labels: Default::default(),
+			limits: None,
+			bandwidth: None,
+			geoip: None,
+			outlier_detection: None,
 		}
 	}
 

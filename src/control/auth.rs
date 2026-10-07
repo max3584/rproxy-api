@@ -43,12 +43,14 @@ pub struct Principal {
 	scopes: Vec<Scope>,
 	/// Listen ports the token may create, change or delete rules on.
 	ports: Option<(u16, u16)>,
+	/// Rules this token creates, changes or deletes are stored in `rproxy_rules` (#144, v0.4).
+	pub persist: bool,
 }
 
 impl Principal {
 	/// Without a token file every request is allowed.
 	fn anonymous() -> Self {
-		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None }
+		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false }
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -79,7 +81,16 @@ struct Token {
 #[serde(deny_unknown_fields)]
 struct TokenEntry {
 	name: String,
-	sha256: String,
+	/// Required unless `client_cert` is given; with both, both must match.
+	#[serde(default)]
+	sha256: Option<String>,
+	/// The client certificate's name (a DNS or URI SAN, else the CN) for the
+	/// control API's mTLS (#167, v0.4).
+	#[serde(default)]
+	client_cert: Option<String>,
+	/// Store the rules this token changes in `rproxy_rules` (#144, v0.4; default false).
+	#[serde(default)]
+	persist: bool,
 	scopes: Vec<Scope>,
 	#[serde(default)]
 	allow_listen_ports: Option<String>,
@@ -136,7 +147,22 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			if e.name.is_empty() || tokens.iter().any(|t: &Token| t.principal.name == e.name) {
 				return Err(invalid(path, format!("token names must be unique and not empty: {:?}", e.name)));
 			}
-			let hash = parse_hex(&e.sha256)
+			if let Some(name) = &e.client_cert {
+				if name.trim().is_empty() || name.contains(char::is_whitespace) {
+					return Err(invalid(path, format!("{}: client_cert must be a certificate name (DNS or URI SAN, or CN)", e.name)));
+				}
+				// tokens that cannot be checked as written are not silently weakened
+				if !crate::core::rule::Features::CURRENT.client_cert_auth {
+					return Err(invalid(
+						path,
+						format!("{}: client_cert is not available in this version (see GET /capabilities features)", e.name),
+					));
+				}
+			}
+			let Some(sha256) = &e.sha256 else {
+				return Err(invalid(path, format!("{}: give sha256 (sha256sum of the token) or client_cert", e.name)));
+			};
+			let hash = parse_hex(sha256)
 				.ok_or_else(|| invalid(path, format!("{}: sha256 must be 64 hex digits (sha256sum of the token)", e.name)))?;
 			if e.scopes.is_empty() {
 				return Err(invalid(path, format!("{}: scopes must not be empty", e.name)));
@@ -151,7 +177,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			};
 			tokens.push(Token {
 				secret: Secret::Sha256(hash),
-				principal: Principal { name: e.name, scopes: e.scopes, ports },
+				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist },
 				expires,
 			});
 		}
@@ -163,7 +189,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			.enumerate()
 			.map(|(i, l)| Token {
 				secret: Secret::Plain(l.to_string()),
-				principal: Principal { name: format!("token-{}", i + 1), scopes: vec![Scope::Admin], ports: None },
+				principal: Principal { name: format!("token-{}", i + 1), scopes: vec![Scope::Admin], ports: None, persist: false },
 				expires: None,
 			})
 			.collect()
@@ -204,6 +230,11 @@ impl Tokens {
 
 	pub fn enabled(&self) -> bool {
 		self.path.is_some()
+	}
+
+	/// Names of the tokens marked `persist: true` (#144).
+	pub fn persisting(&self) -> Vec<String> {
+		self.tokens.read().unwrap().iter().filter(|t| t.principal.persist).map(|t| t.principal.name.clone()).collect()
 	}
 
 	/// Re-reads the token file; on error the current tokens stay in effect.
@@ -329,6 +360,10 @@ mod tests {
 			(&format!("tokens:\n  - {{name: a, sha256: {}, scopes: [admin], allow_listen_ports: 9-1}}\n", sha("a")), "allow_listen_ports"),
 			(&format!("tokens:\n  - {{name: a, sha256: {}, scopes: [admin], expires: 2027-02-30}}\n", sha("a")), "YYYY-MM-DD"),
 			(&format!("tokens:\n  - {{name: a, sha256: {}, scope: [admin]}}\n", sha("a")), "unknown field"),
+			("tokens:\n  - {name: a, scopes: [admin]}\n", "give sha256"),
+			// v0.4 (#167): client certificates are refused until available
+			(&format!("tokens:\n  - {{name: a, sha256: {}, client_cert: ui.example, scopes: [admin]}}\n", sha("a")), "client_cert is not available"),
+			("tokens:\n  - {name: a, client_cert: 'a b', scopes: [admin]}\n", "certificate name"),
 			("tokens: []\n", "no tokens"),
 		] {
 			let file = tempfile("bad", text);
@@ -336,6 +371,23 @@ mod tests {
 			assert!(e.contains(want), "{text}: {e}");
 			std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 		}
+	}
+
+	/// v0.4 (#144): `persist` is read; it is false unless given.
+	#[test]
+	fn persist_marks() {
+		let file = tempfile(
+			"persist",
+			&format!(
+				"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:write]}}\n",
+				sha("ci"),
+				sha("ui")
+			),
+		);
+		let tokens = Tokens::from_file(file.clone()).unwrap();
+		assert_eq!(tokens.persisting(), ["ci"]);
+		assert!(!tokens.authenticate(Some("Bearer ui")).unwrap().persist);
+		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 	}
 
 	#[test]

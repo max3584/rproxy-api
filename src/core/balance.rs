@@ -294,6 +294,8 @@ impl Pool {
 				connections: m.active.load(Ordering::Relaxed),
 				total_connections: m.total.load(Ordering::Relaxed),
 				resolved: m.addrs.borrow().iter().map(|a| a.to_string()).collect(),
+				ejected_until: None,
+				ejections: None,
 			})
 			.collect()
 	}
@@ -310,6 +312,12 @@ pub struct TargetStatus {
 	pub connections: u64,
 	pub total_connections: u64,
 	pub resolved: Vec<String>,
+	/// Ejected by `outlier_detection` until then, in Unix seconds (#170, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ejected_until: Option<u64>,
+	/// Times `outlier_detection` ejected the target (#170, v0.4).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub ejections: Option<u64>,
 }
 
 /// A connection or session counted on a target while it lasts.

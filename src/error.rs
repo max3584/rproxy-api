@@ -60,6 +60,26 @@ impl ApiError {
 		Self::new(StatusCode::BAD_GATEWAY, "resolve_failed", message)
 	}
 
+	/// v0.4 (#28): the rule belongs to a rule set and cannot be changed alone.
+	pub fn owned(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "owned", message)
+	}
+
+	/// v0.4 (#28): `If-Match` differs from the rule set's etag.
+	pub fn precondition_failed(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::PRECONDITION_FAILED, "precondition_failed", message)
+	}
+
+	/// v0.4 (#28): the rule set's generation is older than the current one.
+	pub fn stale_generation(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "stale_generation", message)
+	}
+
+	/// v0.4 (#167): the source is locked out after repeated authentication failures.
+	pub fn locked_out(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::TOO_MANY_REQUESTS, "locked_out", message)
+	}
+
 	pub fn internal(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
 	}

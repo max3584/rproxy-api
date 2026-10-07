@@ -179,6 +179,18 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 |---|---|
 | `relay_buffers_and_half_closes` | データが通り終わった接続（平文 50 本、TLS の終端 20 本）はバッファを持たない（そのあとも使える）。転送先が読まず詰まっている接続はバッファを持ち、終わったら返す。転送先が先に FIN を送っても（平文・TLS の終端）、クライアントが先に終えても（TLS の終端）、半分閉じとして伝わり、残りの向きのデータが全部届く |
 
+## 結合テスト：v0.4 の形（`tests/v04_shapes.rs`、#215）
+
+v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かないものが断られる・無視されることを確かめる。項目ごとに 1 つのテストにしてあり、項目を実装したらそのテストを動くことのテストに置き換える（`features` も true にする）。
+
+| テスト | 確かめること |
+|---|---|
+| `capabilities_list_the_v0_4_features_as_off` | `features` の v0.4 の印がすべて false、`performance` が空 |
+| `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
+| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
+| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
+| `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |
+
 ## DB からの復元（`tests/db_restore.rs`）
 
 | テスト | 確かめること |

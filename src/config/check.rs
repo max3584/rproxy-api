@@ -103,6 +103,10 @@ pub async fn check(input: &CheckInput) -> Report {
 	};
 	report.files = doc.files.iter().map(|f| f.display().to_string()).collect();
 	report.rules = doc.rules.len();
+	// v0.4 global settings this build cannot apply yet: ignored at startup (degraded)
+	for part in doc.global.unsupported(&crate::core::rule::Features::CURRENT) {
+		report.warning("", format!("{part}: not available in this version; ignored (see GET /capabilities features)"));
+	}
 
 	// global: what startup builds, without starting anything
 	let mut secrets: Vec<String> = vec![];

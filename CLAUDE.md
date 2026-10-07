@@ -89,7 +89,8 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 
 ## 設計上の約束
 
-- v0.3 の設定の形は docs/DESIGN-v0.3.md と docs/API.md の「v0.3 の設定」が正。形はマイナーでまとめて決め、中身はパッチで入れる（docs/RELEASING.md）。中身を入れたら `Features::CURRENT` を true にし、`unsupported` のテストを動くことのテストに置き換える。
+- v0.3 の設定の形は docs/DESIGN-v0.3.md と docs/API.md の「v0.3 の設定」が正。形はマイナーでまとめて決め、中身はパッチで入れる（docs/RELEASING.md）。
+- v0.4 の形は docs/DESIGN-v0.4.md と docs/API.md の「v0.4 の設定」が正（#215）。**v0.4.0 は中身まで全部そろえてから 1 回で出す**（v0.4.x の途中の版を作らない。オーナーの決定）。機能ごとにモジュールを分けてある（`core/limits.rs`・`core/bandwidth.rs`・`core/outlier.rs`・`core/ruleset.rs`・`net/geoip.rs`・`config/performance.rs`・`config/plan.rs`・`config/persist.rs`・`control/hardening.rs`・`control/ruleset_api.rs`・`control/upgrade.rs`）。実装したら `Features::CURRENT` を true にし、`tests/v04_shapes.rs` のその機能のテストを動くことのテストに置き換える。Kubernetes のコントローラは別のリポジトリ `../rproxy-gateway`（`max3584/rproxy-gateway`）で、rproxy とは制御 API だけでつながる。中身を入れたら `Features::CURRENT` を true にし、`unsupported` のテストを動くことのテストに置き換える。
 
 - 起動時に止めるのは設定のエラー（値の誤り、存在しないパス、ファイルの中身の誤り）だけ。権限・使用中のポート・DB など環境の問題では、使えない部分だけを止めて起動を続け、`event = "degraded"`（`part` で箇所）をログに出す（README の「起動できないものがあるとき」、`tests/startup.rs`）。トークンが読めないときに認証なしにはしない（API を閉じる）。
 

@@ -75,10 +75,17 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/acme/revoke", post(super::acme_api::revoke))
 		.route("/acme/accounts/{name}/register", post(super::acme_api::register))
 		.route("/acme/accounts/{name}/deactivate", post(super::acme_api::deactivate))
+		// v0.4 (docs/DESIGN-v0.4.md): rule sets (#28), plan (#169), upgrade / update (#174)
+		.route("/rulesets", get(super::ruleset_api::list))
+		.route("/rulesets/{*name}", get(super::ruleset_api::get).put(super::ruleset_api::put).delete(super::ruleset_api::delete))
+		.route("/config/plan", post(config_plan))
+		.route("/admin/upgrade", post(super::upgrade::upgrade))
+		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))
 		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
 
 	Router::new()
 		.route("/healthz", get(|| async { "ok" }))
+		.route("/readyz", get(super::ruleset_api::readyz))
 		.merge(protected)
 		.fallback(|| async { ApiError::not_found("no such endpoint") })
 		.with_state(state)
@@ -90,7 +97,8 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 		"/capabilities" | "/openapi.json" => None,
 		"/metrics" => Some(Scope::MetricsRead),
 		// re-reads files on the host: only for administrators
-		"/config/reload" => Some(Scope::Admin),
+		"/config/reload" | "/config/plan" => Some(Scope::Admin),
+		_ if path.starts_with("/admin/") => Some(Scope::Admin),
 		// the handlers check acme:write (and the Unix socket) themselves, to answer why
 		_ if path.starts_with("/acme/") && method == Method::POST => None,
 		_ if method == Method::GET => Some(Scope::RulesRead),
@@ -211,6 +219,7 @@ async fn config_reload(
 	Extension(principal): Extension<Principal>,
 	Extension(client): Extension<Client>,
 	transport: Option<Extension<Transport>>,
+	Query(query): Query<HashMap<String, String>>,
 ) -> Response {
 	let audit = |outcome: &str, code: &str| {
 		info!(event = "audit", token = %principal.name, client = %client.0, action = "config.reload", rule = "", outcome, code);
@@ -227,6 +236,11 @@ async fn config_reload(
 		return (StatusCode::CONFLICT, Json(json!({"code": "no_config", "error": "no settings file (RPROXY_CONFIG) is configured"})))
 			.into_response();
 	};
+	match crate::config::plan::dry_run(&query) {
+		Ok(false) => {}
+		Ok(true) => return dry_run_unavailable().into_response(),
+		Err(e) => return e.into_response(),
+	}
 	match reloader.reload(true).await {
 		Outcome::Applied(applied) => {
 			audit("ok", "");
@@ -247,6 +261,33 @@ async fn config_reload(
 		// forced reloads always read the files
 		Outcome::Unchanged => (StatusCode::OK, Json(json!({}))).into_response(),
 	}
+}
+
+/// Refuses a strong operation that did not come over the Unix socket while
+/// `RPROXY_API_RELOAD_UNIX_ONLY` is on.
+pub(crate) fn unix_only(state: &AppState, over_unix: bool, what: &str) -> AppResult<()> {
+	if state.reload_unix_only && !over_unix {
+		return Err(ApiError::forbidden(format!(
+			"{what} is accepted only over the Unix socket (RPROXY_API_SOCKET); set RPROXY_API_RELOAD_UNIX_ONLY=false to allow it over TCP"
+		)));
+	}
+	Ok(())
+}
+
+fn dry_run_unavailable() -> ApiError {
+	ApiError::unsupported("dry_run is not available in this version (see GET /capabilities features)")
+}
+
+/// `POST /config/plan` (#169): the settings in the body against what runs.
+async fn config_plan(
+	State(state): State<Arc<AppState>>,
+	transport: Option<Extension<Transport>>,
+	body: Bytes,
+) -> AppResult<StatusCode> {
+	unix_only(&state, transport.is_some(), "POST /config/plan")?;
+	let doc: serde_json::Value = parse_body(&body)?;
+	crate::config::ConfigDoc::from_value(doc).map_err(ApiError::invalid)?;
+	Err(dry_run_unavailable())
 }
 
 /// Addresses of this host that rules can listen on, and the ones rproxy keeps for itself.
@@ -292,9 +333,16 @@ async fn create(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
 	Extension(client): Extension<Client>,
+	Query(query): Query<HashMap<String, String>>,
 	body: Bytes,
 ) -> AppResult<impl IntoResponse> {
 	let req: RuleRequest = parse_body(&body)?;
+	if crate::config::plan::dry_run(&query)? {
+		check_ports(&principal, req.listen_port, req.listen_port_end)?;
+		let everything = crate::core::rule::Caps { features: crate::core::rule::Features::ALL, ..state.registry.caps() };
+		req.validate(&everything)?;
+		return Err(dry_run_unavailable());
+	}
 	let rule = parse_listen(&req.listen_addr, req.listen_port).map_or_else(|_| req.listen_addr.clone(), |a| a.to_string());
 	let rule = format!("{}/{rule}", req.protocol);
 	let result = async {
@@ -321,10 +369,15 @@ async fn update(
 	Extension(principal): Extension<Principal>,
 	Extension(client): Extension<Client>,
 	Path((protocol, addr, port)): Path<(String, String, String)>,
+	Query(query): Query<HashMap<String, String>>,
 	body: Bytes,
 ) -> AppResult<impl IntoResponse> {
 	let key = parse_key(&protocol, &addr, &port)?;
 	let req: UpdateRequest = parse_body(&body)?;
+	if crate::config::plan::dry_run(&query)? {
+		check_rule_ports(&state, &principal, &key).await?;
+		return Err(dry_run_unavailable());
+	}
 	let result = async {
 		check_rule_ports(&state, &principal, &key).await?;
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
@@ -343,6 +396,10 @@ async fn delete(
 	Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<impl IntoResponse> {
 	let key = parse_key(&protocol, &addr, &port)?;
+	if crate::config::plan::dry_run(&query)? {
+		check_rule_ports(&state, &principal, &key).await?;
+		return Err(dry_run_unavailable());
+	}
 	let drain = match query.get("drain_secs") {
 		Some(s) => {
 			let secs: u64 = s.parse().map_err(|_| ApiError::invalid(format!("invalid drain_secs: {s}")))?;
@@ -387,7 +444,8 @@ mod tests {
 		let source = include_str!("api.rs");
 		let mut routed: Vec<String> = vec![];
 		for line in source.lines().map(str::trim).filter(|l| l.starts_with(".route(\"")) {
-			let path = line.split('"').nth(1).unwrap();
+			// a wildcard segment ({*name}) is documented as {name}
+			let path = line.split('"').nth(1).unwrap().replace("{*", "{");
 			for method in ["get", "post", "patch", "delete", "put"] {
 				if line.contains(&format!("{method}(")) {
 					routed.push(format!("{method} {path}"));

@@ -91,6 +91,20 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 
+v0.4 で足す項目（形だけ。中身が入るまでは、指定すると `degraded` を出して無視する。制御 API のクライアント証明書だけは起動しない。docs/API.md の「v0.4 の設定」）：
+
+| 環境変数 | 引数 | 既定 | 説明 |
+|---|---|---|---|
+| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | なし | 制御 API のクライアント証明書を確かめる CA（PEM）（#167） |
+| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | `none`・`optional`・`required`（#167） |
+| `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
+| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | 認証の失敗が続いた送信元を止める（`0` で止めない）（#167） |
+| `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前（#144） |
+| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174） |
+| `RPROXY_UPDATE` | `--update` | `off` | 自動更新：`off`・`check`・`auto`（#174）。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も |
+| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。設定ファイルの `global.performance` が先） |
+| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | — | `--check-config --diff`：動いている rproxy との差分（#169） |
+
 `RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
 
 ### 起動できないものがあるとき
