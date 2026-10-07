@@ -307,7 +307,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
 - `rules` の各要素は `POST /rules` の本文と同じ形。
 - `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。
   - `acme`: ACME のアカウント・DNS のプロバイダ・resolver・許可する名前（docs/ACME.md）。秘密はファイルで指し、API からは触れない。
-  - `files`（v0.4）：`{"owner_check": "strict" | "off"}`（既定 `strict`）。ルールと `global` が指す証明書・鍵・秘密のファイルは、rproxy のユーザー（`rproxy-api`）のもので、グループ・ほかの人が書けず、鍵・秘密はほかの人が読めないものだけ使う（docs/PERMISSIONS.md の「ルールが指すファイルの所有者」）。`off` は root のファイルをそのまま使うときだけ（危険を承知で。起動時に `degraded`）。
+  - `files`（v0.4）：`{"owner_check": "strict" | "off", "trusted_dirs": ["/var/run/rproxy-gateway/certs"]}`（既定 `strict`、`trusted_dirs` なし）。`trusted_dirs`（なければ環境変数 `RPROXY_FILES_TRUSTED_DIRS`、`:` か `,` 区切り。両方あれば設定ファイル）の下にある（シンボリックリンクをたどった本当のパスで判断）ファイルは root のものでもよい（Kubernetes の Secret のボリューム）。絶対パスでなければ設定の誤り。ルールと `global` が指す証明書・鍵・秘密のファイルは、rproxy のユーザー（`rproxy-api`）のもので、グループ・ほかの人が書けず、鍵・秘密はほかの人が読めないものだけ使う（docs/PERMISSIONS.md の「ルールが指すファイルの所有者」）。`off` は root のファイルをそのまま使うときだけ（危険を承知で。起動時に `degraded`）。
   - `trusted_proxies`: CIDR の配列。`http` のルールで、接続元がこの範囲なら `X-Forwarded-For` を信用する（API で作ったルールにも効く）。
   - `crowdsec`: CrowdSec の bouncer（`crowdsec` ミドルウェアと、ルールの `crowdsec: true` が使う。書かずにそれらを使うと `invalid`、設定ファイルなら起動しない）。
     - `lapi_url`（例 `http://127.0.0.1:8080`）の `GET /v1/decisions/stream` を `update_interval`（既定 `10s`）ごとに呼び、判定を覚えておく（最初と、失敗した後は `startup=true` で全部を取り直す）。`X-Api-Key` は `api_key_file` の中身（`cscli bouncers add rproxy` で作ったキー。SIGHUP で読み直す）。

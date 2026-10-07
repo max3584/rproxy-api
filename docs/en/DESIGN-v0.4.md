@@ -600,7 +600,7 @@ The rproxy-api findings of the security review before v0.4.0 (of rproxy-api and 
 | L12 names of unverified certificates | Not in PROXY v2 `SSL_CN` nor the `Subject` of `X-Forwarded-Client-Cert` (#239) |
 | L13 CORS wildcards | `*` as the first label only; a warning for `*` with credentials |
 | L18 GeoIP | A known country / ASN outside its list refuses even when the other is unknown; databases up to 1 GiB; documented that an unreadable database gives `unknown` |
-| Files rules name | Owner's decision: only files of rproxy's user, not writable by the group or others, keys not readable by others (`global.files.owner_check`, default `strict`). The service user is `rproxy-api` (primary group `rproxy`); v0.3's `rproxy` is renamed keeping its uid |
+| Files rules name | Owner's decision: only files of rproxy's user, not writable by the group or others, keys not readable by others (`global.files.owner_check`, default `strict`). Kubernetes Secret volumes are root's, so under trusted directories (`global.files.trusted_dirs`, `RPROXY_FILES_TRUSTED_DIRS`) root's files are used too (judged by the real path; the other checks stay). The service user is `rproxy-api` (primary group `rproxy`); v0.3's `rproxy` is renamed keeping its uid |
 | Addresses of forward_auth and mirror | `rules:write` already lets a token point rule targets (`targets`, service URLs) anywhere, so `forward_auth`'s `address` and `mirror`'s `service` are the same (no new power). To restrict destinations, split tokens and filter egress on the network. Written in docs/en/PERMISSIONS.md |
 
 L6 (rotating a /48), L7 (the number of sets) and L9, L10 (documentation) are not fixed in v0.4.0 (reachable only after authentication, or operational notes).

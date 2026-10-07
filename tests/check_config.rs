@@ -345,3 +345,15 @@ fn files_of_others_are_errors_unless_the_owner_check_is_off() {
 	let (code, v) = check_json(&dir, &file);
 	assert_eq!(code, 0, "{v}");
 }
+
+#[test]
+fn trusted_dirs_must_be_absolute() {
+	let dir = workdir("trusted");
+	let file = dir.join("rproxy.yaml");
+	fs::write(&file, "version: 1\nglobal: {files: {trusted_dirs: [relative/certs]}}\nrules: []\n").unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	assert!(messages(&v, "errors").contains("not an absolute path"), "{v}");
+	fs::write(&file, "version: 1\nglobal: {files: {trusted_dirs: [/var/run/rproxy-gateway/certs]}}\nrules: []\n").unwrap();
+	assert_eq!(check_json(&dir, &file).0, 0);
+}

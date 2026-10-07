@@ -600,7 +600,7 @@ v0.4.0 を出す前のセキュリティレビュー（rproxy-api と rproxy-gat
 | L12 確かめられなかった証明書の名前 | PROXY v2 の `SSL_CN` と `X-Forwarded-Client-Cert` の `Subject` に入れない（#239） |
 | L13 CORS のワイルドカード | `*` は先頭のラベルだけ、`*` と資格情報の組み合わせは警告 |
 | L18 GeoIP | 分かっている国・ASN がリストに当たらなければ拒否（もう一方が分からなくても）、データベースは 1 GiB まで、読めないときは `unknown` になることを文書に |
-| ルールが指すファイル | オーナーの決定：rproxy のユーザーのもの・グループとほかの人が書けない・鍵はほかの人が読めないものだけ（`global.files.owner_check`、既定 `strict`）。サービスのユーザーは `rproxy-api`（主グループ `rproxy`）、v0.3 の `rproxy` は uid のまま改名 |
+| ルールが指すファイル | オーナーの決定：rproxy のユーザーのもの・グループとほかの人が書けない・鍵はほかの人が読めないものだけ（`global.files.owner_check`、既定 `strict`）。Kubernetes の Secret のボリュームは root のものなので、信頼するディレクトリ（`global.files.trusted_dirs`・`RPROXY_FILES_TRUSTED_DIRS`）の下では root のものも使う（本当のパスで判断。ほかの確かめはそのまま）。サービスのユーザーは `rproxy-api`（主グループ `rproxy`）、v0.3 の `rproxy` は uid のまま改名 |
 | forward_auth・mirror の宛先 | `rules:write` はもともとルールの宛先（`targets`・サービスの URL）をどこにでも向けられる権限なので、`forward_auth` の `address`・`mirror` の `service` も同じ扱い（新しい権限ではない）。宛先を絞りたいときは、ルールを作るトークンを分け、ネットワークの側（egress）で絞る。docs/PERMISSIONS.md に書いた |
 
 L6（/48 で回す）、L7（組の数の上限）、L9・L10（文書）は v0.4.0 では直していない（認証の後にしか届かない、または運用の注意）。

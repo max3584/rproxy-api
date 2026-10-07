@@ -100,6 +100,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
 | `RPROXY_API_LOCKOUT_EXEMPT` | `--api-lockout-exempt` | なし | 一時停止しない送信元（カンマ区切りの CIDR）。検証済みのクライアント証明書（mTLS）の接続も止めない（v0.4） |
+| `RPROXY_FILES_TRUSTED_DIRS` | `--files-trusted-dirs` | なし | ルールが指すファイルを root のものでも使うディレクトリ（`:` か `,` 区切りの絶対パス。Kubernetes の Secret のボリューム）。設定ファイルの `global.files.trusted_dirs` があればそちら（v0.4、docs/PERMISSIONS.md） |
 | `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する（#144、docs/API.md の「API で作ったルールの保存」） |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
 | `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |

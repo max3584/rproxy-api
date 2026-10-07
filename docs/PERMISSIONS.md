@@ -57,6 +57,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 - 鍵・秘密はほかの人が読めない（600 か 640。グループ `rproxy` の読み取りはよい：UI と共有するとき）。証明書・CA は 644 まで。
 - 満たさなければ API は `400 tls_config` / `invalid`（理由つき）、設定ファイルは設定の誤り（起動・再読み込みで止まる）。`--check-config` は、サービスのユーザーで動かせば誤り、ほかのユーザー（root）で動かせば rproxy-api について確かめた警告。確かめるのは開いたファイル（fstat）なので、確かめたものを読む。
 - certbot などが root のファイルを作るなら、deploy hook で rproxy-api のものに写す（例：`install -o rproxy-api -g rproxy -m 0640 privkey.pem /etc/rproxy/tls/a.key`）。どうしても root のファイルをそのまま使うなら `global.files.owner_check: off`（`rules:write` のトークンを持つ人が、rproxy の読めるどのファイルでも証明書・鍵として使えるようになる。起動時に `degraded` を出す）。
+- 信頼するディレクトリ（`global.files.trusted_dirs`、なければ環境変数 `RPROXY_FILES_TRUSTED_DIRS`。`:` か `,` 区切りの絶対パス、既定はなし）：開いたファイルの本当のパス（シンボリックリンクをすべてたどった先。`..` で外へは出られない）がその下にあれば、root のものも使う。Kubernetes の Secret のボリューム（root の持ち物、グループは fsGroup、0440、root の `..data` のリンク）のためで、rproxy-gateway は `RPROXY_FILES_TRUSTED_DIRS=/var/run/rproxy-gateway/certs` を渡す。ほかの確かめ（グループ・ほかの人が書けない、鍵はほかの人が読めない（0440 は通る）、リンクは rproxy か root のもの）はそのまま。root 以外のユーザーのファイルは、その下でも使わない。起動時に `files.trusted_dirs` のログに出す。`--check-config` も同じものを使う。そのディレクトリに root が置いたファイルは `rules:write` のトークンから鍵として使えるので、ほかの用途のファイルを置かない。
 - 制御 API の証明書・トークンのファイル（`RPROXY_TLS_*`、`RPROXY_TOKEN_FILE`）・GeoIP のデータベースは対象外（ルールからは指せない）。
 
 ### ルールの宛先

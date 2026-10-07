@@ -149,6 +149,10 @@ struct Options {
 	/// connections with a verified client certificate are never locked out either (v0.4)
 	#[arg(long, env = "RPROXY_API_LOCKOUT_EXEMPT")]
 	api_lockout_exempt: Option<String>,
+	/// Directories whose files rules may name even when root owns them (Kubernetes Secret
+	/// volumes), separated by ':' or ','; global.files.trusted_dirs wins (v0.4)
+	#[arg(long, env = "RPROXY_FILES_TRUSTED_DIRS")]
+	files_trusted_dirs: Option<String>,
 	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
@@ -616,7 +620,7 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 	};
 	// run by someone else than the service user (root, by hand): files are read
 	// without the owner check, which is then judged for the service user (warnings)
-	rproxy_api::config::check::owner_check_for_service_user(&input.path);
+	rproxy_api::config::check::owner_check_for_service_user(&input.path, opts.files_trusted_dirs.as_deref());
 	let mut report = runtime.block_on(rproxy_api::config::check::check(&input));
 	if opts.diff {
 		// v0.4 (#169): asks the running rproxy with POST /config/plan
@@ -763,6 +767,17 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		warn!(event = "degraded", part = "global.files.owner_check",
 			"off: rules may name files of any owner (certificates, keys, secrets); see docs/PERMISSIONS.md");
 	}
+	// global.files.trusted_dirs (or RPROXY_FILES_TRUSTED_DIRS): files there may be root's too
+	let files_global = doc.as_ref().and_then(|(_, d)| d.global.files.as_ref());
+	if let Some(Err(e)) = files_global.map(|f| f.validate()) {
+		return Err(e);
+	}
+	let trusted = rproxy_api::net::files::effective_trusted_dirs(files_global, opts.files_trusted_dirs.as_deref());
+	rproxy_api::net::files::check_dirs(&trusted).map_err(|e| format!("RPROXY_FILES_TRUSTED_DIRS: {e}"))?;
+	if !trusted.is_empty() {
+		info!(event = "files.trusted_dirs", dirs = %trusted.join(":"), "files under these directories may be owned by root too");
+	}
+	rproxy_api::net::files::set_trusted_dirs(trusted);
 	if let Some((_, d)) = &doc {
 		for part in d.global.unsupported(&rproxy_api::core::rule::Features::CURRENT) {
 			warn!(event = "degraded", part = %part, "not available in this version yet; ignored (see GET /capabilities features)");
