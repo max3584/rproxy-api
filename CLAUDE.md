@@ -35,8 +35,9 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 | ファイル | 役割 |
 |---|---|
 | `src/main.rs` | 設定（環境変数・`.env`・引数）、ログ初期化、TLS、起動時の DB 復元、制御 API の起動、SIGHUP（トークン・証明書の再読込）と終了処理 |
-| `src/control/api.rs` | axum のルーター。Bearer 認証のミドルウェア。エラーは常に `ApiError` の JSON |
-| `src/control/auth.rs` | トークンファイル（複数トークン同時有効、再読込）。スコープ `rules:read`・`rules:write`・`metrics:read`・`acme:write`・`admin` |
+| `src/control/api.rs` | axum のルーター。Bearer 認証のミドルウェア（`require_token`：TCP の一時停止の確認 → トークン / クライアント証明書 → スコープ）。エラーは常に `ApiError` の JSON |
+| `src/control/auth.rs` | トークンファイル（複数トークン同時有効、再読込）。スコープ `rules:read`・`rules:write`・`metrics:read`・`acme:write`・`admin`。`client_cert`（#167）：`check_with` がトークンと接続の証明書の名前で確かめる（両方あれば両方が要る）。一時停止（`Lockout`）も `Tokens` が持つ（`AppState` を変えずに済むように） |
+| `src/control/hardening.rs` | 制御 API の守り（#167）：引数の検証、制御 API の TLS の組み立て（`ApiTlsFiles`。証明書・鍵・クライアントの CA を SIGHUP / ファイルの変化で読み直す）、`ClientCertAcceptor`（ハンドシェイクの後、証明書の名前（DNS / URI の SAN、なければ CN）を `ClientCert` の拡張でリクエストに付ける）、`TokenExpiry`（`token.expiring` / `token.expired`、状態が変わったときに 1 回）、`Lockout`（送信元ごと、IPv6 は /64、4096 まで。Unix ソケットは数えない）、`/metrics` の行 |
 | `src/control/acme_api.rs` | ACME の API（#208）：`GET /acme`（名前と状態だけ。秘密もそのファイルの場所も出さない）、強い操作 `POST /acme/renew`・`/acme/revoke`・`/acme/accounts/{name}/register`・`deactivate`（`acme:write`、既定は Unix ソケットからだけ。`RPROXY_API_RELOAD_UNIX_ONLY` を共有）。ACME の証明書を使うルールの作成・変更にも `acme:write` が要る（`check_rule_scope`） |
 | `src/config/mod.rs` | 設定ファイル（`RPROXY_CONFIG`。YAML / JSON、`version`・`global`・`rules`。ディレクトリなら名前の順にまとめる）。YAML は JSON の値を経由して読む（`{種類: 設定}` の enum が API と同じ意味になるように）。変更の検知は `config::fingerprint`、反映は `src/config/reload.rs` の `ConfigReloader::reload`（`main.rs` の `watch_config`・SIGHUP・`POST /config/reload` が共有し、Mutex で同時に動かない）→ `Registry::reload_static`（差分だけ。PATCH で変えられる違いは接続を切らずに変える） |
 | `src/config/reload.rs` | 設定ファイルの再読み込み（`ConfigReloader`）。最後に反映した指紋・誤りを持ち、ファイルの監視・SIGHUP・`POST /config/reload`（`admin` のスコープ。既定は Unix ソケットからだけ：`api::Transport::UnixSocket` の拡張と `RPROXY_API_RELOAD_UNIX_ONLY`）が同じものを使う。失敗したときの詳しい理由は `check::check` |
