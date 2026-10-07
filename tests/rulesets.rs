@@ -379,3 +379,66 @@ async fn sets_need_rules_write_within_the_allowed_ports() {
 	assert_eq!(call("ctl", Method::DELETE, "/rulesets/a", json!(null)).await.unwrap().status(), StatusCode::NO_CONTENT);
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// Security review M2 / M3: a set belongs to the token that made it, `allow_rulesets`
+/// limits the names, and a token cannot shrink a rule onto its ports to take away others.
+#[tokio::test]
+async fn sets_belong_to_their_token_and_old_ports_are_checked() {
+	let dir = std::env::temp_dir().join(format!("rproxy-ruleset-owner-{}", std::process::id()));
+	fs::create_dir_all(&dir).unwrap();
+	let file = dir.join("tokens.yaml");
+	let sha = |s: &str| {
+		use sha2::Digest;
+		sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+	};
+	let a = tcp_backend("A:").await;
+	let port = free_tcp_block(4);
+	fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: admin, sha256: {}, scopes: [admin]}}\n  - {{name: ctl, sha256: {}, scopes: [rules:write, rules:read], allow_rulesets: [k8s/]}}\n  - {{name: other, sha256: {}, scopes: [rules:write, rules:read]}}\n  - {{name: narrow, sha256: {}, scopes: [rules:write, rules:read], allow_listen_ports: {port}-{port}}}\n",
+			sha("admin"),
+			sha("ctl"),
+			sha("other"),
+			sha("narrow")
+		),
+	)
+	.unwrap();
+	let h = harness_with(rproxy_api::control::auth::Tokens::from_file(file).unwrap()).await;
+	let call = |token: &'static str, method: Method, path: &str, body: Value| {
+		h.http.request(method, format!("{}{path}", h.base)).bearer_auth(token).json(&body).send()
+	};
+	let set = |gen: u64| json!({"generation": gen, "rules": [rule("tcp", port, a)]});
+	// allow_rulesets: only names under k8s/
+	assert_eq!(call("ctl", Method::PUT, "/rulesets/other/a", set(1)).await.unwrap().status(), StatusCode::FORBIDDEN);
+	assert_eq!(call("ctl", Method::PUT, "/rulesets/k8s/a", set(1)).await.unwrap().status(), StatusCode::OK);
+	// another token neither changes (even with a huge generation) nor deletes it
+	let r = call("other", Method::PUT, "/rulesets/k8s/a", json!({"generation": 1u64 << 40, "rules": []})).await.unwrap();
+	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	assert!(r.json::<Value>().await.unwrap()["error"].as_str().unwrap().contains("belongs to token \"ctl\""));
+	assert_eq!(call("other", Method::DELETE, "/rulesets/k8s/a", json!(null)).await.unwrap().status(), StatusCode::FORBIDDEN);
+	let view: Value = call("other", Method::GET, "/rulesets/k8s/a", json!(null)).await.unwrap().json().await.unwrap();
+	assert_eq!((view["owner"].as_str(), view["generation"].as_u64()), (Some("ctl"), Some(1)));
+	// generations past 2^53 - 1 are refused
+	let r = call("ctl", Method::PUT, "/rulesets/k8s/a", set(u64::MAX)).await.unwrap();
+	assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+	// an admin token may change it; the owner stays
+	assert_eq!(call("admin", Method::PUT, "/rulesets/k8s/a", set(2)).await.unwrap().status(), StatusCode::OK);
+	let view: Value = call("ctl", Method::GET, "/rulesets/k8s/a", json!(null)).await.unwrap().json().await.unwrap();
+	assert_eq!((view["owner"].as_str(), view["updated_by"].as_str()), (Some("ctl"), Some("admin")));
+	assert_eq!(call("ctl", Method::DELETE, "/rulesets/k8s/a", json!(null)).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+	// M2: a rule over 4 ports cannot be shrunk by a token allowed only the first port
+	let mut wide = rule("tcp", port, a);
+	wide["listen_port_end"] = json!(port + 3);
+	// the narrow token cannot create it…
+	assert_eq!(call("narrow", Method::PUT, "/rulesets/n", json!({"generation": 1, "rules": [wide.clone()]})).await.unwrap().status(), StatusCode::FORBIDDEN);
+	// …and when it owns a set whose rule an admin widened, it cannot shrink it onto its port
+	assert_eq!(call("narrow", Method::PUT, "/rulesets/n", set(1)).await.unwrap().status(), StatusCode::OK);
+	assert_eq!(call("admin", Method::PUT, "/rulesets/n", json!({"generation": 2, "rules": [wide]})).await.unwrap().status(), StatusCode::OK);
+	let r = call("narrow", Method::PUT, "/rulesets/n", set(3)).await.unwrap();
+	assert_eq!(r.status(), StatusCode::FORBIDDEN, "{:?}", r.text().await);
+	let rules: Value = call("admin", Method::GET, "/rules", json!(null)).await.unwrap().json().await.unwrap();
+	assert_eq!(rules.as_array().unwrap().iter().find(|r| r["listen_port"] == port).unwrap()["listen_port_end"], json!(port + 3), "unchanged");
+	fs::remove_dir_all(dir).unwrap();
+}

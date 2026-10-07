@@ -117,6 +117,10 @@ pub struct RulesetRequest {
 impl RulesetRequest {
 	/// The checks that need no registry: the size and keys appearing twice.
 	pub fn validate_shape(&self) -> Result<(), ApiError> {
+		// JSON clients (JavaScript, Go's float64) read larger numbers wrong (security review M3)
+		if self.generation > MAX_GENERATION {
+			return Err(ApiError::invalid(format!("generation must be at most {MAX_GENERATION} (2^53 - 1)")));
+		}
 		if self.rules.len() > MAX_RULES {
 			return Err(ApiError::invalid(format!("a rule set holds at most {MAX_RULES} rules")));
 		}
@@ -162,6 +166,9 @@ pub struct RulesetApplied {
 	pub results: Vec<ApplyResult>,
 }
 
+/// The largest `generation` (JSON's safe integers).
+pub const MAX_GENERATION: u64 = (1 << 53) - 1;
+
 /// `GET /rulesets/{name}`.
 #[derive(Clone, Debug, Serialize)]
 pub struct RulesetView {
@@ -170,6 +177,8 @@ pub struct RulesetView {
 	pub etag: String,
 	pub updated_at: u64,
 	pub updated_by: String,
+	/// The token that created the set; only it (or an `admin` token) may change or delete it.
+	pub owner: String,
 	pub rules: Vec<RuleView>,
 }
 
@@ -182,6 +191,7 @@ pub struct RulesetSummary {
 	pub rules: usize,
 	pub updated_at: u64,
 	pub updated_by: String,
+	pub owner: String,
 }
 
 /// A refused `PUT /rulesets/{name}`: the first problem as `code` / `error`,
@@ -386,6 +396,19 @@ struct SetState {
 	etag: String,
 	updated_at: u64,
 	updated_by: String,
+	/// The token that created the set (security review M3).
+	owner: String,
+}
+
+/// A token other than the set's owner may change it only with `admin` (security review M3).
+fn check_owner(name: &str, current: Option<&SetState>, by: &str, admin: bool) -> Result<(), ApiError> {
+	match current {
+		Some(s) if s.owner != by && !admin => Err(ApiError::forbidden(format!(
+			"rule set {name:?} belongs to token {:?}; only it or an admin token may change it",
+			s.owner
+		))),
+		_ => Ok(()),
+	}
 }
 
 /// Every rule set, by name. Changes to sets run one at a time (`write` is
@@ -487,8 +510,12 @@ pub struct PutOptions<'a> {
 	/// The `If-Match` header.
 	pub if_match: Option<&'a str>,
 	pub dry_run: bool,
-	/// The token's name (`updated_by`).
+	/// The token's name (`updated_by`; the owner of a set it creates).
 	pub by: &'a str,
+	/// The token has `admin`: it may change sets of other tokens.
+	pub admin: bool,
+	/// The owner to keep (handoff); None: the set's own, or `by` for a new set.
+	pub owner: Option<&'a str>,
 	/// The token's `allow_listen_ports`: (first, last) of a rule's ports.
 	pub may_use_ports: &'a (dyn Fn(u16, u16) -> bool + Send + Sync),
 }
@@ -541,6 +568,7 @@ impl Registry {
 				etag: s.etag,
 				updated_at: s.updated_at,
 				updated_by: s.updated_by,
+				owner: s.owner,
 			})
 			.collect()
 	}
@@ -558,6 +586,7 @@ impl Registry {
 			etag: s.etag,
 			updated_at: s.updated_at,
 			updated_by: s.updated_by,
+			owner: s.owner,
 			rules: keys.into_iter().map(|k| self.view_of(&rules[k])).collect(),
 		})
 	}
@@ -570,10 +599,12 @@ impl Registry {
 		if_match_header: Option<&str>,
 		drain: Option<Duration>,
 		may_use_ports: &(dyn Fn(u16, u16) -> bool + Send + Sync),
+		(by, admin): (&str, bool),
 	) -> Result<usize, ApiError> {
 		validate_name(name)?;
 		let _write = self.rulesets.write.lock().await;
 		let current = self.rulesets.get(name).ok_or_else(|| ApiError::not_found(format!("no rule set {name:?}")))?;
+		check_owner(name, Some(&current), by, admin)?;
 		check_if_match(if_match_header, Some(&current))?;
 		let entries: Vec<(Key, Entry)> = {
 			let mut rules = self.rules.lock().await;
@@ -611,6 +642,7 @@ impl Registry {
 		req.validate_shape()?;
 		let write = self.rulesets.write.lock().await;
 		let current_set = self.rulesets.get(name);
+		check_owner(name, current_set.as_ref(), opts.by, opts.admin)?;
 		check_if_match(opts.if_match, current_set.as_ref())?;
 		if let Some(s) = &current_set {
 			if req.generation < s.generation {
@@ -685,6 +717,14 @@ impl Registry {
 			let (first, last) = port_range(spec);
 			if !(opts.may_use_ports)(first, last) {
 				problems.push(finding(*i, label, ApiError::forbidden(format!("this token may not use listen port {first}-{last}"))));
+				continue;
+			}
+			// changing a rule of the set also takes away what it listens on now (security review M2)
+			if let Some(c) = current.get(&spec.key).filter(|c| ours(c)) {
+				let (first, last) = port_range(&c.spec);
+				if !(opts.may_use_ports)(first, last) {
+					problems.push(finding(*i, label, ApiError::forbidden(format!("this token may not change the rule listening on {first}-{last}"))));
+				}
 			}
 		}
 		if !problems.is_empty() {
@@ -811,7 +851,8 @@ impl Registry {
 		};
 		failed += results.iter().filter(|(i, _, r)| i.is_some() && r.state.is_none()).count();
 		let etag = etag(req.generation, &members.iter().collect::<Vec<_>>());
-		let state = SetState { generation: req.generation, etag: etag.clone(), updated_at: unix_now(), updated_by: opts.by.to_string() };
+		let owner = opts.owner.map(str::to_string).or_else(|| current_set.as_ref().map(|s| s.owner.clone())).unwrap_or_else(|| opts.by.to_string());
+		let state = SetState { generation: req.generation, etag: etag.clone(), updated_at: unix_now(), updated_by: opts.by.to_string(), owner };
 		self.rulesets.set(name, Some(state));
 		drop(write);
 		info!(event = "ruleset.apply", ruleset = name, generation = req.generation, etag = %etag, created, updated, deleted,

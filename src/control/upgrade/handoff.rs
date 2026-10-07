@@ -165,6 +165,9 @@ pub struct SetSnapshot {
 	pub name: String,
 	pub generation: u64,
 	pub updated_by: String,
+	/// The token that created the set (security review M3); empty from an older process.
+	#[serde(default)]
+	pub owner: String,
 	pub rules: Vec<serde_json::Value>,
 }
 
@@ -396,6 +399,7 @@ async fn snapshot(registry: &Registry) -> State {
 				name: set.name,
 				generation: set.generation,
 				updated_by: set.updated_by,
+				owner: set.owner,
 				rules: set.rules.iter().filter_map(request_value).collect(),
 			});
 		}
@@ -581,7 +585,15 @@ impl Received {
 				}
 			};
 			let req = crate::core::ruleset::RulesetRequest { generation: set.generation, rules };
-			let opts = crate::core::ruleset::PutOptions { if_match: None, dry_run: false, by: &set.updated_by, may_use_ports: &|_, _| true };
+			let owner = if set.owner.is_empty() { set.updated_by.as_str() } else { set.owner.as_str() };
+			let opts = crate::core::ruleset::PutOptions {
+				if_match: None,
+				dry_run: false,
+				by: &set.updated_by,
+				admin: true,
+				owner: Some(owner),
+				may_use_ports: &|_, _| true,
+			};
 			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
 			}
