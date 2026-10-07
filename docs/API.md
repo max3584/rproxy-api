@@ -472,7 +472,7 @@ v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の�
 | 再起動なしの更新・自動更新（#174） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから | `handoff`、`self_update` |
 
 - `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。DB の `options` でも同じ形で読む。
-- ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）、`stats.targets[]` に `ejected_until`・`ejections`（#170）が、動くようになったら出る。
+- ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）が出る（動いているルール）。`stats.targets[]` の `ejected_until`・`ejections`（#170）は、動くようになったら出る。
 - トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。詳しくは上の「制御 API の守り」。
 
 ### 変更前の差分（dry run、#169）
@@ -569,6 +569,21 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 **readiness**：`GET /readyz`（認証なし、`/healthz` と同じ）。起動時の復元（設定ファイル・DB）が終わると `200 {"ready": true}`、その前と、終了の処理に入った後（#174 の引き継ぎでも）は `503 {"ready": false, "reason": "starting" | "draining"}`。ルールの失敗は readiness に含めない（ルールの状態は `conditions`）。生きているかは今までどおり `/healthz`。
 
+### L4 の制限と帯域（#165・#166）の動き
+
+`features.limits`・`features.bandwidth` は true（形は上の表と docs/DESIGN-v0.4.md の 4・5）。
+
+- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS・PROXY ヘッダより前）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
+- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールだけ。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
+- 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら古いものから忘れる。接続の残っている送信元は何回か後回しにする）。忘れた送信元の数え直しは、そのあとの接続から。
+- `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
+- `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3 は絞らない。
+- 速さはトークンバケツ（`burst` が大きさ、既定は 100 ms 分）。ルール全体のバケツはルールの全接続、送信元ごとのバケツはその送信元の全接続で分ける。TCP は 4 KiB（`burst` が小さければその大きさ）たまるまで待ってから読む。データグラムや読んだ量が残りより大きければ借りにして、その分あとで待つ（長い目で見て速さを守る）。
+- splice（#184）は帯域の上限のないルールでだけ使う。上限のあるルールの平文の TCP はユーザー空間のコピーで絞る。`PATCH` で上限を付けると、splice している接続も次の splice の前にユーザー空間のコピーに戻り、それからは上限を外しても splice に戻らない。
+- `PATCH` で `bandwidth` を変えると、開いている接続にも次に読むところから効く（バケツは満杯から）。
+- 上限を付けていないルールの転送は、読み込みごとに 1 回の不可分な読み出し（relaxed load）が増えるだけ。
+- 集計（#166 5.2）：`stats.rx_bytes`・`tx_bytes`・`total_connections` は単調増加、`stats.counters_since` は数え始めた時刻（Unix 秒。ルールを作り直すと変わる、`PATCH` では変わらない）、`stats.limited` を足した。`/metrics` に `rproxy_process_start_time_seconds`。
+
 ### GeoIP（#168）
 
 ```yaml
@@ -655,7 +670,7 @@ rules:
 | `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ）。`admin`、既定では Unix ソケットからだけ |
 | `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current","available","last_check","error","bad_versions"}`。`admin` |
 | `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ、`RPROXY_UPDATE=auto` なら入れ替える。`admin`、既定では Unix ソケットからだけ |
-| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」） |
+| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」）、L4 の制限・帯域は `rproxy_rule_limited_total`・`rproxy_rule_bandwidth_dropped_total`、プロセスの開始時刻は `rproxy_process_start_time_seconds`（上の「v0.4 の設定」） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
 

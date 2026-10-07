@@ -17,6 +17,8 @@ use dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
 use crate::core::balance::{Lease, Member};
+use crate::core::bandwidth::{Dir, Gate};
+use crate::core::limits::{self, Permit, Reason};
 use crate::tls::dtls::SessionConn;
 use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
@@ -75,6 +77,8 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 			_ = stop.cancelled() => break,
 			received = socket.recv_batch(&mut batch) => match received {
 				Ok(_) => {
+					// `limits` (#165): None after one relaxed load when the rule has none
+					let limiter = rt.limits.get();
 					let mut map = sessions.lock().unwrap();
 					for (data, Meta { from: client, local, .. }) in batch.iter() {
 						if !rt.allowed(client.ip()) {
@@ -91,13 +95,26 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 							denied(&rt, client, "crowdsec");
 							continue;
 						}
+						if limiter.as_ref().is_some_and(|l| !l.packet(client.ip())) {
+							limits::refused(&rt, client, Reason::Packets, "udp");
+							continue;
+						}
 						let tx = match map.get(&(client, local)) {
 							Some((_, tx)) if !tx.is_closed() => tx.clone(),
 							_ => {
+								// a new session: within the limits, or the datagram is dropped
+								let permit = match limiter.as_ref().map(|l| l.admit(client.ip())) {
+									None => None,
+									Some(Ok(p)) => Some(p),
+									Some(Err(reason)) => {
+										limits::refused(&rt, client, reason, "udp");
+										continue;
+									}
+								};
 								let id = next_id.fetch_add(1, Ordering::Relaxed);
 								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
 								map.insert((client, local), (id, tx.clone()));
-								rt.tracker.spawn(run_session(id, (client, local), rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone()));
+								rt.tracker.spawn(run_session(id, (client, local), rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), permit));
 								tx
 							}
 						};
@@ -128,6 +145,7 @@ fn denied(rt: &Runtime, client: SocketAddr, reason: &'static str) {
 
 /// One client's session. With `tls.mode: sni`, a new QUIC connection from the
 /// same client socket to another server name starts it over with the new name.
+/// `permit` counts the session in the rule's `limits` until it ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
 	id: u64,
@@ -138,7 +156,9 @@ async fn run_session(
 	sessions: Sessions,
 	offset: u16,
 	sniffing: Arc<AtomicUsize>,
+	permit: Option<Permit>,
 ) {
+	let _permit = permit;
 	let tls = rt.tls();
 	if tls.mode() == TlsMode::Terminate {
 		return dtls_session(id, peer, from_client, listener, rt, sessions, offset, tls).await;
@@ -226,6 +246,8 @@ async fn session(
 	let geo = rt.geo_for_log(client.ip(), None);
 	info!(event = "conn.open", rule = %rt.key, listen = %listener.local_for(local), client = %client, target = %addr_or_empty(target),
 		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn));
+	// `bandwidth` (#166): datagrams over the rate are dropped
+	let (mut up, mut down) = (Gate::new(client.ip(), Dir::Up), Gate::new(client.ip(), Dir::Down));
 	let header = proxy_header(rt, client, listener.local_for(local));
 	// sni: the QUIC connection this session was routed for, and a new one being read
 	let mut quic_dcid = first.iter().find_map(|d| crate::tls::udp_sni::quic::initial_dcid(d));
@@ -234,7 +256,8 @@ async fn session(
 
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	// the datagrams held while reading the server name, in order
-	rx_bytes += forward(rt, &upstream, &header, client, &first).await;
+	let mut first = first;
+	rx_bytes += forward(rt, &upstream, &header, client, &mut first, &mut up).await;
 	drop(first);
 	let mut buf = RecvBuf::new();
 	// datagrams taken from the queue at once, sent on with one `sendmmsg`
@@ -246,8 +269,8 @@ async fn session(
 			_ = sleep_until(deadline) => break "idle",
 			// a new QUIC connection that did not show its name in time: treat it as ours
 			_ = async { match &probe { Some(p) => sleep_until(p.until).await, None => std::future::pending().await } } => {
-				let held = probe.take().map(|p| p.held).unwrap_or_default();
-				rx_bytes += forward(rt, &upstream, &header, client, &held).await;
+				let mut held = probe.take().map(|p| p.held).unwrap_or_default();
+				rx_bytes += forward(rt, &upstream, &header, client, &mut held, &mut up).await;
 			},
 			received = from_client.recv_many(&mut inbox, BATCH) => {
 				if received == 0 {
@@ -255,7 +278,7 @@ async fn session(
 				}
 				deadline = tokio::time::Instant::now() + idle;
 				if !by_name {
-					rx_bytes += forward(rt, &upstream, &header, client, &inbox).await;
+					rx_bytes += forward(rt, &upstream, &header, client, &mut inbox, &mut up).await;
 					inbox.clear();
 					continue;
 				}
@@ -276,13 +299,17 @@ async fn session(
 				} else {
 					drop(datagrams);
 				}
-				rx_bytes += forward(rt, &upstream, &header, client, &out).await;
+				rx_bytes += forward(rt, &upstream, &header, client, &mut out, &mut up).await;
 				out.clear();
 				if restart.is_some() {
 					break "new connection";
 				}
 			},
 			received = upstream.recv(&mut buf) => match received {
+				Ok(n) if !down.admit(&rt.bandwidth, n) => {
+					rt.stats.bandwidth_dropped();
+					deadline = tokio::time::Instant::now() + idle;
+				}
 				Ok(n) => {
 					if let Err(e) = listener.send_to(&buf[..n], client, local).await {
 						rt.stats.dropped();
@@ -505,8 +532,25 @@ fn proxy_header(rt: &Runtime, client: SocketAddr, local: SocketAddr) -> Option<V
 	(rt.source_ip == SourceIp::ProxyV2).then(|| source::proxy_v2_dgram_header(client, local))
 }
 
-/// Sends a client's datagrams on to its backend; their bytes.
-async fn forward(rt: &Runtime, upstream: &UdpSocket, header: &Option<Vec<u8>>, client: SocketAddr, datagrams: &[Vec<u8>]) -> u64 {
+/// Sends a client's datagrams on to its backend (those over the `bandwidth`
+/// limit, `up`, are dropped); their bytes.
+async fn forward(
+	rt: &Runtime,
+	upstream: &UdpSocket,
+	header: &Option<Vec<u8>>,
+	client: SocketAddr,
+	datagrams: &mut Vec<Vec<u8>>,
+	up: &mut Gate,
+) -> u64 {
+	if rt.bandwidth.is_on() {
+		datagrams.retain(|d| {
+			let pass = up.admit(&rt.bandwidth, d.len());
+			if !pass {
+				rt.stats.bandwidth_dropped();
+			}
+			pass
+		});
+	}
 	if datagrams.is_empty() {
 		return 0;
 	}
@@ -638,12 +682,17 @@ async fn dtls_session(
 	let mut idle = *idle_rx.borrow_and_update();
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	let (mut buf, mut ubuf) = (RecvBuf::new(), RecvBuf::new());
+	let (mut up, mut down) = (Gate::new(client.ip(), Dir::Up), Gate::new(client.ip(), Dir::Down));
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {
 			_ = rt.kill.cancelled() => break "stopped",
 			_ = sleep_until(deadline) => break "idle",
 			read = dtls.read(&mut buf, None) => match read {
+				Ok(n) if !up.admit(&rt.bandwidth, n) => {
+					rt.stats.bandwidth_dropped();
+					deadline = tokio::time::Instant::now() + idle;
+				}
 				Ok(n) => {
 					if let Err(e) = upstream.send(&with_header(&header, &buf[..n])).await {
 						rt.stats.dropped();
@@ -656,6 +705,10 @@ async fn dtls_session(
 				Err(_) => break "closed",
 			},
 			received = upstream.recv(&mut ubuf) => match received {
+				Ok(n) if !down.admit(&rt.bandwidth, n) => {
+					rt.stats.bandwidth_dropped();
+					deadline = tokio::time::Instant::now() + idle;
+				}
 				Ok(n) => {
 					if let Err(e) = dtls.write(&ubuf[..n], None).await {
 						rt.stats.dropped();

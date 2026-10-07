@@ -1,0 +1,20 @@
+# 同じ IP が rproxy の L4 のルールの limits（v0.4、#165）に当たり続ける。rproxy は conn.limited を送信元ごとに
+# 続けて 20 行、その後は 1 秒に 1 行まで出すので、たまに上限に触れるだけでは溢れず、30 秒ほど当たり続けると溢れる。
+# UDP は送信元を偽れるので数えない（偽った送信元を ban しないように）。TCP だけ。
+type: leaky
+name: max3584/rproxy-conn-limited
+description: "One IP keeps hitting the limits of rproxy L4 rules (TCP)"
+filter: "evt.Meta.log_type == 'rproxy_conn' && evt.Meta.rproxy_event == 'conn.limited' && evt.Meta.rproxy_transport == 'tcp'"
+groupby: evt.Meta.source_ip
+capacity: 30
+leakspeed: 5s
+blackhole: 5m
+labels:
+  service: rproxy
+  confidence: 2
+  spoofable: 0
+  classification:
+    - attack.T1498
+  behavior: "tcp:flood"
+  label: "rproxy: keeps hitting connection limits"
+  remediation: true
