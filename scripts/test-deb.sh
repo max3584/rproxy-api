@@ -104,11 +104,12 @@ now=$(systemctl show -p MainPID --value rproxy-api)
 systemctl is-active --quiet rproxy-api || fail "not active after the live upgrade"
 curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/rules" | grep -q '"listen_port":25' ||
 	fail "the rule made through the API did not survive the live upgrade"
+# the glob is expanded by root (the log directory is not readable by the runner user)
 for _ in $(seq 50); do
-	sudo grep -qh '"event":"handoff.done"' /var/log/rproxy/rproxy.*.log && break
+	sudo sh -c 'grep -qh "\"event\":\"handoff.done\"" /var/log/rproxy/rproxy.*.log' && break
 	sleep 0.2
 done
-sudo grep -qh '"event":"handoff.done"' /var/log/rproxy/rproxy.*.log || fail "no handoff.done in the log"
+sudo sh -c 'grep -qh "\"event\":\"handoff.done\"" /var/log/rproxy/rproxy.*.log' || fail "no handoff.done in the log"
 
 echo "== purge"
 sudo apt-get purge -y rproxy-api

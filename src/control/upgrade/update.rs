@@ -86,7 +86,9 @@ pub fn asset_name(v: Version) -> String {
 }
 
 const BINARY: &str = "rproxy-api";
-const MAX_BINARY: usize = 256 << 20;
+/// The largest binary fetched (release binaries are a few tens of MiB; written
+/// to the cache as it arrives, not held in memory).
+const MAX_BINARY: u64 = 1 << 30;
 const MAX_SMALL: usize = 1 << 20;
 /// Patches tried after the newest one known before giving up.
 const MAX_PROBES: u64 = 64;
@@ -233,9 +235,8 @@ impl UpdateConfig {
 		let manifest_bytes = read("manifest.json")?;
 		let manifest_sig = String::from_utf8_lossy(&read("manifest.json.minisig")?).into_owned();
 		let manifest = check_manifest(key, v, &manifest_bytes, &manifest_sig)?;
-		let binary = read(BINARY)?;
 		let sig = String::from_utf8_lossy(&read(&format!("{BINARY}.minisig"))?).into_owned();
-		check_binary(key, v, &manifest, &binary, &sig)?;
+		check_binary(key, v, &manifest, &dir.join(BINARY), &sig)?;
 		Ok(dir.join(BINARY))
 	}
 
@@ -249,9 +250,27 @@ impl UpdateConfig {
 	}
 }
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
 	use sha2::Digest;
 	sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA-256 of a file, read in pieces.
+fn sha256_file(path: &Path) -> Result<String, String> {
+	use sha2::Digest;
+	use std::io::Read;
+	let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+	let mut h = sha2::Sha256::new();
+	let mut buf = vec![0u8; 1 << 16];
+	loop {
+		match f.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => h.update(&buf[..n]),
+			Err(e) => return Err(format!("{}: {e}", path.display())),
+		}
+	}
+	Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn check_manifest(key: &PublicKey, v: Version, bytes: &[u8], sig: &str) -> Result<Manifest, String> {
@@ -263,10 +282,12 @@ fn check_manifest(key: &PublicKey, v: Version, bytes: &[u8], sig: &str) -> Resul
 	Ok(manifest)
 }
 
-fn check_binary(key: &PublicKey, v: Version, manifest: &Manifest, binary: &[u8], sig: &str) -> Result<String, String> {
+/// The binary at `path` is release `v`'s: its signature and the manifest's SHA-256.
+fn check_binary(key: &PublicKey, v: Version, manifest: &Manifest, path: &Path, sig: &str) -> Result<String, String> {
 	let name = asset_name(v);
-	minisign::verify(key, sig, binary).map_err(|e| format!("{name}: {e}"))?;
-	let sha = sha256_hex(binary);
+	let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+	minisign::verify_reader(key, sig, std::io::BufReader::new(file)).map_err(|e| format!("{name}: {e}"))?;
+	let sha = sha256_file(path)?;
 	match manifest.files.get(&name) {
 		Some(want) if want.eq_ignore_ascii_case(&sha) => Ok(sha),
 		Some(_) => Err(format!("{name}: SHA-256 differs from manifest.json")),
@@ -333,23 +354,47 @@ impl Fetcher {
 	}
 
 	/// GET over https, following redirects (to https only); None for 404.
-	async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>, String> {
+	/// One HTTP/1.1 connection per request.
+	async fn open(&self, url: &str) -> Result<Option<hyper::Response<hyper::body::Incoming>>, String> {
+		use http_body_util::Empty;
+		use hyper_util::rt::TokioIo;
+		const STEP: Duration = Duration::from_secs(30);
 		let mut url = url.to_string();
 		for _ in 0..6 {
 			if !url.starts_with("https://") {
 				return Err(format!("{url}: only https:// is fetched"));
 			}
-			let req = hyper::Request::get(url.as_str()).body(Bytes::new()).map_err(|e| format!("{url}: {e}"))?;
-			let resp = crate::acme::http::send_limited(&self.tls, req, max, Duration::from_secs(120)).await?;
+			let uri: hyper::Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
+			let authority = uri.authority().ok_or(format!("{url}: no host"))?.clone();
+			let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
+			let port = authority.port_u16().unwrap_or(443);
+			let tcp = tokio::time::timeout(STEP, tokio::net::TcpStream::connect((host.as_str(), port)))
+				.await
+				.map_err(|_| format!("{authority}: timed out"))?
+				.map_err(|e| format!("{authority}: {e}"))?;
+			crate::net::source::nodelay(&tcp);
+			let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| e.to_string())?;
+			let tls = tokio::time::timeout(STEP, self.tls.connect(name, tcp))
+				.await
+				.map_err(|_| format!("{authority}: timed out"))?
+				.map_err(|e| format!("{authority}: TLS: {e}"))?;
+			let (mut sender, conn) =
+				hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tls)).await.map_err(|e| e.to_string())?;
+			tokio::spawn(conn);
+			let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+			let req = hyper::Request::get(path)
+				.header(hyper::header::HOST, authority.as_str())
+				.header(hyper::header::USER_AGENT, concat!("rproxy-api/", env!("CARGO_PKG_VERSION")))
+				.body(Empty::new())
+				.map_err(|e| format!("{url}: {e}"))?;
+			let resp = tokio::time::timeout(STEP, sender.send_request(req))
+				.await
+				.map_err(|_| format!("{authority}: timed out"))?
+				.map_err(|e| format!("{url}: {e}"))?;
 			let status = resp.status();
 			if status.is_redirection() {
 				let next = resp.headers().get(hyper::header::LOCATION).and_then(|v| v.to_str().ok()).ok_or(format!("{url}: redirect without Location"))?;
-				url = if next.starts_with('/') {
-					let base = url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-					format!("{base}{next}")
-				} else {
-					next.to_string()
-				};
+				url = if next.starts_with('/') { format!("https://{authority}{next}") } else { next.to_string() };
 				continue;
 			}
 			if status == hyper::StatusCode::NOT_FOUND {
@@ -358,9 +403,46 @@ impl Fetcher {
 			if !status.is_success() {
 				return Err(format!("{url}: HTTP {status}"));
 			}
-			return Ok(Some(resp.into_body()));
+			return Ok(Some(resp));
 		}
 		Err(format!("{url}: too many redirects"))
+	}
+
+	/// A small file (manifests, signatures) into memory.
+	async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>, String> {
+		use http_body_util::BodyExt;
+		let Some(resp) = self.open(url).await? else { return Ok(None) };
+		let body = http_body_util::Limited::new(resp.into_body(), max);
+		let bytes = tokio::time::timeout(Duration::from_secs(60), body.collect())
+			.await
+			.map_err(|_| format!("{url}: timed out"))?
+			.map_err(|e| format!("{url}: {e}"))?;
+		Ok(Some(bytes.to_bytes()))
+	}
+
+	/// A binary into a file, without holding it in memory (at most `max` bytes).
+	async fn get_to_file(&self, url: &str, path: &Path, max: u64) -> Result<Option<()>, String> {
+		use http_body_util::BodyExt;
+		use std::io::Write;
+		let Some(resp) = self.open(url).await? else { return Ok(None) };
+		let mut file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+		let mut body = resp.into_body();
+		let mut written: u64 = 0;
+		let copy = async {
+			while let Some(frame) = body.frame().await {
+				let frame = frame.map_err(|e| format!("{url}: {e}"))?;
+				if let Ok(data) = frame.into_data() {
+					written += data.len() as u64;
+					if written > max {
+						return Err(format!("{url}: larger than {max} bytes"));
+					}
+					file.write_all(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+				}
+			}
+			file.sync_all().map_err(|e| format!("{}: {e}", path.display()))
+		};
+		tokio::time::timeout(Duration::from_secs(600), copy).await.map_err(|_| format!("{url}: timed out"))??;
+		Ok(Some(()))
 	}
 
 	async fn get_text(&self, url: &str) -> Result<Option<String>, String> {
@@ -396,37 +478,41 @@ impl Fetcher {
 		let Some((v, (manifest, manifest_bytes, manifest_sig))) = best else { return Ok(None) };
 		// already here and still good
 		if let Ok(path) = self.cfg.verify_cached(&key, v) {
-			let sha = std::fs::read(&path).map(|b| sha256_hex(&b)).unwrap_or_default();
+			let sha = sha256_file(&path).unwrap_or_default();
 			return Ok(Some(Fetched { version: v, path, sha256: sha, handoff: manifest.handoff }));
 		}
 		let name = asset_name(v);
-		let binary = self.get(&self.cfg.url(v, &name), MAX_BINARY).await?.ok_or(format!("v{v}: {name} is missing"))?;
 		let sig = self.get_text(&self.cfg.url(v, &format!("{name}.minisig"))).await?.ok_or(format!("v{v}: {name}.minisig is missing"))?;
-		let sha = check_binary(&key, v, &manifest, &binary, &sig)?;
-		let path = self.store(v, &binary, &sig, &manifest_bytes, &manifest_sig)?;
+		// into a directory of its own, moved into place once verified
+		let tmp = self.cfg.cache.join(format!(".tmp-{v}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
+		let result = async {
+			self.get_to_file(&self.cfg.url(v, &name), &tmp.join(BINARY), MAX_BINARY).await?.ok_or(format!("v{v}: {name} is missing"))?;
+			let sha = check_binary(&key, v, &manifest, &tmp.join(BINARY), &sig)?;
+			let path = self.store(v, &tmp, &sig, &manifest_bytes, &manifest_sig)?;
+			Ok::<_, String>((sha, path))
+		}
+		.await;
+		let _ = std::fs::remove_dir_all(&tmp);
+		let (sha, path) = result?;
 		info!(event = "update.fetched", version = %v, sha256 = %sha);
 		Ok(Some(Fetched { version: v, path, sha256: sha, handoff: manifest.handoff }))
 	}
 
-	fn store(&self, v: Version, binary: &[u8], sig: &str, manifest: &[u8], manifest_sig: &str) -> Result<PathBuf, String> {
+	/// Moves a verified release (`tmp` holds the binary) into the cache.
+	fn store(&self, v: Version, tmp: &Path, sig: &str, manifest: &[u8], manifest_sig: &str) -> Result<PathBuf, String> {
 		use std::os::unix::fs::PermissionsExt;
 		let dir = self.cfg.dir(v);
-		let tmp = self.cfg.cache.join(format!(".tmp-{v}-{}", std::process::id()));
 		let write = || -> std::io::Result<()> {
-			let _ = std::fs::remove_dir_all(&tmp);
-			std::fs::create_dir_all(&tmp)?;
-			std::fs::write(tmp.join(BINARY), binary)?;
 			std::fs::set_permissions(tmp.join(BINARY), std::fs::Permissions::from_mode(0o755))?;
 			std::fs::write(tmp.join(format!("{BINARY}.minisig")), sig)?;
 			std::fs::write(tmp.join("manifest.json"), manifest)?;
 			std::fs::write(tmp.join("manifest.json.minisig"), manifest_sig)?;
 			let _ = std::fs::remove_dir_all(&dir);
-			std::fs::rename(&tmp, &dir)
+			std::fs::rename(tmp, &dir)
 		};
-		write().map_err(|e| {
-			let _ = std::fs::remove_dir_all(&tmp);
-			format!("cache {}: {e}", self.cfg.cache.display())
-		})?;
+		write().map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
 		Ok(dir.join(BINARY))
 	}
 }
@@ -668,8 +754,11 @@ mod tests {
 		})
 		.unwrap();
 		let f = Fetcher::new(c.clone()).unwrap();
+		let tmp = dir.join(".tmp-test");
+		std::fs::create_dir_all(&tmp).unwrap();
+		std::fs::write(tmp.join(BINARY), &binary).unwrap();
 		let path = f
-			.store(v, &binary, &minisign::testing::sign(&pair, id, &binary, "t"), &manifest, &minisign::testing::sign(&pair, id, &manifest, "m"))
+			.store(v, &tmp, &minisign::testing::sign(&pair, id, &binary, "t"), &manifest, &minisign::testing::sign(&pair, id, &manifest, "m"))
 			.unwrap();
 		assert_eq!(c.verify_cached(&key, v).unwrap(), path);
 		assert_eq!(c.cached_versions(), [v]);

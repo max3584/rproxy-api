@@ -33,17 +33,6 @@ pub fn connector(ca_file: Option<&str>) -> Result<tokio_rustls::TlsConnector, St
 
 /// Sends one request; the URI must be absolute.
 pub async fn send(tls: &tokio_rustls::TlsConnector, req: Request<Bytes>) -> Result<Response<Bytes>, String> {
-	send_limited(tls, req, MAX_BODY, TIMEOUT).await
-}
-
-/// `send` with another limit on the response body and the time (the
-/// self-update fetches binaries, #174).
-pub async fn send_limited(
-	tls: &tokio_rustls::TlsConnector,
-	req: Request<Bytes>,
-	max_body: usize,
-	timeout: Duration,
-) -> Result<Response<Bytes>, String> {
 	let (mut parts, body) = req.into_parts();
 	let uri = parts.uri.clone();
 	let authority = uri.authority().ok_or_else(|| format!("{uri}: no host"))?.clone();
@@ -75,11 +64,11 @@ pub async fn send_limited(
 			.or_insert(HeaderValue::from_static(concat!("rproxy-api/", env!("CARGO_PKG_VERSION"))));
 		let resp = sender.send_request(Request::from_parts(parts, Full::new(body))).await.map_err(|e| e.to_string())?;
 		let (parts, body) = resp.into_parts();
-		let limited = http_body_util::Limited::new(body, max_body);
+		let limited = http_body_util::Limited::new(body, MAX_BODY);
 		let bytes = limited.collect().await.map_err(|e| e.to_string())?.to_bytes();
 		Ok::<_, String>(Response::from_parts(parts, bytes))
 	};
-	tokio::time::timeout(timeout, work).await.map_err(|_| format!("{authority}: timed out"))?
+	tokio::time::timeout(TIMEOUT, work).await.map_err(|_| format!("{authority}: timed out"))?
 }
 
 /// The HTTP client instant-acme uses.

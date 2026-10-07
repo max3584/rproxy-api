@@ -89,25 +89,55 @@ impl Signature {
 
 	/// Checks the signature of `data`; the trusted comment when it is good.
 	pub fn verify(&self, key: &PublicKey, data: &[u8]) -> Result<&str, String> {
+		if self.prehashed {
+			return self.verify_digest(key, &blake2b512(data));
+		}
+		self.check(key, data)
+	}
+
+	/// `verify` with the BLAKE2b-512 of the data (prehashed signatures only).
+	fn verify_digest(&self, key: &PublicKey, digest: &[u8; 64]) -> Result<&str, String> {
+		if !self.prehashed {
+			return Err("a legacy signature needs the data itself".into());
+		}
+		self.check(key, digest)
+	}
+
+	fn check(&self, key: &PublicKey, message: &[u8]) -> Result<&str, String> {
 		use ring::signature::{UnparsedPublicKey, ED25519};
 		if self.key_id != key.key_id {
 			let theirs: String = self.key_id.iter().rev().map(|b| format!("{b:02X}")).collect();
 			return Err(format!("signed with key {theirs}, not the release key {}", key.id()));
 		}
 		let pk = UnparsedPublicKey::new(&ED25519, key.key);
-		let digest;
-		let message: &[u8] = if self.prehashed {
-			digest = blake2b512(data);
-			&digest
-		} else {
-			data
-		};
 		pk.verify(message, &self.signature).map_err(|_| "the signature does not match".to_string())?;
 		let mut global = self.signature.to_vec();
 		global.extend_from_slice(self.trusted_comment.as_bytes());
 		pk.verify(&global, &self.global_signature).map_err(|_| "the trusted comment's signature does not match".to_string())?;
 		Ok(&self.trusted_comment)
 	}
+}
+
+/// Verifies what `reader` gives (a file: read in pieces when the signature is
+/// prehashed, minisign's default) against the `.minisig` text with `key`.
+pub fn verify_reader(key: &PublicKey, signature: &str, mut reader: impl std::io::Read) -> Result<String, String> {
+	let sig = Signature::parse(signature)?;
+	if !sig.prehashed {
+		let mut data = vec![];
+		reader.read_to_end(&mut data).map_err(|e| e.to_string())?;
+		return sig.verify(key, &data).map(str::to_string);
+	}
+	let mut hash = Blake2b::default();
+	let mut buf = vec![0u8; 1 << 16];
+	loop {
+		match reader.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => hash.update(&buf[..n]),
+			Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(e) => return Err(e.to_string()),
+		}
+	}
+	sig.verify_digest(key, &hash.finish()).map(str::to_string)
 }
 
 /// Verifies `data` against the `.minisig` text with `key`.
@@ -217,26 +247,55 @@ fn compress(h: &mut [u64; 8], block: &[u8; 128], t: u128, last: bool) {
 	}
 }
 
-/// BLAKE2b with a 64-byte digest and no key.
+/// BLAKE2b with a 64-byte digest and no key, fed in pieces.
+pub struct Blake2b {
+	h: [u64; 8],
+	t: u128,
+	buf: [u8; 128],
+	len: usize,
+}
+
+impl Default for Blake2b {
+	fn default() -> Self {
+		let mut h = IV;
+		h[0] ^= 0x0101_0000 ^ 64;
+		Blake2b { h, t: 0, buf: [0; 128], len: 0 }
+	}
+}
+
+impl Blake2b {
+	pub fn update(&mut self, mut data: &[u8]) {
+		while !data.is_empty() {
+			// the last block is compressed in `finish` (it is marked as the last)
+			if self.len == 128 {
+				self.t += 128;
+				compress(&mut self.h, &self.buf, self.t, false);
+				self.len = 0;
+			}
+			let n = (128 - self.len).min(data.len());
+			self.buf[self.len..self.len + n].copy_from_slice(&data[..n]);
+			self.len += n;
+			data = &data[n..];
+		}
+	}
+
+	pub fn finish(mut self) -> [u8; 64] {
+		self.t += self.len as u128;
+		self.buf[self.len..].fill(0);
+		compress(&mut self.h, &self.buf, self.t, true);
+		let mut out = [0u8; 64];
+		for (i, w) in self.h.iter().enumerate() {
+			out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+		}
+		out
+	}
+}
+
+/// BLAKE2b-512 of `data`.
 pub fn blake2b512(data: &[u8]) -> [u8; 64] {
-	let mut h = IV;
-	h[0] ^= 0x0101_0000 ^ 64;
-	let mut t: u128 = 0;
-	let mut chunks = data.chunks(128).peekable();
-	if data.is_empty() {
-		compress(&mut h, &[0u8; 128], 0, true);
-	}
-	while let Some(chunk) = chunks.next() {
-		let mut block = [0u8; 128];
-		block[..chunk.len()].copy_from_slice(chunk);
-		t += chunk.len() as u128;
-		compress(&mut h, &block, t, chunks.peek().is_none());
-	}
-	let mut out = [0u8; 64];
-	for (i, w) in h.iter().enumerate() {
-		out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
-	}
-	out
+	let mut b = Blake2b::default();
+	b.update(data);
+	b.finish()
 }
 
 #[cfg(test)]
@@ -257,10 +316,15 @@ mod tests {
 			hex(&blake2b512(b"abc")),
 			"ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
 		);
-		// across block boundaries
-		let a = blake2b512(&[0x61; 128]);
-		let b = blake2b512(&[0x61; 129]);
-		assert_ne!(a, b);
+		// across block boundaries, fed in pieces
+		let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+		for split in [0, 1, 127, 128, 129, 256, 999, 1000] {
+			let mut h = Blake2b::default();
+			h.update(&data[..split]);
+			h.update(&data[split..]);
+			assert_eq!(h.finish(), blake2b512(&data), "split at {split}");
+		}
+		assert_ne!(blake2b512(&[0x61; 128]), blake2b512(&[0x61; 129]));
 	}
 
 	#[test]
@@ -271,6 +335,8 @@ mod tests {
 		let sig = testing::sign(&pair, id, b"the binary", "timestamp:1 file:rproxy-api");
 		assert_eq!(verify(&key, &sig, b"the binary").unwrap(), "timestamp:1 file:rproxy-api");
 		assert!(verify(&key, &sig, b"the binary!").unwrap_err().contains("does not match"));
+		assert_eq!(verify_reader(&key, &sig, &b"the binary"[..]).unwrap(), "timestamp:1 file:rproxy-api");
+		assert!(verify_reader(&key, &sig, &b"the binary?"[..]).is_err());
 		// a changed trusted comment
 		let forged = sig.replace("file:rproxy-api", "file:other");
 		assert!(verify(&key, &forged, b"the binary").unwrap_err().contains("trusted comment"));
