@@ -161,12 +161,12 @@ When a UDP rule listens on `0.0.0.0` / `::`, rproxy remembers the destination ad
   - `round_robin`: rotates in order in proportion to `weight`.
   - `least_conn`: the destination with the smallest number of currently open connections (sessions for UDP) ÷ `weight`. Ties rotate in order.
   - `failover`: uses only the first destination that is up, in the order of `targets`. When a higher one comes back, new connections go back to it.
-- up / down: if `health_check` is set, its result (up until the first check). Even without it, a destination that refuses a TCP connection (or does not respond within 5 seconds) is skipped as down for 10 seconds, and the same connection is retried on the next destination. For UDP, a destination that returns ICMP unreachable is likewise marked down.
+- up / down: if `health_check` is set, its result (up until the first check). Even without it, a destination that refuses a TCP connection (or does not respond within 5 seconds) is skipped as down (ejected) for 10 seconds, and the same connection is retried on the next destination. For UDP, a destination that returns ICMP unreachable is likewise ejected. How many failures, how long and how many destinations at once can be changed with the v0.4 `outlier_detection` ("v0.4 settings" below).
 - `backup` destinations are used only when all other destinations are down. If all are down, down destinations are also tried in order (connections are not refused).
 - An existing UDP session moves to the next destination when its own destination goes down (`conn.retarget`, `reason: target down`). With `failover`, existing sessions stay where they are even when a higher destination comes back.
 - If some destinations cannot be resolved, the rule still works as long as others resolve (unresolved destinations are re-resolved later). If none resolve, the result is `resolve_failed` as before.
 - `tls.routes` (destination per server name) remain one per route as before. `targets` is the destination for non-matching names (and for no server name).
-- State changes are logged as `event: "target.down"` (`reason: health_check` / `connect`, `error`) / `"target.up"`. The rule's `stats.targets` holds per-destination `[{"addr","port","backup"?,"up","connections","total_connections","resolved"}]` (only when there are 2 or more `targets` or a `health_check`), and `/metrics` exposes `rproxy_target_up{protocol,listen,target}` (1 / 0) and `rproxy_target_connections{protocol,listen,target}`.
+- State changes are logged as `event: "target.down"` (`reason: health_check` / `outlier`, `error`; `outlier` also has `cause` (`connect`, `refused`, `short_lived`), `ejection_secs` and `ejections`) / `"target.up"` (`reason: health_check` / `outlier`). Up to v0.3 a failed connection was `reason: connect`, and there was no `target.up` when the cooldown ended. The rule's `stats.targets` holds per-destination `[{"addr","port","backup"?,"up","connections","total_connections","resolved","ejected_until","ejections"}]` (only when there are 2 or more `targets` or a `health_check`; `ejected_until` is Unix seconds while ejected, null otherwise), and `/metrics` exposes `rproxy_target_up{protocol,listen,target}` (1 / 0) and `rproxy_target_connections{protocol,listen,target}`.
 - When every destination is down, the rule's `all_targets_down` is `true` and `rproxy_rule_all_targets_down{protocol,listen}` in `/metrics` is 1 (v0.3.20; only for rules that show `stats.targets`; for other rules `all_targets_down` is always `false`). That is, when none is up, backups included.
 - Changing destinations, `balance` or `health_check` resets per-destination connection counts and up / down state (open connections are kept).
 
@@ -459,8 +459,8 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 | Labels (#28, #166) | a rule's `labels` | `{key: value}`. Keys: letters, digits and `._/-` (up to 63), values up to 253 characters, at most 16. No effect on behaviour (logs, `/metrics`) | `labels` |
 | L4 limits (#165) | a rule's `limits` | `max_connections`, `per_source` (`prefix_v4`, `prefix_v6`, `max_connections`, `new_connections`, `packets` (udp only), `max_sources`). Rates are `{average, period, burst}` (as the L7 `rate_limit`) | `limits` |
 | Bandwidth (#166) | a rule's `bandwidth` | `upload`, `download` (`"10Mbps"`, 8kbps-100Gbps), `burst` (`"1MiB"`), `per_source` (`upload`, `download`, `prefix_v4`, `prefix_v6`, `max_sources`). TCP waits, UDP drops | `bandwidth` |
-| GeoIP (#168) | a rule's `geoip`, the `geoip` middleware, `global.geoip` | `allow_countries`, `deny_countries` (ISO 3166-1 alpha-2), `allow_asns`, `deny_asns`, `unknown` (`allow` / `deny`). `global.geoip`: `country_db`, `asn_db` (mmdb), `check_interval`, `log_country`. Country lists need `country_db`, ASN lists need `asn_db` | `geoip`, `geoip` in `middlewares` |
-| Passive health checks (#170) | a rule's `outlier_detection` (L4; `invalid` on `http` rules), `http.services.<name>.outlier_detection` | L4: `consecutive_failures`, `short_lived`, `ejection_time`, `max_ejection_time`, `max_ejected_percent`. L7: `consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`, `min_requests`, `window`, `ejection_time`, `max_ejection_time`, `max_ejected_percent` | `outlier_detection`, `outlier_detection` in `services` |
+| GeoIP (#168; **implemented**, see "GeoIP" below) | a rule's `geoip`, the `geoip` middleware, `global.geoip` | `allow_countries`, `deny_countries` (ISO 3166-1 alpha-2), `allow_asns`, `deny_asns`, `unknown` (`allow` / `deny`). `global.geoip`: `country_db`, `asn_db` (mmdb), `check_interval`, `log_country`. Country lists need `country_db`, ASN lists need `asn_db` | `geoip`, `geoip` in `middlewares` |
+| Passive health checks (#170; **implemented**, see "Passive health checks" below) | a rule's `outlier_detection` (L4; `invalid` on `http` rules), `http.services.<name>.outlier_detection` | L4: `consecutive_failures`, `short_lived`, `ejection_time`, `max_ejection_time`, `max_ejected_percent`. L7: `consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`, `min_requests`, `window`, `ejection_time`, `max_ejection_time`, `max_ejected_percent` | `outlier_detection`, `outlier_detection` in `services` |
 | Performance (#194, #184) | `global.performance` | `workers`, `udp_shards` (1-64 or `auto`), `cpu_affinity` (`none` / `auto` / `"0-3,6"`), `busy_poll_usecs`, `splice` (`enabled`, `after`, `full_reads`, `pipe_size`). The settings file wins over `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE*`. Effective after a restart | `performance` (names of the keys that take effect) |
 | Rule sets (#28) | `GET /rulesets`, `GET` / `PUT` / `DELETE /rulesets/{name}` | See "Rule sets, conditions and readiness" below | `rulesets` |
 | Conditions (#28) | `conditions` in the rule view | `[{"type","status","reason","message","last_transition"}]`; types `Accepted`, `Programmed`, `ResolvedRefs`, `BackendsHealthy` (see "Rule sets, conditions and readiness" below) | `conditions` |
@@ -520,7 +520,7 @@ The Kubernetes controller (a separate repository, `max3584/rproxy-gateway`) driv
 
 `features.limits` and `features.bandwidth` are true (shapes in the table above and sections 4 and 5 of docs/en/DESIGN-v0.4.md).
 
-- `limits` are checked right after accepting (after `allow_from` and `crowdsec`, before TLS and PROXY headers). Over a limit, TCP closes without sending anything and UDP drops the datagram (no new session is made). On `http` rules they apply to the TCP connections (not to HTTP/3). `max_connections` counts TCP connections and UDP sessions (so does `per_source.max_connections`), `new_connections` is the rate of new connections / sessions, `packets` the rate of UDP datagrams (per source).
+- `limits` are checked right after accepting (after `allow_from`, `geoip` and `crowdsec`, before TLS and PROXY headers). Over a limit, TCP closes without sending anything and UDP drops the datagram (no new session is made). On `http` rules they apply to the TCP connections (not to HTTP/3). `max_connections` counts TCP connections and UDP sessions (so does `per_source.max_connections`), `new_connections` is the rate of new connections / sessions, `packets` the rate of UDP datagrams (per source).
 - Refusals are counted in `stats.limited` and `/metrics` `rproxy_rule_limited_total{protocol,listen,reason}` (rules with `limits`; labelled `protocol` and `listen` instead of `rule`, like the other metrics). They are logged as `conn.limited` (`rule`, `client`, `reason` (`max_connections` / `source_connections` / `new_connections` / `packets`), `transport` (`tcp` / `udp`); up to 20 lines in a row per source, then one a second; `suppressed` counts the lines left out).
 - Sources are grouped by `prefix_v4` / `prefix_v6`, and at most `max_sources` are remembered (in 16 tables of 1/16 each; when one is full the oldest source is forgotten, sources with open connections are put back a few times). A forgotten source is counted again from its next connection.
 - A `PATCH` of `limits` applies from the next connection / datagram. The rule's connection count is kept, and the per-source counts and buckets too while `prefix_v4`, `prefix_v6` and `max_sources` stay the same. `{}` stops counting (adding limits again counts from then on).
@@ -530,6 +530,63 @@ The Kubernetes controller (a separate repository, `max3584/rproxy-gateway`) driv
 - A `PATCH` of `bandwidth` applies to open connections from their next read (the buckets start full).
 - Rules without limits pay one relaxed atomic load per read.
 - Collecting traffic (#166 5.2): `stats.rx_bytes`, `tx_bytes` and `total_connections` only grow; `stats.counters_since` is when counting started (Unix seconds; changes when the rule is re-created, not on `PATCH`); `stats.limited` is added. `/metrics` has `rproxy_process_start_time_seconds`.
+
+### GeoIP (#168)
+
+```yaml
+global:
+  geoip:
+    country_db: /var/lib/GeoIP/GeoLite2-Country.mmdb   # a Country or City mmdb
+    asn_db: /var/lib/GeoIP/GeoLite2-ASN.mmdb           # optional
+    check_interval: 1m     # how often to look for a changed file (default 1m; 0s: never)
+    log_country: true      # add country (and asn) to conn.open and http.access (default false)
+rules:
+  - {protocol: tcp, listen_addr: 0.0.0.0, listen_port: 25565, remote_addr: 10.0.0.5, remote_port: 25565,
+     geoip: {allow_countries: [JP], deny_asns: [64496], unknown: allow}}
+```
+
+- No database is bundled. Use MaxMind's GeoLite2 (create an account and fetch it with `geoipupdate`) or any mmdb with the same fields (`country.iso_code`, else `registered_country.iso_code`, and `autonomous_system_number`). The files are read into memory (no mmap) and read again when they changed, every `check_interval` and on SIGHUP (`event: "geoip.reload"`). A version that cannot be read (half written, broken, permissions) keeps the current one (`event: "degraded"`, `part: "geoip"`, once per problem). At startup (and in `--check-config`), a missing file or one that is not an mmdb is a configuration error and rproxy does not start; one that cannot be read for permissions logs `degraded` and rproxy starts, with every client unknown to that database until it can be read.
+- Decision: a hit in a `deny_*` list refuses. When any `allow_*` list is given, only a hit in one of them passes (a client whose country and ASN are known and in none of them is refused). A client whose country / ASN the lists need is not known (not in the database, private addresses, the database unreadable) gets `unknown` (default `allow`).
+- L4 (a rule's `geoip`): checked right after accepting, after `allow_from` and before `crowdsec` (before TLS and PROXY headers). TCP connections are closed, UDP datagrams dropped (also those of open sessions; no session is created). HTTP/3: before accepting the QUIC connection. Works on `http` rules too (on the peer's IP). Refusals count in `stats.denied` and log `conn.denied` (`reason: "geoip"`, `country` and `asn` when known; UDP lines are throttled per source like `allow_from`).
+- L7 (the `geoip` middleware): checked on the client IP as `global.trusted_proxies` decides it; refusals answer `403` (like `ip_allow`). `http.access` has `refused_by: "geoip"`, `middleware`, `country` and `asn`.
+- With `log_country: true`, `conn.open` (TCP and UDP) and `http.access` carry `country` (and `asn`) when known.
+- Country lists without `country_db` and ASN lists without `asn_db` are `400 invalid` (a validation error in the settings file). `geoip` given to `PATCH` replaces the lists as a whole, `{}` removes them (nothing is closed; from the next connection / datagram).
+- Pairing with CrowdSec: coarse filtering by country / ASN with `geoip`, bans by behaviour with CrowdSec (a rule's `crowdsec: true`, the `crowdsec` middleware). The order is `allow_from` → `geoip` → `crowdsec`. CrowdSec can add the country itself (`crowdsecurity/geoip-enrich`), so rproxy's `log_country` is for reading rproxy's logs alone, e.g. in a SIEM (docs/en/CROWDSEC.md).
+
+### Passive health checks (#170)
+
+Destinations that keep failing in real traffic are ejected for a while (outlier detection). An ejected destination is skipped like one that is down (L4 still tries every destination in order when all are ejected or down, as before), and comes back by itself when the ejection ends (`target.up`, `reason: "outlier"`). One that `health_check` sees up again comes back at once.
+
+**L4** (a rule's `outlier_detection`; allowed with one target, useful with several):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `consecutive_failures` | `1` | Failures in a row (1-1000): a TCP connection refused or timed out (`cause: connect`), ICMP unreachable for UDP (`refused`), `short_lived` |
+| `short_lived` | `0s` (not counted) | TCP connections the destination ended (closed or reset) sooner than this (0s-1m) after connecting count as failures too; a connection then counts as a success when it ends. No effect on UDP |
+| `ejection_time` | `10s` | The first ejection (1s-1h) |
+| `max_ejection_time` | `ejection_time` | Doubled on each ejection up to this (back to `ejection_time` after this long without an ejection) |
+| `max_ejected_percent` | `100` | Share of the destinations that may be ejected at once (0-100; `0`: never) |
+
+- Without the setting (or with `{}`), rproxy behaves as up to v0.3: one failed connection ejects for 10 seconds.
+- A destination that fails again while ejected (tried because all are out) has its ejection start over (not counted again).
+- A `PATCH` takes effect from the next connection; the destinations keep their counts and ejections (reset when destinations, `balance` or `health_check` change too).
+
+**L7** (`http.services.<name>.outlier_detection`; only services that have it):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `consecutive_5xx` | `5` | 5xx answers in a row (0: not looked at); gateway failures below count too |
+| `consecutive_gateway_failures` | `3` | 502 / 503 / 504, connection failures and `timeouts.response` timeouts in a row (0: not looked at) |
+| `failure_percent` | none | Eject when failures (5xx, gateway failures) are at least this share within `window` (1-100) |
+| `min_requests` | `20` | Fewest requests in `window` before `failure_percent` counts |
+| `window` | `30s` | The window of `failure_percent` (counted afresh each window) |
+| `ejection_time` / `max_ejection_time` | `30s` / `5m` | As for L4 |
+| `max_ejected_percent` | `50` | Share of the servers that may be ejected at once; by default a service with one server never ejects it |
+
+- Separate from `circuit_breaker` (a middleware that stops the whole service): servers are ejected one by one. Each request to a server counts (each `retry` attempt too, and the pages of `errors` / `forward_auth`).
+- An ejected server shows `"ejected": true` in `stats.http.services.<name>` (`up` is false; services with `outlier_detection` are listed even without `health_check`), and `rproxy_http_server_up` is 0. When every server is ejected (`max_ejected_percent: 100`), one that its health check sees up is still used.
+- Logs: `target.down` (`reason: "outlier"`, `rule`, `service`, `server`, `cause`: the threshold reached, `consecutive_5xx` / `consecutive_gateway_failures` / `failure_percent`, `ejection_secs`, `ejections`) / `target.up` (`reason: "outlier"`).
+- Changing `http` starts the counts over (the `Router` is rebuilt).
 
 ## Endpoints
 

@@ -64,6 +64,8 @@ pub struct Server {
 	/// survives restarts and changes of the other servers).
 	pub id: String,
 	up: AtomicBool,
+	/// Ejected by the service's `outlier_detection` (#170).
+	pub ejection: Arc<crate::core::outlier::Ejection>,
 	/// Requests in progress on this server (for `balance: least_conn`).
 	pub inflight: Arc<AtomicU64>,
 	/// Last used at the end: taken from the end (the warmest), expired from the front.
@@ -87,13 +89,15 @@ impl Server {
 			weight: u64::from(weight.max(1)),
 			id,
 			up: AtomicBool::new(true),
+			ejection: Arc::default(),
 			inflight: Arc::default(),
 			idle: Mutex::new(vec![]),
 		})
 	}
 
+	/// Up by the health check and not ejected by `outlier_detection`.
 	pub fn is_up(&self) -> bool {
-		self.up.load(Ordering::Relaxed)
+		self.up.load(Ordering::Relaxed) && !self.ejection.is_ejected()
 	}
 
 	pub fn addr(&self) -> String {
@@ -181,6 +185,8 @@ pub struct Service {
 	/// Name of the sticky cookie.
 	pub sticky: Option<String>,
 	pub balance: crate::core::balance::Balance,
+	/// Passive health checks (#170): servers failing in real traffic are ejected for a while.
+	pub outlier: Option<crate::core::outlier::HttpOutlier>,
 }
 
 fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError> {
@@ -227,6 +233,7 @@ impl Service {
 			health,
 			sticky,
 			balance: spec.balance,
+			outlier: spec.outlier_detection.as_ref().map(crate::core::outlier::HttpOutlier::new),
 		})
 	}
 
@@ -271,6 +278,14 @@ impl Service {
 			}
 			crate::core::balance::Balance::RoundRobin => {}
 		}
+		self.draw().or_else(|| {
+			// every server that is up by its health checks is ejected (max_ejected_percent: 100):
+			// still try one rather than refuse
+			self.servers.iter().position(|s| s.up.load(Ordering::Relaxed))
+		})
+	}
+
+	fn draw(&self) -> Option<usize> {
 		// a few draws; with most servers down, fall back to scanning
 		for _ in 0..self.servers.len() * 4 {
 			let mut n = self.next.fetch_add(1, Ordering::Relaxed) % self.total_weight;
@@ -366,18 +381,52 @@ pub async fn handshake(stream: Box<dyn Stream>, stop: CancellationToken, spawn: 
 	Ok(sender)
 }
 
-/// Health of the servers of a service with `health_check` (rule view and metrics).
+/// Health of the servers of a service with `health_check` or `outlier_detection` (rule view and metrics).
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ServerHealth {
 	pub url: String,
 	pub up: bool,
+	/// Ejected by `outlier_detection` (#170); `up` is false meanwhile.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub ejected: bool,
 }
 
 pub fn health_view<'a>(services: impl Iterator<Item = &'a Arc<Service>>) -> BTreeMap<String, Vec<ServerHealth>> {
 	services
-		.filter(|s| s.health.is_some())
-		.map(|s| (s.name.clone(), s.servers.iter().map(|v| ServerHealth { url: v.url.clone(), up: v.is_up() }).collect()))
+		.filter(|s| s.health.is_some() || s.outlier.is_some())
+		.map(|s| {
+			let servers = s.servers.iter().map(|v| ServerHealth { url: v.url.clone(), up: v.is_up(), ejected: v.ejection.is_ejected() });
+			(s.name.clone(), servers.collect())
+		})
 		.collect()
+}
+
+impl Service {
+	/// What a request to server `index` came to, for `outlier_detection`: the
+	/// server is ejected when a threshold is reached, unless that would eject more
+	/// than `max_ejected_percent` of the servers. `rule` is for the logs.
+	pub fn observe(self: &Arc<Self>, index: usize, outcome: crate::core::outlier::HttpOutcome, rule: crate::core::rule::Key) {
+		let (Some(cfg), Some(server)) = (&self.outlier, self.servers.get(index)) else { return };
+		// a request to an ejected server (every other one is out) neither extends nor counts
+		if server.ejection.is_ejected() {
+			return;
+		}
+		let Some(cause) = server.ejection.record_http(cfg, outcome) else { return };
+		let ejected = self.servers.iter().filter(|s| s.ejection.is_ejected()).count();
+		if !cfg.ejecting.allows(ejected, self.servers.len()) {
+			tracing::debug!(event = "target.eject_skipped", rule = %rule, service = %self.name, server = %server.url, ejected,
+				max_ejected_percent = cfg.ejecting.max_percent);
+			return;
+		}
+		let (length, until) = server.ejection.eject(&cfg.ejecting);
+		warn!(event = "target.down", rule = %rule, service = %self.name, server = %server.url, reason = "outlier", cause,
+			ejection_secs = length.as_secs_f64(), ejections = server.ejection.ejections());
+		let (service, url) = (Arc::downgrade(self), server.url.clone());
+		crate::core::outlier::after(&server.ejection, until, length, move || {
+			let Some(service) = service.upgrade() else { return };
+			info!(event = "target.up", rule = %rule, service = %service.name, server = %url, reason = "outlier");
+		});
+	}
 }
 
 /// Probes the servers of `service` every `interval` until `stop`; a server is up

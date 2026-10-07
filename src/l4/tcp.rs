@@ -84,12 +84,20 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 				attempt.await
 			};
 			match result {
-				Ok(stream) => return Ok(Connected { stream, addr: *addr, host: c.host.clone(), lease }),
+				Ok(stream) => {
+					// with `short_lived`, the connection is judged when it ends (`Pool::ended`)
+					if let (Some(pool), Some(member)) = (&target.pool, &c.member) {
+						if pool.outlier().short_lived.is_zero() {
+							pool.succeeded(member);
+						}
+					}
+					return Ok(Connected { stream, addr: *addr, host: c.host.clone(), lease });
+				}
 				Err(e) => last_err = io::Error::new(e.kind(), format!("{addr}: {e}")),
 			}
 		}
 		if let (Some(pool), Some(member)) = (&target.pool, &c.member) {
-			pool.mark_failed(&rt.key, member, &last_err.to_string());
+			pool.failed(&rt.key, member, "connect", &last_err.to_string());
 		}
 	}
 	Err(last_err)
@@ -119,6 +127,22 @@ struct Detail {
 	rx: u64,
 	tx: u64,
 	reason: &'static str,
+	/// The client's country and ASN for `conn.open` (`global.geoip.log_country`).
+	geo: Option<crate::net::geoip::Info>,
+	/// When the backend connection was made (`outlier_detection.short_lived`).
+	connected: Option<Instant>,
+	/// Which side ended first; only with `outlier_detection.short_lived`.
+	first: Option<Arc<crate::core::outlier::FirstEnd>>,
+}
+
+impl Detail {
+	fn country(&self) -> Option<&str> {
+		self.geo.as_ref().and_then(|g| g.country_str())
+	}
+
+	fn asn(&self) -> Option<u32> {
+		self.geo.and_then(|g| g.asn)
+	}
 }
 
 /// Refusal that is not an error: allow_from or `unmatched: reject`.
@@ -137,6 +161,13 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		denied(&rt, client, "allow_from", None);
 		return;
 	}
+	let geo = match rt.geoip_check(client.ip()) {
+		Ok(info) => info,
+		Err(info) => {
+			rt.geoip_denied(client, &info, None, false);
+			return;
+		}
+	};
 	if rt.crowdsec_blocks(client.ip()) {
 		denied(&rt, client, "crowdsec", None);
 		return;
@@ -176,7 +207,9 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	}
 	let started = Instant::now();
 	rt.stats.opened();
-	let mut detail = Detail::default();
+	let short_lived = !rt.pool().outlier().short_lived.is_zero();
+	let mut detail =
+		Detail { geo: rt.geo_for_log(client.ip(), geo), first: short_lived.then(Arc::default), ..Default::default() };
 
 	let serving = async {
 		match pass {
@@ -193,6 +226,13 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	};
 
 	rt.stats.closed();
+	// `outlier_detection.short_lived`: a connection the target ended too soon is a failure
+	if let (Some(lease), Some(at), Some(first)) = (&detail.lease, detail.connected, &detail.first) {
+		let pool = rt.pool();
+		if pool.contains(lease.member()) {
+			pool.ended(&rt.key, lease.member(), at.elapsed(), first.backend());
+		}
+	}
 	let elapsed_ms = started.elapsed().as_millis() as u64;
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
@@ -227,7 +267,8 @@ async fn run(
 			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 			detail.target = Some(addr);
 			detail.lease = lease;
-			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
+	detail.connected = Some(Instant::now());
+			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, country = detail.country(), asn = detail.asn());
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			finish_plain(rt, client, inbound, &mut out, detail).await
 		}
@@ -257,8 +298,10 @@ async fn relay_hello(
 	let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, target).await?;
 	detail.target = Some(addr);
 	detail.lease = lease;
+	detail.connected = Some(Instant::now());
 	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
-	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough);
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough,
+		country = detail.country(), asn = detail.asn());
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
@@ -274,7 +317,8 @@ async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &m
 	if crate::l4::splice::settings().enabled {
 		let (rx, tx) = (AtomicU64::new(0), AtomicU64::new(0));
 		let totals = crate::l4::splice::Totals { rx: &rx, tx: &tx, rx_total: &rt.stats.rx_bytes, tx_total: &rt.stats.tx_bytes };
-		let result = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip()).await;
+		let first = detail.first.clone();
+		let result = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip(), first.as_deref()).await;
 		detail.rx += rx.into_inner();
 		detail.tx += tx.into_inner();
 		if result.is_err() {
@@ -352,8 +396,11 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 ) -> io::Result<()> {
 	use crate::core::bandwidth::{Dir, Gate, Shaped};
 	let ip = client_addr.ip();
-	let mut client = Shaped::new(Counted::new(a, &rt.stats.rx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Up));
-	let mut backend = Shaped::new(Counted::new(b, &rt.stats.tx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Down));
+	let first = detail.first.clone();
+	let mut a = crate::core::outlier::Watched::new(a, first.as_deref(), false);
+	let mut b = crate::core::outlier::Watched::new(b, first.as_deref(), true);
+	let mut client = Shaped::new(Counted::new(&mut a, &rt.stats.rx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Up));
+	let mut backend = Shaped::new(Counted::new(&mut b, &rt.stats.tx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Down));
 	let result = relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1).await;
 	detail.rx += client.into_inner().count;
 	detail.tx += backend.into_inner().count;
@@ -493,10 +540,12 @@ async fn terminate(
 	let Connected { stream: mut out, addr, host, lease } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	detail.lease = lease;
+	detail.connected = Some(Instant::now());
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr,
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
-		client_cn = info.client_cn.as_deref().unwrap_or(""), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""));
+		client_cn = info.client_cn.as_deref().unwrap_or(""), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
+		country = detail.country(), asn = detail.asn());
 	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);
 
@@ -542,7 +591,9 @@ async fn plain_smtp(
 	let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
 	detail.target = Some(addr);
 	detail.lease = lease;
-	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, starttls = "smtp", tls = "none");
+	detail.connected = Some(Instant::now());
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, starttls = "smtp", tls = "none",
+		country = detail.country(), asn = detail.asn());
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	let extra = starttls::skip_greeting(StartTls::Smtp, &mut out).await?;
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;

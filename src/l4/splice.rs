@@ -197,13 +197,30 @@ fn splice(from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
 /// once it carries a bulk transfer (`Settings::full_reads`, `Settings::after`),
 /// moves on to splice. Bytes read from `a` are counted in `totals.rx` and
 /// `totals.rx_total`, from `b` in `tx` and `tx_total`, as they move. `bw` is the
-/// rule's bandwidth limit and `client` the client's address (its source).
-pub async fn relay(a: &mut TcpStream, b: &mut TcpStream, totals: Totals<'_>, bw: &Bandwidth, client: std::net::IpAddr) -> io::Result<()> {
+/// rule's bandwidth limit and `client` the client's address (its source);
+/// `first` notes which side ended first (`outlier_detection.short_lived`, #170).
+pub async fn relay(
+	a: &mut TcpStream,
+	b: &mut TcpStream,
+	totals: Totals<'_>,
+	bw: &Bandwidth,
+	client: std::net::IpAddr,
+	first: Option<&crate::core::outlier::FirstEnd>,
+) -> io::Result<()> {
 	let (mut ar, mut aw) = a.split();
 	let (mut br, mut bw_half) = b.split();
+	// which side ended first, for `outlier_detection.short_lived` (#170)
+	let ended = |backend: bool| {
+		move |r: io::Result<()>| {
+			if let Some(f) = first {
+				f.mark(backend);
+			}
+			r
+		}
+	};
 	tokio::try_join!(
-		direction(&mut ar, &mut bw_half, totals.rx, totals.rx_total, bw, Gate::new(client, Dir::Up)),
-		direction(&mut br, &mut aw, totals.tx, totals.tx_total, bw, Gate::new(client, Dir::Down))
+		async { ended(false)(direction(&mut ar, &mut bw_half, totals.rx, totals.rx_total, bw, Gate::new(client, Dir::Up)).await) },
+		async { ended(true)(direction(&mut br, &mut aw, totals.tx, totals.tx_total, bw, Gate::new(client, Dir::Down)).await) }
 	)?;
 	Ok(())
 }
@@ -337,7 +354,7 @@ mod tests {
 		let sent = data.clone();
 		let bw = Bandwidth::default();
 		let totals = Totals { rx: &rx, tx: &tx, rx_total: &rt, tx_total: &tt };
-		let relay = relay(&mut a, &mut b, totals, &bw, "127.0.0.1".parse().unwrap());
+		let relay = relay(&mut a, &mut b, totals, &bw, "127.0.0.1".parse().unwrap(), None);
 		let peers = async {
 			let up = async {
 				client.write_all(&sent).await.unwrap();

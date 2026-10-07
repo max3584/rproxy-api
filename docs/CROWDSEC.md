@@ -32,6 +32,7 @@ rproxy の .deb には `/usr/share/rproxy-api/crowdsec/` に次のファイル�
 | `parsers/s01-parse/rproxy-logs.yaml` | `/etc/crowdsec/parsers/s01-parse/` | rproxy の JSON のログのパーサー（`max3584/rproxy-logs`） |
 | `scenarios/rproxy-conn-denied.yaml` | `/etc/crowdsec/scenarios/` | L4：`allow_from` で断られた接続を同じ IP が短い間に繰り返す（ポートの探索など） |
 | `scenarios/rproxy-conn-flood.yaml` | `/etc/crowdsec/scenarios/` | L4：同じ IP からの新しい接続が多すぎる（平均 10 件/秒を超えて 200 件ぶん） |
+| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4：同じ IP がルールの `limits`（v0.4）に当たり続ける（TCP の `conn.limited` が 5 秒に 1 件を超えて 30 件ぶん。UDP は送信元を偽れるので数えない） |
 | `acquis.d/rproxy.yaml` | `/etc/crowdsec/acquis.d/` | rproxy のログのファイル（`labels.type: rproxy`） |
 | `acquis.d/appsec.yaml` | `/etc/crowdsec/acquis.d/` | AppSec（127.0.0.1:7422） |
 
@@ -66,7 +67,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`・`rproxy_auth_error` | `refused_by`（断ったミドルウェアの種類。`basic_auth`・`ip_allow` など）・`auth_error`（`basic_auth` が断った理由。`bad_password` など）。v0.3.20 から |
 | `evt.StrTime` | `timestamp` |
 
-**L4（`event: conn.open` / `conn.denied`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`allow_from` / `crowdsec` など）、`rproxy_rule`。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
+**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`allow_from` / `crowdsec`、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` など）、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
 
 ## 3. rproxy から止める（bouncer）
 
@@ -107,11 +108,17 @@ rules:
 - 前段に CDN やロードバランサがあるなら `global.trusted_proxies` を設定します。L7 のログの `client` と判定の照合に、`X-Forwarded-For` の本当の IP が使われます（L4 は接続元の IP）。
 - `captcha` の判定は ban として扱います。scope は `Ip` と `Range` だけ（`Country`・`AS` は使いません）。
 
+### GeoIP と組み合わせる（v0.4、#168）
+
+国・ASN で最初から通さないものは rproxy の `geoip`（ルールの `geoip`、L7 の `geoip` ミドルウェア。`global.geoip` に GeoLite2 などの mmdb）で落とし、残りの振る舞いを CrowdSec で見る、という分け方ができる。判定の順は `allow_from` → `geoip` → `crowdsec`。`geoip` で断った接続は `conn.denied`（`reason: geoip`、`country`・`asn`）、リクエストは `http.access`（`refused_by: geoip`）。パーサーは `reason` を `rproxy_reason` に入れるので、シナリオで `geoip` を除く・数えることができる（同梱のシナリオは `allow_from` だけを数える）。
+
+国の情報は CrowdSec の側でも `crowdsecurity/geoip-enrich`（同じ GeoLite2 を使う）で付けられる。rproxy の `global.geoip.log_country: true` は `conn.open`・`http.access` に `country`・`asn` を足すので、CrowdSec を通さずに SIEM などで rproxy のログを見るとき向け。どちらも同じデータベースのファイルを `geoipupdate` で更新すればよい（rproxy は変わったファイルを `check_interval` ごとに読み直す）。
+
 ## 4. CI での確かめ方
 
 `scripts/interop/crowdsec.sh` は、GitHub の Ubuntu のランナーで CrowdSec（LAPI・エージェント・AppSec）を公式のパッケージから入れ、ネットワーク名前空間のクライアントから rproxy を通して、次を確かめます。
 
-1. `cscli explain`：見本のログ（`scripts/interop/crowdsec-samples.log`）の 6 行すべてをパーサーが読み、HTTP の行が `crowdsecurity/http-logs` とシナリオ（`http-sensitive-files`・`http-probing` など）へ、L4 の行が `max3584/rproxy-conn-denied` へ届く
+1. `cscli explain`：見本のログ（`scripts/interop/crowdsec-samples.log`）の 7 行すべてをパーサーが読み、HTTP の行が `crowdsecurity/http-logs` とシナリオ（`http-sensitive-files`・`http-probing` など）へ、L4 の行が `max3584/rproxy-conn-denied`・`max3584/rproxy-conn-limited` へ届く
 2. 検知：global なクライアントが存在しないパスを探索する → CrowdSec が rproxy のログから見つけて ban → そのクライアントは rproxy に 403 で止められ、ほかのクライアントは通る（IPv4 と IPv6）
 3. L4：`allow_from` で断られる接続を繰り返したクライアントが `max3584/rproxy-conn-denied` で ban され、`crowdsec: true` の L4 のルールで接続を切られる
 4. AppSec：`GET /.env`（`crowdsecurity/vpatch-env-access`）を 403 で止め、ふつうのリクエストは通す

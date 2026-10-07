@@ -32,6 +32,7 @@ The rproxy .deb ships the following files in `/usr/share/rproxy-api/crowdsec/` (
 | `parsers/s01-parse/rproxy-logs.yaml` | `/etc/crowdsec/parsers/s01-parse/` | Parser for rproxy's JSON logs (`max3584/rproxy-logs`) |
 | `scenarios/rproxy-conn-denied.yaml` | `/etc/crowdsec/scenarios/` | L4: the same IP repeatedly makes connections refused by `allow_from` within a short time (port probing, etc.) |
 | `scenarios/rproxy-conn-flood.yaml` | `/etc/crowdsec/scenarios/` | L4: too many new connections from the same IP (exceeding an average of 10/s, for 200 connections) |
+| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4: the same IP keeps hitting a rule's `limits` (v0.4; TCP `conn.limited` above one per 5 s, for 30 lines; UDP is not counted, as its sources can be spoofed) |
 | `acquis.d/rproxy.yaml` | `/etc/crowdsec/acquis.d/` | rproxy's log files (`labels.type: rproxy`) |
 | `acquis.d/appsec.yaml` | `/etc/crowdsec/acquis.d/` | AppSec (127.0.0.1:7422) |
 
@@ -66,7 +67,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`, `rproxy_auth_error` | `refused_by` (the kind of middleware that refused: `basic_auth`, `ip_allow`, …), `auth_error` (why `basic_auth` refused: `bad_password`, …). Since v0.3.20 |
 | `evt.StrTime` | `timestamp` |
 
-**L4 (`event: conn.open` / `conn.denied`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (`allow_from` / `crowdsec`, etc.), `rproxy_rule`. UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams).
+**L4 (`event: conn.open` / `conn.denied` / `conn.limited`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (`allow_from` / `crowdsec`; for `conn.limited` `max_connections` / `source_connections` / `new_connections` / `packets`, etc.), `rproxy_rule`, `rproxy_transport` (`tcp` / `udp` of `conn.limited`). UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams).
 
 ## 3. Blocking from rproxy (bouncer)
 
@@ -107,11 +108,17 @@ rules:
 - If there is a CDN or load balancer in front, set `global.trusted_proxies`. The real IP from `X-Forwarded-For` is then used for `client` in the L7 log and for matching against decisions (L4 uses the connection's source IP).
 - `captcha` decisions are treated as bans. Only the `Ip` and `Range` scopes are used (`Country` and `AS` are not).
 
+### Pairing with GeoIP (v0.4, #168)
+
+What should never get in by country or ASN can be dropped by rproxy's `geoip` (a rule's `geoip`, the L7 `geoip` middleware; an mmdb such as GeoLite2 in `global.geoip`), leaving behaviour to CrowdSec. The order is `allow_from` → `geoip` → `crowdsec`. Connections refused by `geoip` log `conn.denied` (`reason: geoip`, `country`, `asn`), requests `http.access` (`refused_by: geoip`). The parser puts `reason` into `rproxy_reason`, so scenarios can leave `geoip` out or count it (the bundled scenario counts `allow_from` only).
+
+CrowdSec can add the country itself with `crowdsecurity/geoip-enrich` (using the same GeoLite2). rproxy's `global.geoip.log_country: true` adds `country` and `asn` to `conn.open` and `http.access`, for reading rproxy's logs without CrowdSec, e.g. in a SIEM. Both can use the same database files updated by `geoipupdate` (rproxy reads a changed file again every `check_interval`).
+
 ## 4. How CI verifies it
 
 `scripts/interop/crowdsec.sh` installs CrowdSec (LAPI, agent, AppSec) from the official packages on a GitHub Ubuntu runner and, from clients in network namespaces going through rproxy, verifies the following:
 
-1. `cscli explain`: the parser reads all 6 lines of the sample log (`scripts/interop/crowdsec-samples.log`); the HTTP lines reach `crowdsecurity/http-logs` and the scenarios (`http-sensitive-files`, `http-probing`, etc.), and the L4 lines reach `max3584/rproxy-conn-denied`
+1. `cscli explain`: the parser reads all 7 lines of the sample log (`scripts/interop/crowdsec-samples.log`); the HTTP lines reach `crowdsecurity/http-logs` and the scenarios (`http-sensitive-files`, `http-probing`, etc.), and the L4 lines reach `max3584/rproxy-conn-denied` and `max3584/rproxy-conn-limited`
 2. Detection: a global client probes nonexistent paths → CrowdSec detects it from rproxy's logs and bans it → that client is blocked by rproxy with 403, while other clients pass (IPv4 and IPv6)
 3. L4: a client that repeatedly makes connections refused by `allow_from` is banned by `max3584/rproxy-conn-denied`, and its connections are cut by an L4 rule with `crowdsec: true`
 4. AppSec: `GET /.env` (`crowdsecurity/vpatch-env-access`) is blocked with 403, while normal requests pass

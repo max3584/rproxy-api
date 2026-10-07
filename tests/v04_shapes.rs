@@ -32,93 +32,28 @@ fn code(r: &(StatusCode, Value)) -> (StatusCode, Option<&str>) {
 const UNSUPPORTED: (StatusCode, Option<&str>) = (StatusCode::BAD_REQUEST, Some("unsupported"));
 const INVALID: (StatusCode, Option<&str>) = (StatusCode::BAD_REQUEST, Some("invalid"));
 
-/// POST with `key: good` is `unsupported`, with `key: bad` is `invalid`; a
-/// running rule PATCHed with `key: good` is `unsupported`, with `{}` is fine.
-async fn rule_setting(h: &Harness, protocol: &str, key: &str, good: Value, bad: Value) {
-	let backend = if protocol == "udp" { udp_backend("V:").await } else { tcp_backend("V:").await };
-	let port = if protocol == "udp" { free_udp_port() } else { free_port() };
-	let mut body = rule(protocol, port, backend);
-	body[key] = good.clone();
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{key}: {}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains(key), "{}", r.1);
-	body[key] = bad;
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), INVALID, "{key}: {}", r.1);
-
-	let plain = rule(protocol, port, backend);
-	assert_eq!(h.post(plain).await.0, StatusCode::CREATED);
-	let path = format!("{protocol}/127.0.0.1/{port}");
-	let target = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port()});
-	let mut patch = target.clone();
-	patch[key] = good;
-	assert_eq!(code(&h.patch(&path, patch).await), UNSUPPORTED, "PATCH {key}");
-	let mut clear = target;
-	clear[key] = json!({});
-	let r = h.patch(&path, clear).await;
-	assert_eq!(r.0, StatusCode::OK, "PATCH {key}: {{}} removes it: {}", r.1);
-	assert!(r.1.get(key).is_none(), "{}", r.1);
-}
-
 #[tokio::test]
 async fn capabilities_list_the_v0_4_features_as_off() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
 	for flag in [
-		"geoip", "outlier_detection", "dry_run",
+		"dry_run",
 		"persistence", "handoff", "self_update",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
 	assert_eq!(f["performance"], json!([]), "{caps}");
-	// implemented (tests/api_hardening.rs, tests/rulesets.rs)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz"] {
+	// implemented (tests/api_hardening.rs, tests/rulesets.rs, tests/geoip.rs, tests/outlier.rs)
+	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
-	assert!(!f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
-	assert!(!f["services"].as_array().unwrap().contains(&json!("outlier_detection")));
+	assert!(f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
+	assert!(f["services"].as_array().unwrap().contains(&json!("outlier_detection")));
 }
 
-/// #168, L4 and the middleware
-#[tokio::test]
-async fn geoip_is_checked_then_unsupported() {
-	let h = harness().await;
-	rule_setting(&h, "udp", "geoip", json!({"allow_countries": ["JP"]}), json!({"allow_countries": ["japan"]})).await;
-
-	let mut body = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
-		"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:9", "middlewares": ["geo"]}],
-		"middlewares": {"geo": {"geoip": {"deny_asns": [64496]}}}
-	}});
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains("geoip"), "{}", r.1);
-	body["http"]["middlewares"]["geo"] = json!({"geoip": {"deny_asns": [0]}});
-	assert_eq!(code(&h.post(body).await), INVALID);
-}
-
-/// #170, L4 and services
-#[tokio::test]
-async fn outlier_detection_is_checked_then_unsupported() {
-	let h = harness().await;
-	let good = json!({"consecutive_failures": 3, "ejection_time": "10s", "max_ejection_time": "5m", "max_ejected_percent": 50});
-	rule_setting(&h, "tcp", "outlier_detection", good, json!({"ejection_time": "1m", "max_ejection_time": "10s"})).await;
-
-	let mut body = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
-		"routes": [{"name": "a", "match": "PathPrefix(`/`)", "service": "s"}],
-		"services": {"s": {"servers": [{"url": "http://127.0.0.1:9"}], "outlier_detection": {"consecutive_5xx": 5}}}
-	}});
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains("outlier_detection"), "{}", r.1);
-	body["http"]["services"]["s"]["outlier_detection"] = json!({"failure_percent": 0});
-	assert_eq!(code(&h.post(body.clone()).await), INVALID);
-	// a rule's outlier_detection is for L4 only
-	body["http"]["services"]["s"]["outlier_detection"] = Value::Null;
-	body["outlier_detection"] = json!({"consecutive_failures": 2});
-	let r = h.post(body).await;
-	assert_eq!(code(&r), INVALID, "{}", r.1);
-}
+// #165 limits, #166 bandwidth, #168 GeoIP and #170 outlier detection are implemented:
+// tests/limits.rs, tests/geoip.rs and tests/outlier.rs.
 
 /// #169
 #[tokio::test]
@@ -241,7 +176,6 @@ fn check_config_validates_the_v0_4_shapes() {
 		&file,
 		r#"version: 1
 global:
-  geoip: {country_db: /var/lib/GeoIP/GeoLite2-Country.mmdb}
   performance: {workers: 2, udp_shards: auto, splice: {enabled: false}}
 rules:
   - protocol: udp
@@ -252,14 +186,13 @@ rules:
     labels: {tenant: act}
     limits: {per_source: {packets: {average: 100}}}
     bandwidth: {download: 10Mbps}
-    geoip: {allow_countries: [JP]}
   - protocol: tcp
     listen_addr: 127.0.0.1
     listen_port: 2
+    limits: {max_connections: 100}
     http:
-      routes: [{name: a, match: 'PathPrefix(`/`)', service: s, middlewares: [geo]}]
+      routes: [{name: a, match: 'PathPrefix(`/`)', service: s}]
       services: {s: {servers: [{url: 'http://127.0.0.1:9'}], outlier_detection: {consecutive_5xx: 3}}}
-      middlewares: {geo: {geoip: {deny_countries: [ZZ]}}}
 "#,
 	)
 	.unwrap();
@@ -267,9 +200,11 @@ rules:
 	let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
 	assert_eq!((exit, &v["ok"]), (0, &json!(true)), "warnings only: {v}");
 	let warnings = v["warnings"].to_string();
-	for want in ["global.geoip", "global.performance.workers", "global.performance.udp_shards", "global.performance.splice", "rule #1", "rule #2"] {
+	for want in ["global.performance.workers", "global.performance.udp_shards", "global.performance.splice"] {
 		assert!(warnings.contains(want), "{want}: {warnings}");
 	}
+	// every v0.4 setting of a rule runs now (labels, limits, bandwidth, outlier_detection)
+	assert!(!warnings.contains("rule #"), "{warnings}");
 
 	// mistakes in the shapes are errors
 	for (text, want) in [

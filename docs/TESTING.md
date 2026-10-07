@@ -204,10 +204,9 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 
 | テスト | 確かめること |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout`・`rulesets`・`labels`・`conditions`・`readyz`・`limits`・`bandwidth` は true）、`performance` が空 |
-| `geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
+| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout`・`rulesets`・`labels`・`conditions`・`readyz`・`geoip`・`outlier_detection`・`limits`・`bandwidth`（ミドルウェアの `geoip`・サービスの `outlier_detection`）は true）、`performance` が空 |
 | `dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
-| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
+| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.performance.*`。ルールの v0.4 の設定はすべて動くので警告にならない）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
 
 ## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
@@ -236,6 +235,30 @@ Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
 | `sets_need_rules_write_within_the_allowed_ports` | `rules:read` のトークンは読めるが PUT / DELETE は 403、`allow_listen_ports` の外のルールは 403、`updated_by` はトークンの名前 |
 
 起動した rproxy が復元の後に `GET /readyz` で 200 を返すことは `tests/startup.rs` の `readyz_answers_once_started`。
+
+## 結合テスト：GeoIP（`tests/geoip.rs`、#168）
+
+mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/96）、32 ビットのレコード、文字列と整数の map だけの小さな書き手。MaxMind のデータベースは使わない・置かない）。loopback の送信元で国を分ける：127.0.0.1 は JP、127.0.0.2 は US（AS64496）、127.0.0.3 はデータベースにない。単体テスト（`net::geoip`）は判定の表、ファイルからの読み込み・壊れた版を飛ばす読み直し・起動時の誤り。
+
+| テスト | 確かめること |
+|---|---|
+| `tcp_rules_refuse_by_country_and_asn` | `allow_countries` で JP は通り US は閉じる、分からないものは既定で通す。`conn.denied` の `reason: geoip`・`country`・`asn`、`log_country` の `conn.open` の `country`、`stats.denied`。PATCH で `deny_asns`・`unknown: deny` に変え、`{}` で外す |
+| `udp_rules_drop_datagrams_by_country` | 断る国のデータグラムは捨て、セッションを作らない |
+| `lists_need_the_databases` | `global.geoip` がない・国のデータベースだけのとき、国 / ASN のリスト（ルール・ミドルウェア）は `400 invalid` |
+| `the_middleware_answers_403_for_the_client_trusted_proxies_name` | ミドルウェアは `403`。信頼するプロキシの `X-Forwarded-For` のクライアントで判定し、信頼しない送信元のものは見ない。`http.access` の `refused_by: geoip`・`country`・`asn` |
+| `check_config_reads_the_databases` | `--check-config` はデータベースを読む。ない・mmdb でないファイルはエラー |
+
+## 結合テスト：受け身のヘルスチェック（`tests/outlier.rs`、#170）
+
+設定がないときの動き（1 回の失敗で 10 秒外す）は `tests/targets.rs`。単体テスト（`core::outlier`・`core::balance`）は既定値、倍にする外す時間、L7 のしきい値、`max_ejected_percent`、`short_lived`。
+
+| テスト | 確かめること |
+|---|---|
+| `consecutive_failures_eject_a_target_for_a_while` | 3 回続けて断られたら外す（`stats.targets[]` の `up`・`ejections`・`ejected_until`、`target.down` の `reason: outlier`・`cause: connect`）。`ejection_time` の後に自然に戻る（`target.up`） |
+| `short_lived_connections_count_as_failures` | 転送先がすぐ閉じる接続は `short_lived` で失敗（`cause: short_lived`）。クライアントが終えた接続は数えない |
+| `max_ejected_percent_keeps_targets_and_patch_changes_it_in_place` | `max_ejected_percent: 0` は外さない。PATCH の `{}` で既定に戻る |
+| `http_servers_that_keep_failing_are_ejected` | 500 を続けて返すサーバを外し、残りに送る（`stats.http.services` の `ejected`、`target.down` の `service`・`server`・`cause`） |
+| `http_ejection_leaves_at_least_half_by_default` | 既定の `max_ejected_percent: 50` で、全部は外さない |
 
 ## DB からの復元（`tests/db_restore.rs`）
 
