@@ -3,7 +3,8 @@
 //! pass through user space. Bytes already read (the ClientHello of `sni`) and
 //! the PROXY header are written before, the normal way.
 //!
-//! Switched by environment variables, read once (internal, for the load test):
+//! Set by `global.performance.splice` (`config::performance`, #194) or, without
+//! it, by environment variables, read once:
 //! - `RPROXY_SPLICE=0` turns it off (only the user-space copy of `l4::relay`)
 //! - `RPROXY_SPLICE_AFTER=<bytes>`: a direction is relayed in user space until it
 //!   has carried this many bytes, then with splice (small exchanges never pay
@@ -51,7 +52,7 @@ const POOL_MAX: usize = 8;
 /// The most asked of one splice into the pipe (the pipe's room limits it anyway).
 const SPLICE_LEN: usize = 1 << 20;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
 	pub enabled: bool,
 	pub after: u64,
@@ -59,9 +60,17 @@ pub struct Settings {
 	pub pipe_size: usize,
 }
 
-pub fn settings() -> &'static Settings {
-	static SETTINGS: OnceLock<Settings> = OnceLock::new();
-	SETTINGS.get_or_init(|| {
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+
+impl Default for Settings {
+	fn default() -> Settings {
+		Settings { enabled: DEFAULT_ENABLED, after: DEFAULT_AFTER, full_reads: DEFAULT_FULL_READS, pipe_size: 0 }
+	}
+}
+
+impl Settings {
+	/// From `RPROXY_SPLICE*`, or the defaults.
+	pub fn from_env() -> Settings {
 		let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 		Settings {
 			enabled: var("RPROXY_SPLICE").map(|v| !matches!(v.trim(), "0" | "false" | "off")).unwrap_or(DEFAULT_ENABLED),
@@ -69,7 +78,19 @@ pub fn settings() -> &'static Settings {
 			full_reads: var("RPROXY_SPLICE_FULL_READS").and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_FULL_READS),
 			pipe_size: var("RPROXY_SPLICE_PIPE_SIZE").and_then(|v| v.trim().parse().ok()).unwrap_or(0),
 		}
-	})
+	}
+}
+
+/// The settings in use: `global.performance.splice` (`configure`, at startup),
+/// else `RPROXY_SPLICE*`, else the defaults. Fixed once read.
+pub fn settings() -> &'static Settings {
+	SETTINGS.get_or_init(Settings::from_env)
+}
+
+/// Sets the settings before the first connection (`config::performance`);
+/// false when they were already read.
+pub fn configure(s: Settings) -> bool {
+	SETTINGS.set(s).is_ok()
 }
 
 struct PipeFds {

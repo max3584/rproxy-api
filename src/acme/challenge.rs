@@ -139,7 +139,14 @@ impl Drop for Answers {
 
 /// `global.acme.http01_listen`: answers HTTP-01 challenges, 404 for anything else.
 pub async fn serve_http01(addr: SocketAddr, stop: CancellationToken) -> std::io::Result<()> {
-	let listener = tokio::net::TcpListener::bind(addr).await?;
+	// a live upgrade (#174) hands the old process's socket over
+	let listener = match crate::control::upgrade::inherit::take_tcp(addr) {
+		Some(l) => {
+			l.set_nonblocking(true)?;
+			tokio::net::TcpListener::from_std(l)?
+		}
+		None => tokio::net::TcpListener::bind(addr).await?,
+	};
 	tokio::spawn(async move {
 		loop {
 			let (stream, client) = tokio::select! {

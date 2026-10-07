@@ -193,6 +193,15 @@ struct Options {
 
 #[derive(clap::Subcommand)]
 enum Command {
+	/// The container image's entry point (v0.4, #174): runs the newest verified
+	/// patch of this major.minor (RPROXY_UPDATE=auto) or this binary, and stays
+	/// as the container's init (signals, live upgrades, rollback). The other
+	/// options and RPROXY_* go to the server
+	Launch {
+		/// Ignored; the server gets the same arguments without `launch`
+		#[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+		rest: Vec<std::ffi::OsString>,
+	},
 	/// The ACME helper (global.acme.helper): holds the DNS providers' secrets and
 	/// writes DNS-01 records for rproxy-api over a Unix socket. Run it as
 	/// another user (docs/ACME.md, docs/PERMISSIONS.md)
@@ -296,22 +305,9 @@ fn raise_nofile_limit() -> Option<u64> {
 /// weaken the control API if ignored are errors; options this build cannot
 /// apply yet are returned to be logged as `degraded`.
 fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
-	use rproxy_api::control::upgrade::UpgradeOptions;
 	let features = rproxy_api::core::rule::Features::CURRENT;
 	let hardening = hardening_options(opts).check(&features);
-	let upgrade = UpgradeOptions {
-		handoff_socket: opts.handoff_socket.clone(),
-		handoff_timeout: opts.handoff_timeout.clone(),
-		handoff_drain: opts.handoff_drain.clone(),
-		update: opts.update,
-		update_pin: opts.update_pin.clone(),
-		update_source: opts.update_source.clone(),
-		update_cache: opts.update_cache.clone(),
-		update_interval: opts.update_interval.clone(),
-		update_pubkey: opts.update_pubkey.clone(),
-		update_healthy: opts.update_healthy.clone(),
-	}
-	.check(&features);
+	let upgrade = upgrade_options(opts).check(&features);
 	let mut errors: Vec<String> = hardening.errors.into_iter().chain(upgrade.errors).collect();
 	let perf = rproxy_api::config::performance::PerformanceSpec {
 		workers: opts.workers,
@@ -343,6 +339,45 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 		}
 	}
 	Ok(ignored)
+}
+
+/// The live upgrade and self-update options (#174).
+fn upgrade_options(opts: &Options) -> rproxy_api::control::upgrade::UpgradeOptions {
+	rproxy_api::control::upgrade::UpgradeOptions {
+		handoff_socket: opts.handoff_socket.clone(),
+		handoff_timeout: opts.handoff_timeout.clone(),
+		handoff_drain: opts.handoff_drain.clone(),
+		update: opts.update,
+		update_pin: opts.update_pin.clone(),
+		update_source: opts.update_source.clone(),
+		update_cache: opts.update_cache.clone(),
+		update_interval: opts.update_interval.clone(),
+		update_pubkey: opts.update_pubkey.clone(),
+		update_healthy: opts.update_healthy.clone(),
+	}
+}
+
+/// `rproxy-api launch` (#174): the container's entry point.
+fn launch(opts: &Options) -> ExitCode {
+	let _guard = match logging::init(&opts.log_level, None, opts.log_keep) {
+		Ok((guard, _)) => guard,
+		Err(e) => {
+			eprintln!("rproxy-api: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	let upgrade = upgrade_options(opts);
+	let verdict = upgrade.check(&rproxy_api::core::rule::Features::CURRENT);
+	if !verdict.errors.is_empty() {
+		error!(event = "fatal", part = "launch", error = %verdict.errors.join("; "));
+		return ExitCode::FAILURE;
+	}
+	// the server gets the same arguments, without `launch`
+	let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+	if let Some(i) = args.iter().position(|a| a == "launch") {
+		args.remove(i);
+	}
+	rproxy_api::control::upgrade::launch::run(upgrade.update_config(), args)
 }
 
 /// The control API hardening options (#167).
@@ -439,7 +474,13 @@ fn main() -> ExitCode {
 			std::env::remove_var(key);
 		}
 	}
+	// a live upgrade (#174): the old process's handoff socket, for this process only
+	let handoff_from = std::env::var_os(rproxy_api::control::upgrade::handoff::ENV_FROM).map(PathBuf::from);
+	std::env::remove_var(rproxy_api::control::upgrade::handoff::ENV_FROM);
 	let opts = Options::parse();
+	if let Some(Command::Launch { .. }) = &opts.command {
+		return launch(&opts);
+	}
 	if opts.command.is_some() {
 		return acme_helper(&opts);
 	}
@@ -459,20 +500,37 @@ fn main() -> ExitCode {
 			return ExitCode::FAILURE;
 		}
 	};
-	let runtime = match tokio::runtime::Runtime::new() {
+	// global.performance (#194): the workers are fixed when the runtime is built,
+	// so the settings file is read for it first (its mistakes are reported by `run`)
+	let perf = performance_settings(&opts);
+	let runtime = match rproxy_api::config::performance::runtime(&perf) {
 		Ok(rt) => rt,
 		Err(e) => {
 			error!(event = "fatal", error = %e);
 			return ExitCode::FAILURE;
 		}
 	};
-	match runtime.block_on(run(opts)) {
+	match runtime.block_on(run(opts, perf, handoff_from)) {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(e) => {
 			error!(event = "fatal", error = %e);
 			ExitCode::FAILURE
 		}
 	}
+}
+
+/// `global.performance` of the settings file over the flags and environment
+/// variables (docs/DESIGN-v0.4.md 12.).
+fn performance_settings(opts: &Options) -> rproxy_api::config::performance::Effective {
+	use rproxy_api::config::performance::{allowed_cpus, parallelism, resolve, EnvKnobs};
+	let spec = opts
+		.config
+		.as_ref()
+		.or(opts.static_rules.as_ref())
+		.and_then(|path| ConfigDoc::load(path).ok())
+		.and_then(|doc| doc.global.performance);
+	let env = EnvKnobs::from_env(opts.workers, opts.cpu_affinity.clone(), opts.busy_poll_usecs);
+	resolve(spec.as_ref(), &env, &allowed_cpus(), parallelism())
 }
 
 /// `--check-config`: validates the settings file and prints the result. No log
@@ -543,7 +601,8 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 	}
 }
 
-async fn run(opts: Options) -> Result<(), String> {
+async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, handoff_from: Option<PathBuf>) -> Result<(), String> {
+	use rproxy_api::control::upgrade::{self as upgrade, handoff};
 	let addrs = if opts.api_port == 0 { vec![] } else { opts.api_addr.clone() };
 	if addrs.is_empty() && opts.api_socket.is_none() {
 		return Err("--api-port 0 turns TCP off; give --api-socket (RPROXY_API_SOCKET) for the control API".into());
@@ -552,6 +611,28 @@ async fn run(opts: Options) -> Result<(), String> {
 	for flag in check_v04_options(&opts)? {
 		warn!(event = "degraded", part = flag, "not available in this version yet; ignored (see GET /capabilities features)");
 	}
+	rproxy_api::config::performance::apply(&perf);
+	log_performance(&perf);
+	let upgrade_opts = upgrade_options(&opts);
+	upgrade::hash_binary();
+	// a live upgrade (#174): take the old process's sockets and state before
+	// anything listens
+	let received = match &handoff_from {
+		Some(path) => {
+			raise_nofile_limit();
+			let timeout = upgrade_opts.handoff_config().timeout;
+			let mut r = tokio::task::block_in_place(|| handoff::receive(path, timeout))?;
+			let fds = r.take_fds();
+			let received = fds.len();
+			let kept = upgrade::inherit::adopt(fds);
+			if let Ok(t) = r.state.process_start_time.parse::<f64>() {
+				upgrade::set_process_start_time(t as u64);
+			}
+			info!(event = "handoff.received", from_version = %r.state.version, sockets = kept, received, rules = r.state.rules.len());
+			Some(r)
+		}
+		None => None,
+	};
 	#[cfg(unix)]
 	let socket = match &opts.api_socket {
 		Some(path) => Some(rproxy_api::control::unix_api::SocketOptions {
@@ -737,7 +818,10 @@ async fn run(opts: Options) -> Result<(), String> {
 			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
 		}
 	}
-	if let Some(url) = &opts.database_url {
+	if let Some(r) = &received {
+		// the old process's rules, as they were (not the database's, read at its start)
+		r.restore_rules(&registry).await;
+	} else if let Some(url) = &opts.database_url {
 		let ui = match db::load_rules(url).await {
 			Ok(rules) => rules,
 			// keep serving the API so the UI can still add rules
@@ -782,12 +866,16 @@ async fn run(opts: Options) -> Result<(), String> {
 			},
 		))
 	});
+	let upgrader = handoff::Upgrader::new(upgrade_opts.handoff_config(), registry.clone());
+	let updater = upgrade::update::Updater::new(upgrade_opts.update_config());
+	upgrade::install(upgrade::Upgrade { upgrader: upgrader.clone(), updater: updater.clone() });
 	let app = api::router(Arc::new(AppState {
 		registry: registry.clone(),
 		tokens: tokens.clone(),
 		reloader: reloader.clone(),
 		reload_unix_only: opts.api_reload_unix_only,
-	}));
+	}))
+	.layer(axum::middleware::from_fn(upgrade::guard));
 	let handles: Arc<Mutex<Vec<Handle>>> = Arc::default();
 	let stop = CancellationToken::new();
 	let retry = Duration::from_secs(opts.api_retry_secs.max(1));
@@ -845,18 +933,32 @@ async fn run(opts: Options) -> Result<(), String> {
 		tokio::spawn(watch_config(every, reloader, config_hup.clone(), stop.clone()));
 	}
 
-	wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup).await?;
+	// the startup is done: a new process of a live upgrade takes over now
+	if let Some(r) = received {
+		let left = upgrade::inherit::close_rest();
+		if !left.is_empty() {
+			info!(event = "handoff.sockets", unused = left.len(), "closed inherited sockets no rule or listener took");
+		}
+		let adopted = r.ready(&registry).await?;
+		tokio::spawn(adopted.follow(registry.clone()));
+	}
+	updater.spawn(Some(upgrader.clone()));
+	upgrade::notify::notify("READY=1");
 
-	info!(event = "shutdown");
+	let handed = wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup, &upgrader).await?;
+
+	// GET /readyz: draining (#28), here and after a handoff
 	registry.readiness().set_draining();
+	match &handed {
+		Some(h) => {
+			handoff::set_draining();
+			info!(event = "handoff.drain", pid = h.pid, drain_secs = upgrader.config().drain.as_secs());
+		}
+		None => info!(event = "shutdown"),
+	}
 	stop.cancel();
 	for handle in handles.lock().unwrap().iter() {
 		handle.graceful_shutdown(Some(Duration::from_secs(5)));
-	}
-	#[cfg(unix)]
-	if let (Some(server), Some(socket)) = (unix_server, &socket) {
-		let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
-		let _ = std::fs::remove_file(&socket.path);
 	}
 	if let Some(b) = &crowdsec {
 		b.stop();
@@ -867,8 +969,63 @@ async fn run(opts: Options) -> Result<(), String> {
 	if let Some(a) = &acme {
 		a.shutdown();
 	}
-	registry.shutdown().await;
+	// after a handoff the rules stop accepting at once and drain meanwhile
+	let runtimes = if handed.is_some() { registry.runtimes().await } else { vec![] };
+	let drain = upgrader.config().drain;
+	let draining = async {
+		if handed.is_none() {
+			return;
+		}
+		// SIGTERM (systemctl stop) cuts the drain short
+		let until = async move {
+			#[cfg(unix)]
+			if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+				tokio::select! {
+					_ = tokio::time::sleep(drain) => {}
+					_ = term.recv() => {}
+					_ = tokio::signal::ctrl_c() => {}
+				}
+				return;
+			}
+			tokio::time::sleep(drain).await;
+		};
+		registry.drain_all(until).await;
+	};
+	let api_down = async {
+		#[cfg(unix)]
+		if let (Some(server), Some(socket)) = (unix_server, &socket) {
+			let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+			// after a handoff the socket file is the new process's
+			if handed.is_none() {
+				let _ = std::fs::remove_file(&socket.path);
+			}
+		}
+	};
+	tokio::join!(draining, api_down);
+	match handed {
+		Some(h) => upgrader.finish(h, runtimes).await,
+		None => registry.shutdown().await,
+	}
 	Ok(())
+}
+
+/// `event = "performance"`: the settings in effect and where each came from.
+fn log_performance(p: &rproxy_api::config::performance::Effective) {
+	use rproxy_api::config::performance::Affinity;
+	let affinity = match &p.cpu_affinity {
+		Affinity::None => "none".to_string(),
+		Affinity::Auto => "auto".to_string(),
+		Affinity::List(cpus) => cpus.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","),
+	};
+	let sources: Vec<String> = p.sources.iter().map(|(k, f)| format!("{k}={}", f.as_str())).collect();
+	info!(event = "performance", workers = p.workers, udp_shards = p.udp_shards, cpu_affinity = %affinity,
+		busy_poll_usecs = p.busy_poll_usecs, splice = p.splice.enabled, splice_after = p.splice.after,
+		splice_full_reads = p.splice.full_reads, splice_pipe_size = p.splice.pipe_size, sources = %sources.join(" "));
+	if !p.missing_cpus.is_empty() {
+		let missing: Vec<String> = p.missing_cpus.iter().map(|c| c.to_string()).collect();
+		warn!(event = "degraded", part = "global.performance.cpu_affinity", cpus = %missing.join(","),
+			"these CPUs do not exist or this process may not use them; left out");
+	}
 }
 
 /// Records the control API's certificate expiry (it is not in the certificate
@@ -991,13 +1148,22 @@ async fn wait_for_shutdown(
 	tls_files: Option<&ApiTlsFiles>,
 	registry: &Arc<Registry>,
 	config_hup: &Notify,
-) -> Result<(), String> {
+	upgrader: &Arc<rproxy_api::control::upgrade::handoff::Upgrader>,
+) -> Result<Option<rproxy_api::control::upgrade::handoff::HandedOff>, String> {
 	use tokio::signal::unix::{signal, SignalKind};
 
 	let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
 	let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
+	// a live upgrade to the binary on disk (#174)
+	let mut usr2 = signal(SignalKind::user_defined2()).map_err(|e| e.to_string())?;
 	loop {
 		tokio::select! {
+			_ = usr2.recv() => {
+				if let Err(e) = upgrader.start(None, "SIGUSR2") {
+					warn!(event = "handoff.busy", error = %e);
+				}
+			}
+			h = upgrader.handed_off() => return Ok(Some(h)),
 			_ = hup.recv() => {
 				match tokens.reload() {
 					Ok(n) => info!(event = "reload.tokens", tokens = n),
@@ -1026,8 +1192,8 @@ async fn wait_for_shutdown(
 					let _ = tokio::task::spawn_blocking(move || g.refresh(true)).await;
 				}
 			}
-			_ = term.recv() => return Ok(()),
-			_ = tokio::signal::ctrl_c() => return Ok(()),
+			_ = term.recv() => return Ok(None),
+			_ = tokio::signal::ctrl_c() => return Ok(None),
 		}
 	}
 }
@@ -1040,8 +1206,10 @@ async fn wait_for_shutdown(
 	_: Option<&ApiTlsFiles>,
 	_: &Arc<Registry>,
 	_: &Notify,
-) -> Result<(), String> {
-	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
+	_: &Arc<rproxy_api::control::upgrade::handoff::Upgrader>,
+) -> Result<Option<rproxy_api::control::upgrade::handoff::HandedOff>, String> {
+	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+	Ok(None)
 }
 
 /// A missing file or unusable content is a mistake in the configuration;
@@ -1076,7 +1244,11 @@ impl ApiListener {
 		};
 		// Bind here so a busy port fails right away. Waiting on `Handle::listening()` for a bind
 		// error can hang: axum-server notifies only the waiters present at that moment.
-		let listener = std::net::TcpListener::bind(self.addr).map_err(|e| e.to_string())?;
+		// a live upgrade (#174): the old process's socket
+		let listener = match rproxy_api::control::upgrade::inherit::take_tcp(self.addr) {
+			Some(l) => l,
+			None => std::net::TcpListener::bind(self.addr).map_err(|e| e.to_string())?,
+		};
 		listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 		// the peer's address for the audit log (api::Client)
 		let app = self.app.clone().into_make_service_with_connect_info::<SocketAddr>();

@@ -65,6 +65,11 @@ async fn remove_stale(path: &Path) -> Result<(), SocketError> {
 /// Opens the socket, replacing a stale one left by a previous run.
 pub async fn bind(opts: &SocketOptions) -> Result<UnixListener, SocketError> {
 	let path = &opts.path;
+	// a live upgrade (#174): the old process's socket, with its owner and mode
+	if let Some(l) = crate::control::upgrade::inherit::take_unix(path) {
+		let inherited = l.set_nonblocking(true).and_then(|_| UnixListener::from_std(l));
+		return inherited.map_err(|e| SocketError::Unavailable(format!("{}: {e}", path.display())));
+	}
 	let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
 	if !parent.is_dir() {
 		return Err(SocketError::Config(format!("{}: directory {} does not exist", path.display(), parent.display())));

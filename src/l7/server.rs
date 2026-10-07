@@ -300,6 +300,7 @@ where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
 	let conn = Arc::new(Conn::new(rt, client, local, tls, false));
+	let stop = conn.rt.stop.clone();
 	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
 		let conn = conn.clone();
 		async move { Ok::<_, Infallible>(conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await) }
@@ -307,7 +308,15 @@ where
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 	builder.http1().timer(TokioTimer::new());
 	builder.http2().timer(TokioTimer::new()).max_header_list_size(MAX_HEADER_SECTION);
-	builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await.map_err(io::Error::other)
+	let served = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+	tokio::pin!(served);
+	// the rule stops accepting (DELETE with drain, a live upgrade's drain): finish
+	// the requests in flight, then close instead of keeping the connection idle
+	tokio::select! {
+		r = served.as_mut() => return r.map_err(io::Error::other),
+		_ = stop.cancelled() => served.as_mut().graceful_shutdown(),
+	}
+	served.await.map_err(io::Error::other)
 }
 
 fn full(status: StatusCode, text: &str) -> Response<Body> {

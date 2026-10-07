@@ -91,7 +91,7 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | Maximum size of the port range one rule can open |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | Interval (seconds) for re-resolving target host names. If resolution fails, the previous result continues to be used |
 
-Added in v0.4 (until implemented, setting them logs `degraded` and they are ignored; control API hardening (#167) works. "v0.4 settings" and "Control API hardening" in docs/en/API.md):
+Added in v0.4 (all of them work; settings of rules and `global` are in "v0.4 settings" of docs/en/API.md, control API hardening in "Control API hardening", live upgrades and the self-update in docs/en/UPGRADE.md):
 
 | Environment variable | Flag | Default | Description |
 |---|---|---|---|
@@ -100,9 +100,9 @@ Added in v0.4 (until implemented, setting them logs `degraded` and they are igno
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | Days before a token's expiry from which `token.expiring` is logged (#167) |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | Lock out sources that keep failing authentication (401) on the TCP control API with `429 locked_out` (on by default; `0`: never; not the Unix socket) (#167) |
 | `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules`; only rows with this name are restored at startup (#144, "Storing API-created rules" in docs/en/API.md) |
-| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174) |
-| `RPROXY_UPDATE` | `--update` | `off` | Self-update: `off`, `check`, `auto` (#174); also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY` |
-| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | number of CPUs / `none` / `0` | Performance (#194; `global.performance` in the settings file wins) |
+| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174): SIGUSR2 or `POST /admin/upgrade` hands the listening sockets to the binary on disk. The handoff socket, how long to wait for the new process, how long the old one waits for its connections. docs/en/UPGRADE.md |
+| `RPROXY_UPDATE` | `--update` | `off` | Self-update (containers, #174): `off`, `check`, `auto`; also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY`. The image's entry point is `rproxy-api launch`. docs/en/UPGRADE.md |
+| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | number of CPUs / `none` / `0` | Performance (#194; `global.performance` in the settings file wins). Also `RPROXY_UDP_SHARDS` (a number or `auto`) and `RPROXY_SPLICE*`. "Performance" in docs/en/API.md |
 | `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | `RPROXY_API_SOCKET`, else the control API / none | `--check-config --diff`: the difference from the running rproxy, asked with `POST /config/plan` (#169, "Diff before change" in docs/en/API.md) |
 
 If `RPROXY_API_ADDR` includes a non-loopback address, a token file and a TLS certificate are required. If any of them is missing, rproxy does not start.
@@ -320,6 +320,9 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | An ACME account was created or deactivated / a DNS-01 TXT record was written or removed / a challenge was set up or answered / `http01_listen` started listening. No secret is logged |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |
 | `cert.check` | Periodic expiry check (`rules_updated`: number of rules from which expired certificates were removed or that were stopped) |
+| `performance` | The `global.performance` values at startup and where each came from (`sources`) |
+| `handoff.start` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.received` / `handoff.counters` | Live upgrade: started / the new process (`pid`) is ready / the old process waits for its connections / done / failed (the old process keeps running) / refused for another minor / what the new process received / the old process's last counts added (docs/en/UPGRADE.md) |
+| `update.available` / `update.fetched` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` | Self-update: a new patch exists / verified and cached / became the good version / rolled back as bad / failed (a signature that does not match, ...) / the launcher started the server / the main process changed with a handoff |
 | (`debug` only) `udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` | A UDP datagram was dropped (counted in `stats.dropped`) / sending or receiving failed / TCP_NODELAY could not be set |
 
 ## Development

@@ -25,25 +25,16 @@ async fn send(h: &Harness, method: Method, path: &str, body: Option<Value>) -> (
 	(status, r.json().await.unwrap_or(Value::Null))
 }
 
-fn code(r: &(StatusCode, Value)) -> (StatusCode, Option<&str>) {
-	(r.0, r.1["code"].as_str())
-}
-
-const UNSUPPORTED: (StatusCode, Option<&str>) = (StatusCode::BAD_REQUEST, Some("unsupported"));
-
 #[tokio::test]
-async fn capabilities_list_the_v0_4_features_as_off() {
+async fn capabilities_list_every_v0_4_feature_as_on() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
+	// all implemented (tests/api_hardening.rs, rulesets.rs, geoip.rs, outlier.rs, plan.rs, persist.rs, limits.rs, handoff.rs, self_update.rs)
 	for flag in [
-		"handoff", "self_update",
+		"client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection",
+		"dry_run", "persistence", "limits", "bandwidth", "handoff", "self_update",
 	] {
-		assert_eq!(f[flag], false, "{flag}: {caps}");
-	}
-	assert_eq!(f["performance"], json!([]), "{caps}");
-	// implemented (tests/api_hardening.rs, tests/rulesets.rs, tests/geoip.rs, tests/outlier.rs, tests/limits.rs)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection", "limits", "bandwidth"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
 	assert!(f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
@@ -55,14 +46,27 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 
 // #169 (dry runs) and #144 (persistence) work: tests/plan.rs and tests/persist.rs
 
-/// #174
+/// #174 (implemented): tests/handoff.rs and tests/self_update.rs run the real
+/// binary; here the endpoints of a router without a server process.
 #[tokio::test]
-async fn upgrade_and_update_endpoints_are_unsupported() {
+async fn upgrade_and_update_endpoints_answer() {
 	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!((&caps["features"]["handoff"], &caps["features"]["self_update"]), (&json!(true), &json!(true)), "{caps}");
+	assert_eq!(caps["build"]["version"], caps["version"], "{caps}");
 	// strong operations: only over the Unix socket by default
 	assert_eq!(send(&h, Method::POST, "/admin/upgrade", None).await.0, StatusCode::FORBIDDEN);
 	assert_eq!(send(&h, Method::POST, "/admin/update", None).await.0, StatusCode::FORBIDDEN);
-	assert_eq!(code(&send(&h, Method::GET, "/admin/update", None).await), UNSUPPORTED);
+	let r = send(&h, Method::GET, "/admin/update", None).await;
+	assert_eq!((r.0, &r.1["mode"], &r.1["available"]), (StatusCode::OK, &json!("off"), &Value::Null), "{}", r.1);
+}
+
+/// #194, #184 (implemented): tests/performance.rs runs the real binary.
+#[tokio::test]
+async fn performance_keys_are_all_applied() {
+	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["performance"], json!(["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]), "{caps}");
 }
 
 /// Scopes of the new endpoints.
@@ -139,11 +143,8 @@ rules:
 	let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
 	assert_eq!((exit, &v["ok"]), (0, &json!(true)), "warnings only: {v}");
 	let warnings = v["warnings"].to_string();
-	for want in ["global.performance.workers", "global.performance.udp_shards", "global.performance.splice"] {
-		assert!(warnings.contains(want), "{want}: {warnings}");
-	}
-	// every v0.4 setting of a rule runs now (labels, limits, bandwidth, outlier_detection)
-	assert!(!warnings.contains("rule #"), "{warnings}");
+	// every v0.4 setting runs now: nothing to warn about
+	assert!(!warnings.contains("global.performance") && !warnings.contains("rule #"), "{warnings}");
 
 	// mistakes in the shapes are errors
 	for (text, want) in [

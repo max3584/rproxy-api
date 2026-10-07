@@ -7,6 +7,7 @@
 | `cargo test` | Unit tests (`src/`) and integration tests (`tests/`) | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (runs Alpine's MariaDB in the same container) |
 | `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME (docs/en/ACME.md): starts Pebble (the ACME test CA) and PowerDNS and obtains real certificates through HTTP-01, TLS-ALPN-01 and DNS-01 (the PowerDNS API, RFC 2136 (PowerDNS's DNS UPDATE, TSIG HMAC-SHA256 and SHA512), acme-dns (a small stand-in), CNAME delegation, generic REST). That part is skipped without the variables (the tests of the API's guards always run); `RPROXY_TEST_REQUIRE_ACME=1` turns the skip into a failure | `test` (Alpine's `pebble`, `pdns`, `pdns-backend-sqlite3`, `pdns-doc` and `sqlite` in the same container; `RPROXY_TEST_REQUIRE_ACME=1`) |
+| `cargo test --test self_update` | Self-update (#174): fetching and verifying from a signed release mirror (HTTPS), swapping in with a handoff, the launcher (`launch`), rollback. The test of signatures made by the minisign tool is skipped without `minisign` (`RPROXY_TEST_REQUIRE_MINISIGN=1` makes skipping a failure) | `test` (Alpine's `minisign`; `RPROXY_TEST_REQUIRE_MINISIGN=1`) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
@@ -204,9 +205,10 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions`, `readyz`, `geoip`, `outlier_detection`, `limits` and `bandwidth` (and the `geoip` middleware, services' `outlier_detection`) are true), `performance` is empty |
-| `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule |
-| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.performance.*`; every v0.4 setting of a rule runs now, so rules are not warned about). A 0.3 settings file passes without warnings |
+| `capabilities_list_every_v0_4_feature_as_on` | Every v0.4 flag in `features` is true (`client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions`, `readyz`, `geoip`, `outlier_detection`, `limits`, `bandwidth`, `dry_run`, `persistence`, `handoff`, `self_update`; the `geoip` middleware and services' `outlier_detection`) |
+| `upgrade_and_update_endpoints_answer`, `performance_keys_are_all_applied` | Implemented #174 and performance: `handoff` and `self_update` are true, `build`, the `/admin/*` answers of a router built as a library (Unix socket only; `GET /admin/update` is `mode: off`), `features.performance` lists every key |
+| `new_endpoints_need_their_scopes` | Scopes of the new endpoints and the Unix-socket-only rule |
+| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors; every v0.4 setting runs, so nothing is warned about. A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
 
 ## Integration tests: control API hardening (`tests/api_hardening.rs`, #167)
@@ -218,6 +220,36 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 | `lockout_is_on_by_default` | By default (owner's decision) the 20th failure locks out |
 | `expiring_tokens_are_reported_and_exported` | A token close to expiry gives `token.expiring` (`days_left`), an expired one `token.expired`, once per change. `rproxy_token_expiry_timestamp_seconds` in `/metrics` |
 | `the_binary_serves_client_certificates` | The real binary: a token file with `client_cert` and no `--tls-client-auth` stops the startup; with `required`, `/rules` is read with the certificate alone and connections without one are refused |
+
+## Integration tests: live upgrades (`tests/handoff.rs`, #174)
+
+Starts the real binary and hands over with SIGUSR2 and `POST /admin/upgrade` (docs/en/UPGRADE.md).
+
+| Test | What it checks |
+|---|---|
+| `tcp_connections_survive_and_new_ones_go_to_the_new_process` | TCP connections opened before the handoff (a static rule and an API rule) are carried by the old process to the end. New connections after it are the new process's (the owner of the server-side socket is found in `/proc`). UDP goes on in a new session. API rules (`targets`, `allow_from`) carry over, as do the control API's TCP and Unix sockets. `rproxy_process_start_time_seconds` stays. The old process exits cleanly once its connections end; counters never go down and what the old process counted while it drained is added (exact connection and byte counts). A second handoff through `POST /admin/upgrade` on the Unix socket. A plain stop at the end removes the socket file |
+| `api_rules_and_http_counters_carry_over` | Rules of a `persist: true` token come back as `origin: "api"` with `created_by`, `created_at` and `persisted`, without reading the database. `stats.http` by route carries over and keeps counting |
+| `a_failed_handoff_keeps_the_old_process` | When the new process cannot connect (the handoff socket's directory is missing): `handoff.failed`, and the old process keeps running. `rproxy_handoffs_total{outcome="failed"}`, `rproxy_build_info`. `POST /admin/upgrade` over TCP is 403 by default |
+
+## Integration tests: performance (`tests/performance.rs`, #194, #184)
+
+Starts the real binary and checks the effect of `global.performance` from outside.
+
+| Test | What it checks |
+|---|---|
+| `the_settings_file_sets_workers_shards_and_pinning` | The settings file wins over the environment: the number of worker threads (`rproxy-wrk-*`), worker i pinned to the i-th listed CPU (`Cpus_allowed_list` in `/proc/<pid>/task/*/status`), `udp_shards: auto` opening as many sockets per port as workers (`/proc/net/udp`), `splice` overridden key by key, `sources` in the `performance` line |
+| `the_environment_applies_without_the_file` | Without `global.performance` in the settings file, `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS=auto` and `RPROXY_SPLICE=0` apply. With nothing set, the defaults (one UDP socket, no pinning) |
+| `cpus_that_do_not_exist_are_left_out` | CPUs that do not exist are left out with `degraded`; the workers are as many as the usable CPUs |
+
+## Integration tests: self-update (`tests/self_update.rs`, #174)
+
+An HTTPS mirror (a small server in the test; binaries are answered with a redirect, as GitHub does) carries this binary signed under the next patch number.
+
+| Test | What it checks |
+|---|---|
+| `a_signed_patch_is_swapped_in_and_a_forged_one_refused` | The new patch is picked from the signed index (with a gap in the numbers and another minor listed); `POST /admin/update` fetches and verifies it and swaps it in with a handoff (the new process runs the cached binary); after `RPROXY_UPDATE_HEALTHY` it is the good version. A patch whose signature does not match its binary is refused (`error` in `GET /admin/update`) and never cached |
+| `launch_runs_the_newest_patch_follows_upgrades_and_rolls_back` | `rproxy-api launch` picks and starts the newest patch (on trial), passes SIGUSR2 on and follows the main process after the handoff; a version on trial that dies is marked bad and the image's version starts instead; SIGTERM stops the server and the launcher |
+| `signatures_of_the_minisign_tool_verify` | Keys and signatures made by the minisign tool (the default prehashed form and the legacy one) verify |
 
 ## Integration tests: diff before change (`tests/plan.rs`, #169)
 

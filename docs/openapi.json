@@ -1694,6 +1694,19 @@
                 "description": "Keys of global.performance applied from the settings file"
               }
             }
+          },
+          "build": {
+            "type": "object",
+            "description": "The running binary (v0.4, #174); sha256 is null right after the start",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string",
+                "nullable": true
+              }
+            }
           }
         }
       },
@@ -2871,7 +2884,8 @@
                 "type": "string"
               },
               "sha256": {
-                "type": "string"
+                "type": "string",
+                "nullable": true
               }
             }
           },
@@ -4369,13 +4383,28 @@
     },
     "/admin/upgrade": {
       "post": {
-        "summary": "Live upgrade: hand the sockets over to the binary now on disk (admin; by default only over the Unix socket; v0.4, #174). unsupported until GET /capabilities features.handoff is true (v0.4)",
+        "summary": "Live upgrade: hand the sockets over to the binary now on disk, as SIGUSR2 (admin; by default only over the Unix socket; v0.4, #174; docs/UPGRADE.md). The handoff goes on in the background",
         "responses": {
           "202": {
-            "description": "Done"
+            "description": "Started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "started"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           },
           "400": {
-            "description": "invalid / unsupported",
+            "description": "unsupported (not the rproxy-api server process)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4403,13 +4432,23 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "upgrading: a live upgrade is already in progress",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
     },
     "/admin/update": {
       "get": {
-        "summary": "Self-update state (admin; v0.4, #174). unsupported until GET /capabilities features.self_update is true (v0.4)",
+        "summary": "Self-update state (admin; v0.4, #174; docs/UPGRADE.md)",
         "responses": {
           "200": {
             "description": "OK",
@@ -4417,16 +4456,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UpdateStatus"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "invalid / unsupported",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -4454,20 +4483,28 @@
         }
       },
       "post": {
-        "summary": "Look for a new patch now and, with RPROXY_UPDATE=auto, swap it in (admin; by default only over the Unix socket; v0.4, #174). unsupported until GET /capabilities features.self_update is true (v0.4)",
+        "summary": "Look for a new patch now and, with RPROXY_UPDATE=auto, swap it in with a live upgrade (admin; by default only over the Unix socket; v0.4, #174). The check goes on in the background; its result is in GET /admin/update",
         "responses": {
           "202": {
-            "description": "OK",
+            "description": "Checking",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UpdateStatus"
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "checking"
+                      ]
+                    }
+                  }
                 }
               }
             }
           },
           "400": {
-            "description": "invalid / unsupported",
+            "description": "unsupported: RPROXY_UPDATE=off, or not the rproxy-api server process",
             "content": {
               "application/json": {
                 "schema": {

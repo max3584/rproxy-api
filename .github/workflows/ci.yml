@@ -29,10 +29,11 @@ jobs:
       # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring と zstd-sys
       # tests/traefik_convert.rs runs contrib/traefik2rproxy.py (python3, py3-yaml)
       # tests/acme.rs obtains certificates from Pebble (the ACME test CA) with PowerDNS (pdns-doc has its schema)
+      # tests/self_update.rs checks signatures made by the minisign tool
       - name: packages
         run: |
           apk add --no-cache bash git tar zstd curl gcc musl-dev python3 py3-yaml mariadb mariadb-client \
-            pebble pdns pdns-backend-sqlite3 pdns-doc sqlite
+            pebble pdns pdns-backend-sqlite3 pdns-doc sqlite minisign
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,6 +69,7 @@ jobs:
           RPROXY_TEST_PDNS_SCHEMA: /usr/share/doc/pdns/schema.sqlite3.sql
           RPROXY_TEST_SQLITE3: /usr/bin/sqlite3
           RPROXY_TEST_REQUIRE_ACME: "1"
+          RPROXY_TEST_REQUIRE_MINISIGN: "1"
         run: cargo test --locked --all-targets
 
   transparent:

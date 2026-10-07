@@ -207,6 +207,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		"max_range_ports": state.registry.caps().max_range_ports,
 		// v0.3 settings this build can run (docs/DESIGN-v0.3.md)
 		"features": state.registry.caps().features,
+		// the running binary (#174)
+		"build": super::upgrade::build_view(),
 	}))
 }
 
@@ -486,6 +488,7 @@ async fn delete(
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	let mut text = state.registry.metrics().await;
 	text.push_str(&crate::control::hardening::metrics(&state.tokens));
+	text.push_str(&super::upgrade::metrics());
 	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
 

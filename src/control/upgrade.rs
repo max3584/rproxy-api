@@ -3,12 +3,32 @@
 //! (SIGUSR2 / `POST /admin/upgrade`), and the launcher that follows the newest
 //! signed patch of the image's X.Y (`RPROXY_UPDATE*`, `GET` / `POST /admin/update`).
 //!
-//! v0.4.0 settles the shape; `features.handoff` and `features.self_update` say
-//! whether this build does it.
+//! - `handoff`: the live upgrade (both sides), `inherit`: the sockets the new
+//!   process received, `fdpass`: the channel (SCM_RIGHTS), `notify`: sd_notify
+//! - `update`: fetching and verifying releases, the cache, `minisign`: signatures,
+//!   `launch`: `rproxy-api launch` (the container's entry point)
 
+pub mod fdpass;
+pub mod handoff;
+pub mod inherit;
+pub mod launch;
+pub mod minisign;
+pub mod notify;
+pub mod update;
+
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
+use serde_json::json;
+
+use crate::control::api::{AppState, Transport};
 use crate::core::rule::Features;
+use crate::error::ApiError;
 
 /// `RPROXY_UPDATE`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -62,7 +82,7 @@ fn duration(what: &str, v: &Option<String>, min: Duration, max: Duration, errors
 }
 
 /// The release this build belongs to, as (major, minor).
-fn own_minor() -> (u64, u64) {
+pub(crate) fn own_minor() -> (u64, u64) {
 	let mut it = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap_or(0));
 	(it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
@@ -117,36 +137,174 @@ impl UpgradeOptions {
 	}
 }
 
+impl UpgradeOptions {
+	/// The handoff settings with their defaults (after `check`).
+	pub fn handoff_config(&self) -> handoff::Config {
+		let d = |v: &Option<String>, default: Duration| v.as_deref().and_then(|v| crate::l7::parse_duration(v).ok()).unwrap_or(default);
+		handoff::Config {
+			socket: self.handoff_socket.clone().unwrap_or_else(|| DEFAULT_HANDOFF_SOCKET.into()),
+			timeout: d(&self.handoff_timeout, DEFAULT_HANDOFF_TIMEOUT),
+			drain: d(&self.handoff_drain, DEFAULT_HANDOFF_DRAIN),
+		}
+	}
+
+	/// The self-update settings with their defaults (after `check`).
+	pub fn update_config(&self) -> update::UpdateConfig {
+		let d = |v: &Option<String>, default: Duration| v.as_deref().and_then(|v| crate::l7::parse_duration(v).ok()).unwrap_or(default);
+		update::UpdateConfig {
+			mode: self.update.unwrap_or_default(),
+			pin: self.update_pin.as_deref().and_then(update::Version::parse),
+			source: self.update_source.clone().unwrap_or_else(|| DEFAULT_UPDATE_SOURCE.into()),
+			cache: self.update_cache.clone().unwrap_or_else(|| DEFAULT_UPDATE_CACHE.into()),
+			interval: d(&self.update_interval, DEFAULT_UPDATE_INTERVAL),
+			pubkey: self.update_pubkey.clone(),
+			healthy: d(&self.update_healthy, DEFAULT_UPDATE_HEALTHY),
+			ca_file: std::env::var("RPROXY_UPDATE_CA_FILE").ok().filter(|v| !v.is_empty()),
+		}
+	}
+}
+
+/// The live upgrade and the self-update of this process (set by `main`; the
+/// router has none in tests that build it as a library).
+pub struct Upgrade {
+	pub upgrader: Arc<handoff::Upgrader>,
+	pub updater: Arc<update::Updater>,
+}
+
+static UPGRADE: OnceLock<Upgrade> = OnceLock::new();
+
+pub fn install(u: Upgrade) {
+	let _ = UPGRADE.set(u);
+}
+
+pub fn installed() -> Option<&'static Upgrade> {
+	UPGRADE.get()
+}
+
+/// `rproxy_process_start_time_seconds` (`core::bandwidth::process_start`, #166):
+/// kept over live upgrades.
+pub fn process_start_time() -> u64 {
+	crate::core::bandwidth::process_start()
+}
+
+/// Takes over the start time from the old process (a live upgrade).
+pub fn set_process_start_time(secs: u64) {
+	crate::core::bandwidth::set_process_start(secs);
+}
+
+static BUILD_SHA256: OnceLock<String> = OnceLock::new();
+
+/// SHA-256 of the running binary (None until `hash_binary` has read it).
+pub fn build_sha256() -> Option<String> {
+	BUILD_SHA256.get().cloned()
+}
+
+/// Reads the running binary once for `build_sha256` (in the background).
+pub fn hash_binary() {
+	std::thread::spawn(|| {
+		use sha2::Digest;
+		use std::io::Read;
+		let Ok(mut f) = std::fs::File::open("/proc/self/exe") else { return };
+		let mut h = sha2::Sha256::new();
+		let mut buf = vec![0u8; 1 << 16];
+		loop {
+			match f.read(&mut buf) {
+				Ok(0) => break,
+				Ok(n) => h.update(&buf[..n]),
+				Err(_) => return,
+			}
+		}
+		let _ = BUILD_SHA256.set(h.finalize().iter().map(|b| format!("{b:02x}")).collect());
+	});
+}
+
+/// `build` of `GET /capabilities`.
+pub fn build_view() -> serde_json::Value {
+	json!({"version": env!("CARGO_PKG_VERSION"), "sha256": build_sha256()})
+}
+
+/// `rproxy_build_info`, `rproxy_handoffs_total` (`rproxy_process_start_time_seconds`
+/// is the registry's).
+pub fn metrics() -> String {
+	use std::fmt::Write as _;
+	use std::sync::atomic::Ordering;
+	let mut out = String::new();
+	let _ = writeln!(out, "# HELP rproxy_build_info The running binary (version, SHA-256).");
+	let _ = writeln!(out, "# TYPE rproxy_build_info gauge");
+	let _ = writeln!(out, "rproxy_build_info{{version=\"{}\",sha256=\"{}\"}} 1", env!("CARGO_PKG_VERSION"), build_sha256().unwrap_or_default());
+	let _ = writeln!(out, "# HELP rproxy_handoffs_total Live upgrades this process started, by outcome.");
+	let _ = writeln!(out, "# TYPE rproxy_handoffs_total counter");
+	let o = &handoff::OUTCOMES;
+	for (outcome, n) in [("done", &o.done), ("failed", &o.failed), ("refused", &o.refused)] {
+		let _ = writeln!(out, "rproxy_handoffs_total{{outcome=\"{outcome}\"}} {}", n.load(Ordering::Relaxed));
+	}
+	out
+}
+
+/// While a live upgrade runs (and after it, in the old process), requests that
+/// change something get `503 upgrading`: the old process's state has been
+/// handed over, and a change it made now would be lost.
+pub async fn guard(req: Request, next: Next) -> Response {
+	let reads = matches!(*req.method(), Method::GET | Method::HEAD);
+	if handoff::active() && !reads && !req.uri().path().starts_with("/admin/") {
+		return upgrading("a live upgrade is in progress; send the request again in a moment").into_response();
+	}
+	next.run(req).await
+}
+
+fn upgrading(message: &str) -> ApiError {
+	ApiError { status: StatusCode::SERVICE_UNAVAILABLE, code: "upgrading", message: message.into() }
+}
+
 /// `POST /admin/upgrade`: a handoff to the binary now on disk (`admin`, by
 /// default only over the Unix socket).
-pub async fn upgrade(
-	axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::control::api::AppState>>,
-	transport: Option<axum::extract::Extension<crate::control::api::Transport>>,
-) -> crate::error::ApiError {
+pub async fn upgrade(State(state): State<Arc<AppState>>, transport: Option<Extension<Transport>>) -> Response {
 	if let Err(e) = crate::control::api::unix_only(&state, transport.is_some(), "POST /admin/upgrade") {
-		return e;
+		return e.into_response();
 	}
-	unavailable("live upgrade (handoff)")
+	let Some(u) = installed() else {
+		return ApiError::unsupported("live upgrades are run by the rproxy-api server process only").into_response();
+	};
+	match u.upgrader.start(None, "api") {
+		Ok(()) => (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response(),
+		Err(e) => ApiError { status: StatusCode::CONFLICT, code: "upgrading", message: e }.into_response(),
+	}
 }
 
 /// `GET /admin/update`: the self-update state (`admin`).
-pub async fn update_status() -> crate::error::ApiError {
-	unavailable("self-update")
+pub async fn update_status() -> Response {
+	match installed() {
+		Some(u) => Json(u.updater.status()).into_response(),
+		None => Json(json!({
+			"mode": "off",
+			"current": {"version": env!("CARGO_PKG_VERSION"), "sha256": build_sha256()},
+			"available": null,
+			"last_check": null,
+			"error": null,
+			"bad_versions": [],
+		}))
+		.into_response(),
+	}
 }
 
 /// `POST /admin/update`: check for a new patch now (`admin`, by default only over the Unix socket).
-pub async fn update_now(
-	axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::control::api::AppState>>,
-	transport: Option<axum::extract::Extension<crate::control::api::Transport>>,
-) -> crate::error::ApiError {
+pub async fn update_now(State(state): State<Arc<AppState>>, transport: Option<Extension<Transport>>) -> Response {
 	if let Err(e) = crate::control::api::unix_only(&state, transport.is_some(), "POST /admin/update") {
-		return e;
+		return e.into_response();
 	}
-	unavailable("self-update")
-}
-
-fn unavailable(what: &str) -> crate::error::ApiError {
-	crate::error::ApiError::unsupported(format!("{what} is not available in this version (see GET /capabilities features)"))
+	let Some(u) = installed() else {
+		return ApiError::unsupported("the self-update runs in the rproxy-api server process only").into_response();
+	};
+	if u.updater.config().mode == UpdateMode::Off {
+		return ApiError::unsupported("the self-update is off (RPROXY_UPDATE=check or auto)").into_response();
+	}
+	let updater = u.updater.clone();
+	tokio::spawn(async move {
+		if let Err(e) = updater.check_now().await {
+			tracing::warn!(event = "update.error", error = %e);
+		}
+	});
+	(StatusCode::ACCEPTED, Json(json!({"status": "checking"}))).into_response()
 }
 
 #[cfg(test)]
@@ -155,7 +313,7 @@ mod tests {
 
 	#[test]
 	fn options_are_checked_and_ignored_until_available() {
-		let none = Features::CURRENT;
+		let none = Features { handoff: false, self_update: false, ..Features::CURRENT };
 		assert_eq!(UpgradeOptions::default().check(&none), Verdict::default());
 		let (a, b) = own_minor();
 		let auto = UpgradeOptions {

@@ -44,3 +44,24 @@ Done only in the repository being released (the other one's version is not bumpe
 3. **Release notes**: write "Main changes" in Japanese from the PRs merged in that milestone. The UI's release notes state the minimum rproxy-api version it needs (e.g. "rproxy-api v0.3.18 or later")
 4. **Close the milestone** and create the milestone for the next patch
 5. Confirm that it has been published via apt (the new version is visible with `apt-cache policy rproxy-api` / `apt-cache policy rproxy-ui`)
+
+## Live upgrades and patches (#174, from v0.4)
+
+- **Patches within one minor (X.Y) are guaranteed to be swappable while running** (docs/en/UPGRADE.md). A .deb upgrade hands over (SIGUSR2) when major.minor is the same and restarts otherwise. The container self-update follows the same X.Y only.
+- What a handoff passes (the kinds of sockets, the shape of `State` in `handoff.rs`, the messages) **does not change within a minor** (additions only in a form older versions can skip). Changing it means a new minor. Within a minor, going back to an older patch uses the same handoff.
+- **Exception patches** (a fix that needs a restart): commit `debian/restart-required` (an empty file) and add `["debian/restart-required", "usr/share/rproxy-api/", "644"]` to `assets` in `Cargo.toml`. The `sign` job of `release.yml` then writes `"handoff": false` into `manifest.json` (the self-update does not swap it in and uses it at the next start), and the .deb's `postinst` restarts. Say "restart needed" in the release notes too. Remove both in the next patch.
+
+## Release signatures (minisign, #174)
+
+The `sign` job of `release.yml` writes the index `releases.json` (every release's version; the self-update reads the latest release's) and attaches minisign signatures (`.minisig`) of every binary, `manifest.json`, `SHA256SUMS` and `releases.json` to the release. The self-update runs nothing it cannot verify. The key is separate from the apt GPG key (the owner's decision).
+
+Creating the key (once, locally; the secret key never goes into the repository):
+
+```bash
+minisign -G -W -p minisign.pub -s minisign.key   # -W: no password (CI signs with it; the secret store protects it)
+```
+
+- **Secret key**: the whole content of `minisign.key` goes into the repository secret **`MINISIGN_SECRET_KEY`** (`gh secret set MINISIGN_SECRET_KEY -R max3584/rproxy-api < minisign.key`). Keep the local `minisign.key` offline.
+- **Public key**: the second line (base64) of `minisign.pub` goes into the repository variable **`MINISIGN_PUBLIC_KEY`** (`gh variable set MINISIGN_PUBLIC_KEY -R max3584/rproxy-api --body "$(tail -n1 minisign.pub)"`). The release build puts it into the binary (`RPROXY_RELEASE_PUBKEY`) as the default of `RPROXY_UPDATE_PUBKEY`. Publish `minisign.pub` in the README and release notes too.
+- Without the secret, `manifest.json` and `SHA256SUMS` are attached unsigned with a warning (the self-update skips that release). Without the variable, binaries have no key built in and the self-update needs `RPROXY_UPDATE_PUBKEY`.
+- Rotating the key: versions with the old key built in cannot self-update to releases signed with a new key (they cannot verify it). Rotate together with a minor upgrade (a restart), or have users pass the new key with `RPROXY_UPDATE_PUBKEY`.

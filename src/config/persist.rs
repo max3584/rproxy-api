@@ -208,6 +208,11 @@ impl Store {
 		})
 	}
 
+	/// Takes over what the old process knew of an `api` rule (a live upgrade, #174).
+	pub fn adopt(&self, key: Key, meta: Meta) {
+		self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(key, meta);
+	}
+
 	/// Remembers the rules restored from the table (as stored).
 	pub fn restored(&self, rules: &[StoredRule]) {
 		let mut meta = self.meta.lock().unwrap();

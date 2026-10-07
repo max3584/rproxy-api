@@ -44,3 +44,24 @@ rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と U
 3. **リリースノート**: そのマイルストーンでマージした PR から、日本語で「主な変更」を書く。UI のリリースノートには、必要な rproxy-api の最小の版（例「rproxy-api v0.3.18 以上」）を書く
 4. **マイルストーンを閉じ**、次のパッチのマイルストーンを作る
 5. apt で公開されたこと（`apt-cache policy rproxy-api` / `apt-cache policy rproxy-ui` で新しいバージョンが見える）を確かめる
+
+## 再起動なしの更新とパッチ（#174、v0.4 から）
+
+- **同じマイナー（X.Y）の中のパッチは、動いたまま引き継げることを保証する**（docs/UPGRADE.md）。.deb の更新は major.minor が同じなら引き継ぎ（SIGUSR2）、違えば restart。コンテナの自動更新も同じ X.Y の中だけを追う。
+- 引き継ぎで渡すもの（ソケットの種類、`handoff.rs` の `State` の形、メッセージ）は**マイナーの中では変えない**（足すときは古い版が知らない項目を読み飛ばせる形で）。形を変えるならマイナーを上げる。同じマイナーの中なら古いパッチに戻すのも同じ引き継ぎで動く。
+- **例外のパッチ**（どうしても再起動が要る修正）：`debian/restart-required`（空のファイル）をコミットし、`Cargo.toml` の `assets` に `["debian/restart-required", "usr/share/rproxy-api/", "644"]` を足して出す。`release.yml` の `sign` が `manifest.json` を `"handoff": false` にし（自動更新は入れ替えず次の起動で使う）、.deb の `postinst` は restart する。リリースノートにも「再起動が要る」と書く。次のパッチでは両方を外す。
+
+## リリースの署名（minisign、#174）
+
+`release.yml` の `sign` ジョブが、索引 `releases.json`（すべてのリリースの版。自動更新は最新のリリースのものを読む）を作り、各バイナリと `manifest.json`・`SHA256SUMS`・`releases.json` に minisign の署名（`.minisig`）を付けてリリースに添付する。自動更新は署名を確かめられないものを実行しない。apt の GPG の鍵とは別の鍵（オーナーの決定）。
+
+鍵を作る（手元で 1 回。秘密鍵はリポジトリに置かない）：
+
+```bash
+minisign -G -W -p minisign.pub -s minisign.key   # -W: パスワードなし（CI で使うため。秘密はシークレットで守る）
+```
+
+- **秘密鍵**：`minisign.key` のファイルの中身をそのまま、リポジトリのシークレット **`MINISIGN_SECRET_KEY`** に入れる（`gh secret set MINISIGN_SECRET_KEY -R max3584/rproxy-api < minisign.key`）。手元の `minisign.key` はオフラインの場所に保管する。
+- **公開鍵**：`minisign.pub` の 2 行目（base64）を、リポジトリの変数 **`MINISIGN_PUBLIC_KEY`** に入れる（`gh variable set MINISIGN_PUBLIC_KEY -R max3584/rproxy-api --body "$(tail -n1 minisign.pub)"`）。リリースのビルドがこれをバイナリに入れ（`RPROXY_RELEASE_PUBKEY`）、`RPROXY_UPDATE_PUBKEY` の既定になる。`minisign.pub` は README・リリースノートにも載せる。
+- シークレットがないときは、`manifest.json`・`SHA256SUMS` を署名なしで添付し、警告を出して進む（自動更新はそのリリースを使わない）。変数がないときは鍵の入っていないバイナリになり、自動更新には `RPROXY_UPDATE_PUBKEY` が要る。
+- 鍵を替えるとき：新しい鍵で署名した版を出す前に、古い鍵の入った版から新しい鍵の入った版へは自動更新できない（古い版は新しい鍵の署名を確かめられない）。その切り替えはマイナーの更新（再起動）に合わせるか、利用者に `RPROXY_UPDATE_PUBKEY` で新しい鍵を渡してもらう。

@@ -202,9 +202,9 @@ impl Features {
 		client_cert_auth: true,
 		token_expiry: true,
 		api_lockout: true,
-		handoff: false,
-		self_update: false,
-		performance: &[],
+		handoff: true,
+		self_update: true,
+		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
 	};
 
 	/// Everything the settings can describe; for registering a startup rule

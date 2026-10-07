@@ -462,18 +462,35 @@ v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の�
 | 帯域（#166） | ルールの `bandwidth` | `upload`・`download`（`"10Mbps"`、8kbps〜100Gbps）、`burst`（`"1MiB"`）、`per_source`（`upload`・`download`・`prefix_v4`・`prefix_v6`・`max_sources`）。TCP は待たせ、UDP は捨てる | `bandwidth` |
 | GeoIP（#168。**動く**、下の「GeoIP」） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
 | 受け身のヘルスチェック（#170。**動く**、下の「受け身のヘルスチェック」） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
-| performance（#194・#184） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）。環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` より設定ファイルが先。再起動まで効かない | `performance`（効く項目の名前） |
+| performance（#194・#184。動く） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）。項目ごとに、設定ファイル → 環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` → 既定の順。再起動まで効かない。下の「performance」 | `performance`（効く項目の名前。すべて） |
 | ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「ルールの組・状態・readiness」 | `rulesets` |
 | 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy`（下の「ルールの組・状態・readiness」） | `conditions` |
 | readiness（#28） | `GET /readyz` | 認証なし。`200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
 | 変更前の差分（#169） | `?dry_run=true`（`POST /rules`・`PATCH`・`DELETE`・`PUT /rulesets/{name}`・`POST /config/reload`）、`POST /config/plan`、`--check-config --diff` | 応答は `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`。`change` は `none`・`in_place`・`recreate` | `dry_run` |
 | API で作ったルールの保存（#144） | トークンの `persist: true`、テーブル `rproxy_rules`、`--node-name` | 表示に `origin: "api"`・`persisted`・`created_by`・`created_at` | `persistence` |
 | 制御 API の守り（#167。動く） | `--tls-client-ca`・`--tls-client-auth`、トークンの `client_cert`、`--token-warn-days`、`--api-lockout-failures`・`--api-lockout-window`・`--api-lockout-duration` | `client_cert` はトークンの `sha256` の代わり、両方あれば両方が要る。期限が近いトークンは `token.expiring`、続けて失敗した送信元は `429 locked_out`（既定で有効）。上の「制御 API の守り」 | `client_cert_auth`、`token_expiry`、`api_lockout` |
-| 再起動なしの更新・自動更新（#174） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから | `handoff`、`self_update` |
+| 再起動なしの更新・自動更新（#174。動く） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update`、`rproxy-api launch` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから。docs/UPGRADE.md | `handoff`、`self_update` |
 
 - `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。DB の `options` でも同じ形で読む。
 - ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）が出る（動いているルール）。`stats.targets[]` の `ejected_until`・`ejections`（#170）は、動くようになったら出る。
 - トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。詳しくは上の「制御 API の守り」。
+
+### performance（`global.performance`、#194・#184）
+
+```yaml
+global:
+  performance:
+    workers: 8              # tokio のワーカースレッドの数（既定：使える CPU の数。cpu_affinity の一覧があればその数）
+    udp_shards: auto        # UDP のポートごとの SO_REUSEPORT のソケットの数。1〜64 か auto（= workers）。既定 1
+    cpu_affinity: none      # none・auto（ワーカー i を i 番目の CPU に固定）・"0-3,6"（ワーカーを一覧の CPU に順に固定し、ほかのスレッドは一覧の中で動かす）
+    busy_poll_usecs: 0      # 待ち受けのソケット（受け付けた接続も引き継ぐ）の SO_BUSY_POLL（マイクロ秒）。0〜1000、0 で使わない
+    splice: {enabled: true, after: 0, full_reads: 4, pipe_size: 0}   # L4 の平文の TCP の splice(2)（docs/PERFORMANCE.md）
+```
+
+- 項目ごとに、設定ファイル → 環境変数・引数（`RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE`）→ 既定の順で決める。`splice` の中も項目ごと。どれも起動のときだけ決まり、ファイルを変えたら `restart_needed` に出る。
+- 起動時に `event = "performance"` の行に、効いている値と出どころ（`sources`：`workers=file` など）を出す。ワーカーのスレッドの名前は `rproxy-wrk-<番号>`。
+- `cpu_affinity` の一覧の CPU が存在しない・このプロセスが使えない（cgroup・taskset）ものは除いて `degraded`（`part: global.performance.cpu_affinity`）。一覧が `workers` より少ないのは設定の誤り。
+- `busy_poll_usecs` を `net.core.busy_read` より大きくするには `CAP_NET_ADMIN` が要る。設定できなければ `degraded` を 1 回出して普通に待つ。
 
 ### 変更前の差分（dry run、#169）
 
@@ -646,7 +663,7 @@ rules:
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.3.20","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc"],"services":["health_check","sticky","balance"]}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`） |
+| `GET /capabilities` | | 200 | `{"version":"0.3.20","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc"],"services":["health_check","sticky","balance"]}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3 の設定（上の「v0.3 の設定」）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
@@ -667,10 +684,10 @@ rules:
 | `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。詳しくは上の「ルールの組・状態・readiness」 |
 | `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて同時に止めて組を消す（`If-Match` も使える）。`rules:write` |
 | `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |
-| `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ）。`admin`、既定では Unix ソケットからだけ |
-| `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current","available","last_check","error","bad_versions"}`。`admin` |
-| `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ、`RPROXY_UPDATE=auto` なら入れ替える。`admin`、既定では Unix ソケットからだけ |
-| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」）、L4 の制限・帯域は `rproxy_rule_limited_total`・`rproxy_rule_bandwidth_dropped_total`、プロセスの開始時刻は `rproxy_process_start_time_seconds`（上の「v0.4 の設定」） |
+| `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ。docs/UPGRADE.md）。`{"status":"started"}` を返し、引き継ぎは後ろで進む（結果はログの `handoff.*` と `/metrics` の `rproxy_handoffs_total`）。すでに動いていれば `409 upgrading`。`admin`、既定では Unix ソケットからだけ |
+| `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current":{"version","sha256"},"available":{"version","sha256"}\|null,"last_check","error","bad_versions"}`。`admin` |
+| `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ（`{"status":"checking"}`。結果は `GET /admin/update`）、`RPROXY_UPDATE=auto` なら入れ替える。`RPROXY_UPDATE=off` なら `400 unsupported`。`admin`、既定では Unix ソケットからだけ |
+| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」）、L4 の制限・帯域は `rproxy_rule_limited_total`・`rproxy_rule_bandwidth_dropped_total`、プロセスの開始時刻は `rproxy_process_start_time_seconds`（上の「v0.4 の設定」）。動いているバイナリは `rproxy_build_info{version,sha256}`、引き継ぎは `rproxy_handoffs_total{outcome}`（#174。`rproxy_process_start_time_seconds` は引き継ぎでも変わらない） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
 
@@ -699,6 +716,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `precondition_failed` | 412 | v0.4：`If-Match` の etag が今の組と違う |
 | `stale_generation` | 409 | v0.4：組の `generation` が今より古い |
 | `locked_out` | 429 | v0.4：認証の失敗が続いたので、この送信元を一時的に止めている（`Retry-After`） |
+| `upgrading` | 503 / 409 | v0.4（#174）：再起動なしの更新の途中なので変更を受け付けない（503。少し待って送り直す）／すでに更新が動いている（`POST /admin/upgrade` の 409） |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係
