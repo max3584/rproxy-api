@@ -7,14 +7,19 @@ on:
   push:
     tags:
       - v*
-  # rproxy-ui の .deb を apt リポジトリに載せる。UI は rproxy-api と別に版を
-  # 進めるので、UI のリリースの後にここを手動で実行する。rproxy-api はビルドしない
-  # （docs/RELEASING.md）
+  # 手動の実行（docs/RELEASING.md）。rproxy-api はビルドしない
+  # - ui_tag：rproxy-ui の .deb を apt リポジトリに載せる。UI は rproxy-api と別に版を
+  #   進めるので、UI のリリースの後に実行する
+  # - sign_tag：rproxy-api のリリース済みのタグに、署名と自動更新のファイルを付け直す
+  #   （タグの push の sign が失敗したとき）
   workflow_dispatch:
     inputs:
       ui_tag:
         description: "TCP-UDP-rproxy-ui のリリースのタグ（例 v0.3.16）"
-        required: true
+        required: false
+      sign_tag:
+        description: "署名を付け直す rproxy-api のタグ（例 v0.4.0）"
+        required: false
 
 jobs:
   # Alpine（musl）のコンテナで 6 つのターゲットをビルドする（#191）。musl の x86_64 はそのまま、ほかは
@@ -103,24 +108,31 @@ jobs:
   # live upgrade may swap it in, SHA-256 of each binary), SHA256SUMS, releases.json (the
   # index of every release; read from the latest release), and minisign
   # signatures of the binaries and of both. The secret key is the repository secret
-  # MINISIGN_SECRET_KEY (the whole key file of `minisign -G -W`: no password); without
-  # it the files are published unsigned with a warning, and the self-update skips the
-  # release. Key generation: docs/RELEASING.md
+  # MINISIGN_SECRET_KEY (the whole key file of `minisign -G`), and MINISIGN_PASSWORD
+  # when the key has a password (none for `minisign -G -W`); without the key the files
+  # are published unsigned with a warning, and the self-update skips the release.
+  # Key generation: docs/RELEASING.md. A manual run with sign_tag signs a published tag again.
   sign:
     needs: build
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: >-
+      always() &&
+      ((github.event_name == 'push' && github.ref_type == 'tag' && needs.build.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.sign_tag != ''))
     runs-on: ubuntu-latest
     container: alpine:3.24
     env:
       MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.sign_tag || github.ref_name }}
     steps:
       - name: Packages
         run: apk add --no-cache bash git github-cli minisign coreutils
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sign_tag || github.ref }}
 
       - name: Manifest and signatures
         shell: bash
@@ -160,7 +172,8 @@ jobs:
             umask 077
             printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
             for f in rproxy-api-v* manifest.json SHA256SUMS releases.json; do
-              minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" -t "rproxy-api $TAG $f" </dev/null
+              # minisign reads the password from stdin when it is not a terminal
+              printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" -t "rproxy-api $TAG $f"
             done
             rm -f "$RUNNER_TEMP/minisign.key"
             files+=(./*.minisig)
@@ -180,7 +193,7 @@ jobs:
     if: >-
       always() &&
       ((github.event_name == 'push' && github.ref_type == 'tag' && needs.build.result == 'success') ||
-       github.event_name == 'workflow_dispatch')
+       (github.event_name == 'workflow_dispatch' && inputs.ui_tag != ''))
     runs-on: ubuntu-latest
     container: debian:13-slim
     concurrency:

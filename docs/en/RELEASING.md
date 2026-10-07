@@ -64,10 +64,13 @@ The `sign` job of `release.yml` writes the index `releases.json` (every release'
 Creating the key (once, locally; the secret key never goes into the repository):
 
 ```bash
-minisign -G -W -p minisign.pub -s minisign.key   # -W: no password (CI signs with it; the secret store protects it)
+minisign -G -p minisign.pub -s minisign.key      # with a password (protects the key file you keep)
+# minisign -G -W -p minisign.pub -s minisign.key # -W for no password
 ```
 
 - **Secret key**: the whole content of `minisign.key` goes into the repository secret **`MINISIGN_SECRET_KEY`** (`gh secret set MINISIGN_SECRET_KEY -R max3584/rproxy-api < minisign.key`). Keep the local `minisign.key` offline.
+- **Password**: if the key has a password, put it in the repository secret **`MINISIGN_PASSWORD`** (`gh secret set MINISIGN_PASSWORD -R max3584/rproxy-api`, typed interactively). `sign` passes it on stdin.
 - **Public key**: the second line (base64) of `minisign.pub` goes into the repository variable **`MINISIGN_PUBLIC_KEY`** (`gh variable set MINISIGN_PUBLIC_KEY -R max3584/rproxy-api --body "$(tail -n1 minisign.pub)"`). The release build puts it into the binary (`RPROXY_RELEASE_PUBKEY`) as the default of `RPROXY_UPDATE_PUBKEY`. Publish `minisign.pub` in the README and release notes too.
+- When `sign` fails on the tag push (a missing password, say), fix it and run `gh workflow run release.yml -R max3584/rproxy-api -f sign_tag=vX.Y.Z` to attach the signatures and self-update files to the published tag (nothing is built).
 - Without the secret, `manifest.json` and `SHA256SUMS` are attached unsigned with a warning (the self-update skips that release). Without the variable, binaries have no key built in and the self-update needs `RPROXY_UPDATE_PUBKEY`.
 - Rotating the key: versions with the old key built in cannot self-update to releases signed with a new key (they cannot verify it). Rotate together with a minor upgrade (a restart), or have users pass the new key with `RPROXY_UPDATE_PUBKEY`.
