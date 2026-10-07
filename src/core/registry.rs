@@ -80,7 +80,7 @@ pub fn force_udp_shards(n: usize) {
 	FORCED_UDP_SHARDS.store(n, Ordering::Relaxed);
 }
 
-struct Running {
+pub(super) struct Running {
 	generation: u64,
 	started_at: u64,
 	spec: RuleSpec,
@@ -130,20 +130,30 @@ impl Running {
 	}
 }
 
-struct Failed {
+pub(super) struct Failed {
 	generation: u64,
 	spec: RuleSpec,
 	error: String,
+	/// The `code` of the error (`bind_failed`, `resolve_failed`, `tls_config`,
+	/// `unsupported`, ...; `failed` for a listener that died), for `conditions`.
+	code: &'static str,
 	retry: Option<JoinHandle<()>>,
 }
 
-enum Entry {
+impl Failed {
+	/// (code, retrying name resolution) for `conditions`.
+	pub(super) fn cause(&self) -> (&'static str, bool) {
+		(self.code, self.retry.is_some())
+	}
+}
+
+pub(super) enum Entry {
 	Running(Running),
 	Failed(Failed),
 }
 
 impl Entry {
-	fn spec(&self) -> &RuleSpec {
+	pub(super) fn spec(&self) -> &RuleSpec {
 		match self {
 			Entry::Running(r) => &r.spec,
 			Entry::Failed(f) => &f.spec,
@@ -241,13 +251,19 @@ pub struct ConfigStatus {
 
 pub struct Registry {
 	cfg: Config,
-	rules: Mutex<HashMap<Key, Entry>>,
+	pub(super) rules: Mutex<HashMap<Key, Entry>>,
 	next_generation: AtomicU64,
 	config_status: RwLock<Option<ConfigStatus>>,
 	/// Every certificate the rules use, loaded once and shared.
 	certs: CertStore,
 	/// `global.acme`: certificates of `tls.certificates[].acme` (set once at startup).
 	acme: std::sync::OnceLock<Arc<crate::acme::Acme>>,
+	/// Rule sets (`PUT /rulesets/{name}`, #28); in memory only.
+	pub(super) rulesets: crate::core::ruleset::Rulesets,
+	/// When each rule's `conditions` last changed (#28).
+	conditions: crate::core::ruleset::ConditionLog,
+	/// `GET /readyz` (#28).
+	readiness: crate::core::ruleset::Readiness,
 }
 
 /// What `Registry::apply_certs` does with one rule.
@@ -342,7 +358,7 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 
 /// Two rules clash when they share a protocol and ports on an address of either
 /// (`listen_addr` or `extra_listen_addrs`), or on a wildcard that covers it.
-fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
+pub(super) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 	let (a0, b0) = (u32::from(a.key.listen.port()), u32::from(b.key.listen.port()));
 	let (a1, b1) = (a0 + u32::from(a.port_count) - 1, b0 + u32::from(b.port_count) - 1);
 	if a.key.protocol != b.key.protocol || a0 > b1 || b0 > a1 {
@@ -353,7 +369,7 @@ fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 }
 
 /// A rule on `::`, whose socket takes IPv4 too unless it has extra addresses.
-fn is_dual_stack_wildcard(key: &Key) -> bool {
+pub(super) fn is_dual_stack_wildcard(key: &Key) -> bool {
 	key.listen.is_ipv6() && key.listen.ip().is_unspecified()
 }
 
@@ -373,7 +389,15 @@ impl Registry {
 			config_status: RwLock::default(),
 			certs: CertStore::default(),
 			acme: std::sync::OnceLock::new(),
+			rulesets: Default::default(),
+			conditions: Default::default(),
+			readiness: Default::default(),
 		})
+	}
+
+	/// Whether the startup restore is done, for `GET /readyz` (#28).
+	pub fn readiness(&self) -> &crate::core::ruleset::Readiness {
+		&self.readiness
 	}
 
 	/// Sets `global.acme` (before rules are loaded). A certificate written by
@@ -422,7 +446,7 @@ impl Registry {
 	}
 
 	/// A rule's view with the expiry of its certificates.
-	fn view_of(&self, entry: &Entry) -> RuleView {
+	pub(super) fn view_of(&self, entry: &Entry) -> RuleView {
 		let mut view = entry.view();
 		let now = tlsconf::unix_now();
 		let warn = self.certs.warn_secs();
@@ -441,6 +465,13 @@ impl Registry {
 				Some(certstore::CertStatusView::new(role, source.file(), not_after, now, warn))
 			})
 			.collect();
+		if self.caps().features.conditions {
+			let cause = match entry {
+				Entry::Failed(f) => Some(f.cause()),
+				Entry::Running(_) => None,
+			};
+			view.conditions = self.conditions.stamp(entry.spec().key, crate::core::ruleset::conditions(&view, cause));
+		}
 		view
 	}
 
@@ -454,7 +485,7 @@ impl Registry {
 
 	/// Forgets certificates no rule uses any more, and tells ACME which
 	/// certificates the rules use now.
-	async fn gc_certs(&self) {
+	pub(super) async fn gc_certs(&self) {
 		let used: HashSet<Source> =
 			self.rules.lock().await.values().flat_map(|e| self.sources(&e.spec().tls)).map(|(_, s)| s).collect();
 		if let Some(acme) = self.acme() {
@@ -475,7 +506,7 @@ impl Registry {
 	}
 
 	/// The control API's own address, if the rule would take it.
-	fn reserved_clash(&self, spec: &RuleSpec) -> Option<SocketAddr> {
+	pub(super) fn reserved_clash(&self, spec: &RuleSpec) -> Option<SocketAddr> {
 		if spec.key.protocol != Protocol::Tcp {
 			return None;
 		}
@@ -560,7 +591,7 @@ impl Registry {
 	/// What a rule needs besides sockets and name resolution: its TLS settings
 	/// with the certificates from the store, and its compiled `http` (secret files
 	/// read). Shared by starting a rule and by `--check-config` (`check_rules`).
-	fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
+	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
@@ -719,7 +750,7 @@ impl Registry {
 		Ok(Running { generation, started_at, spec, rt, listeners, add_listeners, idle_tx, backends, route_resolvers, supervisor })
 	}
 
-	async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
+	pub(super) async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
 		}
@@ -742,7 +773,8 @@ impl Registry {
 		info!(event = "rule.create", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
 			ports = view.listen_port_end.map(|e| e - view.listen_port + 1).unwrap_or(1),
 			source_ip = view.source_ip, tls = ?view.tls.mode, starttls = view.starttls.map(|s| s.as_str()).unwrap_or(""),
-			resolved = ?view.resolved);
+			resolved = ?view.resolved, labels = %crate::core::ruleset::labels_text(&view.labels),
+			ruleset = view.ruleset.as_deref().unwrap_or(""));
 		Ok(view)
 	}
 
@@ -768,6 +800,9 @@ impl Registry {
 		};
 		if spec.origin == Origin::Static {
 			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
+		}
+		if let Some(set) = &spec.ruleset {
+			return Err(crate::core::ruleset::owned(key, set));
 		}
 		if let Some(list) = &req.allow_from {
 			spec.allow_from = crate::net::cidr::parse_list(list)?;
@@ -857,7 +892,7 @@ impl Registry {
 
 	/// Puts a changed spec into effect on an existing rule, keeping its
 	/// connections (the fields PATCH can change: target, timeouts, TLS, allow_from, http).
-	async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
+	pub(super) async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{key} would take rproxy's control API ({api})")));
 		}
@@ -947,6 +982,7 @@ impl Registry {
 					Ok(running) => *entry = Entry::Running(running),
 					Err(e) => {
 						f.error = e.message.clone();
+						f.code = e.code;
 						return Err(e);
 					}
 				}
@@ -954,7 +990,8 @@ impl Registry {
 		}
 		let view = self.view_of(entry);
 		info!(event = "rule.update", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
-			udp_idle_secs = view.udp_idle_secs, tls = ?view.tls.mode, resolved = ?view.resolved);
+			udp_idle_secs = view.udp_idle_secs, tls = ?view.tls.mode, resolved = ?view.resolved,
+			labels = %crate::core::ruleset::labels_text(&view.labels), ruleset = view.ruleset.as_deref().unwrap_or(""));
 		Ok(view)
 	}
 
@@ -1039,7 +1076,8 @@ impl Registry {
 						error!(event = "rule.failed", rule = %key, error = %error, phase = "certificates");
 						if let Some(Entry::Running(r)) = rules.remove(&key) {
 							let generation = self.generation();
-							rules.insert(key, Entry::Failed(Failed { generation, spec: r.spec.clone(), error, retry: None }));
+							let code = "tls_config";
+							rules.insert(key, Entry::Failed(Failed { generation, spec: r.spec.clone(), error, code, retry: None }));
 							stopped.push((key, r));
 						}
 					}
@@ -1061,6 +1099,7 @@ impl Registry {
 					if still_failed(&rules) {
 						if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
 							f.error = e.message;
+							f.code = e.code;
 						}
 					}
 					continue;
@@ -1080,6 +1119,7 @@ impl Registry {
 					error!(event = "rule.failed", rule = %key, error = %e.message, phase = "certificates");
 					if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
 						f.error = e.message;
+						f.code = e.code;
 					}
 				}
 			}
@@ -1097,6 +1137,9 @@ impl Registry {
 				Some(e) if e.spec().origin == Origin::Static => {
 					return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 				}
+				Some(e) if e.spec().ruleset.is_some() => {
+					return Err(crate::core::ruleset::owned(key, e.spec().ruleset.as_deref().unwrap_or_default()));
+				}
 				Some(_) => rules.remove(key).expect("checked above"),
 			}
 		};
@@ -1107,7 +1150,8 @@ impl Registry {
 	}
 
 	/// Stops a rule already taken out of the table.
-	async fn stop_entry(&self, _key: &Key, entry: Entry, drain: Option<Duration>) {
+	pub(super) async fn stop_entry(&self, key: &Key, entry: Entry, drain: Option<Duration>) {
+		self.conditions.forget(key);
 		match entry {
 			Entry::Failed(f) => {
 				if let Some(retry) = f.retry {
@@ -1141,7 +1185,7 @@ impl Registry {
 				Ok((spec, Some(missing))) => {
 					failed += 1;
 					error!(event = "rule.failed", rule = %spec.key, error = %missing, phase = "restore");
-					self.insert_failed(spec, missing, false).await;
+					self.insert_failed(spec, ApiError::unsupported(missing)).await;
 					continue;
 				}
 				Err(e) => {
@@ -1160,18 +1204,20 @@ impl Registry {
 				Err(e) => {
 					failed += 1;
 					error!(event = "rule.failed", rule = %key, error = %e.message, phase = "restore");
-					self.insert_failed(spec, e.message, e.code == "resolve_failed").await;
+					self.insert_failed(spec, e).await;
 				}
 			}
 		}
 		info!(event = "restore.done", started, failed);
 	}
 
-	async fn insert_failed(self: &Arc<Self>, spec: RuleSpec, error: String, retry: bool) {
+	/// Registers a rule that could not start; one whose targets could not be
+	/// resolved is retried in the background.
+	pub(super) async fn insert_failed(self: &Arc<Self>, spec: RuleSpec, e: ApiError) {
 		let generation = self.generation();
 		let key = spec.key;
-		let retry = retry.then(|| tokio::spawn(retry_start(Arc::downgrade(self), spec.clone(), generation)));
-		self.rules.lock().await.insert(key, Entry::Failed(Failed { generation, spec, error, retry }));
+		let retry = (e.code == "resolve_failed").then(|| tokio::spawn(retry_start(Arc::downgrade(self), spec.clone(), generation)));
+		self.rules.lock().await.insert(key, Entry::Failed(Failed { generation, spec, error: e.message, code: e.code, retry }));
 	}
 
 	pub async fn shutdown(&self) {
@@ -1296,7 +1342,7 @@ impl Registry {
 		let key = spec.key;
 		if let Some(missing) = missing {
 			error!(event = "rule.failed", rule = %key, error = %missing, phase);
-			self.insert_failed(spec, missing, false).await;
+			self.insert_failed(spec, ApiError::unsupported(missing)).await;
 			return false;
 		}
 		match self.create_spec(spec.clone()).await {
@@ -1305,7 +1351,7 @@ impl Registry {
 				error!(event = "rule.failed", rule = %key, error = %e.message, phase);
 				// a rule made through the API already holds the key: leave it alone
 				if e.code != "already_exists" {
-					self.insert_failed(spec, e.message, e.code == "resolve_failed").await;
+					self.insert_failed(spec, e).await;
 				}
 				false
 			}
@@ -1435,6 +1481,7 @@ impl Registry {
 		target_metrics(&mut out, &rules);
 		http_metrics(&mut out, &rules);
 		self.cert_metrics(&mut out, &rules);
+		crate::core::ruleset::label_metrics(&mut out, rules.iter().map(|(k, e)| (k, &e.spec().labels)));
 		if let Some(b) = self.cfg.http.crowdsec() {
 			let _ = writeln!(out, "# HELP rproxy_crowdsec_decisions Addresses and ranges blocked by the CrowdSec LAPI decisions.");
 			let _ = writeln!(out, "# TYPE rproxy_crowdsec_decisions gauge");
@@ -1659,7 +1706,7 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 			r.stop_resolver();
 			r.stop_route_resolvers();
 			let spec = r.spec.clone();
-			rules.insert(key, Entry::Failed(Failed { generation, spec, error, retry: None }));
+			rules.insert(key, Entry::Failed(Failed { generation, spec, error, code: "failed", retry: None }));
 		}
 	}
 }
@@ -1676,6 +1723,7 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 				error!(event = "rule.failed", rule = %spec.key, error = %e.message, phase = "retry");
 				if let Some(Entry::Failed(f)) = registry.rules.lock().await.get_mut(&spec.key) {
 					f.error = e.message;
+					f.code = e.code;
 					f.retry = None;
 				}
 				return;
@@ -1696,6 +1744,7 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 				error!(event = "rule.failed", rule = %spec.key, error = %e.message, phase = "retry");
 				if let Some(Entry::Failed(f)) = rules.get_mut(&spec.key) {
 					f.error = e.message;
+					f.code = e.code;
 					f.retry = None;
 				}
 			}

@@ -60,6 +60,11 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | 古い世代の監視タスクは、作り直したルールに触らない |
+| `core/ruleset.rs` | `etags_follow_the_rules_and_the_generation` | etag はルールの順に依らず、ルールか世代が変わると変わる。`If-Match` の書き方（引用符・`W/`・リスト・`*`） |
+| | `last_transition_moves_only_when_the_status_changes` | `last_transition` は `status` が変わったときだけ動く（`reason` だけでは動かない）。消すと最初から |
+| | `conditions_from_the_view` | 状態・誤りの `code` から 4 つの `conditions` の status と reason |
+| | `label_metrics_lines` | `rproxy_rule_labels` の行（名前の置き換え、同じ名前になるキー、値のエスケープ） |
+| | `readiness_states` | `starting` → ready → `draining`（ready に戻らない） |
 
 ## 結合テスト：制御 API（`tests/api.rs`）
 
@@ -186,10 +191,27 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 | テスト | 確かめること |
 |---|---|
 | `capabilities_list_the_v0_4_features_as_off` | `features` の v0.4 の印がすべて false、`performance` が空 |
-| `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
-| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
+| `limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
+| `dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
 | `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |
+
+## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）
+
+Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
+
+| テスト | 確かめること |
+|---|---|
+| `capabilities_turn_the_controller_features_on` | `features` の `rulesets`・`labels`・`conditions`・`readyz` が true |
+| `a_set_is_applied_as_a_whole_with_minimal_disruption` | `/` を含む名前の組を作る（`ETag` ヘッダ、`GET /rules` の `ruleset`・`labels`・`conditions`、`GET /rulesets`）。同じ本文はすべて `none` で etag も同じ。宛先だけの違いは `in_place` で、前からの接続は切れずに新しい接続が新しい宛先へ。`source_ip` の違いは `recreate`。外したルールは `delete`。`DELETE /rulesets/{name}` で全部止まる |
+| `sets_refuse_stale_writes_and_do_not_take_other_rules` | `If-Match` の食い違い・まだない組への `If-Match`（412）、古い `generation`（409 `stale_generation`）、引用符なし・リスト・`W/` の `If-Match`。組のルールの個別の PATCH / DELETE は `409 owned`、ほかの組は `owned`、POST のルールは `already_exists`（何も作らない）。不正なルールが 1 つあれば何も変えず、`errors` にすべての問題。本文の中の重なり。`dry_run` はまだ `unsupported`（何も変えない）。名前の誤り |
+| `a_rule_that_cannot_bind_fails_alone` | 使用中のポートのルールだけ `failed`（`Programmed` が `False`・`BindFailed`、`BackendsHealthy` が `Unknown`、読み直しても `last_transition` は同じ）、残りは動く。ポートが空いてから同じ本文を PUT すると作り直して動く |
+| `conditions_report_targets_that_are_down` | 宛先がすべて down のルールは `BackendsHealthy` が `False`・`AllTargetsDown`（組でないルールにも `conditions`） |
+| `labels_are_kept_replaced_and_exported` | `labels` の表示、`/metrics` の `rproxy_rule_labels`、PATCH で丸ごと置き換え・省けばそのまま・`{}` で外す、誤ったキーは `invalid` |
+| `readyz_follows_the_startup_and_the_shutdown` | トークンなしで `starting`（503）→ ready（200）→ `draining`（503。ready に戻らない） |
+| `sets_need_rules_write_within_the_allowed_ports` | `rules:read` のトークンは読めるが PUT / DELETE は 403、`allow_listen_ports` の外のルールは 403、`updated_by` はトークンの名前 |
+
+起動した rproxy が復元の後に `GET /readyz` で 200 を返すことは `tests/startup.rs` の `readyz_answers_once_started`。
 
 ## DB からの復元（`tests/db_restore.rs`）
 

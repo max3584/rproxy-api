@@ -193,6 +193,16 @@ async fn unreadable_static_rules_are_skipped() {
 	wait_for("the degraded log line", &rp, || async { rp.log().contains(r#""part":"static_rules""#) }).await;
 }
 
+/// `GET /readyz` (#28): ready once the startup restore is done, without a token.
+#[tokio::test]
+async fn readyz_answers_once_started() {
+	let dir = workdir("readyz");
+	let port = free_port();
+	let rp = Rproxy::start(&dir, port, &[]);
+	wait_for("the API", &rp, || async { api_status(port, None).await == Some(200) }).await;
+	assert_eq!(get_json(port, "/readyz").await, (200, serde_json::json!({"ready": true})));
+}
+
 #[tokio::test]
 async fn a_busy_api_port_keeps_the_rules_running_and_is_retried() {
 	let dir = workdir("busy");
