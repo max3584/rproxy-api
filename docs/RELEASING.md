@@ -64,10 +64,13 @@ rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と U
 鍵を作る（手元で 1 回。秘密鍵はリポジトリに置かない）：
 
 ```bash
-minisign -G -W -p minisign.pub -s minisign.key   # -W: パスワードなし（CI で使うため。秘密はシークレットで守る）
+minisign -G -p minisign.pub -s minisign.key      # パスワードを付ける（手元に保管する鍵のファイルを守る）
+# minisign -G -W -p minisign.pub -s minisign.key # パスワードなしにするなら -W
 ```
 
 - **秘密鍵**：`minisign.key` のファイルの中身をそのまま、リポジトリのシークレット **`MINISIGN_SECRET_KEY`** に入れる（`gh secret set MINISIGN_SECRET_KEY -R max3584/rproxy-api < minisign.key`）。手元の `minisign.key` はオフラインの場所に保管する。
+- **パスワード**：鍵にパスワードを付けたときは、リポジトリのシークレット **`MINISIGN_PASSWORD`** に入れる（`gh secret set MINISIGN_PASSWORD -R max3584/rproxy-api`、対話で入れる）。`sign` は標準入力でパスワードを渡す。
 - **公開鍵**：`minisign.pub` の 2 行目（base64）を、リポジトリの変数 **`MINISIGN_PUBLIC_KEY`** に入れる（`gh variable set MINISIGN_PUBLIC_KEY -R max3584/rproxy-api --body "$(tail -n1 minisign.pub)"`）。リリースのビルドがこれをバイナリに入れ（`RPROXY_RELEASE_PUBKEY`）、`RPROXY_UPDATE_PUBKEY` の既定になる。`minisign.pub` は README・リリースノートにも載せる。
+- タグの push の `sign` が失敗したとき（パスワードの入れ忘れなど）は、直してから `gh workflow run release.yml -R max3584/rproxy-api -f sign_tag=vX.Y.Z` で、リリース済みのタグに署名と自動更新のファイルを付け直す（ビルドはしない）。
 - シークレットがないときは、`manifest.json`・`SHA256SUMS` を署名なしで添付し、警告を出して進む（自動更新はそのリリースを使わない）。変数がないときは鍵の入っていないバイナリになり、自動更新には `RPROXY_UPDATE_PUBKEY` が要る。
 - 鍵を替えるとき：新しい鍵で署名した版を出す前に、古い鍵の入った版から新しい鍵の入った版へは自動更新できない（古い版は新しい鍵の署名を確かめられない）。その切り替えはマイナーの更新（再起動）に合わせるか、利用者に `RPROXY_UPDATE_PUBKEY` で新しい鍵を渡してもらう。
