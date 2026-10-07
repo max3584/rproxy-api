@@ -109,7 +109,7 @@ pub struct Caps {
 	/// IPV6_TRANSPARENT
 	pub transparent_ipv6: bool,
 	pub max_range_ports: u16,
-	/// Settings whose shape exists (v0.3) and which this build can run.
+	/// Settings whose shape exists (v0.3 / v0.4) and which this build can run.
 	pub features: Features,
 }
 

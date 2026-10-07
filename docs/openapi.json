@@ -1616,6 +1616,7 @@
           },
           "features": {
             "type": "object",
+            "description": "v0.3 and v0.4 settings this build can run (docs/API.md). In v0.4.0 every boolean is true, middlewares includes geoip, services includes outlier_detection and performance names every key",
             "properties": {
               "http": {
                 "type": "boolean"

@@ -35,7 +35,7 @@ Guarantees:
 | `--handoff-timeout` / `RPROXY_HANDOFF_TIMEOUT` | `30s` | How long to wait for the new process (1s-10m) |
 | `--handoff-drain` / `RPROXY_HANDOFF_DRAIN` | `5m` | Longest the old process waits for its connections (0-24h) |
 
-Logs: `handoff.start`, `handoff.sent`, `handoff.received`, `handoff.ready`, `handoff.drain`, `handoff.done`, `handoff.counters`, `handoff.failed`, `handoff.refused`, `handoff.sockets`. `/metrics`: `rproxy_build_info{version,sha256}`, `rproxy_handoffs_total{outcome="done|failed|refused"}`, `rproxy_process_start_time_seconds`. `GET /capabilities` has `build`: `{"version","sha256"}`.
+Logs: `handoff.start`, `handoff.sent`, `handoff.received`, `handoff.ready`, `handoff.drain`, `handoff.done`, `handoff.counters`, `handoff.failed`, `handoff.refused`, `handoff.sockets`; at warn, `handoff.busy` (SIGUSR2 while a handoff is already running) and `handoff.rule` / `handoff.ruleset` (a rule or rule set from the old process could not be read or applied, so it was dropped). `/metrics`: `rproxy_build_info{version,sha256}`, `rproxy_handoffs_total{outcome="done|failed|refused"}`, `rproxy_process_start_time_seconds`. `GET /capabilities` has `build`: `{"version","sha256"}`.
 
 ### systemd
 

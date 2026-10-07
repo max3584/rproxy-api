@@ -68,26 +68,32 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | 認証のミドルウェアの秘密（`basic_auth` の `users_file`、`oidc` の `client_secret_file` / `cookie_secret_file`。例 `/etc/rproxy/auth/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（`cookie_secret_file` が漏れるとセッションのクッキーを作れる、`client_secret_file` はプロバイダのクライアントの秘密）。読めないとそのミドルウェアは 503 を返す。変えると数秒以内に読み直す（SIGHUP でもすぐ）。`cookie_secret_file` を変えるとすべてのサインインが切れる |
 | 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
 | `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
+| `/run/rproxy/handoff.sock`（`--handoff-socket` / `RPROXY_HANDOFF_SOCKET`、#174） | `rproxy` 600（SEQPACKET） | 再起動なしの更新の間だけある引き継ぎ用のソケット。つなげるのは古いプロセスが起動した子（pid で確かめる）だけ。親のディレクトリ（`/run/rproxy`）がないと引き継ぎは `handoff.failed` になり、古いプロセスが動き続ける（docs/UPGRADE.md） |
+| 制御 API のクライアントの CA（`--tls-client-ca` / `RPROXY_TLS_CLIENT_CA`、#167） | 例 `root:rproxy` 640 | mTLS でクライアント証明書を確かめる CA（PEM）。秘密ではないが、書き換えられると証明書の認証を通せるので rproxy ユーザーには書かせない。制御 API の証明書・鍵（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）と同じく SIGHUP とファイルの変化で読み直す |
+| GeoIP のデータベース（`global.geoip` の `country_db` / `asn_db`、#168） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること（読めなければ `degraded` で起動し、読めるまで国・ASN は「分からない」）。更新のツール（`geoipupdate` など）は置き換え（rename）で書く。`check_interval` と SIGHUP で読み直す |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
 | `/var/lib/rproxy/`（`global.acme.storage` の既定 `/var/lib/rproxy/acme`） | `rproxy:rproxy` 750（`acme/` の下はディレクトリ 700・ファイル 600） | ACME のアカウントの鍵（`accounts/<名前>.key`）、取った証明書と鍵（`certs/`）、消していない DNS-01 の TXT の記録（`dns-pending.json`）。ユニットの `StateDirectory=rproxy` が作る。アカウントの鍵が漏れると、そのアカウントで証明書の失効・注文ができる。purge で消える（docs/ACME.md） |
 | ACME の DNS のプロバイダの秘密（`global.acme.dns_providers` の `api_key_file` / `secret_file` / `tsig_secret_file` / `credentials_file`（acme-dns。rproxy が書く）、EAB の `hmac_key_file`。例 `/etc/rproxy/acme/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（DNS のレコードを書き換えられる。`_acme-challenge` を専用のゾーンに委任し、そのゾーンだけに書ける鍵にすると被害を狭められる）。API からは読めない |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
+| 自動更新のキャッシュ（`RPROXY_UPDATE_CACHE`、既定 `/var/cache/rproxy/update`、#174。コンテナの `rproxy-api launch` だけ） | サーバを動かすユーザーが書けること（例 700） | 取ったリリースのバイナリ・署名・マニフェスト（`<版>/`）と `state.json`（よい版・前の版・悪い版・試している版）。実行する前に毎回署名を確かめ直すが、書き換えられると悪い版の印やロールバックを操作できるので、ほかのユーザーには書かせない。書き込めるボリュームにする（ルートのファイルシステムは読み取り専用でよい）。apt で入れた VM では使わない（`RPROXY_UPDATE` は off） |
 
 ## 制御 API
 
 - Unix ソケット（`RPROXY_API_SOCKET`）を使うと、ファイルのモードとグループで接続できる利用者を絞れる（loopback の TCP は同じホストの誰でも接続できる）。`RPROXY_API_PORT=0` で TCP を閉じられる。
 - 既定の待ち受けは `127.0.0.1`。loopback 以外で待ち受けるには、トークンファイルと TLS 証明書の両方が必須（どちらかがなければ起動しない）。
-- 1 行に 1 つ書いたトークンは全権限。YAML の書き方では、トークンごとにスコープ（`rules:read` / `rules:write` / `metrics:read` / `admin`）・変更できる待ち受けポート・有効期限を決められ、ファイルには SHA-256 だけを置く（docs/API.md）。変更は `event: "audit"` のログに残る。
+- 1 行に 1 つ書いたトークンは全権限。YAML の書き方では、トークンごとにスコープ（`rules:read` / `rules:write` / `metrics:read` / `acme:write` / `admin`）・変更できる待ち受けポート・有効期限・結びつけるクライアント証明書（`client_cert`）・作ったルールを DB に保存するか（`persist`）を決められ、ファイルには SHA-256 だけを置く（docs/API.md）。変更は `event: "audit"` のログに残る。
+- v0.4（#167）：TCP の制御 API はクライアント証明書（mTLS、`--tls-client-auth optional|required` と `--tls-client-ca`）でも確かめられる。期限の近いトークンは `token.expiring` / `token.expired` で知らせる。401 が続く送信元（IPv6 は /64）は既定で一時停止（20 回 / 1 分で 5 分、`429 locked_out`）。Unix ソケットは数えない（docs/API.md の「制御 API の守り」）。
+- 強い操作（`POST /config/reload`・`/admin/upgrade`・`/admin/update`・ACME の更新や失効）は既定で Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。
 - 複数のトークンを同時に有効にできるので、新しいトークンを足して reload し、UI を切り替えてから古いトークンを消せば止めずに入れ替えられる。
 
 ## DB（MariaDB）
 
 | ユーザー | 権限 | 用途 |
 |---|---|---|
-| rproxy-api 用（例 `rproxy`） | `SELECT ON forward_rules` | 起動時にルールを復元する（書き込まない） |
+| rproxy-api 用（例 `rproxy`） | `SELECT ON forward_rules`。API で作ったルールを保存するとき（#144、トークンの `persist: true`）は `SELECT, INSERT, UPDATE, DELETE ON rproxy_rules` も | 起動時にルールを復元する（`forward_rules` には書き込まない）。`rproxy_rules` には自分の `node` の行だけを書く。権限がなければ `degraded`（`part: db`）でルールは動かしたまま `persisted: false` |
 | UI 用（例 `rproxy_ui`） | `SELECT, INSERT, UPDATE, DELETE ON forward_rules`、`SELECT, INSERT ON forward_rules_log` | ルールの管理と変更履歴 |
 
-GRANT の例は UI リポジトリの `db/README.md`。
+GRANT の例は UI リポジトリの `db/README.md`。`rproxy_rules` の定義と GRANT は docs/API.md の「API で作ったルールの保存」。
 
 ## UI（TCP-UDP-rproxy-ui）
 
@@ -100,5 +106,6 @@ GRANT の例は UI リポジトリの `db/README.md`。
 | もの | 置き場所 | 注意 |
 |---|---|---|
 | apt リポジトリの署名鍵 | Actions の Secrets（`APT_GPG_PRIVATE_KEY` / `APT_GPG_KEY_ID`） | パスフレーズなし。予備はオフラインで保管する（docs/APT.md） |
+| リリースの署名鍵（minisign、#174） | Actions の Secret `MINISIGN_SECRET_KEY`（秘密鍵）、変数 `MINISIGN_PUBLIC_KEY`（公開鍵。バイナリに入る） | apt の鍵とは別。パスワードなし。予備はオフラインで保管する。漏れると自動更新に任意のバイナリを入れられる（docs/RELEASING.md） |
 | main / master | ルールセット | PR 経由でだけ変更でき、CI の必須チェックが通るまでマージできない。force push と削除は禁止 |
 | `v*` タグ | ルールセット | 削除と付け替えは禁止（公開したバージョンの中身を変えない） |

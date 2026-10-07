@@ -21,6 +21,12 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 - **Bump the version only when what runs changes** (the rproxy-api binary or source code, the UI code, the package contents). Changes only to the README, docs, badges, CI or tests don't get a release of their own; they stay in the milestone and go out with the next release.
 - In a minor release, decide together the config and API shape for the features that will land over the following period, and write it in docs/API.md. Items whose contents are not ready yet are reported as unavailable by `GET /capabilities` and rejected with `unsupported` when specified.
 - If a change cannot be made without changing the shape, bundle it into the next minor release.
+- **v0.4.0 is an exception** (owner's decision, #215): instead of settling the shape and shipping the contents in patches, every content lands first and v0.4.0 ships once (no intermediate releases before v0.4.0). In v0.4.0 every v0.4 flag in `GET /capabilities` `features` is true (`features.performance` lists every key) and no v0.4 setting is refused with `unsupported`.
+
+### Before releasing v0.4.0
+
+- The release signing key ("Release signatures" below): set the secret `MINISIGN_SECRET_KEY` and the variable `MINISIGN_PUBLIC_KEY`. Tagging without them makes v0.4.0 unsigned and built without a key (the self-update of v0.4.0 binaries then always needs `RPROXY_UPDATE_PUBKEY`).
+- Live upgrades (`handoff`) work only within a minor, so upgrading the .deb from v0.3.x to v0.4.0 restarts the service (`postinst`). Say so in the release notes too.
 
 ## Milestones
 

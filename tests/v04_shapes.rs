@@ -1,8 +1,9 @@
-//! v0.4 settings (docs/DESIGN-v0.4.md): the shapes are validated, and what
-//! this build cannot run yet is refused with `unsupported` (API), registered as
-//! failed or warned about (settings file), or ignored with `degraded` (global
-//! settings and flags). One test per item: an item's implementation replaces
-//! its test with one that shows it working (and turns its `features` flag on).
+//! v0.4 settings (docs/DESIGN-v0.4.md): every item is implemented in v0.4.0,
+//! so this file checks what spans the items: `features` lists every v0.4 item
+//! as on, the scopes of the new endpoints, the validation of the new flags and
+//! settings at startup and in `--check-config`, and that 0.3 settings files and
+//! DB `options` still load. Each item's behaviour is tested in its own file
+//! (docs/TESTING.md).
 
 mod common;
 

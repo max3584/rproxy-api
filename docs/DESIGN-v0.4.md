@@ -2,6 +2,8 @@ English: [DESIGN-v0.4.md](en/DESIGN-v0.4.md)
 
 # v0.4 の設計: 設定と API の形
 
+> **実装済み（v0.4.0）**：この文書の項目はすべて master に入り、v0.4.0 で出す（形は #216、中身は #218〜#223）。`GET /capabilities` の `features` の v0.4 の項目はすべて true。正式な形は docs/API.md の「v0.4 の設定」で、この文書は設計の経緯として残す。実装で設計から変えたところは「15. 実装での設計との違い」。Kubernetes のコントローラ（#28）は別のリポジトリ `max3584/rproxy-gateway` で続ける。
+
 v0.4.0 では、これから入れる機能の**設定と API の形**をまとめて決める（#215）。進め方は v0.3.0（docs/DESIGN-v0.3.md）と同じで、まず形（型・検証・`features` の false・openapi.json・docs/API.md の「v0.4 の設定」・`unsupported` のテスト）を master に入れ、その上に項目ごとの実装の PR を並べて、実装したものから `features` を true にする。
 
 > **v0.4.0 は全部の中身が入ってから 1 回で出す**（オーナーの指示）。v0.3 のように形だけの v0.4.0 を出して中身を v0.4.x のパッチで足すことはしない。形の PR と実装の PR は master に順に入るが、リリースはすべての項目が `true` になってからにする。それまでの master では、まだの項目は `unsupported` になる。
@@ -22,18 +24,18 @@ v0.4.0 では、これから入れる機能の**設定と API の形**をまと�
 
 ### 項目とモジュール・`features`
 
-| issue | 項目 | 形の置き場所（モジュール） | `features` |
-|---|---|---|---|
-| #28 | Kubernetes の口（ルールの組・ラベル・状態・readiness） | `src/core/ruleset.rs`、`src/control/ruleset_api.rs` | `rulesets`、`labels`、`conditions`、`readyz` |
-| #165 | L4 の送信元ごとの制限 | `src/core/limits.rs` | `limits` |
-| #166 | 通信量の上限と集計 | `src/core/bandwidth.rs` | `bandwidth` |
-| #167 | 制御 API の守り | `src/control/hardening.rs` | `client_cert_auth`、`token_expiry`、`api_lockout` |
-| #168 | GeoIP | `src/net/geoip.rs` | `geoip`、`middlewares` の `geoip` |
-| #169 | 変更前の差分 | `src/config/plan.rs` | `dry_run` |
-| #170 | 受け身のヘルスチェック | `src/core/outlier.rs` | `outlier_detection`、`services` の `outlier_detection` |
-| #174 | 再起動なしの更新・自動更新 | `src/control/upgrade.rs` | `handoff`、`self_update` |
-| #144 | API で作ったルールの保存 | `src/config/persist.rs` | `persistence` |
-| #194・#184 | performance の設定 | `src/config/performance.rs` | `performance`（動く項目の名前のリスト） |
+| issue | 項目 | 形の置き場所（モジュール） | `features` | 実装の PR |
+|---|---|---|---|---|
+| #28 | Kubernetes の口（ルールの組・ラベル・状態・readiness） | `src/core/ruleset.rs`、`src/control/ruleset_api.rs` | `rulesets`、`labels`、`conditions`、`readyz` | #220 |
+| #165 | L4 の送信元ごとの制限 | `src/core/limits.rs` | `limits` | #219 |
+| #166 | 通信量の上限と集計 | `src/core/bandwidth.rs` | `bandwidth` | #219 |
+| #167 | 制御 API の守り | `src/control/hardening.rs` | `client_cert_auth`、`token_expiry`、`api_lockout` | #218 |
+| #168 | GeoIP | `src/net/geoip.rs` | `geoip`、`middlewares` の `geoip` | #221 |
+| #169 | 変更前の差分 | `src/config/plan.rs` | `dry_run` | #222 |
+| #170 | 受け身のヘルスチェック | `src/core/outlier.rs` | `outlier_detection`、`services` の `outlier_detection` | #221 |
+| #174 | 再起動なしの更新・自動更新 | `src/control/upgrade.rs` | `handoff`、`self_update` | #223 |
+| #144 | API で作ったルールの保存 | `src/config/persist.rs` | `persistence` | #222 |
+| #194・#184 | performance の設定 | `src/config/performance.rs` | `performance`（動く項目の名前のリスト） | #223 |
 
 ## 2. まとめた例
 
@@ -391,7 +393,7 @@ outlier_detection:
 | `--handoff-drain` / `RPROXY_HANDOFF_DRAIN` | `5m` | 古いプロセスが今の接続の終わりを待つ最長の時間（過ぎたら切る） |
 
 - ログ：`handoff.start`・`handoff.ready`・`handoff.done`・`handoff.failed`・`handoff.refused`。`/metrics`：`rproxy_build_info{version,sha256}`、`rproxy_handoffs_total{outcome}`。
-- systemd：`ExecReload` を `--check-config` の後に `kill -USR2 $MAINPID` にする案と、SIGHUP（設定・証明書の読み直し）を分けたままにする案がある（下の「決めていないこと」）。.deb の `postinst` は前の版と major.minor が同じなら `systemctl kill -s USR2`、違えば restart。
+- systemd：`systemctl reload` は今までどおり SIGHUP（設定・証明書の読み直し）のままにし、引き継ぎは SIGUSR2 に分けた（14. で決めた）。.deb の `postinst` は前の版と major.minor が同じなら `systemctl kill -s USR2`、違えば restart。
 - 例外のパッチ（引き継げない修正）は、リリースの `manifest.json` の `"handoff": false` とリリースノートで知らせる。
 
 ### 10.2 コンテナでの自動更新
@@ -410,13 +412,13 @@ outlier_detection:
 | `RPROXY_UPDATE_PUBKEY` | バイナリに入れたリリースの鍵 | 署名を確かめる minisign の公開鍵（ファイル）。ミラーで自分で署名し直すとき |
 | `RPROXY_UPDATE_HEALTHY` | `60s` | この間落ちなければ新しい版を「よい版」とする |
 
-- 署名は **minisign**（Ed25519。確かめる側は小さな純 Rust の実装で済み、cosign のような外のサービスが要らない）。リリースのワークフローがバイナリの `.tar.gz` ごとに `.minisig` と、`SHA256SUMS`・`manifest.json`（版・`handoff` の可否・各ファイルのハッシュ）とその署名を添付する。確かめられないものは実行しない。
+- 署名は **minisign**（Ed25519。確かめる側は小さな純 Rust の実装で済み、cosign のような外のサービスが要らない）。リリースのワークフローがバイナリの `.tar.gz` ごとに（実装では素のバイナリごと。15.）`.minisig` と、`SHA256SUMS`・`manifest.json`（版・`handoff` の可否・各ファイルのハッシュ）とその署名を添付する。確かめられないものは実行しない。
 - API：`GET /admin/update`（`admin`）`{"mode","current":{"version","sha256"},"available":{"version","sha256"}|null,"last_check","error","bad_versions":[...]}`、`POST /admin/update`（`admin`、既定では Unix ソケットからだけ。今すぐ確かめ、`auto` なら入れ替える）。今のバイナリの版とハッシュは `GET /capabilities` の `build`（`{"version","sha256"}`）と `rproxy_build_info` にも出す。
 - k8s ではレプリカの入れ替えで更新するので `RPROXY_UPDATE=off` にする（Helm chart の既定）。
 
 ## 11. #144 API で作ったルールを DB に保存する
 
-- rproxy は**自分のテーブル `rproxy_rules` にだけ書く**。UI のテーブル（`forward_rules` / `forward_rules_log`）には触らない。テーブルの定義と GRANT は UI リポジトリの `db/` の migration に置く（UI と相談して決める。下は rproxy が使う列の案）：
+- rproxy は**自分のテーブル `rproxy_rules` にだけ書く**。UI のテーブル（`forward_rules` / `forward_rules_log`）には触らない。テーブルの定義と GRANT は UI リポジトリの `db/` の migration に置く（下は設計のときの案。実装した定義は docs/API.md の「API で作ったルールの保存」）：
 
 ```sql
 CREATE TABLE rproxy_rules (
@@ -489,16 +491,16 @@ global:
 ```json
 "features": {
   "...v0.3 の項目...": "...",
-  "rulesets": false, "labels": false, "conditions": false, "readyz": false,
-  "limits": false, "bandwidth": false, "geoip": false, "outlier_detection": false,
-  "dry_run": false, "persistence": false,
-  "client_cert_auth": false, "token_expiry": false, "api_lockout": false,
-  "handoff": false, "self_update": false,
-  "performance": []
+  "rulesets": true, "labels": true, "conditions": true, "readyz": true,
+  "limits": true, "bandwidth": true, "geoip": true, "outlier_detection": true,
+  "dry_run": true, "persistence": true,
+  "client_cert_auth": true, "token_expiry": true, "api_lockout": true,
+  "handoff": true, "self_update": true,
+  "performance": ["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]
 }
 ```
 
-ミドルウェアの `geoip` は `middlewares`、サービスの `outlier_detection` は `services` に、動くようになったら名前が入る。
+ミドルウェアの `geoip` は `middlewares`、サービスの `outlier_detection` は `services` に名前が入る。上は v0.4.0 の値（形の PR の時点ではすべて false・`[]` で、実装の PR ごとに true にした）。
 
 ### 13.3 DB の `options`
 
@@ -520,3 +522,41 @@ UI の `forward_rules.options`（JSON）でも、ルールの `limits`・`bandwi
 - #167 の一時停止は既定で有効（20 回 / 1 分で 5 分。Unix ソケットは対象外）。
 - #166 の UDP の帯域の上限は、超えた分を捨てる。
 - 組の名前に `/` を使ってよい（k8s の `namespace/name`）。
+
+## 15. 実装での設計との違い
+
+実装の PR で設計から変えたところ・設計に書いていなかったことを決めたところ。docs/API.md はこれに合わせてある。
+
+- **#167 制御 API の守り（#218）**
+  - 401 の `reason` に `client_cert` を足した（トークンは合ったが、結びついた証明書がない）。
+  - `api.lockout` に `duration_secs` も出す。
+  - クライアントの CA は SIGHUP のほか、証明書のファイルの確認（`RPROXY_CERT_CHECK_SECS`）でも読み直す（制御 API の証明書と同じ扱い）。
+  - 認証に成功しても失敗の数は戻さない（窓が過ぎれば数え直す）。
+- **#165・#166 制限と帯域（#219）**
+  - 指標のラベルは設計の `{rule,reason}` ではなく、ほかの指標に合わせて `{protocol,listen,reason}`（`rproxy_rule_limited_total`・`rproxy_rule_bandwidth_dropped_total{protocol,listen}`）。
+  - HTTP/3（QUIC）は `limits`・`bandwidth` の対象外（`limits` は TCP の接続だけ、帯域も TCP として扱う）。
+  - 帯域の上限のあるルールでは splice しない（`PATCH` で上限を付けたら splice 中の接続もユーザー空間のコピーに戻る）。
+- **#28 ルールの組・状態・readiness（#220）**
+  - `BackendsHealthy` は動いていないルールで `status: "Unknown"`・reason `NotProgrammed`（宛先の状態が分からないので、False にすると「全滅」と誤読されるため）。
+  - `ResolvedRefs` の reason に `SecretUnreadable` を足した（ミドルウェアの秘密のファイル。`CertificateUnreadable` と分けた）。
+  - `change` は `update` のときだけ `in_place` / `recreate`、`create`・`delete`・`none` は `none`。
+  - `PUT /rulesets/{name}?dry_run=true` の応答は `RulePlan` ではなく組の応答（`dry_run: true`、なるはずの `etag`、`update` に `diff`）。
+  - `DELETE /rulesets/{name}` も `If-Match` を受ける。`GET /rulesets/{name}` に `updated_at`・`updated_by` も出す。
+  - `PUT /rulesets/{name}` の本文の上限は 32 MiB（API の既定の 2 MiB では 10,000 ルールに足りないため）。
+- **#168 GeoIP・#170 受け身のヘルスチェック（#221）**
+  - 接続の失敗の `target.down` は `reason: connect` から `reason: outlier` + `cause: connect`（`refused`・`short_lived` も）に変えた。ヘルスチェックの `target.down` / `target.up` は `reason: health_check`、外した時間が過ぎたときの `target.up` は `reason: outlier`。
+  - L7 の `cause` は越えたしきい値の名前（`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`）。gateway の失敗は 5xx の連続にも数える（Envoy と同じ）。
+  - 外している宛先がまた失敗したとき（すべて外れていて試されたもの）は、外す時間を数え直すだけで回数は増やさない。L7 で全部外れたときは、ヘルスチェックで up のサーバを使う。
+  - 倍にした時間は、戻ってから `max_ejection_time` のあいだ外されなければ最初に戻す。
+  - GeoIP の判定は `allow_from` → `geoip` → `crowdsec` の順（`limits` はその後）。
+- **#169 変更前の差分・#144 保存（#222）**
+  - `change` の値の割り当て（上の #28 と同じ）を docs/API.md に書いた。
+  - 保存の対象：作成はトークンの `persist` で決め、変更・削除はルールの `origin` で決める（`api` のルールを別のトークンが変えても行が食い違わないように）。
+  - `--check-config --diff` の問い合わせ先が https なら `RPROXY_TLS_CERT` を信頼する（自己署名の制御 API のため）。
+- **#174 引き継ぎ・自動更新（#223）**
+  - 署名は `.tar.gz` ごとではなく、リリースの資産（素のバイナリ `rproxy-api-v<X.Y.Z>-<target>`）ごと（リリースに `.tar.gz` がないため）。
+  - パッチの探し方：リリースのたびにすべての版を並べた索引 `releases.json`（minisign で署名）を添付し、自動更新は `<source>/latest/download/releases.json` を読んで同じ X.Y の最新を選ぶ（GitHub の API に頼らない。ミラーも同じ道筋に置くだけ）。
+  - `RPROXY_UPDATE_CA_FILE`（隠しの環境変数）：私設の CA のミラーとテストのため。
+  - 引き継ぎで渡す状態に、API のルール（`GET /rules` の形。#144 の `created_by`・`created_at`・`persisted` ごと）、`stats.http`、`counters_since`（古いプロセスの値のまま）・`limited`・帯域で捨てた数も足した。新しいプロセスで最初からになるもの（`limits`・`bandwidth` のバケツと送信元ごとの数、L7 の `rate_limit` などの状態、外した宛先）は docs/UPGRADE.md。
+  - 自動更新のバイナリは届いた分からキャッシュの一時ディレクトリに書き、ファイルから確かめる（メモリに持たない。上限 1 GiB）。
+  - 引き継ぎの間（と後の古いプロセス）は、変更の API に `503 upgrading`。
