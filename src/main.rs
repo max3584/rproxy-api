@@ -614,6 +614,9 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		Ok(rt) => rt,
 		Err(e) => return fail(e.to_string()),
 	};
+	// run by someone else than the service user (root, by hand): files are read
+	// without the owner check, which is then judged for the service user (warnings)
+	rproxy_api::config::check::owner_check_for_service_user(&input.path);
 	let mut report = runtime.block_on(rproxy_api::config::check::check(&input));
 	if opts.diff {
 		// v0.4 (#169): asks the running rproxy with POST /config/plan
@@ -752,6 +755,13 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 				config_unread = Some(e.to_string());
 			}
 		}
+	}
+	// global.files.owner_check: before any rule or global file is read (v0.4)
+	let owner_check = doc.as_ref().and_then(|(_, d)| d.global.files.as_ref()).map(|f| f.owner_check).unwrap_or_default();
+	rproxy_api::net::files::set_owner_check(owner_check);
+	if owner_check == rproxy_api::net::files::OwnerCheck::Off {
+		warn!(event = "degraded", part = "global.files.owner_check",
+			"off: rules may name files of any owner (certificates, keys, secrets); see docs/PERMISSIONS.md");
 	}
 	if let Some((_, d)) = &doc {
 		for part in d.global.unsupported(&rproxy_api::core::rule::Features::CURRENT) {

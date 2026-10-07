@@ -211,6 +211,23 @@ pub async fn check(input: &CheckInput) -> Report {
 	files.extend(secrets);
 	files.sort();
 	files.dedup();
+	// read without the owner check (`owner_check_for_service_user`): judged for the service user
+	let file_strict = doc.global.files.as_ref().map(|f| f.owner_check).unwrap_or_default() == crate::net::files::OwnerCheck::Strict;
+	if file_strict && crate::net::files::owner_check() == crate::net::files::OwnerCheck::Off {
+		#[cfg(unix)]
+		if let Some((uid, _)) = service_user() {
+			let settings = report.files.clone();
+			for f in files.iter().filter(|f| !settings.contains(f)) {
+				let path = Path::new(f);
+				if let Ok(meta) = std::fs::metadata(path) {
+					let link = std::fs::symlink_metadata(path).ok();
+					if let Some(why) = crate::net::files::problem(path, link.as_ref(), &meta, crate::net::files::Kind::Public, uid) {
+						report.warning("", format!("{why} (rproxy runs as {SERVICE_USER}, uid {uid}; global.files.owner_check: strict)"));
+					}
+				}
+			}
+		}
+	}
 	for f in &files {
 		warn_unreadable(&mut report, Path::new(f), f, false);
 	}
@@ -225,8 +242,27 @@ fn access_error(e: crate::l7::access::AccessLogError) -> String {
 	}
 }
 
+/// `--check-config` run by another user than the service's (root, by hand): the files
+/// are read without the owner check (it would judge them for the wrong user), and
+/// `check` judges them for the service user instead, as warnings. Run as the service
+/// user (the unit's ExecReload), the check is the server's own: errors.
+pub fn owner_check_for_service_user(path: &Path) {
+	#[cfg(unix)]
+	{
+		let strict = ConfigDoc::load(path).ok().and_then(|d| d.global.files).map(|f| f.owner_check).unwrap_or_default();
+		// SAFETY: geteuid has no preconditions
+		let me = unsafe { libc::geteuid() };
+		match service_user() {
+			Some((uid, _)) if uid != me => crate::net::files::set_owner_check(crate::net::files::OwnerCheck::Off),
+			_ => crate::net::files::set_owner_check(strict),
+		}
+	}
+	#[cfg(not(unix))]
+	let _ = path;
+}
+
 /// The service runs as this user (debian/rproxy-api.service).
-const SERVICE_USER: &str = "rproxy";
+const SERVICE_USER: &str = "rproxy-api";
 
 /// Warns when the `rproxy` user (if it exists and is not the one checking) may
 /// not read `path` (or write it, for a directory), judged from its owner and

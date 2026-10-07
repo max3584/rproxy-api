@@ -55,6 +55,7 @@ pub struct Pki {
 
 impl Pki {
 	pub fn new(tag: &str) -> Pki {
+		rproxy_api::net::files::private_umask();
 		let dir = std::env::temp_dir().join(format!("rproxy-pki-{tag}-{}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let ca_key = KeyPair::generate().unwrap();

@@ -318,3 +318,28 @@ fn gateway_settings_are_checked_like_the_api() {
 	assert_eq!(code, 1, "{v}");
 	assert!(messages(&v, "errors").contains("/nope/backend-ca.pem"), "{v}");
 }
+
+#[test]
+fn files_of_others_are_errors_unless_the_owner_check_is_off() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = workdir("owner");
+	let pki = Pki::new("check-owner");
+	let cert = pki.server("front", &["a.test"]);
+	fs::set_permissions(&cert.key_file, fs::Permissions::from_mode(0o644)).unwrap();
+	let file = dir.join("rproxy.yaml");
+	let doc = |global: &str| {
+		format!(
+			"version: 1\n{global}rules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {}, remote_addr: x, remote_port: 1, tls: {{mode: terminate, certificates: [{{cert_file: {}, key_file: {}}}]}}}}\n",
+			free_port(),
+			cert.cert_file,
+			cert.key_file
+		)
+	};
+	fs::write(&file, doc("")).unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	assert!(messages(&v, "errors").contains("may be read by anyone"), "{v}");
+	fs::write(&file, doc("global: {files: {owner_check: off}}\n")).unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 0, "{v}");
+}
