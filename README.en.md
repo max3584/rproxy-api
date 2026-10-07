@@ -287,7 +287,8 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 
 | `event` | Content |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop (with `labels`, and `ruleset` for rules of a set) |
+| `ruleset.apply` / `ruleset.delete` | A rule set (v0.4, #28) was applied (`ruleset`, `generation`, `etag`, counts created / updated / deleted / unchanged / failed, `by`) / deleted |
 | `config.reload` / `config.error` | Application of the configuration file (counts, `global` changes that need a restart) and the reason it could not be applied |
 | `start` / `shutdown` / `fatal` | Startup (`version`, whether transparent, authentication and TLS are on, …) / exit / a configuration mistake that stops the startup |
 | `degraded` | Part of rproxy was left out because of the environment and the rest runs (`part`: `api`, `api_tls`, `tokens`, `log`, `global.*`, …) |

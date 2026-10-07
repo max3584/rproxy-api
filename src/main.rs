@@ -695,6 +695,9 @@ async fn run(opts: Options) -> Result<(), String> {
 		}
 	}
 
+	// GET /readyz (#28): the restore is done
+	registry.readiness().set_ready();
+
 	// the settings file: applied again when it changes, on SIGHUP or by POST /config/reload
 	let reloader = config_path.clone().map(|path| {
 		Arc::new(ConfigReloader::new(
@@ -774,6 +777,7 @@ async fn run(opts: Options) -> Result<(), String> {
 	wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup).await?;
 
 	info!(event = "shutdown");
+	registry.readiness().set_draining();
 	stop.cancel();
 	for handle in handles.lock().unwrap().iter() {
 		handle.graceful_shutdown(Some(Duration::from_secs(5)));
