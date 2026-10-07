@@ -168,6 +168,11 @@ impl Pki {
 		self.issue(name, cn, &[], true)
 	}
 
+	/// A client certificate with DNS names (subjectAltName).
+	pub fn client_with_names(&self, name: &str, cn: &str, sans: &[&str]) -> Issued {
+		self.issue(name, cn, sans, true)
+	}
+
 	pub fn roots(&self) -> RootCertStore {
 		let mut roots = RootCertStore::empty();
 		roots.add(self.ca.der().clone()).unwrap();

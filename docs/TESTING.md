@@ -30,7 +30,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
-SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
+SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`token.expiring` / `token.expired`（`tests/api_hardening.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
 
 ## 単体テスト（`src/`）
 
@@ -185,11 +185,21 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 
 | テスト | 確かめること |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | `features` の v0.4 の印がすべて false、`performance` が空 |
+| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout` は true）、`performance` が空 |
 | `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
 | `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
 | `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
-| `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |
+| `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
+
+## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
+
+| テスト | 確かめること |
+|---|---|
+| `client_certificates_authenticate_alone_or_bound_to_a_token` | main.rs と同じ TLS（`ClientCertAcceptor`）で、`optional` では証明書だけのエントリが証明書（SAN、なければ CN）で通り、スコープも効く。知らない名前・証明書なしは 401、トークンは証明書なしでも通る。証明書に結びついたトークンは、その証明書がないと 401。ほかの CA の証明書はハンドシェイクで断る。`required` では証明書のない接続を断る |
+| `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | 窓の中の 401 が上限に達した送信元は、正しいトークンでも `429 locked_out`（`Retry-After`）。Unix ソケットの失敗は数えず、止めている間も Unix ソケットは通る。`/healthz` は止めない。`/metrics` の `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`。時間が過ぎれば戻る |
+| `lockout_is_on_by_default` | 既定（オーナーの決定）で 20 回目の失敗で止まる |
+| `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
+| `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
 
 ## DB からの復元（`tests/db_restore.rs`）
 
