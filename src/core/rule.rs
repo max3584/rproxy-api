@@ -189,10 +189,10 @@ impl Features {
 			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc",
 		],
 		services: &["health_check", "sticky", "balance"],
-		rulesets: false,
-		labels: false,
-		conditions: false,
-		readyz: false,
+		rulesets: true,
+		labels: true,
+		conditions: true,
+		readyz: true,
 		limits: false,
 		bandwidth: false,
 		geoip: false,
@@ -433,6 +433,9 @@ pub struct RuleSpec {
 	pub geoip: Option<GeoipSpec>,
 	pub outlier_detection: Option<L4OutlierSpec>,
 	pub origin: Origin,
+	/// The rule set (`PUT /rulesets/{name}`) that owns the rule (#28); such a
+	/// rule is changed only through its set.
+	pub ruleset: Option<String>,
 }
 
 impl RuleSpec {
@@ -717,6 +720,7 @@ impl RuleRequest {
 			geoip: v04.geoip,
 			outlier_detection: v04.outlier_detection,
 			origin: Origin::Dynamic,
+			ruleset: None,
 		};
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), caps)?;
@@ -895,7 +899,7 @@ impl RuleView {
 			geoip: spec.geoip.clone(),
 			outlier_detection: spec.outlier_detection.clone(),
 			origin: spec.origin,
-			ruleset: None,
+			ruleset: spec.ruleset.clone(),
 			conditions: vec![],
 			persisted: None,
 			created_by: None,

@@ -766,8 +766,9 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if let Some(r) = &received {
 		// the old process's rules, as they were (not the database's, read at its start)
 		let rules = r.rules();
-		info!(event = "restore.start", rules = rules.len(), from = "handoff");
+		info!(event = "restore.start", rules = rules.len(), rulesets = r.state.rulesets.len(), from = "handoff");
 		registry.restore(rules).await;
+		r.restore_rulesets(&registry).await;
 	} else if let Some(url) = &opts.database_url {
 		match db::load_rules(url).await {
 			Ok(rules) => {
@@ -778,6 +779,9 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			Err(e) => error!(event = "restore.error", error = %e),
 		}
 	}
+
+	// GET /readyz (#28): the restore is done
+	registry.readiness().set_ready();
 
 	// the settings file: applied again when it changes, on SIGHUP or by POST /config/reload
 	let reloader = config_path.clone().map(|path| {
@@ -873,6 +877,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 
 	let handed = wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup, &upgrader).await?;
 
+	// GET /readyz: draining (#28), here and after a handoff
+	registry.readiness().set_draining();
 	match &handed {
 		Some(h) => {
 			handoff::set_draining();

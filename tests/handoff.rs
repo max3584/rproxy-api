@@ -159,6 +159,7 @@ async fn tcp_connections_survive_and_new_ones_go_to_the_new_process() {
 	let backend = tcp_backend("B:").await;
 	let udp_target = udp_backend("U:").await;
 	let (api, static_port, api_port, udp_port) = (free_port(), free_port(), free_port(), free_udp_port());
+	let set_port = free_port();
 	fs::write(
 		dir.join("rproxy.yaml"),
 		format!("version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {static_port}, remote_addr: 127.0.0.1, remote_port: {}}}\n", backend.port()),
@@ -194,6 +195,11 @@ async fn tcp_connections_survive_and_new_ones_go_to_the_new_process() {
 	assert_eq!(r.status(), 201, "{:?}", r.text().await);
 	let r = http.post(format!("http://127.0.0.1:{api}/rules")).json(&rule("udp", udp_port, udp_target)).send().await.unwrap();
 	assert_eq!(r.status(), 201);
+	// a rule set (#28) goes over as a set
+	let set = json!({"generation": 7, "rules": [rule("tcp", set_port, backend)]});
+	let r = http.put(format!("http://127.0.0.1:{api}/rulesets/k8s/default/gw")).json(&set).send().await.unwrap();
+	assert_eq!(r.status(), 200, "{:?}", r.text().await);
+	let set_before = api_get(api, "/rulesets/k8s/default/gw").await.unwrap();
 	let before: Vec<Value> = api_get(api, "/rules").await.unwrap().as_array().unwrap().clone();
 	let start_time = metric(&api_text(api, "/metrics").await, "rproxy_process_start_time_seconds").unwrap();
 
@@ -255,6 +261,14 @@ async fn tcp_connections_survive_and_new_ones_go_to_the_new_process() {
 		out
 	};
 	assert_eq!(shape(&after), shape(&before));
+	let set_after = api_get(api, "/rulesets/k8s/default/gw").await.unwrap();
+	assert_eq!((&set_after["generation"], &set_after["etag"]), (&set_before["generation"], &set_before["etag"]), "{set_after}");
+	assert_eq!(after.iter().find(|r| r["listen_port"] == set_port).unwrap()["ruleset"], json!("k8s/default/gw"));
+	let mut c = TcpStream::connect(("127.0.0.1", set_port)).await.unwrap();
+	assert_eq!(roundtrip(&mut c, "set").await, "B:set");
+	drop(c);
+	let ready = reqwest::get(format!("http://127.0.0.1:{api}/readyz")).await.unwrap();
+	assert_eq!(ready.status(), 200, "the new process is ready");
 	let (status, body) = unix_request(&sock, "GET", "/capabilities");
 	assert_eq!(status, 200, "{body}");
 	assert_eq!(metric(&api_text(api, "/metrics").await, "rproxy_process_start_time_seconds").unwrap(), start_time);

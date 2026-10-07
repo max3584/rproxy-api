@@ -121,6 +121,29 @@ pub struct State {
 	pub rules: Vec<serde_json::Value>,
 	/// Every rule's counters.
 	pub counters: Vec<Counters>,
+	/// Rule sets (#28) with their rules, applied again as they were.
+	#[serde(default)]
+	pub rulesets: Vec<SetSnapshot>,
+}
+
+/// A rule set (`PUT /rulesets/{name}`, #28) as handed over.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SetSnapshot {
+	pub name: String,
+	pub generation: u64,
+	pub updated_by: String,
+	pub rules: Vec<serde_json::Value>,
+}
+
+/// A rule as `GET /rules` shows it, as a body that creates it again.
+fn request_value(v: &crate::core::rule::RuleView) -> Option<serde_json::Value> {
+	let mut v = serde_json::to_value(v).ok()?;
+	// with `targets`, remote_addr / remote_port only repeat the first one
+	if v["targets"].as_array().is_some_and(|t| !t.is_empty()) {
+		v["remote_addr"] = "".into();
+		v["remote_port"] = 0.into();
+	}
+	Some(v)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,23 +348,27 @@ pub fn set_draining() {
 
 /// The rules made through the API (and from the database) and the counters.
 async fn snapshot(registry: &Registry) -> State {
+	// the rules of rule sets go with their set
 	let rules = registry
 		.list()
 		.await
-		.into_iter()
-		.filter(|v| v.origin != Origin::Static)
-		.filter_map(|v| serde_json::to_value(&v).ok())
-		.map(|mut v| {
-			// with `targets`, remote_addr / remote_port only repeat the first one
-			if v["targets"].as_array().is_some_and(|t| !t.is_empty()) {
-				v["remote_addr"] = "".into();
-				v["remote_port"] = 0.into();
-			}
-			v
-		})
+		.iter()
+		.filter(|v| v.origin != Origin::Static && v.ruleset.is_none())
+		.filter_map(request_value)
 		.collect();
+	let mut rulesets = vec![];
+	for summary in registry.list_rulesets().await {
+		if let Ok(set) = registry.get_ruleset(&summary.name).await {
+			rulesets.push(SetSnapshot {
+				name: set.name,
+				generation: set.generation,
+				updated_by: set.updated_by,
+				rules: set.rules.iter().filter_map(request_value).collect(),
+			});
+		}
+	}
 	let counters = registry.runtimes().await.iter().map(|(k, rt)| Counters::of(k, rt)).collect();
-	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time(), rules, counters }
+	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time(), rules, counters, rulesets }
 }
 
 /// Every listening socket of this process, duplicated (so a socket closed
@@ -476,6 +503,25 @@ impl Received {
 				}
 			})
 			.collect()
+	}
+
+	/// Applies the rule sets of the old process again (#28), as they were.
+	pub async fn restore_rulesets(&self, registry: &Arc<Registry>) {
+		for set in &self.state.rulesets {
+			let rules: Result<Vec<RuleRequest>, _> = set.rules.iter().map(|v| serde_json::from_value(v.clone())).collect();
+			let rules = match rules {
+				Ok(r) => r,
+				Err(e) => {
+					warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e, "a rule set from the old process could not be read; dropped");
+					continue;
+				}
+			};
+			let req = crate::core::ruleset::RulesetRequest { generation: set.generation, rules };
+			let opts = crate::core::ruleset::PutOptions { if_match: None, dry_run: false, by: &set.updated_by, may_use_ports: &|_, _| true };
+			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
+				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
+			}
+		}
 	}
 
 	/// Adds the old counters to the rules now running and tells the old process
