@@ -198,10 +198,23 @@ pub async fn relay(
 	tx: &AtomicU64,
 	rx_total: &AtomicU64,
 	tx_total: &AtomicU64,
+	first: Option<&crate::core::outlier::FirstEnd>,
 ) -> io::Result<()> {
 	let (mut ar, mut aw) = a.split();
 	let (mut br, mut bw) = b.split();
-	tokio::try_join!(direction(&mut ar, &mut bw, rx, rx_total), direction(&mut br, &mut aw, tx, tx_total))?;
+	// which side ended first, for `outlier_detection.short_lived` (#170)
+	let ended = |backend: bool| {
+		move |r: io::Result<()>| {
+			if let Some(f) = first {
+				f.mark(backend);
+			}
+			r
+		}
+	};
+	tokio::try_join!(
+		async { ended(false)(direction(&mut ar, &mut bw, rx, rx_total).await) },
+		async { ended(true)(direction(&mut br, &mut aw, tx, tx_total).await) }
+	)?;
 	Ok(())
 }
 
@@ -305,7 +318,7 @@ mod tests {
 		let (rx, tx, rt, tt) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
 		let data: Vec<u8> = (0..4u32 << 20).map(|i| (i * 7 + i / 251) as u8).collect();
 		let sent = data.clone();
-		let relay = relay(&mut a, &mut b, &rx, &tx, &rt, &tt);
+		let relay = relay(&mut a, &mut b, &rx, &tx, &rt, &tt, None);
 		let peers = async {
 			let up = async {
 				client.write_all(&sent).await.unwrap();

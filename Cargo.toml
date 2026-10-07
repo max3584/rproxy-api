@@ -121,6 +121,8 @@ h3-quinn = "0.0.10"
 # ACME (global.acme, src/acme/): the client, with our own HTTP client (src/acme/http.rs) and ring
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "time", "x509-parser"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# GeoIP (global.geoip, src/net/geoip.rs): MaxMind DB (mmdb) reader, ISC, pure Rust; read into memory (no mmap feature)
+maxminddb = "0.32.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

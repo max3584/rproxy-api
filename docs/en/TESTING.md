@@ -185,12 +185,36 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | Every v0.4 flag in `features` is false, `performance` is empty |
-| `labels_…`, `limits_…`, `bandwidth_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
+| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false, `performance` is empty. The implemented `geoip` and `outlier_detection` (and the `geoip` middleware, services' `outlier_detection`) are true |
+| `labels_…`, `limits_…`, `bandwidth_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). GeoIP (#168) and passive health checks (#170) are implemented: `tests/geoip.rs`, `tests/outlier.rs` |
 | `rulesets_and_readyz_…`, `dry_run_…`, `config_plan_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule. A dry run changes nothing |
-| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). `--diff` is not available yet. A 0.3 settings file passes without warnings |
+| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.performance.*`, rules). `--diff` is not available yet. A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables, and control API client certificates (not available yet), stop the startup |
 
+
+## Integration tests: GeoIP (`tests/geoip.rs`, #168)
+
+The mmdb files are made by the test (`tests/common/mmdb.rs`: a small writer of an IPv6 tree (IPv4 under ::/96), 32-bit records and maps of strings and integers; no MaxMind database is used or committed). Loopback sources stand for countries: 127.0.0.1 is JP, 127.0.0.2 is US (AS64496), 127.0.0.3 is not in the databases. Unit tests (`net::geoip`) cover the decision table, reading files, reloading that skips a broken version, and startup errors.
+
+| Test | What it checks |
+|---|---|
+| `tcp_rules_refuse_by_country_and_asn` | With `allow_countries`, JP passes and US is closed; unknown passes by default. `conn.denied` with `reason: geoip`, `country`, `asn`; `country` in `conn.open` with `log_country`; `stats.denied`. PATCH to `deny_asns` and `unknown: deny`, `{}` removes it |
+| `udp_rules_drop_datagrams_by_country` | Datagrams of a refused country are dropped and no session is made |
+| `lists_need_the_databases` | Without `global.geoip`, or with only a country database, country / ASN lists (rules, middleware) are `400 invalid` |
+| `the_middleware_answers_403_for_the_client_trusted_proxies_name` | The middleware answers `403`, on the client a trusted proxy names in `X-Forwarded-For` (not believed from untrusted peers). `http.access` with `refused_by: geoip`, `country`, `asn` |
+| `check_config_reads_the_databases` | `--check-config` reads the databases; a missing file or one that is not an mmdb is an error |
+
+## Integration tests: passive health checks (`tests/outlier.rs`, #170)
+
+The behaviour without the setting (one failure ejects for 10 s) is in `tests/targets.rs`. Unit tests (`core::outlier`, `core::balance`) cover the defaults, doubling ejections, the L7 thresholds, `max_ejected_percent` and `short_lived`.
+
+| Test | What it checks |
+|---|---|
+| `consecutive_failures_eject_a_target_for_a_while` | Ejected after 3 refused connections in a row (`up`, `ejections`, `ejected_until` in `stats.targets[]`; `target.down` with `reason: outlier`, `cause: connect`), back by itself after `ejection_time` (`target.up`) |
+| `short_lived_connections_count_as_failures` | Connections the target closes at once are failures with `short_lived` (`cause: short_lived`); those the client ends are not |
+| `max_ejected_percent_keeps_targets_and_patch_changes_it_in_place` | `max_ejected_percent: 0` never ejects; PATCH with `{}` goes back to the defaults |
+| `http_servers_that_keep_failing_are_ejected` | A server answering 500 in a row is ejected and the rest get the requests (`ejected` in `stats.http.services`; `target.down` with `service`, `server`, `cause`) |
+| `http_ejection_leaves_at_least_half_by_default` | The default `max_ejected_percent: 50` never ejects them all |
 ## Restoring from the DB (`tests/db_restore.rs`)
 
 | Test | What it checks |

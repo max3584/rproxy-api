@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod logs;
+pub mod mmdb;
 pub mod pki;
 
 use std::collections::HashMap;

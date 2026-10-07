@@ -81,6 +81,11 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 							denied(&rt, client, "allow_from");
 							continue;
 						}
+						// also datagrams of sessions that were open before the rule's geoip changed
+						if let Err(info) = rt.geoip_check(client.ip()) {
+							rt.geoip_denied(client, &info, None, true);
+							continue;
+						}
 						// also datagrams of sessions that were open before the ban
 						if rt.crowdsec_blocks(client.ip()) {
 							denied(&rt, client, "crowdsec");
@@ -218,8 +223,9 @@ async fn session(
 	};
 
 	rt.stats.opened();
+	let geo = rt.geo_for_log(client.ip(), None);
 	info!(event = "conn.open", rule = %rt.key, listen = %listener.local_for(local), client = %client, target = %addr_or_empty(target),
-		sni = sni.as_deref().unwrap_or(""));
+		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn));
 	let header = proxy_header(rt, client, listener.local_for(local));
 	// sni: the QUIC connection this session was routed for, and a new one being read
 	let mut quic_dcid = first.iter().find_map(|d| crate::tls::udp_sni::quic::initial_dcid(d));
@@ -292,7 +298,7 @@ async fn session(
 					if let (std::io::ErrorKind::ConnectionRefused, Some(lease)) = (e.kind(), &lease) {
 						let pool = rt.pool();
 						if pool.contains(lease.member()) {
-							pool.mark_failed(&rt.key, lease.member(), &e.to_string());
+							pool.failed(&rt.key, lease.member(), "refused", &e.to_string());
 						}
 					}
 				}

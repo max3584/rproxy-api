@@ -77,6 +77,8 @@ pub enum Middleware {
 	InFlight { name: String, limiter: Arc<InFlight> },
 	/// Asked asynchronously by the server (`crowdsec.rs`); `on_request` passes it by.
 	Crowdsec { name: String, appsec: bool, block_on_error: bool },
+	/// Country / ASN lists (#168): the server looks the client up in `global.geoip`.
+	Geoip(crate::net::geoip::Policy),
 	/// The ones below are run by the server (they need the body, the response
 	/// or the backend); `on_request` / `on_response` pass them by.
 	Compress { encodings: Vec<Encoding>, min_size: u64 },
@@ -106,6 +108,7 @@ impl Middleware {
 			Middleware::RateLimit { .. } => "rate_limit",
 			Middleware::InFlight { .. } => "in_flight",
 			Middleware::Crowdsec { .. } => "crowdsec",
+			Middleware::Geoip(_) => "geoip",
 			Middleware::Compress { .. } => "compress",
 			Middleware::Buffering { .. } => "buffering",
 			Middleware::Retry(_) => "retry",
@@ -279,6 +282,11 @@ impl Middleware {
 					groups_claim: groups_claim.as_deref(),
 				},
 			)?)),
+			MiddlewareSpec::Geoip(g) => {
+				g.validate(&what)?;
+				Middleware::Geoip(crate::net::geoip::Policy::new(g))
+			}
+			#[allow(unreachable_patterns)]
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
 	}
@@ -396,6 +404,7 @@ impl Middleware {
 				None
 			}
 			Middleware::Crowdsec { .. }
+			| Middleware::Geoip(_)
 			| Middleware::Compress { .. }
 			| Middleware::Buffering { .. }
 			| Middleware::Retry(_)
