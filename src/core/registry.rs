@@ -258,6 +258,8 @@ pub struct Registry {
 	certs: CertStore,
 	/// `global.acme`: certificates of `tls.certificates[].acme` (set once at startup).
 	acme: std::sync::OnceLock<Arc<crate::acme::Acme>>,
+	/// `rproxy_rules`: rules of `persist: true` tokens (#144; set once at startup).
+	persist: std::sync::OnceLock<Arc<crate::config::persist::Store>>,
 	/// Rule sets (`PUT /rulesets/{name}`, #28); in memory only.
 	pub(super) rulesets: crate::core::ruleset::Rulesets,
 	/// When each rule's `conditions` last changed (#28).
@@ -358,7 +360,7 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 
 /// Two rules clash when they share a protocol and ports on an address of either
 /// (`listen_addr` or `extra_listen_addrs`), or on a wildcard that covers it.
-pub(super) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
+pub(crate) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 	let (a0, b0) = (u32::from(a.key.listen.port()), u32::from(b.key.listen.port()));
 	let (a1, b1) = (a0 + u32::from(a.port_count) - 1, b0 + u32::from(b.port_count) - 1);
 	if a.key.protocol != b.key.protocol || a0 > b1 || b0 > a1 {
@@ -369,7 +371,7 @@ pub(super) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 }
 
 /// A rule on `::`, whose socket takes IPv4 too unless it has extra addresses.
-pub(super) fn is_dual_stack_wildcard(key: &Key) -> bool {
+pub(crate) fn is_dual_stack_wildcard(key: &Key) -> bool {
 	key.listen.is_ipv6() && key.listen.ip().is_unspecified()
 }
 
@@ -389,10 +391,20 @@ impl Registry {
 			config_status: RwLock::default(),
 			certs: CertStore::default(),
 			acme: std::sync::OnceLock::new(),
+			persist: std::sync::OnceLock::new(),
 			rulesets: Default::default(),
 			conditions: Default::default(),
 			readiness: Default::default(),
 		})
+	}
+
+	/// Sets the store of API-created rules (#144), before rules are restored.
+	pub fn set_persist(&self, store: Arc<crate::config::persist::Store>) {
+		let _ = self.persist.set(store);
+	}
+
+	pub fn persist(&self) -> Option<&Arc<crate::config::persist::Store>> {
+		self.persist.get()
 	}
 
 	/// Whether the startup restore is done, for `GET /readyz` (#28).
@@ -465,6 +477,11 @@ impl Registry {
 				Some(certstore::CertStatusView::new(role, source.file(), not_after, now, warn))
 			})
 			.collect();
+		if view.origin == Origin::Api {
+			if let Some(store) = self.persist() {
+				store.decorate(&entry.spec().key, &mut view);
+			}
+		}
 		if self.caps().features.conditions {
 			let cause = match entry {
 				Entry::Failed(f) => Some(f.cause()),
@@ -533,7 +550,7 @@ impl Registry {
 	/// CAP_NET_ADMIN, a v0.3 feature this build cannot run yet) comes back with
 	/// the reason, to be registered as failed instead of being dropped or
 	/// stopping the startup.
-	fn validate_at_startup(&self, req: RuleRequest) -> Result<(RuleSpec, Option<String>), ApiError> {
+	pub(crate) fn validate_at_startup(&self, req: RuleRequest) -> Result<(RuleSpec, Option<String>), ApiError> {
 		let caps = self.caps();
 		match req.clone().validate(&caps) {
 			Ok(spec) => Ok((spec, None)),
@@ -796,11 +813,24 @@ impl Registry {
 	}
 
 	pub async fn create(self: &Arc<Self>, req: RuleRequest) -> Result<RuleView, ApiError> {
-		let spec = req.validate(&self.caps())?;
+		self.create_as(req, Origin::Dynamic).await
+	}
+
+	/// `create` with the rule's origin: `Api` for a `persist: true` token (#144).
+	pub async fn create_as(self: &Arc<Self>, req: RuleRequest, origin: Origin) -> Result<RuleView, ApiError> {
+		let mut spec = req.validate(&self.caps())?;
+		spec.origin = origin;
 		self.create_spec(spec).await
 	}
 
 	pub async fn update(self: &Arc<Self>, key: &Key, req: UpdateRequest) -> Result<RuleView, ApiError> {
+		let (_, spec, tls_changed, http_changed) = self.updated_spec(key, req).await?;
+		self.apply(key, spec, tls_changed, http_changed).await
+	}
+
+	/// What a PATCH makes of a rule: (current spec, new spec, whether `tls`
+	/// was replaced, whether `http` was). Validates the request; changes nothing.
+	pub(crate) async fn updated_spec(&self, key: &Key, req: UpdateRequest) -> Result<(RuleSpec, RuleSpec, bool, bool), ApiError> {
 		let udp_idle = match req.udp_idle_secs {
 			Some(secs) => Some(validate_udp_idle(Some(secs))?),
 			None => None,
@@ -810,6 +840,7 @@ impl Registry {
 			let rules = self.rules.lock().await;
 			rules.get(key).map(|e| e.spec().clone()).ok_or_else(|| ApiError::not_found(key.to_string()))?
 		};
+		let current = spec.clone();
 		if spec.origin == Origin::Static {
 			return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 		}
@@ -899,7 +930,39 @@ impl Registry {
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), &self.caps())?;
 		}
-		self.apply(key, spec, tls_changed, http_changed).await
+		Ok((current, spec, tls_changed, http_changed))
+	}
+
+	/// A rule's spec and view, and whether it is running (dry runs, #169; storing, #144).
+	pub(crate) async fn current(&self, key: &Key) -> Option<(RuleSpec, bool, RuleView)> {
+		let rules = self.rules.lock().await;
+		rules.get(key).map(|e| (e.spec().clone(), matches!(e, Entry::Running(_)), self.view_of(e)))
+	}
+
+	/// Every rule's spec, and whether it is running.
+	pub(crate) async fn specs(&self) -> Vec<(RuleSpec, bool)> {
+		self.rules.lock().await.values().map(|e| (e.spec().clone(), matches!(e, Entry::Running(_)))).collect()
+	}
+
+	/// What creating `spec` (or putting it in place of the rule `replacing`)
+	/// checks short of sockets and name resolution: the control API's address,
+	/// other rules' keys and addresses, certificates and secret files (read).
+	pub(crate) async fn check_start(&self, spec: &RuleSpec, replacing: Option<&Key>) -> Result<(), ApiError> {
+		if let Some(api) = self.reserved_clash(spec) {
+			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
+		}
+		{
+			let rules = self.rules.lock().await;
+			if replacing != Some(&spec.key) && rules.contains_key(&spec.key) {
+				return Err(ApiError::already_exists(spec.key.to_string()));
+			}
+			if let Some((other, _)) =
+				rules.iter().find(|(k, e)| Some(*k) != replacing && **k != spec.key && overlaps(e.spec(), spec))
+			{
+				return Err(ApiError::already_exists(format!("{} overlaps with {other}", spec.key)));
+			}
+		}
+		self.build_parts(spec).map(|_| ())
 	}
 
 	/// Puts a changed spec into effect on an existing rule, keeping its
@@ -1194,9 +1257,18 @@ impl Registry {
 	/// Starts rules loaded at boot. Rules whose target cannot be resolved yet are
 	/// kept as failed and retried until resolution succeeds.
 	pub async fn restore(self: &Arc<Self>, reqs: Vec<RuleRequest>) {
+		self.restore_as(reqs, Origin::Dynamic).await
+	}
+
+	/// `restore` with the rules' origin (`Api`: from `rproxy_rules`, #144).
+	pub async fn restore_as(self: &Arc<Self>, reqs: Vec<RuleRequest>, origin: Origin) {
 		let (mut started, mut failed) = (0, 0);
 		for req in reqs {
-			let spec = match self.validate_at_startup(req.clone()) {
+			let validated = self.validate_at_startup(req.clone()).map(|(mut spec, missing)| {
+				spec.origin = origin;
+				(spec, missing)
+			});
+			let spec = match validated {
 				Ok((spec, None)) => spec,
 				Ok((spec, Some(missing))) => {
 					failed += 1;
@@ -1224,7 +1296,7 @@ impl Registry {
 				}
 			}
 		}
-		info!(event = "restore.done", started, failed);
+		info!(event = "restore.done", started, failed, origin = ?origin);
 	}
 
 	/// Registers a rule that could not start; one whose targets could not be
@@ -1264,7 +1336,7 @@ impl Registry {
 
 	/// Validates the rules of the settings file as a whole: (spec, reason it
 	/// cannot run here). Only mistakes in the file are errors.
-	fn validate_static(&self, reqs: Vec<(String, RuleRequest)>) -> Result<Vec<(RuleSpec, Option<String>)>, String> {
+	pub(crate) fn validate_static(&self, reqs: Vec<(String, RuleRequest)>) -> Result<Vec<(RuleSpec, Option<String>)>, String> {
 		let mut specs: Vec<(RuleSpec, Option<String>, String)> = vec![];
 		for (label, req) in reqs {
 			let (mut spec, missing) = self.validate_at_startup(req).map_err(|e| format!("{label}: {}", e.message))?;
@@ -1412,12 +1484,7 @@ impl Registry {
 				Some((old, _)) if *old == spec => counts.unchanged += 1,
 				Some((old, running)) => {
 					counts.changed += 1;
-					let in_place = *running
-						&& missing.is_none()
-						&& old.port_count == spec.port_count
-						&& old.source_ip == spec.source_ip
-						&& old.http.is_some() == spec.http.is_some()
-						&& !(is_dual_stack_wildcard(&key) && old.v6only() != spec.v6only());
+					let in_place = *running && missing.is_none() && crate::config::plan::in_place(old, &spec);
 					if in_place {
 						let tls_changed =
 							old.tls != spec.tls || old.starttls != spec.starttls || old.starttls_required != spec.starttls_required;
