@@ -596,8 +596,18 @@ impl Registry {
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
 		}
+		// geoip lists need the databases of global.geoip (#168)
+		let geoip = self.cfg.http.geoip().map(|g| g.spec());
+		if let Some(g) = &spec.geoip {
+			g.check_databases("geoip", geoip).map_err(ApiError::invalid)?;
+		}
 		let http = match &spec.http {
 			Some(h) => {
+				for (name, m) in &h.middlewares {
+					if let crate::l7::MiddlewareSpec::Geoip(g) = m {
+						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::invalid)?;
+					}
+				}
 				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
 				Some(Arc::new(crate::l7::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
 			}
@@ -643,7 +653,8 @@ impl Registry {
 			pool_members.push(Arc::new(Member::new(t, tx)));
 		}
 		let reported = pool_members.len() > 1 || spec.health_check.is_some();
-		let pool = Arc::new(Pool::new(pool_members, spec.balance, events.clone(), reported));
+		let outlier = crate::core::outlier::L4Outlier::new(spec.outlier_detection.as_ref());
+		let pool = Arc::new(Pool::new(pool_members, spec.balance, events.clone(), reported).with_outlier(outlier));
 		if let Some(check) = spec.health_check.clone().filter(|_| !pool.members.is_empty()) {
 			let stop = kill.child_token();
 			balance::spawn_health_checks(spec.key, pool.clone(), check, stop.clone());
@@ -686,6 +697,7 @@ impl Registry {
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
 			crowdsec: spec.crowdsec.into(),
+			geoip: RwLock::new(spec.geoip.as_ref().map(|g| Arc::new(crate::net::geoip::Policy::new(g)))),
 			http: RwLock::new(prepared.http),
 			global: self.cfg.http.clone(),
 			http_stats: Default::default(),
@@ -945,6 +957,7 @@ impl Registry {
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
+				*r.rt.geoip.write().unwrap() = spec.geoip.as_ref().map(|g| Arc::new(crate::net::geoip::Policy::new(g)));
 				if backends_changed {
 					// new connections use the new targets; UDP sessions move when theirs is gone
 					r.backends.stop();
@@ -952,6 +965,9 @@ impl Registry {
 					*r.rt.pool.write().unwrap() = pool;
 					r.backends = backends;
 					r.rt.pool().notify();
+				} else {
+					// outlier_detection: the targets keep their counts and ejections
+					r.rt.pool().set_outlier(crate::core::outlier::L4Outlier::new(spec.outlier_detection.as_ref()));
 				}
 				if http_changed {
 					*r.rt.http.write().unwrap() = prepared.http;

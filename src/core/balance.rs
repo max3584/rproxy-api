@@ -3,21 +3,22 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::error::ApiError;
+use crate::core::outlier::{self, Ejection, L4Outlier};
 use crate::core::rule::{validate_remote, Key, Protocol};
+use crate::error::ApiError;
 
 /// Targets one rule may have.
 pub const MAX_TARGETS: usize = 64;
 /// How long a target that refused a connection is skipped (without `health_check`,
-/// or until the next check says otherwise).
+/// or until the next check says otherwise): the default `outlier_detection.ejection_time`.
 pub const FAIL_COOLDOWN: Duration = Duration::from_secs(10);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -151,8 +152,8 @@ pub struct Member {
 	pub total: AtomicU64,
 	/// What the last health check said (true without checks).
 	healthy: AtomicBool,
-	/// Skipped until then after refusing a connection.
-	failed_until: Mutex<Option<Instant>>,
+	/// Skipped while ejected by `outlier_detection` (by default after one refused connection).
+	pub ejection: Arc<Ejection>,
 }
 
 impl Member {
@@ -164,12 +165,12 @@ impl Member {
 			active: AtomicU64::new(0),
 			total: AtomicU64::new(0),
 			healthy: AtomicBool::new(true),
-			failed_until: Mutex::new(None),
+			ejection: Arc::default(),
 		}
 	}
 
 	pub fn is_up(&self) -> bool {
-		self.healthy.load(Ordering::Relaxed) && self.failed_until.lock().unwrap().is_none_or(|t| Instant::now() >= t)
+		self.healthy.load(Ordering::Relaxed) && !self.ejection.is_ejected()
 	}
 
 	pub fn healthy(&self) -> bool {
@@ -193,24 +194,91 @@ pub struct Pool {
 	events: Arc<watch::Sender<u64>>,
 	/// Whether target states are worth reporting (several targets or a health check).
 	pub reported: bool,
+	/// `outlier_detection` (the defaults without it); PATCH changes it in place.
+	outlier: RwLock<L4Outlier>,
 }
 
 impl Pool {
 	pub fn new(members: Vec<Arc<Member>>, balance: Balance, events: Arc<watch::Sender<u64>>, reported: bool) -> Pool {
-		Pool { members, balance, next: AtomicU64::new(0), events, reported }
+		Pool { members, balance, next: AtomicU64::new(0), events, reported, outlier: RwLock::new(L4Outlier::default()) }
+	}
+
+	pub fn with_outlier(self, outlier: L4Outlier) -> Pool {
+		self.set_outlier(outlier);
+		self
+	}
+
+	/// New settings for the next connections; the targets' counts and ejections stay.
+	pub fn set_outlier(&self, outlier: L4Outlier) {
+		*self.outlier.write().unwrap_or_else(|e| e.into_inner()) = outlier;
+	}
+
+	pub fn outlier(&self) -> L4Outlier {
+		*self.outlier.read().unwrap_or_else(|e| e.into_inner())
 	}
 
 	pub fn notify(&self) {
 		self.events.send_modify(|n| *n = n.wrapping_add(1));
 	}
 
-	/// A target refused a connection: skip it for a while.
-	pub fn mark_failed(&self, key: &Key, member: &Member, error: &str) {
+	/// A connection to `member` was made (or, with `short_lived`, lasted long
+	/// enough or was ended by the client): its run of failures ends.
+	pub fn succeeded(&self, member: &Member) {
+		member.ejection.record_l4(&self.outlier(), false);
+	}
+
+	/// A connection to `member` failed (`cause`: `connect`, `refused` for UDP's
+	/// ICMP, `short_lived`): after `consecutive_failures` in a row it is ejected,
+	/// unless that would eject more than `max_ejected_percent` of the targets.
+	/// A target failing while ejected (tried because every target is out) has
+	/// its ejection started over.
+	pub fn failed(&self, key: &Key, member: &Arc<Member>, cause: &'static str, error: &str) {
+		let cfg = self.outlier();
+		let ejection = &member.ejection;
+		let again = ejection.is_ejected();
+		if !again {
+			if !ejection.record_l4(&cfg, true) {
+				return;
+			}
+			let ejected = self.members.iter().filter(|m| m.ejection.is_ejected()).count();
+			if !cfg.ejecting.allows(ejected, self.members.len()) {
+				tracing::debug!(event = "target.eject_skipped", rule = %key, target = %member.spec.remote(), cause, ejected,
+					max_ejected_percent = cfg.ejecting.max_percent);
+				return;
+			}
+		}
 		let was_up = member.is_up();
-		*member.failed_until.lock().unwrap() = Some(Instant::now() + FAIL_COOLDOWN);
-		if was_up && self.members.len() > 1 {
-			warn!(event = "target.down", rule = %key, target = %member.spec.remote(), error = %error, reason = "connect");
+		let (length, until) = ejection.eject(&cfg.ejecting);
+		if was_up {
+			if self.reported {
+				warn!(event = "target.down", rule = %key, target = %member.spec.remote(), reason = "outlier", cause, error = %error,
+					ejection_secs = length.as_secs_f64(), ejections = ejection.ejections());
+			}
 			self.notify();
+		}
+		let (weak, events, key, reported) = (Arc::downgrade(member), self.events.clone(), *key, self.reported);
+		outlier::after(ejection, until, length, move || {
+			let Some(member) = weak.upgrade() else { return };
+			if member.healthy() {
+				if reported {
+					info!(event = "target.up", rule = %key, target = %member.spec.remote(), reason = "outlier");
+				}
+				events.send_modify(|n| *n = n.wrapping_add(1));
+			}
+		});
+	}
+
+	/// A relayed TCP connection to `member` ended after `lived`; `backend_first`:
+	/// the backend ended it. With `short_lived`, that is a failure when sooner.
+	pub fn ended(&self, key: &Key, member: &Arc<Member>, lived: Duration, backend_first: bool) {
+		let short = self.outlier().short_lived;
+		if short.is_zero() {
+			return;
+		}
+		if backend_first && lived < short {
+			self.failed(key, member, "short_lived", &format!("closed by the target after {} ms", lived.as_millis()));
+		} else {
+			self.succeeded(member);
 		}
 	}
 
@@ -294,8 +362,8 @@ impl Pool {
 				connections: m.active.load(Ordering::Relaxed),
 				total_connections: m.total.load(Ordering::Relaxed),
 				resolved: m.addrs.borrow().iter().map(|a| a.to_string()).collect(),
-				ejected_until: None,
-				ejections: None,
+				ejected_until: m.ejection.ejected_until(),
+				ejections: m.ejection.ejections(),
 			})
 			.collect()
 	}
@@ -312,12 +380,10 @@ pub struct TargetStatus {
 	pub connections: u64,
 	pub total_connections: u64,
 	pub resolved: Vec<String>,
-	/// Ejected by `outlier_detection` until then, in Unix seconds (#170, v0.4).
-	#[serde(skip_serializing_if = "Option::is_none")]
+	/// Ejected by `outlier_detection` until then, in Unix seconds; null when not (#170).
 	pub ejected_until: Option<u64>,
-	/// Times `outlier_detection` ejected the target (#170, v0.4).
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub ejections: Option<u64>,
+	/// Times `outlier_detection` ejected the target (#170).
+	pub ejections: u64,
 }
 
 /// A connection or session counted on a target while it lasts.
@@ -355,8 +421,8 @@ pub fn spawn_health_checks(key: Key, pool: Arc<Pool>, check: HealthCheckSpec, st
 					changed = true;
 					if up {
 						// a recovered target is used again at once
-						*m.failed_until.lock().unwrap() = None;
-						info!(event = "target.up", rule = %key, target = %m.spec.remote());
+						m.ejection.clear();
+						info!(event = "target.up", rule = %key, target = %m.spec.remote(), reason = "health_check");
 					} else {
 						warn!(event = "target.down", rule = %key, target = %m.spec.remote(), error = %why, reason = "health_check");
 					}
@@ -440,15 +506,48 @@ mod tests {
 	fn failover_uses_the_first_target_that_is_up() {
 		let p = pool(Balance::Failover, &[(1, 1, false), (2, 1, false), (3, 1, true)]);
 		assert!((0..4).all(|_| first(&p) == 1));
-		p.mark_failed(&key(), &p.members[0], "refused");
+		p.failed(&key(), &p.members[0], "connect", "refused");
 		assert_eq!(first(&p), 2);
 		p.members[1].healthy.store(false, Ordering::Relaxed);
 		assert_eq!(first(&p), 3, "the backup when every other target is down");
 		p.members[2].healthy.store(false, Ordering::Relaxed);
 		let order: Vec<u16> = p.order().iter().map(|m| m.spec.port).collect();
 		assert_eq!(order, vec![1, 2, 3], "all down: still tried in order");
-		*p.members[0].failed_until.lock().unwrap() = None;
+		p.members[0].ejection.clear();
 		assert_eq!(first(&p), 1, "back to the first once it is up again");
+	}
+
+	#[test]
+	fn outlier_detection_counts_failures_and_keeps_some_targets() {
+		let p = pool(Balance::RoundRobin, &[(1, 1, false), (2, 1, false), (3, 1, false), (4, 1, false)]).with_outlier(L4Outlier::new(Some(
+			&crate::core::outlier::L4OutlierSpec { consecutive_failures: Some(2), max_ejected_percent: Some(50), ..Default::default() },
+		)));
+		p.failed(&key(), &p.members[0], "connect", "refused");
+		assert!(p.members[0].is_up(), "one failure is not enough");
+		p.succeeded(&p.members[0]);
+		p.failed(&key(), &p.members[0], "connect", "refused");
+		assert!(p.members[0].is_up(), "the run started over");
+		p.failed(&key(), &p.members[0], "connect", "refused");
+		assert!(!p.members[0].is_up());
+		let status = p.status();
+		assert_eq!((status[0].ejections, status[0].ejected_until.is_some()), (1, true));
+		assert_eq!((status[1].ejections, status[1].ejected_until), (0, None));
+		for m in &p.members[1..] {
+			p.failed(&key(), m, "connect", "refused");
+			p.failed(&key(), m, "connect", "refused");
+		}
+		let up = p.members.iter().filter(|m| m.is_up()).count();
+		assert_eq!(up, 2, "max_ejected_percent: at most half of them");
+
+		// short_lived: a connection the target ended too soon
+		let p = pool(Balance::RoundRobin, &[(1, 1, false), (2, 1, false)])
+			.with_outlier(L4Outlier::new(Some(&crate::core::outlier::L4OutlierSpec { short_lived: Some("1s".into()), ..Default::default() })));
+		p.ended(&key(), &p.members[0], Duration::from_millis(10), false);
+		assert!(p.members[0].is_up(), "ended by the client");
+		p.ended(&key(), &p.members[0], Duration::from_secs(2), true);
+		assert!(p.members[0].is_up(), "long enough");
+		p.ended(&key(), &p.members[0], Duration::from_millis(10), true);
+		assert!(!p.members[0].is_up());
 	}
 
 	#[test]

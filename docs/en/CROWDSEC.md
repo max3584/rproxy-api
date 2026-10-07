@@ -107,6 +107,12 @@ rules:
 - If there is a CDN or load balancer in front, set `global.trusted_proxies`. The real IP from `X-Forwarded-For` is then used for `client` in the L7 log and for matching against decisions (L4 uses the connection's source IP).
 - `captcha` decisions are treated as bans. Only the `Ip` and `Range` scopes are used (`Country` and `AS` are not).
 
+### Pairing with GeoIP (v0.4, #168)
+
+What should never get in by country or ASN can be dropped by rproxy's `geoip` (a rule's `geoip`, the L7 `geoip` middleware; an mmdb such as GeoLite2 in `global.geoip`), leaving behaviour to CrowdSec. The order is `allow_from` → `geoip` → `crowdsec`. Connections refused by `geoip` log `conn.denied` (`reason: geoip`, `country`, `asn`), requests `http.access` (`refused_by: geoip`). The parser puts `reason` into `rproxy_reason`, so scenarios can leave `geoip` out or count it (the bundled scenario counts `allow_from` only).
+
+CrowdSec can add the country itself with `crowdsecurity/geoip-enrich` (using the same GeoLite2). rproxy's `global.geoip.log_country: true` adds `country` and `asn` to `conn.open` and `http.access`, for reading rproxy's logs without CrowdSec, e.g. in a SIEM. Both can use the same database files updated by `geoipupdate` (rproxy reads a changed file again every `check_interval`).
+
 ## 4. How CI verifies it
 
 `scripts/interop/crowdsec.sh` installs CrowdSec (LAPI, agent, AppSec) from the official packages on a GitHub Ubuntu runner and, from clients in network namespaces going through rproxy, verifies the following:
