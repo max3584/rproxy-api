@@ -147,6 +147,8 @@ pub struct Features {
 	pub http_options: &'static [&'static str],
 	/// `targets` and `balance` of `tls.routes[]` (#234)
 	pub tls_route_targets: bool,
+	/// Modes of `tls.client_auth` that can run (`optional_no_verify`, #238)
+	pub client_auth_modes: &'static [&'static str],
 	// v0.4 (docs/DESIGN-v0.4.md)
 	/// `PUT /rulesets/{name}` and the other rule set endpoints (#28)
 	pub rulesets: bool,
@@ -201,6 +203,7 @@ impl Features {
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
 		tls_route_targets: true,
+		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
 		labels: true,
 		conditions: true,
@@ -235,6 +238,7 @@ impl Features {
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
 		tls_route_targets: true,
+		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
 		labels: true,
 		conditions: true,
@@ -293,6 +297,10 @@ impl Features {
 		}
 		if !self.tls_route_targets && tls.routes.iter().any(|r| !r.targets.is_empty()) {
 			return missing("targets of tls.routes");
+		}
+		let mode = serde_json::to_value(tls.client_auth.mode).ok();
+		if let Some(m) = mode.as_ref().and_then(|v| v.as_str()).filter(|m| !self.client_auth_modes.contains(m)) {
+			return missing(&format!("tls.client_auth.mode {m}"));
 		}
 		Ok(())
 	}

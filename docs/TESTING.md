@@ -117,6 +117,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `bad_tls_settings_are_reported` | 読めないファイル、証明書なしの terminate、未知の mode、UDP の sni を拒否し、何も残らない |
 | `reload_picks_up_renewed_certificates_and_patch_changes_tls` | 証明書ファイルを差し替えて再読込すると新しい証明書が使われる。PATCH で passthrough に戻せる |
 | `terminate_does_not_stall_under_backpressure` | クライアントの送信バッファを小さくして、終端したルールで 1 MiB の往復を 16 回。どの回も全部のバイトが壊れずに返る（#187） |
+| `optional_no_verify_lets_any_client_certificate_in` | `client_auth.mode: optional_no_verify`（#238）：正しい CA・別の CA・証明書なしのどのクライアントも通る（`ca_file` ありとなし）。`optional` に `ca_file` がなければ `tls_config`。`features.client_auth_modes` |
 | `a_tls_route_spreads_over_several_targets` | `tls.routes` の `targets`（#234）：重みどおりに配り、つながらない宛先は飛ばす。`balance: failover`。`remote_addr` と `targets` の両方・どちらもなし・`targets` なしの `balance` は `tls_config` |
 
 ## 結合テスト：多段の CA（`tests/chain.rs`）
@@ -333,7 +334,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc` |
 | `tests/http_resilience.rs` | ヘルスチェック・`sticky`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・転送先の接続の使い回し（#61・#63・#64・#65） |
 | `tests/http_semantics.rs` | HTTP の転送の約束（docs/API.md の「HTTP の転送の扱い」）：クッキー・繰り返しのフィールド・hop-by-hop・本文・大きなヘッダ・時間切れを HTTP/1.1・HTTP/2・HTTP/3 のクライアントで。HTTP/2 の転送先（#233）：h2c の 1 本の接続の多重化、トレーラーの両方向（gRPC の trailers-only の応答を含む）、`te: trailers`、h2（TLS + ALPN）・`auto`（`h2` / `http/1.1` のどちらを選ぶ転送先でも）・`h2` を選ばない転送先は 502、`protocol` と URL のスキームの組み合わせ |
-| `tests/gateway_l7.rs` | Gateway API 向けの L7（#224・#226〜#232・#235）：`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`（504、送信ごと、本文の途中で切る）、`replace_host`、転送先ごとのミドルウェア、`cors`（プリフライト・ワイルドカードのオリジン）、`retry` の `status`、`mirror`（割合・本文・つながらないミラー）、`status` の転送先、`features` |
+| `tests/gateway_l7.rs` | Gateway API 向けの L7（#224・#226〜#232・#235）：`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`（504、送信ごと、本文の途中で切る）、`replace_host`、転送先ごとのミドルウェア、`cors`（プリフライト・ワイルドカードのオリジン）、`retry` の `status`、`mirror`（割合・本文・つながらないミラー）、`status` の転送先、`features`。許さないオリジンのプリフライトに rproxy が答える・転送先が 1 つでも `retry` が送り直す、クライアント証明書の `X-Client-Verify`・`X-Forwarded-Client-Cert`（`optional_no_verify`、偽のヘッダは消す）（#238） |
 | `tests/backend_tls.rs` | サービスの `tls`（#236）：サービスの CA・SNI の名前、`subject_alt_names`（DNS 名・URI）、転送先へのクライアント証明書、平文の HTTP のルールからの `https://` の転送先、形とファイルの誤り |
 | `tests/crowdsec.rs` | `crowdsec` ミドルウェア（偽の LAPI と AppSec） |
 | `tests/acme.rs` | ACME（#208）：API の守り（いつも動く）と、Pebble・PowerDNS で実際に証明書を取る（上の表） |

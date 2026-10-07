@@ -156,7 +156,8 @@
             "enum": [
               "none",
               "optional",
-              "required"
+              "required",
+              "optional_no_verify"
             ]
           },
           "ca_file": {
@@ -1876,6 +1877,13 @@
               },
               "tls_route_targets": {
                 "type": "boolean"
+              },
+              "client_auth_modes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "modes of tls.client_auth that can run (optional_no_verify, #238)"
               },
               "rulesets": {
                 "type": "boolean"

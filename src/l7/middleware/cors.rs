@@ -95,15 +95,20 @@ impl Cors {
 		}
 	}
 
-	/// A preflight from an allowed origin gets its answer here.
+	/// A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is
+	/// answered here: with the CORS headers for an allowed origin, without any for
+	/// another one (#238; it never reaches the backend, which could allow it).
 	pub fn on_request(&self, parts: &Parts, origin: Option<&HeaderValue>) -> Option<Response<Body>> {
-		if parts.method != Method::OPTIONS {
+		if parts.method != Method::OPTIONS || origin.is_none() {
 			return None;
 		}
 		let requested = parts.headers.get(header::ACCESS_CONTROL_REQUEST_METHOD)?;
-		let allow = self.allow_origin(origin)?;
 		let mut resp = Response::new(Full::new(Bytes::new()).map_err(|never| match never {}).boxed());
 		*resp.status_mut() = StatusCode::NO_CONTENT;
+		let Some(allow) = self.allow_origin(origin) else {
+			resp.headers_mut().insert(header::VARY, HeaderValue::from_static("Origin"));
+			return Some(resp);
+		};
 		let h = resp.headers_mut();
 		self.common(h, allow);
 		if self.any_method {
@@ -202,7 +207,12 @@ mod tests {
 		assert_eq!(h["access-control-max-age"], "3600");
 		assert_eq!(h["access-control-allow-credentials"], "true");
 		let p = preflight("https://foobar.com", "GET", None);
-		assert!(c.on_request(&p, p.headers.get("origin")).is_none(), "not allowed: to the backend");
+		let r = c.on_request(&p, p.headers.get("origin")).expect("answered by rproxy, not the backend (#238)");
+		assert_eq!(r.status(), 204);
+		assert!(!r.headers().contains_key("access-control-allow-origin") && !r.headers().contains_key("access-control-allow-methods"));
+		let mut no_origin = preflight("https://foobar.com", "GET", None);
+		no_origin.headers.remove("origin");
+		assert!(c.on_request(&no_origin, None).is_none(), "OPTIONS without Origin is not a CORS preflight");
 		let mut resp = HeaderMap::new();
 		c.on_response(&mut resp, Some(&hv("https://foobar.com")));
 		assert!(resp.is_empty());

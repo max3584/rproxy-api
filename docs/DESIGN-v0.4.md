@@ -575,3 +575,5 @@ rproxy-gateway v0.4.0 で Gateway API のすべての機能（conformance の ex
 - HTTP/2 の転送先は転送先ごとに 1 本の接続（h2 の多重化）。`auto` は ALPN の結果を転送先ごとに覚える。HTTP/2 の転送先への Upgrade は 502（extended CONNECT はしない）。
 - サービスの `tls` はルールの `tls.upstream` と項目ごとに混ぜない（BackendTLSPolicy はサービスごとに完結するため）。`subject_alt_names` は DNS 名と URI（SPIFFE）を確かめる自前の検証器（チェーンと期限は rustls の webpki の関数）。
 - 固定の状態コードの転送先（#235）は `servers[]` の `url` の代わりの `status`（別の種類のサービスにしない。重みの割合をそのまま使えるため）。
+- conformance で分かった直し（#238）：許さないオリジンの CORS のプリフライトは転送先へ送らず rproxy が 204（CORS のヘッダなし）で答える（転送先が独自に許してしまうのを防ぐ。Gateway API の試験もこれを求める）。`retry` の送り直しは `balance` で選び直すので、転送先が 1 つでも同じ転送先へ送り直す（これは前から。conformance で落ちた原因は rproxy ではなく、試験の環境の Gateway API の CRD が standard のチャンネルで、experimental の `retry` が消されていたこと）。
+- `tls.client_auth.mode: optional_no_verify`（#238、Gateway API の `AllowInsecureFallback`）：証明書を求めるが、なくても検証に通らなくても受ける。鍵を持っていることだけはハンドシェイクで確かめ、結果は `X-Client-Verify`（nginx の値）・`X-Forwarded-Client-Cert`（Envoy の形）・アクセスログ・PROXY v2 の `verify` で転送先に任せる。転送先へのヘッダは `client_auth` のあるルールでだけ付け、クライアントが送った同じ名前のヘッダは消す。`features.client_auth_modes`。

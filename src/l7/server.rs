@@ -311,7 +311,19 @@ pub(super) struct Conn {
 	h3: bool,
 }
 
+/// `X-Forwarded-Client-Cert` (Envoy's form): `Hash=<SHA-256 hex>;Subject="<RFC 4514>"`.
+fn xfcc(t: &TlsInfo) -> Option<HeaderValue> {
+	let hash = t.client_sha256.as_ref()?;
+	let subject = t.client_subject.as_deref().unwrap_or("").replace('\\', "\\\\").replace('"', "\\\"");
+	HeaderValue::from_str(&format!("Hash={hash};Subject=\"{subject}\"")).ok()
+}
+
 impl Conn {
+	/// The rule asks clients for certificates (`tls.client_auth`, any mode).
+	fn client_auth(&self) -> bool {
+		self.tls.is_some() && self.rt.tls().spec.client_auth.mode != crate::tls::config::ClientAuthMode::None
+	}
+
 	pub(super) fn new(rt: Arc<Runtime>, client: SocketAddr, local: SocketAddr, tls: Option<TlsInfo>, h3: bool) -> Self {
 		Conn { rt, client, local, https: tls.is_some(), tls, h3 }
 	}
@@ -540,6 +552,8 @@ impl Conn {
 				user_agent: header_text(header::USER_AGENT),
 				sni: self.tls.as_ref().and_then(|t| t.server_name.clone()).unwrap_or_default(),
 				tls_version: self.tls.as_ref().and_then(|t| t.version.clone()).unwrap_or_default(),
+				client_cn: self.tls.as_ref().filter(|_| self.client_auth()).and_then(|t| t.client_cn.clone()).unwrap_or_default(),
+				client_verify: self.tls.as_ref().filter(|_| self.client_auth()).map(|t| t.client_verify().to_string()).unwrap_or_default(),
 				..Default::default()
 			}
 		} else {
@@ -960,6 +974,17 @@ impl Conn {
 		}
 		if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
 			parts.headers.insert(HeaderName::from_static("x-real-ip"), v);
+		}
+		// client certificates (#238): what rproxy saw replaces anything the client sent
+		if self.client_auth() {
+			parts.headers.remove("x-forwarded-client-cert");
+			parts.headers.remove("x-client-verify");
+			if let Some(t) = &self.tls {
+				parts.headers.insert(HeaderName::from_static("x-client-verify"), HeaderValue::from_static(t.client_verify()));
+				if let Some(v) = xfcc(t) {
+					parts.headers.insert(HeaderName::from_static("x-forwarded-client-cert"), v);
+				}
+			}
 		}
 		set(&mut parts.headers, "x-forwarded-proto", if self.https { "https" } else { "http" });
 		set(&mut parts.headers, "x-forwarded-port", &self.local.port().to_string());

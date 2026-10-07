@@ -453,15 +453,15 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 	})?;
 
 	let (_, conn) = session.get_ref();
-	let peer_cert = conn.peer_certificates().and_then(|c| c.first()).map(|c| c.as_ref().to_vec());
+	let chain = conn.peer_certificates().unwrap_or(&[]);
 	let info = TlsInfo {
 		server_name: conn.server_name().map(str::to_string),
 		alpn: conn.alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
 		version: conn.protocol_version().map(|v| format!("{v:?}")),
 		cipher: conn.negotiated_cipher_suite().map(|s| format!("{:?}", s.suite())),
-		client_cn: peer_cert.as_deref().and_then(crate::tls::config::common_name),
-		client_cert: peer_cert.is_some(),
-	};
+		..Default::default()
+	}
+	.with_client(chain, rt.tls().client_verified(chain));
 	Ok((session, info))
 }
 
@@ -544,7 +544,7 @@ async fn terminate(
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr,
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
-		client_cn = info.client_cn.as_deref().unwrap_or(""), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
+		client_cn = info.client_cn.as_deref().unwrap_or(""), client_verify = info.client_verify(), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
 		country = detail.country(), asn = detail.asn());
 	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);

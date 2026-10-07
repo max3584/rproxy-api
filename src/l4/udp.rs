@@ -637,6 +637,8 @@ async fn dtls_session(
 		return;
 	}
 	let client_cn = state.peer_certificates.first().and_then(|c| crate::tls::config::common_name(c));
+	let chain: Vec<rustls::pki_types::CertificateDer<'_>> = state.peer_certificates.iter().map(|c| rustls::pki_types::CertificateDer::from(c.as_slice())).collect();
+	let client_verify = source::TlsInfo::default().with_client(&chain, tls.client_verified(&chain)).client_verify();
 
 	let Some(target) = rt.select(None, offset) else {
 		let _ = dtls.close().await;
@@ -676,7 +678,7 @@ async fn dtls_session(
 
 	rt.stats.opened();
 	info!(event = "conn.open", rule = %rt.key, listen = %listen, client = %client, target = %addr, dtls = true,
-		client_cn = client_cn.as_deref().unwrap_or(""), upstream_dtls = tls.spec.upstream.tls);
+		client_cn = client_cn.as_deref().unwrap_or(""), client_verify, upstream_dtls = tls.spec.upstream.tls);
 
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
