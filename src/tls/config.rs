@@ -138,6 +138,11 @@ pub enum ClientAuthMode {
 	Optional,
 	/// Reject clients without a valid certificate (mTLS).
 	Required,
+	/// Ask for a client certificate but accept the connection without one or with
+	/// one that does not verify (the Gateway API's `AllowInsecureFallback`). The
+	/// result is only told onwards (logs, PROXY v2, `X-Client-Verify`); the backend
+	/// must decide. Not for authentication by rproxy.
+	OptionalNoVerify,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,8 +319,11 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 	{
 		return Err(tls_error("client_auth, upstream and alpn are only used with mode terminate"));
 	}
-	if tls.client_auth.mode != ClientAuthMode::None && tls.client_auth.ca_file.is_none() {
+	if matches!(tls.client_auth.mode, ClientAuthMode::Optional | ClientAuthMode::Required) && tls.client_auth.ca_file.is_none() {
 		return Err(tls_error("client_auth needs ca_file"));
+	}
+	if tls.client_auth.chain_file.is_some() && tls.client_auth.ca_file.is_none() {
+		return Err(tls_error("client_auth chain_file needs ca_file"));
 	}
 	if tls.client_auth.mode == ClientAuthMode::None && tls.client_auth.chain_file.is_some() {
 		return Err(tls_error("client_auth chain_file needs mode optional or required"));
@@ -894,6 +902,11 @@ impl ClientCertVerifier for WithIntermediates {
 /// Client certificate verification for TLS and DTLS alike: the root(s) in
 /// `ca_file` are the only trust anchors; `chain_file` fills in intermediates.
 fn client_verifier(auth: &ClientAuth, loaded: &RuleCerts) -> Result<Option<Arc<dyn ClientCertVerifier>>, ApiError> {
+	if auth.mode == ClientAuthMode::OptionalNoVerify {
+		// any certificate (or none) is let in; `client_check` tells whether it verifies
+		let check = client_check(auth, loaded)?;
+		return Ok(Some(Arc::new(AnyClientCert { check, provider: provider() })));
+	}
 	let (mode, Some(ca), Some(bundle)) = (auth.mode, &auth.ca_file, &loaded.client_ca) else { return Ok(None) };
 	if mode == ClientAuthMode::None {
 		return Ok(None);
@@ -903,6 +916,57 @@ fn client_verifier(auth: &ClientAuth, loaded: &RuleCerts) -> Result<Option<Arc<d
 	let inner = builder.build().map_err(|e| tls_error(format!("{ca}: {e}")))?;
 	let extra = loaded.client_chain.as_ref().map(|b| b.certs.clone()).unwrap_or_default();
 	Ok(Some(Arc::new(WithIntermediates { inner, extra })))
+}
+
+/// `optional_no_verify`: the verifier of `ca_file` (if any) that judges a presented
+/// certificate after the handshake, without refusing anyone.
+fn client_check(auth: &ClientAuth, loaded: &RuleCerts) -> Result<Option<Arc<dyn ClientCertVerifier>>, ApiError> {
+	let (Some(ca), Some(bundle)) = (&auth.ca_file, &loaded.client_ca) else { return Ok(None) };
+	let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(bundle.roots(ca)?), provider())
+		.allow_unauthenticated()
+		.build()
+		.map_err(|e| tls_error(format!("{ca}: {e}")))?;
+	let extra = loaded.client_chain.as_ref().map(|b| b.certs.clone()).unwrap_or_default();
+	Ok(Some(Arc::new(WithIntermediates { inner, extra })))
+}
+
+/// `optional_no_verify` (#238): asks for a client certificate and takes any, or
+/// none. The client still has to prove it holds the certificate's key (the
+/// handshake signature is checked); the chain is judged by `client_check`.
+#[derive(Debug)]
+struct AnyClientCert {
+	check: Option<Arc<dyn ClientCertVerifier>>,
+	provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ClientCertVerifier for AnyClientCert {
+	fn offer_client_auth(&self) -> bool {
+		true
+	}
+
+	fn client_auth_mandatory(&self) -> bool {
+		false
+	}
+
+	fn root_hint_subjects(&self) -> &[DistinguishedName] {
+		self.check.as_ref().map(|c| c.root_hint_subjects()).unwrap_or(&[])
+	}
+
+	fn verify_client_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
+		Ok(ClientCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+	}
+
+	fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.provider.signature_verification_algorithms.supported_schemes()
+	}
 }
 
 /// Accepts any backend certificate (`insecure_skip_verify`).
@@ -1048,6 +1112,8 @@ pub struct TlsRuntime {
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
 	dtls_upstream_cert: Option<dtls::crypto::Certificate>,
+	/// `optional_no_verify`: judges presented client certificates (`client_verified`).
+	client_check: Option<Arc<dyn ClientCertVerifier>>,
 }
 
 impl TlsRuntime {
@@ -1080,9 +1146,13 @@ impl TlsRuntime {
 			dtls_client_verifier: None,
 			dtls_upstream_roots: None,
 			dtls_upstream_cert: None,
+			client_check: None,
 		};
 		if spec.mode != TlsMode::Terminate {
 			return Ok(rt);
+		}
+		if spec.client_auth.mode == ClientAuthMode::OptionalNoVerify {
+			rt.client_check = client_check(&spec.client_auth, loaded)?;
 		}
 		let now = unix_now();
 		match protocol {
@@ -1137,7 +1207,7 @@ impl TlsRuntime {
 		use dtls::config::ClientAuthType;
 		let client_auth = match self.spec.client_auth.mode {
 			ClientAuthMode::None => ClientAuthType::NoClientCert,
-			ClientAuthMode::Optional => ClientAuthType::RequestClientCert,
+			ClientAuthMode::Optional | ClientAuthMode::OptionalNoVerify => ClientAuthType::RequestClientCert,
 			ClientAuthMode::Required => ClientAuthType::RequireAnyClientCert,
 		};
 		dtls::config::Config {
@@ -1146,6 +1216,17 @@ impl TlsRuntime {
 			extended_master_secret: dtls::config::ExtendedMasterSecretType::Require,
 			..Default::default()
 		}
+	}
+
+	/// Whether a client's certificate chain (leaf first) verified: with
+	/// `optional_no_verify` judged against `ca_file` now (false without one);
+	/// with the other modes the handshake already did (any chain there verified).
+	pub fn client_verified(&self, chain: &[CertificateDer<'_>]) -> bool {
+		let Some((leaf, rest)) = chain.split_first() else { return false };
+		if self.spec.client_auth.mode != ClientAuthMode::OptionalNoVerify {
+			return true;
+		}
+		self.client_check.as_ref().is_some_and(|c| c.verify_client_cert(leaf, rest, UnixTime::now()).is_ok())
 	}
 
 	/// Checks a DTLS client's certificate chain the same way TLS does.

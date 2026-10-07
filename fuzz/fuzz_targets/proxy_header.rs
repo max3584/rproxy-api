@@ -104,11 +104,14 @@ fn check_v2(h: &[u8], src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, d
 	let ssl = find(0x20).expect("PP2_TYPE_SSL");
 	assert!(ssl.len() >= 5);
 	assert_eq!(ssl[0], 0x01 | if info.client_cert { 0x02 } else { 0 }, "PP2_CLIENT_SSL / CERT_CONN");
-	assert_eq!(ssl[1..5], [0, 0, 0, 0], "verify");
+	// 1 only for a certificate that did not verify (client_auth optional_no_verify, #238)
+	let verify = u32::from(info.client_cert && !info.client_verified);
+	assert_eq!(ssl[1..5], verify.to_be_bytes(), "verify");
 	let sub = tlvs(&ssl[5..]);
 	let find = |kind: u8| sub.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
 	assert_eq!(find(0x21), info.version.as_deref().map(str::as_bytes), "PP2_SUBTYPE_SSL_VERSION");
-	assert_eq!(find(0x22), info.client_cn.as_deref().map(str::as_bytes), "PP2_SUBTYPE_SSL_CN");
+	let cn = info.client_cn.as_deref().filter(|_| !info.client_cert || info.client_verified);
+	assert_eq!(find(0x22), cn.map(str::as_bytes), "PP2_SUBTYPE_SSL_CN (left out when not verified)");
 }
 
 fn run(u: &mut Unstructured) -> Result<()> {
@@ -123,6 +126,8 @@ fn run(u: &mut Unstructured) -> Result<()> {
 		cipher: text(u, 64)?,
 		client_cn: text(u, 256)?,
 		client_cert: u.arbitrary()?,
+		client_verified: u.arbitrary()?,
+		..Default::default()
 	};
 	check_v1(&proxy_v1_header(src, dst), src, dst);
 	check_v2(&proxy_v2_header(src, dst), src, dst, None, false);

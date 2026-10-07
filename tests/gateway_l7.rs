@@ -311,8 +311,9 @@ async fn cors_answers_preflights_and_marks_responses() {
 	assert!(seen.lock().unwrap().is_empty(), "answered by rproxy");
 
 	let (status, headers, _) = send(preflight("https://foobar.com")).await;
-	assert_eq!(status, 200, "a preflight of another origin goes to the backend");
+	assert_eq!(status, 204, "a preflight of another origin is answered by rproxy (#238)");
 	assert!(!headers.contains_key("access-control-allow-origin"));
+	assert!(seen.lock().unwrap().is_empty(), "and never reaches the backend");
 
 	let (status, headers, _) = send(client().get(&url).header("origin", "https://www.foo.com")).await;
 	assert_eq!(status, 200);
@@ -344,7 +345,7 @@ async fn retry_on_the_statuses_given() {
 	)
 	.await;
 	let base = format!("http://127.0.0.1:{port}");
-	assert_eq!(send(client().get(format!("{base}/r3/fail/a/2/500"))).await.0, 200, "succeeds on the third attempt");
+	assert_eq!(send(client().get(format!("{base}/r3/fail/a/2/500"))).await.0, 200, "succeeds on the third attempt, sent to the only server again (#238)");
 	assert_eq!(send(client().get(format!("{base}/r3/fail/b/3/503"))).await.0, 503, "the last attempt's answer");
 	assert_eq!(send(client().get(format!("{base}/r3/fail/c/1/501"))).await.0, 501, "501 is not retried");
 	assert_eq!(send(client().get(format!("{base}/plain/fail/d/1/500"))).await.0, 500, "without status, 5xx answers are not retried");
@@ -478,4 +479,107 @@ async fn capabilities_list_the_gateway_features() {
 		json!(["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status"])
 	);
 	assert_eq!(f["tls_route_targets"], true);
+}
+
+/// An HTTPS request (HTTP/1.1) with an optional client certificate; the backend's JSON.
+async fn tls_get(pki: &common::pki::Pki, port: u16, client: Option<&common::pki::Issued>, extra: &str) -> Value {
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let mut s = pki.connector_alpn(client, &["http/1.1"]).connect("a.test".to_string().try_into().unwrap(), tcp).await.unwrap();
+	s.write_all(format!("GET /x HTTP/1.1\r\nHost: a.test\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+	let mut out = vec![];
+	let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+	let text = String::from_utf8_lossy(&out);
+	let body = &text[text.find('{').expect(&text)..=text.rfind('}').unwrap()];
+	serde_json::from_str(body).unwrap()
+}
+
+#[tokio::test]
+async fn client_certificates_are_told_to_the_backend() {
+	// #238: optional_no_verify (AllowInsecureFallback) lets everyone in and says what it saw
+	let pki = common::pki::Pki::new("gw-xfcc");
+	let cert = pki.server("front", &["a.test"]);
+	let alice = pki.client("alice", "alice");
+	let other = common::pki::Pki::new("gw-xfcc-other");
+	let mallory = other.client("mallory", "mallory");
+	let h = harness().await;
+	let (b, _) = backend("b").await;
+	let (auth, auth_seen) = backend("auth").await;
+	let (shadow, shadow_seen) = backend("shadow").await;
+	let port = free_port();
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"tls": {"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}],
+				"client_auth": {"mode": "optional_no_verify", "ca_file": pki.ca_file}},
+			"http": {
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "service": "b", "middlewares": ["fa", "copy"]}],
+				"services": {"b": {"servers": [{"url": format!("http://{b}")}]}, "shadow": {"servers": [{"url": format!("http://{shadow}")}]}},
+				"middlewares": {"fa": {"forward_auth": {"address": format!("http://{auth}/check")}}, "copy": {"mirror": {"service": "shadow"}}},
+			}}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let v = tls_get(&pki, port, Some(&alice), "X-Client-Verify: SUCCESS\r\nX-Forwarded-Client-Cert: Hash=forged\r\n").await;
+	assert_eq!(header(&v, "x-client-verify"), ["SUCCESS"]);
+	let xfcc = header(&v, "x-forwarded-client-cert");
+	assert_eq!(xfcc.len(), 1);
+	assert!(xfcc[0].starts_with("Hash=") && xfcc[0].contains("Subject=\"CN=alice\"") && !xfcc[0].contains("forged"), "{xfcc:?}");
+	// the auth server and the mirror see what rproxy saw, never the client's claim
+	let auth_got = auth_seen.lock().unwrap().last().unwrap().1.clone();
+	assert_eq!(auth_got["x-client-verify"], ["SUCCESS"]);
+	assert!(!auth_got["x-forwarded-client-cert"][0].contains("forged"));
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while shadow_seen.lock().unwrap().is_empty() {
+		assert!(Instant::now() < deadline, "no mirror copy");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	let copy = shadow_seen.lock().unwrap()[0].1.clone();
+	assert_eq!((copy["x-client-verify"].clone(), copy["x-forwarded-for"].clone()), (vec!["SUCCESS".to_string()], vec!["127.0.0.1".to_string()]));
+	assert_eq!(copy["x-forwarded-client-cert"], xfcc.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+	let v = tls_get(&pki, port, Some(&mallory), "").await;
+	assert_eq!(header(&v, "x-client-verify"), ["FAILED"], "another CA's certificate gets in, marked");
+	let xfcc = header(&v, "x-forwarded-client-cert");
+	assert!(xfcc[0].starts_with("Hash=") && !xfcc[0].contains("mallory"), "no subject of a certificate that did not verify: {xfcc:?}");
+	let v = tls_get(&pki, port, None, "X-Client-Verify: SUCCESS\r\n").await;
+	assert_eq!(header(&v, "x-client-verify"), ["NONE"], "a forged header is replaced");
+	assert!(header(&v, "x-forwarded-client-cert").is_empty());
+}
+
+#[tokio::test]
+async fn client_certificate_headers_cannot_be_forged_where_no_client_auth_applies() {
+	// security review H1 / M5: plain HTTP rules, forward_auth, mirror and upgrades drop them too
+	let h = harness().await;
+	let (b, main_seen) = backend("b").await;
+	let (auth, auth_seen) = backend("auth").await;
+	let (shadow, shadow_seen) = backend("shadow").await;
+	let port = rule(
+		&h,
+		json!({
+			"routes": [{"name": "r", "match": "PathPrefix(`/`)", "service": "b", "middlewares": ["fa", "copy"]}],
+			"services": {"b": {"servers": [{"url": format!("http://{b}")}]}, "shadow": {"servers": [{"url": format!("http://{shadow}")}]}},
+			"middlewares": {"fa": {"forward_auth": {"address": format!("http://{auth}/check")}}, "copy": {"mirror": {"service": "shadow"}}},
+		}),
+	)
+	.await;
+	let forged = "X-Client-Verify: SUCCESS\r\nX-Forwarded-Client-Cert: Hash=00;Subject=\"CN=admin\"\r\nX-Forwarded-For: 6.6.6.6\r\nX-Real-IP: 6.6.6.6\r\n";
+	for upgrade in ["", "Connection: Upgrade\r\nUpgrade: websocket\r\n"] {
+		let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		s.write_all(format!("GET /x HTTP/1.1\r\nHost: a.test\r\n{forged}{upgrade}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+		let mut out = vec![];
+		let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+	}
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while shadow_seen.lock().unwrap().len() < 2 {
+		assert!(Instant::now() < deadline, "mirror copies missing");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	for (who, seen) in [("backend", &main_seen), ("forward_auth", &auth_seen), ("mirror", &shadow_seen)] {
+		let seen = seen.lock().unwrap();
+		assert_eq!(seen.len(), 2, "{who}");
+		for (_, headers) in seen.iter() {
+			assert!(!headers.contains_key("x-client-verify") && !headers.contains_key("x-forwarded-client-cert"), "{who}: {headers:?}");
+			if who != "forward_auth" {
+				assert_eq!(headers["x-forwarded-for"], ["127.0.0.1"], "{who}: the forged chain is replaced");
+				assert_eq!(headers["x-real-ip"], ["127.0.0.1"], "{who}");
+			}
+		}
+	}
 }

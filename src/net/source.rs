@@ -1,6 +1,7 @@
 //! Passing the client's address on to the backend: PROXY protocol headers and
 //! IP_TRANSPARENT sockets.
 
+use sha2::Digest;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -36,10 +37,39 @@ pub struct TlsInfo {
 	pub version: Option<String>,
 	/// Negotiated cipher suite (logs only), e.g. `TLS13_AES_128_GCM_SHA256`.
 	pub cipher: Option<String>,
-	/// Common name of a verified client certificate.
+	/// Common name of the client certificate (verified unless `client_verified` is
+	/// false: `client_auth.mode: optional_no_verify`).
 	pub client_cn: Option<String>,
-	/// The client sent a certificate (it was verified, or the handshake would have failed).
+	/// The client sent a certificate.
 	pub client_cert: bool,
+	/// That certificate verified against `client_auth.ca_file` (always with the modes
+	/// `optional` / `required`, whose handshake refuses others; #238).
+	pub client_verified: bool,
+	/// Subject (RFC 4514) and SHA-256 (hex) of the client certificate, for `X-Forwarded-Client-Cert`.
+	pub client_subject: Option<String>,
+	pub client_sha256: Option<String>,
+}
+
+impl TlsInfo {
+	/// Fills in the client certificate fields from the chain the client sent (leaf first).
+	pub fn with_client(mut self, chain: &[rustls::pki_types::CertificateDer<'_>], verified: bool) -> Self {
+		let Some(leaf) = chain.first() else { return self };
+		self.client_cert = true;
+		self.client_verified = verified;
+		self.client_cn = crate::tls::config::common_name(leaf.as_ref());
+		self.client_subject = x509_parser::parse_x509_certificate(leaf.as_ref()).ok().map(|(_, c)| c.subject().to_string());
+		self.client_sha256 = Some(sha2::Sha256::digest(leaf.as_ref()).iter().map(|b| format!("{b:02x}")).collect());
+		self
+	}
+
+	/// `SUCCESS`, `FAILED` (a certificate that did not verify) or `NONE` (as nginx's `$ssl_client_verify`).
+	pub fn client_verify(&self) -> &'static str {
+		match (self.client_cert, self.client_verified) {
+			(false, _) => "NONE",
+			(true, true) => "SUCCESS",
+			(true, false) => "FAILED",
+		}
+	}
 }
 
 const PP2_TYPE_ALPN: u8 = 0x01;
@@ -65,11 +95,14 @@ fn tls_tlvs(info: &TlsInfo) -> Vec<u8> {
 		tlv(&mut out, PP2_TYPE_AUTHORITY, name.as_bytes());
 	}
 	let mut ssl = vec![PP2_CLIENT_SSL | if info.client_cert { PP2_CLIENT_CERT_CONN } else { 0 }];
-	ssl.extend_from_slice(&0u32.to_be_bytes()); // verify: 0 = verified (or no certificate)
+	// verify: 0 = verified (or no certificate); 1 = a certificate that did not verify (optional_no_verify)
+	let verify: u32 = if info.client_cert && !info.client_verified { 1 } else { 0 };
+	ssl.extend_from_slice(&verify.to_be_bytes());
 	if let Some(version) = &info.version {
 		tlv(&mut ssl, PP2_SUBTYPE_SSL_VERSION, version.as_bytes());
 	}
-	if let Some(cn) = &info.client_cn {
+	// the CN of a certificate that did not verify (optional_no_verify) could be anything: left out
+	if let Some(cn) = info.client_cn.as_ref().filter(|_| !info.client_cert || info.client_verified) {
 		tlv(&mut ssl, PP2_SUBTYPE_SSL_CN, cn.as_bytes());
 	}
 	tlv(&mut out, PP2_TYPE_SSL, &ssl);
@@ -292,8 +325,17 @@ mod tests {
 			cipher: None,
 			client_cn: Some("alice".into()),
 			client_cert: true,
+			client_verified: true,
+			..Default::default()
 		};
 		let h = proxy_v2_header_with("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), Some(&info));
+		assert_eq!(&h[47..51], &[0, 0, 0, 0], "verified");
+		let unverified = TlsInfo { client_verified: false, ..info.clone() };
+		let u = proxy_v2_header_with("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), Some(&unverified));
+		assert_eq!(&u[47..51], &[0, 0, 0, 1], "optional_no_verify: a certificate that did not verify (#238)");
+		assert_eq!(unverified.client_verify(), "FAILED");
+		assert!(!u.windows(5).any(|w| w == b"alice"), "no unverified CN in the TLV");
+		assert_eq!(TlsInfo::default().client_verify(), "NONE");
 		let len = u16::from_be_bytes([h[14], h[15]]) as usize;
 		assert_eq!(h.len(), 16 + len);
 		let tlvs = &h[28..];

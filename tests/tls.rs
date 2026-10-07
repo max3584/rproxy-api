@@ -847,3 +847,38 @@ async fn a_tls_route_spreads_over_several_targets() {
 		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
 	}
 }
+
+#[tokio::test]
+async fn optional_no_verify_lets_any_client_certificate_in() {
+	// #238: the Gateway API's AllowInsecureFallback; the PROXY v2 header tells the backend
+	let pki = Pki::new("mtls-noverify");
+	let cert = pki.server("front", &["api.test"]);
+	let alice = pki.client("alice", "alice");
+	let other_ca = Pki::new("mtls-noverify-other");
+	let mallory = other_ca.client("mallory", "mallory");
+	let h = harness().await;
+	for ca in [Some(pki.ca_file.clone()), None] {
+		let port = free_port();
+		let mut client_auth = json!({"mode": "optional_no_verify"});
+		if let Some(ca) = &ca {
+			client_auth["ca_file"] = json!(ca);
+		}
+		let tls = json!({
+			"mode": "terminate",
+			"certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}],
+			"client_auth": client_auth,
+		});
+		let (status, v) = h.post(tcp_rule(port, tcp_backend("OK:").await, tls)).await;
+		assert_eq!(status, StatusCode::CREATED, "{v}");
+		for client in [Some(&alice), Some(&mallory), None] {
+			assert_eq!(tls_roundtrip(&pki, port, "api.test", client, "x").await.unwrap(), "OK:x", "ca {ca:?}");
+		}
+	}
+	// optional and required still need ca_file
+	let (status, v) = h
+		.post(tcp_rule(free_port(), tcp_backend("OK:").await, json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}], "client_auth": {"mode": "optional"}})))
+		.await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+	let (_, caps) = h.get("/capabilities").await;
+	assert!(caps["features"]["client_auth_modes"].as_array().unwrap().contains(&json!("optional_no_verify")), "{caps}");
+}

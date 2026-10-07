@@ -232,18 +232,18 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 		}
 	};
 	let handshake = conn.handshake_data().and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
-	let peer_cert = conn
+	let chain = conn
 		.peer_identity()
 		.and_then(|p| p.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
-		.and_then(|chain| chain.first().map(|c| c.as_ref().to_vec()));
+		.map(|c| *c)
+		.unwrap_or_default();
 	let tls = TlsInfo {
 		server_name: handshake.as_ref().and_then(|h| h.server_name.clone()),
 		alpn: Some("h3".into()),
 		version: Some("TLSv1_3".into()),
-		cipher: None,
-		client_cn: peer_cert.as_deref().and_then(crate::tls::config::common_name),
-		client_cert: peer_cert.is_some(),
-	};
+		..Default::default()
+	}
+	.with_client(&chain, rt.tls().client_verified(&chain));
 	info!(event = "conn.open", rule = %rt.key, client = %client, transport = "quic",
 		sni = tls.server_name.as_deref().unwrap_or(""), client_cn = tls.client_cn.as_deref().unwrap_or(""));
 	// names of `passthrough` routes are served by their own backend over TCP, never here

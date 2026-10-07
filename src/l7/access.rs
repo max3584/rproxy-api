@@ -155,6 +155,8 @@ impl HttpGlobal {
 				bytes_in = entry.bytes_in, bytes_out = entry.bytes_out, user_agent = %entry.user_agent,
 				sni = %entry.sni, tls_version = %entry.tls_version, refused_by = %entry.refused_by, middleware = %entry.middleware,
 				user = %entry.user, auth_error = %entry.auth_error,
+				client_cn = (!entry.client_cn.is_empty()).then_some(entry.client_cn.as_str()),
+				client_verify = (!entry.client_verify.is_empty()).then_some(entry.client_verify.as_str()),
 				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
@@ -212,6 +214,12 @@ pub struct AccessEntry {
 	pub user_agent: String,
 	pub sni: String,
 	pub tls_version: String,
+	/// The client certificate's common name and `SUCCESS` / `FAILED` / `NONE` (#238);
+	/// left out on rules without `client_auth`.
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub client_cn: String,
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub client_verify: String,
 	/// The kind of the middleware that refused the request (`ip_allow`, `basic_auth`,
 	/// `forward_auth`, `oidc`, `crowdsec`, `rate_limit`, `in_flight`, …): it answered
 	/// with an error status. Empty otherwise.
