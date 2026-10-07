@@ -150,6 +150,11 @@ async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationT
 			incoming.refuse();
 			continue;
 		}
+		if let Err(info) = rt.geoip_check(ip) {
+			rt.geoip_denied(client, &info, Some("quic"), false);
+			incoming.refuse();
+			continue;
+		}
 		if rt.crowdsec_blocks(ip) {
 			denied(&rt, client, "crowdsec");
 			incoming.refuse();

@@ -663,7 +663,18 @@ async fn run(opts: Options) -> Result<(), String> {
 	if let Some(b) = &crowdsec {
 		b.spawn();
 	}
-	let http_global = http_global.with_crowdsec(crowdsec.clone());
+	// global.geoip: the databases of the geoip lists, looked at again every check_interval (#168)
+	let geoip = match doc.as_ref().and_then(|(path, d)| d.global.geoip.as_ref().map(|g| (path, g))) {
+		Some((path, g)) if rproxy_api::core::rule::Features::CURRENT.geoip => match rproxy_api::net::geoip::Geoip::open(g) {
+			Ok(geoip) => Some(geoip),
+			Err(rproxy_api::net::geoip::GeoipError::Config(e)) => return Err(format!("{}: {e}", path.display())),
+		},
+		_ => None,
+	};
+	if let Some(g) = &geoip {
+		g.spawn();
+	}
+	let http_global = http_global.with_crowdsec(crowdsec.clone()).with_geoip(geoip.clone());
 	// global.acme: certificates of `tls.certificates[].acme`, obtained and renewed in the background
 	let acme = match doc.as_ref().and_then(|(path, d)| d.global.acme.as_ref().map(|a| (path, a))) {
 		Some((path, a)) => Some(rproxy_api::acme::Acme::new(a).map_err(|e| format!("{}: {e}", path.display()))?),
@@ -850,6 +861,9 @@ async fn run(opts: Options) -> Result<(), String> {
 	if let Some(b) = &crowdsec {
 		b.stop();
 	}
+	if let Some(g) = &geoip {
+		g.stop();
+	}
 	if let Some(a) = &acme {
 		a.shutdown();
 	}
@@ -1007,6 +1021,9 @@ async fn wait_for_shutdown(
 						Ok(()) => info!(event = "reload.crowdsec"),
 						Err(e) => warn!(event = "reload.crowdsec", error = %e, "keeping the current CrowdSec key"),
 					}
+				}
+				if let Some(g) = registry.http_global().geoip().cloned() {
+					let _ = tokio::task::spawn_blocking(move || g.refresh(true)).await;
 				}
 			}
 			_ = term.recv() => return Ok(()),

@@ -107,6 +107,12 @@ rules:
 - 前段に CDN やロードバランサがあるなら `global.trusted_proxies` を設定します。L7 のログの `client` と判定の照合に、`X-Forwarded-For` の本当の IP が使われます（L4 は接続元の IP）。
 - `captcha` の判定は ban として扱います。scope は `Ip` と `Range` だけ（`Country`・`AS` は使いません）。
 
+### GeoIP と組み合わせる（v0.4、#168）
+
+国・ASN で最初から通さないものは rproxy の `geoip`（ルールの `geoip`、L7 の `geoip` ミドルウェア。`global.geoip` に GeoLite2 などの mmdb）で落とし、残りの振る舞いを CrowdSec で見る、という分け方ができる。判定の順は `allow_from` → `geoip` → `crowdsec`。`geoip` で断った接続は `conn.denied`（`reason: geoip`、`country`・`asn`）、リクエストは `http.access`（`refused_by: geoip`）。パーサーは `reason` を `rproxy_reason` に入れるので、シナリオで `geoip` を除く・数えることができる（同梱のシナリオは `allow_from` だけを数える）。
+
+国の情報は CrowdSec の側でも `crowdsecurity/geoip-enrich`（同じ GeoLite2 を使う）で付けられる。rproxy の `global.geoip.log_country: true` は `conn.open`・`http.access` に `country`・`asn` を足すので、CrowdSec を通さずに SIEM などで rproxy のログを見るとき向け。どちらも同じデータベースのファイルを `geoipupdate` で更新すればよい（rproxy は変わったファイルを `check_interval` ごとに読み直す）。
+
 ## 4. CI での確かめ方
 
 `scripts/interop/crowdsec.sh` は、GitHub の Ubuntu のランナーで CrowdSec（LAPI・エージェント・AppSec）を公式のパッケージから入れ、ネットワーク名前空間のクライアントから rproxy を通して、次を確かめます。

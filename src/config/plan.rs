@@ -554,6 +554,12 @@ mod tests {
 		assert_eq!(change_of(&a, true, &a), (Action::None, Change::None));
 		assert_eq!(change_of(&a, true, &b), (Action::Update, Change::InPlace));
 		assert_eq!(change_of(&a, false, &b), (Action::Update, Change::Recreate), "a failed rule is started");
+		// geoip and outlier_detection (#168, #170) are changed by PATCH in place
+		let mut c = a.clone();
+		c.geoip = Some(serde_json::from_value(json!({"unknown": "deny"})).unwrap());
+		c.outlier_detection = Some(serde_json::from_value(json!({"consecutive_failures": 3})).unwrap());
+		assert!(in_place(&a, &c) && in_place(&c, &a));
+		assert_eq!(change_of(&a, true, &c), (Action::Update, Change::InPlace));
 		b.source_ip = crate::core::rule::SourceIp::ProxyV2;
 		assert_eq!(change_of(&a, true, &b), (Action::Update, Change::Recreate), "PATCH cannot change source_ip");
 		let wide = spec(json!({"protocol": "tcp", "listen_addr": "::", "listen_port": 80, "remote_addr": "a", "remote_port": 1}));
