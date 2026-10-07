@@ -197,7 +197,8 @@ async fn sets_refuse_stale_writes_and_do_not_take_other_rules() {
 	let mut wrong = rule("tcp", p3, a);
 	wrong["remote_port"] = json!(0);
 	let mut unsupported = rule("tcp", free_port(), a);
-	unsupported["limits"] = json!({"max_connections": 10});
+	// every v0.4 rule setting runs now: transparent, which the test harness does not have, is unsupported
+	unsupported["source_ip"] = json!("transparent");
 	let r = put(&h, "team-a", json!({"generation": 6, "rules": [rule("tcp", p1, tcp_backend("C:").await), wrong, unsupported]})).await;
 	assert_eq!(code(&r), (StatusCode::BAD_REQUEST, Some("invalid".into())), "{}", r.1);
 	assert!(r.1["error"].as_str().unwrap().starts_with("rules[1]: "), "{}", r.1);

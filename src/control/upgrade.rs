@@ -181,17 +181,15 @@ pub fn installed() -> Option<&'static Upgrade> {
 	UPGRADE.get()
 }
 
-/// When this process (or the first one before live upgrades) started.
-static PROCESS_START: OnceLock<f64> = OnceLock::new();
-
-/// `rproxy_process_start_time_seconds`: kept over live upgrades.
-pub fn process_start_time() -> f64 {
-	*PROCESS_START.get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0))
+/// `rproxy_process_start_time_seconds` (`core::bandwidth::process_start`, #166):
+/// kept over live upgrades.
+pub fn process_start_time() -> u64 {
+	crate::core::bandwidth::process_start()
 }
 
-/// Takes the start time over from the old process (a live upgrade).
-pub fn set_process_start_time(t: f64) {
-	let _ = PROCESS_START.set(t);
+/// Takes over the start time from the old process (a live upgrade).
+pub fn set_process_start_time(secs: u64) {
+	crate::core::bandwidth::set_process_start(secs);
 }
 
 static BUILD_SHA256: OnceLock<String> = OnceLock::new();
@@ -225,7 +223,8 @@ pub fn build_view() -> serde_json::Value {
 	json!({"version": env!("CARGO_PKG_VERSION"), "sha256": build_sha256()})
 }
 
-/// `rproxy_build_info`, `rproxy_handoffs_total`, `rproxy_process_start_time_seconds`.
+/// `rproxy_build_info`, `rproxy_handoffs_total` (`rproxy_process_start_time_seconds`
+/// is the registry's).
 pub fn metrics() -> String {
 	use std::fmt::Write as _;
 	use std::sync::atomic::Ordering;
@@ -239,9 +238,6 @@ pub fn metrics() -> String {
 	for (outcome, n) in [("done", &o.done), ("failed", &o.failed), ("refused", &o.refused)] {
 		let _ = writeln!(out, "rproxy_handoffs_total{{outcome=\"{outcome}\"}} {}", n.load(Ordering::Relaxed));
 	}
-	let _ = writeln!(out, "# HELP rproxy_process_start_time_seconds When rproxy started (kept over live upgrades), Unix seconds.");
-	let _ = writeln!(out, "# TYPE rproxy_process_start_time_seconds gauge");
-	let _ = writeln!(out, "rproxy_process_start_time_seconds {}", process_start_time());
 	out
 }
 

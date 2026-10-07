@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::access::{AccessEntry, NO_ROUTE};
+use crate::core::bandwidth::{Dir, Gate};
 use super::middleware::auth::{BasicVerdict, ForwardAuth};
 use super::middleware::oidc::{self, Oidc};
 use super::backend::{self, Dialer, ServerHealth, Service};
@@ -209,23 +210,41 @@ pub struct Metered<S> {
 	/// This connection's bytes from and to the client.
 	rx: Arc<AtomicU64>,
 	tx: Arc<AtomicU64>,
+	/// The rule's `bandwidth` (#166): reads from the client wait for `up`,
+	/// writes to it for `down`.
+	up: Gate,
+	down: Gate,
 }
 
 impl<S> Metered<S> {
-	pub fn new(inner: S, rt: Arc<Runtime>, rx: Arc<AtomicU64>, tx: Arc<AtomicU64>) -> Self {
-		Metered { inner, rt, rx, tx }
+	pub fn new(inner: S, rt: Arc<Runtime>, client: std::net::IpAddr, rx: Arc<AtomicU64>, tx: Arc<AtomicU64>) -> Self {
+		Metered { inner, rt, rx, tx, up: Gate::new(client, Dir::Up), down: Gate::new(client, Dir::Down) }
 	}
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
 	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
 		let this = self.get_mut();
-		let before = buf.filled().len();
-		let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-		let n = (buf.filled().len() - before) as u64;
+		let (poll, n) = match ready!(this.up.poll_allow(&this.rt.bandwidth, cx)) {
+			None => {
+				let before = buf.filled().len();
+				let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+				(poll, buf.filled().len() - before)
+			}
+			Some(allow) => {
+				let mut part = buf.take(allow.min(buf.remaining()));
+				let poll = Pin::new(&mut this.inner).poll_read(cx, &mut part);
+				let n = part.filled().len();
+				// SAFETY: `part` is the unfilled part of `buf`, and its first `n` bytes were filled
+				unsafe { buf.assume_init(n) };
+				buf.advance(n);
+				this.up.spend(&this.rt.bandwidth, n);
+				(poll, n)
+			}
+		};
 		if n > 0 {
-			this.rx.fetch_add(n, Ordering::Relaxed);
-			this.rt.stats.add_rx(n);
+			this.rx.fetch_add(n as u64, Ordering::Relaxed);
+			this.rt.stats.add_rx(n as u64);
 		}
 		poll
 	}
@@ -234,8 +253,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
 impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		let this = self.get_mut();
+		let buf = match ready!(this.down.poll_allow(&this.rt.bandwidth, cx)) {
+			None => buf,
+			Some(allow) => &buf[..allow.min(buf.len())],
+		};
 		let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
 		if let Poll::Ready(Ok(n)) = poll {
+			this.down.spend(&this.rt.bandwidth, n);
 			this.tx.fetch_add(n as u64, Ordering::Relaxed);
 			this.rt.stats.add_tx(n as u64);
 		}

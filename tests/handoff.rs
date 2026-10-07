@@ -408,6 +408,8 @@ async fn api_rules_and_http_counters_carry_over() {
 	};
 	assert_eq!((&before["origin"], &before["created_by"], &before["persisted"]), (&json!("api"), &json!("ci"), &json!(false)), "{before}");
 
+	// counters_since is in seconds: make the new process start in another second
+	tokio::time::sleep(Duration::from_millis(1100)).await;
 	signal(procs.pids[0], libc::SIGUSR2);
 	let ready = wait_event(&log, "handoff.ready", 1).await;
 	procs.pids.push(ready["pid"].as_i64().unwrap() as i32);
@@ -418,6 +420,10 @@ async fn api_rules_and_http_counters_carry_over() {
 		assert_eq!(after[k], before[k], "{k}: {after}");
 	}
 	assert_eq!(after["stats"]["http"]["routes"]["gone"]["requests"], json!(3), "{after}");
+	// the counters go on from when they started (#166)
+	assert!(before["stats"]["counters_since"].as_u64().is_some(), "{before}");
+	assert_eq!(after["stats"]["counters_since"], before["stats"]["counters_since"], "{after}");
+	assert_eq!(after["started_at"], before["started_at"], "{after}");
 	assert_eq!(request().await, 410);
 	let deadline = Instant::now() + Duration::from_secs(10);
 	loop {

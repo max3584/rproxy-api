@@ -49,11 +49,9 @@ const FAILED: u8 = b'X';
 const FINAL: u8 = b'C';
 const FINAL_END: u8 = b'Z';
 
-/// A rule's counters, by its key. Counters of other items (e.g. #165 / #166's
-/// `limited` and `counters_since`) are added here as `#[serde(default)]` fields:
-/// `of` reads them from the runtime, `since` takes the drain's difference and
-/// `add_to` adds them in the new process (a start time such as `counters_since`
-/// is set from the snapshot instead of added).
+/// A rule's counters, by its key: `of` reads them from the runtime, `since`
+/// takes what the old process counted during its drain, `add_to` adds them in
+/// the new process. `counters_since` is a start time: it is kept, not added.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Counters {
 	pub protocol: String,
@@ -65,13 +63,23 @@ pub struct Counters {
 	pub tls_failures: u64,
 	pub denied: u64,
 	pub dropped: u64,
+	/// Refused by `limits` (#165), by reason (`Stats::limited`).
+	#[serde(default)]
+	pub limited: [u64; 4],
+	/// UDP datagrams dropped over `bandwidth` (#166).
+	#[serde(default)]
+	pub bandwidth_dropped: u64,
+	/// `stats.counters_since` (#166): when the counters started, in Unix
+	/// seconds. Set from the snapshot, not added.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub counters_since: Option<u64>,
 	/// `stats.http`: requests by route (`http` rules).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::l7::access::HttpCounters>,
 }
 
 impl Counters {
-	fn of(key: &Key, rt: &Runtime) -> Counters {
+	fn of(key: &Key, rt: &Runtime, counters_since: Option<u64>) -> Counters {
 		let s = &rt.stats;
 		Counters {
 			protocol: key.protocol.to_string(),
@@ -83,6 +91,9 @@ impl Counters {
 			tls_failures: s.tls_failures.load(Ordering::Relaxed),
 			denied: s.denied.load(Ordering::Relaxed),
 			dropped: s.dropped.load(Ordering::Relaxed),
+			limited: std::array::from_fn(|i| s.limited[i].load(Ordering::Relaxed)),
+			bandwidth_dropped: s.bandwidth_dropped.load(Ordering::Relaxed),
+			counters_since,
 			http: Some(rt.http_stats.export()).filter(|h| !h.is_empty()),
 		}
 	}
@@ -103,6 +114,8 @@ impl Counters {
 			tls_failures: self.tls_failures.saturating_sub(before.tls_failures),
 			denied: self.denied.saturating_sub(before.denied),
 			dropped: self.dropped.saturating_sub(before.dropped),
+			limited: std::array::from_fn(|i| self.limited[i].saturating_sub(before.limited[i])),
+			bandwidth_dropped: self.bandwidth_dropped.saturating_sub(before.bandwidth_dropped),
 			http: match (&self.http, &before.http) {
 				(Some(now), Some(then)) => Some(now.since(then)),
 				(now, _) => now.clone(),
@@ -119,6 +132,10 @@ impl Counters {
 		s.tls_failures.fetch_add(self.tls_failures, Ordering::Relaxed);
 		s.denied.fetch_add(self.denied, Ordering::Relaxed);
 		s.dropped.fetch_add(self.dropped, Ordering::Relaxed);
+		for (mine, n) in s.limited.iter().zip(self.limited) {
+			mine.fetch_add(n, Ordering::Relaxed);
+		}
+		s.bandwidth_dropped.fetch_add(self.bandwidth_dropped, Ordering::Relaxed);
 		if let Some(h) = &self.http {
 			rt.http_stats.add(h);
 		}
@@ -341,8 +358,8 @@ impl Upgrader {
 	}
 
 	/// After the drain: the final counters to the new process, then done.
-	pub async fn finish(&self, handed: HandedOff, runtimes: Vec<(Key, Arc<Runtime>)>) {
-		let counters: Vec<Counters> = runtimes.iter().map(|(k, rt)| Counters::of(k, rt)).collect();
+	pub async fn finish(&self, handed: HandedOff, runtimes: Vec<(Key, Arc<Runtime>, u64)>) {
+		let counters: Vec<Counters> = runtimes.iter().map(|(k, rt, _)| Counters::of(k, rt, None)).collect();
 		let pid = handed.pid;
 		let sent = tokio::task::spawn_blocking(move || {
 			let body = serde_json::to_vec(&counters).unwrap_or_default();
@@ -383,7 +400,7 @@ async fn snapshot(registry: &Registry) -> State {
 			});
 		}
 	}
-	let counters = registry.runtimes().await.iter().map(|(k, rt)| Counters::of(k, rt)).collect();
+	let counters = registry.runtimes().await.iter().map(|(k, rt, since)| Counters::of(k, rt, Some(*since))).collect();
 	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time().to_string(), rules, counters, rulesets }
 }
 
@@ -593,8 +610,11 @@ async fn add_counters(registry: &Registry, counters: &[Counters], f: impl Fn(&Co
 	let runtimes = registry.runtimes().await;
 	for c in counters {
 		let Some(key) = c.key() else { continue };
-		if let Some((_, rt)) = runtimes.iter().find(|(k, _)| *k == key) {
+		if let Some((_, rt, _)) = runtimes.iter().find(|(k, _, _)| *k == key) {
 			f(c).add_to(rt);
+			if let Some(since) = c.counters_since {
+				registry.keep_started_at(&key, since).await;
+			}
 		}
 	}
 }

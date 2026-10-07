@@ -185,17 +185,30 @@ Streams tens of MiB of pseudo-random data (slices of a 1 MiB block at positions 
 |---|---|
 | `relay_buffers_and_half_closes` | Connections whose data has passed (50 plain, 20 with TLS terminated) hold no buffer (and still work afterwards). A connection stuck on a backend that does not read holds one, and gives it back when it ends. When the backend sends its FIN first (plain and TLS termination) or the client ends first (TLS termination), it is passed on as a half-close and the data of the other direction all arrives |
 
+## Integration tests: L4 limits and bandwidth (`tests/limits.rs`, #165, #166)
+
+| Test | What it checks |
+|---|---|
+| `capabilities_say_limits_and_bandwidth_run` | `features.limits` and `features.bandwidth` are true |
+| `tcp_connections_are_limited_per_source_and_per_rule` | A TCP connection over the per-source or the rule's concurrent connections is closed without anything sent (`stats.limited`, `reason` in `rproxy_rule_limited_total`). A closed connection frees its place. A `PATCH` of the limits keeps counting the open connections; `{}` removes them. `stats.counters_since`, `rproxy_process_start_time_seconds` |
+| `tcp_new_connections_are_a_rate` | The rate of new connections (`new_connections`) |
+| `http_rules_limit_their_connections` | On `http` rules they apply to the TCP connections |
+| `udp_sessions_and_datagrams_are_limited` | The number of UDP sessions and the per-source datagram rate (`packets`). Datagrams over them are dropped and make no session |
+| `tcp_bandwidth_waits_and_applies_to_open_connections` | A download limit added by `PATCH` slows a connection already moving a bulk transfer with splice (1 MB/s), without losing a byte; removed, it is fast again |
+| `tcp_upload_per_source_waits` | A per-source upload limit makes the client's writes wait |
+| `http_rules_are_shaped` | Responses of an `http` rule are shaped by the download limit |
+| `udp_bandwidth_drops_over_the_rate` | UDP datagrams over the download limit are dropped and counted in `stats.dropped` and `rproxy_rule_bandwidth_dropped_total` (the upload is untouched) |
+
 ## Integration tests: v0.4 shapes (`tests/v04_shapes.rs`, #215)
 
 Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what cannot run yet is refused or ignored. One test per item; implementing an item replaces its test with one showing it works (and turns its `features` flag on).
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions`, `readyz`, `geoip` and `outlier_detection` (and the `geoip` middleware, services' `outlier_detection`), `handoff` and `self_update` are true) |
+| `capabilities_list_every_v0_4_feature_as_on` | Every v0.4 flag in `features` is true (`client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions`, `readyz`, `geoip`, `outlier_detection`, `limits`, `bandwidth`, `dry_run`, `persistence`, `handoff`, `self_update`; the `geoip` middleware and services' `outlier_detection`) |
 | `upgrade_and_update_endpoints_answer`, `performance_keys_are_all_applied` | Implemented #174 and performance: `handoff` and `self_update` are true, `build`, the `/admin/*` answers of a router built as a library (Unix socket only; `GET /admin/update` is `mode: off`), `features.performance` lists every key |
-| `limits_…`, `bandwidth_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). GeoIP (#168) and passive health checks (#170) are implemented: `tests/geoip.rs`, `tests/outlier.rs` |
-| `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule |
-| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (rules; `global.geoip` and `global.performance` run, so no warning). A 0.3 settings file passes without warnings |
+| `new_endpoints_need_their_scopes` | Scopes of the new endpoints and the Unix-socket-only rule |
+| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors; every v0.4 setting runs, so nothing is warned about. A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
 
 ## Integration tests: control API hardening (`tests/api_hardening.rs`, #167)

@@ -25,78 +25,24 @@ async fn send(h: &Harness, method: Method, path: &str, body: Option<Value>) -> (
 	(status, r.json().await.unwrap_or(Value::Null))
 }
 
-fn code(r: &(StatusCode, Value)) -> (StatusCode, Option<&str>) {
-	(r.0, r.1["code"].as_str())
-}
-
-const UNSUPPORTED: (StatusCode, Option<&str>) = (StatusCode::BAD_REQUEST, Some("unsupported"));
-const INVALID: (StatusCode, Option<&str>) = (StatusCode::BAD_REQUEST, Some("invalid"));
-
-/// POST with `key: good` is `unsupported`, with `key: bad` is `invalid`; a
-/// running rule PATCHed with `key: good` is `unsupported`, with `{}` is fine.
-async fn rule_setting(h: &Harness, protocol: &str, key: &str, good: Value, bad: Value) {
-	let backend = if protocol == "udp" { udp_backend("V:").await } else { tcp_backend("V:").await };
-	let port = if protocol == "udp" { free_udp_port() } else { free_port() };
-	let mut body = rule(protocol, port, backend);
-	body[key] = good.clone();
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{key}: {}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains(key), "{}", r.1);
-	body[key] = bad;
-	let r = h.post(body.clone()).await;
-	assert_eq!(code(&r), INVALID, "{key}: {}", r.1);
-
-	let plain = rule(protocol, port, backend);
-	assert_eq!(h.post(plain).await.0, StatusCode::CREATED);
-	let path = format!("{protocol}/127.0.0.1/{port}");
-	let target = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port()});
-	let mut patch = target.clone();
-	patch[key] = good;
-	assert_eq!(code(&h.patch(&path, patch).await), UNSUPPORTED, "PATCH {key}");
-	let mut clear = target;
-	clear[key] = json!({});
-	let r = h.patch(&path, clear).await;
-	assert_eq!(r.0, StatusCode::OK, "PATCH {key}: {{}} removes it: {}", r.1);
-	assert!(r.1.get(key).is_none(), "{}", r.1);
-}
-
 #[tokio::test]
-async fn capabilities_list_the_v0_4_features_as_off() {
+async fn capabilities_list_every_v0_4_feature_as_on() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
+	// all implemented (tests/api_hardening.rs, rulesets.rs, geoip.rs, outlier.rs, plan.rs, persist.rs, limits.rs, handoff.rs, self_update.rs)
 	for flag in [
-		"limits", "bandwidth",
+		"client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection",
+		"dry_run", "persistence", "limits", "bandwidth", "handoff", "self_update",
 	] {
-		assert_eq!(f[flag], false, "{flag}: {caps}");
-	}
-	// implemented (tests/api_hardening.rs, rulesets.rs, geoip.rs, outlier.rs, plan.rs, persist.rs; #174 and performance below)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection", "dry_run", "persistence", "handoff", "self_update"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
 	assert!(f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
 	assert!(f["services"].as_array().unwrap().contains(&json!("outlier_detection")));
 }
 
-/// #165
-#[tokio::test]
-async fn limits_are_checked_then_unsupported() {
-	let h = harness().await;
-	let good = json!({"max_connections": 100, "per_source": {"max_connections": 4, "new_connections": {"average": 10}}});
-	rule_setting(&h, "tcp", "limits", good, json!({"per_source": {"packets": {"average": 5}}})).await;
-	let good = json!({"per_source": {"packets": {"average": 1000, "period": "1s", "burst": 2000}}});
-	rule_setting(&h, "udp", "limits", good, json!({"max_connections": 0})).await;
-}
-
-/// #166
-#[tokio::test]
-async fn bandwidth_is_checked_then_unsupported() {
-	let h = harness().await;
-	let good = json!({"upload": "10Mbps", "download": "100Mbps", "per_source": {"download": "5Mbps"}});
-	rule_setting(&h, "tcp", "bandwidth", good, json!({"upload": "10MB/s"})).await;
-}
-
-// #168 GeoIP and #170 outlier detection are implemented: tests/geoip.rs and tests/outlier.rs.
+// #165 limits, #166 bandwidth, #168 GeoIP and #170 outlier detection are implemented:
+// tests/limits.rs, tests/geoip.rs and tests/outlier.rs.
 
 // #169 (dry runs) and #144 (persistence) work: tests/plan.rs and tests/persist.rs
 
@@ -197,10 +143,8 @@ rules:
 	let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
 	assert_eq!((exit, &v["ok"]), (0, &json!(true)), "warnings only: {v}");
 	let warnings = v["warnings"].to_string();
-	for want in ["rule #1", "rule #2"] {
-		assert!(warnings.contains(want), "{want}: {warnings}");
-	}
-	assert!(!warnings.contains("global.performance"), "applied now: {warnings}");
+	// every v0.4 setting runs now: nothing to warn about
+	assert!(!warnings.contains("global.performance") && !warnings.contains("rule #"), "{warnings}");
 
 	// mistakes in the shapes are errors
 	for (text, want) in [

@@ -4,7 +4,7 @@
 # - acquis の labels.type を rproxy にする（crowdsecurity/non-syslog が evt.Parsed.program に入れる）
 # - event = http.access：CrowdSec の HTTP のアクセスログ（log_type http_access-log）として扱う。
 #   crowdsecurity/http-logs（s02）と crowdsecurity/base-http-scenarios・http-cve などがそのまま使える
-# - event = conn.open / conn.denied：L4（TCP / UDP）の接続（log_type rproxy_conn）。
+# - event = conn.open / conn.denied / conn.limited：L4（TCP / UDP）の接続（log_type rproxy_conn）。
 #   max3584/rproxy-conn-* のシナリオが使う
 # - クライアントの IP は rproxy の client（L7 は global.trusted_proxies を反映したもの）
 onsuccess: next_stage
@@ -60,7 +60,7 @@ nodes:
       - meta: rproxy_auth_error
         expression: "JsonExtractUnescape(evt.Parsed.message, 'auth_error')"
   # L4: client is "IP:port" or "[IPv6]:port"
-  - filter: "JsonExtract(evt.Parsed.message, 'event') in ['conn.open', 'conn.denied']"
+  - filter: "JsonExtract(evt.Parsed.message, 'event') in ['conn.open', 'conn.denied', 'conn.limited']"
     grok:
       pattern: '"client":"\[?%{IP:client_ip}\]?:%{INT:client_port}"'
       apply_on: message
@@ -79,3 +79,6 @@ nodes:
         expression: "JsonExtractUnescape(evt.Parsed.message, 'reason')"
       - meta: rproxy_rule
         expression: "JsonExtractUnescape(evt.Parsed.message, 'rule')"
+      # conn.limited (rproxy v0.4, a rule's limits): tcp or udp
+      - meta: rproxy_transport
+        expression: "JsonExtractUnescape(evt.Parsed.message, 'transport')"
