@@ -177,6 +177,20 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 	let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).map_err(|e| e.to_string())?;
 	let std_sock = std::os::unix::net::UnixDatagram::bind_addr(&addr).map_err(|e| format!("notify socket: {e}"))?;
 	std_sock.set_nonblocking(true).map_err(|e| e.to_string())?;
+	// every datagram carries its sender's pid (SCM_CREDENTIALS): only our own server
+	// processes may say MAINPID (security review L1; the abstract name is visible
+	// in /proc/net/unix to anything in the network namespace)
+	{
+		use std::os::fd::AsRawFd;
+		let on: libc::c_int = 1;
+		// SAFETY: setsockopt with a c_int on a socket we own
+		let r = unsafe {
+			libc::setsockopt(std_sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PASSCRED, (&on as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t)
+		};
+		if r != 0 {
+			return Err(format!("notify socket: SO_PASSCRED: {}", std::io::Error::last_os_error()));
+		}
+	}
 	let sock = tokio::net::UnixDatagram::from_std(std_sock).map_err(|e| e.to_string())?;
 	let notify = format!("@{name}");
 
@@ -201,8 +215,12 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 			_ = int.recv() => { stopping = true; send(main, libc::SIGINT); for p in &former { send(*p, libc::SIGINT); } }
 			_ = hup.recv() => send(main, libc::SIGHUP),
 			_ = usr2.recv() => send(main, libc::SIGUSR2),
-			r = sock.recv(&mut buf) => {
-				let Ok(n) = r else { continue };
+			r = recv_from_pid(&sock, &mut buf) => {
+				let Ok((n, sender)) = r else { continue };
+				if !sender.is_some_and(|p| p == main || descends_from_me(p)) {
+					warn!(event = "launch.notify_refused", sender = sender.unwrap_or(0), "a notification from a process that is not ours");
+					continue;
+				}
 				let text = String::from_utf8_lossy(&buf[..n]);
 				for line in text.lines() {
 					if let Some(pid) = line.strip_prefix("MAINPID=").and_then(|p| p.trim().parse::<i32>().ok()) {
@@ -251,6 +269,47 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 			}
 		}
 	}
+}
+
+/// One datagram and its sender's pid (from SCM_CREDENTIALS; `SO_PASSCRED` is on).
+async fn recv_from_pid(sock: &tokio::net::UnixDatagram, buf: &mut [u8]) -> std::io::Result<(usize, Option<i32>)> {
+	use std::os::fd::AsRawFd;
+	loop {
+		sock.readable().await?;
+		match sock.try_io(tokio::io::Interest::READABLE, || recvmsg_pid(sock.as_raw_fd(), buf)) {
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+			other => return other,
+		}
+	}
+}
+
+fn recvmsg_pid(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize, Option<i32>)> {
+	let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+	let mut control = [0u64; 8]; // room for one ucred, aligned
+	// SAFETY: msghdr is plain data; zeroed is a valid start
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = &mut iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = control.as_mut_ptr().cast();
+	msg.msg_controllen = std::mem::size_of_val(&control) as _;
+	// SAFETY: recvmsg into buffers that live for the call
+	let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+	if n < 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	let mut pid = None;
+	// SAFETY: walking the control messages the kernel wrote into `control`
+	unsafe {
+		let mut c = libc::CMSG_FIRSTHDR(&msg);
+		while !c.is_null() {
+			if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_CREDENTIALS {
+				let cred: libc::ucred = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
+				pid = Some(cred.pid);
+			}
+			c = libc::CMSG_NXTHDR(&msg, c);
+		}
+	}
+	Ok((n as usize, pid))
 }
 
 /// The version a server process runs, from its binary's path.
