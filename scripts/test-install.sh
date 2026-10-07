@@ -124,6 +124,7 @@ if [ -e /etc/rproxy ] || [ -e /var/log/rproxy ]; then fail "purge left files beh
 
 echo "== binary: from v0.3 (user rproxy, same uid as rproxy-api)"
 userdel rproxy-api 2>/dev/null || true
+groupdel rproxy 2>/dev/null || true
 getent passwd rproxy >/dev/null || useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy
 old_uid=$(id -u rproxy)
 install -d -m 0750 /etc/rproxy

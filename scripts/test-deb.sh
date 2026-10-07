@@ -121,8 +121,9 @@ sudo apt-get purge -y rproxy-api
 sudo rm -f /etc/apt/sources.list.d/rproxy-api.list /usr/share/keyrings/rproxy-archive-keyring.gpg
 
 echo "== upgrade from v0.3.21: the user rproxy becomes rproxy-api with the same uid"
-# a host as v0.3 left it: no rproxy-api user yet
+# a host as v0.3 left it: no rproxy-api user and no shared rproxy group yet (v0.3.21's postinst fails when the group exists without the user)
 sudo userdel rproxy-api 2>/dev/null || true
+sudo groupdel rproxy 2>/dev/null || true
 arch=$(dpkg --print-architecture)
 curl -fsSL -o "$work/old.deb" "https://github.com/max3584/rproxy-api/releases/download/v0.3.21/rproxy-api_0.3.21-1_${arch}.deb"
 sudo apt-get install -y "$work/old.deb"
