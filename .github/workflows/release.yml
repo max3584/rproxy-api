@@ -153,7 +153,7 @@ jobs:
             --json tagName -q '.[].tagName' > tags.txt
           echo "$TAG" >> tags.txt
           grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' tags.txt | sort -uV | sed 's/^v//' |
-            awk 'BEGIN { printf "{\"releases\":[" } NR > 1 { printf "," } { printf "{\"version\":\"%s\"}", $0 } END { print "]}" }' > releases.json
+            awk -v now="$(date +%s)" 'BEGIN { printf "{\"releases\":[" } NR > 1 { printf "," } { printf "{\"version\":\"%s\"}", $0 } END { printf "],\"generated_at\":%s}\n", now }' > releases.json
           cat releases.json
           files=(manifest.json SHA256SUMS releases.json)
           if [ -n "$MINISIGN_SECRET_KEY" ]; then

@@ -31,12 +31,14 @@ use super::UpdateMode;
 struct Choice {
 	exe: PathBuf,
 	version: Version,
+	/// The cached binary, open as it was verified: run from this file (security review L5).
+	verified: Option<std::fs::File>,
 }
 
 /// The image's own binary.
 fn image() -> Result<Choice, String> {
 	let exe = super::handoff::binary_on_disk().map_err(|e| format!("cannot find the binary: {e}"))?;
-	Ok(Choice { exe, version: Version::own() })
+	Ok(Choice { exe, version: Version::own(), verified: None })
 }
 
 /// Picks the binary: the pin, else the newest good one (image, cache, source).
@@ -52,7 +54,7 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 			return Ok(image);
 		}
 	};
-	let _ = std::fs::create_dir_all(&cfg.cache);
+	let _ = super::update::private_dir(&cfg.cache);
 	// a version still on trial: the container stopped without the launcher seeing it
 	// (SIGKILL, OOM); counted, and bad only when it keeps happening
 	let mut interrupted = 0;
@@ -83,8 +85,8 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 		None => *v > image.version && v.0 == image.version.0 && v.1 == image.version.1,
 	};
 	for v in cfg.cached_versions().into_iter().filter(|v| wanted(v) && !is_bad(v)) {
-		match cfg.verify_cached(&key, v) {
-			Ok(exe) => {
+		match cfg.verify_cached_open(&key, v) {
+			Ok((exe, verified)) => {
 				// not known to be good yet: on trial until RPROXY_UPDATE_HEALTHY
 				if cfg.load_state().good.as_deref().and_then(Version::parse) != Some(v) {
 					let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -96,7 +98,7 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 				} else {
 					let _ = cfg.update_state(|s| s.trial = None);
 				}
-				return Ok(Choice { exe, version: v });
+				return Ok(Choice { exe, version: v, verified: Some(verified) });
 			}
 			Err(e) => warn!(event = "update.error", version = %v, error = %e, "not running this cached release"),
 		}
@@ -130,7 +132,16 @@ fn descends_from_me(pid: i32) -> bool {
 
 fn spawn(choice: &Choice, args: &[OsString], notify: &str) -> Result<i32, String> {
 	info!(event = "launch.start", version = %choice.version, exe = %choice.exe.display());
-	let child = std::process::Command::new(&choice.exe)
+	// the file that was verified, not whatever the path names now (the kernel opens
+	// /proc/self/fd/N before closing our close-on-exec descriptor, as fexecve does)
+	let program = match &choice.verified {
+		Some(f) => {
+			use std::os::fd::AsRawFd;
+			PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()))
+		}
+		None => choice.exe.clone(),
+	};
+	let child = std::process::Command::new(&program)
 		.args(args)
 		.env("NOTIFY_SOCKET", notify)
 		.spawn()

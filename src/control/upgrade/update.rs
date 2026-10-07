@@ -155,6 +155,9 @@ pub struct CacheState {
 	pub bad: Vec<String>,
 	#[serde(default)]
 	pub trial: Option<Trial>,
+	/// `generated_at` of the newest release index seen (security review L4).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub index_generated_at: Option<u64>,
 }
 
 /// The self-update settings, resolved.
@@ -216,7 +219,7 @@ impl UpdateConfig {
 	/// Changes the state file under a lock file (the launcher and the server
 	/// both write it).
 	pub fn update_state<T>(&self, f: impl FnOnce(&mut CacheState) -> T) -> Result<T, String> {
-		let _ = std::fs::create_dir_all(&self.cache);
+		let _ = private_dir(&self.cache);
 		let lock = std::fs::OpenOptions::new()
 			.create(true)
 			.truncate(false)
@@ -255,14 +258,23 @@ impl UpdateConfig {
 
 	/// Checks a cached release again (before it runs): both signatures and the hash.
 	pub fn verify_cached(&self, key: &PublicKey, v: Version) -> Result<PathBuf, String> {
+		self.verify_cached_open(key, v).map(|(path, _)| path)
+	}
+
+	/// `verify_cached`, with the binary open (read only) as it was verified: running
+	/// it from this file (`/proc/self/fd/N`) runs what was checked even if the path
+	/// changes after (security review L5).
+	pub fn verify_cached_open(&self, key: &PublicKey, v: Version) -> Result<(PathBuf, std::fs::File), String> {
 		let dir = self.dir(v);
 		let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()));
 		let manifest_bytes = read("manifest.json")?;
 		let manifest_sig = String::from_utf8_lossy(&read("manifest.json.minisig")?).into_owned();
 		let manifest = check_manifest(key, v, &manifest_bytes, &manifest_sig)?;
 		let sig = String::from_utf8_lossy(&read(&format!("{BINARY}.minisig"))?).into_owned();
-		check_binary(key, v, &manifest, &dir.join(BINARY), &sig)?;
-		Ok(dir.join(BINARY))
+		let path = dir.join(BINARY);
+		let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+		check_binary(key, v, &manifest, &mut file, &sig)?;
+		Ok((path, file))
 	}
 
 	/// Keeps only `keep` in the cache.
@@ -312,6 +324,10 @@ fn check_manifest(key: &PublicKey, v: Version, bytes: &[u8], sig: &str) -> Resul
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Index {
 	pub releases: Vec<IndexEntry>,
+	/// When the release workflow wrote it (Unix seconds); an index older than one
+	/// seen before is refused (a mirror replaying an old index; security review L4).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub generated_at: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -319,22 +335,56 @@ pub struct IndexEntry {
 	pub version: String,
 }
 
-fn parse_index(key: &PublicKey, bytes: &[u8], sig: &str) -> Result<Vec<Version>, String> {
+/// The signed index's versions; `seen` is the newest `generated_at` seen before.
+fn parse_index(key: &PublicKey, bytes: &[u8], sig: &str, seen: Option<u64>) -> Result<(Vec<Version>, Option<u64>), String> {
 	minisign::verify(key, sig, bytes).map_err(|e| format!("{INDEX}: {e}"))?;
 	let index: Index = serde_json::from_slice(bytes).map_err(|e| format!("{INDEX}: {e}"))?;
-	Ok(index.releases.iter().filter_map(|r| Version::parse(&r.version)).collect())
+	if let Some(seen) = seen {
+		match index.generated_at {
+			Some(t) if t >= seen => {}
+			Some(t) => return Err(format!("{INDEX} was written at {t}, before one seen already ({seen}); not using an old index")),
+			None => return Err(format!("{INDEX} has no generated_at, but one with it was seen already")),
+		}
+	}
+	Ok((index.releases.iter().filter_map(|r| Version::parse(&r.version)).collect(), index.generated_at))
 }
 
-fn check_binary(key: &PublicKey, v: Version, manifest: &Manifest, path: &Path, sig: &str) -> Result<String, String> {
+/// The binary in `file` is release `v`'s: first its SHA-256 against the signed
+/// manifest (read in pieces, so nothing unsigned is ever held in memory; security
+/// review L3), then its own signature.
+fn check_binary(key: &PublicKey, v: Version, manifest: &Manifest, file: &mut std::fs::File, sig: &str) -> Result<String, String> {
+	use std::io::Seek;
 	let name = asset_name(v);
-	let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-	minisign::verify_reader(key, sig, std::io::BufReader::new(file)).map_err(|e| format!("{name}: {e}"))?;
-	let sha = sha256_file(path)?;
+	let sha = sha256_reader(&mut *file).map_err(|e| format!("{name}: {e}"))?;
 	match manifest.files.get(&name) {
-		Some(want) if want.eq_ignore_ascii_case(&sha) => Ok(sha),
-		Some(_) => Err(format!("{name}: SHA-256 differs from manifest.json")),
-		None => Err(format!("{name} is not in the v{v} manifest.json")),
+		Some(want) if want.eq_ignore_ascii_case(&sha) => {}
+		Some(_) => return Err(format!("{name}: SHA-256 differs from manifest.json")),
+		None => return Err(format!("{name} is not in the v{v} manifest.json")),
 	}
+	file.rewind().map_err(|e| format!("{name}: {e}"))?;
+	minisign::verify_reader(key, sig, std::io::BufReader::new(&mut *file)).map_err(|e| format!("{name}: {e}"))?;
+	Ok(sha)
+}
+
+fn sha256_reader(mut r: impl std::io::Read) -> std::io::Result<String> {
+	use sha2::Digest;
+	let mut h = sha2::Sha256::new();
+	let mut buf = vec![0u8; 1 << 16];
+	loop {
+		match r.read(&mut buf) {
+			Ok(0) => break,
+			Ok(n) => h.update(&buf[..n]),
+			Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+			Err(e) => return Err(e),
+		}
+	}
+	Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Creates the cache's directories for this user only (security review L5).
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+	use std::os::unix::fs::DirBuilderExt;
+	std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
 /// What one check found.
@@ -499,7 +549,11 @@ impl Fetcher {
 		let url = format!("{base}/latest/download/{INDEX}");
 		let bytes = self.get(&url, MAX_SMALL).await?.ok_or(format!("{url} is missing"))?;
 		let sig = self.get_text(&format!("{url}.minisig")).await?.ok_or(format!("{url}.minisig is missing"))?;
-		parse_index(key, &bytes, &sig)
+		let (versions, generated_at) = parse_index(key, &bytes, &sig, self.cfg.load_state().index_generated_at)?;
+		if let Some(t) = generated_at {
+			let _ = self.cfg.update_state(|s| s.index_generated_at = Some(s.index_generated_at.unwrap_or(0).max(t)));
+		}
+		Ok(versions)
 	}
 
 	/// The signed manifest of `v`; None when there is no such release.
@@ -554,11 +608,16 @@ impl Fetcher {
 		// into a directory of its own, moved into place once verified
 		let tmp = self.cfg.cache.join(format!(".tmp-{v}-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&tmp);
-		std::fs::create_dir_all(&tmp).map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
+		private_dir(&tmp).map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
 		let result = async {
 			self.get_to_file(&self.cfg.url(v, &name), &tmp.join(BINARY), MAX_BINARY).await?.ok_or(format!("v{v}: {name} is missing"))?;
 			let (k, m, file, sg) = (key.clone(), manifest.clone(), tmp.join(BINARY), sig.clone());
-			let sha = tokio::task::spawn_blocking(move || check_binary(&k, v, &m, &file, &sg)).await.map_err(|e| e.to_string())??;
+			let sha = tokio::task::spawn_blocking(move || {
+				let mut f = std::fs::File::open(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+				check_binary(&k, v, &m, &mut f, &sg)
+			})
+			.await
+			.map_err(|e| e.to_string())??;
 			let path = self.store(v, &tmp, &sig, &manifest_bytes, &manifest_sig)?;
 			Ok::<_, String>((sha, path))
 		}
@@ -654,7 +713,7 @@ impl Updater {
 		if self.cfg.mode == UpdateMode::Off {
 			return;
 		}
-		if let Err(e) = std::fs::create_dir_all(&self.cfg.cache) {
+		if let Err(e) = private_dir(&self.cfg.cache) {
 			warn!(event = "degraded", part = "update.cache", error = %format!("{}: {e}", self.cfg.cache.display()),
 				"releases cannot be cached; the self-update fails until this is fixed");
 		}
@@ -809,8 +868,14 @@ mod tests {
 		let key = PublicKey::parse(&pub_text).unwrap();
 		let body = br#"{"releases":[{"version":"0.4.0"},{"version":"0.4.7"},{"version":"0.5.0"},{"version":"junk"}]}"#;
 		let sig = minisign::testing::sign(&pair, id, body, "index");
-		assert_eq!(parse_index(&key, body, &sig).unwrap(), [Version(0, 4, 0), Version(0, 4, 7), Version(0, 5, 0)]);
-		assert!(parse_index(&key, br#"{"releases":[{"version":"0.4.9"}]}"#, &sig).unwrap_err().contains("does not match"));
+		assert_eq!(parse_index(&key, body, &sig, None).unwrap().0, [Version(0, 4, 0), Version(0, 4, 7), Version(0, 5, 0)]);
+		assert!(parse_index(&key, br#"{"releases":[{"version":"0.4.9"}]}"#, &sig, None).unwrap_err().contains("does not match"));
+		// security review L4: an index older than one seen is refused
+		let stamped = br#"{"releases":[{"version":"0.4.7"}],"generated_at":1000}"#;
+		let ssig = minisign::testing::sign(&pair, id, stamped, "index");
+		assert_eq!(parse_index(&key, stamped, &ssig, Some(1000)).unwrap().1, Some(1000));
+		assert!(parse_index(&key, stamped, &ssig, Some(1001)).unwrap_err().contains("before one seen"));
+		assert!(parse_index(&key, body, &sig, Some(1)).unwrap_err().contains("no generated_at"));
 	}
 
 	#[test]
@@ -844,7 +909,7 @@ mod tests {
 		assert_eq!(c.cached_versions(), [v]);
 		// tampered with in the cache
 		std::fs::write(&path, b"#!/bin/false\n").unwrap();
-		assert!(c.verify_cached(&key, v).unwrap_err().contains("does not match"));
+		assert!(c.verify_cached(&key, v).unwrap_err().contains("SHA-256 differs"), "the SHA-256 is checked before the signature");
 
 		// state: bad versions and promotion
 		mark_bad(&c, v, "test");

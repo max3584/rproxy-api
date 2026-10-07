@@ -104,6 +104,9 @@ fn list(files: &Files, pair: &ring::signature::Ed25519KeyPair, v: Version) {
 	let key = "/releases/latest/download/releases.json".to_string();
 	let mut index: Value = f.get(&key).map(|b| serde_json::from_slice(b).unwrap()).unwrap_or(json!({"releases": []}));
 	index["releases"].as_array_mut().unwrap().push(json!({"version": v.to_string()}));
+	// newer with each release, as the release workflow writes it (security review L4)
+	let n = index["releases"].as_array().unwrap().len() as u64;
+	index["generated_at"] = json!(1_700_000_000 + n);
 	let body = serde_json::to_vec(&index).unwrap();
 	f.insert(format!("{key}.minisig"), testing::sign(pair, KEY_ID, &body, "index").into());
 	f.insert(key, body.into());
