@@ -123,6 +123,9 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `global.access_log` のディレクトリに書き込めない | アクセスログをメインのログに出す（`part: global.access_log`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
 | `rproxy_rules` を読めない・書けない（テーブルがない、権限、DB が落ちている） | 起動時は UI のルールだけを復元する。API のルールは動かしたまま `persisted: false`（`part: db`、#144） |
+| `global.geoip` のデータベースが読めない（権限）・新しい版が壊れている | 読めるまで国・ASN は「分からない」（`unknown` の扱い）、読み直しでは今のものを使い続ける（`part: geoip`） |
+| `global.performance` の `busy_poll_usecs` を設定できない・`cpu_affinity` に存在しない CPU | `SO_BUSY_POLL` なしで動く / その CPU を除く（`part: global.performance.*`） |
+| 自動更新のキャッシュのディレクトリを作れない | 転送は動かしたまま、直るまで自動更新は失敗する（`part: update.cache`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
 
 
@@ -184,6 +187,7 @@ rproxy-api --check-config                            # RPROXY_CONFIG（/etc/rpro
 rproxy-api --check-config /etc/rproxy/conf.d         # ファイルかディレクトリを指定
 rproxy-api --check-config /etc/rproxy/rproxy.yaml --check-config-format json   # スクリプト向け
 rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
+rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/rproxy/admin.token   # 動いている rproxy と比べた差分も出す
 ```
 
 - 誤り：ファイル・ルール（`rproxy.yaml rule #2` など）ごとに理由を出す。最初の 1 つで止めず、すべて出す
@@ -191,6 +195,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
 - JSON：`{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - 名前解決はしない（転送先の名前が引けるかは、起動したときに分かる）
 - 設定ファイルが指定されていなければ、確かめるものがないので 0 で終わる
+- `--diff`：検証に通ったら、動いている rproxy に `POST /config/plan` で問い合わせ、反映すると作る・変える・消すルールを 1 行ずつ出す（`+` / `~` / `-`、再起動が要る `global` は `!`）。問い合わせ先の既定は `RPROXY_API_SOCKET`、なければ制御 API（`--diff-api` で指定）。トークンは `admin` のスコープ（`--diff-token-file`）。docs/API.md の「変更前の差分」
 
 パッケージ（と install.sh）の systemd のユニットは、`systemctl reload rproxy-api` で先にこの確認をします。誤りがあれば reload は失敗し（`journalctl -u rproxy-api` に理由）、rproxy には何も送りません。そのときは、トークンや証明書の読み直しも行われないので、設定ファイルを直してから reload してください。
 
@@ -205,6 +210,7 @@ curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" 
 
 - `admin` のスコープを持つトークンだけが使えます（UI 用の `rules:read` / `rules:write` では使えない）
 - 既定では Unix ソケット（`RPROXY_API_SOCKET`）からだけ受け付けます。TCP の制御 API から使うなら `RPROXY_API_RELOAD_UNIX_ONLY=false`
+- `POST /config/reload?dry_run=true` は反映せずに、反映したら何が変わるか（`changes`。ルールごとの `diff` と、接続を切らずに変えられるか（`change`：`in_place` / `recreate`））を返します。ルールの `POST` / `PATCH` / `DELETE` と `PUT /rulesets/{name}` にも `?dry_run=true` があります
 - ファイルの変化の検知・SIGHUP と同じ処理で、同時には動きません
 
 ## TLS・DTLS・STARTTLS・ポート範囲
@@ -318,12 +324,13 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `rule.persist` | `persist: true` のトークンの API のルール（`origin: "api"`）を `rproxy_rules` に書いた・消した（`action: save` / `delete`、`token`。#144） |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
+| `acme.helper` | ACME の補助プロセス（`rproxy-api acme-helper`）が待ち受けを始めた・許していない相手を断った・失敗した（`outcome`：`listening` / `refused` / `error`） |
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
-| `performance` | 起動時の `global.performance` の値と出どころ（`sources`） |
-| `handoff.start` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.received` / `handoff.counters` | 再起動なしの更新：始めた / 新しいプロセス（`pid`）の準備ができた / 古いプロセスが今の接続を待つ / 終わった / できなかった（古いプロセスが動き続ける）/ マイナーが違うので断った / 新しいプロセスが受け取った / 古いプロセスの最後の数を足した（docs/UPGRADE.md） |
-| `update.available` / `update.fetched` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` | 自動更新：新しいパッチがある / 確かめてキャッシュに入れた / よい版になった / 悪い版として戻した / 失敗（署名が合わないなど）/ 起動役がサーバを起動した・引き継ぎで主プロセスが変わった |
-| （`debug` だけ）`udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` | UDP のデータグラムを捨てた（数は `stats.dropped`）/ 送受信の失敗 / TCP_NODELAY を設定できない |
+| `performance` | 起動時の `global.performance` の値と出どころ（`sources`）。`SO_BUSY_POLL` を設定できない・存在しない CPU は `degraded`（`part: global.performance.busy_poll_usecs` / `global.performance.cpu_affinity`） |
+| `handoff.start` / `handoff.sent` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.busy` / `handoff.received` / `handoff.sockets` / `handoff.counters` / `handoff.rule` / `handoff.ruleset` | 再起動なしの更新：始めた / ソケットと状態を渡した / 新しいプロセス（`pid`）の準備ができた / 古いプロセスが今の接続を待つ / 終わった / できなかった（古いプロセスが動き続ける）/ マイナーが違う・別のプロセスがつないだので断った / もう動いている / 新しいプロセスが受け取った / 受け取ったソケットを使った・使わずに閉じた / 古いプロセスの最後の数を足した（届かなければ warn）/ 受け取った API のルール・ルールの組を読めない・当てられない（warn）（docs/UPGRADE.md） |
+| `update.check` / `update.available` / `update.fetched` / `update.restart_needed` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` / `launch.exit` | 自動更新：探したが新しいパッチはない / 新しいパッチがある / 確かめてキャッシュに入れた / 引き継げないパッチなので次の再起動で使う / よい版になった / 悪い版として戻した / 失敗（署名が合わないなど）/ 起動役（`rproxy-api launch`）がサーバを起動した / 引き継ぎで主プロセスが変わった / サーバが終わった（`code`）。キャッシュに書けないときは `degraded`（`part: update.cache`） |
+| （`debug` だけ）`udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` / `target.eject_skipped` | UDP のデータグラムを捨てた（数は `stats.dropped`）/ 送受信の失敗 / TCP_NODELAY を設定できない / `max_ejected_percent` のため失敗した宛先を外さなかった |
 
 ## 開発
 

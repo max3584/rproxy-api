@@ -123,6 +123,9 @@ For other environment problems, only the unusable part is stopped and startup co
 | The `global.access_log` directory is not writable | Access logs go to the main log (`part: global.access_log`) |
 | Cannot connect to the DB | Starts without the DB rules (`restore.error`) |
 | `rproxy_rules` cannot be read or written (missing table, permissions, DB down) | At startup only the UI's rules are restored. API rules keep running with `persisted: false` (`part: db`, #144) |
+| The `global.geoip` database cannot be read (permissions), or a new version is corrupt | Until it can be read, country and ASN are unknown (handled as `unknown`); a reload keeps using the current one (`part: geoip`) |
+| `global.performance` `busy_poll_usecs` cannot be set, or `cpu_affinity` names CPUs that do not exist | Runs without `SO_BUSY_POLL` / leaves those CPUs out (`part: global.performance.*`) |
+| The self-update cache directory cannot be created | Forwarding keeps running; the self-update fails until it is fixed (`part: update.cache`) |
 | A rule lacks the required permissions (capabilities) | Only that rule becomes `failed`, with a reason ([docs/en/PERMISSIONS.md](docs/en/PERMISSIONS.md)) |
 
 
@@ -184,6 +187,7 @@ rproxy-api --check-config                            # the file in RPROXY_CONFIG
 rproxy-api --check-config /etc/rproxy/conf.d         # specify a file or directory
 rproxy-api --check-config /etc/rproxy/rproxy.yaml --check-config-format json   # for scripts
 rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
+rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/rproxy/admin.token   # also show the difference from the running rproxy
 ```
 
 - Errors: reasons are reported per file and per rule (such as `rproxy.yaml rule #2`). It does not stop at the first one; all are reported
@@ -191,6 +195,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml && systemctl reload rproxy-api
 - JSON: `{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - No name resolution is done (whether target names resolve is found out at startup)
 - If no configuration file is specified, there is nothing to check, so it exits 0
+- `--diff`: once the check passes, it asks the running rproxy with `POST /config/plan` and prints, one per line, the rules applying it would create, change or remove (`+` / `~` / `-`; `global` changes that need a restart as `!`). It asks `RPROXY_API_SOCKET` by default, else the control API (`--diff-api` to choose). The token needs the `admin` scope (`--diff-token-file`). "Diff before change" in docs/en/API.md
 
 The systemd unit of the package (and install.sh) runs this check first on `systemctl reload rproxy-api`. If there are errors, the reload fails (the reason is in `journalctl -u rproxy-api`) and nothing is sent to rproxy. In that case tokens and certificates are not reloaded either, so fix the configuration file and then reload.
 
@@ -205,6 +210,7 @@ curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" 
 
 - Only tokens with the `admin` scope can use it (the UI's `rules:read` / `rules:write` cannot)
 - By default it is accepted only from the Unix socket (`RPROXY_API_SOCKET`). To use it from the TCP control API, set `RPROXY_API_RELOAD_UNIX_ONLY=false`
+- `POST /config/reload?dry_run=true` applies nothing and returns what applying would change (`changes`: each rule's `diff` and whether it can change without closing connections, `change`: `in_place` / `recreate`). Rule `POST` / `PATCH` / `DELETE` and `PUT /rulesets/{name}` also take `?dry_run=true`
 - It uses the same processing as file change detection and SIGHUP, and they do not run concurrently
 
 ## TLS, DTLS, STARTTLS, port ranges
@@ -318,12 +324,13 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `rule.persist` | An API rule of a `persist: true` token (`origin: "api"`) was written to or deleted from `rproxy_rules` (`action: save` / `delete`, `token`; #144) |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | An ACME order started / a certificate was obtained / renewed / an order failed (`retry_at`) / the issuance limit held an order back (docs/en/ACME.md) |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | An ACME account was created or deactivated / a DNS-01 TXT record was written or removed / a challenge was set up or answered / `http01_listen` started listening. No secret is logged |
+| `acme.helper` | The ACME helper (`rproxy-api acme-helper`) started listening / refused a peer it does not allow / failed (`outcome`: `listening` / `refused` / `error`) |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |
 | `cert.check` | Periodic expiry check (`rules_updated`: number of rules from which expired certificates were removed or that were stopped) |
-| `performance` | The `global.performance` values at startup and where each came from (`sources`) |
-| `handoff.start` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.received` / `handoff.counters` | Live upgrade: started / the new process (`pid`) is ready / the old process waits for its connections / done / failed (the old process keeps running) / refused for another minor / what the new process received / the old process's last counts added (docs/en/UPGRADE.md) |
-| `update.available` / `update.fetched` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` | Self-update: a new patch exists / verified and cached / became the good version / rolled back as bad / failed (a signature that does not match, ...) / the launcher started the server / the main process changed with a handoff |
-| (`debug` only) `udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` | A UDP datagram was dropped (counted in `stats.dropped`) / sending or receiving failed / TCP_NODELAY could not be set |
+| `performance` | The `global.performance` values at startup and where each came from (`sources`). `SO_BUSY_POLL` that cannot be set and CPUs that do not exist log `degraded` (`part: global.performance.busy_poll_usecs` / `global.performance.cpu_affinity`) |
+| `handoff.start` / `handoff.sent` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.busy` / `handoff.received` / `handoff.sockets` / `handoff.counters` / `handoff.rule` / `handoff.ruleset` | Live upgrade: started / sockets and state sent / the new process (`pid`) is ready / the old process waits for its connections / done / failed (the old process keeps running) / refused for another minor or because another process connected / one is already running / what the new process received / inherited sockets taken, or closed unused / the old process's last counts added (warn if they did not arrive) / an inherited API rule or rule set could not be read or applied (warn) (docs/en/UPGRADE.md) |
+| `update.check` / `update.available` / `update.fetched` / `update.restart_needed` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` / `launch.exit` | Self-update: looked, no new patch / a new patch exists / verified and cached / the patch cannot be swapped in live and runs after the next restart / became the good version / rolled back as bad / failed (a signature that does not match, ...) / the launcher (`rproxy-api launch`) started the server / the main process changed with a handoff / the server exited (`code`). A cache that cannot be created logs `degraded` (`part: update.cache`) |
+| (`debug` only) `udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` / `target.eject_skipped` | A UDP datagram was dropped (counted in `stats.dropped`) / sending or receiving failed / TCP_NODELAY could not be set / a failing target was not ejected because of `max_ejected_percent` |
 
 ## Development
 

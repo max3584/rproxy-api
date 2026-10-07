@@ -5,7 +5,7 @@
 | How to run | Scope | CI job |
 |---|---|---|
 | `cargo test` | Unit tests (`src/`) and integration tests (`tests/`) | `test` |
-| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | Restoring from MariaDB. Skipped if the variable is not set | `test` (runs Alpine's MariaDB in the same container) |
+| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore --test persist` | Restoring from MariaDB (`forward_rules`), and storing API-created rules and restoring them across a restart (`rproxy_rules`, #144). Those parts are skipped if the variable is not set | `test` (runs Alpine's MariaDB in the same container) |
 | `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME (docs/en/ACME.md): starts Pebble (the ACME test CA) and PowerDNS and obtains real certificates through HTTP-01, TLS-ALPN-01 and DNS-01 (the PowerDNS API, RFC 2136 (PowerDNS's DNS UPDATE, TSIG HMAC-SHA256 and SHA512), acme-dns (a small stand-in), CNAME delegation, generic REST). That part is skipped without the variables (the tests of the API's guards always run); `RPROXY_TEST_REQUIRE_ACME=1` turns the skip into a failure | `test` (Alpine's `pebble`, `pdns`, `pdns-backend-sqlite3`, `pdns-doc` and `sqlite` in the same container; `RPROXY_TEST_REQUIRE_ACME=1`) |
 | `cargo test --test self_update` | Self-update (#174): fetching and verifying from a signed release mirror (HTTPS), swapping in with a handoff, the launcher (`launch`), rollback. The test of signatures made by the minisign tool is skipped without `minisign` (`RPROXY_TEST_REQUIRE_MINISIGN=1` makes skipping a failure) | `test` (Alpine's `minisign`; `RPROXY_TEST_REQUIRE_MINISIGN=1`) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
@@ -201,7 +201,7 @@ Streams tens of MiB of pseudo-random data (slices of a 1 MiB block at positions 
 
 ## Integration tests: v0.4 shapes (`tests/v04_shapes.rs`, #215)
 
-Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what cannot run yet is refused or ignored. One test per item; implementing an item replaces its test with one showing it works (and turns its `features` flag on).
+Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v0.4.0 every item runs (all `features` flags are true), so what remains here is the `features` list, the scopes of the new endpoints, the validation by `--check-config` and of the startup flags, and that a 0.3 settings file still passes. That each feature works is checked by its own tests (`tests/api_hardening.rs`, `rulesets.rs`, `limits.rs`, `geoip.rs`, `outlier.rs`, `plan.rs`, `persist.rs`, `handoff.rs`, `self_update.rs`, `performance.rs`).
 
 | Test | What it checks |
 |---|---|
@@ -312,6 +312,28 @@ The behaviour without the setting (one failure ejects for 10 s) is in `tests/tar
 | `max_ejected_percent_keeps_targets_and_patch_changes_it_in_place` | `max_ejected_percent: 0` never ejects; PATCH with `{}` goes back to the defaults |
 | `http_servers_that_keep_failing_are_ejected` | A server answering 500 in a row is ejected and the rest get the requests (`ejected` in `stats.http.services`; `target.down` with `service`, `server`, `cause`) |
 | `http_ejection_leaves_at_least_half_by_default` | The default `max_ejected_percent: 50` never ejects them all |
+## Integration tests: others
+
+Test files not covered by the sections above (see the description at the top of each file and the test names).
+
+| File | What it checks |
+|---|---|
+| `tests/check_config.rs` | `rproxy-api --check-config` (#140): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON |
+| `tests/startup.rs` | Starting the real binary: configuration mistakes stop it; problems in the environment (permissions, a busy port) leave it running in a restricted mode that recovers. TLS on the control API, reloads on SIGHUP, `GET /readyz` |
+| `tests/targets.rs` | Several destinations (#98): `targets`, `balance` (round_robin / least_conn / failover), `backup`, `health_check` (L4 and services of `http` rules). The default behaviour without `outlier_detection` |
+| `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99) |
+| `tests/udp_shards.rs` | Reading a UDP port with several `SO_REUSEPORT` sockets (#194): no session opened twice, the reply source (#137), counters add up |
+| `tests/udp_source.rs` | UDP replies on wildcard listeners leave from the address the client sent to (#137; to 127.0.0.2) |
+| `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends |
+| `tests/http.rs` | L7 routing of `http` rules |
+| `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
+| `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc` |
+| `tests/http_resilience.rs` | Health checks, `sticky`, `compress`, `buffering`, `retry`, `circuit_breaker`, `errors` and kept backend connections (#61, #63, #64, #65) |
+| `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients |
+| `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec) |
+| `tests/acme.rs` | ACME (#208): the API's guards (always run) and obtaining real certificates with Pebble and PowerDNS (table above) |
+| `tests/traefik_convert.rs` | `contrib/traefik2rproxy.py` converts `tests/fixtures/traefik/` and rproxy accepts the result. Skipped without python3 and PyYAML (CI sets `RPROXY_TEST_REQUIRE_PYTHON=1`) |
+
 ## Restoring from the DB (`tests/db_restore.rs`)
 
 | Test | What it checks |

@@ -35,7 +35,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 | `--handoff-timeout` / `RPROXY_HANDOFF_TIMEOUT` | `30s` | 新しいプロセスの準備を待つ時間（1 秒〜10 分） |
 | `--handoff-drain` / `RPROXY_HANDOFF_DRAIN` | `5m` | 古いプロセスが今の接続の終わりを待つ最長の時間（0〜24 時間） |
 
-ログ：`handoff.start`・`handoff.sent`・`handoff.received`・`handoff.ready`・`handoff.drain`・`handoff.done`・`handoff.counters`・`handoff.failed`・`handoff.refused`・`handoff.sockets`。`/metrics`：`rproxy_build_info{version,sha256}`、`rproxy_handoffs_total{outcome="done|failed|refused"}`、`rproxy_process_start_time_seconds`。`GET /capabilities` の `build` は `{"version","sha256"}`。
+ログ：`handoff.start`・`handoff.sent`・`handoff.received`・`handoff.ready`・`handoff.drain`・`handoff.done`・`handoff.counters`・`handoff.failed`・`handoff.refused`・`handoff.sockets`、warn の `handoff.busy`（SIGUSR2 のとき引き継ぎがすでに動いている）・`handoff.rule` / `handoff.ruleset`（古いプロセスから受け取ったルール・組を読めない・当てられないので落とした）。`/metrics`：`rproxy_build_info{version,sha256}`、`rproxy_handoffs_total{outcome="done|failed|refused"}`、`rproxy_process_start_time_seconds`。`GET /capabilities` の `build` は `{"version","sha256"}`。
 
 ### systemd
 

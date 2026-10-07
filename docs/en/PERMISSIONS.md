@@ -68,26 +68,32 @@ With `global.acme.helper` (docs/en/ACME.md, "Helper process"). Only this process
 | Secrets for authentication middlewares (`users_file` of `basic_auth`, `client_secret_file` / `cookie_secret_file` of `oidc`; e.g. `/etc/rproxy/auth/`) | `root:rproxy` 640 (directory 750) | Must be readable by the rproxy user. Do not let other users read them (a leaked `cookie_secret_file` allows forging session cookies; `client_secret_file` is the provider's client secret). If unreadable, that middleware returns 503. Changes are reloaded within a few seconds (immediately on SIGHUP). Changing `cookie_secret_file` signs everyone out |
 | Static rules (`RPROXY_STATIC_RULES`) | e.g. `root:rproxy` 640 | Same as above. install.sh checks that the rproxy user can read it |
 | `/run/rproxy/api.sock` (`RPROXY_API_SOCKET`) | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660 (default) | Unix socket for the control API. Only the owner and group can connect. The unit's `RuntimeDirectory=rproxy` creates `/run/rproxy` (create it yourself when not using systemd) |
+| `/run/rproxy/handoff.sock` (`--handoff-socket` / `RPROXY_HANDOFF_SOCKET`, #174) | `rproxy` 600 (SEQPACKET) | The handoff socket, present only during a live upgrade. Only the child the old process started (checked by pid) may connect. Without its parent directory (`/run/rproxy`) the handoff ends in `handoff.failed` and the old process keeps running (docs/en/UPGRADE.md) |
+| Client CA of the control API (`--tls-client-ca` / `RPROXY_TLS_CLIENT_CA`, #167) | e.g. `root:rproxy` 640 | The CA (PEM) that verifies client certificates (mTLS). Not secret, but whoever can rewrite it can pass certificate authentication, so the rproxy user must not be able to write it. Re-read on SIGHUP and when the file changes, like the control API's certificate and key (`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`) |
+| GeoIP databases (`country_db` / `asn_db` of `global.geoip`, #168) | e.g. `root:rproxy` 640 | Must be readable by the rproxy user (otherwise rproxy starts `degraded` and countries/ASNs are "unknown" until it can read them). Updaters (`geoipupdate` etc.) should replace the file (rename). Re-read every `check_interval` and on SIGHUP |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | Policy routing configuration for transparent |
 | `/var/lib/rproxy/` (default `global.acme.storage` is `/var/lib/rproxy/acme`) | `rproxy:rproxy` 750 (below `acme/`: directories 700, files 600) | ACME account keys (`accounts/<name>.key`), certificates obtained and their keys (`certs/`), DNS-01 TXT records not removed yet (`dns-pending.json`). Created by the unit's `StateDirectory=rproxy`. A leaked account key lets someone order and revoke certificates with that account. Removed on purge (docs/en/ACME.md) |
 | Secrets of ACME DNS providers (`api_key_file` / `secret_file` / `tsig_secret_file` / `credentials_file` (acme-dns; written by rproxy) of `global.acme.dns_providers`, EAB `hmac_key_file`; e.g. `/etc/rproxy/acme/`) | `root:rproxy` 640 (directory 750) | Must be readable by the rproxy user; do not let other users read them (they can change DNS records; delegating `_acme-challenge` to a zone of its own and using a key limited to that zone narrows the damage). Not readable through the API |
 | `/var/log/rproxy/` | `rproxy:rproxy` 750 | Logs. They contain client IPs, SNI and client certificate CNs, so restrict who can view them |
+| Self-update cache (`RPROXY_UPDATE_CACHE`, default `/var/cache/rproxy/update`, #174; only `rproxy-api launch` in containers) | Writable by the user running the server (e.g. 700) | Fetched release binaries, signatures and manifests (`<version>/`) and `state.json` (good, previous, bad and trial versions). Signatures are verified again before every run, but whoever can write it can tamper with the bad-version marks and rollbacks, so no other user may write it. Put it on a writable volume (the root filesystem may be read-only). Not used on VMs installed with apt (`RPROXY_UPDATE` stays off) |
 
 ## Control API
 
 - Using the Unix socket (`RPROXY_API_SOCKET`) lets you restrict which users can connect via the file mode and group (loopback TCP can be reached by anyone on the same host). TCP can be closed with `RPROXY_API_PORT=0`.
 - The default listen address is `127.0.0.1`. Listening on anything other than loopback requires both a token file and a TLS certificate (it will not start if either is missing).
-- Tokens written one per line have full permissions. With the YAML format, each token can be given scopes (`rules:read` / `rules:write` / `metrics:read` / `admin`), the listen ports it may change, and an expiry date, and only the SHA-256 is stored in the file (docs/API.md). Changes are recorded in the `event: "audit"` log.
+- Tokens written one per line have full permissions. With the YAML format, each token can be given scopes (`rules:read` / `rules:write` / `metrics:read` / `acme:write` / `admin`), the listen ports it may change, an expiry date, a bound client certificate (`client_cert`) and whether the rules it creates are stored in the DB (`persist`), and only the SHA-256 is stored in the file (docs/en/API.md). Changes are recorded in the `event: "audit"` log.
+- v0.4 (#167): the TCP control API can also check client certificates (mTLS, `--tls-client-auth optional|required` with `--tls-client-ca`). Tokens close to expiry are reported with `token.expiring` / `token.expired`. Sources (IPv6 by /64) with repeated 401s are locked out by default (20 in 1 minute locks for 5 minutes, `429 locked_out`); the Unix socket is not counted ("Control API hardening" in docs/en/API.md).
+- Strong operations (`POST /config/reload`, `/admin/upgrade`, `/admin/update`, ACME renew/revoke) are accepted only over the Unix socket by default (`RPROXY_API_RELOAD_UNIX_ONLY`).
 - Multiple tokens can be active at the same time, so tokens can be rotated without downtime: add a new token and reload, switch the UI over, then remove the old token.
 
 ## DB (MariaDB)
 
 | User | Privileges | Purpose |
 |---|---|---|
-| For rproxy-api (e.g. `rproxy`) | `SELECT ON forward_rules` | Restores rules at startup (does not write) |
+| For rproxy-api (e.g. `rproxy`) | `SELECT ON forward_rules`; to store API-created rules (#144, tokens with `persist: true`) also `SELECT, INSERT, UPDATE, DELETE ON rproxy_rules` | Restores rules at startup (never writes `forward_rules`). Writes only its own `node`'s rows in `rproxy_rules`; without the grant it logs `degraded` (`part: db`) and the rule keeps running with `persisted: false` |
 | For the UI (e.g. `rproxy_ui`) | `SELECT, INSERT, UPDATE, DELETE ON forward_rules`, `SELECT, INSERT ON forward_rules_log` | Rule management and change history |
 
-GRANT examples are in `db/README.md` in the UI repository.
+GRANT examples are in `db/README.md` in the UI repository. The definition and GRANT of `rproxy_rules` are in "Storing API-created rules" in docs/en/API.md.
 
 ## UI (TCP-UDP-rproxy-ui)
 
@@ -100,5 +106,6 @@ GRANT examples are in `db/README.md` in the UI repository.
 | Item | Location | Notes |
 |---|---|---|
 | apt repository signing key | Actions Secrets (`APT_GPG_PRIVATE_KEY` / `APT_GPG_KEY_ID`) | No passphrase. A backup is kept offline (docs/APT.md) |
+| Release signing key (minisign, #174) | Actions Secret `MINISIGN_SECRET_KEY` (secret key), variable `MINISIGN_PUBLIC_KEY` (public key, built into the binary) | Separate from the apt key. No password. A backup is kept offline. If it leaks, arbitrary binaries can be pushed through the self-update (docs/en/RELEASING.md) |
 | main / master | Ruleset | Can only be changed via PRs, and cannot be merged until required CI checks pass. Force pushes and deletion are prohibited |
 | `v*` tags | Ruleset | Deletion and re-pointing are prohibited (the contents of a published version must not change) |

@@ -2,6 +2,8 @@
 
 # v0.4 design: the shape of the configuration and API
 
+> **Implemented (v0.4.0)**: every item of this document is on master and ships in v0.4.0 (shape in #216, implementation in #218-#223). Every v0.4 item of `features` in `GET /capabilities` is true. The authoritative shape is the "v0.4 settings" section of docs/en/API.md; this document stays as the design history. Where the implementation departs from the design is in "15. Deviations in the implementation". The Kubernetes controller (#28) continues in the separate repository `max3584/rproxy-gateway`.
+
 v0.4.0 decides, all at once, the **shape of the configuration and API** for the features to be added (#215). The process follows v0.3.0 (docs/en/DESIGN-v0.3.md): first the shape (types, validation, `features` set to false, openapi.json, the "v0.4 settings" section of docs/API.md, `unsupported` tests) goes into master; then one implementation PR per item is built on top of it, and each item's `features` flag becomes true once implemented.
 
 > **v0.4.0 is released once, with everything implemented** (owner's decision). Unlike v0.3, there is no shape-only v0.4.0 followed by v0.4.x patches filling it in. The shape PR and the implementation PRs land on master one after another, but the release waits until every item is `true`. Until then, items not done yet are `unsupported` on master.
@@ -22,18 +24,18 @@ Once this document is settled, it is copied into the "v0.4 settings" section of 
 
 ### Items, modules and `features`
 
-| Issue | Item | Where the shape lives (module) | `features` |
-|---|---|---|---|
-| #28 | Kubernetes hooks (rule sets, labels, conditions, readiness) | `src/core/ruleset.rs`, `src/control/ruleset_api.rs` | `rulesets`, `labels`, `conditions`, `readyz` |
-| #165 | L4 per-source limits | `src/core/limits.rs` | `limits` |
-| #166 | Bandwidth limits and accounting | `src/core/bandwidth.rs` | `bandwidth` |
-| #167 | Control API hardening | `src/control/hardening.rs` | `client_cert_auth`, `token_expiry`, `api_lockout` |
-| #168 | GeoIP | `src/net/geoip.rs` | `geoip`, `geoip` in `middlewares` |
-| #169 | Diff before change | `src/config/plan.rs` | `dry_run` |
-| #170 | Passive health checks | `src/core/outlier.rs` | `outlier_detection`, `outlier_detection` in `services` |
-| #174 | Live upgrade, self-update | `src/control/upgrade.rs` | `handoff`, `self_update` |
-| #144 | Storing API-created rules | `src/config/persist.rs` | `persistence` |
-| #194, #184 | Performance settings | `src/config/performance.rs` | `performance` (names of the keys that take effect) |
+| Issue | Item | Where the shape lives (module) | `features` | Implemented in |
+|---|---|---|---|---|
+| #28 | Kubernetes hooks (rule sets, labels, conditions, readiness) | `src/core/ruleset.rs`, `src/control/ruleset_api.rs` | `rulesets`, `labels`, `conditions`, `readyz` | #220 |
+| #165 | L4 per-source limits | `src/core/limits.rs` | `limits` | #219 |
+| #166 | Bandwidth limits and accounting | `src/core/bandwidth.rs` | `bandwidth` | #219 |
+| #167 | Control API hardening | `src/control/hardening.rs` | `client_cert_auth`, `token_expiry`, `api_lockout` | #218 |
+| #168 | GeoIP | `src/net/geoip.rs` | `geoip`, `geoip` in `middlewares` | #221 |
+| #169 | Diff before change | `src/config/plan.rs` | `dry_run` | #222 |
+| #170 | Passive health checks | `src/core/outlier.rs` | `outlier_detection`, `outlier_detection` in `services` | #221 |
+| #174 | Live upgrade, self-update | `src/control/upgrade.rs` | `handoff`, `self_update` | #223 |
+| #144 | Storing API-created rules | `src/config/persist.rs` | `persistence` | #222 |
+| #194, #184 | Performance settings | `src/config/performance.rs` | `performance` (names of the keys that take effect) | #223 |
 
 ## 2. Combined example
 
@@ -391,7 +393,7 @@ outlier_detection:
 | `--handoff-drain` / `RPROXY_HANDOFF_DRAIN` | `5m` | Longest the old process waits for current connections (then cuts them) |
 
 - Logs: `handoff.start`, `handoff.ready`, `handoff.done`, `handoff.failed`, `handoff.refused`. `/metrics`: `rproxy_build_info{version,sha256}`, `rproxy_handoffs_total{outcome}`.
-- systemd: either `ExecReload` runs `--check-config` then `kill -USR2 $MAINPID`, or SIGHUP (re-reading settings and certificates) stays separate (see "Open questions"). The .deb `postinst` uses `systemctl kill -s USR2` when major.minor matches the previous version and restarts otherwise.
+- systemd: `systemctl reload` stays SIGHUP (re-reading settings and certificates), and the handoff is a separate SIGUSR2 (decided in 14.). The .deb `postinst` uses `systemctl kill -s USR2` when major.minor matches the previous version and restarts otherwise.
 - Exceptional patches (fixes that cannot be handed over) are announced with `"handoff": false` in the release's `manifest.json` and in the release notes.
 
 ### 10.2 Container self-update
@@ -410,13 +412,13 @@ outlier_detection:
 | `RPROXY_UPDATE_PUBKEY` | the release key built into the binary | minisign public key (a file) to verify with, for mirrors that re-sign |
 | `RPROXY_UPDATE_HEALTHY` | `60s` | A new version that survives this long is marked good |
 
-- Signatures are **minisign** (Ed25519; verification is a small pure-Rust implementation and needs no outside service, unlike cosign). The release workflow attaches a `.minisig` per binary `.tar.gz`, plus `SHA256SUMS` and `manifest.json` (version, whether a handoff is possible, each file's hash) with their signatures. Nothing unverified is executed.
+- Signatures are **minisign** (Ed25519; verification is a small pure-Rust implementation and needs no outside service, unlike cosign). The release workflow attaches a `.minisig` per binary `.tar.gz` (per bare binary in the implementation; 15.), plus `SHA256SUMS` and `manifest.json` (version, whether a handoff is possible, each file's hash) with their signatures. Nothing unverified is executed.
 - API: `GET /admin/update` (`admin`) `{"mode","current":{"version","sha256"},"available":{"version","sha256"}|null,"last_check","error","bad_versions":[...]}`, `POST /admin/update` (`admin`, by default only over the Unix socket; checks now and swaps in under `auto`). The running binary's version and hash are also in `build` of `GET /capabilities` (`{"version","sha256"}`) and `rproxy_build_info`.
 - On Kubernetes, updates replace replicas, so set `RPROXY_UPDATE=off` (the Helm chart's default).
 
 ## 11. #144 Storing API-created rules in the DB
 
-- rproxy **writes only its own table, `rproxy_rules`**. The UI's tables (`forward_rules` / `forward_rules_log`) are never touched. The table definition and GRANT go into the UI repository's `db/` migrations (to be agreed with the UI; below are the columns rproxy uses):
+- rproxy **writes only its own table, `rproxy_rules`**. The UI's tables (`forward_rules` / `forward_rules_log`) are never touched. The table definition and GRANT go into the UI repository's `db/` migrations (below is the proposal from the design; the implemented definition is in "Storing API-created rules" of docs/en/API.md):
 
 ```sql
 CREATE TABLE rproxy_rules (
@@ -489,16 +491,16 @@ global:
 ```json
 "features": {
   "...v0.3 entries...": "...",
-  "rulesets": false, "labels": false, "conditions": false, "readyz": false,
-  "limits": false, "bandwidth": false, "geoip": false, "outlier_detection": false,
-  "dry_run": false, "persistence": false,
-  "client_cert_auth": false, "token_expiry": false, "api_lockout": false,
-  "handoff": false, "self_update": false,
-  "performance": []
+  "rulesets": true, "labels": true, "conditions": true, "readyz": true,
+  "limits": true, "bandwidth": true, "geoip": true, "outlier_detection": true,
+  "dry_run": true, "persistence": true,
+  "client_cert_auth": true, "token_expiry": true, "api_lockout": true,
+  "handoff": true, "self_update": true,
+  "performance": ["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]
 }
 ```
 
-The `geoip` middleware appears in `middlewares`, and the services' `outlier_detection` in `services`, once they can run.
+The `geoip` middleware appears in `middlewares`, and the services' `outlier_detection` in `services`. The above are the v0.4.0 values (at the shape PR everything was false / `[]`; each implementation PR turned its items on).
 
 ### 13.3 DB `options`
 
@@ -520,3 +522,41 @@ The UI's `forward_rules.options` (JSON) also carries a rule's `limits`, `bandwid
 - #167 lockout is on by default (20 failures per minute → 5 minutes; the Unix socket is exempt).
 - #166 UDP bandwidth limits drop what exceeds the rate.
 - Rule-set names may contain `/` (Kubernetes `namespace/name`).
+
+## 15. Deviations in the implementation
+
+Where the implementation PRs departed from the design, or decided what the design left open. docs/en/API.md follows these.
+
+- **#167 Control API hardening (#218)**
+  - A 401 `reason` of `client_cert` was added (the token matched but the certificate bound to it is missing).
+  - `api.lockout` also carries `duration_secs`.
+  - The client CA is re-read on SIGHUP and also by the certificate file check (`RPROXY_CERT_CHECK_SECS`), like the control API certificate.
+  - A successful authentication does not reset the failure count (it restarts when the window passes).
+- **#165, #166 Limits and bandwidth (#219)**
+  - Metric labels are `{protocol,listen,reason}` like the other metrics, not `{rule,reason}` as designed (`rproxy_rule_limited_total`, `rproxy_rule_bandwidth_dropped_total{protocol,listen}`).
+  - HTTP/3 (QUIC) is not covered by `limits` or `bandwidth` (`limits` applies to TCP connections only; bandwidth is handled as TCP).
+  - Rules with a bandwidth limit are never spliced (a `PATCH` adding a limit moves spliced connections back to a user-space copy).
+- **#28 Rule sets, conditions, readiness (#220)**
+  - `BackendsHealthy` on a rule that is not running is `status: "Unknown"`, reason `NotProgrammed` (False would read as "every backend down" while the state is unknown).
+  - `ResolvedRefs` gained the reason `SecretUnreadable` (middleware secret files, separate from `CertificateUnreadable`).
+  - `change` is `in_place` / `recreate` only for `update`; `create`, `delete` and `none` have `none`.
+  - The answer to `PUT /rulesets/{name}?dry_run=true` is the rule set answer (`dry_run: true`, the would-be `etag`, `diff` on `update`), not `RulePlan`.
+  - `DELETE /rulesets/{name}` also takes `If-Match`. `GET /rulesets/{name}` also shows `updated_at` and `updated_by`.
+  - The `PUT /rulesets/{name}` body limit is 32 MiB (the API default of 2 MiB is too small for 10,000 rules).
+- **#168 GeoIP, #170 passive health checks (#221)**
+  - A connection failure's `target.down` changed from `reason: connect` to `reason: outlier` + `cause: connect` (also `refused`, `short_lived`). Health check `target.down` / `target.up` carry `reason: health_check`; the `target.up` when an ejection expires carries `reason: outlier`.
+  - The L7 `cause` is the name of the crossed threshold (`consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`). Gateway failures also count toward consecutive 5xx (as in Envoy).
+  - When an ejected destination fails again (all were ejected and it was tried), the ejection time restarts but the count does not grow. When every L7 server is ejected, servers that are up by health check are used.
+  - A doubled ejection time goes back to the first value after `max_ejection_time` without an ejection.
+  - GeoIP is checked in the order `allow_from` → `geoip` → `crowdsec` (`limits` after them).
+- **#169 Diff before change, #144 storage (#222)**
+  - The assignment of `change` values (as for #28 above) is written in docs/en/API.md.
+  - What is stored: creation is decided by the token's `persist`, changes and deletions by the rule's `origin` (so a row never diverges when another token changes an `api` rule).
+  - `--check-config --diff` trusts `RPROXY_TLS_CERT` when it asks over https (for a self-signed control API).
+- **#174 Live upgrade, self-update (#223)**
+  - Signatures are per release asset (the bare binary `rproxy-api-v<X.Y.Z>-<target>`), not per `.tar.gz` (releases have no `.tar.gz`).
+  - Finding patches: every release attaches an index of all versions, `releases.json` (minisign-signed); self-update reads `<source>/latest/download/releases.json` and picks the newest of the same X.Y (no GitHub API; a mirror only needs the same paths).
+  - `RPROXY_UPDATE_CA_FILE` (hidden environment variable): for mirrors with a private CA and for tests.
+  - The handed-over state also includes the API rules (in the `GET /rules` shape, with #144's `created_by`, `created_at`, `persisted`), `stats.http`, and `counters_since` (kept from the old process), `limited` and bandwidth drops. What starts over in the new process (`limits` and `bandwidth` buckets and per-source counts, L7 `rate_limit` and similar state, ejected destinations) is in docs/en/UPGRADE.md.
+  - The self-update binary is streamed into a temporary file in the cache and verified from the file (not held in memory; capped at 1 GiB).
+  - During a handoff (and in the old process afterwards) change endpoints answer `503 upgrading`.

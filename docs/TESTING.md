@@ -5,7 +5,7 @@ English: [TESTING.md](en/TESTING.md)
 | 実行方法 | 対象 | CI のジョブ |
 |---|---|---|
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
-| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
+| `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore --test persist` | MariaDB からの復元（`forward_rules`）と、API で作ったルールの保存・再起動をまたぐ復元（`rproxy_rules`、#144）。変数がなければその部分はスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
 | `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME（docs/ACME.md）：Pebble（ACME の試験用の CA）と PowerDNS を起動して、HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS の API・RFC 2136（PowerDNS の DNS UPDATE、TSIG の HMAC-SHA256 と SHA512）・acme-dns（小さな偽物）・CNAME の委任・汎用の REST）で実際に証明書を取る。変数がなければその部分はスキップ（API の守りの試験はいつも動く）。`RPROXY_TEST_REQUIRE_ACME=1` でスキップを失敗にする | `test`（同じコンテナで Alpine の `pebble`・`pdns`・`pdns-backend-sqlite3`・`pdns-doc`・`sqlite`。`RPROXY_TEST_REQUIRE_ACME=1`） |
 | `cargo test --test self_update` | 自動更新（#174）：署名つきのリリースのミラー（HTTPS）から取って確かめ、引き継ぎで入れ替える・起動役（`launch`）・ロールバック。minisign の道具で作った署名を確かめる試験は、`minisign` がなければスキップ（`RPROXY_TEST_REQUIRE_MINISIGN=1` でスキップを失敗にする） | `test`（Alpine の `minisign`。`RPROXY_TEST_REQUIRE_MINISIGN=1`） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
@@ -201,7 +201,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 
 ## 結合テスト：v0.4 の形（`tests/v04_shapes.rs`、#215）
 
-v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かないものが断られる・無視されることを確かめる。項目ごとに 1 つのテストにしてあり、項目を実装したらそのテストを動くことのテストに置き換える（`features` も true にする）。
+v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.0 ではすべての項目が動く（`features` はすべて true）ので、ここに残っているのは `features` の一覧・新しいエンドポイントのスコープ・`--check-config` と起動時の引数の検証・0.3 の設定ファイルがそのまま通ることだけ。各機能が動くことは、機能ごとのテスト（`tests/api_hardening.rs`・`rulesets.rs`・`limits.rs`・`geoip.rs`・`outlier.rs`・`plan.rs`・`persist.rs`・`handoff.rs`・`self_update.rs`・`performance.rs`）で確かめる。
 
 | テスト | 確かめること |
 |---|---|
@@ -311,6 +311,28 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `max_ejected_percent_keeps_targets_and_patch_changes_it_in_place` | `max_ejected_percent: 0` は外さない。PATCH の `{}` で既定に戻る |
 | `http_servers_that_keep_failing_are_ejected` | 500 を続けて返すサーバを外し、残りに送る（`stats.http.services` の `ejected`、`target.down` の `service`・`server`・`cause`） |
 | `http_ejection_leaves_at_least_half_by_default` | 既定の `max_ejected_percent: 50` で、全部は外さない |
+
+## 結合テスト：そのほか
+
+ここまでの節にないテストのファイル（中身はファイルの先頭の説明とテストの名前を見る）。
+
+| ファイル | 確かめること |
+|---|---|
+| `tests/check_config.rs` | `rproxy-api --check-config`（#140）：起動・再読み込みと同じ道筋で設定ファイルを確かめ、何も開かず、終了コード・テキスト・JSON で答える |
+| `tests/startup.rs` | 本物のバイナリの起動：設定の誤りは止まり、環境の問題（権限・使用中のポート）は制限つきで動き続けて、直れば戻る。制御 API の TLS と SIGHUP の読み直し、`GET /readyz` |
+| `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き |
+| `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99） |
+| `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
+| `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |
+| `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先 |
+| `tests/http.rs` | `http` のルールの L7 のルーティング |
+| `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |
+| `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc` |
+| `tests/http_resilience.rs` | ヘルスチェック・`sticky`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・転送先の接続の使い回し（#61・#63・#64・#65） |
+| `tests/http_semantics.rs` | HTTP の転送の約束（docs/API.md の「HTTP の転送の扱い」）：クッキー・繰り返しのフィールド・hop-by-hop・本文・大きなヘッダ・時間切れを HTTP/1.1・HTTP/2・HTTP/3 のクライアントで |
+| `tests/crowdsec.rs` | `crowdsec` ミドルウェア（偽の LAPI と AppSec） |
+| `tests/acme.rs` | ACME（#208）：API の守り（いつも動く）と、Pebble・PowerDNS で実際に証明書を取る（上の表） |
+| `tests/traefik_convert.rs` | `contrib/traefik2rproxy.py` が `tests/fixtures/traefik/` を変換し、rproxy が受け付ける。python3 と PyYAML がなければスキップ（CI は `RPROXY_TEST_REQUIRE_PYTHON=1`） |
 
 ## DB からの復元（`tests/db_restore.rs`）
 
