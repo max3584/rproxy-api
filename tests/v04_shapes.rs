@@ -66,7 +66,7 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
 	for flag in [
-		"rulesets", "labels", "conditions", "readyz", "limits", "bandwidth", "geoip", "outlier_detection", "dry_run",
+		"rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection", "dry_run",
 		"persistence", "client_cert_auth", "token_expiry", "api_lockout", "handoff", "self_update",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
@@ -81,24 +81,6 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 async fn labels_are_checked_then_unsupported() {
 	let h = harness().await;
 	rule_setting(&h, "tcp", "labels", json!({"tenant": "act"}), json!({"bad key": "x"})).await;
-}
-
-/// #165
-#[tokio::test]
-async fn limits_are_checked_then_unsupported() {
-	let h = harness().await;
-	let good = json!({"max_connections": 100, "per_source": {"max_connections": 4, "new_connections": {"average": 10}}});
-	rule_setting(&h, "tcp", "limits", good, json!({"per_source": {"packets": {"average": 5}}})).await;
-	let good = json!({"per_source": {"packets": {"average": 1000, "period": "1s", "burst": 2000}}});
-	rule_setting(&h, "udp", "limits", good, json!({"max_connections": 0})).await;
-}
-
-/// #166
-#[tokio::test]
-async fn bandwidth_is_checked_then_unsupported() {
-	let h = harness().await;
-	let good = json!({"upload": "10Mbps", "download": "100Mbps", "per_source": {"download": "5Mbps"}});
-	rule_setting(&h, "tcp", "bandwidth", good, json!({"upload": "10MB/s"})).await;
 }
 
 /// #168, L4 and the middleware

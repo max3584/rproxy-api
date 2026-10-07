@@ -141,6 +141,16 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		denied(&rt, client, "crowdsec", None);
 		return;
 	}
+	// `limits` (#165): held until the connection ends (also through `handle_http`)
+	let _permit = match rt.limits.get().map(|l| l.admit(client.ip())) {
+		None => None,
+		Some(Ok(permit)) => Some(permit),
+		Some(Err(reason)) => {
+			// closed at once, nothing sent
+			crate::core::limits::refused(&rt, client, reason, "tcp");
+			return;
+		}
+	};
 	let tls = rt.tls();
 	// a `terminate` rule with passthrough routes reads the ClientHello first:
 	// passthrough names are relayed as they are, the others are terminated
@@ -219,7 +229,7 @@ async fn run(
 			detail.lease = lease;
 			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr);
 			send_proxy_header(rt, &mut out, client, local, None).await?;
-			finish_plain(rt, inbound, &mut out, detail).await
+			finish_plain(rt, client, inbound, &mut out, detail).await
 		}
 		TlsMode::Sni => {
 			let (name, hello) = crate::tls::sni::read_client_hello(inbound).await.inspect_err(|_| rt.stats.tls_failed())?;
@@ -253,16 +263,18 @@ async fn relay_hello(
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
-	finish_plain(rt, inbound, &mut out, detail).await
+	finish_plain(rt, client, inbound, &mut out, detail).await
 }
 
 /// `finish` for two plain TCP sockets (nothing terminated in between): a
-/// direction that carries a bulk transfer moves on to splice(2) (#184, `l4::splice`).
-async fn finish_plain(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> io::Result<()> {
+/// direction that carries a bulk transfer moves on to splice(2) (#184,
+/// `l4::splice`) while the rule has no `bandwidth` limit.
+async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> io::Result<()> {
 	#[cfg(target_os = "linux")]
 	if crate::l4::splice::settings().enabled {
 		let (rx, tx) = (AtomicU64::new(0), AtomicU64::new(0));
-		let result = crate::l4::splice::relay(a, b, &rx, &tx, &rt.stats.rx_bytes, &rt.stats.tx_bytes).await;
+		let totals = crate::l4::splice::Totals { rx: &rx, tx: &tx, rx_total: &rt.stats.rx_bytes, tx_total: &rt.stats.tx_bytes };
+		let result = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip()).await;
 		detail.rx += rx.into_inner();
 		detail.tx += tx.into_inner();
 		if result.is_err() {
@@ -273,7 +285,7 @@ async fn finish_plain(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detail
 		return Ok(());
 	}
 	let backend = b.as_raw_fd();
-	finish(rt, a, b, backend, PLAIN, detail).await
+	finish(rt, client, a, b, backend, PLAIN, detail).await
 }
 
 /// A stream that first yields bytes already read from it (the ClientHello read
@@ -327,20 +339,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 /// connection is reset (RST) rather than closed cleanly, so it does not take a
 /// cut-off stream for a complete one (the client's is reset by `handle`).
 /// `reads` is how much is read at a time from `a` and from `b`
-/// (`relay::TLS_READ_SIZE` for TLS streams).
+/// (`relay::TLS_READ_SIZE` for TLS streams). Reads wait for the rule's
+/// `bandwidth` (`Shaped`; nothing but a relaxed load per read without one).
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 	rt: &Runtime,
+	client_addr: SocketAddr,
 	a: &mut A,
 	b: &mut B,
 	b_fd: RawFd,
 	reads: (usize, usize),
 	detail: &mut Detail,
 ) -> io::Result<()> {
-	let mut client = Counted::new(a, &rt.stats.rx_bytes);
-	let mut backend = Counted::new(b, &rt.stats.tx_bytes);
+	use crate::core::bandwidth::{Dir, Gate, Shaped};
+	let ip = client_addr.ip();
+	let mut client = Shaped::new(Counted::new(a, &rt.stats.rx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Up));
+	let mut backend = Shaped::new(Counted::new(b, &rt.stats.tx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Down));
 	let result = relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1).await;
-	detail.rx += client.count;
-	detail.tx += backend.count;
+	detail.rx += client.into_inner().count;
+	detail.tx += backend.into_inner().count;
 	if result.is_err() {
 		// SAFETY: `b` (which owns `b_fd`) is borrowed for this whole call, so the fd is open
 		reset_on_close(&unsafe { BorrowedFd::borrow_raw(b_fd) });
@@ -416,12 +432,12 @@ async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt
 			(TlsMode::Terminate, Some(config)) => {
 				let (session, i) = accept_tls(Prefixed::new(prefix, inbound), client, &rt, offset, config).await?;
 				info = Some(i.clone());
-				let stream = Metered::new(session, rt.clone(), rx.clone(), tx.clone());
+				let stream = Metered::new(session, rt.clone(), client.ip(), rx.clone(), tx.clone());
 				http::serve(stream, client, local, rt.clone(), Some(i)).await
 			}
 			(TlsMode::Terminate, None) => Err(io::Error::other("TLS is not configured")),
 			_ => {
-				let stream = Metered::new(inbound, rt.clone(), rx.clone(), tx.clone());
+				let stream = Metered::new(inbound, rt.clone(), client.ip(), rx.clone(), tx.clone());
 				http::serve(stream, client, local, rt.clone(), None).await
 			}
 		}
@@ -507,7 +523,7 @@ async fn terminate(
 		}
 	}
 	let upstream_read = if tls.connector.is_some() { relay::TLS_READ_SIZE } else { relay::BUFFER_SIZE };
-	finish(rt, &mut session, &mut upstream, backend, (relay::TLS_READ_SIZE, upstream_read), detail).await
+	finish(rt, client, &mut session, &mut upstream, backend, (relay::TLS_READ_SIZE, upstream_read), detail).await
 }
 
 /// SMTP client that carried on without STARTTLS (`starttls_required: false`).
@@ -533,5 +549,5 @@ async fn plain_smtp(
 	inbound.write_all(&extra).await?;
 	inbound.write_all(&after).await?;
 	let backend = out.as_raw_fd();
-	finish(rt, inbound, &mut out, backend, PLAIN, detail).await
+	finish(rt, client, inbound, &mut out, backend, PLAIN, detail).await
 }

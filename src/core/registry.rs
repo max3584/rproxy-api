@@ -164,8 +164,8 @@ impl Entry {
 					tls_failures: s.tls_failures.load(Ordering::Relaxed),
 					denied: s.denied.load(Ordering::Relaxed),
 					dropped: s.dropped.load(Ordering::Relaxed),
-					limited: None,
-					counters_since: None,
+					limited: Some(s.limited_total()),
+					counters_since: Some(r.started_at),
 					http: r.spec.http.is_some().then(|| {
 						let mut v = crate::l7::access::HttpStatsView::from_stats(&r.rt.http_stats);
 						v.services = r.rt.http_router().map(|router| router.health()).unwrap_or_default();
@@ -366,6 +366,8 @@ fn route_spec(route: &Route) -> String {
 
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
+		// fixes the start time of the process (`rproxy_process_start_time_seconds`)
+		crate::core::bandwidth::process_start();
 		Arc::new(Registry {
 			cfg,
 			rules: Mutex::default(),
@@ -663,10 +665,16 @@ impl Registry {
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			denied_log: Default::default(),
+			limits: Default::default(),
+			limited_log: Default::default(),
+			bandwidth: Default::default(),
 			stop: kill.child_token(),
 			kill,
 			tracker: TaskTracker::new(),
 		});
+
+		rt.limits.set(spec.limits.as_ref());
+		rt.bandwidth.set(spec.bandwidth.as_ref());
 
 		// bind everything first so a failure leaves nothing half-open
 		let bound = spec.listen_ips().into_iter().map(|ip| Ok((ip, bind_all(&spec, ip)?))).collect::<Result<Vec<_>, ApiError>>()?;
@@ -910,6 +918,13 @@ impl Registry {
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
+				// from the next connection / read on; what the limits count is kept
+				if r.spec.limits != spec.limits {
+					r.rt.limits.set(spec.limits.as_ref());
+				}
+				if r.spec.bandwidth != spec.bandwidth {
+					r.rt.bandwidth.set(spec.bandwidth.as_ref());
+				}
 				if backends_changed {
 					// new connections use the new targets; UDP sessions move when theirs is gone
 					r.backends.stop();
@@ -1398,13 +1413,15 @@ impl Registry {
 		let _ = writeln!(out, "rproxy_rules{{state=\"running\"}} {running}");
 		let _ = writeln!(out, "rproxy_rules{{state=\"failed\"}} {}", rules.len() - running);
 
-		let mut lines: [(&str, &str, &str, Vec<String>); 6] = [
+		let mut lines: [(&str, &str, &str, Vec<String>); 8] = [
 			("rproxy_rule_up", "gauge", "1 if the rule is running.", vec![]),
 			("rproxy_connections", "gauge", "Open TCP connections or UDP sessions.", vec![]),
 			("rproxy_connections_total", "counter", "TCP connections or UDP sessions handled.", vec![]),
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
 			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
-			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, or sending failed).", vec![]),
+			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, sending failed, or over bandwidth).", vec![]),
+			("rproxy_rule_limited_total", "counter", "Connections (TCP) or datagrams (UDP) refused by the rule's limits, by reason.", vec![]),
+			("rproxy_rule_bandwidth_dropped_total", "counter", "UDP datagrams dropped over the rule's bandwidth.", vec![]),
 		];
 		for (key, entry) in rules.iter() {
 			let labels = format!("protocol=\"{}\",listen=\"{}\"", key.protocol, key.listen);
@@ -1414,6 +1431,15 @@ impl Registry {
 					lines[4].3.push(format!("{{{labels}}} {}", s.tls_failures.load(Ordering::Relaxed)));
 					if key.protocol == Protocol::Udp {
 						lines[5].3.push(format!("{{{labels}}} {}", s.dropped.load(Ordering::Relaxed)));
+					}
+					if r.spec.limits.is_some() || s.limited_total() > 0 {
+						for reason in crate::core::limits::Reason::ALL {
+							let n = s.limited[reason.index()].load(Ordering::Relaxed);
+							lines[6].3.push(format!("{{{labels},reason=\"{}\"}} {n}", reason.as_str()));
+						}
+					}
+					if key.protocol == Protocol::Udp && (r.spec.bandwidth.is_some() || s.bandwidth_dropped.load(Ordering::Relaxed) > 0) {
+						lines[7].3.push(format!("{{{labels}}} {}", s.bandwidth_dropped.load(Ordering::Relaxed)));
 					}
 					lines[0].3.push(format!("{{{labels}}} 1"));
 					lines[1].3.push(format!("{{{labels}}} {}", s.active.load(Ordering::Relaxed)));
@@ -1452,6 +1478,9 @@ impl Registry {
 				let _ = writeln!(out, "rproxy_crowdsec_last_success_timestamp_seconds {at}");
 			}
 		}
+		let _ = writeln!(out, "# HELP rproxy_process_start_time_seconds Start time of the process in Unix seconds (kept over a handoff).");
+		let _ = writeln!(out, "# TYPE rproxy_process_start_time_seconds gauge");
+		let _ = writeln!(out, "rproxy_process_start_time_seconds {}", crate::core::bandwidth::process_start());
 		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals under attack do not flood the log (UDP conn.denied, control API audit).");
 		let _ = writeln!(out, "# TYPE rproxy_log_suppressed_total counter");
 		let _ = writeln!(out, "rproxy_log_suppressed_total {}", crate::logging::suppressed_total());

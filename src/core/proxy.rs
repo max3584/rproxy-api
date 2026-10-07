@@ -28,6 +28,10 @@ pub struct Stats {
 	/// UDP datagrams rproxy could not pass on: a session's queue was full, or
 	/// sending failed (the kernel's own socket-buffer drops are not seen here).
 	pub dropped: AtomicU64,
+	/// Refused by `limits` (#165), by `limits::Reason`.
+	pub limited: [AtomicU64; 4],
+	/// UDP datagrams dropped over `bandwidth` (#166; also in `dropped`).
+	pub bandwidth_dropped: AtomicU64,
 }
 
 impl Stats {
@@ -52,6 +56,20 @@ impl Stats {
 
 	pub fn dropped(&self) {
 		self.dropped.fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn limited(&self, reason: crate::core::limits::Reason) {
+		self.limited[reason.index()].fetch_add(1, Ordering::Relaxed);
+	}
+
+	pub fn limited_total(&self) -> u64 {
+		self.limited.iter().map(|n| n.load(Ordering::Relaxed)).sum()
+	}
+
+	/// A UDP datagram over `bandwidth`.
+	pub fn bandwidth_dropped(&self) {
+		self.dropped.fetch_add(1, Ordering::Relaxed);
+		self.bandwidth_dropped.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn denied(&self) {
@@ -126,6 +144,12 @@ pub struct Runtime {
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
 	/// datagrams (whose sources may be spoofed) must not flood the log.
 	pub denied_log: crate::logging::Throttle<std::net::IpAddr>,
+	/// `limits` (#165): connection / datagram limits, whole rule and per source.
+	pub limits: crate::core::limits::Limits,
+	/// `conn.limited` lines, by client address (as `denied_log`).
+	pub limited_log: crate::logging::Throttle<std::net::IpAddr>,
+	/// `bandwidth` (#166).
+	pub bandwidth: crate::core::bandwidth::Bandwidth,
 	/// Stops accepting new connections.
 	pub stop: CancellationToken,
 	/// Closes established connections. `stop` is its child, so this stops everything.

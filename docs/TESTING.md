@@ -179,6 +179,20 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 |---|---|
 | `relay_buffers_and_half_closes` | データが通り終わった接続（平文 50 本、TLS の終端 20 本）はバッファを持たない（そのあとも使える）。転送先が読まず詰まっている接続はバッファを持ち、終わったら返す。転送先が先に FIN を送っても（平文・TLS の終端）、クライアントが先に終えても（TLS の終端）、半分閉じとして伝わり、残りの向きのデータが全部届く |
 
+## 結合テスト：L4 の制限と帯域（`tests/limits.rs`、#165・#166）
+
+| テスト | 確かめること |
+|---|---|
+| `capabilities_say_limits_and_bandwidth_run` | `features.limits`・`features.bandwidth` が true |
+| `tcp_connections_are_limited_per_source_and_per_rule` | 送信元ごと・ルール全体の同時接続数を超えた TCP の接続は何も送らずに閉じる（`stats.limited`、`rproxy_rule_limited_total` の `reason`）。閉じた接続の分は空く。`PATCH` で上限を変えても開いている接続は数えたまま、`{}` で外れる。`stats.counters_since`・`rproxy_process_start_time_seconds` |
+| `tcp_new_connections_are_a_rate` | 新しい接続の速さ（`new_connections`） |
+| `http_rules_limit_their_connections` | `http` のルールでは TCP の接続に効く |
+| `udp_sessions_and_datagrams_are_limited` | UDP のセッションの数と、送信元ごとのデータグラムの速さ（`packets`）。超えたデータグラムは捨て、セッションを作らない |
+| `tcp_bandwidth_waits_and_applies_to_open_connections` | 下りの上限を `PATCH` で付けると、splice で大きな転送をしている接続も絞られ（1 MB/s）、バイトは欠けない。外すと速さが戻る |
+| `tcp_upload_per_source_waits` | 送信元ごとの上りの上限で、クライアントの書き込みが待たされる |
+| `http_rules_are_shaped` | `http` のルールの応答が下りの上限で絞られる |
+| `udp_bandwidth_drops_over_the_rate` | UDP の下りの上限を超えたデータグラムを捨て、`stats.dropped`・`rproxy_rule_bandwidth_dropped_total` に数える（上りはそのまま） |
+
 ## 結合テスト：v0.4 の形（`tests/v04_shapes.rs`、#215）
 
 v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かないものが断られる・無視されることを確かめる。項目ごとに 1 つのテストにしてあり、項目を実装したらそのテストを動くことのテストに置き換える（`features` も true にする）。
@@ -186,7 +200,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 | テスト | 確かめること |
 |---|---|
 | `capabilities_list_the_v0_4_features_as_off` | `features` の v0.4 の印がすべて false、`performance` が空 |
-| `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
+| `labels_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
 | `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
 | `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |

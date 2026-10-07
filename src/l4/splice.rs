@@ -20,6 +20,11 @@
 //! is emptied when no direction is splicing any more. A side that cannot be
 //! spliced (EINVAL / ENOSYS) or a pipe that cannot be made (EMFILE) goes back to
 //! the user-space copy for the rest of that direction.
+//!
+//! A rule with a `bandwidth` limit (#166) is not spliced: the user-space copy
+//! reads at the limit's pace (`bandwidth::Shaped`). A direction checks before
+//! each splice and goes back to the shaped copy when a limit applies (a PATCH
+//! that adds one), and does not hand over to splice again while it does.
 
 use std::io;
 use std::net::Shutdown;
@@ -34,6 +39,7 @@ use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
+use crate::core::bandwidth::{Bandwidth, Dir, Gate, Shaped};
 use crate::core::proxy::Counted;
 use crate::l4::relay::{self, Copy, Handover, Step};
 
@@ -189,40 +195,58 @@ fn splice(from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
 /// passed on as a half-close, an error of either direction ends both. Each
 /// direction starts with the user-space copy of `relay` (pooled buffers) and,
 /// once it carries a bulk transfer (`Settings::full_reads`, `Settings::after`),
-/// moves on to splice. Bytes read from `a` are counted in `rx` and `rx_total`,
-/// from `b` in `tx` and `tx_total`, as they move.
-pub async fn relay(
-	a: &mut TcpStream,
-	b: &mut TcpStream,
-	rx: &AtomicU64,
-	tx: &AtomicU64,
-	rx_total: &AtomicU64,
-	tx_total: &AtomicU64,
-) -> io::Result<()> {
+/// moves on to splice. Bytes read from `a` are counted in `totals.rx` and
+/// `totals.rx_total`, from `b` in `tx` and `tx_total`, as they move. `bw` is the
+/// rule's bandwidth limit and `client` the client's address (its source).
+pub async fn relay(a: &mut TcpStream, b: &mut TcpStream, totals: Totals<'_>, bw: &Bandwidth, client: std::net::IpAddr) -> io::Result<()> {
 	let (mut ar, mut aw) = a.split();
-	let (mut br, mut bw) = b.split();
-	tokio::try_join!(direction(&mut ar, &mut bw, rx, rx_total), direction(&mut br, &mut aw, tx, tx_total))?;
+	let (mut br, mut bw_half) = b.split();
+	tokio::try_join!(
+		direction(&mut ar, &mut bw_half, totals.rx, totals.rx_total, bw, Gate::new(client, Dir::Up)),
+		direction(&mut br, &mut aw, totals.tx, totals.tx_total, bw, Gate::new(client, Dir::Down))
+	)?;
 	Ok(())
 }
 
-async fn direction(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, count: &AtomicU64, total: &AtomicU64) -> io::Result<()> {
+/// Where `relay` counts the bytes: this connection's and the rule's, each way.
+pub struct Totals<'a> {
+	pub rx: &'a AtomicU64,
+	pub tx: &'a AtomicU64,
+	pub rx_total: &'a AtomicU64,
+	pub tx_total: &'a AtomicU64,
+}
+
+async fn direction(
+	r: &mut ReadHalf<'_>,
+	w: &mut WriteHalf<'_>,
+	count: &AtomicU64,
+	total: &AtomicU64,
+	bw: &Bandwidth,
+	mut gate: Gate,
+) -> io::Result<()> {
 	let Settings { after, full_reads, .. } = *settings();
-	let mut handover = Some(Handover { full_reads, after });
+	let mut can_splice = true;
 	loop {
-		// user space, until the reader ends or the transfer is a bulk one
-		let mut reader = Counted::new(&mut *r, total);
+		// user space, until the reader ends or the transfer is a bulk one; shaped
+		// (and never handed over) while the rule has a bandwidth limit
+		let handover = (can_splice && !bw.is_on()).then_some(Handover { full_reads, after });
+		let mut reader = Shaped::new(Counted::new(&mut *r, total), bw, gate);
 		let mut copy = Copy::new(relay::BUFFER_SIZE).with_handover(handover);
 		let step = poll_fn(|cx| copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut *w))).await;
-		count.fetch_add(reader.count, Ordering::Relaxed);
 		drop(copy);
+		let (counted, g) = reader.into_parts();
+		count.fetch_add(counted.count, Ordering::Relaxed);
+		gate = g;
 		match step? {
 			Step::Done(_) => return w.shutdown().await,
 			Step::Handover(_) => {}
 		}
-		match spliced(r.as_ref(), w.as_ref(), count, total).await? {
+		match spliced(r.as_ref(), w.as_ref(), count, total, bw).await? {
 			Spliced::Ended => return Ok(()),
 			// this pair cannot be spliced: the user-space copy to the end
-			Spliced::Unsupported => handover = None,
+			Spliced::Unsupported => can_splice = false,
+			// a bandwidth limit applies now: the shaped copy
+			Spliced::Shaped => {}
 		}
 	}
 }
@@ -230,10 +254,12 @@ async fn direction(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, count: &AtomicU6
 enum Spliced {
 	Ended,
 	Unsupported,
+	Shaped,
 }
 
-/// Moves `src` to `dst` through a pipe until `src` ends, then passes the FIN on.
-async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &AtomicU64) -> io::Result<Spliced> {
+/// Moves `src` to `dst` through a pipe until `src` ends, then passes the FIN on;
+/// stops (with the pipe empty) when the rule gets a bandwidth limit.
+async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &AtomicU64, bw: &Bandwidth) -> io::Result<Spliced> {
 	let (src_fd, dst_fd) = (src.as_raw_fd(), dst.as_raw_fd());
 	// declared before `pipe` so the pipe is given back before this ends (and may empty the pool)
 	let _splicing = Splicing::start();
@@ -241,6 +267,10 @@ async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &At
 	loop {
 		// wait without a pipe; take one only when there is something to move
 		src.readable().await?;
+		// the pipe is empty here: what is left is read by the shaped copy
+		if bw.is_on() {
+			return Ok(Spliced::Shaped);
+		}
 		let p = match pipe.as_mut() {
 			Some(p) => p,
 			None => match Pipe::take() {
@@ -305,7 +335,9 @@ mod tests {
 		let (rx, tx, rt, tt) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
 		let data: Vec<u8> = (0..4u32 << 20).map(|i| (i * 7 + i / 251) as u8).collect();
 		let sent = data.clone();
-		let relay = relay(&mut a, &mut b, &rx, &tx, &rt, &tt);
+		let bw = Bandwidth::default();
+		let totals = Totals { rx: &rx, tx: &tx, rx_total: &rt, tx_total: &tt };
+		let relay = relay(&mut a, &mut b, totals, &bw, "127.0.0.1".parse().unwrap());
 		let peers = async {
 			let up = async {
 				client.write_all(&sent).await.unwrap();

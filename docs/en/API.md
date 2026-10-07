@@ -402,8 +402,23 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 | Live upgrade, self-update (#174) | SIGUSR2, `POST /admin/upgrade`, `--handoff-*`, `RPROXY_UPDATE*`, `GET` / `POST /admin/update` | Hands the listening sockets to a new process within one minor. Self-update verifies signatures (minisign) first | `handoff`, `self_update` |
 
 - `limits`, `bandwidth`, `geoip`, `outlier_detection` and `labels` given to `PATCH` replace the current value as a whole (`{}` removes it; left out keeps it). The DB `options` carry the same shape.
-- Once they run, a rule's `stats` gets `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff), and `stats.targets[]` gets `ejected_until` and `ejections` (#170).
+- A running rule's `stats` has `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff). Once it runs, `stats.targets[]` gets `ejected_until` and `ejections` (#170).
 - Token rotation: add the new token and SIGHUP, switch the clients, then remove the old token and SIGHUP (with `expires`, `token.expiring` reminds you).
+
+### How L4 limits and bandwidth (#165, #166) behave
+
+`features.limits` and `features.bandwidth` are true (shapes in the table above and sections 4 and 5 of docs/en/DESIGN-v0.4.md).
+
+- `limits` are checked right after accepting (after `allow_from` and `crowdsec`, before TLS and PROXY headers). Over a limit, TCP closes without sending anything and UDP drops the datagram (no new session is made). On `http` rules they apply to the TCP connections (not to HTTP/3). `max_connections` counts TCP connections and UDP sessions (so does `per_source.max_connections`), `new_connections` is the rate of new connections / sessions, `packets` the rate of UDP datagrams (per source).
+- Refusals are counted in `stats.limited` and `/metrics` `rproxy_rule_limited_total{protocol,listen,reason}` (rules with `limits`; labelled `protocol` and `listen` instead of `rule`, like the other metrics). They are logged as `conn.limited` (`rule`, `client`, `reason` (`max_connections` / `source_connections` / `new_connections` / `packets`), `transport` (`tcp` / `udp`); up to 20 lines in a row per source, then one a second; `suppressed` counts the lines left out).
+- Sources are grouped by `prefix_v4` / `prefix_v6`, and at most `max_sources` are remembered (in 16 tables of 1/16 each; when one is full the oldest source is forgotten, sources with open connections are put back a few times). A forgotten source is counted again from its next connection.
+- A `PATCH` of `limits` applies from the next connection / datagram. The rule's connection count is kept, and the per-source counts and buckets too while `prefix_v4`, `prefix_v6` and `max_sources` stay the same. `{}` stops counting (adding limits again counts from then on).
+- `bandwidth`: TCP (including `http` rules) is shaped by waiting before reading (nothing is dropped). L4: upload is read from the client, download from the backend; `http` rules: reads from and writes to the client. While waiting, the relay gives its buffer back to the pool. UDP drops the datagrams over the rate, counted in `stats.dropped` and `rproxy_rule_bandwidth_dropped_total{protocol,listen}`. HTTP/3 is not shaped.
+- Rates are token buckets (`burst` is the size, default 100 ms worth). The rule's buckets are shared by all its connections, a source's by all of that source's connections. TCP waits until 4 KiB (or `burst`, if smaller) have refilled, then reads. A datagram or read larger than what is left is lent and waited out later (the long-run rate holds).
+- splice (#184) is only used on rules without a bandwidth limit; plain TCP of a rule with one is shaped in the user-space copy. When a `PATCH` adds a limit, spliced connections go back to the user-space copy before their next splice, and do not go back to splice when the limit is removed.
+- A `PATCH` of `bandwidth` applies to open connections from their next read (the buckets start full).
+- Rules without limits pay one relaxed atomic load per read.
+- Collecting traffic (#166 5.2): `stats.rx_bytes`, `tx_bytes` and `total_connections` only grow; `stats.counters_since` is when counting started (Unix seconds; changes when the rule is re-created, not on `PATCH`); `stats.limited` is added. `/metrics` has `rproxy_process_start_time_seconds`.
 
 ## Endpoints
 
@@ -434,7 +449,7 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 | `POST /admin/upgrade` | | 202 | v0.4 (#174): hands over to the binary now on disk (as SIGUSR2). `admin`; by default only over the Unix socket |
 | `GET /admin/update` | | 200 | v0.4 (#174): self-update state `{"mode","current","available","last_check","error","bad_versions"}`. `admin` |
 | `POST /admin/update` | | 202 | v0.4 (#174): looks for a new patch now and swaps it in under `RPROXY_UPDATE=auto`. `admin`; by default only over the Unix socket |
-| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total` |
+| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total`; L4 limits and bandwidth in `rproxy_rule_limited_total` and `rproxy_rule_bandwidth_dropped_total`; the process start time in `rproxy_process_start_time_seconds` ("v0.4 settings" above) |
 
 When putting an IPv6 `listen_addr` in a path, URL-encode it.
 
