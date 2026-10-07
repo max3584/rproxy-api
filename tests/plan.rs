@@ -107,7 +107,7 @@ async fn dry_runs_of_the_rule_endpoints_change_nothing() {
 
 	// delete
 	let r = send(&h, Method::DELETE, &format!("{path}?dry_run=true"), None).await;
-	assert_eq!((r.1["action"].as_str(), r.1["change"].as_str()), (Some("delete"), Some("recreate")), "{}", r.1);
+	assert_eq!((r.1["action"].as_str(), r.1["change"].as_str()), (Some("delete"), Some("none")), "{}", r.1);
 	assert!(r.1["after"].is_null());
 	assert_eq!(h.get(&path).await.0, StatusCode::OK, "still there");
 	let r = send(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{}?dry_run=true", free_port()), None).await;

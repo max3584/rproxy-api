@@ -106,17 +106,39 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 	}
 }
 
-/// Checks the bearer token and the scope. Refusals are logged as `event = "audit"`
-/// with the client (never the token), at most `Throttle`'s rate per client.
+/// Checks the bearer token or client certificate, and the scope. Refusals are
+/// logged as `event = "audit"` with the client (never the token), at most
+/// `Throttle`'s rate per client. Over TCP, sources that keep failing are locked
+/// out for a while (#167; never over the Unix socket).
 async fn require_token(State((state, refusals)): State<Guard>, mut req: Request, next: Next) -> Response {
 	let client = Client::of(&req);
+	// the source counted by the lockout: TCP only
+	let source = match req.extensions().get::<Transport>() {
+		Some(_) => None,
+		None => req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(a)| a.ip()),
+	};
+	if let Some(left) = source.filter(|_| state.tokens.enabled()).and_then(|ip| state.tokens.lockout().locked(ip)) {
+		if let Some(suppressed) = refusals.check(&client.0) {
+			info!(event = "audit", client = %client.0, method = %req.method(), path = %req.uri().path(),
+				outcome = "locked_out", suppressed);
+		}
+		let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+		let mut res =
+			ApiError::locked_out("too many failed authentications from this address; try again later").into_response();
+		res.headers_mut().insert(header::RETRY_AFTER, header::HeaderValue::from(secs.max(1)));
+		return res;
+	}
 	let header = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-	let principal = match state.tokens.check(header) {
+	let cert = req.extensions().get::<crate::control::hardening::ClientCert>().cloned().unwrap_or_default();
+	let principal = match state.tokens.check_with(header, cert.names()) {
 		Ok(p) => p,
 		Err(reason) => {
 			if let Some(suppressed) = refusals.check(&client.0) {
 				info!(event = "audit", client = %client.0, method = %req.method(), path = %req.uri().path(),
 					outcome = "unauthorized", reason, suppressed);
+			}
+			if let Some(ip) = source {
+				state.tokens.lockout().failed(ip);
 			}
 			return ApiError::unauthorized().into_response();
 		}
@@ -124,8 +146,8 @@ async fn require_token(State((state, refusals)): State<Guard>, mut req: Request,
 	if let Some(scope) = required_scope(req.method(), req.uri().path()) {
 		if !principal.has(scope) {
 			if let Some(suppressed) = refusals.check(&client.0) {
-				info!(event = "audit", token = %principal.name, client = %client.0, method = %req.method(), path = %req.uri().path(),
-					outcome = "forbidden", scope = scope.as_str(), suppressed);
+				info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, method = %req.method(),
+					path = %req.uri().path(), outcome = "forbidden", scope = scope.as_str(), suppressed);
 			}
 			return ApiError::forbidden(format!("this token lacks the {} scope", scope.as_str())).into_response();
 		}
@@ -152,7 +174,7 @@ fn audit<T>(principal: &Principal, client: &Client, action: &str, rule: &str, re
 		Err(e) if e.code == "forbidden" => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
-	info!(event = "audit", token = %principal.name, client = %client.0, action, rule, outcome, code);
+	info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action, rule, outcome, code);
 }
 
 /// Parses a JSON body, reporting failures in the API's own error format.
@@ -222,7 +244,7 @@ async fn config_reload(
 	Query(query): Query<HashMap<String, String>>,
 ) -> Response {
 	let audit = |outcome: &str, code: &str| {
-		info!(event = "audit", token = %principal.name, client = %client.0, action = "config.reload", rule = "", outcome, code);
+		info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.reload", rule = "", outcome, code);
 	};
 	if state.reload_unix_only && transport.is_none() {
 		audit("forbidden", "unix_only");
@@ -462,10 +484,9 @@ async fn delete(
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-	(
-		[(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-		state.registry.metrics().await,
-	)
+	let mut text = state.registry.metrics().await;
+	text.push_str(&crate::control::hardening::metrics(&state.tokens));
+	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
 
 #[cfg(test)]

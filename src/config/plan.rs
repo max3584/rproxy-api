@@ -151,8 +151,10 @@ fn connections_warning(view: &crate::core::rule::RuleView) -> Vec<String> {
 	}
 }
 
-/// `POST /rules?dry_run=true`: a new rule. `change` is `none`: nothing running
-/// is touched (the new listeners are opened).
+/// `POST /rules?dry_run=true`: a new rule.
+///
+/// `change` says how an `update` takes effect (`in_place` or `recreate`);
+/// it is `none` for `create`, `delete` and `none` (as in `PUT /rulesets`).
 pub async fn plan_create(registry: &Registry, req: RuleRequest) -> Result<RulePlan, ApiError> {
 	let spec = req.validate(&registry.caps())?;
 	registry.check_start(&spec, None).await?;
@@ -190,15 +192,14 @@ pub async fn plan_update(registry: &Registry, key: &Key, req: UpdateRequest) -> 
 
 /// `DELETE /rules/...?dry_run=true`.
 pub async fn plan_delete(registry: &Registry, key: &Key) -> Result<RulePlan, ApiError> {
-	let (old, running, view) = registry.current(key).await.ok_or_else(|| ApiError::not_found(key.to_string()))?;
+	let (old, _, view) = registry.current(key).await.ok_or_else(|| ApiError::not_found(key.to_string()))?;
 	if old.origin == Origin::Static {
 		return Err(ApiError::static_rule(format!(
 			"{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes"
 		)));
 	}
 	let warnings = connections_warning(&view);
-	let change = if running { Change::Recreate } else { Change::None };
-	Ok(rule_plan(Action::Delete, change, key, Some(&old), Some(view), None, warnings))
+	Ok(rule_plan(Action::Delete, Change::None, key, Some(&old), Some(view), None, warnings))
 }
 
 /// A rule put in place as a whole (a rule set's rule, #28): created when its
@@ -307,12 +308,12 @@ pub async fn plan_config(registry: &Arc<Registry>, base: &ConfigDoc, doc: &Confi
 	let wanted: std::collections::HashSet<Key> = specs.iter().map(|(s, _)| s.key).collect();
 	let mut removed: Vec<&(RuleSpec, bool)> = current.iter().filter(|(k, _)| !wanted.contains(k)).map(|(_, v)| v).collect();
 	removed.sort_by_key(|(s, _)| (s.key.protocol as u8, s.key.listen));
-	for (old, running) in removed {
+	for (old, _) in removed {
 		plan.counts.removed += 1;
 		plan.changes.push(ConfigChange {
 			rule: old.key.to_string(),
 			action: Action::Delete,
-			change: if *running { Change::Recreate } else { Change::None },
+			change: Change::None,
 			diff: diff(&shape(old), &empty),
 		});
 	}
@@ -570,11 +571,11 @@ mod tests {
 			"changes": [
 				{"rule": "tcp/0.0.0.0:80", "action": "create", "change": "none", "diff": [{"path": "remote_port", "before": null, "after": 1}]},
 				{"rule": "tcp/0.0.0.0:81", "action": "update", "change": "in_place", "diff": [{"path": "remote_port", "before": 1, "after": 2}]},
-				{"rule": "udp/0.0.0.0:53", "action": "delete", "change": "recreate", "diff": []}]});
+				{"rule": "udp/0.0.0.0:53", "action": "delete", "change": "none", "diff": []}]});
 		let text = plan_text(&plan);
 		assert!(text.contains("+ tcp/0.0.0.0:80 (create, none)\n"), "{text}");
 		assert!(text.contains("~ tcp/0.0.0.0:81 (update, in_place): remote_port\n"), "{text}");
-		assert!(text.contains("- udp/0.0.0.0:53 (delete, recreate)\n"), "{text}");
+		assert!(text.contains("- udp/0.0.0.0:53 (delete, none)\n"), "{text}");
 		assert!(text.contains("! global.acme changes after a restart"), "{text}");
 		assert!(text.contains("1 to add, 1 to change, 1 to remove, 2 unchanged"), "{text}");
 	}
