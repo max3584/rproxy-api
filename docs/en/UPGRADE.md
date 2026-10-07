@@ -64,6 +64,15 @@ Make `rproxy-api launch` the image's entry point (with `RPROXY_UPDATE=auto` and 
 | `RPROXY_UPDATE_PUBKEY` | the release key built in | minisign public key file that verifies releases (for a mirror that signs again). Needed with builds that have no key built in |
 | `RPROXY_UPDATE_HEALTHY` | `60s` | A new version that runs this long is good |
 
+### Release key
+
+From v0.4.0, the release binaries, `manifest.json`, `SHA256SUMS` and `releases.json` carry minisign signatures (`.minisig`) by the key below. Release binaries have it built in (the default of `RPROXY_UPDATE_PUBKEY`). To check by hand, save it as `minisign.pub` and run `minisign -Vm <file> -p minisign.pub`.
+
+```
+untrusted comment: rproxy-api release key
+RWRwgQhoV+uUAniEVZO6xGxvUZAx6aMNQWmC/+TasCJekyDmGb0tRc/X
+```
+
 ### What is verified
 
 - Fetched: `manifest.json` (version, whether a `handoff` is allowed, SHA-256 of each binary) and its `.minisig`, this target's binary `rproxy-api-v<X.Y.Z>-<target>` and its `.minisig`. Which releases exist comes from the signed index `<source>/latest/download/releases.json` (`{"releases":[{"version":"0.4.3"},...]}`; the release workflow writes it with every release, listing every release of every minor). Patch numbers have gaps (only the repository whose code changed is released), so the newest release of the same X.Y that is newer than the running one and not bad is picked from the index rather than probing numbers (if its manifest does not verify, the next older one).
