@@ -69,6 +69,8 @@ impl Rproxy {
 }
 
 fn workdir(tag: &str) -> PathBuf {
+	// keys and secrets written here must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let dir = std::env::temp_dir().join(format!("rproxy-startup-{tag}-{}", std::process::id()));
 	let _ = fs::remove_dir_all(&dir);
 	fs::create_dir_all(&dir).unwrap();

@@ -137,6 +137,11 @@ systemctl is-active --quiet rproxy-api || fail "not running after the rename"
 "$install" --uninstall --purge
 
 echo "== apt: install the published package"
+# the published package may still be v0.3, whose postinst makes the user rproxy with
+# its own group: start from a host without what the v0.4 install above left behind
+userdel rproxy-api 2>/dev/null || true
+userdel rproxy 2>/dev/null || true
+groupdel rproxy 2>/dev/null || true
 "$install" --method apt
 dpkg-query -W -f='${Status}' rproxy-api | grep -q 'install ok installed' || fail "package not installed"
 systemctl is-active --quiet rproxy-api || fail "not running"

@@ -48,6 +48,8 @@ fn client() -> reqwest::Client {
 }
 
 fn workdir(tag: &str) -> std::path::PathBuf {
+	// keys and secrets written here must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let d = std::env::temp_dir().join(format!("rproxy-http-auth-{}-{tag}", std::process::id()));
 	let _ = std::fs::remove_dir_all(&d);
 	std::fs::create_dir_all(&d).unwrap();

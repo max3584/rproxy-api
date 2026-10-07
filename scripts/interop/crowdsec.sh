@@ -117,6 +117,8 @@ for _ in $(seq 60); do cscli lapi status >/dev/null 2>&1 && break; sleep 1; done
 cscli lapi status >/dev/null 2>&1 || fail "the CrowdSec LAPI is not up"
 key=$(cscli bouncers add rproxy-ci -o raw)
 printf '%s\n' "$key" > "$WORK/bouncer.key"
+# a secret rproxy reads: its own user's, not readable by others (global.files.owner_check)
+chmod 600 "$WORK/bouncer.key"
 cat > "$WORK/rproxy.yaml" <<EOF
 version: 1
 global:
