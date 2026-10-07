@@ -45,6 +45,9 @@ pub struct Report {
 	pub rules: usize,
 	pub errors: Vec<Finding>,
 	pub warnings: Vec<Finding>,
+	/// `--diff` (#169): what the running rproxy would change (`POST /config/plan`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub plan: Option<serde_json::Value>,
 }
 
 impl Report {

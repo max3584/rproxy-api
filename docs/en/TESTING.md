@@ -187,9 +187,29 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 |---|---|
 | `capabilities_list_the_v0_4_features_as_off` | Every v0.4 flag in `features` is false, `performance` is empty |
 | `labels_…`, `limits_…`, `bandwidth_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
-| `rulesets_and_readyz_…`, `dry_run_…`, `config_plan_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule. A dry run changes nothing |
-| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). `--diff` is not available yet. A 0.3 settings file passes without warnings |
+| `rulesets_and_readyz_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule |
+| `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables, and control API client certificates (not available yet), stop the startup |
+
+## Integration tests: diff before change (`tests/plan.rs`, #169)
+
+| Test | What it checks |
+|---|---|
+| `dry_runs_of_the_rule_endpoints_change_nothing` | `dry_run` on `POST` / `PATCH` / `DELETE` answers `action`, `change`, `before` (view), `after` (shape) and `diff`, and creates, changes and deletes nothing (no listener is opened). Mistakes get the change's own answers (`invalid`, `tls_config` (certificates are read), `already_exists`, `unsupported`, `not_found`, `static`). Names are not resolved |
+| `dry_runs_need_the_same_permissions` | `allow_listen_ports` and scopes apply to dry runs |
+| `config_plan_compares_with_the_static_rules` | `POST /config/plan` answers the difference from the static rules (creates, in-place changes, re-creations, deletes, the unchanged count), `restart_needed`, and a warning for an address an API rule holds (`failed`), changing nothing. Mistakes: `400` with `errors` |
+| `config_reload_dry_run_reads_the_file_and_applies_nothing` | `POST /config/reload?dry_run=true` reads the file and only answers the difference. Mistakes: `400`. A real reload afterwards applies |
+| `check_config_diff_asks_the_running_rproxy` | With the real binary on a Unix socket, `--check-config --diff` prints the difference (`text`, `json`, the default `RPROXY_API_SOCKET`, `--diff-token-file`). No token (401), nothing listening, a wrong `--diff-api` and mistakes in the file exit 1 |
+
+## Integration tests: storing API-created rules (`tests/persist.rs`, #144)
+
+| Test | What it checks |
+|---|---|
+| `persist_tokens_store_their_rules` | Rules of a `persist: true` token are `origin: "api"` with `persisted`, `created_by` and `created_at`, and get a row (memory store). Rules of other tokens stay `dynamic`. Changes to an `api` rule are written whichever token makes them, keeping the creator. A failed write leaves the rule running with `persisted: false`. Deleting removes the row. Dry runs write nothing |
+| `without_a_database_nothing_is_stored` | Without `RPROXY_DATABASE_URL`: `api`, but `persisted: false` |
+| `restored_rows_are_api_rules` | Restored rows are `api` rules (`persisted: true`, the stored `created_at`). The UI's row wins on the same key |
+| `rules_survive_a_restart_with_mariadb` | MariaDB (`RPROXY_TEST_DATABASE_URL`) and the real binary: a created (and changed) rule is written to `rproxy_rules` and comes back as `api` after a restart. On the UI's key the UI's rule is used (`restore.conflict`); other nodes' rows stay out. Deleting removes the row |
+| `a_blank_node_name_stops_the_startup` | A blank `RPROXY_NODE_NAME` is a configuration error |
 
 ## Restoring from the DB (`tests/db_restore.rs`)
 

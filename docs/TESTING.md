@@ -187,9 +187,29 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 |---|---|
 | `capabilities_list_the_v0_4_features_as_off` | `features` の v0.4 の印がすべて false、`performance` が空 |
 | `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
-| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
-| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
+| `rulesets_and_readyz_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり |
+| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |
+
+## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
+
+| テスト | 確かめること |
+|---|---|
+| `dry_runs_of_the_rule_endpoints_change_nothing` | `POST` / `PATCH` / `DELETE` の `dry_run` は `action`・`change`・`before`（表示）・`after`（形）・`diff` を返し、何も作らない・変えない・消さない（待ち受けも開かない）。誤りは実際の操作と同じ答え（`invalid`・`tls_config`（証明書を読む）・`already_exists`・`unsupported`・`not_found`・`static`）。名前は解決しない |
+| `dry_runs_need_the_same_permissions` | `allow_listen_ports` とスコープは dry run にも効く |
+| `config_plan_compares_with_the_static_rules` | `POST /config/plan` が固定ルールとの違い（作成・接続を切らない変更・作り直し・削除・変わらない数）、`restart_needed`、API のルールが持つアドレスの警告（`failed`）を返し、何も変えない。誤りは `400` と `errors` |
+| `config_reload_dry_run_reads_the_file_and_applies_nothing` | `POST /config/reload?dry_run=true` はファイルを読んで差分を返すだけ。誤りは `400`。そのあとの本当の reload は反映する |
+| `check_config_diff_asks_the_running_rproxy` | 本物のバイナリを Unix ソケットで動かし、`--check-config --diff` が差分を出す（`text`・`json`、既定の問い合わせ先 `RPROXY_API_SOCKET`、`--diff-token-file`）。トークンなし（401）・つながらない・`--diff-api` の誤り・設定の誤りは 1 |
+
+## 結合テスト：API で作ったルールの保存（`tests/persist.rs`、#144）
+
+| テスト | 確かめること |
+|---|---|
+| `persist_tokens_store_their_rules` | `persist: true` のトークンのルールは `origin: "api"`・`persisted`・`created_by`・`created_at` で行が書かれる（メモリのストア）。保存しないトークンのルールは `dynamic` のまま。`api` のルールの変更はどのトークンでも書き、作った人は残る。書けなければ `persisted: false` で動き続ける。削除で行も消える。dry run は書かない |
+| `without_a_database_nothing_is_stored` | `RPROXY_DATABASE_URL` がなければ `api` だが `persisted: false` |
+| `restored_rows_are_api_rules` | 復元した行は `api` のルール（`persisted: true`、保存した `created_at`）。同じキーは UI の行が先 |
+| `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
+| `a_blank_node_name_stops_the_startup` | 空白だけの `RPROXY_NODE_NAME` は設定のエラー |
 
 ## DB からの復元（`tests/db_restore.rs`）
 

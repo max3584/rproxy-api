@@ -99,11 +99,11 @@ Added in v0.4 (shape only; until implemented, setting them logs `degraded` and t
 | `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | `none`, `optional`, `required` (#167) |
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | Days before a token's expiry from which `token.expiring` is logged (#167) |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | Lock out sources that keep failing authentication (`0`: never) (#167) |
-| `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules` (#144) |
+| `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules`; only rows with this name are restored at startup (#144, "Storing API-created rules" in docs/en/API.md) |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174) |
 | `RPROXY_UPDATE` | `--update` | `off` | Self-update: `off`, `check`, `auto` (#174); also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY` |
 | `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | number of CPUs / `none` / `0` | Performance (#194; `global.performance` in the settings file wins) |
-| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | — | `--check-config --diff`: difference from the running rproxy (#169) |
+| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | `RPROXY_API_SOCKET`, else the control API / none | `--check-config --diff`: the difference from the running rproxy, asked with `POST /config/plan` (#169, "Diff before change" in docs/en/API.md) |
 
 If `RPROXY_API_ADDR` includes a non-loopback address, a token file and a TLS certificate are required. If any of them is missing, rproxy does not start.
 
@@ -122,6 +122,7 @@ For other environment problems, only the unusable part is stopped and startup co
 | The static rules file cannot be read (permissions) | Starts without static rules (`part: static_rules`) |
 | The `global.access_log` directory is not writable | Access logs go to the main log (`part: global.access_log`) |
 | Cannot connect to the DB | Starts without the DB rules (`restore.error`) |
+| `rproxy_rules` cannot be read or written (missing table, permissions, DB down) | At startup only the UI's rules are restored. API rules keep running with `persisted: false` (`part: db`, #144) |
 | A rule lacks the required permissions (capabilities) | Only that rule becomes `failed`, with a reason ([docs/en/PERMISSIONS.md](docs/en/PERMISSIONS.md)) |
 
 
@@ -308,7 +309,8 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `conn.retarget` | The target of a UDP session was switched (name resolution changed, or the target went down: `reason: target down`) |
 | `target.down` / `target.up` | In a rule with multiple targets (`targets`) or `health_check`, a target went down / up (`reason: health_check` / `connect`) |
 | `dns.change` / `dns.stale` | The name resolution result of a target changed / resolution failed (the previous result continues to be used) |
-| `restore.*` | Restoration from the DB at startup (`restore.paused` is the number of rules not created because they are paused in the UI) |
+| `restore.*` | Restoration from the DB at startup (`restore.paused` is the number of rules not created because they are paused in the UI; `restore.conflict`: `rproxy_rules` and the UI's `forward_rules` have the same key and the UI's row was used, #144) |
+| `rule.persist` | An API rule of a `persist: true` token (`origin: "api"`) was written to or deleted from `rproxy_rules` (`action: save` / `delete`, `token`; #144) |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | An ACME order started / a certificate was obtained / renewed / an order failed (`retry_at`) / the issuance limit held an order back (docs/en/ACME.md) |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | An ACME account was created or deactivated / a DNS-01 TXT record was written or removed / a challenge was set up or answered / `http01_listen` started listening. No secret is logged |
 | `cert.expiring` / `cert.expired` / `cert.ok` | A certificate is close to expiry (within `RPROXY_CERT_WARN_DAYS`) / expired / was renewed (`file`, `not_after`, `days_left`). Emitted only once when the state changes |

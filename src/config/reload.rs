@@ -69,6 +69,11 @@ impl ConfigReloader {
 		&self.path
 	}
 
+	/// The settings the process started with (`global` changes against them need a restart).
+	pub fn base(&self) -> &ConfigDoc {
+		&self.base
+	}
+
 	/// Reads the settings again and applies the differences. `forced` (SIGHUP,
 	/// the API) reads even when the files look unchanged.
 	pub async fn reload(&self, forced: bool) -> Outcome {

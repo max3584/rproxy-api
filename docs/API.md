@@ -24,6 +24,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           scopes: [rules:write]
           allow_listen_ports: 20000-29999   # 作成・変更・削除できる待ち受けポート（範囲ルールは全体が収まること）
           expires: 2027-03-31               # この日（UTC）まで有効
+          persist: true                     # v0.4（#144）：作ったルールを rproxy_rules に保存する（既定 false）
       ```
 
     - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
@@ -405,6 +406,59 @@ v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の�
 - ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）、`stats.targets[]` に `ejected_until`・`ejections`（#170）が、動くようになったら出る。
 - トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。
 
+### 変更前の差分（dry run、#169）
+
+- `POST /rules?dry_run=true`・`PATCH /rules/...?dry_run=true`・`DELETE /rules/...?dry_run=true`：実際の操作と同じ検証（同じ `400` / `403` / `404` / `409`）をして、`200` で差分を返す。何も変えない：待ち受けを開かず、名前解決もしない（証明書・秘密のファイルは読んで確かめる）。スコープ・`allow_listen_ports`・`acme:write` も実際の操作と同じ。`audit` のログには残さない。
+  ```json
+  {"dry_run": true, "action": "update", "change": "in_place", "rule": "tcp/0.0.0.0:443",
+   "before": {<今のルールの表示>}, "after": {<POST /rules の本文の形>},
+   "diff": [{"path": "remote_port", "before": 80, "after": 8080}], "warnings": []}
+  ```
+  - `action`：`create`・`update`・`delete`・`none`（変わらない）。
+  - `change`：`none`（動いているものに触れない：作成は新しい待ち受けを開くだけ、変わらない更新）・`in_place`（接続を切らずに変わる。PATCH の変更はすべてこれで、PATCH で変えられないものは実際の操作と同じく `400 unsupported`）・`recreate`（待ち受けを閉じる・作り直す。今の接続は切れる：削除、`failed` のルールを PATCH で動かすとき、設定ファイルの変更で PATCH では変えられないもの）。
+  - `before` はルールの表示（`GET /rules/...` と同じ）、`after` はルールの形（`POST /rules` の本文の形。状態・統計・`origin` はない）。`diff` は形どうしを比べた、変わった項目の JSON のパス（`.` でつなぐ。配列は丸ごと）と前後の値。作成は `{}` から、削除は `{}` へ。
+  - `warnings`：削除で切れる接続の数など。
+- `POST /config/reload?dry_run=true`：設定ファイルを読んで、反映したら何が変わるかを返す（反映しない）。`POST /config/plan`：本文の設定（設定ファイルと同じ形の JSON）を同じように比べる（ファイルは読まない。設定ファイルを使っていなければ、固定ルールはまだないものとして比べる）。どちらもスコープ（`admin`）と Unix ソケットの決まりは `POST /config/reload` と同じ。
+  ```json
+  {"dry_run": true, "added": 1, "removed": 0, "changed": 1, "unchanged": 3, "failed": 0,
+   "restart_needed": ["global.trusted_proxies"],
+   "changes": [{"rule": "tcp/0.0.0.0:443", "action": "update", "change": "in_place", "diff": [...]}],
+   "warnings": [{"rule": "...", "message": "..."}]}
+  ```
+  - 数は `POST /config/reload` の答えと同じ意味（`failed` は作られるが `failed` になるもの：この版で動かない設定、証明書を読めない、API のルールが同じアドレスを持っている）。`changes` は変わるルールだけ（変わらないものは `unchanged` の数だけ）。`restart_needed` は起動したときの `global` との違い。
+  - 誤りがあれば、反映と同じく `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`。
+- `rproxy-api --check-config [PATH] --diff [--diff-api unix:/path|URL] [--diff-token-file FILE]`：検証に通ったら、動いている rproxy に `POST /config/plan` で問い合わせて差分を出す。問い合わせ先の既定は `RPROXY_API_SOCKET`、なければ `http://<RPROXY_API_ADDR の先頭（0.0.0.0 / :: なら loopback）>:<RPROXY_API_PORT>`（`RPROXY_TLS_CERT` があれば https で、その証明書を信頼する）。トークンは平文の 1 行のファイル（`admin` のスコープが要る）。
+  - `text` の出力は検証の結果の後に 1 行に 1 つの変更（`+` 作成・`~` 変更（変わった項目）・`-` 削除、`!` 再起動が要る `global`）と `plan: N to add, ...`。`json` は `Report` に `plan`（上の答え）を足したもの。
+  - 終了コード：検証の誤り・問い合わせの失敗（つながらない、断られた）は 1、差分があってもなくても成功なら 0。
+- 組（`PUT /rulesets/{name}?dry_run=true`、#28）は同じ差分の作り方（`config::plan` の `plan_replace`・`plan_delete`）を使う。
+
+### API で作ったルールの保存（#144）
+
+- トークンファイルで `persist: true` を付けたトークン（YAML の書き方だけ。既定は false）で作ったルールは `origin: "api"` になり、rproxy のテーブル `rproxy_rules` に保存する。UI のテーブル（`forward_rules`）には書かない。UI 用のトークンには付けない（UI は自分の DB に保存するので二重になる）。
+- 書くのは作成・変更・削除の応答の前。`api` のルールは、どのトークンで変えても・消しても行を書き直す・消す（行がルールと食い違わないように）。`persist: true` のトークンでも、`dynamic` のルール（UI・保存しないトークンのもの）を変えたときは保存しない。
+- 表示：`origin: "api"` のルールに `persisted`（行が最新か）・`created_by`（作ったトークンの名前）・`created_at`（Unix 秒）。書けなかったとき（DB に届かない、テーブルがない）はルールを動かしたまま `persisted: false`、ログに `event = "degraded"`（`part: "db"`）。`RPROXY_DATABASE_URL` がなければ保存しない（`persisted: false`）。保存したら `rule.persist`（`action: save` / `delete`、`token`）。
+- 起動時は UI の `forward_rules` を復元してから、`rproxy_rules` の自分の `node`（`--node-name` / `RPROXY_NODE_NAME`、既定はホスト名）の行を `origin: "api"` で復元する。同じキーが両方にあれば UI の行を使い、`restore.conflict`（warn）を出す。テーブルが読めなければ `degraded`（`part: "db"`）を出して、UI のルールだけで起動する。`spec_version` がこの版より新しい行は `restore.skip` で読み飛ばす。
+- テーブルの定義と GRANT は UI リポジトリの `db/` の migration に置く。rproxy が使う定義：
+
+```sql
+CREATE TABLE rproxy_rules (
+  node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (default: the host name)
+  protocol     VARCHAR(3)   NOT NULL,   -- tcp / udp
+  listen_addr  VARCHAR(45)  NOT NULL,   -- IPv6 without brackets
+  listen_port  INT UNSIGNED NOT NULL,
+  spec         JSON         NOT NULL,   -- the rule in the shape of the body of POST /rules
+  spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+  created_by   VARCHAR(255) NOT NULL,   -- token name
+  created_at   DATETIME(3)  NOT NULL,
+  updated_by   VARCHAR(255) NOT NULL,
+  updated_at   DATETIME(3)  NOT NULL,
+  PRIMARY KEY (node, protocol, listen_addr, listen_port)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
+```
+
+  `spec` はルールの形（`POST /rules` の本文の形、dry run の `after` と同じ）。`spec_version` は `spec` の読み方の版（今は 1）。時刻は DB のセッションのタイムゾーンで書き、`UNIX_TIMESTAMP` で読む。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -474,14 +528,17 @@ rproxy のルールには 3 つの出どころがある。どれも `GET /rules`
 | 設定ファイル（`RPROXY_CONFIG`） | `static` | ファイル | ファイルを書き換える（自動で反映）。API からは `409 static` |
 | UI（TCP-UDP-rproxy-ui） | `dynamic` | UI の DB（`forward_rules`） | UI から。UI は DB に書いてから rproxy の API を呼ぶ。rproxy は起動時に DB から復元する |
 | API を直接呼ぶ（CI・スクリプト） | `dynamic` | rproxy のメモリだけ | API から。DB には書かれないので、rproxy を再起動すると消える |
+| `persist: true` のトークンで API を呼ぶ（v0.4、#144） | `api` | rproxy のテーブル `rproxy_rules` | API から。rproxy が作成・変更・削除のたびに `rproxy_rules` に書き、起動時に復元する（上の「API で作ったルールの保存」） |
 
-- 長く残すルールは、設定ファイルか UI（DB）で作る。API を直接呼んで作ったルールは一時的なもの（CI のプレビュー環境など）として扱う。
+- 長く残すルールは、設定ファイルか UI（DB）、または `persist: true` のトークン（v0.4）で作る。保存しないトークンで API を直接呼んで作ったルールは一時的なもの（CI のプレビュー環境など）として扱う。
 - UI は DB にないルールを編集しない。API で作ったルールは UI の一覧に出ず、DB にあるが rproxy にないルールは UI で「未登録」（missing）になる。
 - API を直接使うときは、スコープと `allow_listen_ports` で UI のルールと範囲を分けたトークンを使う（「基本」の認証）。
 
 ## 起動時の復元
 
 `--database-url mysql://user:pass@host:port/db` を指定すると、起動時に `forward_rules` テーブルの全ルールを読み込んで開始する。DB ユーザーには `SELECT` 権限だけを与えればよい。失敗したルールは `failed` として登録し、残りのルールは開始する。名前解決に失敗して `failed` になったルールは、再解決に成功した時点で自動的に開始する。
+
+v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自分の `node` の行も復元する（`origin: "api"`。同じキーは `forward_rules` の行が先。上の「API で作ったルールの保存」）。このテーブルには `SELECT`・`INSERT`・`UPDATE`・`DELETE` が要る。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
 `options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。

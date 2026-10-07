@@ -66,8 +66,8 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
 	for flag in [
-		"rulesets", "labels", "conditions", "readyz", "limits", "bandwidth", "geoip", "outlier_detection", "dry_run",
-		"persistence", "client_cert_auth", "token_expiry", "api_lockout", "handoff", "self_update",
+		"rulesets", "labels", "conditions", "readyz", "limits", "bandwidth", "geoip", "outlier_detection",
+		"client_cert_auth", "token_expiry", "api_lockout", "handoff", "self_update",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
@@ -169,66 +169,7 @@ async fn rulesets_and_readyz_are_checked_then_unsupported() {
 	assert_eq!(code(&send(&h, Method::GET, "/readyz", None).await), UNSUPPORTED);
 }
 
-/// #169
-#[tokio::test]
-async fn dry_run_is_checked_then_unsupported() {
-	let h = harness().await;
-	let backend = tcp_backend("D:").await;
-	let port = free_port();
-	let r = send(&h, Method::POST, "/rules?dry_run=true", Some(rule("tcp", port, backend))).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains("dry_run"), "{}", r.1);
-	let mut bad = rule("tcp", port, backend);
-	bad["remote_port"] = json!(0);
-	assert_eq!(code(&send(&h, Method::POST, "/rules?dry_run=true", Some(bad)).await), INVALID);
-	assert_eq!(code(&send(&h, Method::POST, "/rules?dry_run=perhaps", Some(rule("tcp", port, backend))).await), INVALID);
-	let (_, rules) = h.get("/rules").await;
-	assert_eq!(rules, json!([]), "a dry run creates nothing");
-
-	assert_eq!(h.post(rule("tcp", port, backend)).await.0, StatusCode::CREATED);
-	let path = format!("/rules/tcp/127.0.0.1/{port}");
-	let patch = json!({"remote_addr": "127.0.0.1", "remote_port": backend.port()});
-	assert_eq!(code(&send(&h, Method::PATCH, &format!("{path}?dry_run=1"), Some(patch)).await), UNSUPPORTED);
-	assert_eq!(code(&send(&h, Method::DELETE, &format!("{path}?dry_run=true"), None).await), UNSUPPORTED);
-	assert_eq!(h.get(&path).await.0, StatusCode::OK, "still there");
-	// POST /config/plan and POST /config/reload are only over the Unix socket by default
-	let r = send(&h, Method::POST, "/config/plan", Some(json!({"version": 1, "rules": []}))).await;
-	assert_eq!(r.0, StatusCode::FORBIDDEN, "{}", r.1);
-}
-
-/// #169: `POST /config/plan` checks the document like a settings file.
-#[tokio::test]
-async fn config_plan_checks_the_document_then_unsupported() {
-	use rproxy_api::control::api::{router, AppState};
-	let h = harness().await;
-	let app = router(std::sync::Arc::new(AppState {
-		registry: h.registry.clone(),
-		tokens: std::sync::Arc::new(rproxy_api::control::auth::Tokens::disabled()),
-		reloader: None,
-		reload_unix_only: false,
-	}));
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let base = format!("http://{}", listener.local_addr().unwrap());
-	tokio::spawn(async move {
-		axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
-	});
-	let post = |body: Value| {
-		let (client, base) = (h.http.clone(), base.clone());
-		async move {
-			let r = client.post(format!("{base}/config/plan")).json(&body).send().await.unwrap();
-			let status = r.status();
-			(status, r.json::<Value>().await.unwrap_or(Value::Null))
-		}
-	};
-	let r = post(json!({"version": 1, "global": {"performance": {"workers": 2}}, "rules": []})).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	let r = post(json!({"version": 1, "global": {"performance": {"workers": 0}}})).await;
-	assert_eq!(code(&r), INVALID, "{}", r.1);
-	let r = post(json!({"version": 1, "rules": [{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 1,
-		"remote_addr": "a", "remote_port": 1, "geoip": {"allow_countries": ["JP"]}}]}))
-	.await;
-	assert_eq!(code(&r), INVALID, "country lists need global.geoip: {}", r.1);
-}
+// #169 (dry runs) and #144 (persistence) work: tests/plan.rs and tests/persist.rs
 
 /// #174
 #[tokio::test]
@@ -341,13 +282,6 @@ rules:
 		let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap()], &[]);
 		assert!(exit == 1 && out.contains(want), "{text}: {out}");
 	}
-
-	// --diff (#169) is not available yet
-	fs::write(&file, "version: 1\n").unwrap();
-	let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap(), "--diff"], &[]);
-	assert!(exit == 1 && out.contains("--diff is not available"), "{out}");
-	let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap(), "--diff", "--diff-api", "ftp://x"], &[]);
-	assert!(exit == 1 && out.contains("--diff-api"), "{out}");
 	fs::remove_dir_all(dir).unwrap();
 }
 
@@ -367,7 +301,7 @@ fn a_0_3_settings_file_still_passes() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
-/// #167, #174, #144, performance flags: mistakes stop the startup, client
+/// #167, #174, performance flags: mistakes stop the startup, client
 /// certificates (which would weaken the control API if ignored) too.
 #[test]
 fn v0_4_flags_are_checked_at_startup() {

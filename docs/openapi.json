@@ -3054,7 +3054,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Answer what applying the file would change (ConfigPlan) without changing anything. unsupported until GET /capabilities features.dry_run is true (v0.4)"
+            "description": "Answer what applying the file would change (ConfigPlan) without changing anything. (v0.4, #169)"
           }
         ]
       }
@@ -3180,7 +3180,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). (v0.4, #169)"
           }
         ]
       }
@@ -3342,7 +3342,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). (v0.4, #169)"
           }
         ]
       },
@@ -3365,7 +3365,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). (v0.4, #169)"
           }
         ],
         "responses": {
@@ -3974,7 +3974,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Validate and answer the difference without changing anything (RulePlan, 200). unsupported until GET /capabilities features.dry_run is true (v0.4)"
+            "description": "Validate and answer the difference without changing anything (RulePlan, 200). (v0.4, #169)"
           },
           {
             "name": "If-Match",
@@ -4129,7 +4129,7 @@
     },
     "/config/plan": {
       "post": {
-        "summary": "Compare the settings in the body (settings file shape, JSON) with what runs (admin; by default only over the Unix socket; v0.4, #169). unsupported until GET /capabilities features.dry_run is true (v0.4)",
+        "summary": "Compare the settings in the body (settings file shape, JSON) with what runs (admin; by default only over the Unix socket; v0.4, #169). (v0.4, #169)",
         "requestBody": {
           "required": true,
           "content": {

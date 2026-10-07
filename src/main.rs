@@ -353,13 +353,45 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 	Ok(ignored)
 }
 
-/// `--diff-api`: `unix:/path` or an http(s) URL.
-fn check_diff_api(api: &str) -> Result<(), String> {
-	match api.strip_prefix("unix:") {
-		Some(path) if path.starts_with('/') => Ok(()),
-		None if api.starts_with("http://") || api.starts_with("https://") => Ok(()),
-		_ => Err(format!("--diff-api {api:?} must be unix:/path or an http(s):// URL")),
+/// `--check-config --diff` (#169): what the running rproxy would change with
+/// these settings (`POST /config/plan`). Only asked when the check passed
+/// (`checked`); None then.
+async fn diff(opts: &Options, path: &std::path::Path, checked: bool) -> Result<Option<serde_json::Value>, String> {
+	use rproxy_api::config::plan::{self, Api};
+	let api: Api = match &opts.diff_api {
+		Some(api) => api.parse()?,
+		None => match &opts.api_socket {
+			Some(socket) => Api::Unix(socket.clone()),
+			None if opts.api_port != 0 => {
+				let ip = match opts.api_addr.first().copied() {
+					Some(ip) if !ip.is_unspecified() => ip,
+					Some(IpAddr::V6(_)) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+					_ => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+				};
+				let scheme = if opts.tls_cert.is_some() { "https" } else { "http" };
+				Api::Url(format!("{scheme}://{}", SocketAddr::new(ip, opts.api_port)))
+			}
+			None => return Err("--diff: no control API to ask (give --diff-api)".into()),
+		},
+	};
+	let token = match &opts.diff_token_file {
+		Some(file) => Some(
+			std::fs::read_to_string(file)
+				.map_err(|e| format!("--diff-token-file {}: {e}", file.display()))?
+				.trim()
+				.to_string(),
+		),
+		None => None,
+	};
+	if !checked {
+		return Ok(None);
 	}
+	let doc = plan::document_json(path)?;
+	let ca = opts.tls_cert.as_ref().map(|p| p.display().to_string());
+	plan::ask(&api, token.as_deref(), &doc, ca.as_deref())
+		.await
+		.map(Some)
+		.map_err(|e| format!("--diff: could not get the difference from the running rproxy: {e}"))
 }
 
 fn check_exposure(opts: &Options, addrs: &[IpAddr]) -> Result<(), String> {
@@ -477,19 +509,21 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 	let mut report = runtime.block_on(rproxy_api::config::check::check(&input));
 	if opts.diff {
 		// v0.4 (#169): asks the running rproxy with POST /config/plan
-		let mut problem = opts.diff_api.as_deref().map(check_diff_api).transpose().err();
-		if problem.is_none() && !rproxy_api::core::rule::Features::CURRENT.dry_run {
-			problem = Some("--diff is not available in this version (see GET /capabilities features)".into());
-		}
-		if let Some(message) = problem {
-			report.errors.push(rproxy_api::config::check::Finding { rule: String::new(), message });
-			report.ok = false;
+		match runtime.block_on(diff(opts, &input.path, report.ok)) {
+			Ok(plan) => report.plan = plan,
+			Err(message) => {
+				report.errors.push(rproxy_api::config::check::Finding { rule: String::new(), message });
+				report.ok = false;
+			}
 		}
 	}
 	if json {
 		println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
 	} else {
 		print!("{}", report.to_text());
+		if let Some(plan) = &report.plan {
+			print!("{}", rproxy_api::config::plan::plan_text(plan));
+		}
 	}
 	if report.ok {
 		ExitCode::SUCCESS
@@ -667,14 +701,40 @@ async fn run(opts: Options) -> Result<(), String> {
 		}
 	}
 
+	// #144: rules of persist: true tokens, in rproxy_rules
+	if rproxy_api::core::rule::Features::CURRENT.persistence {
+		let node = opts.node_name.clone().unwrap_or_else(rproxy_api::config::persist::host_name);
+		match rproxy_api::config::persist::Store::new(node, opts.database_url.as_deref()) {
+			Ok(store) => registry.set_persist(Arc::new(store)),
+			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
+		}
+	}
 	if let Some(url) = &opts.database_url {
-		match db::load_rules(url).await {
-			Ok(rules) => {
-				info!(event = "restore.start", rules = rules.len());
-				registry.restore(rules).await;
-			}
+		let ui = match db::load_rules(url).await {
+			Ok(rules) => rules,
 			// keep serving the API so the UI can still add rules
-			Err(e) => error!(event = "restore.error", error = %e),
+			Err(e) => {
+				error!(event = "restore.error", error = %e);
+				vec![]
+			}
+		};
+		let stored = match registry.persist() {
+			Some(store) => match store.load().await {
+				Ok(rows) => rproxy_api::config::persist::without_conflicts(&ui, rows),
+				Err(e) => {
+					error!(event = "degraded", part = "db", table = rproxy_api::config::persist::TABLE, error = %e,
+						"rules stored by the API are not restored");
+					vec![]
+				}
+			},
+			None => vec![],
+		};
+		info!(event = "restore.start", rules = ui.len(), api_rules = stored.len(),
+			node = registry.persist().map(|s| s.node()).unwrap_or(""));
+		registry.restore(ui).await;
+		if let Some(store) = registry.persist().filter(|_| !stored.is_empty()) {
+			store.restored(&stored);
+			registry.restore_as(stored.into_iter().map(|r| r.spec).collect(), rproxy_api::core::rule::Origin::Api).await;
 		}
 	}
 
