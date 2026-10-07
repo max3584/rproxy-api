@@ -30,7 +30,7 @@ Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc 
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
-Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
+Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `token.expiring` / `token.expired` (`tests/api_hardening.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
 
 ## Unit tests (`src/`)
 
@@ -60,6 +60,11 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
+| `core/ruleset.rs` | `etags_follow_the_rules_and_the_generation` | The etag does not depend on the order of the rules and changes with the rules or the generation. How `If-Match` may be written (quoted, `W/`, a list, `*`) |
+| | `last_transition_moves_only_when_the_status_changes` | `last_transition` moves only when `status` changes (not for a new `reason` alone); deleting starts it over |
+| | `conditions_from_the_view` | The status and reason of the four `conditions` from the state and the error's `code` |
+| | `label_metrics_lines` | `rproxy_rule_labels` lines (names, keys that end up the same, escaped values) |
+| | `readiness_states` | `starting` → ready → `draining` (never ready again) |
 
 ## Integration tests: control API (`tests/api.rs`)
 
@@ -199,11 +204,38 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | Every v0.4 flag in `features` is false, `performance` is empty |
-| `labels_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
-| `rulesets_and_readyz_…`, `dry_run_…`, `config_plan_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule. A dry run changes nothing |
+| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions`, `readyz`, `limits` and `bandwidth` are true), `performance` is empty |
+| `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
+| `dry_run_…`, `config_plan_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule. A dry run changes nothing |
 | `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). `--diff` is not available yet. A 0.3 settings file passes without warnings |
-| `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables, and control API client certificates (not available yet), stop the startup |
+| `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
+
+## Integration tests: control API hardening (`tests/api_hardening.rs`, #167)
+
+| Test | What it checks |
+|---|---|
+| `client_certificates_authenticate_alone_or_bound_to_a_token` | With the TLS of main.rs (`ClientCertAcceptor`) in `optional` mode, a certificate-only entry authenticates by the certificate (SAN, else CN) with its scopes. An unknown name or no certificate is 401; tokens work without a certificate. A token bound to a certificate is 401 without it. A certificate from another CA fails the handshake. `required` refuses connections without a certificate |
+| `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | A source reaching the limit of 401s in the window gets `429 locked_out` (`Retry-After`) even with a good token. Failures over the Unix socket are not counted, and the Unix socket works while locked out. `/healthz` is never refused. `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` in `/metrics`. It recovers when the time is up |
+| `lockout_is_on_by_default` | By default (owner's decision) the 20th failure locks out |
+| `expiring_tokens_are_reported_and_exported` | A token close to expiry gives `token.expiring` (`days_left`), an expired one `token.expired`, once per change. `rproxy_token_expiry_timestamp_seconds` in `/metrics` |
+| `the_binary_serves_client_certificates` | The real binary: a token file with `client_cert` and no `--tls-client-auth` stops the startup; with `required`, `/rules` is read with the certificate alone and connections without one are refused |
+
+## Integration tests: rule sets, labels, conditions, readiness (`tests/rulesets.rs`, #28)
+
+What the Kubernetes controller (`max3584/rproxy-gateway`) uses.
+
+| Test | What it checks |
+|---|---|
+| `capabilities_turn_the_controller_features_on` | `rulesets`, `labels`, `conditions` and `readyz` in `features` are true |
+| `a_set_is_applied_as_a_whole_with_minimal_disruption` | A set whose name has `/` is created (`ETag` header, `ruleset`, `labels` and `conditions` in `GET /rules`, `GET /rulesets`). The same body is all `none` with the same etag. A new target alone is `in_place`: an earlier connection stays while new ones go to the new target. A different `source_ip` is `recreate`. A rule left out is `delete`. `DELETE /rulesets/{name}` stops everything |
+| `sets_refuse_stale_writes_and_do_not_take_other_rules` | A wrong `If-Match` and `If-Match` on a set that does not exist (412), an older `generation` (409 `stale_generation`), unquoted / list / `W/` `If-Match`. PATCH / DELETE of a set's rule is `409 owned`, another set's rule `owned`, a POSTed rule `already_exists` (nothing created). One invalid rule changes nothing and `errors` lists every problem. Overlaps within the body. `dry_run` is still `unsupported` (nothing changes). Wrong names |
+| `a_rule_that_cannot_bind_fails_alone` | Only the rule on a busy port is `failed` (`Programmed` `False` / `BindFailed`, `BackendsHealthy` `Unknown`, `last_transition` unchanged when read again); the rest runs. Once the port is free, the same body re-creates it and it runs |
+| `conditions_report_targets_that_are_down` | A rule with every target down has `BackendsHealthy` `False` / `AllTargetsDown` (rules outside sets have `conditions` too) |
+| `labels_are_kept_replaced_and_exported` | `labels` in the view, `rproxy_rule_labels` in `/metrics`, PATCH replacing them as a whole / keeping them when left out / `{}` removing them, a wrong key is `invalid` |
+| `readyz_follows_the_startup_and_the_shutdown` | Without a token: `starting` (503) → ready (200) → `draining` (503; never ready again) |
+| `sets_need_rules_write_within_the_allowed_ports` | A `rules:read` token can read but not PUT / DELETE (403), rules outside `allow_listen_ports` are 403, `updated_by` is the token's name |
+
+That a started rproxy answers 200 on `GET /readyz` after the restore is `readyz_answers_once_started` in `tests/startup.rs`.
 
 ## Restoring from the DB (`tests/db_restore.rs`)
 

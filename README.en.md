@@ -91,14 +91,14 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | Maximum size of the port range one rule can open |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | Interval (seconds) for re-resolving target host names. If resolution fails, the previous result continues to be used |
 
-Added in v0.4 (shape only; until implemented, setting them logs `degraded` and they are ignored, except client certificates for the control API, which stop the startup. "v0.4 settings" in docs/en/API.md):
+Added in v0.4 (until implemented, setting them logs `degraded` and they are ignored; control API hardening (#167) works. "v0.4 settings" and "Control API hardening" in docs/en/API.md):
 
 | Environment variable | Flag | Default | Description |
 |---|---|---|---|
-| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | none | CA (PEM) verifying control API client certificates (#167) |
-| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | `none`, `optional`, `required` (#167) |
+| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | none | CA (PEM) verifying control API client certificates; re-read on SIGHUP (#167) |
+| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | Control API client certificates: `none`, `optional` (verified when presented), `required` (connections without one fail the handshake). A token file's `client_cert` uses them for authentication (#167) |
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | Days before a token's expiry from which `token.expiring` is logged (#167) |
-| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | Lock out sources that keep failing authentication (`0`: never) (#167) |
+| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | Lock out sources that keep failing authentication (401) on the TCP control API with `429 locked_out` (on by default; `0`: never; not the Unix socket) (#167) |
 | `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules` (#144) |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174) |
 | `RPROXY_UPDATE` | `--update` | `off` | Self-update: `off`, `check`, `auto` (#174); also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY` |
@@ -287,12 +287,15 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 
 | `event` | Content |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop (with `labels`, and `ruleset` for rules of a set) |
+| `ruleset.apply` / `ruleset.delete` | A rule set (v0.4, #28) was applied (`ruleset`, `generation`, `etag`, counts created / updated / deleted / unchanged / failed, `by`) / deleted |
 | `config.reload` / `config.error` | Application of the configuration file (counts, `global` changes that need a restart) and the reason it could not be applied |
 | `start` / `shutdown` / `fatal` | Startup (`version`, whether transparent, authentication and TLS are on, …) / exit / a configuration mistake that stops the startup |
 | `degraded` | Part of rproxy was left out because of the environment and the rest runs (`part`: `api`, `api_tls`, `tokens`, `log`, `global.*`, …) |
 | `api.listening` / `api.retry` / `api.stopped` | The control API started listening / cannot listen and retries / stopped |
-| `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`). Lines of refused requests are thinned out per sender (`suppressed`) |
+| `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`), a locked-out source (`outcome: locked_out`). How the caller authenticated (`auth`: `token`, `cert`, `token+cert`). Lines of refused requests are thinned out per sender (`suppressed`) |
+| `token.expiring` / `token.expired` | A control API token is close to expiry (closer than `RPROXY_TOKEN_WARN_DAYS`) / has expired (`token`, `expires`, `days_left`). At startup, on SIGHUP and daily, once per change of state |
+| `api.lockout` / `api.unlock` | A source that kept failing authentication (`client`; IPv6 by /64) was locked out (`failures`, `until`) / unlocked |
 | `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP re-read the tokens, the control API's certificate, the rules' certificates, the CrowdSec key (the current ones stay if a file cannot be read) |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | Static rules were loaded / a rule's listen addresses changed / a rule with the same key was skipped |
 | `conn.open` / `conn.close` | Start and end of a connection (session for UDP). `client`, `target`, `rx_bytes`, `tx_bytes`, `duration_ms`, `reason`. When TLS is terminated, `tls_version`, `tls_cipher`, etc. HTTP/3 QUIC connections have `transport: quic` |

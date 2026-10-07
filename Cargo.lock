@@ -2629,6 +2629,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tower-layer",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

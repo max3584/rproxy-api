@@ -221,12 +221,21 @@ async fn tcp_bandwidth_waits_and_applies_to_open_connections() {
 	let (status, v) = h.patch(&rule_path, patch).await;
 	assert_eq!(status, StatusCode::OK, "{v}");
 	assert_eq!(v["bandwidth"]["download"], "8Mbps", "{v}");
-	// what was already in the socket buffers and pipes still comes fast; then the limit
-	read_pattern(&mut s, 4 << 20, &mut at).await;
+	// what was already in the socket buffers still comes fast (MBs on loopback); then the limit
+	let mut chunks = 0;
+	loop {
+		let started = Instant::now();
+		read_pattern(&mut s, 256 << 10, &mut at).await;
+		if started.elapsed() >= Duration::from_millis(150) {
+			break;
+		}
+		chunks += 1;
+		assert!(chunks < 128, "32 MiB came fast after the limit");
+	}
 	let started = Instant::now();
-	read_pattern(&mut s, 3_000_000, &mut at).await;
+	read_pattern(&mut s, 2_000_000, &mut at).await;
 	let took = started.elapsed();
-	assert!(took >= Duration::from_millis(1500) && took < Duration::from_secs(10), "3 MB at 1 MB/s took {took:?}");
+	assert!(took >= Duration::from_millis(1600) && took < Duration::from_secs(10), "2 MB at 1 MB/s took {took:?}");
 
 	let mut clear = target;
 	clear["bandwidth"] = json!({});
