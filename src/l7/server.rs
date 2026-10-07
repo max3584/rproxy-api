@@ -311,14 +311,77 @@ pub(super) struct Conn {
 	h3: bool,
 }
 
+const X_FORWARDED_CLIENT_CERT: &str = "x-forwarded-client-cert";
+const X_CLIENT_VERIFY: &str = "x-client-verify";
+
 /// `X-Forwarded-Client-Cert` (Envoy's form): `Hash=<SHA-256 hex>;Subject="<RFC 4514>"`.
+/// The subject of a certificate that did not verify is left out (anyone can write any).
 fn xfcc(t: &TlsInfo) -> Option<HeaderValue> {
 	let hash = t.client_sha256.as_ref()?;
-	let subject = t.client_subject.as_deref().unwrap_or("").replace('\\', "\\\\").replace('"', "\\\"");
-	HeaderValue::from_str(&format!("Hash={hash};Subject=\"{subject}\"")).ok()
+	match t.client_subject.as_deref().filter(|_| t.client_verified) {
+		Some(subject) => {
+			let subject = subject.replace('\\', "\\\\").replace('"', "\\\"");
+			HeaderValue::from_str(&format!("Hash={hash};Subject=\"{subject}\"")).ok()
+		}
+		None => HeaderValue::from_str(&format!("Hash={hash}")).ok(),
+	}
 }
 
 impl Conn {
+	/// The headers rproxy sets on a request to a backend, shared by the request itself and
+	/// `mirror` copies (#238): X-Forwarded-*, X-Real-IP and the client certificate's.
+	/// X-Forwarded-* from the client are believed only from trusted proxies
+	/// (global.trusted_proxies): then the chain is extended and their Proto / Host / Port are kept.
+	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str) {
+		let peer = canonical(self.client.ip());
+		let trusted = self.rt.global.trusts(peer);
+		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
+			let name = HeaderName::from_static(name);
+			if trusted && headers.contains_key(&name) {
+				return;
+			}
+			if let Ok(v) = HeaderValue::from_str(value) {
+				headers.insert(name, v);
+			}
+		};
+		let chain: Vec<String> = if trusted {
+			headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).map(str::to_string).collect()
+		} else {
+			vec![]
+		};
+		let forwarded_for = chain.iter().map(String::as_str).chain([peer.to_string().as_str()]).collect::<Vec<_>>().join(", ");
+		if let Ok(v) = HeaderValue::from_str(&forwarded_for) {
+			headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+		}
+		if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
+			headers.insert(HeaderName::from_static("x-real-ip"), v);
+		}
+		set(headers, "x-forwarded-proto", if self.https { "https" } else { "http" });
+		set(headers, "x-forwarded-port", &self.local.port().to_string());
+		if let Some(h) = original_host.and_then(|h| h.to_str().ok()) {
+			set(headers, "x-forwarded-host", h);
+		} else if !host.is_empty() {
+			set(headers, "x-forwarded-host", host);
+		}
+		self.client_cert_headers(headers);
+	}
+
+	/// `X-Client-Verify` / `X-Forwarded-Client-Cert` as rproxy saw the client (#238);
+	/// none at all (whatever the client sent is dropped) on rules without `client_auth`.
+	fn client_cert_headers(&self, headers: &mut HeaderMap) {
+		headers.remove(X_FORWARDED_CLIENT_CERT);
+		headers.remove(X_CLIENT_VERIFY);
+		if !self.client_auth() {
+			return;
+		}
+		if let Some(t) = &self.tls {
+			headers.insert(HeaderName::from_static(X_CLIENT_VERIFY), HeaderValue::from_static(t.client_verify()));
+			if let Some(v) = xfcc(t) {
+				headers.insert(HeaderName::from_static(X_FORWARDED_CLIENT_CERT), v);
+			}
+		}
+	}
+
 	/// The rule asks clients for certificates (`tls.client_auth`, any mode).
 	fn client_auth(&self) -> bool {
 		self.tls.is_some() && self.rt.tls().spec.client_auth.mode != crate::tls::config::ClientAuthMode::None
@@ -498,6 +561,10 @@ impl Conn {
 		// HTTP/2 and HTTP/3 may split the cookie header into several fields; join them
 		// before anything reads cookies or the request goes to an HTTP/1.1 backend
 		join_cookie_fields(req.headers_mut());
+		// client certificate headers are rproxy's alone (#238): whatever a client sends is
+		// dropped on every rule, before middlewares (forward_auth) or copies (mirror) see it
+		req.headers_mut().remove(X_FORWARDED_CLIENT_CERT);
+		req.headers_mut().remove(X_CLIENT_VERIFY);
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
@@ -683,6 +750,8 @@ impl Conn {
 							method: parts.method.clone(),
 							uri: parts.uri.clone(),
 							headers: parts.headers.clone(),
+							client_ip,
+							host: host.clone(),
 						});
 					}
 					None
@@ -859,6 +928,8 @@ impl Conn {
 		let server = &fa.service.servers[0];
 		let mut req = Request::get(fa.path.as_str()).body(empty_body()).ok()?;
 		*req.headers_mut() = fa.request_headers(parts, client, self.https, host);
+		// the auth server sees the client certificate as rproxy did, never a client's claim (#238)
+		self.client_cert_headers(req.headers_mut());
 		req.headers_mut().insert(header::HOST, HeaderValue::from_str(&server.authority).ok()?);
 		match self.send(router, &fa.service, 0, req, None).await {
 			Ok(resp) if resp.status().is_success() => {
@@ -950,49 +1021,7 @@ impl Conn {
 			parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
 			parts.headers.insert(header::UPGRADE, u.clone());
 		}
-		// X-Forwarded-* from the client are believed only from trusted proxies (global.trusted_proxies):
-		// then the chain is extended and their Proto / Host / Port are kept
-		let peer = canonical(self.client.ip());
-		let trusted = self.rt.global.trusts(peer);
-		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
-			let name = HeaderName::from_static(name);
-			if trusted && headers.contains_key(&name) {
-				return;
-			}
-			if let Ok(v) = HeaderValue::from_str(value) {
-				headers.insert(name, v);
-			}
-		};
-		let chain: Vec<&str> = if trusted {
-			parts.headers.get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()).collect()
-		} else {
-			vec![]
-		};
-		let forwarded_for = chain.iter().copied().chain([peer.to_string().as_str()]).collect::<Vec<_>>().join(", ");
-		if let Ok(v) = HeaderValue::from_str(&forwarded_for) {
-			parts.headers.insert(HeaderName::from_static("x-forwarded-for"), v);
-		}
-		if let Ok(v) = HeaderValue::from_str(&client_ip.to_string()) {
-			parts.headers.insert(HeaderName::from_static("x-real-ip"), v);
-		}
-		// client certificates (#238): what rproxy saw replaces anything the client sent
-		if self.client_auth() {
-			parts.headers.remove("x-forwarded-client-cert");
-			parts.headers.remove("x-client-verify");
-			if let Some(t) = &self.tls {
-				parts.headers.insert(HeaderName::from_static("x-client-verify"), HeaderValue::from_static(t.client_verify()));
-				if let Some(v) = xfcc(t) {
-					parts.headers.insert(HeaderName::from_static("x-forwarded-client-cert"), v);
-				}
-			}
-		}
-		set(&mut parts.headers, "x-forwarded-proto", if self.https { "https" } else { "http" });
-		set(&mut parts.headers, "x-forwarded-port", &self.local.port().to_string());
-		if let Some(h) = original_host.as_ref().and_then(|h| h.to_str().ok()) {
-			set(&mut parts.headers, "x-forwarded-host", h);
-		} else if !host.is_empty() {
-			set(&mut parts.headers, "x-forwarded-host", host);
-		}
+		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host);
 		let path_and_query = parts.uri.path_and_query().cloned().unwrap_or_else(|| PathAndQuery::from_static("/"));
 		// kept for further attempts only
 		let again = (attempts > 1).then(|| (parts.method.clone(), parts.headers.clone()));
@@ -1124,7 +1153,7 @@ impl Conn {
 
 	/// A copy of the request for `mirror` (#232), sent on its own; its answer is dropped.
 	fn mirror(&self, router: Arc<Router>, copy: mirror::Copy, body: Body) {
-		let conn = Conn { rt: self.rt.clone(), client: self.client, local: self.local, https: self.https, tls: None, h3: self.h3 };
+		let conn = Conn { rt: self.rt.clone(), client: self.client, local: self.local, https: self.https, tls: self.tls.clone(), h3: self.h3 };
 		self.rt.tracker.spawn(async move {
 			let kill = conn.rt.kill.clone();
 			tokio::select! {
@@ -1151,8 +1180,11 @@ impl Conn {
 			_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
 		};
 		let trailers = te_trailers(&copy.headers);
+		let original_host = request_authority(&copy.uri, &copy.headers);
 		let mut headers = copy.headers;
 		strip_hop_by_hop(&mut headers);
+		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238)
+		self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
 		headers.insert(header::HOST, host);
 		let mut req = Request::new(body);
 		*req.method_mut() = copy.method;

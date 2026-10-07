@@ -110,7 +110,8 @@ fn check_v2(h: &[u8], src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, d
 	let sub = tlvs(&ssl[5..]);
 	let find = |kind: u8| sub.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
 	assert_eq!(find(0x21), info.version.as_deref().map(str::as_bytes), "PP2_SUBTYPE_SSL_VERSION");
-	assert_eq!(find(0x22), info.client_cn.as_deref().map(str::as_bytes), "PP2_SUBTYPE_SSL_CN");
+	let cn = info.client_cn.as_deref().filter(|_| !info.client_cert || info.client_verified);
+	assert_eq!(find(0x22), cn.map(str::as_bytes), "PP2_SUBTYPE_SSL_CN (left out when not verified)");
 }
 
 fn run(u: &mut Unstructured) -> Result<()> {

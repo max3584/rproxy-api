@@ -26,6 +26,9 @@ pub struct Copy {
 	pub method: Method,
 	pub uri: Uri,
 	pub headers: HeaderMap,
+	/// The client as `global.trusted_proxies` decided, and the request's host (X-Forwarded-*).
+	pub client_ip: std::net::IpAddr,
+	pub host: String,
 }
 
 enum Item {

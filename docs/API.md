@@ -213,8 +213,9 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
 - `ca_file` は省ける。あれば、送られた証明書をそれで確かめた結果（`SUCCESS` / `FAILED`）を下の形で知らせる。なければ送られた証明書はいつも `FAILED`。`chain_file` は `ca_file` があるときだけ。
 - 証明書を送ったクライアントは、その鍵を持っていることだけは TLS のハンドシェイクで確かめる（署名）。チェーン・期限・CA は確かめない（rproxy は断らない）。
 - 知らせ方：
-  - `http` のルール（`client_auth` があるとき。どのモードでも）：転送先へ `X-Client-Verify: SUCCESS | FAILED | NONE`（nginx の `$ssl_client_verify` と同じ値）と、証明書があれば `X-Forwarded-Client-Cert: Hash=<SHA-256 の 16 進>;Subject="<RFC 4514 の subject>"`（Envoy の形）。クライアントが送ってきた同じ名前のヘッダは必ず消してから付ける。アクセスログに `client_cn`・`client_verify`。
-  - L4 の終端：`conn.open` のログに `client_cn`・`client_verify`。`source_ip: proxy_v2` なら、PROXY v2 の SSL の TLV の `verify` が 0（確かめた、または証明書なし）か 1（確かめられなかった証明書）。
+  - `http` のルール（`client_auth` があるとき。どのモードでも）：転送先へ `X-Client-Verify: SUCCESS | FAILED | NONE`（nginx の `$ssl_client_verify` と同じ値）と、証明書があれば `X-Forwarded-Client-Cert: Hash=<SHA-256 の 16 進>;Subject="<RFC 4514 の subject>"`（Envoy の形。`Subject` は確かめられた証明書のときだけ）。`forward_auth` の問い合わせと `mirror` の写しにも同じ値を付ける。アクセスログに `client_cn`・`client_verify`。
+  - **クライアントが送ってきた `X-Client-Verify`・`X-Forwarded-Client-Cert` は、どのルールでも（`client_auth` のない平文・HTTPS のルール、HTTP/1.1・HTTP/2・HTTP/3、Upgrade、`forward_auth`・`mirror` を含む）、ミドルウェアより前に必ず消す**（Envoy の SANITIZE と同じ。同じ HTTPRoute を mTLS の 443 と平文の 80 に付けても、80 から偽れない）。`mirror` の写しの `X-Forwarded-For`・`X-Real-IP`・`X-Forwarded-*` も、転送先へのリクエストと同じものにする。
+  - L4 の終端：`conn.open` のログに `client_cn`・`client_verify`。`source_ip: proxy_v2` なら、PROXY v2 の SSL の TLV の `verify` が 0（確かめた、または証明書なし）か 1（確かめられなかった証明書）。確かめられなかった証明書の CN は TLV（`SSL_CN`）に入れない。
 - **安全上の注意**：このモードは認証にならない。誰でも（証明書なし・偽の証明書で）接続できるので、許すかどうかは転送先が `X-Client-Verify`（または PROXY v2 の `verify`）を見て決めなければならない。転送先へは rproxy を通る経路だけにする（直接つながると、転送先はヘッダが rproxy のものか分からない）。Gateway API も試験や一時的な移行のためのものとしている。認証に使うなら `required`、使えるなら確かめる `optional`。
 
 ### UDP のサーバ名での振り分け（`tls.mode: sni`、v0.3.8）

@@ -639,3 +639,22 @@ async fn protocol_and_scheme_must_agree() {
 		assert!(v["error"].as_str().unwrap().contains(&format!("protocol {protocol}")), "{v}");
 	}
 }
+
+#[tokio::test]
+async fn client_certificate_headers_never_pass_without_client_auth() {
+	// security review H1: an HTTPS rule without client_auth, over HTTP/1.1, HTTP/2 and HTTP/3
+	let s = setup("sem-xfcc", json!({})).await;
+	let (_, _, body) = h1_fields(&s.h1_raw(b"GET /echo HTTP/1.1\r\nHost: a.test\r\nX-Client-Verify: SUCCESS\r\nX-Forwarded-Client-Cert: Hash=00\r\nConnection: close\r\n\r\n").await);
+	let v = json_body(&body);
+	assert!(received(&v, "x-client-verify").is_empty() && received(&v, "x-forwarded-client-cert").is_empty(), "{v}");
+	let mut h2 = s.h2().await;
+	let req = hyper::Request::get("https://a.test/echo").header("x-client-verify", "SUCCESS").header("x-forwarded-client-cert", "Hash=00").body(empty()).unwrap();
+	let (_, _, body) = h2_send(&mut h2, req).await;
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert!(received(&v, "x-client-verify").is_empty() && received(&v, "x-forwarded-client-cert").is_empty(), "{v}");
+	let (mut h3, _ep) = s.h3().await;
+	let req = hyper::Request::get("https://a.test/echo").header("x-client-verify", "SUCCESS").header("x-forwarded-client-cert", "Hash=00").body(()).unwrap();
+	let (_, _, body) = h3_get(&mut h3, req).await;
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert!(received(&v, "x-client-verify").is_empty() && received(&v, "x-forwarded-client-cert").is_empty(), "{v}");
+}

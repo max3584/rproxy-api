@@ -101,7 +101,8 @@ fn tls_tlvs(info: &TlsInfo) -> Vec<u8> {
 	if let Some(version) = &info.version {
 		tlv(&mut ssl, PP2_SUBTYPE_SSL_VERSION, version.as_bytes());
 	}
-	if let Some(cn) = &info.client_cn {
+	// the CN of a certificate that did not verify (optional_no_verify) could be anything: left out
+	if let Some(cn) = info.client_cn.as_ref().filter(|_| !info.client_cert || info.client_verified) {
 		tlv(&mut ssl, PP2_SUBTYPE_SSL_CN, cn.as_bytes());
 	}
 	tlv(&mut out, PP2_TYPE_SSL, &ssl);
@@ -333,6 +334,7 @@ mod tests {
 		let u = proxy_v2_header_with("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), Some(&unverified));
 		assert_eq!(&u[47..51], &[0, 0, 0, 1], "optional_no_verify: a certificate that did not verify (#238)");
 		assert_eq!(unverified.client_verify(), "FAILED");
+		assert!(!u.windows(5).any(|w| w == b"alice"), "no unverified CN in the TLV");
 		assert_eq!(TlsInfo::default().client_verify(), "NONE");
 		let len = u16::from_be_bytes([h[14], h[15]]) as usize;
 		assert_eq!(h.len(), 16 + len);
