@@ -115,8 +115,9 @@ impl Counters {
 pub struct State {
 	/// The old process's version.
 	pub version: String,
-	/// `rproxy_process_start_time_seconds` of the first process.
-	pub process_start_time: f64,
+	/// `rproxy_process_start_time_seconds` of the first process, as text (a
+	/// float through JSON can lose its last digit).
+	pub process_start_time: String,
 	/// Rules that are not from the settings file, as `GET /rules` shows them.
 	pub rules: Vec<serde_json::Value>,
 	/// Every rule's counters.
@@ -368,7 +369,7 @@ async fn snapshot(registry: &Registry) -> State {
 		}
 	}
 	let counters = registry.runtimes().await.iter().map(|(k, rt)| Counters::of(k, rt)).collect();
-	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time(), rules, counters, rulesets }
+	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time().to_string(), rules, counters, rulesets }
 }
 
 /// Every listening socket of this process, duplicated (so a socket closed

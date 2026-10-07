@@ -591,7 +591,9 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			let fds = r.take_fds();
 			let received = fds.len();
 			let kept = upgrade::inherit::adopt(fds);
-			upgrade::set_process_start_time(r.state.process_start_time);
+			if let Ok(t) = r.state.process_start_time.parse() {
+				upgrade::set_process_start_time(t);
+			}
 			info!(event = "handoff.received", from_version = %r.state.version, sockets = kept, received, rules = r.state.rules.len());
 			Some(r)
 		}
