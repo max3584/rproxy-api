@@ -205,8 +205,8 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 | テスト | 確かめること |
 |---|---|
 | `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout`・`rulesets`・`labels`・`conditions`・`readyz`・`geoip`・`outlier_detection`・`limits`・`bandwidth`（ミドルウェアの `geoip`・サービスの `outlier_detection`）は true）、`performance` が空 |
-| `dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
-| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.performance.*`。ルールの v0.4 の設定はすべて動くので警告にならない）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
+| `upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり |
+| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.performance.*`。ルールの v0.4 の設定はすべて動くので警告にならない）。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
 
 ## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
@@ -219,6 +219,26 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 | `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
 | `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
 
+## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
+
+| テスト | 確かめること |
+|---|---|
+| `dry_runs_of_the_rule_endpoints_change_nothing` | `POST` / `PATCH` / `DELETE` の `dry_run` は `action`・`change`・`before`（表示）・`after`（形）・`diff` を返し、何も作らない・変えない・消さない（待ち受けも開かない）。誤りは実際の操作と同じ答え（`invalid`・`tls_config`（証明書を読む）・`already_exists`・`unsupported`・`not_found`・`static`）。名前は解決しない |
+| `rule_set_dry_runs_change_nothing` | `PUT /rulesets/{name}?dry_run=true` が組の確かめをして、ルールごとの `action`・`change`（変わらない・接続を切らない変更（`diff`）・作り直し・削除・作成）と、なるはずの etag を返し、組もルールも変えない。古い `generation` は実際と同じく断る |
+| `dry_runs_need_the_same_permissions` | `allow_listen_ports` とスコープは dry run にも効く |
+| `config_plan_compares_with_the_static_rules` | `POST /config/plan` が固定ルールとの違い（作成・接続を切らない変更・作り直し・削除・変わらない数）、`restart_needed`、API のルールが持つアドレスの警告（`failed`）を返し、何も変えない。誤りは `400` と `errors` |
+| `config_reload_dry_run_reads_the_file_and_applies_nothing` | `POST /config/reload?dry_run=true` はファイルを読んで差分を返すだけ。誤りは `400`。そのあとの本当の reload は反映する |
+| `check_config_diff_asks_the_running_rproxy` | 本物のバイナリを Unix ソケットで動かし、`--check-config --diff` が差分を出す（`text`・`json`、既定の問い合わせ先 `RPROXY_API_SOCKET`、`--diff-token-file`）。トークンなし（401）・つながらない・`--diff-api` の誤り・設定の誤りは 1 |
+
+## 結合テスト：API で作ったルールの保存（`tests/persist.rs`、#144）
+
+| テスト | 確かめること |
+|---|---|
+| `persist_tokens_store_their_rules` | `persist: true` のトークンのルールは `origin: "api"`・`persisted`・`created_by`・`created_at` で行が書かれる（メモリのストア）。保存しないトークンのルールは `dynamic` のまま。`api` のルールの変更はどのトークンでも書き、作った人は残る。書けなければ `persisted: false` で動き続ける。削除で行も消える。dry run は書かない |
+| `without_a_database_nothing_is_stored` | `RPROXY_DATABASE_URL` がなければ `api` だが `persisted: false` |
+| `restored_rows_are_api_rules` | 復元した行は `api` のルール（`persisted: true`、保存した `created_at`）。同じキーは UI の行が先 |
+| `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
+| `a_blank_node_name_stops_the_startup` | 空白だけの `RPROXY_NODE_NAME` は設定のエラー |
 ## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）
 
 Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
@@ -227,7 +247,7 @@ Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
 |---|---|
 | `capabilities_turn_the_controller_features_on` | `features` の `rulesets`・`labels`・`conditions`・`readyz` が true |
 | `a_set_is_applied_as_a_whole_with_minimal_disruption` | `/` を含む名前の組を作る（`ETag` ヘッダ、`GET /rules` の `ruleset`・`labels`・`conditions`、`GET /rulesets`）。同じ本文はすべて `none` で etag も同じ。宛先だけの違いは `in_place` で、前からの接続は切れずに新しい接続が新しい宛先へ。`source_ip` の違いは `recreate`。外したルールは `delete`。`DELETE /rulesets/{name}` で全部止まる |
-| `sets_refuse_stale_writes_and_do_not_take_other_rules` | `If-Match` の食い違い・まだない組への `If-Match`（412）、古い `generation`（409 `stale_generation`）、引用符なし・リスト・`W/` の `If-Match`。組のルールの個別の PATCH / DELETE は `409 owned`、ほかの組は `owned`、POST のルールは `already_exists`（何も作らない）。不正なルールが 1 つあれば何も変えず、`errors` にすべての問題。本文の中の重なり。`dry_run` はまだ `unsupported`（何も変えない）。名前の誤り |
+| `sets_refuse_stale_writes_and_do_not_take_other_rules` | `If-Match` の食い違い・まだない組への `If-Match`（412）、古い `generation`（409 `stale_generation`）、引用符なし・リスト・`W/` の `If-Match`。組のルールの個別の PATCH / DELETE は `409 owned`、ほかの組は `owned`、POST のルールは `already_exists`（何も作らない）。不正なルールが 1 つあれば何も変えず、`errors` にすべての問題。本文の中の重なり。`dry_run` は消えるルールを答えて何も変えない（詳しくは tests/plan.rs）。名前の誤り |
 | `a_rule_that_cannot_bind_fails_alone` | 使用中のポートのルールだけ `failed`（`Programmed` が `False`・`BindFailed`、`BackendsHealthy` が `Unknown`、読み直しても `last_transition` は同じ）、残りは動く。ポートが空いてから同じ本文を PUT すると作り直して動く |
 | `conditions_report_targets_that_are_down` | 宛先がすべて down のルールは `BackendsHealthy` が `False`・`AllTargetsDown`（組でないルールにも `conditions`） |
 | `labels_are_kept_replaced_and_exported` | `labels` の表示、`/metrics` の `rproxy_rule_labels`、PATCH で丸ごと置き換え・省けばそのまま・`{}` で外す、誤ったキーは `invalid` |

@@ -18,7 +18,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::core::registry::{is_dual_stack_wildcard, overlaps, Entry, Registry};
+use crate::core::registry::{overlaps, Entry, Registry};
 use crate::core::rule::{Key, Origin, RuleRequest, RuleSpec, RuleView, State};
 use crate::error::ApiError;
 
@@ -512,12 +512,10 @@ fn finding(index: usize, rule: String, e: ApiError) -> (SetFinding, StatusCode) 
 	(SetFinding { index, rule, code: e.code, message: e.message }, e.status)
 }
 
-/// Whether PATCH's path can change `old` into `new` without dropping connections.
+/// Whether PATCH's path can change `old` into `new` without dropping
+/// connections (the plan engine's rule, shared with reloads and dry runs).
 fn in_place(old: &RuleSpec, new: &RuleSpec) -> bool {
-	old.port_count == new.port_count
-		&& old.source_ip == new.source_ip
-		&& old.http.is_some() == new.http.is_some()
-		&& !(is_dual_stack_wildcard(&old.key) && old.v6only() != new.v6only())
+	crate::config::plan::in_place(old, new)
 }
 
 fn port_range(spec: &RuleSpec) -> (u16, u16) {
@@ -825,9 +823,6 @@ impl Registry {
 	/// after the same checks; nothing changes. The hook for the plan engine
 	/// (`config::plan`).
 	fn ruleset_dry_run(&self, name: &str, generation: u64, etag: String, steps: &[Step]) -> Result<RulesetApplied, SetError> {
-		if !self.caps().features.dry_run {
-			return Err(ApiError::unsupported("dry_run is not available in this version (see GET /capabilities features)").into());
-		}
 		let results = steps
 			.iter()
 			.map(|s| ApplyResult {
@@ -837,7 +832,8 @@ impl Registry {
 				state: None,
 				error: None,
 				diff: match (s.action, &s.old, &s.spec) {
-					("update", Some(old), Some(new)) => crate::config::plan::diff(&spec_json(old), &spec_json(new)),
+					// the same shapes and paths as the other dry runs (#169)
+					("update", Some(old), Some(new)) => crate::config::plan::rule_diff(Some(old), Some(new)),
 					_ => vec![],
 				},
 			})
