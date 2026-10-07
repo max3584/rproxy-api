@@ -1315,6 +1315,29 @@
               "additionalProperties": false
             }
           },
+          "services": {
+            "type": "object",
+            "description": "Services with health_check or outlier_detection: the state of their servers.",
+            "properties": {},
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string"
+                  },
+                  "up": {
+                    "type": "boolean"
+                  },
+                  "ejected": {
+                    "type": "boolean",
+                    "description": "Ejected by outlier_detection (#170); left out when not."
+                  }
+                }
+              }
+            }
+          },
           "http3": {
             "type": "object",
             "description": "Rules with http.http3: whether HTTP/3 (QUIC) is answered on the UDP port, and why not.",

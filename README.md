@@ -297,19 +297,20 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `token.expiring` / `token.expired` | 制御 API のトークンの期限が近い（`RPROXY_TOKEN_WARN_DAYS` より近い）/ 切れた（`token`、`expires`、`days_left`）。起動・SIGHUP・1 日 1 回、状態が変わったときに 1 回だけ |
 | `api.lockout` / `api.unlock` | 認証の失敗が続いた送信元（`client`。IPv6 は /64）を止めた（`failures`、`until`）/ 解いた |
 | `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP でトークン・制御 API の証明書・ルールの証明書・CrowdSec の鍵を読み直した（読めなければ今のものを使い続ける） |
+| `geoip.reload` | `global.geoip` のデータベースを読んだ・読み直した（`db`：`country` / `asn`、`path`、`build_epoch`）。読めないときは `degraded`（`part: geoip`）で今のものを使い続ける |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |
-| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic` |
-| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`crowdsec`・`unmatched`。`client`（`IP:ポート`）、`sni`。UDP は送信元ごとに間引く（`suppressed`：その前に省いた行の数）。HTTP/3 は `transport: quic` |
+| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn` |
+| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`。`client`（`IP:ポート`）、`sni`。UDP は送信元ごとに間引く（`suppressed`：その前に省いた行の数）。HTTP/3 は `transport: quic` |
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗 |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
-| `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）を含む |
+| `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn` |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | `oidc` ミドルウェアのサインイン（`user`）、リフレッシュの失敗、プロバイダとのやり取りの失敗、セッションが大きすぎてリフレッシュトークンを持てない |
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |
 | `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
-| `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `connect`） |
+| `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `outlier`。`outlier` は実際の通信の失敗で外した・戻した：`cause`、`ejection_secs`）。`http` のサービスの `outlier_detection` でも（`service`、`server`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |

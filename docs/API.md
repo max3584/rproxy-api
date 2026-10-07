@@ -161,12 +161,12 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
   - `round_robin`：`weight` の比率で順に回す。
   - `least_conn`：いま開いている接続（UDP はセッション）の数 ÷ `weight` が一番小さい宛先。同じなら順に回す。
   - `failover`：`targets` の上から順に、up の最初の宛先だけを使う。上位が戻れば、新しい接続から戻る。
-- up / down：`health_check` があれば、その結果（最初の確認までは up）。なくても、TCP の接続を断られた（または 5 秒以内に応答がない）宛先は、10 秒のあいだ down として飛ばし、同じ接続を次の宛先で接続し直す。UDP は、転送先から ICMP の到達不能が返った宛先を同じく down にする。
+- up / down：`health_check` があれば、その結果（最初の確認までは up）。なくても、TCP の接続を断られた（または 5 秒以内に応答がない）宛先は、10 秒のあいだ down として飛ばし（外す）、同じ接続を次の宛先で接続し直す。UDP は、転送先から ICMP の到達不能が返った宛先を同じく外す。外す回数・時間・割合は v0.4 の `outlier_detection`（下の「v0.4 の設定」）で変えられる。
 - `backup` の宛先は、ほかの宛先がすべて down のときだけ使う。すべて down なら、down の宛先も順に試す（接続を断らない）。
 - UDP の既存のセッションは、自分の宛先が down になったら次の宛先へ移る（`conn.retarget`、`reason: target down`）。`failover` で上位が戻っても、既存のセッションはそのまま。
 - 名前解決できない宛先があっても、ほかの宛先が解決できればルールは動く（解決できない宛先は後から再解決する）。すべて解決できなければ、これまでどおり `resolve_failed`。
 - `tls.routes`（サーバ名ごとの転送先）は今までどおり route ごとに 1 つ。`targets` は一致しない名前（とサーバ名なし）の転送先。
-- 状態が変わると `event: "target.down"`（`reason: health_check` / `connect`、`error`）/ `"target.up"` のログ。ルールの `stats.targets` に宛先ごとの `[{"addr","port","backup"?,"up","connections","total_connections","resolved"}]`（`targets` が 2 つ以上か `health_check` があるときだけ）、`/metrics` に `rproxy_target_up{protocol,listen,target}`（1 / 0）と `rproxy_target_connections{protocol,listen,target}`。
+- 状態が変わると `event: "target.down"`（`reason: health_check` / `outlier`、`error`。`outlier` は `cause`（`connect`・`refused`・`short_lived`）と `ejection_secs`・`ejections` も）/ `"target.up"`（`reason: health_check` / `outlier`）のログ。v0.3 までは接続の失敗が `reason: connect` で、外した時間が過ぎたときの `target.up` はなかった。ルールの `stats.targets` に宛先ごとの `[{"addr","port","backup"?,"up","connections","total_connections","resolved","ejected_until","ejections"}]`（`targets` が 2 つ以上か `health_check` があるときだけ。`ejected_until` は外している間だけ Unix 秒、ほかは null）、`/metrics` に `rproxy_target_up{protocol,listen,target}`（1 / 0）と `rproxy_target_connections{protocol,listen,target}`。
 - 宛先がすべて down のときは、ルールの `all_targets_down` が `true`、`/metrics` の `rproxy_rule_all_targets_down{protocol,listen}` が 1（v0.3.20。`stats.targets` を出すルールだけ。ほかのルールでは `all_targets_down` はいつも `false`）。backup の宛先も含めて、どれも down のとき。
 - 宛先・`balance`・`health_check` を変えると、宛先ごとの接続数と up / down は最初からになる（開いている接続はそのまま）。
 
@@ -459,8 +459,8 @@ v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の�
 | ラベル（#28・#166） | ルールの `labels` | `{キー: 値}`。キーは英数字と `._/-`（63 文字まで）、値は 253 文字まで、16 個まで。動きには使わない（ログ・`/metrics`） | `labels` |
 | L4 の制限（#165） | ルールの `limits` | `max_connections`、`per_source`（`prefix_v4`・`prefix_v6`・`max_connections`・`new_connections`・`packets`（udp だけ）・`max_sources`）。速さは `{average, period, burst}`（L7 の `rate_limit` と同じ） | `limits` |
 | 帯域（#166） | ルールの `bandwidth` | `upload`・`download`（`"10Mbps"`、8kbps〜100Gbps）、`burst`（`"1MiB"`）、`per_source`（`upload`・`download`・`prefix_v4`・`prefix_v6`・`max_sources`）。TCP は待たせ、UDP は捨てる | `bandwidth` |
-| GeoIP（#168） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
-| 受け身のヘルスチェック（#170） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
+| GeoIP（#168。**動く**、下の「GeoIP」） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
+| 受け身のヘルスチェック（#170。**動く**、下の「受け身のヘルスチェック」） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
 | performance（#194・#184。動く） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）。項目ごとに、設定ファイル → 環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` → 既定の順。再起動まで効かない。下の「performance」 | `performance`（効く項目の名前。すべて） |
 | ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「ルールの組・状態・readiness」 | `rulesets` |
 | 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy`（下の「ルールの組・状態・readiness」） | `conditions` |
@@ -532,6 +532,63 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - 今までの `state`・`error`・`all_targets_down`・`down_services` もそのまま（UI が使う）。
 
 **readiness**：`GET /readyz`（認証なし、`/healthz` と同じ）。起動時の復元（設定ファイル・DB）が終わると `200 {"ready": true}`、その前と、終了の処理に入った後（#174 の引き継ぎでも）は `503 {"ready": false, "reason": "starting" | "draining"}`。ルールの失敗は readiness に含めない（ルールの状態は `conditions`）。生きているかは今までどおり `/healthz`。
+
+### GeoIP（#168）
+
+```yaml
+global:
+  geoip:
+    country_db: /var/lib/GeoIP/GeoLite2-Country.mmdb   # Country か City の mmdb
+    asn_db: /var/lib/GeoIP/GeoLite2-ASN.mmdb           # 任意
+    check_interval: 1m     # ファイルが変わったか確かめる間隔（既定 1m、0s で確かめない）
+    log_country: true      # conn.open・http.access に country（と asn）を足す（既定 false）
+rules:
+  - {protocol: tcp, listen_addr: 0.0.0.0, listen_port: 25565, remote_addr: 10.0.0.5, remote_port: 25565,
+     geoip: {allow_countries: [JP], deny_asns: [64496], unknown: allow}}
+```
+
+- データベースは同梱しない。MaxMind の GeoLite2（アカウントを作って `geoipupdate` で取る）か、同じ項目（`country.iso_code`、なければ `registered_country.iso_code`、`autonomous_system_number`）を持つ mmdb を使う。ファイルはメモリに読み込み（mmap はしない）、`check_interval` ごとと SIGHUP で変わっていれば読み直す（`event: "geoip.reload"`）。読み直せない（書きかけ・壊れている・権限）ときは今のものを使い続ける（`event: "degraded"`、`part: "geoip"`。同じ問題は 1 回だけ）。起動時（と `--check-config`）は、ファイルがない・mmdb でないなら設定のエラーで起動しない。権限で読めないなら `degraded` を出して起動し、読めるまでそのデータベースの判定はすべて「分からない」になる。
+- 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（国も ASN も分かっていて、どれにも当たらなければ拒否）。リストが要る国・ASN が分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。
+- L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS・PROXY ヘッダより前）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
+- L7（ミドルウェアの `geoip`）：`global.trusted_proxies` で決めたクライアントの IP で判定し、拒否は `403`（`ip_allow` と同じ）。`http.access` の `refused_by: "geoip"`・`middleware`、`country`・`asn`。
+- `log_country: true` で、`conn.open`（TCP・UDP）と `http.access` に `country`（と `asn`）が付く（分からないときは付かない）。
+- 国のリストは `country_db`、ASN のリストは `asn_db` がないと `400 invalid`（設定ファイルは検証の誤り）。`PATCH` で `geoip` を付けると丸ごと置き換え、`{}` で外す（接続は切らない。次の接続・データグラムから）。
+- CrowdSec と組み合わせるとき：国・ASN での粗い絞り込みは `geoip`、振る舞いでの ban は CrowdSec（L4 のルールの `crowdsec: true`、L7 の `crowdsec` ミドルウェア）。判定の順は `allow_from` → `geoip` → `crowdsec`。CrowdSec の側でも `crowdsecurity/geoip-enrich` で国を付けられるので、rproxy の `log_country` は SIEM などで rproxy のログだけを見るとき向け（docs/CROWDSEC.md）。
+
+### 受け身のヘルスチェック（#170）
+
+実際の通信で失敗が続いた宛先を、しばらく外す（outlier detection）。外した宛先は down と同じく選ばない（L4 は、すべての宛先が外れている・down のときは今までどおり順に試す）。外す時間が過ぎたら自然に戻る（`target.up`、`reason: "outlier"`）。`health_check` で up に戻った宛先はすぐ戻る。
+
+**L4**（ルールの `outlier_detection`。宛先が 1 つでも使えるが、意味があるのは複数のとき）：
+
+| 項目 | 既定 | 意味 |
+|---|---|---|
+| `consecutive_failures` | `1` | 続けて失敗した回数（1〜1000）。失敗は TCP の接続を断られた・時間切れ（`cause: connect`）、UDP の ICMP の到達不能（`refused`）、`short_lived` |
+| `short_lived` | `0s`（数えない） | TCP で、転送先が先に閉じた（切った）接続のうち、つながってからこの時間（0s〜1m）より短いものも失敗に数える。そのとき接続の成功は接続が終わるときに数える。UDP には効かない |
+| `ejection_time` | `10s` | 最初に外す時間（1s〜1h） |
+| `max_ejection_time` | `ejection_time` | 外すたびに倍にし、ここで止める（戻ってからこの時間のあいだ外されなければ、`ejection_time` に戻る） |
+| `max_ejected_percent` | `100` | 同時に外せる宛先の割合（0〜100。`0` で外さない） |
+
+- 書かなければ v0.3 までと同じ（接続に 1 回失敗したら 10 秒外す）。`{}` も同じ。
+- 外しているあいだにまた失敗した宛先（すべて外れていて試されたもの）は、外す時間を最初から数え直す（回数は増やさない）。
+- `PATCH` で変えると次の接続から効き、宛先ごとの回数と外している状態はそのまま（宛先・`balance`・`health_check` も変えたときは最初から）。
+
+**L7**（`http.services.<名前>.outlier_detection`。書いたサービスだけ）：
+
+| 項目 | 既定 | 意味 |
+|---|---|---|
+| `consecutive_5xx` | `5` | 続けて 5xx を返した回数（0 で見ない）。下の gateway の失敗も数える |
+| `consecutive_gateway_failures` | `3` | 502・503・504、接続できない、`timeouts.response` の時間切れが続いた回数（0 で見ない） |
+| `failure_percent` | なし | `window` の中で失敗（5xx・gateway の失敗）の割合がこれ以上なら外す（1〜100） |
+| `min_requests` | `20` | `failure_percent` を見る最小のリクエスト数 |
+| `window` | `30s` | `failure_percent` を数える窓（区切りごとに数え直す） |
+| `ejection_time` / `max_ejection_time` | `30s` / `5m` | L4 と同じ |
+| `max_ejected_percent` | `50` | 同時に外せるサーバの割合。既定ではサーバが 1 つのサービスは外さない |
+
+- `circuit_breaker`（ミドルウェア。サービス全体を止める）とは別で、サーバごとに外す。数えるのは転送先への 1 回ごとのリクエスト（`retry` の試し直しもそれぞれ数える。`errors`・`forward_auth` のページの取得も）。
+- 外したサーバは `stats.http.services.<名前>` のサーバに `"ejected": true`（`up` は false。`outlier_detection` のあるサービスは `health_check` がなくても出る）、`/metrics` の `rproxy_http_server_up` も 0。すべてのサーバが外れていて（`max_ejected_percent: 100`）、ヘルスチェックで up のものがあれば、それを使う。
+- ログは `target.down`（`reason: "outlier"`、`rule`、`service`、`server`、`cause`：越えたしきい値 `consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`、`ejection_secs`、`ejections`）/ `target.up`（`reason: "outlier"`）。
+- `http` を変えると数え直し（`Router` を組み立て直すため）。
 
 ## エンドポイント
 

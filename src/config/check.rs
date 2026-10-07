@@ -129,7 +129,22 @@ pub async fn check(input: &CheckInput) -> Report {
 		},
 		None => None,
 	};
-	let http = HttpGlobal::without_file(&doc.global.trusted_proxies).with_crowdsec(bouncer);
+	// global.geoip: the databases are read as at startup (#168)
+	let geoip = match &doc.global.geoip {
+		Some(g) if crate::core::rule::Features::CURRENT.geoip => {
+			secrets.extend(g.country_db.iter().chain(&g.asn_db).cloned());
+			match crate::net::geoip::Geoip::open(g) {
+				Ok(geoip) => Some(geoip),
+				Err(crate::net::geoip::GeoipError::Config(e)) => {
+					report.error("", e);
+					// the rules' lists are still checked against the paths given
+					crate::net::geoip::Geoip::from_bytes(g.clone(), None, None).ok()
+				}
+			}
+		}
+		_ => None,
+	};
+	let http = HttpGlobal::without_file(&doc.global.trusted_proxies).with_crowdsec(bouncer).with_geoip(geoip);
 	// global.acme: built as at startup (nothing is started, nothing is written)
 	let acme = match &doc.global.acme {
 		Some(a) => match crate::acme::Acme::new(a) {

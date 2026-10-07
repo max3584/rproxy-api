@@ -35,11 +35,13 @@ pub struct HttpGlobal {
 	sink: Sink,
 	/// `global.crowdsec`: the bouncer the `crowdsec` middleware asks.
 	crowdsec: Option<Arc<Bouncer>>,
+	/// `global.geoip`: the databases of the `geoip` lists (#168).
+	geoip: Option<Arc<crate::net::geoip::Geoip>>,
 }
 
 impl Default for HttpGlobal {
 	fn default() -> Self {
-		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None }
+		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None, geoip: None }
 	}
 }
 
@@ -67,7 +69,7 @@ impl HttpGlobal {
 	pub fn new(trusted_proxies: &[String], access_log: Option<&Path>, keep_files: usize) -> Result<Self, AccessLogError> {
 		let trusted_proxies = cidr::parse_list(trusted_proxies).map_err(|e| AccessLogError::Config(e.message))?;
 		let Some(path) = access_log else {
-			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, crowdsec: None });
+			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, crowdsec: None, geoip: None });
 		};
 		let dir = access_log_dir(path)?;
 		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("access");
@@ -80,12 +82,12 @@ impl HttpGlobal {
 			.build(dir)
 			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
 		let (writer, guard) = tracing_appender::non_blocking(appender);
-		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, crowdsec: None })
+		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, crowdsec: None, geoip: None })
 	}
 
 	/// Same as `new` without an access log file, for when it cannot be written.
 	pub fn without_file(trusted_proxies: &[String]) -> Self {
-		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), sink: Sink::Log, crowdsec: None }
+		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), sink: Sink::Log, crowdsec: None, geoip: None }
 	}
 
 	/// Attaches the CrowdSec bouncer of `global.crowdsec`.
@@ -96,6 +98,21 @@ impl HttpGlobal {
 
 	pub fn crowdsec(&self) -> Option<&Arc<Bouncer>> {
 		self.crowdsec.as_ref()
+	}
+
+	/// Attaches the databases of `global.geoip`.
+	pub fn with_geoip(mut self, geoip: Option<Arc<crate::net::geoip::Geoip>>) -> Self {
+		self.geoip = geoip;
+		self
+	}
+
+	pub fn geoip(&self) -> Option<&Arc<crate::net::geoip::Geoip>> {
+		self.geoip.as_ref()
+	}
+
+	/// The country (and ASN) of a client for the logs, when `global.geoip.log_country` is on.
+	pub fn geo_for_log(&self, ip: IpAddr) -> Option<crate::net::geoip::Info> {
+		self.geoip.as_ref().filter(|g| g.log_country()).map(|g| g.lookup(ip))
 	}
 
 	pub fn trusts(&self, peer: IpAddr) -> bool {
@@ -137,7 +154,8 @@ impl HttpGlobal {
 				path = %entry.path, query = %entry.query, protocol = %entry.protocol, status = entry.status, duration_ms = entry.duration_ms,
 				bytes_in = entry.bytes_in, bytes_out = entry.bytes_out, user_agent = %entry.user_agent,
 				sni = %entry.sni, tls_version = %entry.tls_version, refused_by = %entry.refused_by, middleware = %entry.middleware,
-				user = %entry.user, auth_error = %entry.auth_error),
+				user = %entry.user, auth_error = %entry.auth_error,
+				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
 				line.push(b'\n');
@@ -205,6 +223,11 @@ pub struct AccessEntry {
 	/// Why `basic_auth` refused: `no_credentials`, `unknown_user`, `bad_password` or
 	/// `unavailable` (the users file cannot be read). Never the password.
 	pub auth_error: String,
+	/// The client's country and ASN with `global.geoip.log_country` (#168); left out otherwise.
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub country: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub asn: Option<u32>,
 }
 
 #[derive(Serialize)]

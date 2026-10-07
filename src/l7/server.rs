@@ -485,6 +485,12 @@ impl Conn {
 		} else {
 			AccessEntry { route: route_label, ..Default::default() }
 		};
+		if log {
+			if let Some(geo) = global.geo_for_log(client_ip) {
+				entry.country = geo.country_str().unwrap_or("").to_string();
+				entry.asn = geo.asn;
+			}
+		}
 		let ctx = Ctx {
 			client: client_ip,
 			https: self.https,
@@ -566,6 +572,17 @@ impl Conn {
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
 					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
+				// the client as global.trusted_proxies decided; refused like ip_allow
+				Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
+					Ok(_) => None,
+					Err(info) => {
+						if log && entry.country.is_empty() {
+							entry.country = info.country_str().unwrap_or("").to_string();
+							entry.asn = info.asn;
+						}
+						Some(error_response(StatusCode::FORBIDDEN))
+					}
+				},
 				Middleware::Buffering { max } => {
 					let taken = std::mem::replace(&mut body, empty_body());
 					match resilience::buffer(&parts.headers, taken, *max).await {
@@ -951,6 +968,19 @@ impl Conn {
 	/// One request to one server, on a kept connection when there is one. The
 	/// connection goes back to the server's pool once the response body has been read.
 	async fn send(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>) -> Result<Response<Body>, Failure> {
+		let result = self.send_once(router, service, index, req).await;
+		// outlier_detection (#170): 5xx answers, connection failures and timeouts count against the server
+		if service.outlier.is_some() {
+			let outcome = match &result {
+				Ok(resp) => crate::core::outlier::HttpOutcome::of_status(resp.status().as_u16()),
+				Err(_) => crate::core::outlier::HttpOutcome::Gateway,
+			};
+			service.observe(index, outcome, self.rt.key);
+		}
+		result
+	}
+
+	async fn send_once(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>) -> Result<Response<Body>, Failure> {
 		let server = &service.servers[index];
 		// connections from the client's address (transparent) are not shared
 		let pooled = self.rt.bind_as(self.client).is_none();
@@ -1199,7 +1229,7 @@ mod tests {
 		assert_eq!(r.default_service.as_ref().unwrap().name, "s");
 		let health = r.health();
 		assert_eq!(health.keys().collect::<Vec<_>>(), ["s"], "only services with health_check");
-		assert_eq!(health["s"], [ServerHealth { url: "http://10.0.0.1".into(), up: true }], "up until a check fails");
+		assert_eq!(health["s"], [ServerHealth { url: "http://10.0.0.1".into(), up: true, ejected: false }], "up until a check fails");
 	}
 
 	#[test]
