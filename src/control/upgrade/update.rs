@@ -513,8 +513,17 @@ impl Fetcher {
 		}
 		let Some((v, (manifest, manifest_bytes, manifest_sig))) = best else { return Ok(None) };
 		// already here and still good
-		if let Ok(path) = self.cfg.verify_cached(&key, v) {
-			let sha = sha256_file(&path).unwrap_or_default();
+		// (hashing a binary is slow work: off the runtime's threads)
+		let (cfg, k) = (self.cfg.clone(), key.clone());
+		let cached = tokio::task::spawn_blocking(move || {
+			cfg.verify_cached(&k, v).map(|path| {
+				let sha = sha256_file(&path).unwrap_or_default();
+				(path, sha)
+			})
+		})
+		.await
+		.map_err(|e| e.to_string())?;
+		if let Ok((path, sha)) = cached {
 			return Ok(Some(Fetched { version: v, path, sha256: sha, handoff: manifest.handoff }));
 		}
 		let name = asset_name(v);
@@ -525,7 +534,8 @@ impl Fetcher {
 		std::fs::create_dir_all(&tmp).map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
 		let result = async {
 			self.get_to_file(&self.cfg.url(v, &name), &tmp.join(BINARY), MAX_BINARY).await?.ok_or(format!("v{v}: {name} is missing"))?;
-			let sha = check_binary(&key, v, &manifest, &tmp.join(BINARY), &sig)?;
+			let (k, m, file, sg) = (key.clone(), manifest.clone(), tmp.join(BINARY), sig.clone());
+			let sha = tokio::task::spawn_blocking(move || check_binary(&k, v, &m, &file, &sg)).await.map_err(|e| e.to_string())??;
 			let path = self.store(v, &tmp, &sig, &manifest_bytes, &manifest_sig)?;
 			Ok::<_, String>((sha, path))
 		}

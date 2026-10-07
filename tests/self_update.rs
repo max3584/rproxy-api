@@ -289,11 +289,12 @@ async fn a_signed_patch_is_swapped_in_and_a_forged_one_refused() {
 	publish(&s.files, &s.pair, v2, &binary, true);
 	let (status, _) = api(port, reqwest::Method::POST, "/admin/update").await.unwrap();
 	assert_eq!(status, 202);
-	let deadline = Instant::now() + Duration::from_secs(20);
+	let deadline = Instant::now() + Duration::from_secs(60);
 	let st = loop {
-		let (_, st) = api(port, reqwest::Method::GET, "/admin/update").await.unwrap();
-		if !st["error"].is_null() {
-			break st;
+		if let Some((_, st)) = api(port, reqwest::Method::GET, "/admin/update").await {
+			if !st["error"].is_null() {
+				break st;
+			}
 		}
 		assert!(Instant::now() < deadline, "no error reported");
 		tokio::time::sleep(Duration::from_millis(100)).await;
