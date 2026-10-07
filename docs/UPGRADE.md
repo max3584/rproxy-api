@@ -64,6 +64,15 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 | `RPROXY_UPDATE_PUBKEY` | バイナリに入れたリリースの鍵 | 署名を確かめる minisign の公開鍵のファイル（ミラーで自分で署名し直すとき）。鍵が入っていないビルドではこれが要る |
 | `RPROXY_UPDATE_HEALTHY` | `60s` | この間落ちなければ新しい版を「よい版」とする |
 
+### リリースの鍵
+
+v0.4.0 から、リリースのバイナリ・`manifest.json`・`SHA256SUMS`・`releases.json` に次の鍵で minisign の署名（`.minisig`）を付けている。リリースのバイナリにはこの鍵が入っている（`RPROXY_UPDATE_PUBKEY` の既定）。手で確かめるときは、下を `minisign.pub` に保存して `minisign -Vm <ファイル> -p minisign.pub`。
+
+```
+untrusted comment: rproxy-api release key
+RWRwgQhoV+uUAniEVZO6xGxvUZAx6aMNQWmC/+TasCJekyDmGb0tRc/X
+```
+
 ### 確かめること
 
 - 取るもの：`manifest.json`（版、`handoff` の可否、各バイナリの SHA-256）とその `.minisig`、このターゲットのバイナリ `rproxy-api-v<X.Y.Z>-<target>` とその `.minisig`。どの版があるかは、署名つきの索引 `<source>/latest/download/releases.json`（`{"releases":[{"version":"0.4.3"},...]}`。リリースのワークフローがリリースのたびに、すべてのマイナーのすべてのリリースを並べて書く）で知る。番号は飛ぶ（動くものが変わったリポジトリだけを出すため）ので、順に試すのではなく索引から、同じ X.Y で今より新しく悪い版でない最新のものを選ぶ（そのマニフェストが確かめられなければ 1 つ古いものへ）。
