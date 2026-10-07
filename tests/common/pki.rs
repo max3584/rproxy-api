@@ -116,13 +116,16 @@ impl Pki {
 	}
 
 	fn issue(&self, name: &str, cn: &str, sans: &[&str], client: bool) -> Issued {
-		self.issue_until(name, cn, sans, client, None)
+		self.issue_until(name, cn, sans, client, None, &[])
 	}
 
 	/// `not_after`: Unix seconds the certificate is valid until (it starts a year earlier).
-	fn issue_until(&self, name: &str, cn: &str, sans: &[&str], client: bool, not_after: Option<i64>) -> Issued {
+	fn issue_until(&self, name: &str, cn: &str, sans: &[&str], client: bool, not_after: Option<i64>, uris: &[&str]) -> Issued {
 		let key = KeyPair::generate().unwrap();
 		let mut params = CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+		for u in uris {
+			params.subject_alt_names.push(rcgen::SanType::URI((*u).try_into().unwrap()));
+		}
 		if let Some(t) = not_after {
 			params.not_after = time::OffsetDateTime::from_unix_timestamp(t).unwrap();
 			params.not_before = time::OffsetDateTime::from_unix_timestamp(t - 365 * 86_400).unwrap();
@@ -149,7 +152,12 @@ impl Pki {
 
 	/// A server certificate valid until `not_after` (Unix seconds; in the past for an expired one).
 	pub fn server_until(&self, name: &str, sans: &[&str], not_after: i64) -> Issued {
-		self.issue_until(name, sans.first().copied().unwrap_or(name), sans, false, Some(not_after))
+		self.issue_until(name, sans.first().copied().unwrap_or(name), sans, false, Some(not_after), &[])
+	}
+
+	/// A server certificate with URIs (e.g. SPIFFE IDs) in its subjectAltName besides `sans`.
+	pub fn server_with_uris(&self, name: &str, sans: &[&str], uris: &[&str]) -> Issued {
+		self.issue_until(name, sans.first().copied().unwrap_or(name), sans, false, None, uris)
 	}
 
 	/// A self-signed CA certificate valid until `not_after`, written to `name`.pem.

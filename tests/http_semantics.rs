@@ -441,3 +441,201 @@ async fn the_response_timeout_counts_from_the_end_of_the_request_body() {
 	assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["body_len"], 8 << 20);
 }
 
+
+// ---- HTTP/2 to backends (#233): h2c, h2 over TLS, auto; trailers both ways ----
+
+type H2Body = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+/// An HTTP/2 backend (h2c without `tls`; with it, TLS offering `alpn`, and HTTP/1.1
+/// too when `alpn` has it). It answers JSON of what it received, then trailers;
+/// `/grpc-error` answers with only headers and `grpc-status: 13` trailers.
+/// The second value counts accepted connections.
+async fn h2_backend(tls: Option<(&Pki, &Issued, &[&str])>) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let acceptor = tls.map(|(_, issued, alpn)| {
+		let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+			.with_safe_default_protocol_versions()
+			.unwrap()
+			.with_no_client_auth()
+			.with_single_cert(issued.full_chain(), issued.key_der())
+			.unwrap();
+		config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+		tokio_rustls::TlsAcceptor::from(Arc::new(config))
+	});
+	let count = conns.clone();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { return };
+			count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			let acceptor = acceptor.clone();
+			tokio::spawn(async move {
+				let service = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					let (parts, body) = req.into_parts();
+					let collected = body.collect().await.unwrap();
+					let trailers_in: Vec<Value> = collected.trailers().map(|t| t.iter().map(|(k, v)| json!([k.as_str(), v.to_str().unwrap()])).collect()).unwrap_or_default();
+					let len = collected.to_bytes().len();
+					let h = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+					let mut trailers = hyper::HeaderMap::new();
+					if parts.uri.path() == "/grpc-error" {
+						trailers.insert("grpc-status", "13".parse().unwrap());
+						trailers.insert("grpc-message", "boom".parse().unwrap());
+						let frames = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Frame::trailers(trailers))]);
+						return Ok::<_, std::convert::Infallible>(hyper::Response::builder().header("content-type", "application/grpc").body(boxed(StreamBody::new(frames))).unwrap());
+					}
+					let v = json!({
+						"version": format!("{:?}", parts.version), "path": parts.uri.path(), "authority": parts.uri.authority().map(|a| a.to_string()),
+						"host": h("host"), "te": h("te"), "x_forwarded_for": h("x-forwarded-for"), "body_len": len, "trailers_in": trailers_in,
+					});
+					trailers.insert("grpc-status", "0".parse().unwrap());
+					trailers.insert("x-trailer", "t".parse().unwrap());
+					let frames = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(Bytes::from(v.to_string()))), Ok(Frame::trailers(trailers))]);
+					Ok(hyper::Response::builder().header("content-type", "application/json").body(boxed(StreamBody::new(frames))).unwrap())
+				});
+				match acceptor {
+					None => {
+						let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(tcp), service).await;
+					}
+					Some(a) => {
+						let Ok(tls) = a.accept(tcp).await else { return };
+						let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(tls), service).await;
+					}
+				}
+			});
+		}
+	});
+	(addr, conns)
+}
+
+/// An `http` rule (TLS for the clients) in front of `services`, routed by path prefix to each service.
+async fn h2_setup(tag: &str, services: Value) -> Setup {
+	let pki = Pki::new(tag);
+	let cert: Issued = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let routes: Vec<Value> = services
+		.as_object()
+		.unwrap()
+		.keys()
+		.map(|name| json!({"name": name, "match": format!("PathPrefix(`/{name}/`)"), "service": name, "middlewares": ["strip"]}))
+		.collect();
+	let prefixes: Vec<String> = services.as_object().unwrap().keys().map(|n| format!("/{n}")).collect();
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"tls": {"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]},
+			"http": {"http3": true, "routes": routes, "services": services, "middlewares": {"strip": {"strip_prefix": {"prefixes": prefixes}}}},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	Setup { pki, port, _h: h }
+}
+
+/// A request with a body and trailers over HTTP/2; the response's body and trailers.
+async fn h2_with_trailers(sender: &mut hyper::client::conn::http2::SendRequest<H2Body>, uri: &str, te: bool) -> (StatusCode, Value, Option<hyper::HeaderMap>) {
+	let mut trailers = hyper::HeaderMap::new();
+	trailers.insert("x-req-trailer", "rt".parse().unwrap());
+	let frames = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Frame::data(Bytes::from_static(b"grpc-frame"))), Ok(Frame::trailers(trailers))]);
+	let mut req = hyper::Request::post(uri).header("content-type", "application/grpc");
+	if te {
+		req = req.header("te", "trailers");
+	}
+	let resp = sender.send_request(req.body(boxed(StreamBody::new(frames))).unwrap()).await.unwrap();
+	let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+	let collected = resp.into_body().collect().await.unwrap();
+	let trailers = collected.trailers().cloned();
+	let body = collected.to_bytes();
+	(status, serde_json::from_slice(&body).unwrap_or(Value::Null), trailers)
+}
+
+#[tokio::test]
+async fn h2c_backends_get_one_multiplexed_connection_and_trailers_pass_both_ways() {
+	let (b, conns) = h2_backend(None).await;
+	let s = h2_setup("sem-h2c", json!({"g": {"protocol": "h2c", "servers": [{"url": format!("http://{b}")}]}})).await;
+	let mut h2 = s.h2().await;
+	let (status, v, trailers) = h2_with_trailers(&mut h2, "https://a.test/g/pkg.Svc/Method", true).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(v["version"], "HTTP/2.0");
+	assert_eq!(v["path"], "/pkg.Svc/Method");
+	assert_eq!(v["authority"], "a.test", "the Host goes as :authority");
+	assert_eq!(v["te"], "trailers", "TE: trailers reaches an HTTP/2 backend");
+	assert_eq!(v["body_len"], 10);
+	assert_eq!(v["trailers_in"], json!([["x-req-trailer", "rt"]]), "request trailers reach the backend");
+	let trailers = trailers.expect("response trailers");
+	assert_eq!((trailers["grpc-status"].to_str().unwrap(), trailers["x-trailer"].to_str().unwrap()), ("0", "t"));
+
+	// a trailers-only answer (a gRPC error)
+	let resp = h2.send_request(hyper::Request::post("https://a.test/g/grpc-error").header("te", "trailers").body(empty()).unwrap()).await.unwrap();
+	let collected = resp.into_body().collect().await.unwrap();
+	assert_eq!(collected.trailers().unwrap()["grpc-status"], "13");
+
+	// many requests at once share one connection to the backend
+	let mut tasks = vec![];
+	for _ in 0..32 {
+		let mut sender = h2.clone();
+		tasks.push(tokio::spawn(async move { h2_send(&mut sender, hyper::Request::get("https://a.test/g/x").body(empty()).unwrap()).await.0 }));
+	}
+	for t in tasks {
+		assert_eq!(t.await.unwrap(), StatusCode::OK);
+	}
+	assert_eq!(conns.load(std::sync::atomic::Ordering::SeqCst), 1, "one multiplexed connection");
+
+	// HTTP/1.1 and HTTP/3 clients reach the HTTP/2 backend too
+	let (status, _, body) = h1_fields(&s.h1_raw(b"GET /g/h1 HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await);
+	assert_eq!(status, 200);
+	assert_eq!(json_body(&body)["version"], "HTTP/2.0");
+	let (mut h3, _ep) = s.h3().await;
+	let (status, _, body) = h3_get(&mut h3, hyper::Request::get("https://a.test/g/h3").body(()).unwrap()).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["path"], "/h3");
+}
+
+#[tokio::test]
+async fn h2_over_tls_auto_and_http1_fallback() {
+	let pki = Pki::new("sem-h2tls-back");
+	let back = pki.server("back", &["backend.test"]);
+	let (h2_only, _) = h2_backend(Some((&pki, &back, &["h2"]))).await;
+	let (both, _) = h2_backend(Some((&pki, &back, &["h2", "http/1.1"]))).await;
+	let (h1_only, _) = h2_backend(Some((&pki, &back, &["http/1.1"]))).await;
+	let tls = json!({"server_name": "backend.test", "ca_file": pki.ca_file});
+	let s = h2_setup(
+		"sem-h2tls",
+		json!({
+			"h2": {"protocol": "h2", "servers": [{"url": format!("https://{h2_only}")}], "tls": tls},
+			"auto2": {"protocol": "auto", "servers": [{"url": format!("https://{both}")}], "tls": tls},
+			"auto1": {"protocol": "auto", "servers": [{"url": format!("https://{h1_only}")}], "tls": tls},
+			"h2bad": {"protocol": "h2", "servers": [{"url": format!("https://{h1_only}")}], "tls": tls},
+		}),
+	)
+	.await;
+	let mut h2 = s.h2().await;
+	for (path, version) in [("h2", "HTTP/2.0"), ("auto2", "HTTP/2.0"), ("auto1", "HTTP/1.1")] {
+		for _ in 0..2 {
+			let (status, v, trailers) = h2_with_trailers(&mut h2, &format!("https://a.test/{path}/x"), true).await;
+			assert_eq!(status, StatusCode::OK, "{path}: {v}");
+			assert_eq!(v["version"], version, "{path}");
+			let host = if version == "HTTP/2.0" { &v["authority"] } else { &v["host"] };
+			assert_eq!(host, "a.test", "{path}");
+			if version == "HTTP/2.0" {
+				assert_eq!(trailers.unwrap()["grpc-status"], "0", "{path}");
+			}
+		}
+	}
+	let (status, _, _) = h2_send(&mut h2, hyper::Request::get("https://a.test/h2bad/x").body(empty()).unwrap()).await;
+	assert_eq!(status, StatusCode::BAD_GATEWAY, "h2 needs the server to pick h2");
+}
+
+#[tokio::test]
+async fn protocol_and_scheme_must_agree() {
+	let h = harness().await;
+	for (protocol, url) in [("h2", "http://127.0.0.1:1"), ("h2c", "https://127.0.0.1:1")] {
+		let (status, v) = h
+			.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "service": "s"}],
+				"services": {"s": {"protocol": protocol, "servers": [{"url": url}]}}}}))
+			.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+		assert!(v["error"].as_str().unwrap().contains(&format!("protocol {protocol}")), "{v}");
+	}
+}

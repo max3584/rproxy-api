@@ -54,14 +54,14 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 
 | Traefik | rproxy |
 |---|---|
-| `loadBalancer.servers[].url` / `weight` | `http.services.<名前>.servers` |
+| `loadBalancer.servers[].url` / `weight` | `http.services.<名前>.servers`（`h2c://` の URL は `http://` と `protocol: h2c`） |
 | `passHostHeader: false` | `pass_host_header: false` |
 | `healthCheck.path` / `interval` / `timeout` | `health_check` |
 | `sticky.cookie.name` | `sticky.cookie` |
 | `serversTransport`（`insecureSkipVerify`・`rootCAs`・`serverName`） | TLS を終端するルールの `tls.upstream`（ルールのすべての `https://` の転送先に効く） |
 | `weighted` | 中のサービスの転送先を 1 つにまとめ、重みを掛け合わせる（TCP / UDP も同じ） |
 | `failover` | 主のサービスの転送先、続けて `fallback` の転送先を並べ、`balance: failover`（上から順に、生きている最初の転送先。主のサービスの中でもラウンドロビンはしない）。`health_check` がなければ一覧で知らせる |
-| `mirroring` | 主のサービスだけを使う |
+| `mirroring` | 主のサービスだけを使う（写しが要れば、ルートに `mirror` ミドルウェアを手で足す） |
 | TCP / UDP のサービスの転送先が複数 | ルールの `targets`（`balance: round_robin`、重みつき）。サーバ名ごとの転送先（`tls.routes`）は 1 つなので、そこでは先頭だけ |
 | TCP / UDP のサービスの `healthCheck` | 変換しない（rproxy の L4 の `health_check` は TCP の接続で確かめる。必要なら足す） |
 

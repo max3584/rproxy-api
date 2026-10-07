@@ -4,6 +4,10 @@ http:
       entryPoints: [web]
       rule: Host(`app.example.com`)
       service: app
+    grpc:
+      entryPoints: [web]
+      rule: Host(`grpc.example.com`)
+      service: grpc
   services:
     app:
       failover:
@@ -21,3 +25,7 @@ http:
       loadBalancer:
         servers:
           - url: http://10.0.3.1:80
+    grpc:
+      loadBalancer:
+        servers:
+          - url: h2c://10.0.4.1:50051

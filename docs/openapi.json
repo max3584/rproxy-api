@@ -108,12 +108,18 @@
           "passthrough": {
             "type": "boolean",
             "description": "terminate rules: relay TLS of these names untouched"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Target"
+            },
+            "description": "several backends instead of remote_addr / remote_port (#234): features.tls_route_targets"
+          },
+          "balance": {
+            "$ref": "#/components/schemas/Balance"
           }
         },
-        "required": [
-          "remote_addr",
-          "remote_port"
-        ],
         "additionalProperties": false
       },
       "Certificate": {
@@ -282,6 +288,19 @@
             "items": {
               "type": "string"
             }
+          },
+          "timeouts": {
+            "type": "object",
+            "description": "#227: the whole request and one attempt to a backend; 0s is no limit (route_timeouts in features.http_options)",
+            "properties": {
+              "request": {
+                "type": "string"
+              },
+              "backend_request": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
           }
         },
         "required": [
@@ -318,13 +337,24 @@
                 },
                 "weight": {
                   "type": "integer",
-                  "minimum": 0
+                  "minimum": 1
+                },
+                "status": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 599,
+                  "description": "answer with this status instead of url (#235)"
+                },
+                "middlewares": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "middlewares for this server only (#229): headers, replace_host, strip_prefix, add_prefix, replace_path, replace_path_regex"
                 }
               },
-              "required": [
-                "url"
-              ],
-              "additionalProperties": false
+              "additionalProperties": false,
+              "description": "url or status, exactly one"
             }
           },
           "health_check": {
@@ -377,6 +407,48 @@
           },
           "outlier_detection": {
             "$ref": "#/components/schemas/HttpOutlierDetection"
+          },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "http1",
+              "h2",
+              "h2c",
+              "auto"
+            ],
+            "description": "HTTP version towards the servers (#233)"
+          },
+          "tls": {
+            "type": "object",
+            "description": "TLS towards the https:// servers instead of the rule's tls.upstream (#236)",
+            "properties": {
+              "server_name": {
+                "type": "string"
+              },
+              "ca_file": {
+                "type": "string"
+              },
+              "subject_alt_names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "DNS names or URIs, one of which must be a SAN of the certificate"
+              },
+              "cert_file": {
+                "type": "string"
+              },
+              "key_file": {
+                "type": "string"
+              },
+              "chain_file": {
+                "type": "string"
+              },
+              "insecure_skip_verify": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
           }
         },
         "required": [
@@ -399,6 +471,14 @@
             "items": {
               "type": "string"
             }
+          },
+          "add": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "appended to an existing value with , (#224)"
           }
         },
         "additionalProperties": false
@@ -422,6 +502,17 @@
                   },
                   "permanent": {
                     "type": "boolean"
+                  },
+                  "status": {
+                    "type": "integer",
+                    "enum": [
+                      301,
+                      302,
+                      303,
+                      307,
+                      308
+                    ],
+                    "description": "over permanent (#226)"
                   }
                 },
                 "additionalProperties": false
@@ -446,6 +537,17 @@
                   },
                   "permanent": {
                     "type": "boolean"
+                  },
+                  "status": {
+                    "type": "integer",
+                    "enum": [
+                      301,
+                      302,
+                      303,
+                      307,
+                      308
+                    ],
+                    "description": "over permanent (#226)"
                   }
                 },
                 "required": [
@@ -918,6 +1020,13 @@
                   },
                   "initial_interval": {
                     "type": "string"
+                  },
+                  "status": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "answers of these statuses (\"500\", \"502-504\") are tried again (#231)"
                   }
                 },
                 "required": [
@@ -1032,6 +1141,122 @@
             },
             "required": [
               "geoip"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "cors": {
+                "type": "object",
+                "description": "#230",
+                "properties": {
+                  "allow_origins": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "allow_methods": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "allow_headers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "expose_headers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "allow_credentials": {
+                    "type": "boolean"
+                  },
+                  "max_age": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "allow_origins"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "cors"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mirror": {
+                "type": "object",
+                "description": "#232",
+                "properties": {
+                  "service": {
+                    "type": "string"
+                  },
+                  "percent": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100
+                  },
+                  "fraction": {
+                    "type": "object",
+                    "properties": {
+                      "numerator": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "denominator": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "numerator"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "service"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "mirror"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "replace_host": {
+                "type": "object",
+                "description": "#228",
+                "properties": {
+                  "host": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "host"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "replace_host"
             ],
             "additionalProperties": false
           }
@@ -1616,7 +1841,7 @@
           },
           "features": {
             "type": "object",
-            "description": "v0.3 and v0.4 settings this build can run (docs/API.md). In v0.4.0 every boolean is true, middlewares includes geoip, services includes outlier_detection and performance names every key",
+            "description": "v0.3 and v0.4 settings this build can run (docs/API.md). In v0.4.0 every boolean is true, middlewares includes geoip, services includes outlier_detection and performance names every key; services includes protocol and tls, middlewares cors, mirror and replace_host",
             "properties": {
               "http": {
                 "type": "boolean"
@@ -1641,6 +1866,16 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "http_options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235)"
+              },
+              "tls_route_targets": {
+                "type": "boolean"
               },
               "rulesets": {
                 "type": "boolean"

@@ -560,3 +560,18 @@ UI の `forward_rules.options`（JSON）でも、ルールの `limits`・`bandwi
   - 引き継ぎで渡す状態に、API のルール（`GET /rules` の形。#144 の `created_by`・`created_at`・`persisted` ごと）、`stats.http`、`counters_since`（古いプロセスの値のまま）・`limited`・帯域で捨てた数も足した。新しいプロセスで最初からになるもの（`limits`・`bandwidth` のバケツと送信元ごとの数、L7 の `rate_limit` などの状態、外した宛先）は docs/UPGRADE.md。
   - 自動更新のバイナリは届いた分からキャッシュの一時ディレクトリに書き、ファイルから確かめる（メモリに持たない。上限 1 GiB）。
   - 引き継ぎの間（と後の古いプロセス）は、変更の API に `503 upgrading`。
+
+## 16. Gateway API の残りのための L7・TLS（#224・#226〜#236）
+
+rproxy-gateway v0.4.0 で Gateway API のすべての機能（conformance の extended を含む）を写せるように、オーナーの決定で v0.4.0 に足した（rproxy-gateway v0.4.0 と一緒に出す）。形は docs/API.md の「Gateway API 向けの L7・TLS」。決めたこと：
+
+- 機能ごとにモジュールを分けた：`l7/middleware/cors.rs`（#230）、`l7/mirror.rs`（#232）、`l7/deadline.rs`（#227）、`l7/backend_tls.rs`（#236）。HTTP/2 の転送先（#233）は `l7/backend.rs`（接続）と `l7/server.rs`（送信）、`tls.routes` の `targets`（#234）は `core/balance.rs` の `Pool` をそのまま使う。
+- `features` に足したもの：`middlewares` に `cors`・`mirror`・`replace_host`、`services` に `protocol`・`tls`、`http_options`（`headers_add`・`redirect_status`・`route_timeouts`・`server_middlewares`・`server_status`・`retry_status`）、`tls_route_targets`。コントローラはこれで古い rproxy を見分ける。
+- `headers` の `add` は `remove` → `set` → `add` の順、既にある値に `,`（空白なし）でつないで 1 本にする（Envoy と conformance の期待）。
+- CORS は `headers` の `cors` を広げずに、HTTPCORSFilter の形の `cors` ミドルウェアを別に作った（`expose_headers`・ワイルドカードのオリジン・`*` と `allow_credentials` の組み合わせの扱いが違うため。`headers` の `cors` はそのまま）。許さないオリジンのプリフライトは転送先へ渡す（Envoy と同じ）。
+- ルートの時間の上限は、Gateway API の `timeouts` に合わせてルートの項目にした（ミドルウェアではない）。`request` は応答の本文の終わりまでを数え、応答ヘッダの後に過ぎたら本文を誤りで終える（#134 の約束：完全に見せない）。`backend_request` は送信ごとで、サービスの `timeouts.response` の代わり。
+- `retry` の `attempts` は最初の 1 回を含む数のまま（Gateway API の `attempts` は送り直しの数なので、コントローラが 1 を足す）。送り直すメソッドの制限（冪等なものだけ）も変えない。
+- ミラーの割合は無作為ではなく数で揃える（黄金比で散らす。conformance の割合の確認が安定する）。本文は写しながら流し、ミラーが 64 フレーム遅れたらミラーの側だけ止める（本体を待たせない）。
+- HTTP/2 の転送先は転送先ごとに 1 本の接続（h2 の多重化）。`auto` は ALPN の結果を転送先ごとに覚える。HTTP/2 の転送先への Upgrade は 502（extended CONNECT はしない）。
+- サービスの `tls` はルールの `tls.upstream` と項目ごとに混ぜない（BackendTLSPolicy はサービスごとに完結するため）。`subject_alt_names` は DNS 名と URI（SPIFFE）を確かめる自前の検証器（チェーンと期限は rustls の webpki の関数）。
+- 固定の状態コードの転送先（#235）は `servers[]` の `url` の代わりの `status`（別の種類のサービスにしない。重みの割合をそのまま使えるため）。

@@ -698,6 +698,35 @@ mod tests {
 	}
 
 	#[test]
+	fn headers_add_redirect_status_and_mirror_share() {
+		// #224: appended with ',' (one field), after remove and set
+		let m = mw("headers: {request: {add: {X-A: v, X-New: n}, set: {X-S: s}, remove: [X-R]}}");
+		let mut p = parts("GET", "/", &[("x-a", "a"), ("x-a", "b"), ("x-r", "1"), ("x-s", "old")]);
+		m.on_request(&mut p, &ctx(false));
+		assert_eq!(p.headers.get_all("x-a").iter().collect::<Vec<_>>(), ["a,b,v"]);
+		assert_eq!((p.headers["x-new"].to_str().unwrap(), p.headers["x-s"].to_str().unwrap()), ("n", "s"));
+		assert!(!p.headers.contains_key("x-r"));
+		// #226
+		let m = mw("redirect_scheme: {scheme: https, status: 303}");
+		assert_eq!(m.on_request(&mut parts("POST", "/", &[]), &ctx(false)).unwrap().status(), StatusCode::SEE_OTHER);
+		let m = mw("redirect_regex: {regex: '^(.*)$', replacement: 'https://x/', permanent: true, status: 307}");
+		assert_eq!(m.on_request(&mut parts("GET", "/", &[]), &ctx(false)).unwrap().status(), StatusCode::TEMPORARY_REDIRECT);
+		// #232: a share kept by count
+		for (num, den) in [(20u32, 100u32), (1, 3), (25, 50), (0, 7)] {
+			let share = Share::new(num, den);
+			let taken = (0..3000).filter(|_| share.take()).count() as f64;
+			let want = 3000.0 * f64::from(num) / f64::from(den);
+			assert!((taken - want).abs() <= 3.0, "{num}/{den}: {taken} of 3000");
+		}
+		assert!((0..10).all(|_| Share::new(5, 5).take()));
+		// #228
+		let mut p = parts("GET", "/", &[("host", "a.example")]);
+		assert!(mw("replace_host: {host: 'one.example.org:8080'}").on_request(&mut p, &ctx(false)).is_none());
+		assert_eq!(p.extensions.get::<HostOverride>().unwrap().0, "one.example.org:8080");
+		assert_eq!(p.headers["host"], "a.example", "the client's Host stays for X-Forwarded-Host");
+	}
+
+	#[test]
 	fn paths() {
 		let m = mw("strip_prefix: {prefixes: [/api/, /v1]}");
 		let mut p = parts("GET", "/api/users?x=1", &[]);

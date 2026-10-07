@@ -117,6 +117,7 @@ The test CA, server certificates, and client certificates are generated on every
 | `bad_tls_settings_are_reported` | Rejects unreadable files, terminate without a certificate, unknown modes, and sni on UDP, leaving nothing behind |
 | `reload_picks_up_renewed_certificates_and_patch_changes_tls` | After replacing the certificate files and reloading, the new certificate is used. PATCH can switch back to passthrough |
 | `terminate_does_not_stall_under_backpressure` | With a small client send buffer, 16 round trips of 1 MiB through a terminating rule; every byte comes back intact each time (#187) |
+| `a_tls_route_spreads_over_several_targets` | `targets` of `tls.routes` (#234): spread by weight, a target that cannot be connected to is skipped; `balance: failover`. `remote_addr` with `targets`, neither, or `balance` without `targets` is `tls_config` |
 
 ## Integration tests: multi-tier CA (`tests/chain.rs`)
 
@@ -176,6 +177,8 @@ Streams tens of MiB of pseudo-random data (slices of a 1 MiB block at positions 
 | `websocket_streams_arrive_unchanged` | WebSocket (Upgrade) streams in both directions are unchanged |
 | `a_response_cut_off_by_the_backend_never_looks_complete` | When the target cuts off in the middle of a response, HTTP/1.1, HTTP/2, and HTTP/3 clients see an error (truncated) (for `Content-Length`, chunked, and through `compress`) |
 | `a_request_cut_off_by_the_client_never_reaches_the_backend_as_complete` | When the client cuts off in the middle of the body (HTTP/1.1 `Content-Length` and chunked truncation, HTTP/2 RST_STREAM, HTTP/3 reset), the target never receives it as a complete request |
+| `http2_backends_and_mirrors_keep_bodies_intact` | Downloads and uploads with an h2c backend (`protocol: h2c`, #233), and uploads through `mirror` (#232), arrive unchanged from HTTP/1.1, HTTP/2 and HTTP/3 clients |
+| `http2_backend_cut_offs_and_route_timeouts_never_look_complete` | An h2c backend cutting off a response, and a route's `timeouts.request` / `backend_request` (#227) running out in the middle of a response body, look like errors to every client |
 
 ## Integration tests: the TCP relay (`tests/relay.rs`, #185)
 
@@ -329,7 +332,9 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
 | `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc` |
 | `tests/http_resilience.rs` | Health checks, `sticky`, `compress`, `buffering`, `retry`, `circuit_breaker`, `errors` and kept backend connections (#61, #63, #64, #65) |
-| `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients |
+| `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients. HTTP/2 backends (#233): one multiplexed h2c connection, trailers both ways (including a gRPC trailers-only answer), `te: trailers`, h2 (TLS + ALPN) and `auto` (with backends picking `h2` or `http/1.1`), 502 when the backend does not pick `h2`, `protocol` against the URL scheme |
+| `tests/gateway_l7.rs` | L7 for the Gateway API (#224, #226-#232, #235): `add` of `headers`, redirect `status`, route `timeouts` (504, per attempt, cutting a body off), `replace_host`, per-server middlewares, `cors` (preflights, wildcard origins), `status` of `retry`, `mirror` (share, bodies, an unreachable mirror), `status` servers, `features` |
+| `tests/backend_tls.rs` | A service's `tls` (#236): its CA and SNI name, `subject_alt_names` (DNS names and URIs), a client certificate towards the backend, `https://` backends from a plain-HTTP rule, mistakes in shape and files |
 | `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec) |
 | `tests/acme.rs` | ACME (#208): the API's guards (always run) and obtaining real certificates with Pebble and PowerDNS (table above) |
 | `tests/traefik_convert.rs` | `contrib/traefik2rproxy.py` converts `tests/fixtures/traefik/` and rproxy accepts the result. Skipped without python3 and PyYAML (CI sets `RPROXY_TEST_REQUIRE_PYTHON=1`) |
