@@ -56,6 +56,8 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 
 /// With `global` settings of `http` rules (trusted proxies, access log).
 pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::HttpGlobal) -> Harness {
+	// keys and secrets written by tests must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_millis(100),
@@ -104,6 +106,8 @@ fn next_port(bindable: fn(u16) -> bool) -> u16 {
 
 /// The first of `n` consecutive TCP ports that no other test will be given.
 pub fn free_tcp_block(n: u16) -> u16 {
+	// keys and secrets written by tests must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	next_ports(n, |p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
@@ -113,15 +117,21 @@ pub fn free_udp_block(n: u16) -> u16 {
 }
 
 pub fn free_port() -> u16 {
+	// keys and secrets written by tests must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	next_port(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
 pub fn free_udp_port() -> u16 {
+	// keys and secrets written by tests must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	next_port(|p| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok())
 }
 
 /// TCP backend that answers every read with `tag` + the bytes read.
 pub async fn tcp_backend(tag: &'static str) -> SocketAddr {
+	// keys and secrets written by tests must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
 	tokio::spawn(async move {

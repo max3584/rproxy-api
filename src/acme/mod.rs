@@ -529,7 +529,7 @@ impl Acme {
 		let meta_path = self.storage.join("accounts").join(format!("{name}.json"));
 		let contacts: Vec<&str> = cfg.contact.iter().map(String::as_str).collect();
 		let account = if cfg.key_file.exists() {
-			let pem = std::fs::read(&cfg.key_file).map_err(|e| format!("{}: {e}", cfg.key_file.display()))?;
+			let pem = crate::net::files::read(&cfg.key_file, crate::net::files::Kind::Secret).map_err(|e| format!("{}: {e}", cfg.key_file.display()))?;
 			let der = PrivatePkcs8KeyDer::from_pem_slice(&pem)
 				.map_err(|e| format!("{}: not a PKCS#8 key: {e}", cfg.key_file.display()))?;
 			match self.account_meta(name, cfg) {
@@ -553,7 +553,7 @@ impl Acme {
 		} else {
 			let eab = match &cfg.eab {
 				Some(e) => {
-					let text = std::fs::read_to_string(&e.hmac_key_file).map_err(|err| format!("{}: {err}", e.hmac_key_file))?;
+					let text = crate::net::files::read_to_string(&e.hmac_key_file, crate::net::files::Kind::Secret).map_err(|err| format!("{}: {err}", e.hmac_key_file))?;
 					let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
 						.decode(text.trim().trim_end_matches('='))
 						.map_err(|_| format!("{}: the HMAC key is not base64url", e.hmac_key_file))?;

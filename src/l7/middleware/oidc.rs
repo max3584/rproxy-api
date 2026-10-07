@@ -735,6 +735,7 @@ mod tests {
 
 	#[test]
 	fn sealed_cookies_open_only_unchanged_with_the_same_key_and_name() {
+		crate::net::files::private_umask();
 		let d = dir("seal");
 		let o = oidc(&d);
 		let key = o.key.get().unwrap();
@@ -753,6 +754,7 @@ mod tests {
 
 	#[test]
 	fn short_cookie_secrets_and_missing_files_are_refused() {
+		crate::net::files::private_umask();
 		let d = dir("bad");
 		std::fs::write(d.join("client"), "x\n").unwrap();
 		std::fs::write(d.join("cookie"), "short\n").unwrap();
@@ -777,6 +779,7 @@ mod tests {
 
 	#[test]
 	fn cookies_and_query_strings() {
+		crate::net::files::private_umask();
 		let mut h = HeaderMap::new();
 		h.insert(header::COOKIE, HeaderValue::from_static("a=1; _rproxy_oidc=xyz; b=2"));
 		assert_eq!(cookie(&h, "_rproxy_oidc").as_deref(), Some("xyz"));
@@ -791,6 +794,7 @@ mod tests {
 
 	#[test]
 	fn identity_headers_replace_what_the_client_sent() {
+		crate::net::files::private_umask();
 		let d = dir("ident");
 		let o = oidc(&d);
 		let mut h = HeaderMap::new();

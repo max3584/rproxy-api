@@ -145,6 +145,14 @@ struct Options {
 	/// How long a source stays locked out [default: 5m]
 	#[arg(long, env = "RPROXY_API_LOCKOUT_DURATION")]
 	api_lockout_duration: Option<String>,
+	/// Sources never locked out, comma-separated CIDRs (e.g. the controller's Pod network);
+	/// connections with a verified client certificate are never locked out either (v0.4)
+	#[arg(long, env = "RPROXY_API_LOCKOUT_EXEMPT")]
+	api_lockout_exempt: Option<String>,
+	/// Directories whose files rules may name even when root owns them (Kubernetes Secret
+	/// volumes), separated by ':' or ','; global.files.trusted_dirs wins (v0.4)
+	#[arg(long, env = "RPROXY_FILES_TRUSTED_DIRS")]
+	files_trusted_dirs: Option<String>,
 	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
@@ -222,6 +230,14 @@ enum Command {
 		/// comma-separated or repeated (default: whoever the socket's mode lets in)
 		#[arg(long, env = "RPROXY_ACME_HELPER_ALLOW_USER", value_delimiter = ',')]
 		allow_user: Vec<String>,
+	},
+	/// Lets versions the self-update marked bad be chosen again (v0.4, security
+	/// review M1): all of them, or --version. Edits the cache's state
+	/// (RPROXY_UPDATE_CACHE); the same as DELETE /admin/update/bad
+	UpdateClearBad {
+		/// Only this version (X.Y.Z)
+		#[arg(long)]
+		version: Option<String>,
 	},
 }
 
@@ -357,6 +373,29 @@ fn upgrade_options(opts: &Options) -> rproxy_api::control::upgrade::UpgradeOptio
 	}
 }
 
+/// `rproxy-api update-clear-bad` (security review M1).
+fn update_clear_bad(opts: &Options, version: Option<&str>) -> ExitCode {
+	let version = match version.map(|v| rproxy_api::control::upgrade::update::Version::parse(v).ok_or(v)) {
+		Some(Err(v)) => {
+			eprintln!("rproxy-api: version {v:?} is not X.Y.Z");
+			return ExitCode::FAILURE;
+		}
+		Some(Ok(v)) => Some(v),
+		None => None,
+	};
+	let cfg = upgrade_options(opts).update_config();
+	match rproxy_api::control::upgrade::update::clear_bad(&cfg, version) {
+		Ok(cleared) => {
+			println!("{}", serde_json::json!({"cleared": cleared}));
+			ExitCode::SUCCESS
+		}
+		Err(e) => {
+			eprintln!("rproxy-api: {e}");
+			ExitCode::FAILURE
+		}
+	}
+}
+
 /// `rproxy-api launch` (#174): the container's entry point.
 fn launch(opts: &Options) -> ExitCode {
 	let _guard = match logging::init(&opts.log_level, None, opts.log_keep) {
@@ -390,6 +429,7 @@ fn hardening_options(opts: &Options) -> rproxy_api::control::hardening::Hardenin
 		lockout_failures: opts.api_lockout_failures,
 		lockout_window: opts.api_lockout_window.clone(),
 		lockout_duration: opts.api_lockout_duration.clone(),
+		lockout_exempt: opts.api_lockout_exempt.clone(),
 	}
 }
 
@@ -480,6 +520,9 @@ fn main() -> ExitCode {
 	let opts = Options::parse();
 	if let Some(Command::Launch { .. }) = &opts.command {
 		return launch(&opts);
+	}
+	if let Some(Command::UpdateClearBad { version }) = &opts.command {
+		return update_clear_bad(&opts, version.as_deref());
 	}
 	if opts.command.is_some() {
 		return acme_helper(&opts);
@@ -575,6 +618,9 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 		Ok(rt) => rt,
 		Err(e) => return fail(e.to_string()),
 	};
+	// run by someone else than the service user (root, by hand): files are read
+	// without the owner check, which is then judged for the service user (warnings)
+	rproxy_api::config::check::owner_check_for_service_user(&input.path, opts.files_trusted_dirs.as_deref());
 	let mut report = runtime.block_on(rproxy_api::config::check::check(&input));
 	if opts.diff {
 		// v0.4 (#169): asks the running rproxy with POST /config/plan
@@ -666,7 +712,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		},
 	};
 	// client_cert entries while the API asks for no certificates are a mistake
-	let tokens = Arc::new(tokens.with_client_auth(hardening.client_auth()).map_err(|e| e.to_string())?.with_lockout(hardening.lockout()));
+	let tokens = Arc::new(tokens.with_client_auth(hardening.client_auth()).map_err(|e| e.to_string())?.with_lockout(hardening.lockout()).with_lockout_exempt(hardening.lockout_exempt().unwrap_or_default()));
 	let token_expiry = Arc::new(TokenExpiry::new(hardening.token_warn_days()));
 	token_expiry.check(&tokens.expiries());
 
@@ -714,6 +760,24 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			}
 		}
 	}
+	// global.files.owner_check: before any rule or global file is read (v0.4)
+	let owner_check = doc.as_ref().and_then(|(_, d)| d.global.files.as_ref()).map(|f| f.owner_check).unwrap_or_default();
+	rproxy_api::net::files::set_owner_check(owner_check);
+	if owner_check == rproxy_api::net::files::OwnerCheck::Off {
+		warn!(event = "degraded", part = "global.files.owner_check",
+			"off: rules may name files of any owner (certificates, keys, secrets); see docs/PERMISSIONS.md");
+	}
+	// global.files.trusted_dirs (or RPROXY_FILES_TRUSTED_DIRS): files there may be root's too
+	let files_global = doc.as_ref().and_then(|(_, d)| d.global.files.as_ref());
+	if let Some(Err(e)) = files_global.map(|f| f.validate()) {
+		return Err(e);
+	}
+	let trusted = rproxy_api::net::files::effective_trusted_dirs(files_global, opts.files_trusted_dirs.as_deref());
+	rproxy_api::net::files::check_dirs(&trusted).map_err(|e| format!("RPROXY_FILES_TRUSTED_DIRS: {e}"))?;
+	if !trusted.is_empty() {
+		info!(event = "files.trusted_dirs", dirs = %trusted.join(":"), "files under these directories may be owned by root too");
+	}
+	rproxy_api::net::files::set_trusted_dirs(trusted);
 	if let Some((_, d)) = &doc {
 		for part in d.global.unsupported(&rproxy_api::core::rule::Features::CURRENT) {
 			warn!(event = "degraded", part = %part, "not available in this version yet; ignored (see GET /capabilities features)");

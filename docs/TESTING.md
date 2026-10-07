@@ -119,6 +119,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `terminate_does_not_stall_under_backpressure` | クライアントの送信バッファを小さくして、終端したルールで 1 MiB の往復を 16 回。どの回も全部のバイトが壊れずに返る（#187） |
 | `optional_no_verify_lets_any_client_certificate_in` | `client_auth.mode: optional_no_verify`（#238）：正しい CA・別の CA・証明書なしのどのクライアントも通る（`ca_file` ありとなし）。`optional` に `ca_file` がなければ `tls_config`。`features.client_auth_modes` |
 | `a_tls_route_spreads_over_several_targets` | `tls.routes` の `targets`（#234）：重みどおりに配り、つながらない宛先は飛ばす。`balance: failover`。`remote_addr` と `targets` の両方・どちらもなし・`targets` なしの `balance` は `tls_config` |
+| `files_others_may_write_or_read_are_refused` | ルールの鍵がほかの人に読める・証明書がグループに書けると `400 tls_config`（理由つき）、0644 の証明書と 0640 の鍵は使える（`global.files.owner_check`） |
 
 ## 結合テスト：多段の CA（`tests/chain.rs`）
 
@@ -221,6 +222,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 |---|---|
 | `client_certificates_authenticate_alone_or_bound_to_a_token` | main.rs と同じ TLS（`ClientCertAcceptor`）で、`optional` では証明書だけのエントリが証明書（SAN、なければ CN）で通り、スコープも効く。知らない名前・証明書なしは 401、トークンは証明書なしでも通る。証明書に結びついたトークンは、その証明書がないと 401。ほかの CA の証明書はハンドシェイクで断る。`required` では証明書のない接続を断る |
 | `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | 窓の中の 401 が上限に達した送信元は、正しいトークンでも `429 locked_out`（`Retry-After`）。Unix ソケットの失敗は数えず、止めている間も Unix ソケットは通る。`/healthz` は止めない。`/metrics` の `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`。時間が過ぎれば戻る |
+| `verified_certificates_and_exempt_sources_are_not_locked_out` | 止められた送信元からでも検証済みのクライアント証明書の接続は通る、`--api-lockout-exempt` の範囲は数えも止めもしない、形の誤りは起動を止める（セキュリティレビュー M4） |
 | `lockout_is_on_by_default` | 既定（オーナーの決定）で 20 回目の失敗で止まる |
 | `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
 | `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
@@ -253,6 +255,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 |---|---|
 | `a_signed_patch_is_swapped_in_and_a_forged_one_refused` | 署名つきの索引（番号が飛んでいて、ほかのマイナーも並ぶ）から新しいパッチを選び、`POST /admin/update` で取って確かめ、引き継ぎで入れ替える（新しいプロセスはキャッシュのバイナリ）。`RPROXY_UPDATE_HEALTHY` の後によい版になる。署名がバイナリと合わないパッチは断り（`GET /admin/update` の `error`）、キャッシュにも入れない |
 | `launch_runs_the_newest_patch_follows_upgrades_and_rolls_back` | `rproxy-api launch` が最新のパッチを選んで起動する（trial）。SIGUSR2 を渡して引き継ぎの後の主プロセスを追う。trial の版が落ちたら悪い版にしてイメージの版で起動し直す。SIGTERM でサーバと一緒に終わる |
+| `a_trial_stopped_by_a_signal_is_not_bad_and_bad_marks_can_be_cleared` | 試している版を起動役への SIGTERM で止めても悪い版にしない（`trial` は消える）。`rproxy-api update-clear-bad --version` で悪い版の印を外せる（セキュリティレビュー M1） |
 | `signatures_of_the_minisign_tool_verify` | minisign の道具で作った鍵と署名（既定の事前ハッシュの形と古い形）を確かめられる |
 
 ## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
@@ -289,6 +292,7 @@ Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
 | `labels_are_kept_replaced_and_exported` | `labels` の表示、`/metrics` の `rproxy_rule_labels`、PATCH で丸ごと置き換え・省けばそのまま・`{}` で外す、誤ったキーは `invalid` |
 | `readyz_follows_the_startup_and_the_shutdown` | トークンなしで `starting`（503）→ ready（200）→ `draining`（503。ready に戻らない） |
 | `sets_need_rules_write_within_the_allowed_ports` | `rules:read` のトークンは読めるが PUT / DELETE は 403、`allow_listen_ports` の外のルールは 403、`updated_by` はトークンの名前 |
+| `sets_belong_to_their_token_and_old_ports_are_checked` | 組は作ったトークンのもの（ほかのトークンは大きな `generation` でも `403`、`admin` は変えられて `owner` は残る）、`allow_rulesets` の外の名前は `403`、2^53 を超える `generation` は `400`、変える前の待ち受けの範囲が `allow_listen_ports` の外なら `403`（セキュリティレビュー M2・M3） |
 
 起動した rproxy が復元の後に `GET /readyz` で 200 を返すことは `tests/startup.rs` の `readyz_answers_once_started`。
 
@@ -322,7 +326,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 
 | ファイル | 確かめること |
 |---|---|
-| `tests/check_config.rs` | `rproxy-api --check-config`（#140）：起動・再読み込みと同じ道筋で設定ファイルを確かめ、何も開かず、終了コード・テキスト・JSON で答える |
+| `tests/check_config.rs` | `rproxy-api --check-config`（#140。ほかの人が読める鍵は誤り、`global.files.owner_check: off` なら通る）：起動・再読み込みと同じ道筋で設定ファイルを確かめ、何も開かず、終了コード・テキスト・JSON で答える |
 | `tests/startup.rs` | 本物のバイナリの起動：設定の誤りは止まり、環境の問題（権限・使用中のポート）は制限つきで動き続けて、直れば戻る。制御 API の TLS と SIGHUP の読み直し、`GET /readyz` |
 | `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き |
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99） |
@@ -333,7 +337,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |
 | `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc` |
 | `tests/http_resilience.rs` | ヘルスチェック・`sticky`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・転送先の接続の使い回し（#61・#63・#64・#65） |
-| `tests/http_semantics.rs` | HTTP の転送の約束（docs/API.md の「HTTP の転送の扱い」）：`client_auth` のない HTTPS のルールでクライアントの証明書のヘッダを HTTP/1.1・HTTP/2・HTTP/3 とも消す（セキュリティレビュー H1）。クッキー・繰り返しのフィールド・hop-by-hop・本文・大きなヘッダ・時間切れを HTTP/1.1・HTTP/2・HTTP/3 のクライアントで。HTTP/2 の転送先（#233）：h2c の 1 本の接続の多重化、トレーラーの両方向（gRPC の trailers-only の応答を含む）、`te: trailers`、h2（TLS + ALPN）・`auto`（`h2` / `http/1.1` のどちらを選ぶ転送先でも）・`h2` を選ばない転送先は 502、`protocol` と URL のスキームの組み合わせ |
+| `tests/http_semantics.rs` | HTTP の転送の約束（docs/API.md の「HTTP の転送の扱い」）：HTTP/2 の転送先のストリームが埋まったときの 504 と接続の追加（セキュリティレビュー M6）。`client_auth` のない HTTPS のルールでクライアントの証明書のヘッダを HTTP/1.1・HTTP/2・HTTP/3 とも消す（セキュリティレビュー H1）。クッキー・繰り返しのフィールド・hop-by-hop・本文・大きなヘッダ・時間切れを HTTP/1.1・HTTP/2・HTTP/3 のクライアントで。HTTP/2 の転送先（#233）：h2c の 1 本の接続の多重化、トレーラーの両方向（gRPC の trailers-only の応答を含む）、`te: trailers`、h2（TLS + ALPN）・`auto`（`h2` / `http/1.1` のどちらを選ぶ転送先でも）・`h2` を選ばない転送先は 502、`protocol` と URL のスキームの組み合わせ |
 | `tests/gateway_l7.rs` | Gateway API 向けの L7（#224・#226〜#232・#235）：`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`（504、送信ごと、本文の途中で切る）、`replace_host`、転送先ごとのミドルウェア、`cors`（プリフライト・ワイルドカードのオリジン）、`retry` の `status`、`mirror`（割合・本文・つながらないミラー）、`status` の転送先、`features`。許さないオリジンのプリフライトに rproxy が答える・転送先が 1 つでも `retry` が送り直す、クライアント証明書の `X-Client-Verify`・`X-Forwarded-Client-Cert`（`optional_no_verify`、偽のヘッダは消す）（#238）。`client_auth` のない平文のルール・Upgrade・`forward_auth`・`mirror` でも証明書のヘッダを偽れない、`mirror` の写しの X-Forwarded-For（セキュリティレビュー H1・M5） |
 | `tests/backend_tls.rs` | サービスの `tls`（#236）：サービスの CA・SNI の名前、`subject_alt_names`（DNS 名・URI）、転送先へのクライアント証明書、平文の HTTP のルールからの `https://` の転送先、形とファイルの誤り |
 | `tests/crowdsec.rs` | `crowdsec` ミドルウェア（偽の LAPI と AppSec） |

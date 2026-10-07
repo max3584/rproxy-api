@@ -185,7 +185,7 @@ systemctl enable --now rproxy-acme-helper
 systemctl restart rproxy-api
 ```
 
-  The unit runs `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy` as `rproxy-acme` (with the supplementary group `rproxy`, to read the settings file and give the socket to rproxy). The helper writes acme-dns's `credentials_file`, so keep it in `/var/lib/rproxy-acme/` (`StateDirectory`).
+  The unit runs `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy-api` as `rproxy-acme` (with the supplementary group `rproxy`, to read the settings file and give the socket to rproxy). The helper writes acme-dns's `credentials_file`, so keep it in `/var/lib/rproxy-acme/` (`StateDirectory`).
 - While the helper is down or not answering, DNS-01 orders fail and are retried (HTTP-01 and TLS-ALPN-01 are not affected). The helper logs `acme.dns` (`part: helper`) and `acme.helper` (refused requests).
 
 ## Permissions and storage

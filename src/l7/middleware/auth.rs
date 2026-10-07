@@ -52,9 +52,10 @@ impl<T> SecretFile<T> {
 	pub fn open(path: &str, what: &str, parse: fn(&str) -> Result<T, String>) -> Result<SecretFile<T>, ApiError> {
 		let path = PathBuf::from(path);
 		let print = fingerprint(&path);
-		let value = match std::fs::read_to_string(&path) {
+		let value = match crate::net::files::read_to_string(&path, crate::net::files::Kind::Secret) {
 			Ok(text) => Some(Arc::new(parse(&text).map_err(|e| ApiError::invalid(format!("{what}: {}: {e}", path.display())))?)),
-			Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
+			// a file rproxy may not use (owner, mode) is a mistake of the settings, not of the environment
+			Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) || crate::net::files::is_refused(&e) => {
 				return Err(ApiError::invalid(format!("{what}: {}: {e}", path.display())));
 			}
 			Err(e) => {
@@ -87,7 +88,7 @@ impl<T> SecretFile<T> {
 		if !force && print == s.print && s.value.is_some() {
 			return;
 		}
-		let result = std::fs::read_to_string(&self.path).map_err(|e| e.to_string()).and_then(|t| (self.parse)(&t));
+		let result = crate::net::files::read_to_string(&self.path, crate::net::files::Kind::Secret).map_err(|e| e.to_string()).and_then(|t| (self.parse)(&t));
 		match result {
 			Ok(v) => {
 				if s.value.is_some() && print != s.print {
@@ -425,6 +426,7 @@ mod tests {
 
 	#[test]
 	fn htpasswd_lines() {
+		crate::net::files::private_umask();
 		let bc = bcrypt::hash("pw", 4).unwrap();
 		let sha = format!("{{SHA}}{}", base64::engine::general_purpose::STANDARD.encode(Sha1::digest(b"pw")));
 		let users = parse_htpasswd(&format!("# c\nalice:{bc}\nbob:{sha}\n")).unwrap();
@@ -448,6 +450,7 @@ mod tests {
 
 	#[test]
 	fn apr1_matches_htpasswd() {
+		crate::net::files::private_umask();
 		// `openssl passwd -apr1 -salt r31..... password`
 		assert_eq!(apr1(b"password", b"r31....."), "ARC3pREO82RIm0aQ2zszC0");
 		assert_ne!(apr1(b"Password", b"r31....."), "ARC3pREO82RIm0aQ2zszC0");
@@ -455,6 +458,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn basic_auth_checks_and_reloads() {
+		crate::net::files::private_umask();
 		let file = tempfile("basic", &format!("alice:{}\n", bcrypt::hash("secret", 4).unwrap()));
 		let b = BasicAuth::new("auth", file.to_str().unwrap(), None, false, Some("X-User")).unwrap();
 		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(u) if u == "alice"));
@@ -478,6 +482,7 @@ mod tests {
 
 	#[test]
 	fn missing_or_bad_files_are_configuration_errors() {
+		crate::net::files::private_umask();
 		let e = BasicAuth::new("a", "/nonexistent/rproxy/users", None, false, None).unwrap_err();
 		assert!(e.message.contains("users_file"), "{}", e.message);
 		let file = tempfile("bad", "alice:plain\n");
@@ -488,6 +493,7 @@ mod tests {
 
 	#[test]
 	fn forward_auth_headers() {
+		crate::net::files::private_umask();
 		let service = Arc::new(crate::l7::backend::Service::single("http://127.0.0.1:1/auth").unwrap());
 		let mut fa = ForwardAuth {
 			name: "fa".into(),

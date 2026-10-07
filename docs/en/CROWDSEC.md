@@ -48,7 +48,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 ```
 
 - Match the file name in `acquis.d/rproxy.yaml` to `RPROXY_LOG_FILE` (`/var/log/rproxy/rproxy.log` in the default .deb). rproxy's logs are split daily into `<name>.<date>.<extension>`, so specify them with a glob (`/var/log/rproxy/*.log`). If you write the access log to a separate file with `global.access_log`, add that file too.
-- Make sure CrowdSec (root) can read rproxy's log directory (`rproxy:rproxy` 750).
+- Make sure CrowdSec (root) can read rproxy's log directory (`rproxy-api:rproxy` 750).
 
 ### Fields produced by the parser
 

@@ -16,10 +16,10 @@ English: [APT.md](en/APT.md)
 | `/var/log/rproxy/` | ログ（`rproxy.<日付>.log`、JSON Lines）。rproxy が日ごとに分け、`RPROXY_LOG_KEEP` を超えた古いものを消すので logrotate は不要 |
 | `/usr/share/doc/rproxy-api/` | README、API.md、PROFILES.md、固定ルールの例 |
 
-- インストール時に `rproxy` システムユーザーを作る。サービスはこのユーザーで動き、ユニットが `CAP_NET_BIND_SERVICE`（1024 未満のポート）と `CAP_NET_ADMIN`（`source_ip: transparent`）を与える（docs/PERMISSIONS.md）。
+- インストール時に `rproxy` グループと `rproxy-api` システムユーザー（主グループ `rproxy`）を作る。v0.3 の `rproxy` ユーザーがあれば、uid を変えずに `rproxy-api` に改名する（ファイルの所有者はそのまま。改名のために一度止めて、終わったら起動する）。サービスはこのユーザーで動き、ユニットが `CAP_NET_BIND_SERVICE`（1024 未満のポート）と `CAP_NET_ADMIN`（`source_ip: transparent`）を与える（docs/PERMISSIONS.md）。
 - インストールしただけでは有効にも起動にもしない（設定前に API が上がらないように）。`systemctl enable --now rproxy-api` で起動する。
 - アップグレードでは、動いていれば再起動する（`try-restart`）。トークンと設定は変えない。
-- `apt purge` で `/etc/rproxy/tokens`、`/etc/rproxy/`、`/var/log/rproxy/` を消す。`rproxy` ユーザーは残す。
+- `apt purge` で `/etc/rproxy/tokens`、`/etc/rproxy/`、`/var/log/rproxy/` を消す。`rproxy-api` ユーザーと `rproxy` グループは残す。
 - ログを journald（`journalctl -u rproxy-api`）に出すなら、`rproxy.env` の `RPROXY_LOG_FILE` の行をコメントにする。
 - `source_ip: transparent` の戻りのパケットのポリシールーティングは、`scripts/install.sh --transparent-clients ... --transparent-iface ...` で入れられる（README の「送信元 IP の引き渡し」）。
 

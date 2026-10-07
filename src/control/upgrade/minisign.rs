@@ -118,13 +118,21 @@ impl Signature {
 	}
 }
 
+/// The largest file a legacy (not prehashed) signature is checked for.
+pub const LEGACY_MAX: u64 = 64 << 20;
+
 /// Verifies what `reader` gives (a file: read in pieces when the signature is
 /// prehashed, minisign's default) against the `.minisig` text with `key`.
 pub fn verify_reader(key: &PublicKey, signature: &str, mut reader: impl std::io::Read) -> Result<String, String> {
 	let sig = Signature::parse(signature)?;
 	if !sig.prehashed {
+		// a legacy signature needs the whole file in memory: only for small files
+		// (security review L3; minisign signs prehashed by default)
 		let mut data = vec![];
-		reader.read_to_end(&mut data).map_err(|e| e.to_string())?;
+		std::io::Read::read_to_end(&mut reader.take(LEGACY_MAX + 1), &mut data).map_err(|e| e.to_string())?;
+		if data.len() as u64 > LEGACY_MAX {
+			return Err(format!("a legacy (not prehashed) signature is taken for files up to {} MiB only", LEGACY_MAX >> 20));
+		}
 		return sig.verify(key, &data).map(str::to_string);
 	}
 	let mut hash = Blake2b::default();

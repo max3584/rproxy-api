@@ -165,6 +165,9 @@ pub struct SetSnapshot {
 	pub name: String,
 	pub generation: u64,
 	pub updated_by: String,
+	/// The token that created the set (security review M3); empty from an older process.
+	#[serde(default)]
+	pub owner: String,
 	pub rules: Vec<serde_json::Value>,
 }
 
@@ -396,6 +399,7 @@ async fn snapshot(registry: &Registry) -> State {
 				name: set.name,
 				generation: set.generation,
 				updated_by: set.updated_by,
+				owner: set.owner,
 				rules: set.rules.iter().filter_map(request_value).collect(),
 			});
 		}
@@ -497,7 +501,24 @@ pub struct Received {
 /// Connects to the old process and takes its sockets and state (blocking; at
 /// the very start, before anything listens).
 pub fn receive(socket: &Path, timeout: Duration) -> Result<Received, String> {
+	// the socket's directory: nobody else may put a socket of their own there (security review L2)
+	if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+		use std::os::unix::fs::MetadataExt;
+		let meta = std::fs::metadata(dir).map_err(|e| format!("handoff socket: {}: {e}", dir.display()))?;
+		// SAFETY: geteuid has no preconditions
+		let me = unsafe { libc::geteuid() };
+		if meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0 || (meta.uid() != me && meta.uid() != 0) {
+			return Err(format!("handoff socket: {} may be written by other users", dir.display()));
+		}
+	}
 	let channel = Channel::connect(socket).map_err(|e| format!("handoff socket: {e}"))?;
+	// the old process started us: it is our parent and runs as our user (security review L2)
+	let cred = channel.peer_cred().map_err(|e| format!("handoff socket: {e}"))?;
+	// SAFETY: getppid / geteuid have no preconditions
+	let (parent, me) = unsafe { (libc::getppid(), libc::geteuid()) };
+	if cred.pid != parent || cred.uid != me {
+		return Err(format!("handoff socket: the other end (pid {}, uid {}) is not the process that started this one", cred.pid, cred.uid));
+	}
 	let hello = serde_json::to_vec(&Hello { version: env!("CARGO_PKG_VERSION").into(), pid: std::process::id() }).unwrap_or_default();
 	channel.send(HELLO, &hello, &[]).map_err(|e| format!("handoff: {e}"))?;
 	let mut fds = vec![];
@@ -581,7 +602,15 @@ impl Received {
 				}
 			};
 			let req = crate::core::ruleset::RulesetRequest { generation: set.generation, rules };
-			let opts = crate::core::ruleset::PutOptions { if_match: None, dry_run: false, by: &set.updated_by, may_use_ports: &|_, _| true };
+			let owner = if set.owner.is_empty() { set.updated_by.as_str() } else { set.owner.as_str() };
+			let opts = crate::core::ruleset::PutOptions {
+				if_match: None,
+				dry_run: false,
+				by: &set.updated_by,
+				admin: true,
+				owner: Some(owner),
+				may_use_ports: &|_, _| true,
+			};
 			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
 			}

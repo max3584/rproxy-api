@@ -64,6 +64,9 @@ pub struct GlobalSpec {
 	pub geoip: Option<crate::net::geoip::GeoipGlobal>,
 	/// Worker threads, UDP sockets per port, CPU pinning, busy poll, splice (#194, #184, v0.4).
 	pub performance: Option<performance::PerformanceSpec>,
+	/// The owner check of the files rules and settings name (v0.4, `net::files`).
+	#[serde(default)]
+	pub files: Option<crate::net::files::FilesGlobal>,
 }
 
 impl GlobalSpec {

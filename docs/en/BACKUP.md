@@ -42,7 +42,7 @@ mariadb-dump --single-transaction --default-character-set=utf8mb4 \
 
 - Use the database name of the UI's `DB_DATABASE` (default `rproxy`)
 - The output contains `DROP TABLE IF EXISTS` and `CREATE TABLE`, so you do not need to create the tables before restoring
-- The backup user only needs to read. Keep it separate from the UI user (`rproxy_ui`) and the rproxy user (`rproxy`, `SELECT` on `forward_rules` only)
+- The backup user only needs to read. Keep it separate from the UI user (`rproxy_ui`) and the rproxy DB user (`rproxy`, `SELECT` on `forward_rules` only)
 
 ```sql
 CREATE USER 'rproxy_backup'@'localhost' IDENTIFIED BY '<password>';
@@ -173,7 +173,7 @@ The order for restoring onto a freshly installed host (or the same host).
 
    The database users (the UI's `rproxy_ui`, rproxy's `rproxy`) and their grants are not in the dump; create them again ("DB users" in `db/README.en.md` of the UI repository).
    When restoring an older dump under a newer UI, apply the missing migrations in order (`/usr/share/rproxy-ui/db/migrations/`, `db/README.en.md`)
-4. **Check the rproxy configuration**: `sudo -u rproxy rproxy-api --check-config` ("Checks after restoring" below)
+4. **Check the rproxy configuration**: `sudo -u rproxy-api rproxy-api --check-config` ("Checks after restoring" below)
 5. **Start rproxy-api**: `sudo systemctl enable --now rproxy-api`. At startup it restores the rules from the database's `forward_rules`
 6. **Start rproxy-ui**: `sudo systemctl enable --now rproxy-ui`
 7. **Check** (below)
@@ -185,7 +185,7 @@ rproxy-api does not stop if it starts before the database is back (it starts wit
 ### Configuration file
 
 ```bash
-sudo -u rproxy rproxy-api --check-config /etc/rproxy/rproxy.yaml
+sudo -u rproxy-api rproxy-api --check-config /etc/rproxy/rproxy.yaml
 ```
 
 Runs the same checks as startup and reloads (syntax, rule values, overlapping listeners, certificate, key and CA files and their expiry, secret files) and exits with 0 when everything is fine.
@@ -256,7 +256,7 @@ jq '{version: 1, rules: [.[] | select(.origin == "dynamic")
       | if has("targets") or has("http") then del(.remote_addr, .remote_port) else . end]}' \
   rules.json > from-db.json
 sudo install -o root -g rproxy -m 0640 from-db.json /etc/rproxy/from-db.json
-sudo -u rproxy rproxy-api --check-config /etc/rproxy/from-db.json
+sudo -u rproxy-api rproxy-api --check-config /etc/rproxy/from-db.json
 ```
 
 - The `jq` drops the runtime fields (`state`, `stats`, ...), and for rules with several targets and L7 (`http`) rules drops the listing's `remote_addr` / `remote_port` (they are not accepted together with `targets`)

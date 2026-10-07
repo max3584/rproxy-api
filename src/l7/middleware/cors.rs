@@ -41,6 +41,15 @@ impl CorsFilterSpec {
 			if o != "*" && !(o.starts_with("http://") || o.starts_with("https://")) {
 				return bad(format!("allow_origins: {o:?} must be * or start with http:// or https://"));
 			}
+			// a wildcard only as the first label: `https://*.bar.com`, never `https://*bar.com`
+			// (which would take `https://evilbar.com`; security review L13)
+			if o != "*" && o.contains('*') {
+				let rest = o.split_once("://").map(|(_, r)| r).unwrap_or("");
+				let ok = rest.strip_prefix("*.").is_some_and(|host| !host.is_empty() && !host.contains('*') && !host.starts_with('.'));
+				if !ok {
+					return bad(format!("allow_origins: {o:?}: a wildcard must be the first label (https://*.example.com)"));
+				}
+			}
 		}
 		for v in self.allow_origins.iter().chain(&self.allow_methods).chain(&self.allow_headers).chain(&self.expose_headers) {
 			if HeaderValue::from_str(v).is_err() || v.contains(',') {
@@ -62,6 +71,10 @@ pub struct Cors {
 impl Cors {
 	pub fn new(spec: &CorsFilterSpec, what: &str) -> Result<Cors, ApiError> {
 		spec.validate(what)?;
+		if spec.allow_credentials && spec.allow_origins.iter().any(|o| o == "*") {
+			tracing::warn!(event = "config.warning", middleware = what,
+				"cors: allow_origins * with allow_credentials lets every site make credentialed requests (the Origin is echoed)");
+		}
 		Ok(Cors {
 			any_origin: spec.allow_origins.iter().any(|o| o == "*"),
 			any_method: spec.allow_methods.iter().any(|m| m == "*"),
@@ -244,5 +257,9 @@ mod tests {
 		assert!(v(serde_json::json!({"allow_origins": []})).is_err());
 		assert!(v(serde_json::json!({"allow_origins": ["www.foo.com"]})).is_err());
 		assert!(v(serde_json::json!({"allow_origins": ["*"], "allow_methods": ["GET,PUT"]})).is_err());
+		for bad in ["https://*bar.com", "https://a.*.bar.com", "https://*.", "https://**.bar.com", "https://*.bar.*"] {
+			assert!(v(serde_json::json!({"allow_origins": [bad]})).is_err(), "{bad}");
+		}
+		assert!(v(serde_json::json!({"allow_origins": ["https://*.bar.com"]})).is_ok());
 	}
 }

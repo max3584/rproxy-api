@@ -30,6 +30,8 @@ use rproxy_api::control::upgrade::update::{asset_name, Version};
 const KEY_ID: [u8; 8] = [0x52, 0x50, 0x52, 0x58, 0x59, 0x54, 0x53, 0x54];
 
 fn workdir(tag: &str) -> PathBuf {
+	// keys and secrets written here must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let dir = std::env::temp_dir().join(format!("rproxy-update-{tag}-{}", std::process::id()));
 	let _ = fs::remove_dir_all(&dir);
 	fs::create_dir_all(&dir).unwrap();
@@ -104,6 +106,9 @@ fn list(files: &Files, pair: &ring::signature::Ed25519KeyPair, v: Version) {
 	let key = "/releases/latest/download/releases.json".to_string();
 	let mut index: Value = f.get(&key).map(|b| serde_json::from_slice(b).unwrap()).unwrap_or(json!({"releases": []}));
 	index["releases"].as_array_mut().unwrap().push(json!({"version": v.to_string()}));
+	// newer with each release, as the release workflow writes it (security review L4)
+	let n = index["releases"].as_array().unwrap().len() as u64;
+	index["generated_at"] = json!(1_700_000_000 + n);
 	let body = serde_json::to_vec(&index).unwrap();
 	f.insert(format!("{key}.minisig"), testing::sign(pair, KEY_ID, &body, "index").into());
 	f.insert(key, body.into());
@@ -383,6 +388,55 @@ async fn launch_runs_the_newest_patch_follows_upgrades_and_rolls_back() {
 	assert!(status.success(), "{status:?}\n{}", fs::read_to_string(&log).unwrap_or_default());
 	assert!(!alive(third));
 	drop(procs);
+	let _ = fs::remove_dir_all(&s.dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trial_stopped_by_a_signal_is_not_bad_and_bad_marks_can_be_cleared() {
+	// security review M1: docker stop / a rolling restart during the trial says nothing about the version
+	let s = setup("launch-stop").await;
+	let binary = fs::read(env!("CARGO_BIN_EXE_rproxy-api")).unwrap();
+	let v1 = next(Version::own(), 1);
+	publish(&s.files, &s.pair, v1, &binary, false);
+	let port = free_port();
+	let mut env = s.env.clone();
+	env.push(("RPROXY_API_PORT", port.to_string()));
+	env.retain(|(k, _)| *k != "RPROXY_UPDATE_HEALTHY");
+	env.push(("RPROXY_UPDATE_HEALTHY", "10m".into()));
+	let mut procs = start(&s.dir, &["launch"], &env);
+	let log = procs.log.clone();
+	let launcher = procs.pids[0];
+	wait_event(&log, "launch.start", 1).await;
+	assert_eq!(state(&s.cache)["trial"]["version"], json!(v1.to_string()));
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while api(port, reqwest::Method::GET, "/capabilities").await.is_none() {
+		assert!(Instant::now() < deadline, "API down:\n{}", fs::read_to_string(&log).unwrap_or_default());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	signal(launcher, libc::SIGTERM);
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while procs.first.try_wait().unwrap().is_none() {
+		assert!(Instant::now() < deadline, "the launcher did not stop");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let st = state(&s.cache);
+	assert!(st["trial"].is_null(), "{st}");
+	assert!(!st["bad"].as_array().is_some_and(|b| b.contains(&json!(v1.to_string()))), "{st}");
+	drop(procs);
+
+	// a mark can be taken off again from the command line (or DELETE /admin/update/bad)
+	let mut st = st;
+	st["bad"] = json!([v1.to_string()]);
+	fs::write(s.cache.join("state.json"), st.to_string()).unwrap();
+	let out = Command::new(env!("CARGO_BIN_EXE_rproxy-api"))
+		.env_clear()
+		.args(["update-clear-bad", "--version", &v1.to_string()])
+		.env("RPROXY_UPDATE_CACHE", s.cache.display().to_string())
+		.output()
+		.unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["cleared"], json!([v1.to_string()]));
+	assert_eq!(state(&s.cache)["bad"], json!([]));
 	let _ = fs::remove_dir_all(&s.dir);
 }
 

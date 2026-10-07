@@ -23,6 +23,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           sha256: 2c26b46b...
           scopes: [rules:write]
           allow_listen_ports: 20000-29999   # 作成・変更・削除できる待ち受けポート（範囲ルールは全体が収まること）
+          allow_rulesets: [ci/]             # v0.4：PUT / DELETE できるルールの組の名前の先頭（省略ですべて）
           expires: 2027-03-31               # この日（UTC）まで有効
           persist: true                     # v0.4（#144）：作ったルールを rproxy_rules に保存する（既定 false）
       ```
@@ -46,6 +47,7 @@ TCP の制御 API の守りを足す：クライアント証明書（mTLS）、�
 | `--api-lockout-failures` / `RPROXY_API_LOCKOUT_FAILURES` | `20` | `window` の間に認証に失敗（401）した回数がこれに達した送信元を止める。`0` で止めない |
 | `--api-lockout-window` / `RPROXY_API_LOCKOUT_WINDOW` | `1m` | 数える時間（1s〜24h） |
 | `--api-lockout-duration` / `RPROXY_API_LOCKOUT_DURATION` | `5m` | 止める時間（1s〜24h） |
+| `--api-lockout-exempt` / `RPROXY_API_LOCKOUT_EXEMPT` | なし | 数えず止めない送信元（カンマ区切りの CIDR。NAT の後ろのコントローラなど）。検証済みのクライアント証明書（mTLS）で来た接続も止めない（同じアドレスから推測を続ける攻撃者に、正しい証明書を持つ管理者やコントローラを締め出させないため。セキュリティレビュー M4）。トークンだけの接続は、止まっているあいだトークンを確かめる前に `429` |
 
 **クライアント証明書（mTLS）**：トークンファイル（YAML）のエントリに `client_cert` を書く。値は証明書の名前で、DNS か URI の subjectAltName（なければ subject の CN）と完全一致で比べる。
 
@@ -305,6 +307,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
 - `rules` の各要素は `POST /rules` の本文と同じ形。
 - `global` はプロセス全体の設定（`trusted_proxies`、`access_log`、`acme`、`crowdsec`。docs/DESIGN-v0.3.md の 2.）。
   - `acme`: ACME のアカウント・DNS のプロバイダ・resolver・許可する名前（docs/ACME.md）。秘密はファイルで指し、API からは触れない。
+  - `files`（v0.4）：`{"owner_check": "strict" | "off", "trusted_dirs": ["/var/run/rproxy-gateway/certs"]}`（既定 `strict`、`trusted_dirs` なし）。`trusted_dirs`（なければ環境変数 `RPROXY_FILES_TRUSTED_DIRS`、`:` か `,` 区切り。両方あれば設定ファイル）の下にある（シンボリックリンクをたどった本当のパスで判断）ファイルは root のものでもよい（Kubernetes の Secret のボリューム）。絶対パスでなければ設定の誤り。ルールと `global` が指す証明書・鍵・秘密のファイルは、rproxy のユーザー（`rproxy-api`）のもので、グループ・ほかの人が書けず、鍵・秘密はほかの人が読めないものだけ使う（docs/PERMISSIONS.md の「ルールが指すファイルの所有者」）。`off` は root のファイルをそのまま使うときだけ（危険を承知で。起動時に `degraded`）。
   - `trusted_proxies`: CIDR の配列。`http` のルールで、接続元がこの範囲なら `X-Forwarded-For` を信用する（API で作ったルールにも効く）。
   - `crowdsec`: CrowdSec の bouncer（`crowdsec` ミドルウェアと、ルールの `crowdsec: true` が使う。書かずにそれらを使うと `invalid`、設定ファイルなら起動しない）。
     - `lapi_url`（例 `http://127.0.0.1:8080`）の `GET /v1/decisions/stream` を `update_interval`（既定 `10s`）ごとに呼び、判定を覚えておく（最初と、失敗した後は `startup=true` で全部を取り直す）。`X-Api-Key` は `api_key_file` の中身（`cscli bouncers add rproxy` で作ったキー。SIGHUP で読み直す）。
@@ -626,7 +629,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
 - **`replace_host`**（#228）：転送先へ送る `Host`（HTTP/2 の転送先なら `:authority`）を `host`（`host[:port]`）にする。サービスの `pass_host_header` より優先。`X-Forwarded-Host` はクライアントが送った値のまま。`match` には効かない（ルートを選んだ後に働く）。
 - **転送先ごとのミドルウェア**（#229）：`servers[].middlewares` のミドルウェアは、その転送先へ送るリクエストにだけ、ルートのミドルウェアの後に働く（`retry` の送り直しでは、送り直す先の転送先のもの）。応答へは逆の順で、ルートのミドルウェアの応答側より先に働く。使える種類は `headers`・`replace_host`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`（ほかは `400 invalid`）。
 - **`cors`**（#230）：
-  - `allow_origins`：`https://www.foo.com`（スキーム・ホスト・ポートの完全一致、大文字小文字を区別しない）、`*`（すべて）、`https://*.bar.com`（`*` は 1 文字以上の何にでも一致。`.` を含む）。
+  - `allow_origins`：`https://www.foo.com`（スキーム・ホスト・ポートの完全一致、大文字小文字を区別しない）、`*`（すべて）、`https://*.bar.com`（`*` は 1 文字以上の何にでも一致。`.` を含む）。`*` は先頭のラベルとしてだけ書ける（`https://*bar.com` は `evilbar.com` に一致してしまうので `400 invalid`。セキュリティレビュー L13）。`*` と `allow_credentials: true` を同時に書くと、どのサイトにも資格情報つきのリクエストを許すことになるので `config.warning` を出す（Gateway API の決まりどおり `Origin` をそのまま返す）。
   - プリフライト（`OPTIONS` で `Origin` と `Access-Control-Request-Method` があるもの）は、オリジンを許すなら rproxy が 204 で答える：`Access-Control-Allow-Origin`（`allow_origins` が `*` で `allow_credentials` が false なら `*`、ほかは `Origin` の値）、`Access-Control-Allow-Methods`（`allow_methods` をカンマ区切りで。`*` なら、`allow_credentials` のときは求められたメソッド、そうでなければ `*`）、`Access-Control-Allow-Headers`（同じく。`*` なら `allow_credentials` のときは `Access-Control-Request-Headers` の値）、`Access-Control-Expose-Headers`、`Access-Control-Max-Age`（`max_age` があれば）、`Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）、`Vary: Origin`。許さないオリジンのプリフライトも rproxy が 204 で答え、CORS のヘッダは付けない（`Vary: Origin` だけ。転送先へは送らない。#238。転送先が許してしまわないように）。`Origin` のない `OPTIONS` はプリフライトではないので転送先へ。
   - ふつうのリクエストは転送先へ送り、オリジンを許すなら応答に `Access-Control-Allow-Origin`・`Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers`・`Vary: Origin` を付ける（転送先が返した同じ名前のヘッダは置き換える）。
   - `headers` の `cors` はいままでのまま。
@@ -642,7 +645,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
   - `h2c`：`http://` の転送先と、前置きから始める HTTP/2（prior knowledge）。
   - `auto`：`https://` の転送先は ALPN で `h2` と `http/1.1` を提示して、転送先が選んだほうで話す。`http://` の転送先は HTTP/1.1。
   - `h2` は `http://`、`h2c` は `https://` の転送先とは組み合わせられない（`400 invalid`）。
-  - HTTP/2 の転送先とは、転送先ごとに 1 本の接続を多重化して使い回す（閉じられたら次のリクエストでつなぎ直す。同時に送れる数は転送先の `SETTINGS_MAX_CONCURRENT_STREAMS` まで、超えた分は空くのを待つ）。`source_ip: transparent` のルールではクライアントごとに新しい接続。
+  - HTTP/2 の転送先とは、接続を多重化して使い回す（閉じられたら次のリクエストでつなぎ直す）。1 本の接続に 100 件を超えて流すときは、転送先ごとに 8 本まで接続を足す。それでも空きがなく、転送先の `SETTINGS_MAX_CONCURRENT_STREAMS` で本文のあるリクエストがストリームを得られないときは、`timeouts.connect` の間待って 504（セキュリティレビュー M6：遅い本文で全部のリクエストが止まらないように）。接続を開くのは一度に 1 つで、空きのある接続を使うリクエストは待たない。`source_ip: transparent` のルールではクライアントごとに新しい接続。
   - トレーラーは両方向にそのまま流す（gRPC の `grpc-status` など）。クライアントの `TE` に `trailers` があれば、HTTP/2 の転送先へ `te: trailers` を渡す（ほかのホップごとのヘッダはいままでどおり取り除く）。
   - `timeouts`・`retry`・`health_check`（HTTP/2 で `GET`）・`outlier_detection`・`sticky` は HTTP/1.1 の転送先と同じ。HTTP/2 の転送先への Upgrade（WebSocket）は 502。
   - gRPC：クライアントは HTTP/2（TLS か h2c）で rproxy につなぐ。サービス・メソッドの一致は `Path(`/<package.Service>/<Method>`)`・`PathPrefix(`/<package.Service>/`)` で書く。
@@ -662,11 +665,12 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - 名前は `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?`（例 `k8s/default/web-gateway`）。パスの `/` はそのまま書く（`PUT /rulesets/k8s/default/web-gateway`）。
 - 本文は `{"generation": <整数>, "rules": [<POST /rules と同じルール>...]}`（ルールは 10,000 個まで、本文は 32 MiB まで）。同じキーのルールを 2 つ書くと `400 invalid`。
 - 順番：まず全部を確かめ、どれかが通らなければ**何も変えない**。
+  0. 持ち主（セキュリティレビュー M3）：組はそれを作ったトークン（`owner`）のもので、ほかのトークンは `admin` でなければ `PUT` / `DELETE` できない（`403 forbidden`）。トークンの `allow_rulesets`（名前の先頭の一覧）の外の名前も `403`。rproxy の再起動のあと先に組を作られないように、コントローラのトークンには `allow_rulesets: [k8s/]` のように付け、ほかの `rules:write` のトークンには付けない名前にする。`generation` は 2^53 - 1 まで（`400 invalid`。JSON のクライアントが正しく読める数）。
   1. `If-Match`（あれば）：今の etag と違う、または組がまだないと `412 precondition_failed`。`*` は「組があれば」。ETag ヘッダの引用符つきの値でも、本文の `etag` の値そのままでもよい（`W/`・カンマ区切りも受ける）。
   2. `generation`：覚えている値より小さいと `409 stale_generation`（同じ値はよい）。
   3. 各ルールの形（`POST /rules` と同じ検証。この版で動かせない設定は `unsupported`）と、本文の中のルール同士の重なり（`400 invalid`）。
   4. 組の外のルールとの取り合い：設定ファイルのルールと同じキーは `409 static`、ほかの組のルールは `409 owned`、`POST /rules` で作ったルールや待ち受けが重なるルールは `409 already_exists`、制御 API のアドレスは `409 reserved`。
-  5. 作る・変える・消すルールの待ち受けポートがトークンの `allow_listen_ports` の内か（外なら `403`）、ACME の証明書を使うルールには `acme:write`。
+  5. 作る・変える・消すルールの待ち受けポートがトークンの `allow_listen_ports` の内か（外なら `403`。変えるルールは、今の待ち受けの範囲も内であること：狭めて範囲の外の待ち受けを消せないように。セキュリティレビュー M2）、ACME の証明書を使うルールには `acme:write`。
   6. 作る・変えるルールの証明書・秘密のファイルが読めるか（`400 tls_config` / `invalid`）。
   - 断るときの本文は `{"code","error","errors":[{"index","rule","code","message"}]}`。`code` と `error`（`rules[i]: ...`）は最初の問題、`errors` はルールの問題のすべて（`index` は本文の `rules` の何番目か）。
 - 当て方：組から外れたルールを先に止め（接続は切れる）、変わったルールは PATCH で接続を切らずに変えられる違い（宛先・`balance`・`health_check`・時間・TLS・`allow_from`・`extra_listen_addrs`・`http`・`labels` などの v0.4 の設定）ならその場で変え（`change: in_place`）、そうでなければ（ポートの範囲・`source_ip`・`http` の有無）待ち受けを作り直す（`recreate`）。新しいルールは作り、変わらず動いているルールには触らない（`none`）。`failed` のルールは変わっていなくても作り直す。
@@ -674,7 +678,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - etag は `g<generation>-<ルールの正規化した JSON（キーの順）の SHA-256 の先頭 16 桁>`。ルールか `generation` が変わると変わり、状態（`running` / `failed`）では変わらない。
 - `?dry_run=true`：同じ確かめをして、変えずに結果（`dry_run: true`、なるはずの `etag`、`update` には `diff`）を返す。`change` と `diff` の意味は上の「変更前の差分」と同じ。
 - 組のルールは `GET /rules` にも出て `ruleset: "<名前>"` が付く（`origin` は `dynamic`）。個別の `PATCH` / `DELETE /rules/...` は `409 owned`（変えるなら組を PUT する）。`POST /rules` で同じキーは `409 already_exists`。
-- `GET /rulesets/{name}`：`{"name","generation","etag","updated_at","updated_by","rules":[<GET /rules と同じ表示>...]}`（キーの順、`ETag` ヘッダつき）。`updated_by` は最後に PUT したトークンの名前（トークンファイルがなければ空）。`GET /rulesets` は名前の順の一覧（`rules` は数）。
+- `GET /rulesets/{name}`：`{"name","generation","etag","updated_at","updated_by","owner","rules":[<GET /rules と同じ表示>...]}`（キーの順、`ETag` ヘッダつき）。`updated_by` は最後に PUT したトークンの名前（トークンファイルがなければ空）。`GET /rulesets` は名前の順の一覧（`rules` は数）。
 - `DELETE /rulesets/{name}?drain_secs=N`：組のルールを同時に止めて組を消す（`drain_secs` の間、各ルールの接続の終わりを待つ）。`If-Match` も使える。全部の接続が終わってから `204`。
 - 組は rproxy のメモリにだけあり、DB にも設定ファイルにも書かない。rproxy を再起動したら、コントローラは `GET /readyz` が 200 になってから組を PUT し直す。組の変更は 1 つずつ順に行う（読むのは待たない）。
 - ログ：`event = "ruleset.apply"`（`ruleset`・`generation`・`etag`・`created`・`updated`・`deleted`・`unchanged`・`failed`・`by`）、`ruleset.delete`（`ruleset`・`rules`）。個々のルールの `rule.create` / `rule.update` / `rule.delete` にも `ruleset` が付く。`audit` は `action: ruleset.put` / `ruleset.delete` と `ruleset`。
@@ -701,7 +705,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 - `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS・PROXY ヘッダより前）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
 - 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールだけ。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
-- 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら古いものから忘れる。接続の残っている送信元は何回か後回しにする）。忘れた送信元の数え直しは、そのあとの接続から。
+- 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら、接続の残っていない古いものから忘れる。接続の残っている送信元は忘れない（数え直しで制限をすり抜けられないように。セキュリティレビュー L8）。表がそういう送信元でいっぱいのあいだ、新しい送信元は `limits` では断り（`reason: source_connections`）、`bandwidth` では 1 つの共有のバケツを使う）。`max_sources` は 1,000,000 まで。
 - `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
 - `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3 は絞らない。
 - 速さはトークンバケツ（`burst` が大きさ、既定は 100 ms 分）。ルール全体のバケツはルールの全接続、送信元ごとのバケツはその送信元の全接続で分ける。TCP は 4 KiB（`burst` が小さければその大きさ）たまるまで待ってから読む。データグラムや読んだ量が残りより大きければ借りにして、その分あとで待つ（長い目で見て速さを守る）。
@@ -725,7 +729,7 @@ rules:
 ```
 
 - データベースは同梱しない。MaxMind の GeoLite2（アカウントを作って `geoipupdate` で取る）か、同じ項目（`country.iso_code`、なければ `registered_country.iso_code`、`autonomous_system_number`）を持つ mmdb を使う。ファイルはメモリに読み込み（mmap はしない）、`check_interval` ごとと SIGHUP で変わっていれば読み直す（`event: "geoip.reload"`）。読み直せない（書きかけ・壊れている・権限）ときは今のものを使い続ける（`event: "degraded"`、`part: "geoip"`。同じ問題は 1 回だけ）。起動時（と `--check-config`）は、ファイルがない・mmdb でないなら設定のエラーで起動しない。権限で読めないなら `degraded` を出して起動し、読めるまでそのデータベースの判定はすべて「分からない」になる。
-- 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（国も ASN も分かっていて、どれにも当たらなければ拒否）。リストが要る国・ASN が分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。
+- 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（分かっている国か ASN が、そのリストに当たらなければ拒否。もう一方が分からなくても拒否する。セキュリティレビュー L18）。リストが要る国・ASN がどれも分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。**データベースが読めないときも `unknown` になる**ので、拒否に倒したいときは `unknown: deny` にする。データベースは 1 GiB まで（それより大きいファイルは読まない）。
 - L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS・PROXY ヘッダより前）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
 - L7（ミドルウェアの `geoip`）：`global.trusted_proxies` で決めたクライアントの IP で判定し、拒否は `403`（`ip_allow` と同じ）。`http.access` の `refused_by: "geoip"`・`middleware`、`country`・`asn`。
 - `log_country: true` で、`conn.open`（TCP・UDP）と `http.access` に `country`（と `asn`）が付く（分からないときは付かない）。
@@ -789,7 +793,7 @@ rules:
 | `POST /acme/accounts/{name}/deactivate` | | 200 | アカウントを CA で無効にし、鍵を `<key_file>.deactivated` に退ける（次の注文で新しいアカウントを作る）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
 | `GET /readyz` | | 200 / 503 | v0.4（#28）：認証不要の readiness。`200 {"ready":true}` / `503 {"ready":false,"reason":"starting"\|"draining"}`（上の「ルールの組・状態・readiness」） |
 | `GET /rulesets` | | 200 | v0.4（#28）：ルールの組の一覧 `[{"name","generation","etag","rules","updated_at","updated_by"}]`。`rules:read` |
-| `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","updated_at","updated_by","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
+| `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","updated_at","updated_by","owner","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
 | `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。詳しくは上の「ルールの組・状態・readiness」 |
 | `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて同時に止めて組を消す（`If-Match` も使える）。`rules:write` |
 | `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |

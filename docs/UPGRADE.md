@@ -51,7 +51,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 
 - 起動役（launch）は、イメージと同じ X.Y の最新のパッチを、キャッシュとリリースの取り先から選び、**署名を確かめてから**子として起動する。取り先に届かない（障害・閉じたネットワーク）ときはキャッシュの最新、なければイメージの版。そのあとはコンテナの init として残り、シグナル（TERM・INT・HUP・USR2）をサーバに渡し、引き継ぎで主プロセスが変わったら新しいほうを追う（`launch.mainpid`）。孤児になったプロセスも引き取る（`PR_SET_CHILD_SUBREAPER`）。
 - 動いている間：`RPROXY_UPDATE_INTERVAL` ごと、または `POST /admin/update`（`admin`、既定では Unix ソケットからだけ。`202 {"status":"checking"}`）で新しいパッチを探し、確かめたら引き継ぎで入れ替える。`check` なら知らせるだけ（ログ `update.available` と `GET /admin/update`）。
-- 新しい版は、`RPROXY_UPDATE_HEALTHY` の間動き続けたら「よい版」になる（`update.healthy`。前のよい版を 1 つ残し、ほかはキャッシュから消す）。それまでに落ちたら（起動しない・引き継ぎに失敗した・すぐ落ちた）「悪い版」として覚えて二度と選ばず、前のよい版（なければイメージの版）で起動し直す（`update.rollback`）。
+- 新しい版は、`RPROXY_UPDATE_HEALTHY` の間動き続けたら「よい版」になる（`update.healthy`。前のよい版を 1 つ残し、ほかはキャッシュから消す）。それまでに自分で落ちたら（起動しない・引き継ぎに失敗した・すぐ落ちた）「悪い版」として覚えて二度と選ばず、前のよい版（なければイメージの版）で起動し直す（`update.rollback`）。起動役へのシグナル（`docker stop`・ローリング再起動）で止めた版は悪い版にしない（次の起動でまた試す）。起動役ごと止まった（SIGKILL・OOM）ときは `update.interrupted` で数え、続けて 3 回で悪い版にする（セキュリティレビュー M1。1 回の停止でセキュリティのパッチが止まらないように）。悪い版の印は `DELETE /admin/update/bad[?version=X.Y.Z]`（`admin`、既定では Unix ソケットからだけ）か `rproxy-api update-clear-bad [--version X.Y.Z]`（キャッシュの `state.json` を直す）で外せる。
 - k8s ではレプリカの入れ替えで更新するので `RPROXY_UPDATE=off` にする。
 
 | 環境変数（引数は同じ名前の `--update-*`） | 既定 | 意味 |
@@ -67,9 +67,11 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 ### 確かめること
 
 - 取るもの：`manifest.json`（版、`handoff` の可否、各バイナリの SHA-256）とその `.minisig`、このターゲットのバイナリ `rproxy-api-v<X.Y.Z>-<target>` とその `.minisig`。どの版があるかは、署名つきの索引 `<source>/latest/download/releases.json`（`{"releases":[{"version":"0.4.3"},...]}`。リリースのワークフローがリリースのたびに、すべてのマイナーのすべてのリリースを並べて書く）で知る。番号は飛ぶ（動くものが変わったリポジトリだけを出すため）ので、順に試すのではなく索引から、同じ X.Y で今より新しく悪い版でない最新のものを選ぶ（そのマニフェストが確かめられなければ 1 つ古いものへ）。
-- 署名は **minisign**（Ed25519。既定の BLAKE2b の事前ハッシュの形と古い形の両方）。マニフェストとバイナリの両方の署名、マニフェストの版、マニフェストの SHA-256 との一致がそろわないものは実行しない。キャッシュのものも起動の前に確かめ直す。
+- 署名は **minisign**（Ed25519。既定の BLAKE2b の事前ハッシュの形と古い形の両方。古い形はファイルを丸ごとメモリに読むので 64 MiB まで）。マニフェストとバイナリの両方の署名、マニフェストの版、マニフェストの SHA-256 との一致がそろわないものは実行しない。バイナリは先に SHA-256 を署名済みのマニフェストと比べてから署名を確かめる（署名のないものをメモリに読まない）。キャッシュのものも起動の前に確かめ直し、起動役は確かめたファイル（開いたまま）を実行する（確かめた後にパスを差し替えられても、確かめたものを動かす）。キャッシュのディレクトリは 700 で作る（セキュリティレビュー L3・L5）。
+- 索引の `generated_at`（リリースのワークフローが書く Unix 秒）は、前に見たものより古ければ断る（古い索引を返し続けるミラーで更新を止めさせない。セキュリティレビュー L4）。`state.json` の `index_generated_at` に覚える。
 - `"handoff": false` のパッチは入れ替えず、`update.restart_needed` を出す（次の起動で使う）。
 - `GET /admin/update`：`{"mode","current":{"version","sha256"},"available":{"version","sha256"}|null,"last_check","error","bad_versions":[...]}`。
-- キャッシュ：`<cache>/<版>/`（バイナリ・署名・マニフェスト）と `state.json`（`good`・`previous`・`bad`・`trial`）。
+- キャッシュ：`<cache>/<版>/`（バイナリ・署名・マニフェスト）と `state.json`（`good`・`previous`・`bad`・`trial`（`interrupted`）・`index_generated_at`）。
+- 起動役は `$NOTIFY_SOCKET` の `MAINPID=` を、送り主（`SCM_CREDENTIALS` の pid）が今のサーバか自分の子孫のときだけ受ける（セキュリティレビュー L1）。
 
-ログ：`update.check`・`update.available`・`update.fetched`・`update.healthy`・`update.rollback`・`update.restart_needed`・`update.error`、起動役の `launch.start`・`launch.mainpid`・`launch.exit`。
+ログ：`update.check`・`update.available`・`update.fetched`・`update.healthy`・`update.rollback`・`update.interrupted`・`update.clear_bad`・`update.restart_needed`・`update.error`、起動役の `launch.start`・`launch.mainpid`・`launch.notify_refused`・`launch.exit`。

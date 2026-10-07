@@ -2817,7 +2817,8 @@
           "generation": {
             "type": "integer",
             "minimum": 0,
-            "description": "The caller's generation (e.g. the Gateway's metadata.generation), stored and returned as is (observedGeneration). A PUT with a lower generation than the stored one is 409 stale_generation."
+            "description": "The caller's generation (e.g. the Gateway's metadata.generation), stored and returned as is (observedGeneration). A PUT with a lower generation than the stored one is 409 stale_generation.",
+            "maximum": 9007199254740991
           },
           "rules": {
             "type": "array",
@@ -2860,6 +2861,10 @@
             "items": {
               "$ref": "#/components/schemas/Rule"
             }
+          },
+          "owner": {
+            "type": "string",
+            "description": "the token that created the set; only it or an admin token may change or delete it (security review M3)"
           }
         },
         "required": [
@@ -2893,6 +2898,10 @@
           },
           "updated_by": {
             "type": "string"
+          },
+          "owner": {
+            "type": "string",
+            "description": "the token that created the set; only it or an admin token may change or delete it (security review M3)"
           }
         },
         "required": [
@@ -4776,6 +4785,45 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/admin/update/bad": {
+      "delete": {
+        "summary": "Let versions the self-update marked bad be chosen again (admin; by default only over the Unix socket; security review M1)",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "only this version (X.Y.Z); all when left out"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the versions taken off",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cleared": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid version or the Unix socket is required"
           }
         }
       }

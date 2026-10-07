@@ -81,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/config/plan", post(config_plan))
 		.route("/admin/upgrade", post(super::upgrade::upgrade))
 		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))
+		.route("/admin/update/bad", axum::routing::delete(super::upgrade::clear_bad))
 		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
 
 	Router::new()
@@ -117,7 +118,12 @@ async fn require_token(State((state, refusals)): State<Guard>, mut req: Request,
 		Some(_) => None,
 		None => req.extensions().get::<ConnectInfo<SocketAddr>>().map(|ConnectInfo(a)| a.ip()),
 	};
-	if let Some(left) = source.filter(|_| state.tokens.enabled()).and_then(|ip| state.tokens.lockout().locked(ip)) {
+	// a connection with a verified client certificate (mTLS) is not locked out: no one
+	// guessing tokens from the same address (NAT, a shared /64) has one (security review M4)
+	let verified_cert = req.extensions().get::<crate::control::hardening::ClientCert>().is_some_and(|c| !c.names().is_empty());
+	if let Some(left) =
+		source.filter(|_| state.tokens.enabled() && !verified_cert).and_then(|ip| state.tokens.lockout().locked(ip))
+	{
 		if let Some(suppressed) = refusals.check(&client.0) {
 			info!(event = "audit", client = %client.0, method = %req.method(), path = %req.uri().path(),
 				outcome = "locked_out", suppressed);

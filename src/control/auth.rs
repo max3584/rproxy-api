@@ -50,12 +50,15 @@ pub struct Principal {
 	/// How the request was authenticated, for the audit log (#167): `token`,
 	/// `cert` or `token+cert` (empty without a token file).
 	pub auth: &'static str,
+	/// Name prefixes of the rule sets the token may create, change or delete
+	/// (`allow_rulesets`; None: any). Security review M3.
+	rulesets: Option<Vec<String>>,
 }
 
 impl Principal {
 	/// Without a token file every request is allowed.
 	fn anonymous() -> Self {
-		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "" }
+		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "", rulesets: None }
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -65,6 +68,17 @@ impl Principal {
 	/// Whether the listen ports `first..=last` are all within `allow_listen_ports`.
 	pub fn may_use_ports(&self, first: u16, last: u16) -> bool {
 		self.ports.is_none_or(|(lo, hi)| lo <= first && last <= hi)
+	}
+
+	/// Whether the token may change rule set `name` (`allow_rulesets`).
+	pub fn may_use_ruleset(&self, name: &str) -> Result<(), crate::error::ApiError> {
+		match &self.rulesets {
+			Some(prefixes) if !prefixes.iter().any(|p| name.starts_with(p.as_str())) => Err(crate::error::ApiError::forbidden(format!(
+				"this token may not change rule set {name:?} (allow_rulesets: {})",
+				prefixes.join(", ")
+			))),
+			_ => Ok(()),
+		}
 	}
 }
 
@@ -102,6 +116,9 @@ struct TokenEntry {
 	scopes: Vec<Scope>,
 	#[serde(default)]
 	allow_listen_ports: Option<String>,
+	/// Name prefixes of the rule sets this token may change (security review M3).
+	#[serde(default)]
+	allow_rulesets: Option<Vec<String>>,
 	#[serde(default)]
 	expires: Option<String>,
 }
@@ -175,6 +192,9 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 				})?)),
 				None => None,
 			};
+			if e.allow_rulesets.as_ref().is_some_and(|p| p.is_empty() || p.iter().any(|p| p.is_empty())) {
+				return Err(invalid(path, format!("{}: allow_rulesets must list name prefixes (none empty)", e.name)));
+			}
 			if e.scopes.is_empty() {
 				return Err(invalid(path, format!("{}: scopes must not be empty", e.name)));
 			}
@@ -194,7 +214,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			tokens.push(Token {
 				secret,
 				client_cert: e.client_cert,
-				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist, auth },
+				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist, auth, rulesets: e.allow_rulesets },
 				expires,
 			});
 		}
@@ -213,6 +233,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					ports: None,
 					persist: false,
 					auth: "token",
+					rulesets: None,
 				},
 				expires: None,
 			})
@@ -293,6 +314,12 @@ impl Tokens {
 	/// `--api-lockout-*` (on by default: 20 failures in 1m lock out for 5m).
 	pub fn with_lockout(mut self, config: LockoutConfig) -> Self {
 		self.lockout = Lockout::new(config);
+		self
+	}
+
+	/// `--api-lockout-exempt` (security review M4).
+	pub fn with_lockout_exempt(mut self, exempt: Vec<crate::net::cidr::Cidr>) -> Self {
+		self.lockout = std::mem::take(&mut self.lockout).with_exempt(exempt);
 		self
 	}
 

@@ -58,6 +58,8 @@ pub struct HardeningOptions {
 	pub lockout_failures: Option<u32>,
 	pub lockout_window: Option<String>,
 	pub lockout_duration: Option<String>,
+	/// `--api-lockout-exempt`: CIDRs never locked out (security review M4).
+	pub lockout_exempt: Option<String>,
 }
 
 /// What the options mean for this build: errors stop the startup, warnings
@@ -105,6 +107,9 @@ impl HardeningOptions {
 				v.errors.push(e);
 			}
 		}
+		if let Err(e) = self.lockout_exempt() {
+			v.errors.push(e);
+		}
 		if !features.token_expiry && self.token_warn_days.is_some() {
 			v.ignored.push("--token-warn-days");
 		}
@@ -120,6 +125,16 @@ impl HardeningOptions {
 
 	pub fn token_warn_days(&self) -> u64 {
 		self.token_warn_days.unwrap_or(DEFAULT_TOKEN_WARN_DAYS)
+	}
+
+	/// `--api-lockout-exempt` (comma-separated CIDRs).
+	pub fn lockout_exempt(&self) -> Result<Vec<crate::net::cidr::Cidr>, String> {
+		let Some(list) = &self.lockout_exempt else { return Ok(vec![]) };
+		list.split(',')
+			.map(str::trim)
+			.filter(|c| !c.is_empty())
+			.map(|c| c.parse::<crate::net::cidr::Cidr>().map_err(|e| format!("--api-lockout-exempt: {}", e.message)))
+			.collect()
 	}
 
 	/// The lockout settings (after `check`: mistakes fall back to the defaults).
@@ -450,6 +465,8 @@ pub struct Lockout {
 	config: LockoutConfig,
 	sources: Mutex<HashMap<IpAddr, Source>>,
 	total: AtomicU64,
+	/// Sources never counted nor locked out (`--api-lockout-exempt`).
+	exempt: Vec<crate::net::cidr::Cidr>,
 }
 
 impl Default for Lockout {
@@ -460,7 +477,17 @@ impl Default for Lockout {
 
 impl Lockout {
 	pub fn new(config: LockoutConfig) -> Self {
-		Lockout { config, sources: Mutex::default(), total: AtomicU64::new(0) }
+		Lockout { config, sources: Mutex::default(), total: AtomicU64::new(0), exempt: vec![] }
+	}
+
+	/// Sources that are never counted nor locked out (`--api-lockout-exempt`).
+	pub fn with_exempt(mut self, exempt: Vec<crate::net::cidr::Cidr>) -> Self {
+		self.exempt = exempt;
+		self
+	}
+
+	pub fn exempt(&self, ip: IpAddr) -> bool {
+		crate::net::cidr::allows_any(&self.exempt, ip)
 	}
 
 	pub fn config(&self) -> LockoutConfig {
@@ -477,7 +504,7 @@ impl Lockout {
 	}
 
 	pub fn locked_at(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
-		if !self.enabled() {
+		if !self.enabled() || self.exempt(ip) {
 			return None;
 		}
 		let key = source_key(ip);
@@ -498,6 +525,9 @@ impl Lockout {
 	}
 
 	pub fn failed_at(&self, ip: IpAddr, now: Instant) -> bool {
+		if self.exempt(ip) {
+			return false;
+		}
 		if !self.enabled() {
 			return false;
 		}

@@ -58,7 +58,7 @@ pub struct Written {
 }
 
 fn read_secret(file: &str) -> Result<String, String> {
-	std::fs::read_to_string(file).map(|s| s.trim().to_string()).map_err(|e| format!("{file}: {e}"))
+	crate::net::files::read_to_string(file, crate::net::files::Kind::Secret).map(|s| s.trim().to_string()).map_err(|e| format!("{file}: {e}"))
 }
 
 /// Replaces `{fqdn}`, `{value}`, `{zone}` and `{secret}`.
@@ -154,7 +154,7 @@ impl Provider {
 
 	fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
 		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
-		match std::fs::read(file) {
+		match crate::net::files::read(file, crate::net::files::Kind::Secret) {
 			Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{file}: {e}")),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
 			Err(e) => Err(format!("{file}: {e}")),

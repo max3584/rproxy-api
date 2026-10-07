@@ -81,6 +81,11 @@ pub fn allows(list: &[Cidr], ip: IpAddr) -> bool {
 	list.is_empty() || list.iter().any(|c| c.contains(ip))
 }
 
+/// Whether `ip` is in one of `list` (an empty list holds nothing).
+pub fn allows_any(list: &[Cidr], ip: IpAddr) -> bool {
+	list.iter().any(|c| c.contains(ip))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

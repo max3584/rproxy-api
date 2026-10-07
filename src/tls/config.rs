@@ -1,7 +1,6 @@
 //! TLS / DTLS settings of a rule: what the API accepts, and the rustls /
 //! the dtls crate configurations built from it.
 
-use std::fs;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -432,8 +431,14 @@ pub fn best_match<'a>(lists: impl IntoIterator<Item = &'a [String]>, name: &str)
 		.map(|(_, i)| i)
 }
 
+/// Reads a certificate / CA file (or, with `Kind::Secret`, a key) after the
+/// owner check (`net::files`).
+fn read_kind(path: &str, kind: crate::net::files::Kind) -> Result<Vec<u8>, ApiError> {
+	crate::net::files::read(path, kind).map_err(|e| tls_error(format!("{path}: {e}")))
+}
+
 fn read(path: &str) -> Result<Vec<u8>, ApiError> {
-	fs::read(path).map_err(|e| tls_error(format!("{path}: {e}")))
+	read_kind(path, crate::net::files::Kind::Public)
 }
 
 fn load_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, ApiError> {
@@ -483,7 +488,7 @@ fn check_order(chain: &[CertificateDer<'_>], file: &str) -> Result<(), ApiError>
 }
 
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, ApiError> {
-	let data = read(path)?;
+	let data = read_kind(path, crate::net::files::Kind::Secret)?;
 	// the first PKCS#8, PKCS#1 (RSA) or SEC1 (EC) key in the file
 	PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
 		pem::Error::NoItemsFound => tls_error(format!("{path}: no private key block")),

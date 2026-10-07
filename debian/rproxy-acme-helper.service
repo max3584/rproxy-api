@@ -12,7 +12,7 @@ User=rproxy-acme
 Group=rproxy-acme
 # reads the settings file in /etc/rproxy (group rproxy) and gives the socket to group rproxy
 SupplementaryGroups=rproxy
-ExecStart=/usr/bin/rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy
+ExecStart=/usr/bin/rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy-api
 Restart=on-failure
 RestartSec=2
 

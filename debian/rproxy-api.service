@@ -9,7 +9,7 @@ After=network-online.target mariadb.service
 # new process with MAINPID= (sent by the old process, hence NotifyAccess=all)
 Type=notify
 NotifyAccess=all
-User=rproxy
+User=rproxy-api
 Group=rproxy
 # RPROXY_* settings, e.g. RPROXY_API_ADDR, RPROXY_TOKEN_FILE, RPROXY_STATIC_RULES, RPROXY_DATABASE_URL
 EnvironmentFile=/etc/rproxy/rproxy.env

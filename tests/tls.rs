@@ -882,3 +882,28 @@ async fn optional_no_verify_lets_any_client_certificate_in() {
 	let (_, caps) = h.get("/capabilities").await;
 	assert!(caps["features"]["client_auth_modes"].as_array().unwrap().contains(&json!("optional_no_verify")), "{caps}");
 }
+
+#[tokio::test]
+async fn files_others_may_write_or_read_are_refused() {
+	// owner's decision: rules use only files of rproxy's user, not writable by others,
+	// keys not readable by others (net::files, global.files.owner_check: strict)
+	use std::os::unix::fs::PermissionsExt;
+	let pki = Pki::new("owner-check");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let backend = tcp_backend("B:").await;
+	let tls = || json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]});
+	let set = |f: &str, mode| std::fs::set_permissions(f, std::fs::Permissions::from_mode(mode)).unwrap();
+	set(&cert.key_file, 0o644);
+	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("may be read by anyone"), "{v}");
+	set(&cert.key_file, 0o640);
+	set(&cert.cert_file, 0o664);
+	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+	assert!(v["error"].as_str().unwrap().contains("written by the group"), "{v}");
+	set(&cert.cert_file, 0o644);
+	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
+	assert_eq!(status, StatusCode::CREATED, "a 0644 certificate and a 0640 key are fine: {v}");
+}

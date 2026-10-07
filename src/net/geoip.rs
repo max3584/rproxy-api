@@ -219,9 +219,10 @@ impl Policy {
 			if hit_c(&self.allow_countries) || hit_a(&self.allow_asns) {
 				return true;
 			}
-			// known, and in none of the allow lists
-			let known = (!allow_c || info.country.is_some()) && (!allow_a || info.asn.is_some());
-			if known {
+			// what is known misses its allow list: refused, even if the other one is not
+			// known (an unknown ASN must not let a refused country in; security review L18)
+			let known_miss = (allow_c && info.country.is_some()) || (allow_a && info.asn.is_some());
+			if known_miss {
 				return false;
 			}
 			return self.unknown == Unknown::Allow;
@@ -301,7 +302,14 @@ impl Db {
 	}
 }
 
+/// The largest database read (GeoLite2/GeoIP2 City are about 100 MiB).
+const MAX_DB: u64 = 1 << 30;
+
 fn load(path: &Path) -> Result<Reader<Vec<u8>>, (std::io::ErrorKind, String)> {
+	let size = std::fs::metadata(path).map_err(|e| (e.kind(), format!("{}: {e}", path.display())))?.len();
+	if size > MAX_DB {
+		return Err((std::io::ErrorKind::InvalidData, format!("{}: larger than {} MiB", path.display(), MAX_DB >> 20)));
+	}
 	let bytes = std::fs::read(path).map_err(|e| (e.kind(), format!("{}: {e}", path.display())))?;
 	Reader::from_source(bytes).map_err(|e| (std::io::ErrorKind::InvalidData, format!("{}: not a MaxMind database: {e}", path.display())))
 }
@@ -507,7 +515,8 @@ mod tests {
 		let either = policy(serde_json::json!({"allow_countries": ["JP"], "allow_asns": [64500]}));
 		assert!(either.allows(&info(Some("US"), Some(64500))));
 		assert!(!either.allows(&info(Some("US"), Some(64501))));
-		assert!(either.allows(&info(Some("US"), None)), "the ASN is not known: unknown");
+		assert!(!either.allows(&info(Some("US"), None)), "a known country outside the list decides, not the unknown ASN (security review L18)");
+		assert!(either.allows(&info(None, None)), "nothing known: unknown");
 	}
 
 	fn write(dir: &Path, name: &str, bytes: &[u8]) -> String {

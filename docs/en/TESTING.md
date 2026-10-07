@@ -119,6 +119,7 @@ The test CA, server certificates, and client certificates are generated on every
 | `terminate_does_not_stall_under_backpressure` | With a small client send buffer, 16 round trips of 1 MiB through a terminating rule; every byte comes back intact each time (#187) |
 | `optional_no_verify_lets_any_client_certificate_in` | `client_auth.mode: optional_no_verify` (#238): clients with a certificate of the right CA, another CA, or none all get in (with and without `ca_file`). `optional` without `ca_file` is `tls_config`. `features.client_auth_modes` |
 | `a_tls_route_spreads_over_several_targets` | `targets` of `tls.routes` (#234): spread by weight, a target that cannot be connected to is skipped; `balance: failover`. `remote_addr` with `targets`, neither, or `balance` without `targets` is `tls_config` |
+| `files_others_may_write_or_read_are_refused` | A rule's key readable by others or a certificate writable by the group is `400 tls_config` (with the reason); a 0644 certificate and a 0640 key are fine (`global.files.owner_check`) |
 
 ## Integration tests: multi-tier CA (`tests/chain.rs`)
 
@@ -221,6 +222,7 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v
 |---|---|
 | `client_certificates_authenticate_alone_or_bound_to_a_token` | With the TLS of main.rs (`ClientCertAcceptor`) in `optional` mode, a certificate-only entry authenticates by the certificate (SAN, else CN) with its scopes. An unknown name or no certificate is 401; tokens work without a certificate. A token bound to a certificate is 401 without it. A certificate from another CA fails the handshake. `required` refuses connections without a certificate |
 | `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | A source reaching the limit of 401s in the window gets `429 locked_out` (`Retry-After`) even with a good token. Failures over the Unix socket are not counted, and the Unix socket works while locked out. `/healthz` is never refused. `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` in `/metrics`. It recovers when the time is up |
+| `verified_certificates_and_exempt_sources_are_not_locked_out` | A verified client certificate gets in from a locked-out address; `--api-lockout-exempt` sources are neither counted nor locked out; a malformed value stops the startup (security review M4) |
 | `lockout_is_on_by_default` | By default (owner's decision) the 20th failure locks out |
 | `expiring_tokens_are_reported_and_exported` | A token close to expiry gives `token.expiring` (`days_left`), an expired one `token.expired`, once per change. `rproxy_token_expiry_timestamp_seconds` in `/metrics` |
 | `the_binary_serves_client_certificates` | The real binary: a token file with `client_cert` and no `--tls-client-auth` stops the startup; with `required`, `/rules` is read with the certificate alone and connections without one are refused |
@@ -253,6 +255,7 @@ An HTTPS mirror (a small server in the test; binaries are answered with a redire
 |---|---|
 | `a_signed_patch_is_swapped_in_and_a_forged_one_refused` | The new patch is picked from the signed index (with a gap in the numbers and another minor listed); `POST /admin/update` fetches and verifies it and swaps it in with a handoff (the new process runs the cached binary); after `RPROXY_UPDATE_HEALTHY` it is the good version. A patch whose signature does not match its binary is refused (`error` in `GET /admin/update`) and never cached |
 | `launch_runs_the_newest_patch_follows_upgrades_and_rolls_back` | `rproxy-api launch` picks and starts the newest patch (on trial), passes SIGUSR2 on and follows the main process after the handoff; a version on trial that dies is marked bad and the image's version starts instead; SIGTERM stops the server and the launcher |
+| `a_trial_stopped_by_a_signal_is_not_bad_and_bad_marks_can_be_cleared` | A version on trial stopped by SIGTERM to the launcher is not marked bad (the `trial` is cleared); `rproxy-api update-clear-bad --version` takes a bad mark off (security review M1) |
 | `signatures_of_the_minisign_tool_verify` | Keys and signatures made by the minisign tool (the default prehashed form and the legacy one) verify |
 
 ## Integration tests: diff before change (`tests/plan.rs`, #169)
@@ -289,6 +292,7 @@ What the Kubernetes controller (`max3584/rproxy-gateway`) uses.
 | `labels_are_kept_replaced_and_exported` | `labels` in the view, `rproxy_rule_labels` in `/metrics`, PATCH replacing them as a whole / keeping them when left out / `{}` removing them, a wrong key is `invalid` |
 | `readyz_follows_the_startup_and_the_shutdown` | Without a token: `starting` (503) → ready (200) → `draining` (503; never ready again) |
 | `sets_need_rules_write_within_the_allowed_ports` | A `rules:read` token can read but not PUT / DELETE (403), rules outside `allow_listen_ports` are 403, `updated_by` is the token's name |
+| `sets_belong_to_their_token_and_old_ports_are_checked` | A set belongs to the token that made it (others get `403` even with a huge `generation`; `admin` may change it and the `owner` stays); names outside `allow_rulesets` are `403`; a `generation` past 2^53 is `400`; a change whose current listen range is outside `allow_listen_ports` is `403` (security review M2, M3) |
 
 That a started rproxy answers 200 on `GET /readyz` after the restore is `readyz_answers_once_started` in `tests/startup.rs`.
 
@@ -322,7 +326,7 @@ Test files not covered by the sections above (see the description at the top of 
 
 | File | What it checks |
 |---|---|
-| `tests/check_config.rs` | `rproxy-api --check-config` (#140): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON |
+| `tests/check_config.rs` | `rproxy-api --check-config` (#140; a key readable by others is an error, fine with `global.files.owner_check: off`): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON |
 | `tests/startup.rs` | Starting the real binary: configuration mistakes stop it; problems in the environment (permissions, a busy port) leave it running in a restricted mode that recovers. TLS on the control API, reloads on SIGHUP, `GET /readyz` |
 | `tests/targets.rs` | Several destinations (#98): `targets`, `balance` (round_robin / least_conn / failover), `backup`, `health_check` (L4 and services of `http` rules). The default behaviour without `outlier_detection` |
 | `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99) |
@@ -333,7 +337,7 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
 | `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc` |
 | `tests/http_resilience.rs` | Health checks, `sticky`, `compress`, `buffering`, `retry`, `circuit_breaker`, `errors` and kept backend connections (#61, #63, #64, #65) |
-| `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): client certificate headers dropped on an HTTPS rule without `client_auth` over HTTP/1.1, HTTP/2 and HTTP/3 (security review H1); cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients. HTTP/2 backends (#233): one multiplexed h2c connection, trailers both ways (including a gRPC trailers-only answer), `te: trailers`, h2 (TLS + ALPN) and `auto` (with backends picking `h2` or `http/1.1`), 502 when the backend does not pick `h2`, `protocol` against the URL scheme |
+| `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): 504 when an HTTP/2 backend's streams are taken, and more connections (security review M6); client certificate headers dropped on an HTTPS rule without `client_auth` over HTTP/1.1, HTTP/2 and HTTP/3 (security review H1); cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients. HTTP/2 backends (#233): one multiplexed h2c connection, trailers both ways (including a gRPC trailers-only answer), `te: trailers`, h2 (TLS + ALPN) and `auto` (with backends picking `h2` or `http/1.1`), 502 when the backend does not pick `h2`, `protocol` against the URL scheme |
 | `tests/gateway_l7.rs` | L7 for the Gateway API (#224, #226-#232, #235): `add` of `headers`, redirect `status`, route `timeouts` (504, per attempt, cutting a body off), `replace_host`, per-server middlewares, `cors` (preflights, wildcard origins), `status` of `retry`, `mirror` (share, bodies, an unreachable mirror), `status` servers, `features`. Preflights from origins not allowed answered by rproxy, `retry` again with one server, `X-Client-Verify` and `X-Forwarded-Client-Cert` of client certificates (`optional_no_verify`, forged headers removed) (#238). Certificate headers cannot be forged on plain rules without `client_auth`, Upgrades, `forward_auth` or `mirror`, and the X-Forwarded-For of `mirror` copies (security review H1, M5) |
 | `tests/backend_tls.rs` | A service's `tls` (#236): its CA and SNI name, `subject_alt_names` (DNS names and URIs), a client certificate towards the backend, `https://` backends from a plain-HTTP rule, mistakes in shape and files |
 | `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec) |

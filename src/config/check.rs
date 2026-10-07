@@ -105,6 +105,9 @@ pub async fn check(input: &CheckInput) -> Report {
 		}
 	};
 	report.files = doc.files.iter().map(|f| f.display().to_string()).collect();
+	if let Some(Err(e)) = doc.global.files.as_ref().map(|f| f.validate()) {
+		report.error("", e);
+	}
 	report.rules = doc.rules.len();
 	// v0.4 global settings this build cannot apply yet: ignored at startup (degraded)
 	for part in doc.global.unsupported(&crate::core::rule::Features::CURRENT) {
@@ -211,6 +214,25 @@ pub async fn check(input: &CheckInput) -> Report {
 	files.extend(secrets);
 	files.sort();
 	files.dedup();
+	// read without the owner check (`owner_check_for_service_user`): judged for the service user
+	let file_strict = doc.global.files.as_ref().map(|f| f.owner_check).unwrap_or_default() == crate::net::files::OwnerCheck::Strict;
+	if file_strict && crate::net::files::owner_check() == crate::net::files::OwnerCheck::Off {
+		#[cfg(unix)]
+		if let Some((uid, _)) = service_user() {
+			let settings = report.files.clone();
+			for f in files.iter().filter(|f| !settings.contains(f)) {
+				let path = Path::new(f);
+				if let Ok(meta) = std::fs::metadata(path) {
+					let link = std::fs::symlink_metadata(path).ok();
+					let dirs = crate::net::files::trusted_dirs();
+					let trusted = std::fs::canonicalize(path).is_ok_and(|real| crate::net::files::under_trusted(&real, &dirs));
+					if let Some(why) = crate::net::files::problem(path, link.as_ref(), &meta, crate::net::files::Kind::Public, uid, trusted) {
+						report.warning("", format!("{why} (rproxy runs as {SERVICE_USER}, uid {uid}; global.files.owner_check: strict)"));
+					}
+				}
+			}
+		}
+	}
 	for f in &files {
 		warn_unreadable(&mut report, Path::new(f), f, false);
 	}
@@ -225,8 +247,29 @@ fn access_error(e: crate::l7::access::AccessLogError) -> String {
 	}
 }
 
+/// `--check-config` run by another user than the service's (root, by hand): the files
+/// are read without the owner check (it would judge them for the wrong user), and
+/// `check` judges them for the service user instead, as warnings. Run as the service
+/// user (the unit's ExecReload), the check is the server's own: errors.
+pub fn owner_check_for_service_user(path: &Path, env_trusted_dirs: Option<&str>) {
+	let files = ConfigDoc::load(path).ok().and_then(|d| d.global.files);
+	crate::net::files::set_trusted_dirs(crate::net::files::effective_trusted_dirs(files.as_ref(), env_trusted_dirs));
+	#[cfg(unix)]
+	{
+		let strict = files.map(|f| f.owner_check).unwrap_or_default();
+		// SAFETY: geteuid has no preconditions
+		let me = unsafe { libc::geteuid() };
+		match service_user() {
+			Some((uid, _)) if uid != me => crate::net::files::set_owner_check(crate::net::files::OwnerCheck::Off),
+			_ => crate::net::files::set_owner_check(strict),
+		}
+	}
+	#[cfg(not(unix))]
+	let _ = path;
+}
+
 /// The service runs as this user (debian/rproxy-api.service).
-const SERVICE_USER: &str = "rproxy";
+const SERVICE_USER: &str = "rproxy-api";
 
 /// Warns when the `rproxy` user (if it exists and is not the one checking) may
 /// not read `path` (or write it, for a directory), judged from its owner and

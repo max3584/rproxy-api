@@ -307,6 +307,38 @@ pub async fn update_now(State(state): State<Arc<AppState>>, transport: Option<Ex
 	(StatusCode::ACCEPTED, Json(json!({"status": "checking"}))).into_response()
 }
 
+#[derive(serde::Deserialize)]
+pub struct ClearBadQuery {
+	pub version: Option<String>,
+}
+
+/// `DELETE /admin/update/bad[?version=X.Y.Z]`: versions marked bad may be chosen again
+/// (`admin`, by default only over the Unix socket; security review M1).
+pub async fn clear_bad(
+	State(state): State<Arc<AppState>>,
+	transport: Option<Extension<Transport>>,
+	axum::extract::Query(q): axum::extract::Query<ClearBadQuery>,
+) -> Response {
+	if let Err(e) = crate::control::api::unix_only(&state, transport.is_some(), "DELETE /admin/update/bad") {
+		return e.into_response();
+	}
+	let Some(u) = installed() else {
+		return ApiError::unsupported("the self-update runs in the rproxy-api server process only").into_response();
+	};
+	let version = match q.version.as_deref().map(|v| update::Version::parse(v).ok_or(v)) {
+		Some(Err(v)) => return ApiError::invalid(format!("version {v:?} is not X.Y.Z")).into_response(),
+		Some(Ok(v)) => Some(v),
+		None => None,
+	};
+	match update::clear_bad(u.updater.config(), version) {
+		Ok(cleared) => {
+			tracing::info!(event = "update.clear_bad", versions = ?cleared);
+			Json(json!({"cleared": cleared})).into_response()
+		}
+		Err(e) => ApiError::internal(e).into_response(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

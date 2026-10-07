@@ -21,6 +21,8 @@ use common::pki::{Issued, Pki};
 use common::*;
 
 fn workdir(tag: &str) -> PathBuf {
+	// keys and secrets written here must pass the owner check (net::files)
+	rproxy_api::net::files::private_umask();
 	let dir = std::env::temp_dir().join(format!("rproxy-hardening-{tag}-{}", std::process::id()));
 	let _ = fs::remove_dir_all(&dir);
 	fs::create_dir_all(&dir).unwrap();
@@ -179,6 +181,42 @@ async fn failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket() {
 	tokio::time::sleep(Duration::from_millis(2100)).await;
 	assert_eq!(get("good").await.unwrap().status(), 200);
 	assert_eq!(tokens.lockout().locked_sources(), 0);
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// Security review M4: a client certificate (mTLS) gets in from a locked-out address,
+/// and `--api-lockout-exempt` sources are never locked out.
+#[tokio::test]
+async fn verified_certificates_and_exempt_sources_are_not_locked_out() {
+	let dir = workdir("lockout-exempt");
+	let pki = Pki::new("hardening-lockout-cert");
+	let server = pki.server("api", &["localhost"]);
+	let ctl = pki.client("ctl", "ctl.rproxy.internal");
+	let file = mtls_tokens(&dir);
+	let files = ApiTlsFiles {
+		cert: server.cert_file.clone().into(),
+		key: server.key_file.clone().into(),
+		client_ca: Some(pki.ca_file.clone().into()),
+		client_auth: ClientAuth::Optional,
+	};
+	let config = LockoutConfig { failures: 2, window: Duration::from_secs(60), duration: Duration::from_secs(60) };
+	let tokens = Tokens::from_file(file.clone()).unwrap().with_client_auth(ClientAuth::Optional).unwrap().with_lockout(config);
+	let addr = serve_tls(tokens, &files).await;
+	for _ in 0..2 {
+		assert_eq!(https_get(&pki, addr, None, "/rules", Some("guess")).await, Some(401));
+	}
+	assert_eq!(https_get(&pki, addr, None, "/rules", Some("ci-secret")).await, Some(429), "a token alone is locked out");
+	assert_eq!(https_get(&pki, addr, Some(&ctl), "/metrics", Some("ctl-secret")).await, Some(200), "a verified certificate is not");
+
+	let exempt = rproxy_api::control::hardening::HardeningOptions { lockout_exempt: Some("127.0.0.0/8, 10.0.0.0/8".into()), ..Default::default() };
+	let tokens = Tokens::from_file(file).unwrap().with_client_auth(ClientAuth::Optional).unwrap().with_lockout(config).with_lockout_exempt(exempt.lockout_exempt().unwrap());
+	let addr = serve_tls(tokens, &files).await;
+	for _ in 0..5 {
+		assert_eq!(https_get(&pki, addr, None, "/rules", Some("guess")).await, Some(401));
+	}
+	assert_eq!(https_get(&pki, addr, None, "/rules", Some("ci-secret")).await, Some(200), "exempt sources are never locked out");
+	let bad = rproxy_api::control::hardening::HardeningOptions { lockout_exempt: Some("nope".into()), ..Default::default() };
+	assert!(bad.check(&rproxy_api::core::rule::Features::CURRENT).errors.iter().any(|e| e.contains("--api-lockout-exempt")));
 	fs::remove_dir_all(dir).unwrap();
 }
 

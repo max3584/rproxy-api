@@ -10,8 +10,12 @@
 //!   the old process drains and exits, and the successor is followed instead
 //!   (orphans come to this process: `PR_SET_CHILD_SUBREAPER`);
 //! - when the server exits, so does the launcher, with its status. A version on
-//!   trial (swapped in, not `RPROXY_UPDATE_HEALTHY` yet) that exits is marked
-//!   bad and the previous good version is started instead (rollback).
+//!   trial (swapped in, not `RPROXY_UPDATE_HEALTHY` yet) that exits on its own is
+//!   marked bad and the previous good version is started instead (rollback). One
+//!   stopped by a signal to the launcher (docker stop, a rolling restart) is not:
+//!   its trial ends, and it is tried again on the next start. A trial cut short
+//!   without the launcher seeing it (SIGKILL, OOM of the container) counts against
+//!   the version only `MAX_INTERRUPTED` times in a row (security review M1).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -20,19 +24,21 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use super::update::{mark_bad, Fetcher, Trial, UpdateConfig, Version};
+use super::update::{mark_bad, Fetcher, Trial, UpdateConfig, Version, MAX_INTERRUPTED};
 use super::UpdateMode;
 
 /// The binary the launcher starts, and whether it is on trial.
 struct Choice {
 	exe: PathBuf,
 	version: Version,
+	/// The cached binary, open as it was verified: run from this file (security review L5).
+	verified: Option<std::fs::File>,
 }
 
 /// The image's own binary.
 fn image() -> Result<Choice, String> {
 	let exe = super::handoff::binary_on_disk().map_err(|e| format!("cannot find the binary: {e}"))?;
-	Ok(Choice { exe, version: Version::own() })
+	Ok(Choice { exe, version: Version::own(), verified: None })
 }
 
 /// Picks the binary: the pin, else the newest good one (image, cache, source).
@@ -48,11 +54,20 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 			return Ok(image);
 		}
 	};
-	let _ = std::fs::create_dir_all(&cfg.cache);
-	// a version still on trial did not last: it never became good
-	let stale = cfg.load_state().trial;
-	if let Some(t) = stale.and_then(|t| Version::parse(&t.version)) {
-		mark_bad(cfg, t, "it stopped before RPROXY_UPDATE_HEALTHY");
+	let _ = super::update::private_dir(&cfg.cache);
+	// a version still on trial: the container stopped without the launcher seeing it
+	// (SIGKILL, OOM); counted, and bad only when it keeps happening
+	let mut interrupted = 0;
+	if let Some(t) = cfg.load_state().trial {
+		if let Some(v) = Version::parse(&t.version) {
+			interrupted = t.interrupted + 1;
+			if interrupted >= MAX_INTERRUPTED {
+				mark_bad(cfg, v, &format!("stopped {interrupted} times before RPROXY_UPDATE_HEALTHY"));
+				interrupted = 0;
+			} else {
+				warn!(event = "update.interrupted", version = %v, times = interrupted, "the trial of this version was cut short; trying it again");
+			}
+		}
 	}
 	let bad = cfg.load_state().bad;
 	let is_bad = |v: &Version| bad.iter().any(|b| Version::parse(b) == Some(*v));
@@ -70,14 +85,20 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 		None => *v > image.version && v.0 == image.version.0 && v.1 == image.version.1,
 	};
 	for v in cfg.cached_versions().into_iter().filter(|v| wanted(v) && !is_bad(v)) {
-		match cfg.verify_cached(&key, v) {
-			Ok(exe) => {
+		match cfg.verify_cached_open(&key, v) {
+			Ok((exe, verified)) => {
 				// not known to be good yet: on trial until RPROXY_UPDATE_HEALTHY
 				if cfg.load_state().good.as_deref().and_then(Version::parse) != Some(v) {
 					let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-					let _ = cfg.update_state(|s| s.trial = Some(Trial { version: v.to_string(), started_at: now }));
+					let _ = cfg.update_state(|s| {
+						// the count goes on for the same version only
+						let count = if s.trial.as_ref().is_some_and(|t| t.version == v.to_string()) { interrupted } else { 0 };
+						s.trial = Some(Trial { version: v.to_string(), started_at: now, interrupted: count });
+					});
+				} else {
+					let _ = cfg.update_state(|s| s.trial = None);
 				}
-				return Ok(Choice { exe, version: v });
+				return Ok(Choice { exe, version: v, verified: Some(verified) });
 			}
 			Err(e) => warn!(event = "update.error", version = %v, error = %e, "not running this cached release"),
 		}
@@ -85,6 +106,7 @@ async fn choose(cfg: &UpdateConfig) -> Result<Choice, String> {
 	if let Some(pin) = cfg.pin.filter(|p| *p != image.version) {
 		warn!(event = "update.error", version = %pin, "the pinned version is not available; running the image's version");
 	}
+	let _ = cfg.update_state(|s| s.trial = None);
 	Ok(image)
 }
 
@@ -110,7 +132,16 @@ fn descends_from_me(pid: i32) -> bool {
 
 fn spawn(choice: &Choice, args: &[OsString], notify: &str) -> Result<i32, String> {
 	info!(event = "launch.start", version = %choice.version, exe = %choice.exe.display());
-	let child = std::process::Command::new(&choice.exe)
+	// the file that was verified, not whatever the path names now (the kernel opens
+	// /proc/self/fd/N before closing our close-on-exec descriptor, as fexecve does)
+	let program = match &choice.verified {
+		Some(f) => {
+			use std::os::fd::AsRawFd;
+			PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()))
+		}
+		None => choice.exe.clone(),
+	};
+	let child = std::process::Command::new(&program)
 		.args(args)
 		.env("NOTIFY_SOCKET", notify)
 		.spawn()
@@ -157,6 +188,20 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 	let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).map_err(|e| e.to_string())?;
 	let std_sock = std::os::unix::net::UnixDatagram::bind_addr(&addr).map_err(|e| format!("notify socket: {e}"))?;
 	std_sock.set_nonblocking(true).map_err(|e| e.to_string())?;
+	// every datagram carries its sender's pid (SCM_CREDENTIALS): only our own server
+	// processes may say MAINPID (security review L1; the abstract name is visible
+	// in /proc/net/unix to anything in the network namespace)
+	{
+		use std::os::fd::AsRawFd;
+		let on: libc::c_int = 1;
+		// SAFETY: setsockopt with a c_int on a socket we own
+		let r = unsafe {
+			libc::setsockopt(std_sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PASSCRED, (&on as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t)
+		};
+		if r != 0 {
+			return Err(format!("notify socket: SO_PASSCRED: {}", std::io::Error::last_os_error()));
+		}
+	}
 	let sock = tokio::net::UnixDatagram::from_std(std_sock).map_err(|e| e.to_string())?;
 	let notify = format!("@{name}");
 
@@ -181,8 +226,12 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 			_ = int.recv() => { stopping = true; send(main, libc::SIGINT); for p in &former { send(*p, libc::SIGINT); } }
 			_ = hup.recv() => send(main, libc::SIGHUP),
 			_ = usr2.recv() => send(main, libc::SIGUSR2),
-			r = sock.recv(&mut buf) => {
-				let Ok(n) = r else { continue };
+			r = recv_from_pid(&sock, &mut buf) => {
+				let Ok((n, sender)) = r else { continue };
+				if !sender.is_some_and(|p| p == main || descends_from_me(p)) {
+					warn!(event = "launch.notify_refused", sender = sender.unwrap_or(0), "a notification from a process that is not ours");
+					continue;
+				}
 				let text = String::from_utf8_lossy(&buf[..n]);
 				for line in text.lines() {
 					if let Some(pid) = line.strip_prefix("MAINPID=").and_then(|p| p.trim().parse::<i32>().ok()) {
@@ -210,6 +259,9 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 					}
 					let code = exit_code(status);
 					if stopping {
+						// stopped by us (docker stop, a rolling restart): proves nothing about
+						// the version; its trial ends and it is tried again next time
+						let _ = cfg.update_state(|s| s.trial = None);
 						return Ok(code);
 					}
 					// a version on trial that stops is rolled back
@@ -228,6 +280,47 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 			}
 		}
 	}
+}
+
+/// One datagram and its sender's pid (from SCM_CREDENTIALS; `SO_PASSCRED` is on).
+async fn recv_from_pid(sock: &tokio::net::UnixDatagram, buf: &mut [u8]) -> std::io::Result<(usize, Option<i32>)> {
+	use std::os::fd::AsRawFd;
+	loop {
+		sock.readable().await?;
+		match sock.try_io(tokio::io::Interest::READABLE, || recvmsg_pid(sock.as_raw_fd(), buf)) {
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+			other => return other,
+		}
+	}
+}
+
+fn recvmsg_pid(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<(usize, Option<i32>)> {
+	let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+	let mut control = [0u64; 8]; // room for one ucred, aligned
+	// SAFETY: msghdr is plain data; zeroed is a valid start
+	let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+	msg.msg_iov = &mut iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = control.as_mut_ptr().cast();
+	msg.msg_controllen = std::mem::size_of_val(&control) as _;
+	// SAFETY: recvmsg into buffers that live for the call
+	let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+	if n < 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	let mut pid = None;
+	// SAFETY: walking the control messages the kernel wrote into `control`
+	unsafe {
+		let mut c = libc::CMSG_FIRSTHDR(&msg);
+		while !c.is_null() {
+			if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_CREDENTIALS {
+				let cred: libc::ucred = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast());
+				pid = Some(cred.pid);
+			}
+			c = libc::CMSG_NXTHDR(&msg, c);
+		}
+	}
+	Ok((n as usize, pid))
 }
 
 /// The version a server process runs, from its binary's path.

@@ -224,7 +224,7 @@ fn parse_url(url: &str, what: &str) -> Result<Uri, CrowdsecError> {
 
 /// Reads the API key; a missing or empty file is a configuration error.
 fn read_key(path: &PathBuf) -> Result<String, std::io::Error> {
-	let key = std::fs::read_to_string(path)?.trim().to_string();
+	let key = crate::net::files::read_to_string(path, crate::net::files::Kind::Secret)?.trim().to_string();
 	if key.is_empty() {
 		return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the key file is empty"));
 	}
@@ -245,7 +245,7 @@ impl Bouncer {
 		let key_file = PathBuf::from(&g.api_key_file);
 		let key = match read_key(&key_file) {
 			Ok(k) => k,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::InvalidData => {
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::InvalidData || crate::net::files::is_refused(&e) => {
 				return Err(CrowdsecError::Config(format!("global.crowdsec.api_key_file {}: {e}", key_file.display())));
 			}
 			Err(e) => {
@@ -549,6 +549,7 @@ mod tests {
 
 	#[test]
 	fn decisions_by_address_and_range() {
+		crate::net::files::private_umask();
 		let mut set = Decisions::default();
 		set.add(&d(1, "Ip", "192.0.2.1", "ban"));
 		set.add(&d(2, "Range", "198.51.100.0/24", "ban"));
@@ -566,6 +567,7 @@ mod tests {
 
 	#[test]
 	fn one_decision_expiring_does_not_lift_another() {
+		crate::net::files::private_umask();
 		let mut set = Decisions::default();
 		set.add(&d(1, "Ip", "192.0.2.1", "ban"));
 		set.add(&d(2, "Ip", "192.0.2.1", "ban"));
@@ -583,6 +585,7 @@ mod tests {
 
 	#[test]
 	fn settings() {
+		crate::net::files::private_umask();
 		let g = |lapi: &str, key: &str| CrowdsecGlobal {
 			lapi_url: lapi.into(),
 			api_key_file: key.into(),

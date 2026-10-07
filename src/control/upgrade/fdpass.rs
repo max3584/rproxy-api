@@ -117,13 +117,18 @@ impl Channel {
 	}
 
 	fn peer_pid(&self) -> io::Result<i32> {
+		Ok(self.peer_cred()?.pid)
+	}
+
+	/// The peer's pid, uid and gid (SO_PEERCRED).
+	pub fn peer_cred(&self) -> io::Result<libc::ucred> {
 		let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
 		let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
 		// SAFETY: getsockopt writes a ucred into a local
 		cvt(unsafe {
 			libc::getsockopt(self.fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len)
 		})?;
-		Ok(cred.pid)
+		Ok(cred)
 	}
 
 	/// Sends one message: `tag`, then `data`, with `fds` attached.

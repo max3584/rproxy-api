@@ -80,7 +80,15 @@ const PP2_SUBTYPE_SSL_CN: u8 = 0x22;
 const PP2_CLIENT_SSL: u8 = 0x01;
 const PP2_CLIENT_CERT_CONN: u8 = 0x02;
 
+/// The longest value of one TLV rproxy writes: a longer one (a client
+/// certificate's huge CN) is left out, never cut to a misleading prefix or let
+/// wrap the 16-bit lengths around (security review L11).
+const MAX_TLV_VALUE: usize = 1024;
+
 fn tlv(out: &mut Vec<u8>, kind: u8, value: &[u8]) {
+	if value.len() > MAX_TLV_VALUE {
+		return;
+	}
 	out.push(kind);
 	out.extend_from_slice(&(value.len() as u16).to_be_bytes());
 	out.extend_from_slice(value);
@@ -127,7 +135,11 @@ pub fn proxy_v2_dgram_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
 }
 
 fn v2_header(src: SocketAddr, dst: SocketAddr, tls: Option<&TlsInfo>, dgram: bool) -> Vec<u8> {
-	let tlvs = tls.map(tls_tlvs).unwrap_or_default();
+	let mut tlvs = tls.map(tls_tlvs).unwrap_or_default();
+	// the header's length is 16 bits: without room, no TLVs rather than a wrong length
+	if tlvs.len() + 4 + 36 > u16::MAX as usize {
+		tlvs.clear();
+	}
 	let mut out = V2_SIGNATURE.to_vec();
 	out.push(0x21); // version 2, PROXY command
 	let (family, addrs) = match (src.ip(), dst.ip()) {
@@ -336,6 +348,11 @@ mod tests {
 		assert_eq!(unverified.client_verify(), "FAILED");
 		assert!(!u.windows(5).any(|w| w == b"alice"), "no unverified CN in the TLV");
 		assert_eq!(TlsInfo::default().client_verify(), "NONE");
+		// a huge name is left out, not cut or wrapped around (security review L11)
+		let huge = TlsInfo { client_cn: Some("x".repeat(70_000)), server_name: Some("y".repeat(2000)), ..info.clone() };
+		let hh = proxy_v2_header_with("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), Some(&huge));
+		assert_eq!(hh.len(), 16 + u16::from_be_bytes([hh[14], hh[15]]) as usize);
+		assert!(!hh.windows(3).any(|w| w == b"xxx" || w == b"yyy"));
 		let len = u16::from_be_bytes([h[14], h[15]]) as usize;
 		assert_eq!(h.len(), 16 + len);
 		let tlvs = &h[28..];

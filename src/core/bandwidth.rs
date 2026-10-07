@@ -44,7 +44,7 @@ const MAX_RATE: u64 = 100_000_000_000;
 /// 1 KiB .. 1 GiB.
 const MIN_BURST: u64 = 1 << 10;
 const MAX_BURST: u64 = 1 << 30;
-const MAX_SOURCES: u64 = 10_000_000;
+const MAX_SOURCES: u64 = 1_000_000;
 
 /// `bandwidth` of a rule. `{}` means no limits (how PATCH removes them).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +238,9 @@ pub struct SourceBuckets {
 
 struct PerSource {
 	table: SourceTable<Arc<SourceBuckets>>,
+	/// Shared by new sources while the table is full of sources with connections
+	/// (forgetting one would give it fresh buckets; security review L8).
+	overflow: Arc<SourceBuckets>,
 	upload: Option<String>,
 	download: Option<String>,
 }
@@ -259,6 +262,7 @@ impl Shaper {
 			burst,
 			per_source: spec.per_source.as_ref().filter(|p| p.upload.is_some() || p.download.is_some()).map(|p| PerSource {
 				table: SourceTable::new(p.prefix_v4, p.prefix_v6, p.max_sources),
+				overflow: Arc::new(SourceBuckets { up: Bucket::new(&p.upload, burst), down: Bucket::new(&p.download, burst) }),
 				upload: p.upload.clone(),
 				download: p.download.clone(),
 			}),
@@ -269,13 +273,14 @@ impl Shaper {
 	fn source(&self, client: IpAddr) -> Option<Arc<SourceBuckets>> {
 		let p = self.per_source.as_ref()?;
 		let burst = self.burst;
-		Some(p.table.with(
+		let found = p.table.try_with(
 			p.table.key(client),
 			|| Arc::new(SourceBuckets { up: Bucket::new(&p.upload, burst), down: Bucket::new(&p.download, burst) }),
 			// a source whose connections still hold its buckets
 			|b| Arc::strong_count(b) > 1,
 			|b| b.clone(),
-		))
+		);
+		Some(found.unwrap_or_else(|| p.overflow.clone()))
 	}
 
 	/// Sources remembered now.
