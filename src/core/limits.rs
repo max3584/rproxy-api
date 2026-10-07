@@ -11,8 +11,10 @@
 //!
 //! Sources are kept in a `SourceTable` (also used by `core::bandwidth`): an
 //! address grouped by prefix, at most `max_sources` of them, in shards with a
-//! lock each; when a shard is full, the oldest source is forgotten first (one
-//! that still has connections gets a few second chances).
+//! lock each; when a shard is full, the oldest idle source is forgotten. A
+//! source that still has connections is never forgotten (its limits would start
+//! over): while a shard is full of them, new sources are refused (`limits`) or
+//! share one overflow bucket (`bandwidth`). Security review L8.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
@@ -31,7 +33,7 @@ use crate::error::ApiError;
 const MAX_CONNECTIONS: u64 = 10_000_000;
 const MAX_SOURCE_CONNECTIONS: u64 = 1_000_000;
 pub const DEFAULT_MAX_SOURCES: u64 = 65_536;
-const MAX_SOURCES: u64 = 10_000_000;
+const MAX_SOURCES: u64 = 1_000_000;
 
 /// `limits` of a rule. `{}` means no limits (how PATCH removes them).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +154,8 @@ const DEFAULT_PREFIX_V6: u8 = 64;
 const TABLE_SHARDS: usize = 16;
 /// Sources that still have connections are moved to the back this many times
 /// before one is forgotten anyway.
-const SECOND_CHANCES: usize = 8;
+/// Entries of a full shard looked at for one that can be forgotten.
+const SCAN: usize = 64;
 
 /// Locks a mutex even if a thread panicked while holding it (the data is
 /// counters: still usable).
@@ -273,16 +276,22 @@ impl<V> SourceTable<V> {
 	}
 
 	/// Runs `f` on the value of `key`'s source, made with `new` if there is none
-	/// (forgetting the oldest source of a full shard; `busy` ones get second chances).
-	pub fn with<R>(&self, key: IpAddr, new: impl FnOnce() -> V, busy: impl Fn(&V) -> bool, f: impl FnOnce(&mut V) -> R) -> R {
+	/// (forgetting the oldest idle source of a full shard). A `busy` source (with
+	/// connections now) is never forgotten: that would start its limits over, which
+	/// a flood of new (spoofed) sources could use to get round them (security
+	/// review L8). None when the shard is full of busy sources.
+	pub fn try_with<R>(&self, key: IpAddr, new: impl FnOnce() -> V, busy: impl Fn(&V) -> bool, f: impl FnOnce(&mut V) -> R) -> Option<R> {
 		let mut shard = self.shard(&key);
 		let shard = &mut *shard;
 		if !shard.map.contains_key(&key) {
-			let mut chances = SECOND_CHANCES;
+			let mut looked = 0;
 			while shard.map.len() >= self.per_shard {
+				if looked >= SCAN.min(shard.order.len()) {
+					return None;
+				}
 				let Some(old) = shard.order.pop_front() else { break };
-				if chances > 0 && shard.map.get(&old).is_some_and(&busy) {
-					chances -= 1;
+				looked += 1;
+				if shard.map.get(&old).is_some_and(&busy) {
 					shard.order.push_back(old);
 					continue;
 				}
@@ -290,8 +299,9 @@ impl<V> SourceTable<V> {
 			}
 			shard.order.push_back(key);
 		}
-		f(shard.map.entry(key).or_insert_with(new))
+		Some(f(shard.map.entry(key).or_insert_with(new)))
 	}
+
 
 	/// Runs `f` on the value of `key`'s source if it is still remembered.
 	pub fn with_existing(&self, key: IpAddr, f: impl FnOnce(&mut V)) {
@@ -416,7 +426,8 @@ impl Limiter {
 		let Some(p) = &self.per_source else { return Ok(permit) };
 		let key = p.table.key(client);
 		let now = Instant::now();
-		p.table.with(
+		// a table full of sources with connections: a new source waits until one ends
+		p.table.try_with(
 			key,
 			SourceState::default,
 			|s| s.active > 0,
@@ -432,7 +443,8 @@ impl Limiter {
 				s.active += 1;
 				Ok(())
 			},
-		)?;
+		)
+		.unwrap_or(Err(Reason::SourceConnections))?;
 		permit.source = Some((p.table.clone(), key));
 		Ok(permit)
 	}
@@ -442,12 +454,14 @@ impl Limiter {
 		let Some(p) = &self.per_source else { return true };
 		let Some(r) = p.packets else { return true };
 		let now = Instant::now();
-		p.table.with(
-			p.table.key(client),
-			SourceState::default,
-			|s| s.active > 0,
-			|s| s.packets.get_or_insert(TokenBucket::full(r.cap, now)).take_one(r.cap, r.per_sec, now),
-		)
+		p.table
+			.try_with(
+				p.table.key(client),
+				SourceState::default,
+				|s| s.active > 0,
+				|s| s.packets.get_or_insert(TokenBucket::full(r.cap, now)).take_one(r.cap, r.per_sec, now),
+			)
+			.unwrap_or(false)
 	}
 
 	/// Connections / sessions counted now.
@@ -592,12 +606,23 @@ mod tests {
 		}
 		assert!(l.sources() <= 4, "{}", l.sources());
 		let t: SourceTable<u32> = SourceTable::new(None, None, Some(1));
-		t.with(ip("192.0.2.1"), || 1, |_| false, |_| ());
-		t.with(ip("192.0.2.2"), || 2, |_| false, |_| ());
+		t.try_with(ip("192.0.2.1"), || 1, |_| false, |_| ()).unwrap();
+		t.try_with(ip("192.0.2.2"), || 2, |_| false, |_| ()).unwrap();
 		assert_eq!(t.len(), 1);
 		let mut seen = 0;
 		t.with_existing(ip("192.0.2.2"), |v| seen = *v);
 		assert_eq!(seen, 2, "the newest stays");
+	}
+
+	#[test]
+	fn sources_with_connections_are_never_forgotten() {
+		// security review L8: a flood of new sources must not start a busy source's count over
+		let l = limiter(serde_json::json!({"per_source": {"max_connections": 1, "max_sources": 1}}));
+		let held = l.admit(ip("192.0.2.1")).unwrap();
+		assert!(matches!(l.admit(ip("192.0.2.2")), Err(Reason::SourceConnections)), "the table is full of busy sources");
+		assert!(matches!(l.admit(ip("192.0.2.1")), Err(Reason::SourceConnections)), "still counted");
+		drop(held);
+		assert!(l.admit(ip("192.0.2.2")).is_ok(), "an idle source is forgotten");
 	}
 
 	#[test]

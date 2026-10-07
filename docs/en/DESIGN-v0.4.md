@@ -189,7 +189,7 @@ limits:
 | `per_source.max_connections` | 1-1,000,000 |
 | `new_connections` / `packets` | `average` at least 1, `period` 1ms-1h (default 1s), `burst` at least `average` (default `average`). The same shape as the L7 `rate_limit` |
 | `packets` | `protocol: udp` only (`invalid` on tcp) |
-| `max_sources` | 1-10,000,000 |
+| `max_sources` | 1-1,000,000 (lowered from 10,000,000 by security review L8) |
 | Overall | At least one limit (`{}` means "no limits" and is how PATCH removes them) |
 
 - Checked right after accepting, after `allow_from`, GeoIP and CrowdSec, before TLS and the PROXY header.

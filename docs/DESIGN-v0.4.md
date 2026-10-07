@@ -189,7 +189,7 @@ limits:
 | `per_source.max_connections` | 1〜1,000,000 |
 | `new_connections` / `packets` | `average` 1 以上、`period` は 1ms〜1h（既定 1s）、`burst` は `average` 以上（既定 `average`）。L7 の `rate_limit` と同じ形 |
 | `packets` | `protocol: udp` だけ（tcp は `invalid`） |
-| `max_sources` | 1〜10,000,000 |
+| `max_sources` | 1〜1,000,000（セキュリティレビュー L8 で 10,000,000 から下げた） |
 | 全体 | 少なくとも 1 つの上限があること（`{}` は「上限なし」で、PATCH で外すのに使う） |
 
 - 判定は受け付けた直後、`allow_from`・GeoIP・CrowdSec の後、TLS・PROXY ヘッダより前。
