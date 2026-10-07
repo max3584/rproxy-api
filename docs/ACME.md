@@ -185,7 +185,7 @@ systemctl enable --now rproxy-acme-helper
 systemctl restart rproxy-api
 ```
 
-  ユニットは `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy` を `rproxy-acme` ユーザー（補助のグループ `rproxy`：設定ファイルを読み、ソケットを rproxy に渡すため）で動かします。acme-dns の `credentials_file` は補助プロセスが書くので、`/var/lib/rproxy-acme/`（`StateDirectory`）に置いてください。
+  ユニットは `rproxy-api acme-helper --config /etc/rproxy/rproxy.yaml --socket /run/rproxy-acme/helper.sock --socket-group rproxy --allow-user rproxy-api` を `rproxy-acme` ユーザー（補助のグループ `rproxy`：設定ファイルを読み、ソケットを rproxy に渡すため）で動かします。acme-dns の `credentials_file` は補助プロセスが書くので、`/var/lib/rproxy-acme/`（`StateDirectory`）に置いてください。
 - 補助プロセスが動いていない・応答しないときは、DNS-01 の注文が失敗して再試行されます（HTTP-01・TLS-ALPN-01 には影響しません）。補助プロセスのログは `acme.dns`（`part: helper`）と `acme.helper`（断った要求）。
 
 ## 権限と保存場所

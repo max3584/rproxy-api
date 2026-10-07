@@ -3,7 +3,7 @@ English: [PERMISSIONS.md](en/PERMISSIONS.md)
 # 権限
 
 rproxy-api は root やネットワークの強い権限を持つホストで動かす前提にしている。
-ホストの設定（パッケージのインストール、ポリシールーティング）は root で行う。rproxy-api 本体は `rproxy` ユーザーで動き、必要な capability だけを systemd から受け取る。
+ホストの設定（パッケージのインストール、ポリシールーティング）は root で行う。rproxy-api 本体は `rproxy-api` ユーザー（主グループ `rproxy`）で動き、必要な capability だけを systemd から受け取る。v0.3 までのユーザー `rproxy` は、v0.4 の .deb・install.sh が uid を変えずに `rproxy-api` に改名する（ファイルの所有者はそのまま）。UI（`rproxy-ui` ユーザー）を `rproxy` グループに入れると、グループの読み取りでファイルを共有できる。
 
 ## rproxy-api プロセスの権限
 
@@ -42,11 +42,26 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 | 項目 | 値 |
 |---|---|
-| ユーザー | `rproxy-acme`（.deb の postinst が作る）。補助のグループ `rproxy`（設定ファイルを読み、ソケットのグループにする） |
+| ユーザー | `rproxy-acme`（.deb の postinst が作る）。補助のグループ `rproxy`（設定ファイルを読み、ソケットのグループにする。本体の `rproxy-api` の主グループ） |
 | capability | なし（`CapabilityBoundingSet=` は空） |
-| ソケット | `/run/rproxy-acme/helper.sock`（`rproxy-acme:rproxy` 660。`RuntimeDirectory=rproxy-acme`）。`--allow-user rproxy` で相手のユーザーも確かめる |
-| 秘密のファイル | 例 `/etc/rproxy/acme-helper/`（`root:rproxy-acme` 750、ファイルは 640）。rproxy ユーザーには読めない |
+| ソケット | `/run/rproxy-acme/helper.sock`（`rproxy-acme:rproxy` 660。`RuntimeDirectory=rproxy-acme`）。`--allow-user rproxy-api` で相手のユーザーも確かめる |
+| 秘密のファイル | 例 `/etc/rproxy/acme-helper/`（`root:rproxy-acme` 750、ファイルは 640）。rproxy-api ユーザーには読めない |
 | 書くもの | `/var/lib/rproxy-acme/`（`StateDirectory`、700）：acme-dns の `credentials_file` |
+
+### ルールが指すファイルの所有者（v0.4、オーナーの決定）
+
+ルール（API・ルールの組・設定ファイル）と `global` が指すファイル（証明書・鍵・CA・チェーン、サービスの `tls`、`client_auth.ca_file`、`basic_auth` の `users_file`、`oidc` の秘密、`global.crowdsec.api_key_file`、ACME の秘密）は、次を満たすものだけ使う（`global.files.owner_check: strict`、既定）。`rules:write` のトークンで、ほかのサービスの鍵や root のファイルを rproxy に読ませる（使う・在るかを探る）ことを防ぐ。
+
+- 所有者が rproxy のプロセスのユーザー（`rproxy-api`）。シンボリックリンクは先のファイルで確かめ、リンク自体の所有者も rproxy-api か root。
+- グループ・ほかの人が書けない（`g-w,o-w`）。
+- 鍵・秘密はほかの人が読めない（600 か 640。グループ `rproxy` の読み取りはよい：UI と共有するとき）。証明書・CA は 644 まで。
+- 満たさなければ API は `400 tls_config` / `invalid`（理由つき）、設定ファイルは設定の誤り（起動・再読み込みで止まる）。`--check-config` は、サービスのユーザーで動かせば誤り、ほかのユーザー（root）で動かせば rproxy-api について確かめた警告。確かめるのは開いたファイル（fstat）なので、確かめたものを読む。
+- certbot などが root のファイルを作るなら、deploy hook で rproxy-api のものに写す（例：`install -o rproxy-api -g rproxy -m 0640 privkey.pem /etc/rproxy/tls/a.key`）。どうしても root のファイルをそのまま使うなら `global.files.owner_check: off`（`rules:write` のトークンを持つ人が、rproxy の読めるどのファイルでも証明書・鍵として使えるようになる。起動時に `degraded` を出す）。
+- 制御 API の証明書・トークンのファイル（`RPROXY_TLS_*`、`RPROXY_TOKEN_FILE`）・GeoIP のデータベースは対象外（ルールからは指せない）。
+
+### ルールの宛先
+
+`rules:write`（と `PUT /rulesets`）のトークンは、ルールの宛先（`remote_addr`・`targets`・サービスの `url`・`forward_auth` の `address`・`mirror` の先のサービス）をどこにでも向けられる。rproxy は宛先を絞らないので、内側のネットワーク（メタデータの IP・管理用のサービス）に向けられたくないときは、トークンを分けて渡す相手を絞り、rproxy のホストの出口（egress のファイアウォール）で絞る。
 
 ## ホスト側の設定（root）
 
@@ -60,22 +75,22 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 | パス | 所有者・モード | 中身と注意 |
 |---|---|---|
-| `/etc/rproxy/` | `root:rproxy` 750 | 設定の置き場所。rproxy ユーザーは読むだけ |
-| `/etc/rproxy/rproxy.env` | `root:root` 640 | 設定。DB のパスワードを含みうる。systemd（root）が読んで環境変数として渡すので、rproxy ユーザーが読める必要はない |
+| `/etc/rproxy/` | `root:rproxy` 750 | 設定の置き場所。rproxy-api ユーザーは読むだけ |
+| `/etc/rproxy/rproxy.env` | `root:root` 640 | 設定。DB のパスワードを含みうる。systemd（root）が読んで環境変数として渡すので、rproxy-api ユーザーが読める必要はない |
 | `/etc/rproxy/tokens` | `root:rproxy` 640 | 制御 API のトークン（1 行に 1 つ、またはスコープ付きの YAML）。変えたら `systemctl reload rproxy-api` |
-| 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
-| CrowdSec の API キー（`global.crowdsec.api_key_file`、例 `/etc/rproxy/crowdsec.key`） | `root:rproxy` 640 | `cscli bouncers add rproxy` で作ったキー。rproxy ユーザーが読めること。変えたら `systemctl reload rproxy-api` |
-| 認証のミドルウェアの秘密（`basic_auth` の `users_file`、`oidc` の `client_secret_file` / `cookie_secret_file`。例 `/etc/rproxy/auth/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（`cookie_secret_file` が漏れるとセッションのクッキーを作れる、`client_secret_file` はプロバイダのクライアントの秘密）。読めないとそのミドルウェアは 503 を返す。変えると数秒以内に読み直す（SIGHUP でもすぐ）。`cookie_secret_file` を変えるとすべてのサインインが切れる |
-| 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy ユーザーが読めるかを確かめる |
-| `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
-| `/run/rproxy/handoff.sock`（`--handoff-socket` / `RPROXY_HANDOFF_SOCKET`、#174） | `rproxy` 600（SEQPACKET） | 再起動なしの更新の間だけある引き継ぎ用のソケット。つなげるのは古いプロセスが起動した子（pid で確かめる）だけ。親のディレクトリ（`/run/rproxy`）がないと引き継ぎは `handoff.failed` になり、古いプロセスが動き続ける（docs/UPGRADE.md） |
-| 制御 API のクライアントの CA（`--tls-client-ca` / `RPROXY_TLS_CLIENT_CA`、#167） | 例 `root:rproxy` 640 | mTLS でクライアント証明書を確かめる CA（PEM）。秘密ではないが、書き換えられると証明書の認証を通せるので rproxy ユーザーには書かせない。制御 API の証明書・鍵（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）と同じく SIGHUP とファイルの変化で読み直す |
-| GeoIP のデータベース（`global.geoip` の `country_db` / `asn_db`、#168） | 例 `root:rproxy` 640 | rproxy ユーザーが読めること（読めなければ `degraded` で起動し、読めるまで国・ASN は「分からない」）。更新のツール（`geoipupdate` など）は置き換え（rename）で書く。`check_interval` と SIGHUP で読み直す |
+| 証明書・秘密鍵（`tls` の `cert_file` / `key_file` / `ca_file` / `chain_file`、サービスの `tls`） | `rproxy-api:rproxy`、鍵は 600 か 640・証明書は 644 まで | **rproxy-api ユーザーのものだけ使う**（下の「ルールが指すファイルの所有者」）。`/home`・`/root`・`/tmp` 以外に置く（`/etc/rproxy/tls/` など） |
+| CrowdSec の API キー（`global.crowdsec.api_key_file`、例 `/etc/rproxy/crowdsec.key`） | `rproxy-api:rproxy` 640 | `cscli bouncers add rproxy` で作ったキー。rproxy-api ユーザーのもの（所有者の確認）。変えたら `systemctl reload rproxy-api` |
+| 認証のミドルウェアの秘密（`basic_auth` の `users_file`、`oidc` の `client_secret_file` / `cookie_secret_file`。例 `/etc/rproxy/auth/`） | `rproxy-api:rproxy` 640（ディレクトリは 750） | rproxy-api ユーザーのもの（所有者の確認）。ほかの利用者に読ませない（`cookie_secret_file` が漏れるとセッションのクッキーを作れる、`client_secret_file` はプロバイダのクライアントの秘密）。読めないとそのミドルウェアは 503 を返す。変えると数秒以内に読み直す（SIGHUP でもすぐ）。`cookie_secret_file` を変えるとすべてのサインインが切れる |
+| 固定ルール（`RPROXY_STATIC_RULES`） | 例 `root:rproxy` 640 | 同上。install.sh は rproxy-api ユーザーが読めるかを確かめる |
+| `/run/rproxy/api.sock`（`RPROXY_API_SOCKET`） | `rproxy-api:<RPROXY_API_SOCKET_GROUP>` 660（既定） | 制御 API の Unix ソケット。接続できるのは所有者とグループだけ。ユニットの `RuntimeDirectory=rproxy` が `/run/rproxy` を作る（systemd を使わないときは自分で作る） |
+| `/run/rproxy/handoff.sock`（`--handoff-socket` / `RPROXY_HANDOFF_SOCKET`、#174） | `rproxy-api` 600（SEQPACKET） | 再起動なしの更新の間だけある引き継ぎ用のソケット。つなげるのは古いプロセスが起動した子（pid で確かめる）だけで、子の側も相手が自分の親で同じユーザーか、ソケットのディレクトリをほかのユーザーが書けないかを確かめる。親のディレクトリ（`/run/rproxy`）がないと引き継ぎは `handoff.failed` になり、古いプロセスが動き続ける（docs/UPGRADE.md） |
+| 制御 API のクライアントの CA（`--tls-client-ca` / `RPROXY_TLS_CLIENT_CA`、#167） | 例 `root:rproxy` 640 | mTLS でクライアント証明書を確かめる CA（PEM）。秘密ではないが、書き換えられると証明書の認証を通せるので rproxy-api ユーザーには書かせない。制御 API の証明書・鍵（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）と同じく SIGHUP とファイルの変化で読み直す |
+| GeoIP のデータベース（`global.geoip` の `country_db` / `asn_db`、#168） | 例 `root:rproxy` 640 | rproxy-api ユーザーが読めること（読めなければ `degraded` で起動し、読めるまで国・ASN は「分からない」）。更新のツール（`geoipupdate` など）は置き換え（rename）で書く。`check_interval` と SIGHUP で読み直す |
 | `/etc/rproxy/transparent-routing.conf` | `root:root` 644 | transparent 用のポリシールーティングの設定 |
-| `/var/lib/rproxy/`（`global.acme.storage` の既定 `/var/lib/rproxy/acme`） | `rproxy:rproxy` 750（`acme/` の下はディレクトリ 700・ファイル 600） | ACME のアカウントの鍵（`accounts/<名前>.key`）、取った証明書と鍵（`certs/`）、消していない DNS-01 の TXT の記録（`dns-pending.json`）。ユニットの `StateDirectory=rproxy` が作る。アカウントの鍵が漏れると、そのアカウントで証明書の失効・注文ができる。purge で消える（docs/ACME.md） |
-| ACME の DNS のプロバイダの秘密（`global.acme.dns_providers` の `api_key_file` / `secret_file` / `tsig_secret_file` / `credentials_file`（acme-dns。rproxy が書く）、EAB の `hmac_key_file`。例 `/etc/rproxy/acme/`） | `root:rproxy` 640（ディレクトリは 750） | rproxy ユーザーが読めること。ほかの利用者に読ませない（DNS のレコードを書き換えられる。`_acme-challenge` を専用のゾーンに委任し、そのゾーンだけに書ける鍵にすると被害を狭められる）。API からは読めない |
-| `/var/log/rproxy/` | `rproxy:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
-| 自動更新のキャッシュ（`RPROXY_UPDATE_CACHE`、既定 `/var/cache/rproxy/update`、#174。コンテナの `rproxy-api launch` だけ） | サーバを動かすユーザーが書けること（例 700） | 取ったリリースのバイナリ・署名・マニフェスト（`<版>/`）と `state.json`（よい版・前の版・悪い版・試している版）。実行する前に毎回署名を確かめ直すが、書き換えられると悪い版の印やロールバックを操作できるので、ほかのユーザーには書かせない。書き込めるボリュームにする（ルートのファイルシステムは読み取り専用でよい）。apt で入れた VM では使わない（`RPROXY_UPDATE` は off） |
+| `/var/lib/rproxy/`（`global.acme.storage` の既定 `/var/lib/rproxy/acme`） | `rproxy-api:rproxy` 750（`acme/` の下はディレクトリ 700・ファイル 600） | ACME のアカウントの鍵（`accounts/<名前>.key`）、取った証明書と鍵（`certs/`）、消していない DNS-01 の TXT の記録（`dns-pending.json`）。ユニットの `StateDirectory=rproxy` が作る。アカウントの鍵が漏れると、そのアカウントで証明書の失効・注文ができる。purge で消える（docs/ACME.md） |
+| ACME の DNS のプロバイダの秘密（`global.acme.dns_providers` の `api_key_file` / `secret_file` / `tsig_secret_file` / `credentials_file`（acme-dns。rproxy が書く）、EAB の `hmac_key_file`。例 `/etc/rproxy/acme/`） | `rproxy-api:rproxy` 640（ディレクトリは 750） | rproxy-api ユーザーのもの（所有者の確認。補助プロセスを使うときは `rproxy-acme` のもの）。ほかの利用者に読ませない（DNS のレコードを書き換えられる。`_acme-challenge` を専用のゾーンに委任し、そのゾーンだけに書ける鍵にすると被害を狭められる）。API からは読めない |
+| `/var/log/rproxy/` | `rproxy-api:rproxy` 750 | ログ。クライアントの IP、SNI、クライアント証明書の CN を含むので、閲覧できる人を絞る |
+| 自動更新のキャッシュ（`RPROXY_UPDATE_CACHE`、既定 `/var/cache/rproxy/update`、#174。コンテナの `rproxy-api launch` だけ） | サーバを動かすユーザーのもの 700（rproxy が 700 で作る） | 取ったリリースのバイナリ・署名・マニフェスト（`<版>/`）と `state.json`（よい版・前の版・悪い版・試している版）。実行する前に毎回署名を確かめ直すが、書き換えられると悪い版の印やロールバックを操作できるので、ほかのユーザーには書かせない。書き込めるボリュームにする（ルートのファイルシステムは読み取り専用でよい）。apt で入れた VM では使わない（`RPROXY_UPDATE` は off） |
 
 ## 制御 API
 
@@ -90,7 +105,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 | ユーザー | 権限 | 用途 |
 |---|---|---|
-| rproxy-api 用（例 `rproxy`） | `SELECT ON forward_rules`。API で作ったルールを保存するとき（#144、トークンの `persist: true`）は `SELECT, INSERT, UPDATE, DELETE ON rproxy_rules` も | 起動時にルールを復元する（`forward_rules` には書き込まない）。`rproxy_rules` には自分の `node` の行だけを書く。権限がなければ `degraded`（`part: db`）でルールは動かしたまま `persisted: false` |
+| rproxy-api 用（例 `rproxy`。DB のユーザーで OS のユーザーとは別） | `SELECT ON forward_rules`。API で作ったルールを保存するとき（#144、トークンの `persist: true`）は `SELECT, INSERT, UPDATE, DELETE ON rproxy_rules` も | 起動時にルールを復元する（`forward_rules` には書き込まない）。`rproxy_rules` には自分の `node` の行だけを書く。権限がなければ `degraded`（`part: db`）でルールは動かしたまま `persisted: false` |
 | UI 用（例 `rproxy_ui`） | `SELECT, INSERT, UPDATE, DELETE ON forward_rules`、`SELECT, INSERT ON forward_rules_log` | ルールの管理と変更履歴 |
 
 GRANT の例は UI リポジトリの `db/README.md`。`rproxy_rules` の定義と GRANT は docs/API.md の「API で作ったルールの保存」。

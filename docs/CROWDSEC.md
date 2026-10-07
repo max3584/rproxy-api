@@ -48,7 +48,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 ```
 
 - `acquis.d/rproxy.yaml` のファイル名は、`RPROXY_LOG_FILE`（既定の .deb では `/var/log/rproxy/rproxy.log`）に合わせます。rproxy のログは日ごとに `<名前>.<日付>.<拡張子>` へ分かれるので、glob（`/var/log/rproxy/*.log`）で指定します。`global.access_log` でアクセスログを別のファイルにしているなら、そのファイルも足します。
-- CrowdSec（root）が rproxy のログのディレクトリ（`rproxy:rproxy` 750）を読めることを確かめます。
+- CrowdSec（root）が rproxy のログのディレクトリ（`rproxy-api:rproxy` 750）を読めることを確かめます。
 
 ### パーサーが作る項目
 

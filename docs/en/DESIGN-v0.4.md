@@ -577,3 +577,30 @@ Added to v0.4.0 by the owner's decision so that rproxy-gateway v0.4.0 can map ev
 - Fixed-status servers (#235) are `status` instead of `url` in `servers[]` (not a separate kind of service, so the weight share works as it is).
 - Fixes found by conformance (#238): a CORS preflight from an origin not allowed is answered by rproxy with 204 (no CORS headers) instead of going to the backend (which could allow it on its own; the Gateway API tests require it too). A `retry` attempt is picked again by `balance`, so it goes to the same server when there is only one (it always did; the conformance failure came not from rproxy but from the test cluster's Gateway API CRDs being the standard channel, which drops the experimental `retry`).
 - `tls.client_auth.mode: optional_no_verify` (#238, the Gateway API's `AllowInsecureFallback`): asks for a certificate but accepts none or one that does not verify. Only possession of the key is checked in the handshake; the outcome goes to the backend to decide by `X-Client-Verify` (nginx's values), `X-Forwarded-Client-Cert` (Envoy's form), the access log and PROXY v2 `verify`. The headers are set only on rules with `client_auth`, and those the client sent are removed. `features.client_auth_modes`.
+
+## 17. Fixes from the v0.4.0 security review
+
+The rproxy-api findings of the security review before v0.4.0 (of rproxy-api and rproxy-gateway), and the owner's decisions.
+
+| Finding | Fix |
+|---|---|
+| H1, M5 forged certificate headers, mirror copies | `X-Client-Verify` and `X-Forwarded-Client-Cert` are removed first on every rule and set again only with `client_auth`; `forward_auth` and `mirror` get the same forwarding headers (#239) |
+| M1 a version on trial marked bad by a stop | A signal to the launcher only ends the trial; a stop of the launcher itself is counted, bad after 3. `DELETE /admin/update/bad`, `rproxy-api update-clear-bad` |
+| M2 PUT of a set did not check the old ports | A changed rule's current listen range must be within `allow_listen_ports` too |
+| M3 sets had no owner | A set belongs to the token that created it (`owner`), others need `admin`; a token's `allow_rulesets` (name prefixes); `generation` up to 2^53 - 1. Requiring If-Match was not taken: a controller re-creating its sets (after rproxy restarts) has no etag |
+| M4 lockout could shut out good clients | Connections with a verified client certificate are not locked out; `--api-lockout-exempt`. Authenticating first was not taken: it would take guesses uncounted while locked out |
+| M6 HTTP/2 backends stalling | A limit (`timeouts.connect`) for a request with a body to get a stream; another connection past 100 requests on one (up to 8); one opened at a time (L15) |
+| L1 sender of MAINPID | The sender's pid by `SO_PASSCRED`: the current server or a descendant only |
+| L2 the handoff's receiving side | The other end is the parent, of the same user (`SO_PEERCRED`); others cannot write the socket's directory |
+| L3 legacy minisign | SHA-256 against the signed manifest first; legacy signatures up to 64 MiB |
+| L4 index freshness | `generated_at` in `releases.json`; older than one seen is refused |
+| L5 verify-then-exec | The launcher runs the verified file kept open (`/proc/self/fd/N`); cache 700. The server's handoff path (a cache only the same uid can write) remains |
+| L8 eviction from the limits table | Sources with connections are never forgotten (new sources refused / a shared bucket for bandwidth); `max_sources` up to 1,000,000 |
+| L11 PROXY v2 lengths | One TLV up to 1024 bytes (longer ones left out); no TLVs when the total does not fit 16 bits |
+| L12 names of unverified certificates | Not in PROXY v2 `SSL_CN` nor the `Subject` of `X-Forwarded-Client-Cert` (#239) |
+| L13 CORS wildcards | `*` as the first label only; a warning for `*` with credentials |
+| L18 GeoIP | A known country / ASN outside its list refuses even when the other is unknown; databases up to 1 GiB; documented that an unreadable database gives `unknown` |
+| Files rules name | Owner's decision: only files of rproxy's user, not writable by the group or others, keys not readable by others (`global.files.owner_check`, default `strict`). The service user is `rproxy-api` (primary group `rproxy`); v0.3's `rproxy` is renamed keeping its uid |
+| Addresses of forward_auth and mirror | `rules:write` already lets a token point rule targets (`targets`, service URLs) anywhere, so `forward_auth`'s `address` and `mirror`'s `service` are the same (no new power). To restrict destinations, split tokens and filter egress on the network. Written in docs/en/PERMISSIONS.md |
+
+L6 (rotating a /48), L7 (the number of sets) and L9, L10 (documentation) are not fixed in v0.4.0 (reachable only after authentication, or operational notes).

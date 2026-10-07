@@ -16,10 +16,10 @@ Releases use a statically linked musl binary, so the same package works on any D
 | `/var/log/rproxy/` | Logs (`rproxy.<date>.log`, JSON Lines). rproxy splits them daily and deletes old ones beyond `RPROXY_LOG_KEEP`, so logrotate is not needed |
 | `/usr/share/doc/rproxy-api/` | README, API.md, PROFILES.md, examples of static rules |
 
-- Installation creates the `rproxy` system user. The service runs as this user, and the unit grants `CAP_NET_BIND_SERVICE` (ports below 1024) and `CAP_NET_ADMIN` (`source_ip: transparent`) (docs/PERMISSIONS.md).
+- Installation creates the `rproxy` group and the `rproxy-api` system user (primary group `rproxy`). A v0.3 `rproxy` user is renamed to `rproxy-api` with its uid unchanged (file ownership stays; the service is stopped for the rename and started again). The service runs as this user, and the unit grants `CAP_NET_BIND_SERVICE` (ports below 1024) and `CAP_NET_ADMIN` (`source_ip: transparent`) (docs/PERMISSIONS.md).
 - Installing alone neither enables nor starts the service (so that the API does not come up before configuration). Start it with `systemctl enable --now rproxy-api`.
 - On upgrade, the service is restarted if it is running (`try-restart`). Tokens and configuration are left unchanged.
-- `apt purge` removes `/etc/rproxy/tokens`, `/etc/rproxy/`, and `/var/log/rproxy/`. The `rproxy` user is kept.
+- `apt purge` removes `/etc/rproxy/tokens`, `/etc/rproxy/`, and `/var/log/rproxy/`. The `rproxy-api` user and the `rproxy` group are kept.
 - To send logs to journald (`journalctl -u rproxy-api`), comment out the `RPROXY_LOG_FILE` line in `rproxy.env`.
 - Policy routing for the return packets of `source_ip: transparent` can be installed with `scripts/install.sh --transparent-clients ... --transparent-iface ...` (see "Passing the source IP" in the README).
 

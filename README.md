@@ -99,6 +99,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | 制御 API のクライアント証明書：`none`・`optional`（あれば確かめる）・`required`（ない接続はハンドシェイクで断る）。トークンファイルの `client_cert` で証明書を認証に使う（#167） |
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
+| `RPROXY_API_LOCKOUT_EXEMPT` | `--api-lockout-exempt` | なし | 一時停止しない送信元（カンマ区切りの CIDR）。検証済みのクライアント証明書（mTLS）の接続も止めない（v0.4） |
 | `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する（#144、docs/API.md の「API で作ったルールの保存」） |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
 | `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
@@ -330,7 +331,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
 | `performance` | 起動時の `global.performance` の値と出どころ（`sources`）。`SO_BUSY_POLL` を設定できない・存在しない CPU は `degraded`（`part: global.performance.busy_poll_usecs` / `global.performance.cpu_affinity`） |
 | `handoff.start` / `handoff.sent` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.busy` / `handoff.received` / `handoff.sockets` / `handoff.counters` / `handoff.rule` / `handoff.ruleset` | 再起動なしの更新：始めた / ソケットと状態を渡した / 新しいプロセス（`pid`）の準備ができた / 古いプロセスが今の接続を待つ / 終わった / できなかった（古いプロセスが動き続ける）/ マイナーが違う・別のプロセスがつないだので断った / もう動いている / 新しいプロセスが受け取った / 受け取ったソケットを使った・使わずに閉じた / 古いプロセスの最後の数を足した（届かなければ warn）/ 受け取った API のルール・ルールの組を読めない・当てられない（warn）（docs/UPGRADE.md） |
-| `update.check` / `update.available` / `update.fetched` / `update.restart_needed` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` / `launch.exit` | 自動更新：探したが新しいパッチはない / 新しいパッチがある / 確かめてキャッシュに入れた / 引き継げないパッチなので次の再起動で使う / よい版になった / 悪い版として戻した / 失敗（署名が合わないなど）/ 起動役（`rproxy-api launch`）がサーバを起動した / 引き継ぎで主プロセスが変わった / サーバが終わった（`code`）。キャッシュに書けないときは `degraded`（`part: update.cache`） |
+| `update.check` / `update.available` / `update.fetched` / `update.restart_needed` / `update.healthy` / `update.rollback` / `update.interrupted` / `update.clear_bad` / `update.error` / `launch.start` / `launch.mainpid` / `launch.notify_refused` / `launch.exit` | 自動更新：探したが新しいパッチはない / 新しいパッチがある / 確かめてキャッシュに入れた / 引き継げないパッチなので次の再起動で使う / よい版になった / 悪い版として戻した / 試している版が起動役ごと止まった（3 回で悪い版）/ 悪い版の印を外した / 失敗（署名が合わないなど）/ 起動役（`rproxy-api launch`）がサーバを起動した / 引き継ぎで主プロセスが変わった / 自分の子孫でないプロセスからの `MAINPID=` を断った / サーバが終わった（`code`）。キャッシュに書けないときは `degraded`（`part: update.cache`） |
 | （`debug` だけ）`udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` / `target.eject_skipped` | UDP のデータグラムを捨てた（数は `stats.dropped`）/ 送受信の失敗 / TCP_NODELAY を設定できない / `max_ejected_percent` のため失敗した宛先を外さなかった |
 
 ## 開発

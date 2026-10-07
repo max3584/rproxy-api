@@ -173,7 +173,7 @@ journalctl -u rproxy-backup.service
 
    DB のユーザー（UI の `rproxy_ui`、rproxy の `rproxy`）と権限は、ダンプに入っていないので作り直す（UI リポジトリの `db/README.md` の「DB ユーザー」）。
    新しい版の UI に古いダンプを戻したときは、足りない migration を順に流す（`/usr/share/rproxy-ui/db/migrations/`、`db/README.md`）
-4. **rproxy の設定を確かめる**：`sudo -u rproxy rproxy-api --check-config`（下の「戻した後の確認」）
+4. **rproxy の設定を確かめる**：`sudo -u rproxy-api rproxy-api --check-config`（下の「戻した後の確認」）
 5. **rproxy-api を起動する**：`sudo systemctl enable --now rproxy-api`。起動時に DB の `forward_rules` からルールを復元する
 6. **rproxy-ui を起動する**：`sudo systemctl enable --now rproxy-ui`
 7. **確かめる**（下）
@@ -185,7 +185,7 @@ rproxy-api は DB より先に起動しても止まりません（DB のルー�
 ### 設定ファイル
 
 ```bash
-sudo -u rproxy rproxy-api --check-config /etc/rproxy/rproxy.yaml
+sudo -u rproxy-api rproxy-api --check-config /etc/rproxy/rproxy.yaml
 ```
 
 起動時・再読み込みと同じ検証（書式、ルールの値、待ち受けの重なり、証明書・鍵・CA のファイルと期限、秘密のファイル）をして、問題がなければ 0 で終わります。
@@ -256,7 +256,7 @@ jq '{version: 1, rules: [.[] | select(.origin == "dynamic")
       | if has("targets") or has("http") then del(.remote_addr, .remote_port) else . end]}' \
   rules.json > from-db.json
 sudo install -o root -g rproxy -m 0640 from-db.json /etc/rproxy/from-db.json
-sudo -u rproxy rproxy-api --check-config /etc/rproxy/from-db.json
+sudo -u rproxy-api rproxy-api --check-config /etc/rproxy/from-db.json
 ```
 
 - `jq` は稼働情報（`state`・`stats` など）を落とし、宛先が複数のルールと L7（`http`）のルールでは一覧用の `remote_addr` / `remote_port` を落とす（`targets` と一緒には受け付けないため）

@@ -577,3 +577,30 @@ rproxy-gateway v0.4.0 で Gateway API のすべての機能（conformance の ex
 - 固定の状態コードの転送先（#235）は `servers[]` の `url` の代わりの `status`（別の種類のサービスにしない。重みの割合をそのまま使えるため）。
 - conformance で分かった直し（#238）：許さないオリジンの CORS のプリフライトは転送先へ送らず rproxy が 204（CORS のヘッダなし）で答える（転送先が独自に許してしまうのを防ぐ。Gateway API の試験もこれを求める）。`retry` の送り直しは `balance` で選び直すので、転送先が 1 つでも同じ転送先へ送り直す（これは前から。conformance で落ちた原因は rproxy ではなく、試験の環境の Gateway API の CRD が standard のチャンネルで、experimental の `retry` が消されていたこと）。
 - `tls.client_auth.mode: optional_no_verify`（#238、Gateway API の `AllowInsecureFallback`）：証明書を求めるが、なくても検証に通らなくても受ける。鍵を持っていることだけはハンドシェイクで確かめ、結果は `X-Client-Verify`（nginx の値）・`X-Forwarded-Client-Cert`（Envoy の形）・アクセスログ・PROXY v2 の `verify` で転送先に任せる。転送先へのヘッダは `client_auth` のあるルールでだけ付け、クライアントが送った同じ名前のヘッダは消す。`features.client_auth_modes`。
+
+## 17. v0.4.0 のセキュリティレビューで直したこと
+
+v0.4.0 を出す前のセキュリティレビュー（rproxy-api と rproxy-gateway）の rproxy-api の指摘と、オーナーの決定。
+
+| 指摘 | 直し方 |
+|---|---|
+| H1・M5 証明書のヘッダの偽り・mirror の写し | `X-Client-Verify`・`X-Forwarded-Client-Cert` はどのルールでも最初に消し、`client_auth` のあるときだけ付け直す。`forward_auth`・`mirror` にも同じ転送のヘッダ（#239） |
+| M1 試している版が止めただけで悪い版になる | 起動役へのシグナルで止めたら試しを終えるだけ。起動役ごと止まったら数えて 3 回で悪い版。`DELETE /admin/update/bad`・`rproxy-api update-clear-bad` |
+| M2 組の PUT で変える前のポートを見ていない | 変えるルールの今の待ち受けの範囲も `allow_listen_ports` の内であること |
+| M3 組に持ち主がない | 組は作ったトークンのもの（`owner`）、ほかは `admin` だけ。トークンの `allow_rulesets`（名前の先頭）。`generation` は 2^53 - 1 まで。If-Match を必須にする案は、コントローラが組を作り直す場合（rproxy の再起動）に etag がないので採らなかった |
+| M4 一時停止で正しいクライアントも締め出せる | 検証済みのクライアント証明書の接続は止めない、`--api-lockout-exempt`。認証を先にする案は、止めている間も推測を数えずに受けることになるので採らなかった |
+| M6 HTTP/2 の転送先の詰まり | 本文のあるリクエストがストリームを得るまでの上限（`timeouts.connect`）、1 本に 100 件を超えたら接続を足す（8 本まで）、開くのは一度に 1 つ（L15） |
+| L1 MAINPID の送り主 | `SO_PASSCRED` で送り主の pid を見て、今のサーバか子孫だけ |
+| L2 引き継ぎの受け手 | 相手が親で同じユーザーか（`SO_PEERCRED`）、ソケットのディレクトリをほかのユーザーが書けないか |
+| L3 古い形の minisign | SHA-256 を署名済みのマニフェストと先に比べる、古い形は 64 MiB まで |
+| L4 索引の鮮度 | `releases.json` の `generated_at`、前に見たものより古ければ断る |
+| L5 確かめてから実行までの隙 | 起動役は確かめたファイルを開いたまま `/proc/self/fd/N` で実行、キャッシュは 700。サーバの引き継ぎの道（同じ uid でしか書けないキャッシュ）は残る |
+| L8 制限の表の追い出し | 接続のある送信元は忘れない（いっぱいなら新しい送信元を断る・帯域は共有のバケツ）、`max_sources` は 1,000,000 まで |
+| L11 PROXY v2 の長さ | 1 つの TLV は 1024 バイトまで（超えるものは入れない）、合計が 16 ビットに収まらなければ TLV なし |
+| L12 確かめられなかった証明書の名前 | PROXY v2 の `SSL_CN` と `X-Forwarded-Client-Cert` の `Subject` に入れない（#239） |
+| L13 CORS のワイルドカード | `*` は先頭のラベルだけ、`*` と資格情報の組み合わせは警告 |
+| L18 GeoIP | 分かっている国・ASN がリストに当たらなければ拒否（もう一方が分からなくても）、データベースは 1 GiB まで、読めないときは `unknown` になることを文書に |
+| ルールが指すファイル | オーナーの決定：rproxy のユーザーのもの・グループとほかの人が書けない・鍵はほかの人が読めないものだけ（`global.files.owner_check`、既定 `strict`）。サービスのユーザーは `rproxy-api`（主グループ `rproxy`）、v0.3 の `rproxy` は uid のまま改名 |
+| forward_auth・mirror の宛先 | `rules:write` はもともとルールの宛先（`targets`・サービスの URL）をどこにでも向けられる権限なので、`forward_auth` の `address`・`mirror` の `service` も同じ扱い（新しい権限ではない）。宛先を絞りたいときは、ルールを作るトークンを分け、ネットワークの側（egress）で絞る。docs/PERMISSIONS.md に書いた |
+
+L6（/48 で回す）、L7（組の数の上限）、L9・L10（文書）は v0.4.0 では直していない（認証の後にしか届かない、または運用の注意）。
