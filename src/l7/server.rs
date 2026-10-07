@@ -712,12 +712,19 @@ impl Conn {
 					entry.service = service.name.clone();
 				}
 				if !mirrors.is_empty() {
-					let (parts, body) = req.into_parts();
-					let (body, copies) = mirror::tee(body, mirrors.len());
+					// a body read by `buffering` is sent from `replay`; copies get it too
+					let copies = match &replay {
+						Some(bytes) => (0..mirrors.len()).map(|_| full_body(bytes.clone())).collect(),
+						None => {
+							let (parts, body) = req.into_parts();
+							let (body, copies) = mirror::tee(body, mirrors.len());
+							req = Request::from_parts(parts, body);
+							copies
+						}
+					};
 					for (copy, body) in mirrors.into_iter().zip(copies) {
 						self.mirror(router.clone(), copy, body);
 					}
-					req = Request::from_parts(parts, body);
 				}
 				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log, ctx: &ctx, backend_timeout };
 				let forwarded = self.forward(target, req, replay, retry, &mut entry.backend, &mut holds);

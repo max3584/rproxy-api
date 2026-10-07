@@ -366,6 +366,7 @@ async fn mirror_copies_a_share_without_touching_the_response() {
 				{"name": "part", "match": "PathPrefix(`/part`)", "service": "s", "middlewares": ["copy20"]},
 				{"name": "frac", "match": "PathPrefix(`/frac`)", "service": "s", "middlewares": ["half"]},
 				{"name": "down", "match": "PathPrefix(`/down`)", "service": "s", "middlewares": ["dead"]},
+				{"name": "buf", "match": "PathPrefix(`/buf`)", "service": "s", "middlewares": ["buffer", "copy"]},
 			],
 			"services": {
 				"s": {"servers": [{"url": format!("http://{b}")}]},
@@ -378,6 +379,7 @@ async fn mirror_copies_a_share_without_touching_the_response() {
 				"copy20": {"mirror": {"service": "shadow", "percent": 20}},
 				"half": {"mirror": {"service": "shadow", "fraction": {"numerator": 25, "denominator": 50}}},
 				"dead": {"mirror": {"service": "gone"}},
+				"buffer": {"buffering": {"max_request_body": 1000}},
 			},
 		}),
 	)
@@ -409,6 +411,14 @@ async fn mirror_copies_a_share_without_touching_the_response() {
 	assert_eq!(main.lock().unwrap().iter().filter(|(p, _)| p == "/part").count(), 100);
 	// a mirror that cannot be reached changes nothing for the client
 	assert_eq!(send(client().get(format!("{base}/down"))).await.0, 200);
+	// a body read by buffering reaches the mirror too
+	assert_eq!(send(client().put(format!("{base}/buf")).body("buffered")).await.0, 200);
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while count("/buf") == 0 {
+		assert!(Instant::now() < deadline, "the buffered request was not mirrored");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	assert_eq!(mirrored.lock().unwrap().iter().find(|(p, _)| p == "/buf").unwrap().1["content-length"], ["8"]);
 
 	let (status, v) = h
 		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
