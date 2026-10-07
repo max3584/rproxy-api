@@ -39,14 +39,21 @@ pub fn idempotent(method: &Method) -> bool {
 	matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS | Method::PUT | Method::DELETE | Method::TRACE)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RetryPolicy {
 	/// Attempts in all, the first one included.
 	pub attempts: u32,
 	pub interval: Duration,
+	/// Statuses of a backend's answer that are tried again (#231).
+	pub status: Arc<[(u16, u16)]>,
 }
 
 impl RetryPolicy {
+	/// Whether an answer with `status` is tried again.
+	pub fn retries(&self, status: u16) -> bool {
+		self.status.iter().any(|(a, b)| (*a..=*b).contains(&status))
+	}
+
 	/// The wait before attempt `n` (2, 3, ...).
 	pub fn wait(&self, n: u32) -> Duration {
 		self.interval.saturating_mul(1u32 << n.saturating_sub(2).min(16))
@@ -223,8 +230,9 @@ mod tests {
 
 	#[test]
 	fn retry_waits_double() {
-		let p = RetryPolicy { attempts: 4, interval: Duration::from_millis(100) };
+		let p = RetryPolicy { attempts: 4, interval: Duration::from_millis(100), status: Arc::from(vec![(500, 500), (502, 504)]) };
 		assert_eq!([p.wait(2), p.wait(3), p.wait(4)], [100, 200, 400].map(Duration::from_millis));
 		assert!(idempotent(&Method::PUT) && !idempotent(&Method::POST));
+		assert!(p.retries(500) && p.retries(503) && !p.retries(501) && !p.retries(200));
 	}
 }

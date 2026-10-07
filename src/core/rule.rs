@@ -139,8 +139,14 @@ pub struct Features {
 	pub tls_options: bool,
 	/// Middleware kinds (`http.middlewares`) that can run
 	pub middlewares: &'static [&'static str],
-	/// Options of `http.services` that can run (`health_check`, `sticky`, `balance`, `outlier_detection`)
+	/// Options of `http.services` that can run (`health_check`, `sticky`, `balance`, `outlier_detection`,
+	/// `protocol`, `tls`)
 	pub services: &'static [&'static str],
+	/// Other `http` options for the Gateway API (#224, #226-#235): `headers_add`, `redirect_status`,
+	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`
+	pub http_options: &'static [&'static str],
+	/// `targets` and `balance` of `tls.routes[]` (#234)
+	pub tls_route_targets: bool,
 	// v0.4 (docs/DESIGN-v0.4.md)
 	/// `PUT /rulesets/{name}` and the other rule set endpoints (#28)
 	pub rulesets: bool,
@@ -176,6 +182,9 @@ pub struct Features {
 	pub performance: &'static [&'static str],
 }
 
+/// Every name of `Features::http_options`.
+const HTTP_OPTIONS: &[&str] = &["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status"];
+
 impl Features {
 	pub const CURRENT: Features =
 		Features {
@@ -186,9 +195,12 @@ impl Features {
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path",
 			"replace_path_regex", "respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "retry",
-			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc", "geoip",
+			"circuit_breaker", "errors", "basic_auth", "forward_auth", "oidc", "geoip", "cors", "mirror",
+			"replace_host",
 		],
-		services: &["health_check", "sticky", "balance", "outlier_detection"],
+		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
+		http_options: HTTP_OPTIONS,
+		tls_route_targets: true,
 		rulesets: true,
 		labels: true,
 		conditions: true,
@@ -217,9 +229,12 @@ impl Features {
 		middlewares: &[
 			"redirect_scheme", "redirect_regex", "rate_limit", "in_flight", "crowdsec", "ip_allow", "headers",
 			"forward_auth", "oidc", "basic_auth", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
-			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond", "geoip",
+			"compress", "buffering", "retry", "circuit_breaker", "errors", "respond", "geoip", "cors", "mirror",
+			"replace_host",
 		],
-		services: &["health_check", "sticky", "balance", "outlier_detection"],
+		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
+		http_options: HTTP_OPTIONS,
+		tls_route_targets: true,
 		rulesets: true,
 		labels: true,
 		conditions: true,
@@ -264,12 +279,20 @@ impl Features {
 					("health_check", s.health_check.is_some()),
 					("sticky", s.sticky.is_some()),
 					("outlier_detection", s.outlier_detection.is_some()),
+					("protocol", !s.protocol.is_default()),
+					("tls", s.tls.is_some()),
 				] {
 					if used && !self.services.contains(&option) {
 						return missing(&format!("service {name}: {option}"));
 					}
 				}
 			}
+			if let Some(option) = h.options_used().into_iter().find(|o| !self.http_options.contains(o)) {
+				return missing(&format!("http option {option}"));
+			}
+		}
+		if !self.tls_route_targets && tls.routes.iter().any(|r| !r.targets.is_empty()) {
+			return missing("targets of tls.routes");
 		}
 		Ok(())
 	}

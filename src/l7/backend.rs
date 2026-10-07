@@ -1,6 +1,7 @@
 //! Services of `http` rules (#61): servers chosen by weighted round robin,
 //! active health checks, sticky sessions by cookie, and HTTP/1.1 connections to
-//! the servers kept for reuse.
+//! the servers kept for reuse. HTTP/2 servers (`protocol`, #233) get one
+//! multiplexed connection each; `status` entries (#235) answer themselves.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -12,9 +13,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::client::conn::http1::SendRequest;
+use hyper::client::conn::http2;
 use hyper::header::{self, HeaderMap, HeaderValue};
-use hyper::{Request, Uri};
-use hyper_util::rt::TokioIo;
+use hyper::{Request, StatusCode, Uri};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::ServerName;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -22,8 +24,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::middleware::Middleware;
 use super::server::Body;
-use super::{parse_duration, ServiceSpec};
+use super::{parse_duration, MiddlewareSpec, ServiceSpec, UpstreamProtocol};
 use crate::error::ApiError;
 use crate::core::resolve::{self, Lookup};
 
@@ -70,9 +73,26 @@ pub struct Server {
 	pub inflight: Arc<AtomicU64>,
 	/// Last used at the end: taken from the end (the warmest), expired from the front.
 	idle: Mutex<Vec<(SendRequest<Body>, Instant)>>,
+	/// `status` entry (#235): rproxy answers with this instead of forwarding.
+	pub status: Option<StatusCode>,
+	/// `middlewares` of this server (#229), run after the route's.
+	pub middlewares: Vec<Arc<Middleware>>,
+	/// The shared HTTP/2 connection (#233); taken under the lock while connecting.
+	h2: tokio::sync::Mutex<Option<http2::SendRequest<Body>>>,
+	/// `protocol: auto`: what the server picked by ALPN (0 not known yet, 1 HTTP/1.1, 2 HTTP/2).
+	alpn: std::sync::atomic::AtomicU8,
 }
 
 impl Server {
+	/// A `status` entry (#235).
+	fn fixed(status: u16, weight: u32) -> Result<Server, ApiError> {
+		let status = StatusCode::from_u16(status).map_err(|e| ApiError::invalid(format!("status {status}: {e}")))?;
+		let mut server = Server::parse(&format!("http://status-{}.invalid", status.as_u16()), weight)?;
+		server.url = format!("status:{}", status.as_u16());
+		server.status = Some(status);
+		Ok(server)
+	}
+
 	fn parse(url: &str, weight: u32) -> Result<Server, ApiError> {
 		let uri: Uri = url.parse().map_err(|e| ApiError::invalid(format!("{url:?}: {e}")))?;
 		let https = uri.scheme_str() == Some("https");
@@ -92,7 +112,29 @@ impl Server {
 			ejection: Arc::default(),
 			inflight: Arc::default(),
 			idle: Mutex::new(vec![]),
+			status: None,
+			middlewares: vec![],
+			h2: tokio::sync::Mutex::new(None),
+			alpn: Default::default(),
 		})
+	}
+
+	/// The kept HTTP/2 connection, if it is still open.
+	pub async fn h2_sender(&self) -> tokio::sync::MutexGuard<'_, Option<http2::SendRequest<Body>>> {
+		let mut slot = self.h2.lock().await;
+		if slot.as_ref().is_some_and(|s| s.is_closed()) {
+			*slot = None;
+		}
+		slot
+	}
+
+	/// `protocol: auto`: the server picked HTTP/2 by ALPN on the last connection.
+	pub fn picked_h2(&self) -> bool {
+		self.alpn.load(Ordering::Relaxed) == 2
+	}
+
+	pub fn set_picked(&self, h2: bool) {
+		self.alpn.store(if h2 { 2 } else { 1 }, Ordering::Relaxed);
 	}
 
 	/// Up by the health check and not ejected by `outlier_detection`.
@@ -187,6 +229,39 @@ pub struct Service {
 	pub balance: crate::core::balance::Balance,
 	/// Passive health checks (#170): servers failing in real traffic are ejected for a while.
 	pub outlier: Option<crate::core::outlier::HttpOutlier>,
+	/// HTTP version towards the servers (#233).
+	pub protocol: UpstreamProtocol,
+	/// TLS of this service (its `tls`, #236, or ALPN other than http/1.1); None uses the router's.
+	pub tls: Option<ServiceTls>,
+}
+
+/// The TLS client of one service.
+#[derive(Clone)]
+pub struct ServiceTls {
+	pub connector: tokio_rustls::TlsConnector,
+	pub server_name: Option<String>,
+}
+
+impl std::fmt::Debug for ServiceTls {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ServiceTls").field("server_name", &self.server_name).finish_non_exhaustive()
+	}
+}
+
+/// ALPN offered for `protocol`.
+pub fn alpn(protocol: UpstreamProtocol) -> Vec<Vec<u8>> {
+	match protocol {
+		UpstreamProtocol::H2 => vec![b"h2".to_vec()],
+		UpstreamProtocol::Auto => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+		UpstreamProtocol::Http1 | UpstreamProtocol::H2c => vec![b"http/1.1".to_vec()],
+	}
+}
+
+impl ServiceTls {
+	pub fn new(mut config: rustls::ClientConfig, protocol: UpstreamProtocol, server_name: Option<String>) -> ServiceTls {
+		config.alpn_protocols = alpn(protocol);
+		ServiceTls { connector: tokio_rustls::TlsConnector::from(Arc::new(config)), server_name }
+	}
 }
 
 fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError> {
@@ -197,12 +272,32 @@ fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError>
 }
 
 impl Service {
-	pub fn compile(name: &str, spec: &ServiceSpec) -> Result<Service, ApiError> {
-		let servers = spec
-			.servers
-			.iter()
-			.map(|s| Server::parse(&s.url, s.weight.unwrap_or(1)))
-			.collect::<Result<Vec<_>, _>>()?;
+	/// `middlewares` are the rule's, for the servers' own (#229).
+	pub fn compile(name: &str, spec: &ServiceSpec, middlewares: &BTreeMap<String, MiddlewareSpec>) -> Result<Service, ApiError> {
+		let mut servers = vec![];
+		for (i, s) in spec.servers.iter().enumerate() {
+			let weight = s.weight.unwrap_or(1);
+			let mut server = match s.status {
+				Some(status) => Server::fixed(status, weight)?,
+				None => Server::parse(&s.url, weight)?,
+			};
+			for m in &s.middlewares {
+				let what = format!("service {name}: servers[{i}]: middleware {m}");
+				let spec = middlewares.get(m).ok_or_else(|| ApiError::invalid(format!("{what} is not defined")))?;
+				if !super::SERVER_MIDDLEWARES.contains(&spec.kind()) {
+					return Err(ApiError::invalid(format!("{what}: {} cannot run per server", spec.kind())));
+				}
+				server.middlewares.push(Arc::new(Middleware::compile(m, spec)?));
+			}
+			servers.push(server);
+		}
+		let tls = match &spec.tls {
+			Some(t) => {
+				t.validate(&format!("service {name}: tls"))?;
+				Some(ServiceTls::new(t.client_config()?, spec.protocol, t.server_name.clone()))
+			}
+			None => None,
+		};
 		if servers.is_empty() {
 			return Err(ApiError::invalid(format!("service {name}: servers is empty")));
 		}
@@ -234,20 +329,33 @@ impl Service {
 			sticky,
 			balance: spec.balance,
 			outlier: spec.outlier_detection.as_ref().map(crate::core::outlier::HttpOutlier::new),
+			protocol: spec.protocol,
+			tls,
 		})
 	}
 
 	pub fn single(url: &str) -> Result<Service, ApiError> {
 		let spec = ServiceSpec {
-			servers: vec![super::ServerSpec { url: url.to_string(), weight: None }],
+			servers: vec![super::ServerSpec { url: url.to_string(), ..Default::default() }],
 			health_check: None,
 			sticky: None,
 			pass_host_header: None,
 			timeouts: None,
 			balance: Default::default(),
 			outlier_detection: None,
+			protocol: Default::default(),
+			tls: None,
 		};
-		Service::compile(url, &spec)
+		Service::compile(url, &spec, &BTreeMap::new())
+	}
+
+	/// Whether requests to server `index` go over HTTP/2.
+	pub fn speaks_h2(&self, index: usize) -> bool {
+		match self.protocol {
+			UpstreamProtocol::H2 | UpstreamProtocol::H2c => true,
+			UpstreamProtocol::Auto => self.servers.get(index).is_some_and(|s| s.https && s.picked_h2()),
+			UpstreamProtocol::Http1 => false,
+		}
 	}
 
 	/// The server for a request: the one its sticky cookie names while that is
@@ -339,8 +447,9 @@ pub struct Dialer {
 
 impl Dialer {
 	/// A TCP (and TLS for https://) connection to `server`, from `bind` when
-	/// the rule uses `source_ip: transparent`.
-	pub async fn dial(&self, server: &Server, bind: Option<SocketAddr>) -> Result<Box<dyn Stream>, String> {
+	/// the rule uses `source_ip: transparent`. `tls` is the service's own (#236);
+	/// the second value tells that the server picked HTTP/2 by ALPN.
+	pub async fn dial(&self, server: &Server, bind: Option<SocketAddr>, tls: Option<&ServiceTls>) -> Result<(Box<dyn Stream>, bool), String> {
 		let addrs = match server.host.parse::<IpAddr>() {
 			Ok(ip) => vec![SocketAddr::new(ip, server.port)],
 			Err(_) => resolve::resolve(&self.lookup, &server.addr()).await.map_err(|e| e.message)?,
@@ -358,16 +467,55 @@ impl Dialer {
 		}
 		let tcp = tcp.ok_or(last)?; // TCP_NODELAY is set by connect_tcp
 		if !server.https {
-			return Ok(Box::new(tcp));
+			return Ok((Box::new(tcp), false));
 		}
-		let name = self.server_name.clone().unwrap_or_else(|| server.host.clone());
+		let (connector, name) = match tls {
+			Some(t) => (&t.connector, t.server_name.clone()),
+			None => (&self.tls, self.server_name.clone()),
+		};
+		let name = name.unwrap_or_else(|| server.host.clone());
 		let name = ServerName::try_from(name).map_err(|e| e.to_string())?;
-		Ok(Box::new(self.tls.connect(name, tcp).await.map_err(|e| format!("TLS: {e}"))?))
+		let stream = connector.connect(name, tcp).await.map_err(|e| format!("TLS: {e}"))?;
+		let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
+		Ok((Box::new(stream), h2))
 	}
 }
 
-/// Starts HTTP/1.1 on a connection; the connection itself runs until `stop` or its end.
-pub async fn handshake(stream: Box<dyn Stream>, stop: CancellationToken, spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>)) -> io::Result<SendRequest<Body>> {
+/// Marks a request whose client asked for trailers (`TE: trailers`), for HTTP/2 servers (#233).
+#[derive(Clone, Copy, Debug)]
+pub struct WantsTrailers;
+
+/// A connection to a server, ready for requests.
+pub enum Sender {
+	Http1(SendRequest<Body>),
+	Http2(http2::SendRequest<Body>),
+}
+
+/// Starts HTTP/1.1 (or HTTP/2 with `h2`) on a connection; the connection itself
+/// runs until `stop` or its end.
+pub async fn handshake(
+	stream: Box<dyn Stream>,
+	h2: bool,
+	stop: CancellationToken,
+	spawn: impl FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
+) -> io::Result<Sender> {
+	if h2 {
+		let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+			.timer(TokioTimer::new())
+			.keep_alive_interval(Some(H2_KEEPALIVE))
+			.keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+			.max_header_list_size(super::server::MAX_HEADER_SECTION)
+			.handshake::<_, Body>(TokioIo::new(stream))
+			.await
+			.map_err(io::Error::other)?;
+		spawn(Box::pin(async move {
+			tokio::select! {
+				_ = stop.cancelled() => {}
+				_ = conn => {}
+			}
+		}));
+		return Ok(Sender::Http2(sender));
+	}
 	let (sender, conn) = hyper::client::conn::http1::Builder::new()
 		.handshake::<_, Body>(TokioIo::new(stream))
 		.await
@@ -378,7 +526,30 @@ pub async fn handshake(stream: Box<dyn Stream>, stop: CancellationToken, spawn: 
 			_ = conn.with_upgrades() => {}
 		}
 	}));
-	Ok(sender)
+	Ok(Sender::Http1(sender))
+}
+
+/// Pings on an idle HTTP/2 connection, so one the server or a middlebox dropped is noticed.
+const H2_KEEPALIVE: Duration = Duration::from_secs(30);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A request in the form HTTP/2 needs (#233): an absolute URI whose authority is
+/// the Host (no Host field), and `te: trailers` when the client asked for trailers.
+pub fn to_h2<B>(mut req: Request<B>, https: bool, trailers: bool) -> Request<B> {
+	let authority = req.headers_mut().remove(header::HOST).and_then(|h| h.to_str().ok().map(str::to_string));
+	let pq = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+	let mut b = Uri::builder().scheme(if https { "https" } else { "http" }).path_and_query(pq);
+	if let Some(a) = authority.as_deref().filter(|a| !a.is_empty()) {
+		b = b.authority(a);
+	}
+	if let Ok(uri) = b.build() {
+		*req.uri_mut() = uri;
+	}
+	*req.version_mut() = hyper::Version::HTTP_2;
+	if trailers {
+		req.headers_mut().insert(header::TE, HeaderValue::from_static("trailers"));
+	}
+	req
 }
 
 /// Health of the servers of a service with `health_check` or `outlier_detection` (rule view and metrics).
@@ -395,7 +566,7 @@ pub fn health_view<'a>(services: impl Iterator<Item = &'a Arc<Service>>) -> BTre
 	services
 		.filter(|s| s.health.is_some() || s.outlier.is_some())
 		.map(|s| {
-			let servers = s.servers.iter().map(|v| ServerHealth { url: v.url.clone(), up: v.is_up(), ejected: v.ejection.is_ejected() });
+			let servers = s.servers.iter().filter(|v| v.status.is_none()).map(|v| ServerHealth { url: v.url.clone(), up: v.is_up(), ejected: v.ejection.is_ejected() });
 			(s.name.clone(), servers.collect())
 		})
 		.collect()
@@ -407,6 +578,9 @@ impl Service {
 	/// than `max_ejected_percent` of the servers. `rule` is for the logs.
 	pub fn observe(self: &Arc<Self>, index: usize, outcome: crate::core::outlier::HttpOutcome, rule: crate::core::rule::Key) {
 		let (Some(cfg), Some(server)) = (&self.outlier, self.servers.get(index)) else { return };
+		if server.status.is_some() {
+			return;
+		}
 		// a request to an ejected server (every other one is out) neither extends nor counts
 		if server.ejection.is_ejected() {
 			return;
@@ -460,10 +634,21 @@ pub fn start_health_checks(service: Arc<Service>, dialer: Dialer, stop: Cancella
 
 async fn probe(service: &Service, server: &Server, dialer: &Dialer, stop: &CancellationToken) -> (bool, String) {
 	let Some(h) = service.health.as_ref() else { return (true, String::new()) };
+	if server.status.is_some() {
+		return (true, String::new());
+	}
 	let check = async {
-		let stream = dialer.dial(server, None).await?;
+		let (stream, picked_h2) = dialer.dial(server, None, service.tls.as_ref()).await?;
+		let h2 = match service.protocol {
+			UpstreamProtocol::H2 | UpstreamProtocol::H2c => true,
+			UpstreamProtocol::Auto => picked_h2,
+			UpstreamProtocol::Http1 => false,
+		};
+		if service.protocol == UpstreamProtocol::H2 && !picked_h2 {
+			return Err("the server did not pick h2 (ALPN)".to_string());
+		}
 		let conn_stop = stop.child_token();
-		let mut sender = handshake(stream, conn_stop.clone(), |f| {
+		let sender = handshake(stream, h2, conn_stop.clone(), |f| {
 			tokio::spawn(f);
 		})
 		.await
@@ -473,7 +658,10 @@ async fn probe(service: &Service, server: &Server, dialer: &Dialer, stop: &Cance
 			.header(header::USER_AGENT, "rproxy-health-check")
 			.body(Empty::<Bytes>::new().map_err(|never| match never {}).boxed())
 			.map_err(|e| e.to_string())?;
-		let resp = sender.send_request(req).await.map_err(|e| e.to_string());
+		let resp = match sender {
+			Sender::Http1(mut s) => s.send_request(req).await.map_err(|e| e.to_string()),
+			Sender::Http2(mut s) => s.send_request(to_h2(req, server.https, false)).await.map_err(|e| e.to_string()),
+		};
 		conn_stop.cancel();
 		let status = resp?.status();
 		if status.is_success() || status.is_redirection() {
@@ -495,7 +683,7 @@ mod tests {
 
 	fn service(yaml: &str) -> Service {
 		let spec: ServiceSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
-		Service::compile("s", &spec).unwrap()
+		Service::compile("s", &spec, &BTreeMap::new()).unwrap()
 	}
 
 	#[test]
@@ -545,6 +733,6 @@ mod tests {
 		assert_eq!(s.pick(Some("unknown")), Some(0));
 		let set = s.sticky_cookie(&s.servers[0], true).unwrap();
 		assert_eq!(set.to_str().unwrap(), format!("lb={}; Path=/; HttpOnly; SameSite=Lax; Secure", s.servers[0].id));
-		assert!(Service::compile("s", &serde_json::from_value(serde_json::json!({"servers": [{"url": "http://a"}], "sticky": {"cookie": "a b"}})).unwrap()).is_err());
+		assert!(Service::compile("s", &serde_json::from_value(serde_json::json!({"servers": [{"url": "http://a"}], "sticky": {"cookie": "a b"}})).unwrap(), &BTreeMap::new()).is_err());
 	}
 }

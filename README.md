@@ -311,11 +311,12 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `conn.limited` | ルールの `limits`（#165）で断った接続（UDP はデータグラム）：`reason` は `max_connections`・`source_connections`・`new_connections`・`packets`、`transport` は `tcp`・`udp`、`client`。送信元ごとに間引く（`suppressed`） |
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗 |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |
-| `http.error` | `http` のルールで転送先に接続できない・時間切れ（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
+| `http.error` | `http` のルールで転送先に接続できない・時間切れ（ルートの `timeouts` を含む）・`retry` の `status` で送り直す（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
 | `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn` |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | `oidc` ミドルウェアのサインイン（`user`）、リフレッシュの失敗、プロバイダとのやり取りの失敗、セッションが大きすぎてリフレッシュトークンを持てない |
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
+| `http.mirror` | `mirror` ミドルウェアの写しの結果（debug。`middleware`、`service`、`backend`、`status`、失敗なら `error`）。クライアントの応答には影響しない |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |
 | `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `outlier`。`outlier` は実際の通信の失敗で外した・戻した：`cause`、`ejection_secs`）。`http` のサービスの `outlier_detection` でも（`service`、`server`） |

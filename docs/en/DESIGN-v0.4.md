@@ -560,3 +560,18 @@ Where the implementation PRs departed from the design, or decided what the desig
   - The handed-over state also includes the API rules (in the `GET /rules` shape, with #144's `created_by`, `created_at`, `persisted`), `stats.http`, and `counters_since` (kept from the old process), `limited` and bandwidth drops. What starts over in the new process (`limits` and `bandwidth` buckets and per-source counts, L7 `rate_limit` and similar state, ejected destinations) is in docs/en/UPGRADE.md.
   - The self-update binary is streamed into a temporary file in the cache and verified from the file (not held in memory; capped at 1 GiB).
   - During a handoff (and in the old process afterwards) change endpoints answer `503 upgrading`.
+
+## 16. L7 and TLS for the rest of the Gateway API (#224, #226-#236)
+
+Added to v0.4.0 by the owner's decision so that rproxy-gateway v0.4.0 can map every Gateway API feature (conformance extended features included); released together with rproxy-gateway v0.4.0. The shapes are in "L7 and TLS features for the Gateway API" of docs/en/API.md. Decisions:
+
+- One module per feature: `l7/middleware/cors.rs` (#230), `l7/mirror.rs` (#232), `l7/deadline.rs` (#227), `l7/backend_tls.rs` (#236). HTTP/2 to backends (#233) lives in `l7/backend.rs` (connections) and `l7/server.rs` (sending); `targets` of `tls.routes` (#234) reuse `Pool` of `core/balance.rs`.
+- Added to `features`: `cors`, `mirror` and `replace_host` in `middlewares`, `protocol` and `tls` in `services`, `http_options` (`headers_add`, `redirect_status`, `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`), and `tls_route_targets`. The controller tells older rproxy builds apart by these.
+- `add` of `headers` runs after `remove` and `set`, appending to an existing value with `,` (no space) as one field (what Envoy and the conformance tests expect).
+- CORS is a separate `cors` middleware in the HTTPCORSFilter shape rather than an extension of `cors` in `headers` (`expose_headers`, wildcard origins and `*` with `allow_credentials` behave differently; `cors` of `headers` is unchanged). Preflights from origins not allowed go to the backend (as in Envoy).
+- Route time limits are a route field, like the Gateway API's `timeouts` (not a middleware). `request` counts until the end of the response body; running out after the response headers ends the body with an error (the #134 rule: never look complete). `backend_request` is per attempt and replaces the service's `timeouts.response`.
+- `attempts` of `retry` still counts the first attempt (the Gateway API's `attempts` counts retries, so the controller adds one). Only idempotent methods are still retried.
+- The mirrored share is kept by count, not at random (spread by the golden ratio; the conformance share checks are stable). The body is copied as it streams; a mirror 64 frames behind is cut off alone (the main request never waits).
+- HTTP/2 backends get one connection per server (h2 multiplexing). `auto` remembers the ALPN outcome per server. An Upgrade to an HTTP/2 backend gets 502 (no extended CONNECT).
+- A service's `tls` is not merged field by field with the rule's `tls.upstream` (a BackendTLSPolicy is complete per service). `subject_alt_names` uses our own verifier for DNS names and URIs (SPIFFE); chain and validity are checked with rustls's webpki functions.
+- Fixed-status servers (#235) are `status` instead of `url` in `servers[]` (not a separate kind of service, so the weight share works as it is).

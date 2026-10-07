@@ -201,6 +201,10 @@ pub async fn check(input: &CheckInput) -> Report {
 				_ => {}
 			}
 		}
+		// the services' own TLS files (#236)
+		for t in r.http.iter().flat_map(|h| h.services.values()).filter_map(|s| s.tls.as_ref()) {
+			secrets.extend(t.files().cloned());
+		}
 	}
 	let mut files: Vec<String> = report.files.clone();
 	files.extend(checked.files);

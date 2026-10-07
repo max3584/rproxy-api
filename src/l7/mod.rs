@@ -4,9 +4,12 @@
 
 pub mod access;
 pub mod backend;
+pub mod backend_tls;
 pub mod compress;
+pub mod deadline;
 pub mod h3;
 pub mod matcher;
+pub mod mirror;
 pub mod resilience;
 pub mod middleware;
 pub mod server;
@@ -58,6 +61,22 @@ pub struct RouteSpec {
 	pub to: Option<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub middlewares: Vec<String>,
+	/// Time limits of the whole request and of one attempt to a backend (#227).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeouts: Option<RouteTimeoutsSpec>,
+}
+
+/// `timeouts` of a route (#227, the Gateway API's `timeouts.request` / `backendRequest`).
+/// `0s` is no limit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTimeoutsSpec {
+	/// From receiving the request until the end of the response body.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub request: Option<String>,
+	/// One attempt to a backend, from starting to send until the end of the response body.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub backend_request: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,16 +112,52 @@ pub struct ServiceSpec {
 	/// Passive health checks: servers failing in real traffic are ejected for a while (#170, v0.4).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub outlier_detection: Option<crate::core::outlier::HttpOutlierSpec>,
+	/// HTTP version towards the servers (#233): http1 (default), h2, h2c or auto.
+	#[serde(default, skip_serializing_if = "UpstreamProtocol::is_default")]
+	pub protocol: UpstreamProtocol,
+	/// TLS towards this service's https:// servers instead of the rule's `tls.upstream` (#236).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tls: Option<backend_tls::ServiceTlsSpec>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `protocol` of a service (#233).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+	#[default]
+	Http1,
+	/// HTTP/2 over TLS (ALPN h2), https:// servers.
+	H2,
+	/// HTTP/2 with prior knowledge, http:// servers.
+	H2c,
+	/// https://: what the server picks of h2 and http/1.1 (ALPN); http://: HTTP/1.1.
+	Auto,
+}
+
+impl UpstreamProtocol {
+	pub fn is_default(&self) -> bool {
+		*self == UpstreamProtocol::Http1
+	}
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSpec {
-	/// http:// or https://
+	/// http:// or https:// (or `status` instead)
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	pub url: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub weight: Option<u32>,
+	/// Answer with this status instead of forwarding (#235, partially invalid backendRefs).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub status: Option<u16>,
+	/// Middlewares (names in `http.middlewares`) for requests sent to this server only (#229).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub middlewares: Vec<String>,
 }
+
+/// Middleware kinds that `servers[].middlewares` may use (#229): those that only rewrite.
+pub const SERVER_MIDDLEWARES: &[&str] = &["headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,12 +195,18 @@ pub enum MiddlewareSpec {
 		port: Option<u16>,
 		#[serde(default)]
 		permanent: bool,
+		/// 301, 302, 303, 307 or 308; over `permanent` (#226).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		status: Option<u16>,
 	},
 	RedirectRegex {
 		regex: String,
 		replacement: String,
 		#[serde(default)]
 		permanent: bool,
+		/// 301, 302, 303, 307 or 308; over `permanent` (#226).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		status: Option<u16>,
 	},
 	RateLimit {
 		/// Requests per `period` on average.
@@ -264,6 +325,9 @@ pub enum MiddlewareSpec {
 		attempts: u32,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		initial_interval: Option<String>,
+		/// Also again when the backend answers one of these (e.g. ["500", "502-504"], #231).
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		status: Vec<String>,
 	},
 	CircuitBreaker {
 		/// Percentage of failed responses (1-100) in `window` that opens the breaker.
@@ -286,6 +350,34 @@ pub enum MiddlewareSpec {
 	},
 	/// Country / ASN allow and deny lists for the client IP (#168, v0.4).
 	Geoip(crate::net::geoip::GeoipSpec),
+	/// CORS as the Gateway API's HTTPCORSFilter (#230).
+	Cors(middleware::cors::CorsFilterSpec),
+	/// A copy of requests to another service (#232).
+	Mirror {
+		service: String,
+		/// 0-100; all when left out.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		percent: Option<u8>,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		fraction: Option<FractionSpec>,
+	},
+	/// The Host sent to the backend (#228).
+	ReplaceHost {
+		host: String,
+	},
+}
+
+/// `fraction` of `mirror`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FractionSpec {
+	pub numerator: u32,
+	#[serde(default = "hundred")]
+	pub denominator: u32,
+}
+
+fn hundred() -> u32 {
+	100
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +387,9 @@ pub struct HeaderOps {
 	pub set: BTreeMap<String, String>,
 	#[serde(default)]
 	pub remove: Vec<String>,
+	/// Appended after an existing value with `,` (#224).
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub add: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +454,9 @@ impl MiddlewareSpec {
 			MiddlewareSpec::Errors { .. } => "errors",
 			MiddlewareSpec::Respond { .. } => "respond",
 			MiddlewareSpec::Geoip(_) => "geoip",
+			MiddlewareSpec::Cors(_) => "cors",
+			MiddlewareSpec::Mirror { .. } => "mirror",
+			MiddlewareSpec::ReplaceHost { .. } => "replace_host",
 		}
 	}
 
@@ -372,6 +470,16 @@ impl MiddlewareSpec {
 
 	fn validate(&self, name: &str, services: &BTreeMap<String, ServiceSpec>) -> Result<(), ApiError> {
 		let bad = |msg: String| Err(invalid(format!("middleware {name}: {msg}")));
+		if let MiddlewareSpec::RedirectScheme { status: Some(s), .. } | MiddlewareSpec::RedirectRegex { status: Some(s), .. } = self {
+			if ![301, 302, 303, 307, 308].contains(s) {
+				return bad(format!("status {s} must be 301, 302, 303, 307 or 308"));
+			}
+		}
+		if let MiddlewareSpec::Retry { status, .. } = self {
+			for s in status {
+				parse_status_range(s).map_err(|e| invalid(format!("middleware {name}: status: {e}")))?;
+			}
+		}
 		match self {
 			MiddlewareSpec::RedirectScheme { scheme, .. } if scheme != "http" && scheme != "https" => bad(format!("scheme {scheme:?} must be http or https")),
 			MiddlewareSpec::RedirectRegex { regex, .. } | MiddlewareSpec::ReplacePathRegex { regex, .. } => {
@@ -438,6 +546,32 @@ impl MiddlewareSpec {
 			}
 			MiddlewareSpec::Respond { status, .. } if !(100..=599).contains(status) => bad(format!("status {status} is not an HTTP status")),
 			MiddlewareSpec::Geoip(g) => g.validate(&format!("middleware {name}")),
+			MiddlewareSpec::Cors(c) => c.validate(&format!("middleware {name}")),
+			MiddlewareSpec::Mirror { service, percent, fraction } => {
+				if !services.contains_key(service) {
+					return bad(format!("service {service:?} is not defined"));
+				}
+				if percent.is_some() && fraction.is_some() {
+					return bad("give percent or fraction, not both".into());
+				}
+				if percent.is_some_and(|p| p > 100) {
+					return bad("percent must be 0-100".into());
+				}
+				if let Some(f) = fraction {
+					if f.denominator == 0 || f.numerator > f.denominator {
+						return bad("fraction: denominator must be at least 1 and numerator at most denominator".into());
+					}
+				}
+				Ok(())
+			}
+			MiddlewareSpec::ReplaceHost { host } => {
+				let ok = !host.is_empty() && host.parse::<hyper::http::uri::Authority>().is_ok_and(|a| a.as_str() == host && !host.contains('@'));
+				if ok {
+					Ok(())
+				} else {
+					bad(format!("host {host:?} must be host or host:port"))
+				}
+			}
 			MiddlewareSpec::ForwardAuth { address, timeout, .. } => {
 				check_url(address, &format!("middleware {name}"))?;
 				if let Some(t) = timeout {
@@ -516,8 +650,50 @@ impl HttpSpec {
 			if svc.servers.is_empty() {
 				return Err(invalid(format!("service {name}: servers is empty")));
 			}
-			for s in &svc.servers {
-				check_url(&s.url, &format!("service {name}"))?;
+			for (i, s) in svc.servers.iter().enumerate() {
+				let what = format!("service {name}: servers[{i}]");
+				match (s.url.is_empty(), s.status) {
+					(false, None) => check_url(&s.url, &format!("service {name}"))?,
+					(true, Some(st)) if (100..=599).contains(&st) => {
+						if !s.middlewares.is_empty() {
+							return Err(invalid(format!("{what}: a status entry takes no middlewares")));
+						}
+					}
+					(true, Some(st)) => return Err(invalid(format!("{what}: status {st} is not an HTTP status"))),
+					_ => return Err(invalid(format!("{what}: give url or status (exactly one)"))),
+				}
+				if s.weight == Some(0) {
+					return Err(invalid(format!("{what}: weight must be at least 1")));
+				}
+				for m in &s.middlewares {
+					match self.middlewares.get(m) {
+						None => return Err(invalid(format!("{what}: middleware {m:?} is not defined"))),
+						Some(spec) if !SERVER_MIDDLEWARES.contains(&spec.kind()) => {
+							return Err(invalid(format!(
+								"{what}: middleware {m:?} ({}) cannot run per server; only {}",
+								spec.kind(),
+								SERVER_MIDDLEWARES.join(", ")
+							)));
+						}
+						Some(_) => {}
+					}
+				}
+				let https = s.url.starts_with("https://");
+				match svc.protocol {
+					UpstreamProtocol::H2 if !s.url.is_empty() && !https => {
+						return Err(invalid(format!("{what}: protocol h2 needs https:// servers (h2c is HTTP/2 without TLS)")));
+					}
+					UpstreamProtocol::H2c if https => {
+						return Err(invalid(format!("{what}: protocol h2c needs http:// servers (h2 is HTTP/2 over TLS)")));
+					}
+					_ => {}
+				}
+			}
+			if svc.servers.iter().all(|s| s.status.is_some()) && (svc.health_check.is_some() || svc.sticky.is_some()) {
+				return Err(invalid(format!("service {name}: health_check and sticky need a server with url")));
+			}
+			if let Some(t) = &svc.tls {
+				t.validate(&format!("service {name}: tls"))?;
 			}
 			if let Some(h) = &svc.health_check {
 				if !h.path.starts_with('/') {
@@ -555,6 +731,11 @@ impl HttpSpec {
 					return Err(invalid(format!("route {}: middleware {m:?} is not defined", r.name)));
 				}
 			}
+			if let Some(t) = &r.timeouts {
+				for d in [&t.request, &t.backend_request].into_iter().flatten() {
+					parse_duration(d).map_err(|e| invalid(format!("route {}: timeouts: {e}", r.name)))?;
+				}
+			}
 			let answered = r.middlewares.iter().any(|m| self.middlewares[m].answers());
 			match (&r.service, &r.to) {
 				(Some(_), Some(_)) => return Err(invalid(format!("route {}: give service or to, not both", r.name))),
@@ -579,6 +760,31 @@ impl HttpSpec {
 			}
 		}
 		Ok(())
+	}
+
+	/// Names in `Features::http_options` that these settings use (#224, #226-#235).
+	pub fn options_used(&self) -> Vec<&'static str> {
+		let mut used = vec![];
+		let ops = |o: &Option<HeaderOps>| o.as_ref().is_some_and(|o| !o.add.is_empty());
+		for m in self.middlewares.values() {
+			match m {
+				MiddlewareSpec::Headers { request, response, .. } if ops(request) || ops(response) => used.push("headers_add"),
+				MiddlewareSpec::RedirectScheme { status: Some(_), .. } | MiddlewareSpec::RedirectRegex { status: Some(_), .. } => used.push("redirect_status"),
+				MiddlewareSpec::Retry { status, .. } if !status.is_empty() => used.push("retry_status"),
+				_ => {}
+			}
+		}
+		if self.routes.iter().any(|r| r.timeouts.is_some()) {
+			used.push("route_timeouts");
+		}
+		let servers = || self.services.values().flat_map(|s| &s.servers);
+		if servers().any(|s| !s.middlewares.is_empty()) {
+			used.push("server_middlewares");
+		}
+		if servers().any(|s| s.status.is_some()) {
+			used.push("server_status");
+		}
+		used
 	}
 
 	/// Middleware kinds used, for checking against what this version can run.

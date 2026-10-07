@@ -288,3 +288,33 @@ fn acme_settings_and_names_are_checked_without_writing_anything() {
 	}
 	let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn gateway_settings_are_checked_like_the_api() {
+	// #236: a service's TLS files; #229/#235: per-server middlewares and status entries
+	let dir = workdir("gateway");
+	let file = dir.join("rproxy.yaml");
+	fs::write(
+		&file,
+		format!(
+			"version: 1\nrules:\n  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: {}\n    http:\n      routes: [{{name: all, match: 'PathPrefix(`/`)', service: s}}]\n      services:\n        s: {{servers: [{{url: 'https://127.0.0.1:9'}}], tls: {{ca_file: /nope/backend-ca.pem}}}}\n        t: {{servers: [{{status: 500, middlewares: [h]}}]}}\n      middlewares: {{h: {{headers: {{request: {{add: {{X-A: b}}}}}}}}}}\n",
+			free_port()
+		),
+	)
+	.unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	let errors = messages(&v, "errors");
+	assert!(errors.contains("a status entry takes no middlewares"), "{errors}");
+	fs::write(
+		&file,
+		format!(
+			"version: 1\nrules:\n  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: {}\n    http:\n      routes: [{{name: all, match: 'PathPrefix(`/`)', service: s}}]\n      services:\n        s: {{servers: [{{url: 'https://127.0.0.1:9'}}], tls: {{ca_file: /nope/backend-ca.pem}}}}\n",
+			free_port()
+		),
+	)
+	.unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	assert!(messages(&v, "errors").contains("/nope/backend-ca.pem"), "{v}");
+}

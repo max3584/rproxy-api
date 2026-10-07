@@ -362,7 +362,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - `http.http3: true`（v0.3.2）で、同じアドレス・ポートの UDP でも QUIC + HTTP/3 を受ける。
   - `tls.mode: terminate` のときだけ（TLS なしなら `400 tls_config`）。`source_ip: transparent` とは組み合わせられない（`unsupported`）。
   - 証明書・クライアント認証（`client_auth`）は TCP と同じもの。QUIC は TLS 1.3 だけなので、`tls.options.cipher_suites` に TLS 1.3 の暗号スイートが要る（`TLS13_AES_128_GCM_SHA256` がないと QUIC の初期化に使えない）。証明書の読み直し（SIGHUP、`RPROXY_CERT_CHECK_SECS`）は新しい QUIC 接続から効く。
-  - リクエストは HTTP/1.1・HTTP/2 と同じルート・ミドルウェア・転送先に渡る（転送先へは HTTP/1.1）。本文は流しながら送る。アクセスログの `protocol` は `HTTP/3.0`。
+  - リクエストは HTTP/1.1・HTTP/2 と同じルート・ミドルウェア・転送先に渡る（転送先へはサービスの `protocol` のとおり。既定は HTTP/1.1）。本文は流しながら送る。アクセスログの `protocol` は `HTTP/3.0`。
   - `allow_from` とルールの `crowdsec` は QUIC の接続を受ける前に確かめる（`conn.denied`、`transport: quic`）。
   - TCP 側（HTTP/1.1・HTTP/2）の応答には `Alt-Svc: h3=":<ポート>"; ma=86400` を付ける（転送先が `Alt-Svc` を返したときはそのまま）。HTTP/3 を受けていないあいだは付けない。
   - UDP のポートを使えない（使用中・権限）、または TLS の設定が QUIC に使えないときは、ルールは TCP だけで動き、`stats.http.http3` に `{"listening": false, "error": "..."}` と出る（ログは `event: degraded`、`part: http3`）。受けているときは `{"listening": true}`。`http3` のないルールには `http3` の項目がない。
@@ -377,7 +377,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - `Host` はポートを除き、大文字小文字を区別しない。HTTP/2 では `:authority` を使う。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
 - `match` の式の上限（v0.3.18）：括弧と `!` の入れ子は 32 段まで、1 つの式に書ける条件（`Host(...)` など。引数の数は数えない）は 256 個まで。超えると設定の誤り（API は 400、設定ファイルは起動・再読み込み・`--check-config` の誤り）。
 - 時間の値（`10s`・`500ms`・`1m`・`2h` の形。`period`・`timeouts`・`health_check` の `interval` / `timeout`・`initial_interval`・`window` / `recovery`・`update_interval` など）は 365 日（`8760h`）まで（v0.3.18）。それより長い値は設定の誤り。
-- 転送先とは HTTP/1.1 で話す。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。
+- 転送先とは HTTP/1.1 で話す（サービスの `protocol` で HTTP/2 も。下の「Gateway API 向けの L7・TLS」）。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。サービスに `tls`（#236）があれば、そのサービスでは `tls.upstream` の代わりにそれを使う。
 - 転送先への接続は、応答の本文を読み終えたあと、次のリクエストに使い回す（転送先ごとに待機中の接続は 1024 本まで、使われないまま 4 秒たったものは閉じる。`source_ip: transparent` のルールでは、送信元がクライアントごとに違うので使い回さない）。使い回そうとした接続を転送先が閉じていたら、新しい接続で送り直す。
 - `health_check`（v0.3.2）: `interval`（既定 `10s`）ごとに各 `servers` へ `GET <URLのパス><path>`（`Host` は転送先のホスト）を送り、`timeout`（既定 `3s`）以内に 2xx / 3xx が返れば up、そうでなければ down。down の転送先はラウンドロビンから外し、戻れば入れる。最初の確認までは up として扱う。すべて down なら 503。状態が変わると `event: "http.health"` のログ（`service`、`server`、`up`、down の理由の `error`）。ルールの `stats.http.services.<サービス名>` に `[{"url","up"}]`、`/metrics` に `rproxy_http_server_up{protocol,listen,service,server}`（1 / 0）。サービスの転送先がすべて down なら、ルールの `down_services` にサービスの名前が入り、`rproxy_http_service_down{protocol,listen,service}` が 1（v0.3.20）。
 - `balance`（v0.3.3）: `round_robin`（既定。`weight` の比率）、`least_conn`（処理中のリクエストが `weight` あたり一番少ない転送先）、`failover`（`servers` の上から順に、up の最初の転送先）。どれも down の転送先は外す（`health_check` の結果）。`sticky` のクッキーの転送先が up なら、そちらが優先。
@@ -390,14 +390,15 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 
 ### HTTP の転送の扱い
 
-rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先とは HTTP/1.1 で話す。そのあいだで次のように扱う（tests/http_semantics.rs で HTTP/1.1・HTTP/2・HTTP/3 のクライアントから確かめている）。
+rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先とは HTTP/1.1（サービスの `protocol` で HTTP/2、#233）で話す。そのあいだで次のように扱う（tests/http_semantics.rs で HTTP/1.1・HTTP/2・HTTP/3 のクライアントから確かめている）。
 
 | 項目 | 扱い |
 |---|---|
 | `Cookie` | HTTP/2・HTTP/3 で複数のフィールドに分けて届いたもの（Chrome はそうする）は `"; "` で 1 本にまとめる（RFC 9113 §8.2.3 / RFC 9114 §4.2.1）。まとめたものをミドルウェア（`oidc`・`sticky`・`forward_auth`）も読む |
 | `Set-Cookie` | 転送先の複数の `Set-Cookie` は 1 本ずつそのままクライアントへ（まとめない。`compress`・`headers` を通っても同じ）。`Domain` / `Path` / `Secure` などの属性、`Location` は書き換えない |
 | そのほかのヘッダ | 同じ名前の複数のフィールドは順番どおり、値はバイトのまま（ASCII 以外も）渡す。`Authorization` は渡す |
-| ホップごとのヘッダ | 両方向で取り除く：`Connection` とそこに書かれた名前、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`（WebSocket などの `Upgrade` は付け直して中継する）。`Via` と `Forwarded`（RFC 7239）は付けない（Traefik・nginx の既定と同じ。`X-Forwarded-*` を使う） |
+| ホップごとのヘッダ | 両方向で取り除く：`Connection` とそこに書かれた名前、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`（WebSocket などの `Upgrade` は付け直して中継する）。`Via` と `Forwarded`（RFC 7239）は付けない（Traefik・nginx の既定と同じ。`X-Forwarded-*` を使う）。HTTP/2 の転送先（`protocol`）へは、クライアントの `TE` に `trailers` があれば `te: trailers` だけを渡す |
+| トレーラー | 本文の後のトレーラーは、HTTP/2 の転送先と HTTP/2・HTTP/3 のクライアントのあいだで両方向にそのまま渡す（gRPC の `grpc-status` など。tests/http_semantics.rs）。HTTP/1.1 のクライアントへは、`TE: trailers` を送ってきたときだけ chunked の後に付ける |
 | `Host` | HTTP/2・HTTP/3 の `:authority`、HTTP/1.1 の absolute-form の宛先（`GET https://a.example/ HTTP/1.1`）の authority を、`Host` フィールドより優先する（RFC 9112 §3.2.2）。転送先には origin-form（パスとクエリ）で送る。`pass_host_header: false` なら転送先の URL のホスト |
 | ヘッダの大きさ | HTTP/2・HTTP/3 は 1 リクエストのヘッダの合計 64 KiB まで（hyper の既定の 16 KiB では、大きなクッキーのブラウザで足りない）。HTTP/1.1 は約 400 KB まで。超えると 431 |
 | 本文 | 流しながら中継する（`buffering` がなければため込まない）。chunked、`Expect: 100-continue`、`HEAD`（`Content-Length` を保つ）、`204` / `304` に対応 |
@@ -413,7 +414,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 - 使えるミドルウェア（v0.3.1。`features.middlewares`）:
   - `redirect_scheme`: `scheme` と違う方式で受けたリクエストを、同じホスト・パス・クエリの `scheme://` へリダイレクトする。`port` は既定のポート（80 / 443）なら省く。
   - `redirect_regex`: `http://host[:port]/path?query`（受けた URL）が `regex` に一致すれば、`replacement`（`$1`・`${name}` が使える）へリダイレクトする。一致しなければ次へ進む。
-  - リダイレクトの状態コードは、`permanent` なら 301、そうでなければ 302。GET / HEAD 以外は 308 / 307（メソッドと本文を保つ）。
+  - リダイレクトの状態コードは、`permanent` なら 301、そうでなければ 302。GET / HEAD 以外は 308 / 307（メソッドと本文を保つ）。`status`（301・302・303・307・308、#226）を書けばそれを使う。
   - `respond`: `status`・`body`・`content_type`（既定 `text/plain; charset=utf-8`）で応答する。`service` のないルート（ブロックやメンテナンス表示）に使う。
   - `ip_allow`: 接続元の IP が `source_range` になければ 403。
   - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）と `Vary: Origin` を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。
@@ -425,7 +426,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 - v0.3.2 で使えるようになったミドルウェア:
   - `compress`: クライアントの `Accept-Encoding` に合わせて応答を `br`・`zstd`・`gzip` で圧縮する。`encodings`（既定 `[br, zstd, gzip]`）は使う形式と優先順（`q` 値が同じときの順）。`min_size`（既定 1024 バイト）より `Content-Length` が小さい応答、すでに `Content-Encoding` のある応答、画像（SVG を除く）・動画・音声・`font/woff*`・圧縮済みの形式（zip・gzip・zstd・pdf など）・`text/event-stream`・gRPC、`Cache-Control: no-transform`、HEAD・204・206・304 はそのまま。圧縮したら `Content-Length` を外し、`Vary: Accept-Encoding` を足し、強い `ETag` を弱い `W/` にする。本文は流れてきた分ずつ圧縮して送る（長く続く応答も止めない）。
   - `buffering`: リクエストの本文を先に読み切る。`max_request_body`（バイト）を超えたら 413（`Content-Length` で分かればすぐに、分からなければ読みながら）で、転送先には送らない。読み切った本文は `retry` で送り直せる。
-  - `retry`: 転送先に接続できない・応答がない（502 / 504 になるもの）ときに、次の転送先へ送り直す。`attempts` は最初の 1 回を含む回数、`initial_interval`（既定 `100ms`）は最初の待ち時間で、回ごとに倍になる。送り直すのは冪等なメソッド（GET・HEAD・OPTIONS・PUT・DELETE・TRACE）で、本文がないか、`buffering` で読み切った本文のときだけ（WebSocket などの Upgrade は送り直さない）。転送先が返した 5xx は送り直さない。
+  - `retry`: 転送先に接続できない・応答がない（502 / 504 になるもの）ときに、次の転送先へ送り直す。`attempts` は最初の 1 回を含む回数、`initial_interval`（既定 `100ms`）は最初の待ち時間で、回ごとに倍になる。送り直すのは冪等なメソッド（GET・HEAD・OPTIONS・PUT・DELETE・TRACE）で、本文がないか、`buffering` で読み切った本文のときだけ（WebSocket などの Upgrade は送り直さない）。転送先が返した 5xx は、`status`（#231）に書いたものだけ送り直す。
   - `circuit_breaker`: 応答のうち 5xx（502 / 504 を含む）の割合が `window` の中で `failure_percent` 以上になったら（10 件以上あるときに判定）、`recovery` のあいだ転送先へ送らずに 503 を返す。`recovery` を過ぎたら 1 件だけ通し、成功すれば元に戻し、失敗すればまた `recovery` だけ止める。状態は `event: "http.breaker"` のログ。数はルールの `http` を変えると最初からになる。
   - `errors`: 応答の状態コードが `status`（`"500-599"`・`"404"` のような範囲か値）に入れば、`service` の `path`（`{status}` は状態コードに置き換える）を GET し、その本文とヘッダで返す。状態コードは元のまま。ページを取れなければ元の応答を返す。メンテナンス表示には、`respond` のルートを `priority` を上げて一時的に足すか、`errors` のページを使う。
 - 認証のミドルウェア（v0.3.2、#59）。HTTP/1.1・HTTP/2・HTTP/3 のどのリクエストにも働く:
@@ -544,6 +545,97 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
 ```
 
   `spec` はルールの形（`POST /rules` の本文の形、dry run の `after` と同じ）。`spec_version` は `spec` の読み方の版（今は 1）。時刻は DB のセッションのタイムゾーンで書き、`UNIX_TIMESTAMP` で読む。
+### Gateway API 向けの L7・TLS（#224・#226〜#236）
+
+rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・BackendTLSPolicy を写すための設定。どれも省略でき、省略したときの動きはいままでと同じ。使えるかは `GET /capabilities` の `features` で分かる（`middlewares` に `cors`・`mirror`・`replace_host`、`services` に `protocol`・`tls`、`http_options` に下の名前、`tls_route_targets`）。
+
+| 項目 | 場所 | 形 | features |
+|---|---|---|---|
+| ヘッダを足す（#224） | `headers` の `request` / `response` | `add: {名前: 値}` | `http_options` の `headers_add` |
+| リダイレクトの状態コード（#226） | `redirect_scheme`・`redirect_regex` | `status`: 301・302・303・307・308 | `http_options` の `redirect_status` |
+| ルートの時間の上限（#227） | `http.routes[].timeouts` | `{"request": "10s", "backend_request": "5s"}` | `http_options` の `route_timeouts` |
+| Host の書き換え（#228） | ミドルウェア `replace_host` | `{"host": "one.example.org"}` | `middlewares` の `replace_host` |
+| 転送先ごとのミドルウェア（#229） | `http.services.<名前>.servers[].middlewares` | `http.middlewares` の名前の一覧 | `http_options` の `server_middlewares` |
+| CORS（#230） | ミドルウェア `cors` | `allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age` | `middlewares` の `cors` |
+| 状態コードでの送り直し（#231） | `retry` | `status: ["500", "502-504"]` | `http_options` の `retry_status` |
+| ミラー（#232） | ミドルウェア `mirror` | `{"service": "<名前>", "percent": 20}` か `{"service": "<名前>", "fraction": {"numerator": 1, "denominator": 3}}` | `middlewares` の `mirror` |
+| 転送先との HTTP/2（#233） | `http.services.<名前>.protocol` | `http1`（既定）・`h2`・`h2c`・`auto` | `services` の `protocol` |
+| サービスごとの転送先の TLS（#236） | `http.services.<名前>.tls` | `server_name`・`ca_file`・`subject_alt_names`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify` | `services` の `tls` |
+| 名前ごとの複数の宛先（#234） | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`・`balance`（`remote_addr` / `remote_port` の代わり） | `tls_route_targets` |
+| 固定の状態コードの転送先（#235） | `http.services.<名前>.servers[]` | `{"status": 500, "weight": 1}`（`url` の代わり） | `http_options` の `server_status` |
+
+例（HTTPRoute 1 つの規則を写したもの）：
+
+```json
+{
+  "routes": [{
+    "name": "r0", "match": "Host(`app.example`) && PathPrefix(`/api/`)",
+    "service": "r0", "middlewares": ["r0-hdr", "r0-cors", "r0-mirror", "r0-retry"],
+    "timeouts": {"request": "10s", "backend_request": "2s"}
+  }],
+  "services": {
+    "r0": {
+      "protocol": "h2c",
+      "servers": [
+        {"url": "http://10.1.0.5:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"url": "http://10.1.0.6:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"status": 500, "weight": 10}
+      ]
+    },
+    "r0-shadow": {"servers": [{"url": "http://10.1.0.9:8080"}]},
+    "tls-svc": {"servers": [{"url": "https://10.1.0.7:8443"}],
+      "tls": {"server_name": "abc.example.com", "ca_file": "/var/run/rproxy-gateway/certs/0123456789abcdef.crt",
+              "subject_alt_names": ["abc.example.com", "spiffe://abc.example.com/test-identity"]}}
+  },
+  "middlewares": {
+    "r0-hdr": {"headers": {"request": {"set": {"X-Header-Set": "v"}, "add": {"X-Header-Add": "v"}, "remove": ["X-Header-Remove"]}}},
+    "r0-b0": {"headers": {"request": {"set": {"Backend": "v1"}}}},
+    "r0-cors": {"cors": {"allow_origins": ["https://www.foo.com", "https://*.bar.com"], "allow_methods": ["GET", "OPTIONS"],
+                         "allow_headers": ["x-header-1"], "expose_headers": ["x-header-3"], "allow_credentials": true, "max_age": 3600}},
+    "r0-mirror": {"mirror": {"service": "r0-shadow", "percent": 20}},
+    "r0-retry": {"retry": {"attempts": 4, "status": ["500", "502-504"], "initial_interval": "100ms"}},
+    "r0-host": {"replace_host": {"host": "one.example.org"}},
+    "r0-redirect": {"redirect_regex": {"regex": "^http://([^/:]+)(:\\d+)?/(.*)$", "replacement": "https://$1/$3", "status": 303}}
+  }
+}
+```
+
+- **`headers` の `add`**（#224）：同じ名前のヘッダ（大文字小文字を区別しない）があれば、その値（複数のフィールドなら `,` でつないだもの）の後ろに `,` で足して 1 本にする（`a` → `a,v`）。なければ足す。順は `remove` → `set` → `add`。転送先へ（`request`）も応答へ（`response`）も同じ。
+- **リダイレクトの `status`**（#226）：指定すると、`permanent` とメソッドによる切り替え（GET・HEAD 以外は 308 / 307）より優先する。301・302・303・307・308 のほかは `400 invalid`。
+- **ルートの `timeouts`**（#227）：`0s` は上限なし（省略と同じ）。
+  - `request`：リクエストを受けてから応答の本文を送り終えるまで（ミドルウェア・`retry` の送り直し・待ち時間を含む）。応答ヘッダの前に過ぎたら 504（`event: "http.error"`、`error: "request timed out"`）。応答ヘッダの後に過ぎたら応答を途中で切る（HTTP/1.1 は接続を閉じる、HTTP/2 は RST_STREAM、HTTP/3 はストリームのリセット。完全な応答に見せない）。
+  - `backend_request`：転送先への 1 回の送信の、送り始めから応答の本文の終わりまで。応答ヘッダの前に過ぎたら 504（`retry` が送り直せるなら次の転送先へ）。応答ヘッダの後は `request` と同じく切る。このルートではサービスの `timeouts.response` の代わりに使う（`timeouts.connect` はそのまま）。
+  - 101（WebSocket など）の後の中継は数えない。
+- **`replace_host`**（#228）：転送先へ送る `Host`（HTTP/2 の転送先なら `:authority`）を `host`（`host[:port]`）にする。サービスの `pass_host_header` より優先。`X-Forwarded-Host` はクライアントが送った値のまま。`match` には効かない（ルートを選んだ後に働く）。
+- **転送先ごとのミドルウェア**（#229）：`servers[].middlewares` のミドルウェアは、その転送先へ送るリクエストにだけ、ルートのミドルウェアの後に働く（`retry` の送り直しでは、送り直す先の転送先のもの）。応答へは逆の順で、ルートのミドルウェアの応答側より先に働く。使える種類は `headers`・`replace_host`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`（ほかは `400 invalid`）。
+- **`cors`**（#230）：
+  - `allow_origins`：`https://www.foo.com`（スキーム・ホスト・ポートの完全一致、大文字小文字を区別しない）、`*`（すべて）、`https://*.bar.com`（`*` は 1 文字以上の何にでも一致。`.` を含む）。
+  - プリフライト（`OPTIONS` で `Origin` と `Access-Control-Request-Method` があるもの）は、オリジンを許すなら rproxy が 204 で答える：`Access-Control-Allow-Origin`（`allow_origins` が `*` で `allow_credentials` が false なら `*`、ほかは `Origin` の値）、`Access-Control-Allow-Methods`（`allow_methods` をカンマ区切りで。`*` なら、`allow_credentials` のときは求められたメソッド、そうでなければ `*`）、`Access-Control-Allow-Headers`（同じく。`*` なら `allow_credentials` のときは `Access-Control-Request-Headers` の値）、`Access-Control-Expose-Headers`、`Access-Control-Max-Age`（`max_age` があれば）、`Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）、`Vary: Origin`。許さないオリジンのプリフライトは転送先へそのまま送る（CORS のヘッダは付けない）。
+  - ふつうのリクエストは転送先へ送り、オリジンを許すなら応答に `Access-Control-Allow-Origin`・`Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers`・`Vary: Origin` を付ける（転送先が返した同じ名前のヘッダは置き換える）。
+  - `headers` の `cors` はいままでのまま。
+- **`retry` の `status`**（#231）：転送先がこの状態コード（`"500"`・`"502-504"` のような値か範囲）を返したら、その応答を捨てて次の転送先へ送り直す。最後の回の応答はそのまま返す。送り直せる条件（冪等なメソッド、本文がないか `buffering` で読み切ったもの、Upgrade でない）と `attempts`（最初の 1 回を含む回数）・`initial_interval`（待ち時間。回ごとに倍）はいままでと同じ。Gateway API の `attempts` は送り直しの回数なので、写すときは `attempts + 1`。
+- **`mirror`**（#232）：
+  - 転送先へ送るリクエストの写しを、`service`（`http.services` の名前）の転送先へも送る。写しはルートの `middlewares` でそこまでのミドルウェアを通った形（ヘッダの書き換えの後ろに書けば書き換えた形）。`Host` は `service` の `pass_host_header` に従う。
+  - `percent`（0〜100）か `fraction`（`numerator` / `denominator`、`denominator` の既定 100）の割合だけ写す（両方は `400 invalid`。省略で全部）。割合は数で揃える（無作為ではなく、`n` 件目を黄金比で散らす）。
+  - ミラーの応答は読み捨て、つながらない・遅い・失敗はクライアントの応答に影響しない（ログは `event: "http.mirror"` の debug）。本文は流れてくる分を写し、ミラーが追いつかない（64 フレーム分たまった）ときはミラーの送信だけを途中で止める。
+  - 前のミドルウェアが答えたリクエスト（リダイレクト・拒否）は写さない。1 つのルートに複数書ける。
+- **`protocol`**（#233）：
+  - `http1`（既定）：いままでどおり HTTP/1.1。
+  - `h2`：`https://` の転送先と TLS（ALPN `h2`）の HTTP/2。転送先が `h2` を選ばなければ 502。
+  - `h2c`：`http://` の転送先と、前置きから始める HTTP/2（prior knowledge）。
+  - `auto`：`https://` の転送先は ALPN で `h2` と `http/1.1` を提示して、転送先が選んだほうで話す。`http://` の転送先は HTTP/1.1。
+  - `h2` は `http://`、`h2c` は `https://` の転送先とは組み合わせられない（`400 invalid`）。
+  - HTTP/2 の転送先とは、転送先ごとに 1 本の接続を多重化して使い回す（閉じられたら次のリクエストでつなぎ直す。同時に送れる数は転送先の `SETTINGS_MAX_CONCURRENT_STREAMS` まで、超えた分は空くのを待つ）。`source_ip: transparent` のルールではクライアントごとに新しい接続。
+  - トレーラーは両方向にそのまま流す（gRPC の `grpc-status` など）。クライアントの `TE` に `trailers` があれば、HTTP/2 の転送先へ `te: trailers` を渡す（ほかのホップごとのヘッダはいままでどおり取り除く）。
+  - `timeouts`・`retry`・`health_check`（HTTP/2 で `GET`）・`outlier_detection`・`sticky` は HTTP/1.1 の転送先と同じ。HTTP/2 の転送先への Upgrade（WebSocket）は 502。
+  - gRPC：クライアントは HTTP/2（TLS か h2c）で rproxy につなぐ。サービス・メソッドの一致は `Path(`/<package.Service>/<Method>`)`・`PathPrefix(`/<package.Service>/`)` で書く。
+- **サービスの `tls`**（#236）：
+  - そのサービスの `https://` の転送先には、ルールの `tls.upstream` の代わりにこれを使う（項目ごとに混ぜない）。平文の HTTP のルール（`tls` なし）でも使える。
+  - `server_name`：SNI と、証明書で確かめる名前（既定は URL のホスト）。`ca_file`：転送先の証明書を確かめる CA（既定は Mozilla のルート）。`subject_alt_names`：指定すると、証明書の SAN の DNS 名か URI（`spiffe://...` など）のどれかがこの一覧にあることを確かめる（`server_name` での名前の確認の代わり。署名・期限は確かめる）。`cert_file`・`key_file`（・`chain_file`）：転送先へ出すクライアント証明書。`insecure_skip_verify`：確かめない（試験用）。
+  - ファイルはルールを作る・変えるときに読む（変わったファイルはルールの変更で読み直す。rproxy-gateway は中身のハッシュの名前にする）。`http://` の転送先だけのサービスに書いても使わない。
+- **`tls.routes[]` の `targets`**（#234）：`remote_addr` / `remote_port` の代わりに `targets`（ルールの `targets` と同じ形、`weight`・`backup` も同じ）と `balance`（`round_robin`（既定）・`least_conn`・`failover`）。どちらか一方が要る（両方・どちらもなしは `400 tls_config`）。接続できない宛先は次の宛先へ移り、10 秒外す（ルールの `targets` と同じ）。`passthrough` の route、`sni` のルールの route のどちらでも使える。名前の再解決もルールの `targets` と同じ。ポート範囲のルールでは各宛先のポートも同じだけずれる。
+- **`servers[]` の `status`**（#235）：`url` の代わりに `status`（100〜599）を書くと、その転送先に当たったリクエスト（`weight` の割合）に rproxy がその状態コードで答える（本文は `500 Internal Server Error` のような文）。ヘルスチェック・`outlier_detection`・`sticky` の対象にしない（`sticky` のクッキーも付けない）。`url` と `status` はどちらか一方（両方・どちらもなしは `400 invalid`）。`middlewares` は付けられない。
+
 ### ルールの組・状態・readiness（Kubernetes のコントローラ向け、#28）
 
 Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway`）は、この API だけで rproxy を動かす。正確な形は `docs/openapi.json`（`GET /openapi.json`）。
@@ -663,7 +755,7 @@ rules:
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip"],"services":["health_check","sticky","balance","outlier_detection"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"]},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
+| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"]},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |

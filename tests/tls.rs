@@ -797,3 +797,53 @@ async fn terminate_does_not_stall_under_backpressure() {
 		assert!(back == data, "round {round}: corrupted");
 	}
 }
+
+#[tokio::test]
+async fn a_tls_route_spreads_over_several_targets() {
+	// #234: TLSRoute with several backends
+	let pki = Pki::new("sni-targets");
+	let cert = pki.server("backend", &["a.test", "f.test"]);
+	let (a, b, fallback) = (tls_backend(&pki, &cert, "A:").await, tls_backend(&pki, &cert, "B:").await, tls_backend(&pki, &cert, "D:").await);
+	let dead = {
+		let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		l.local_addr().unwrap().port()
+	};
+	let h = harness().await;
+	let port = free_port();
+	let tls = json!({
+		"mode": "sni",
+		"routes": [
+			{"server_name": "a.test", "targets": [
+				{"addr": "127.0.0.1", "port": a.port(), "weight": 1},
+				{"addr": "127.0.0.1", "port": b.port(), "weight": 1},
+				{"addr": "127.0.0.1", "port": dead, "weight": 1},
+			]},
+			{"server_name": "f.test", "balance": "failover", "targets": [
+				{"addr": "127.0.0.1", "port": dead},
+				{"addr": "127.0.0.1", "port": b.port()},
+			]},
+		],
+	});
+	let (status, v) = h.post(tcp_rule(port, fallback, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["tls"]["routes"][0]["targets"].as_array().unwrap().len(), 3, "{v}");
+	let mut seen = std::collections::HashMap::new();
+	for i in 0..12 {
+		let got = tls_roundtrip(&pki, port, "a.test", None, &i.to_string()).await.unwrap();
+		*seen.entry(got[..2].to_string()).or_insert(0) += 1;
+	}
+	assert!(seen["A:"] >= 4 && seen["B:"] >= 4 && seen.len() == 2, "{seen:?}");
+	for i in 0..3 {
+		assert_eq!(tls_roundtrip(&pki, port, "f.test", None, &i.to_string()).await.unwrap(), format!("B:{i}"), "past the dead first target");
+	}
+
+	// remote_addr and targets together, or neither, are refused
+	for route in [
+		json!({"server_name": "x.test", "remote_addr": "127.0.0.1", "remote_port": 1, "targets": [{"addr": "127.0.0.1", "port": 2}]}),
+		json!({"server_name": "x.test"}),
+		json!({"server_name": "x.test", "remote_addr": "127.0.0.1", "remote_port": 1, "balance": "least_conn"}),
+	] {
+		let (status, v) = h.post(tcp_rule(free_port(), fallback, json!({"mode": "sni", "routes": [route]}))).await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
+	}
+}

@@ -560,10 +560,29 @@ fn stream_body(seed: u64, len: u64, fail_after: Option<u64>) -> ServerBody {
 /// - `GET /cut?...&cut=N`: sends N bytes of it and then fails (the connection is cut)
 /// - `POST /sink?id=`: reports to the test when the body started and how it ended
 /// - `GET /ws`: switches protocols and echoes the bytes
-async fn http_backend() -> (SocketAddr, mpsc::UnboundedReceiver<Sink>) {
+/// - `GET /slow?n=`: n chunks, one every 200 ms
+///
+/// The second address serves the same over HTTP/2 without TLS (h2c, #233).
+async fn http_backend() -> (SocketAddr, SocketAddr, mpsc::UnboundedReceiver<Sink>) {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let addr = listener.local_addr().unwrap();
 	let (tx, rx) = mpsc::unbounded_channel();
+	let h2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let h2_addr = h2_listener.local_addr().unwrap();
+	let h2_tx = tx.clone();
+	tokio::spawn(async move {
+		loop {
+			let (s, _) = h2_listener.accept().await.unwrap();
+			let tx = h2_tx.clone();
+			let service = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+				let tx = tx.clone();
+				async move { Ok::<_, std::convert::Infallible>(backend_answer(req, tx).await) }
+			});
+			tokio::spawn(async move {
+				let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(s), service).await;
+			});
+		}
+	});
 	tokio::spawn(async move {
 		loop {
 			let (s, _) = listener.accept().await.unwrap();
@@ -580,7 +599,7 @@ async fn http_backend() -> (SocketAddr, mpsc::UnboundedReceiver<Sink>) {
 			});
 		}
 	});
-	(addr, rx)
+	(addr, h2_addr, rx)
 }
 
 async fn backend_answer(mut req: hyper::Request<Incoming>, tx: mpsc::UnboundedSender<Sink>) -> hyper::Response<ServerBody> {
@@ -637,6 +656,17 @@ async fn backend_answer(mut req: hyper::Request<Incoming>, tx: mpsc::UnboundedSe
 			let _ = tx.send(Sink::Ended(id, result));
 			hyper::Response::new(Empty::new().map_err(|e| match e {}).boxed())
 		}
+		"slow" => {
+			let n = num("n");
+			let items = futures_util::stream::unfold(0u64, move |i| async move {
+				if i == n {
+					return None;
+				}
+				tokio::time::sleep(Duration::from_millis(200)).await;
+				Some((Ok::<_, BoxErr>(Frame::data(Bytes::from_static(chunk(3, i, 1000)))), i + 1))
+			});
+			hyper::Response::new(StreamBody::new(items).boxed())
+		}
 		"ws" => {
 			let upgrade = hyper::upgrade::on(&mut req);
 			tokio::spawn(async move {
@@ -678,7 +708,7 @@ fn free_tcp_udp_port() -> u16 {
 async fn http_setup(tag: &str) -> Http {
 	let pki = Pki::new(tag);
 	let cert = pki.server("front", &["a.test"]);
-	let (b, sinks) = http_backend().await;
+	let (b, b2, sinks) = http_backend().await;
 	let dead = {
 		let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		l.local_addr().unwrap()
@@ -695,16 +725,22 @@ async fn http_setup(tag: &str) -> Http {
 					{"name": "c", "match": "PathPrefix(`/c/`)", "service": "b", "middlewares": ["zip"]},
 					{"name": "buf", "match": "PathPrefix(`/b/`)", "service": "b", "middlewares": ["buffer"]},
 					{"name": "r", "match": "PathPrefix(`/r/`)", "service": "retried", "middlewares": ["again", "buffer"]},
+					{"name": "h2", "match": "PathPrefix(`/h2/`)", "service": "h2c"},
+					{"name": "t", "match": "PathPrefix(`/t/`)", "service": "b", "timeouts": {"request": "1s"}},
+					{"name": "tb", "match": "PathPrefix(`/tb/`)", "service": "h2c", "timeouts": {"backend_request": "1s"}},
+					{"name": "m", "match": "PathPrefix(`/m/`)", "service": "b", "middlewares": ["copy"]},
 					{"name": "all", "match": "PathPrefix(`/`)", "service": "b"},
 				],
 				"services": {
 					"b": {"servers": [{"url": format!("http://{b}")}]},
 					"retried": {"servers": [{"url": format!("http://{dead}")}, {"url": format!("http://{b}")}]},
+					"h2c": {"protocol": "h2c", "servers": [{"url": format!("http://{b2}")}]},
 				},
 				"middlewares": {
 					"zip": {"compress": {"min_size": 0}},
 					"buffer": {"buffering": {"max_request_body": 1u64 << 31}},
 					"again": {"retry": {"attempts": 3, "initial_interval": "10ms"}},
+					"copy": {"mirror": {"service": "h2c"}},
 				},
 			},
 		}))
@@ -1096,4 +1132,53 @@ async fn a_request_cut_off_by_the_client_never_reaches_the_backend_as_complete()
 /// An mpsc receiver as a stream (no tokio-stream dependency).
 fn tokio_stream_from<T: Send + 'static>(mut rx: mpsc::Receiver<T>) -> impl futures_util::Stream<Item = T> {
 	futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_backends_and_mirrors_keep_bodies_intact() {
+	// #233: an h2c backend; #232: a mirrored request's body must reach the backend unchanged
+	let s = Arc::new(http_setup("integrity-h2back").await);
+	let len = case_bytes() / 4;
+	for proto in [Proto::H1, Proto::H2, Proto::H3] {
+		let mut tasks = vec![];
+		for i in 0..2u64 {
+			let s = s.clone();
+			tasks.push(tokio::spawn(async move {
+				let seed = 300 + i;
+				let mode = if i == 0 { "cl" } else { "chunked" };
+				let g = s.send(proto, get(&format!("/h2/down?seed={seed}&len={len}&mode={mode}")), false).await;
+				assert_eq!((g.status, &g.end), (200, &Ok(())), "{proto:?} {mode}");
+				assert_eq!((g.len, hex(&g.hash)), (len, hex(&expected(seed, len))), "{proto:?} h2 download {mode}");
+				let g = s.send(proto, upload(&format!("/h2/up?id={i}"), seed + 50, len, i == 0), true).await;
+				let v = upload_result(&g, &format!("{proto:?} h2 upload {i}"));
+				assert_eq!(v["hash"], hex(&expected(seed + 50, len)), "{proto:?} h2 upload");
+				let g = s.send(proto, upload(&format!("/m/up?id=m{i}"), seed + 70, len, i == 0), true).await;
+				let v = upload_result(&g, &format!("{proto:?} mirrored upload {i}"));
+				assert_eq!(v["hash"], hex(&expected(seed + 70, len)), "{proto:?} mirrored upload");
+			}));
+		}
+		for t in tasks {
+			t.await.unwrap();
+		}
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http2_backend_cut_offs_and_route_timeouts_never_look_complete() {
+	let s = http_setup("integrity-h2cut").await;
+	let len = 4 << 20;
+	for proto in [Proto::H1, Proto::H2, Proto::H3] {
+		for mode in ["cl", "chunked"] {
+			let g = s.send(proto, get(&format!("/h2/cut?seed=5&len={len}&cut={}&mode={mode}", len / 2)), false).await;
+			assert_eq!(g.status, 200, "{proto:?} {mode}");
+			assert!(g.end.is_err(), "{proto:?} {mode}: an h2 backend's cut body ended cleanly after {} bytes", g.len);
+		}
+		// #227: a body still streaming at the deadline is cut, not ended
+		for path in ["/t/slow?n=20", "/tb/slow?n=20"] {
+			let g = s.send(proto, get(path), false).await;
+			assert_eq!(g.status, 200, "{proto:?} {path}");
+			assert!(g.end.is_err(), "{proto:?} {path}: ended cleanly after {} bytes", g.len);
+			assert!(g.len < 20_000, "{proto:?} {path}");
+		}
+	}
 }

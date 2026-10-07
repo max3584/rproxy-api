@@ -769,6 +769,10 @@ class Converter:
             out = {"servers": []}
             for s in as_list(g(lb, "servers")):
                 server = {"url": g(s, "url")}
+                # Traefik's h2c:// scheme: HTTP/2 without TLS (rproxy: protocol h2c, #233)
+                if isinstance(server["url"], str) and server["url"].startswith("h2c://"):
+                    server["url"] = "http://" + server["url"][len("h2c://"):]
+                    out["protocol"] = "h2c"
                 if as_int(g(s, "weight")) not in (None, 1):
                     server["weight"] = as_int(g(s, "weight"))
                 out["servers"].append(server)
@@ -826,7 +830,8 @@ class Converter:
         mirroring = g(svc, "mirroring")
         if mirroring is not None:
             main = strip_provider(g(mirroring, "service"))
-            NOTES.add(where, f"mirroring service {name}: only its main service {main} is used")
+            NOTES.add(where, f"mirroring service {name}: only its main service {main} is used "
+                      f"(add a mirror middleware to the routes by hand to copy requests)")
             return self.http_service(main, where, seen) if main not in seen else None
         NOTES.add(where, f"service {name}: type not converted")
         return None

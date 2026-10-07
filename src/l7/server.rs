@@ -1,5 +1,6 @@
 //! Serving `http` rules: HTTP/1.1 and HTTP/2 from clients (after TLS
-//! termination, or plain), routed by `match` to services of HTTP/1.1 backends.
+//! termination, or plain), routed by `match` to services of HTTP/1.1 or HTTP/2
+//! (`protocol`, #233) backends.
 
 use std::convert::Infallible;
 use std::io;
@@ -22,17 +23,18 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::access::{AccessEntry, NO_ROUTE};
 use crate::core::bandwidth::{Dir, Gate};
 use super::middleware::auth::{BasicVerdict, ForwardAuth};
 use super::middleware::oidc::{self, Oidc};
-use super::backend::{self, Dialer, ServerHealth, Service};
+use super::backend::{self, Dialer, Sender, ServerHealth, Service};
 use super::compress;
 use super::middleware::crowdsec::Verdict;
 use super::middleware::limit::Hold;
-use super::middleware::{self, Blocked, Ctx, Limited, Middleware};
+use super::middleware::{self, Blocked, Ctx, HostOverride, Limited, Middleware};
+use super::{deadline, mirror};
 use super::resilience::{self, RetryPolicy, Ticket};
 use super::{HttpSpec, Matcher};
 use crate::error::ApiError;
@@ -71,7 +73,7 @@ pub type Body = BoxBody<Bytes, BoxError>;
 /// Largest request header section taken over HTTP/2 and HTTP/3 (64 KiB). hyper's
 /// HTTP/2 default is 16 KiB, which browsers pass with a few sites' worth of cookies
 /// (GitLab, Keycloak); larger sections get 431. HTTP/1.1 keeps hyper's limit (about 400 KB).
-pub(super) const MAX_HEADER_SECTION: u32 = 64 * 1024;
+pub(crate) const MAX_HEADER_SECTION: u32 = 64 * 1024;
 
 fn boxed_error(e: hyper::Error) -> BoxError {
 	BoxError::new(e)
@@ -85,6 +87,9 @@ struct Route {
 	middlewares: Vec<Arc<Middleware>>,
 	/// Names of `middlewares` as in the settings (access log).
 	names: Vec<String>,
+	/// `timeouts` (#227): the whole request, and one attempt to a backend.
+	request_timeout: Option<std::time::Duration>,
+	backend_timeout: Option<std::time::Duration>,
 }
 
 /// The compiled `http` of a rule. Replaced as a whole when the rule changes,
@@ -122,7 +127,13 @@ impl Router {
 	pub fn compile(spec: &HttpSpec, upstream: &Upstream, lookup: Lookup) -> Result<Router, ApiError> {
 		let mut services = std::collections::HashMap::new();
 		for (name, s) in &spec.services {
-			services.insert(name.clone(), Arc::new(Service::compile(name, s)?));
+			let mut service = Service::compile(name, s, &spec.middlewares)?;
+			// HTTP/2 over the rule's tls.upstream: its own ALPN
+			if service.tls.is_none() && !service.protocol.is_default() && service.servers.iter().any(|v| v.https) {
+				let config = (*crate::tls::config::client_config(upstream)?).clone();
+				service.tls = Some(backend::ServiceTls::new(config, service.protocol, upstream.server_name.clone()));
+			}
+			services.insert(name.clone(), Arc::new(service));
 		}
 		let mut middlewares = std::collections::HashMap::new();
 		for (name, m) in &spec.middlewares {
@@ -142,7 +153,20 @@ impl Router {
 				(None, None) => None,
 			};
 			let priority = r.priority.unwrap_or_else(|| Matcher::default_priority(&r.rule));
-			routes.push((priority, i, Route { name: r.name.clone(), matcher, service, middlewares: chain, names: r.middlewares.clone() }));
+			let timeouts = r.timeouts.clone().unwrap_or_default();
+			routes.push((
+				priority,
+				i,
+				Route {
+					name: r.name.clone(),
+					matcher,
+					service,
+					middlewares: chain,
+					names: r.middlewares.clone(),
+					request_timeout: deadline::limit(timeouts.request.as_ref()),
+					backend_timeout: deadline::limit(timeouts.backend_request.as_ref()),
+				},
+			));
 		}
 		// higher priority first; the order in the settings breaks ties
 		routes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -438,6 +462,16 @@ enum Failure {
 	Status(StatusCode, String),
 }
 
+/// Whether the client's `TE` asks for trailers (passed on to HTTP/2 backends, #233).
+fn te_trailers(headers: &HeaderMap) -> bool {
+	headers
+		.get_all(header::TE)
+		.iter()
+		.filter_map(|v| v.to_str().ok())
+		.flat_map(|v| v.split(','))
+		.any(|t| t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("trailers")))
+}
+
 /// What the response side of the chain needs to know about the request.
 struct Sent {
 	accept_encoding: String,
@@ -482,10 +516,12 @@ impl Conn {
 			headers: &headers,
 			client: client_ip,
 		};
-		let (route_name, service, chain, names) = match router.route(&info) {
-			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice()),
-			None => ("", router.default_service.clone(), &[][..], &[][..]),
+		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info) {
+			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
+			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
 		};
+		// timeouts.request (#227) counts from here
+		let deadline = request_timeout.map(|d| tokio::time::Instant::now() + d);
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
 		// the access log line is put together only when it is written (the statistics need just the route)
 		let log = global.logging();
@@ -535,6 +571,8 @@ impl Conn {
 		let mut answer = None;
 		let mut replay: Option<Bytes> = None;
 		let mut retry: Option<RetryPolicy> = None;
+		// copies for `mirror` (#232), as the request was at each
+		let mut mirrors: Vec<mirror::Copy> = vec![];
 		// cookies of the authentication middlewares for the response
 		let mut set_cookies: Vec<HeaderValue> = vec![];
 		let authority = request_authority(&parts.uri, &parts.headers)
@@ -620,7 +658,19 @@ impl Conn {
 					}
 				}
 				Middleware::Retry(policy) => {
-					retry = Some(*policy);
+					retry = Some(policy.clone());
+					None
+				}
+				Middleware::Mirror { name, service: to, share } => {
+					if share.take() {
+						mirrors.push(mirror::Copy {
+							name: name.clone(),
+							service: to.clone(),
+							method: parts.method.clone(),
+							uri: parts.uri.clone(),
+							headers: parts.headers.clone(),
+						});
+					}
 					None
 				}
 				Middleware::CircuitBreaker(breaker) => match breaker.admit() {
@@ -647,7 +697,7 @@ impl Conn {
 				}
 			}
 		}
-		let req = Request::from_parts(parts, body);
+		let mut req = Request::from_parts(parts, body);
 		if let Some(limited) = answer.as_ref().and_then(|r| r.extensions().get::<Limited>()) {
 			self.rt.http_stats.limited(route_name, &limited.0);
 		}
@@ -661,8 +711,34 @@ impl Conn {
 				if log {
 					entry.service = service.name.clone();
 				}
-				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log };
-				self.forward(target, req, replay, retry, &mut entry.backend, &mut holds).await
+				if !mirrors.is_empty() {
+					// a body read by `buffering` is sent from `replay`; copies get it too
+					let copies = match &replay {
+						Some(bytes) => (0..mirrors.len()).map(|_| full_body(bytes.clone())).collect(),
+						None => {
+							let (parts, body) = req.into_parts();
+							let (body, copies) = mirror::tee(body, mirrors.len());
+							req = Request::from_parts(parts, body);
+							copies
+						}
+					};
+					for (copy, body) in mirrors.into_iter().zip(copies) {
+						self.mirror(router.clone(), copy, body);
+					}
+				}
+				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log, ctx: &ctx, backend_timeout };
+				let forwarded = self.forward(target, req, replay, retry, &mut entry.backend, &mut holds);
+				match deadline {
+					Some(at) => match tokio::time::timeout_at(at, forwarded).await {
+						Ok(resp) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => resp,
+						Ok(resp) => resp.map(|b| deadline::until(b, at, "request timed out")),
+						Err(_) => {
+							warn!(event = "http.error", rule = %self.rt.key, route = route_name, service = %service.name, status = 504, error = "request timed out");
+							error_response(StatusCode::GATEWAY_TIMEOUT)
+						}
+					},
+					None => forwarded.await,
+				}
 			}
 			(None, None) if route_name.is_empty() => error_response(router.default_status),
 			// validation makes such a route end in an answering middleware
@@ -743,7 +819,7 @@ impl Conn {
 		let server = &service.servers[index];
 		let host = if service.pass_host { host.clone() } else { HeaderValue::from_str(&server.authority).ok()? };
 		let req = Request::get(format!("{}{path}", server.prefix)).header(header::HOST, host).body(empty_body()).ok()?;
-		match self.send(router, service, index, req).await {
+		match self.send(router, service, index, req, None).await {
 			Ok(resp) => {
 				let mut resp = resp;
 				strip_hop_by_hop(resp.headers_mut());
@@ -770,7 +846,7 @@ impl Conn {
 		let mut req = Request::get(fa.path.as_str()).body(empty_body()).ok()?;
 		*req.headers_mut() = fa.request_headers(parts, client, self.https, host);
 		req.headers_mut().insert(header::HOST, HeaderValue::from_str(&server.authority).ok()?);
-		match self.send(router, &fa.service, 0, req).await {
+		match self.send(router, &fa.service, 0, req, None).await {
 			Ok(resp) if resp.status().is_success() => {
 				let (answer, body) = resp.into_parts();
 				// read the rest so the connection can be used again
@@ -828,7 +904,8 @@ impl Conn {
 	}
 
 	/// Sends the request to a server of the service: again on another server
-	/// (as `retry` allows) when a backend cannot be reached or does not answer.
+	/// (as `retry` allows) when a backend cannot be reached, does not answer, or
+	/// answers a status `retry` names (#231).
 	async fn forward(
 		&self,
 		target: Target<'_>,
@@ -838,17 +915,20 @@ impl Conn {
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
-		let Target { router, service, route, host, client_ip, log } = target;
+		let Target { router, service, route, host, client_ip, log, ctx, backend_timeout } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
 		let original_host = request_authority(req.uri(), req.headers());
+		// replace_host of the route (#228); a server's own may replace it again
+		let host_override = req.extensions().get::<HostOverride>().map(|h| h.0.clone());
 		let sticky = service.sticky_value(req.headers());
 		// a body can be sent again when it was buffered or there is none
 		let replayable = replay.is_some() || req.body().is_end_stream();
-		let attempts = match retry {
+		let attempts = match &retry {
 			Some(p) if upgrade.is_none() && replayable && resilience::idempotent(req.method()) => p.attempts,
 			_ => 1,
 		};
+		let trailers = te_trailers(req.headers());
 
 		let (mut parts, body) = req.into_parts();
 		strip_hop_by_hop(&mut parts.headers);
@@ -902,46 +982,68 @@ impl Conn {
 			};
 			let server = &service.servers[index];
 			if log {
-				*backend = server.addr();
+				*backend = if server.status.is_some() { server.url.clone() } else { server.addr() };
 			}
-			let uri: Uri = if server.prefix.is_empty() {
-				Uri::from(path_and_query.clone())
-			} else {
-				match format!("{}{}", server.prefix, path_and_query).parse() {
-					Ok(u) => u,
-					Err(_) => return error_response(StatusCode::BAD_REQUEST),
+			// counted while in progress, for `balance: least_conn`
+			let counted = Hold::counting(server.inflight.clone());
+			let again_after = |status: StatusCode| retry.as_ref().is_some_and(|p| p.retries(status.as_u16())) && attempt < attempts;
+			// a `status` entry answers itself (#235)
+			if let Some(status) = server.status {
+				if again_after(status) {
+					if let Some(p) = &retry {
+						tokio::time::sleep(p.wait(attempt + 1)).await;
+					}
+					continue;
 				}
-			};
-			let host_value = match (&original_host, service.pass_host) {
-				(Some(h), true) => h.clone(),
-				_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
-			};
-			let req = match first.take() {
-				Some((mut parts, body)) => {
-					parts.uri = uri;
-					parts.version = Version::HTTP_11;
-					parts.headers.insert(header::HOST, host_value);
-					let body = match &replay {
-						Some(bytes) => full_body(bytes.clone()),
-						None => body,
-					};
-					Request::from_parts(parts, body)
-				}
+				break (error_response(status), index, counted);
+			}
+			let (mut p, body) = match first.take() {
+				Some((p, body)) => (p, match &replay {
+					Some(bytes) => full_body(bytes.clone()),
+					None => body,
+				}),
 				None => {
 					let Some((method, headers)) = &again else {
 						return error_response(StatusCode::BAD_GATEWAY);
 					};
 					let mut req = Request::new(replay.clone().map(full_body).unwrap_or_else(empty_body));
 					*req.method_mut() = method.clone();
-					*req.uri_mut() = uri;
 					*req.headers_mut() = headers.clone();
-					req.headers_mut().insert(header::HOST, host_value);
-					req
+					req.into_parts()
 				}
 			};
-			// counted while in progress, for `balance: least_conn`
-			let counted = Hold::counting(server.inflight.clone());
-			match self.send(router, service, index, req).await {
+			p.uri = Uri::from(path_and_query.clone());
+			p.version = Version::HTTP_11;
+			// the server's own middlewares (#229), after the route's
+			if let Some(answer) = server.middlewares.iter().find_map(|m| m.on_request(&mut p, ctx)) {
+				break (answer, index, counted);
+			}
+			if !server.prefix.is_empty() {
+				let pq = p.uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
+				match format!("{}{pq}", server.prefix).parse() {
+					Ok(u) => p.uri = u,
+					Err(_) => return error_response(StatusCode::BAD_REQUEST),
+				}
+			}
+			let host_value = match (p.extensions.get::<HostOverride>().map(|h| h.0.clone()).or_else(|| host_override.clone()), &original_host, service.pass_host) {
+				(Some(h), _, _) => h,
+				(None, Some(h), true) => h.clone(),
+				_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
+			};
+			p.headers.insert(header::HOST, host_value);
+			if trailers {
+				p.extensions.insert(backend::WantsTrailers);
+			}
+			let req = Request::from_parts(p, body);
+			match self.send(router, service, index, req, backend_timeout).await {
+				Ok(resp) if again_after(resp.status()) => {
+					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
+						status = resp.status().as_u16(), error = "status to retry", attempt, attempts);
+					drop(resp);
+					if let Some(p) = &retry {
+						tokio::time::sleep(p.wait(attempt + 1)).await;
+					}
+				}
 				Ok(resp) => break (resp, index, counted),
 				Err(Failure::Status(status, error)) => {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
@@ -949,7 +1051,7 @@ impl Conn {
 					if attempt >= attempts {
 						return error_response(status);
 					}
-					if let Some(p) = retry {
+					if let Some(p) = &retry {
 						tokio::time::sleep(p.wait(attempt + 1)).await;
 					}
 				}
@@ -957,6 +1059,9 @@ impl Conn {
 		};
 		holds.push(counted);
 		let server = &service.servers[index];
+		if server.status.is_some() {
+			return resp;
+		}
 		if sticky.as_deref() != Some(server.id.as_str()) {
 			if let Some(cookie) = service.sticky_cookie(server, self.https) {
 				resp.headers_mut().append(header::SET_COOKIE, cookie);
@@ -986,13 +1091,88 @@ impl Conn {
 			}
 		}
 		strip_hop_by_hop(resp.headers_mut());
+		for m in server.middlewares.iter().rev() {
+			m.on_response(resp.headers_mut(), ctx);
+		}
 		resp
+	}
+
+	/// A copy of the request for `mirror` (#232), sent on its own; its answer is dropped.
+	fn mirror(&self, router: Arc<Router>, copy: mirror::Copy, body: Body) {
+		let conn = Conn { rt: self.rt.clone(), client: self.client, local: self.local, https: self.https, tls: None, h3: self.h3 };
+		self.rt.tracker.spawn(async move {
+			let kill = conn.rt.kill.clone();
+			tokio::select! {
+				_ = kill.cancelled() => {}
+				_ = conn.send_mirror(&router, copy, body) => {}
+			}
+		});
+	}
+
+	async fn send_mirror(&self, router: &Router, copy: mirror::Copy, body: Body) {
+		let service = &copy.service;
+		let Some(index) = service.pick(None) else {
+			debug!(event = "http.mirror", rule = %self.rt.key, middleware = %copy.name, service = %service.name, error = "no server is up");
+			return;
+		};
+		let server = &service.servers[index];
+		if server.status.is_some() {
+			return;
+		}
+		let pq = copy.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+		let Ok(uri) = format!("{}{pq}", server.prefix).parse::<Uri>() else { return };
+		let host = match (request_authority(&copy.uri, &copy.headers), service.pass_host) {
+			(Some(h), true) => h,
+			_ => HeaderValue::from_str(&server.authority).unwrap_or(HeaderValue::from_static("localhost")),
+		};
+		let trailers = te_trailers(&copy.headers);
+		let mut headers = copy.headers;
+		strip_hop_by_hop(&mut headers);
+		headers.insert(header::HOST, host);
+		let mut req = Request::new(body);
+		*req.method_mut() = copy.method;
+		*req.uri_mut() = uri;
+		*req.headers_mut() = headers;
+		if trailers {
+			req.extensions_mut().insert(backend::WantsTrailers);
+		}
+		match self.send(router, service, index, req, None).await {
+			Ok(resp) => {
+				let status = resp.status().as_u16();
+				// read to the end so the connection can be used again
+				let _ = tokio::time::timeout(service.response, resp.into_body().collect()).await;
+				debug!(event = "http.mirror", rule = %self.rt.key, middleware = %copy.name, service = %service.name, backend = %server.addr(), status);
+			}
+			Err(Failure::Status(status, error)) => {
+				debug!(event = "http.mirror", rule = %self.rt.key, middleware = %copy.name, service = %service.name, backend = %server.addr(),
+					status = status.as_u16(), error = %error);
+			}
+		}
 	}
 
 	/// One request to one server, on a kept connection when there is one. The
 	/// connection goes back to the server's pool once the response body has been read.
-	async fn send(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>) -> Result<Response<Body>, Failure> {
-		let result = self.send_once(router, service, index, req).await;
+	/// `per_try` is the route's `timeouts.backend_request` (#227).
+	async fn send(
+		&self,
+		router: &Router,
+		service: &Arc<Service>,
+		index: usize,
+		req: Request<Body>,
+		per_try: Option<std::time::Duration>,
+	) -> Result<Response<Body>, Failure> {
+		let result = match per_try {
+			Some(limit) => {
+				let at = tokio::time::Instant::now() + limit;
+				match tokio::time::timeout_at(at, self.send_once(router, service, index, req, true)).await {
+					Ok(Ok(resp)) if resp.status() == StatusCode::SWITCHING_PROTOCOLS => Ok(resp),
+					Ok(Ok(resp)) => Ok(resp.map(|b| deadline::until(b, at, "backend request timed out"))),
+					Ok(Err(e)) => Err(e),
+					Err(_) => Err(Failure::Status(StatusCode::GATEWAY_TIMEOUT, "backend request timed out".into())),
+				}
+			}
+			None => self.send_once(router, service, index, req, false).await,
+		};
 		// outlier_detection (#170): 5xx answers, connection failures and timeouts count against the server
 		if service.outlier.is_some() {
 			let outcome = match &result {
@@ -1004,7 +1184,13 @@ impl Conn {
 		result
 	}
 
-	async fn send_once(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>) -> Result<Response<Body>, Failure> {
+	/// `limited`: the caller times the whole attempt (`timeouts.backend_request`), so
+	/// the service's `timeouts.response` does not apply.
+	async fn send_once(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>, limited: bool) -> Result<Response<Body>, Failure> {
+		let response_limit = if limited { super::MAX_DURATION } else { service.response };
+		if service.speaks_h2(index) {
+			return self.send_h2(router, service, index, req, response_limit).await;
+		}
 		let server = &service.servers[index];
 		// connections from the client's address (transparent) are not shared
 		let pooled = self.rt.bind_as(self.client).is_none();
@@ -1014,7 +1200,7 @@ impl Conn {
 		let (mut req, sent) = until_sent(req);
 		let timed_out = || Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into());
 		if let Some(mut sender) = pooled.then(|| server.checkout()).flatten() {
-			match within(service.response, sent.clone(), sender.try_send_request(req)).await {
+			match within(response_limit, sent.clone(), sender.try_send_request(req)).await {
 				None => return Err(timed_out()),
 				Some(Ok(resp)) => return Ok(self.returning(resp, sender, service, index, keep)),
 				// the kept connection closed before the request went out: use a new one
@@ -1024,12 +1210,71 @@ impl Conn {
 				},
 			}
 		}
-		let mut sender = self.connect(router, service, index).await?;
-		let resp = within(service.response, sent, sender.send_request(req))
+		let mut sender = match self.connect(router, service, index).await? {
+			Sender::Http1(s) => s,
+			// protocol: auto, and the server picked HTTP/2 by ALPN
+			Sender::Http2(h2) => {
+				if pooled {
+					*server.h2_sender().await = Some(h2.clone());
+				}
+				return self.h2_request(h2, server, req, sent, response_limit).await;
+			}
+		};
+		let resp = within(response_limit, sent, sender.send_request(req))
 			.await
 			.ok_or_else(timed_out)?
 			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
 		Ok(self.returning(resp, sender, service, index, keep))
+	}
+
+	/// A request to an HTTP/2 server (#233), on its shared connection.
+	async fn send_h2(&self, router: &Router, service: &Arc<Service>, index: usize, req: Request<Body>, limit: std::time::Duration) -> Result<Response<Body>, Failure> {
+		let server = &service.servers[index];
+		if req.headers().contains_key(header::UPGRADE) {
+			return Err(Failure::Status(StatusCode::BAD_GATEWAY, "an upgrade cannot go to an HTTP/2 backend".into()));
+		}
+		let sender = if self.rt.bind_as(self.client).is_none() {
+			let mut slot = server.h2_sender().await;
+			match slot.as_ref() {
+				Some(s) => s.clone(),
+				None => {
+					let s = self.connect_h2(router, service, index).await?;
+					*slot = Some(s.clone());
+					s
+				}
+			}
+		} else {
+			self.connect_h2(router, service, index).await?
+		};
+		let (req, sent) = until_sent(req);
+		self.h2_request(sender, server, req, sent, limit).await
+	}
+
+	async fn connect_h2(&self, router: &Router, service: &Service, index: usize) -> Result<hyper::client::conn::http2::SendRequest<Body>, Failure> {
+		match self.connect(router, service, index).await? {
+			Sender::Http2(s) => Ok(s),
+			Sender::Http1(_) => Err(Failure::Status(StatusCode::BAD_GATEWAY, "the server picked HTTP/1.1, not h2 (ALPN)".into())),
+		}
+	}
+
+	async fn h2_request(
+		&self,
+		mut sender: hyper::client::conn::http2::SendRequest<Body>,
+		server: &backend::Server,
+		req: Request<Body>,
+		sent: Option<tokio::sync::watch::Receiver<bool>>,
+		limit: std::time::Duration,
+	) -> Result<Response<Body>, Failure> {
+		let trailers = req.extensions().get::<backend::WantsTrailers>().is_some();
+		let req = backend::to_h2(req, server.https, trailers);
+		let resp = within(limit, sent, async {
+			sender.ready().await?;
+			sender.send_request(req).await
+		})
+		.await
+		.ok_or_else(|| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "response timed out".into()))?
+		.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e.to_string()))?;
+		Ok(resp.map(|b| b.map_err(boxed_error).boxed()))
 	}
 
 	fn returning(&self, resp: Response<Incoming>, sender: SendRequest<Body>, service: &Arc<Service>, index: usize, keep: bool) -> Response<Body> {
@@ -1040,14 +1285,27 @@ impl Conn {
 		resp.map(|inner| Pooled { inner, back: Some((sender, service, index)) }.boxed())
 	}
 
-	async fn connect(&self, router: &Router, service: &Service, index: usize) -> Result<SendRequest<Body>, Failure> {
+	async fn connect(&self, router: &Router, service: &Service, index: usize) -> Result<Sender, Failure> {
 		let server = &service.servers[index];
-		let stream = tokio::time::timeout(service.connect, router.dialer.dial(server, self.rt.bind_as(self.client)))
+		let (stream, picked_h2) = tokio::time::timeout(service.connect, router.dialer.dial(server, self.rt.bind_as(self.client), service.tls.as_ref()))
 			.await
 			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "connect timed out".into()))?
 			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e))?;
+		let h2 = match service.protocol {
+			super::UpstreamProtocol::H2 if !picked_h2 => {
+				return Err(Failure::Status(StatusCode::BAD_GATEWAY, "the server did not pick h2 (ALPN)".into()));
+			}
+			super::UpstreamProtocol::H2 | super::UpstreamProtocol::H2c => true,
+			super::UpstreamProtocol::Auto => {
+				if server.https {
+					server.set_picked(picked_h2);
+				}
+				picked_h2
+			}
+			super::UpstreamProtocol::Http1 => false,
+		};
 		let tracker = self.rt.tracker.clone();
-		backend::handshake(stream, self.rt.kill.clone(), move |f| {
+		backend::handshake(stream, h2, self.rt.kill.clone(), move |f| {
 			tracker.spawn(f);
 		})
 		.await
@@ -1064,6 +1322,10 @@ struct Target<'a> {
 	client_ip: IpAddr,
 	/// The access log needs the backend's address.
 	log: bool,
+	/// For the servers' own middlewares (#229).
+	ctx: &'a Ctx,
+	/// `timeouts.backend_request` of the route (#227).
+	backend_timeout: Option<std::time::Duration>,
 }
 
 fn empty_body() -> Body {

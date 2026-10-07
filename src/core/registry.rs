@@ -201,11 +201,15 @@ fn down_services(health: &std::collections::BTreeMap<String, Vec<crate::l7::back
 	health.iter().filter(|(_, servers)| !servers.iter().any(|s| s.up)).map(|(name, _)| name.clone()).collect()
 }
 
+/// Targets with their addresses (empty for one that could not be resolved yet).
+type Resolved = Vec<(TargetSpec, Vec<SocketAddr>)>;
+
 /// What a rule needs before it can listen: resolved targets and TLS settings.
 struct Prepared {
 	/// The targets with their addresses (empty for one that could not be resolved yet).
 	members: Vec<(TargetSpec, Vec<SocketAddr>)>,
-	routes: Vec<(Route, Vec<SocketAddr>)>,
+	/// `tls.routes` with their targets' addresses.
+	routes: Vec<(Route, Resolved)>,
 	tls: Arc<TlsRuntime>,
 	http: Option<Arc<crate::l7::server::Router>>,
 }
@@ -375,12 +379,6 @@ pub(crate) fn is_dual_stack_wildcard(key: &Key) -> bool {
 	key.listen.is_ipv6() && key.listen.ip().is_unspecified()
 }
 
-fn route_spec(route: &Route) -> String {
-	match route.remote_addr.parse::<IpAddr>() {
-		Ok(IpAddr::V6(ip)) => SocketAddr::new(IpAddr::V6(ip), route.remote_port).to_string(),
-		_ => format!("{}:{}", route.remote_addr, route.remote_port),
-	}
-}
 
 impl Registry {
 	pub fn new(cfg: Config) -> Arc<Self> {
@@ -657,7 +655,24 @@ impl Registry {
 		}
 		let mut routes = vec![];
 		for route in &spec.tls.routes {
-			routes.push((route.clone(), resolve::resolve(&self.cfg.lookup, &route_spec(route)).await?));
+			// like the rule's targets: one that cannot be resolved yet is retried; all of them failing fails the rule
+			let mut members = vec![];
+			let mut first_error = None;
+			for t in route.members() {
+				match resolve::resolve(&self.cfg.lookup, &t.remote()).await {
+					Ok(addrs) => members.push((t, addrs)),
+					Err(e) if route.targets.is_empty() => return Err(e),
+					Err(e) => {
+						warn!(event = "dns.stale", rule = %spec.key, target = %t.remote(), error = %e.message);
+						first_error.get_or_insert(e);
+						members.push((t, vec![]));
+					}
+				}
+			}
+			if let Some(e) = first_error.filter(|_| members.iter().all(|(_, a)| a.is_empty())) {
+				return Err(e);
+			}
+			routes.push((route.clone(), members));
 		}
 		Ok(Prepared { members, routes, tls, http })
 	}
@@ -682,19 +697,21 @@ impl Registry {
 		(pool, backends)
 	}
 
-	fn install_routes(&self, key: Key, routes: Vec<(Route, Vec<SocketAddr>)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
+	/// The run-time `tls.routes`: a pool of targets each (#234), like the rule's.
+	fn install_routes(&self, key: Key, routes: Vec<(Route, Resolved)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
 		let mut targets = vec![];
 		let mut resolvers = vec![];
-		for (route, addrs) in routes {
-			let (tx, rx) = watch::channel(addrs);
-			// the resolver task keeps the sender; without one the last value stays readable
-			resolvers.extend(self.spawn_resolver(key, &route.remote_addr, route_spec(&route), &Arc::new(tx)));
-			targets.push(RouteTarget {
-				patterns: route.patterns(),
-				passthrough: route.passthrough,
-				host: route.remote_addr.clone(),
-				target: rx,
-			});
+		for (route, members) in routes {
+			let mut pool_members = vec![];
+			for (t, addrs) in members {
+				// the resolver task keeps the sender; without one the last value stays readable
+				let tx = Arc::new(watch::channel(addrs).0);
+				resolvers.extend(self.spawn_resolver(key, &t.addr, t.remote(), &tx));
+				pool_members.push(Arc::new(Member::new(t, tx)));
+			}
+			let events = Arc::new(watch::channel(0).0);
+			let pool = Pool::new(pool_members, route.balance, events, false).with_outlier(crate::core::outlier::L4Outlier::new(None));
+			targets.push(RouteTarget { patterns: route.patterns(), passthrough: route.passthrough, pool: Arc::new(pool) });
 		}
 		(Arc::new(targets), resolvers)
 	}

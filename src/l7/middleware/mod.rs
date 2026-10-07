@@ -4,6 +4,7 @@
 //! Traefik.
 
 pub mod auth;
+pub mod cors;
 pub mod crowdsec;
 pub mod limit;
 pub mod oidc;
@@ -61,11 +62,39 @@ pub struct Headers {
 	cors: Option<CorsSpec>,
 }
 
+/// The Host for the backend set by `replace_host` (#228), over `pass_host_header`.
+#[derive(Clone, Debug)]
+pub struct HostOverride(pub HeaderValue);
+
+/// Which share of requests `mirror` copies (#232): the n-th request is spread
+/// by the golden ratio, so any stretch of requests gets close to the share.
+#[derive(Debug)]
+pub struct Share {
+	/// Of 2^64.
+	threshold: u128,
+	seen: std::sync::atomic::AtomicU64,
+}
+
+impl Share {
+	pub fn new(numerator: u32, denominator: u32) -> Share {
+		let threshold = (u128::from(numerator.min(denominator)) << 64) / u128::from(denominator.max(1));
+		Share { threshold, seen: Default::default() }
+	}
+
+	pub fn take(&self) -> bool {
+		if self.threshold >= 1 << 64 {
+			return true;
+		}
+		let n = self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		u128::from(n.wrapping_mul(0x9E37_79B9_7F4A_7C15)) < self.threshold
+	}
+}
+
 /// A compiled middleware.
 #[derive(Debug)]
 pub enum Middleware {
-	RedirectScheme { scheme: String, port: Option<u16>, permanent: bool },
-	RedirectRegex { regex: Regex, replacement: String, permanent: bool },
+	RedirectScheme { scheme: String, port: Option<u16>, permanent: bool, status: Option<StatusCode> },
+	RedirectRegex { regex: Regex, replacement: String, permanent: bool, status: Option<StatusCode> },
 	Respond { status: StatusCode, body: String, content_type: HeaderValue },
 	IpAllow(Vec<Cidr>),
 	Headers(Box<Headers>),
@@ -90,6 +119,12 @@ pub enum Middleware {
 	BasicAuth(Arc<BasicAuth>),
 	ForwardAuth(Arc<ForwardAuth>),
 	Oidc(Arc<Oidc>),
+	/// CORS (#230).
+	Cors(Box<cors::Cors>),
+	/// A copy of the request to `service` (#232), sent by the server.
+	Mirror { name: String, service: Arc<Service>, share: Share },
+	/// The Host for the backend (#228).
+	ReplaceHost(HeaderValue),
 }
 
 impl Middleware {
@@ -117,6 +152,9 @@ impl Middleware {
 			Middleware::BasicAuth(_) => "basic_auth",
 			Middleware::ForwardAuth(_) => "forward_auth",
 			Middleware::Oidc(_) => "oidc",
+			Middleware::Cors(_) => "cors",
+			Middleware::Mirror { .. } => "mirror",
+			Middleware::ReplaceHost(_) => "replace_host",
 		}
 	}
 }
@@ -137,6 +175,10 @@ fn check_ops(ops: &HeaderOps, what: &str) -> Result<(), ApiError> {
 	for n in &ops.remove {
 		name(n, what)?;
 	}
+	for (n, v) in &ops.add {
+		name(n, what)?;
+		value(v, what)?;
+	}
 	Ok(())
 }
 
@@ -146,12 +188,15 @@ impl Middleware {
 		let regex = |r: &str| Regex::new(r).map_err(|e| ApiError::invalid(format!("middleware {label}: {e}")));
 		let what = format!("middleware {label}");
 		Ok(match spec {
-			MiddlewareSpec::RedirectScheme { scheme, port, permanent } => {
-				Middleware::RedirectScheme { scheme: scheme.clone(), port: *port, permanent: *permanent }
+			MiddlewareSpec::RedirectScheme { scheme, port, permanent, status } => {
+				Middleware::RedirectScheme { scheme: scheme.clone(), port: *port, permanent: *permanent, status: redirect_status(*status, &what)? }
 			}
-			MiddlewareSpec::RedirectRegex { regex: r, replacement, permanent } => {
-				Middleware::RedirectRegex { regex: regex(r)?, replacement: replacement.clone(), permanent: *permanent }
-			}
+			MiddlewareSpec::RedirectRegex { regex: r, replacement, permanent, status } => Middleware::RedirectRegex {
+				regex: regex(r)?,
+				replacement: replacement.clone(),
+				permanent: *permanent,
+				status: redirect_status(*status, &what)?,
+			},
 			MiddlewareSpec::Respond { status, body, content_type } => Middleware::Respond {
 				status: StatusCode::from_u16(*status).map_err(|e| ApiError::invalid(format!("{what}: {e}")))?,
 				body: body.clone().unwrap_or_default(),
@@ -215,12 +260,17 @@ impl Middleware {
 				min_size: min_size.unwrap_or(compress::DEFAULT_MIN_SIZE),
 			},
 			MiddlewareSpec::Buffering { max_request_body } => Middleware::Buffering { max: *max_request_body },
-			MiddlewareSpec::Retry { attempts, initial_interval } => Middleware::Retry(RetryPolicy {
+			MiddlewareSpec::Retry { attempts, initial_interval, status } => Middleware::Retry(RetryPolicy {
 				attempts: (*attempts).max(1),
 				interval: match initial_interval {
 					Some(d) => parse_duration(d).map_err(|e| ApiError::invalid(format!("{what}: {e}")))?,
 					None => DEFAULT_RETRY_INTERVAL,
 				},
+				status: status
+					.iter()
+					.map(|s| parse_status_range(s).map_err(|e| ApiError::invalid(format!("{what}: status: {e}"))))
+					.collect::<Result<Vec<_>, _>>()?
+					.into(),
 			}),
 			MiddlewareSpec::CircuitBreaker { failure_percent, window, recovery } => {
 				let d = |s: &str| parse_duration(s).map_err(|e| ApiError::invalid(format!("{what}: {e}")));
@@ -231,7 +281,7 @@ impl Middleware {
 			)),
 			MiddlewareSpec::ForwardAuth { address, response_headers, trust_forward_header, request_headers, timeout } => {
 				let spec = super::ServiceSpec {
-					servers: vec![super::ServerSpec { url: address.clone(), weight: None }],
+					servers: vec![super::ServerSpec { url: address.clone(), ..Default::default() }],
 					health_check: None,
 					sticky: None,
 					pass_host_header: Some(false),
@@ -241,6 +291,8 @@ impl Middleware {
 					}),
 					balance: Default::default(),
 					outlier_detection: None,
+					protocol: Default::default(),
+					tls: None,
 				};
 				let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
 				let path = match uri.path_and_query().map(|p| p.as_str()) {
@@ -249,7 +301,7 @@ impl Middleware {
 				};
 				Middleware::ForwardAuth(Arc::new(ForwardAuth {
 					name: label.to_string(),
-					service: Arc::new(Service::compile(label, &spec)?),
+					service: Arc::new(Service::compile(label, &spec, &Default::default())?),
 					path,
 					response_headers: auth::header_names(response_headers, &format!("{what}: response_headers"))?,
 					request_headers: auth::header_names(request_headers, &format!("{what}: request_headers"))?,
@@ -286,17 +338,29 @@ impl Middleware {
 				g.validate(&what)?;
 				Middleware::Geoip(crate::net::geoip::Policy::new(g))
 			}
+			MiddlewareSpec::Cors(c) => Middleware::Cors(Box::new(cors::Cors::new(c, &what)?)),
+			MiddlewareSpec::ReplaceHost { host } => Middleware::ReplaceHost(value(host, &what)?),
+			MiddlewareSpec::Mirror { .. } => return Err(ApiError::invalid(format!("{what}: mirror needs the rule's services"))),
 			#[allow(unreachable_patterns)]
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
 		})
 	}
 
-	/// `errors`: pages from `service`, which must be compiled already.
+	/// `errors` and `mirror`: they use one of `services`, which must be compiled already.
 	pub fn errors(label: &str, spec: &MiddlewareSpec, services: &std::collections::HashMap<String, Arc<Service>>) -> Result<Middleware, ApiError> {
+		let what = format!("middleware {label}");
+		if let MiddlewareSpec::Mirror { service, percent, fraction } = spec {
+			let service = services.get(service).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {service:?} is not defined")))?;
+			let share = match (percent, fraction) {
+				(Some(p), _) => Share::new(u32::from(*p), 100),
+				(None, Some(f)) => Share::new(f.numerator, f.denominator),
+				(None, None) => Share::new(1, 1),
+			};
+			return Ok(Middleware::Mirror { name: label.to_string(), service, share });
+		}
 		let MiddlewareSpec::Errors { status, service, path } = spec else {
 			return Middleware::compile(label, spec);
 		};
-		let what = format!("middleware {label}");
 		let ranges = status
 			.iter()
 			.map(|s| parse_status_range(s).map_err(|e| ApiError::invalid(format!("{what}: {e}"))))
@@ -311,7 +375,7 @@ impl Middleware {
 	/// Runs the request side. `Some` answers the request without going further.
 	pub fn on_request(&self, parts: &mut Parts, ctx: &Ctx) -> Option<Response<Body>> {
 		match self {
-			Middleware::RedirectScheme { scheme, port, permanent } => {
+			Middleware::RedirectScheme { scheme, port, permanent, status } => {
 				let https = scheme == "https";
 				if https == ctx.https {
 					return None;
@@ -319,15 +383,20 @@ impl Middleware {
 				let default = if https { 443 } else { 80 };
 				let port = port.filter(|p| *p != default).map(|p| format!(":{p}")).unwrap_or_default();
 				let host = if ctx.host.contains(':') { format!("[{}]", ctx.host) } else { ctx.host.clone() };
-				Some(redirect(&format!("{scheme}://{host}{port}{}", path_and_query(&parts.uri)), *permanent, &parts.method))
+				Some(redirect(&format!("{scheme}://{host}{port}{}", path_and_query(&parts.uri)), *permanent, *status, &parts.method))
 			}
-			Middleware::RedirectRegex { regex, replacement, permanent } => {
+			Middleware::RedirectRegex { regex, replacement, permanent, status } => {
 				let url = request_url(parts, ctx);
 				if !regex.is_match(&url) {
 					return None;
 				}
 				let to = regex.replace(&url, replacement.as_str());
-				Some(redirect(&to, *permanent, &parts.method))
+				Some(redirect(&to, *permanent, *status, &parts.method))
+			}
+			Middleware::Cors(c) => c.on_request(parts, ctx.origin.as_ref()),
+			Middleware::ReplaceHost(host) => {
+				parts.extensions.insert(HostOverride(host.clone()));
+				None
 			}
 			Middleware::Respond { status, body, content_type } => {
 				let mut resp = Response::new(full(body.clone()));
@@ -412,12 +481,17 @@ impl Middleware {
 			| Middleware::Errors { .. }
 			| Middleware::BasicAuth(_)
 			| Middleware::ForwardAuth(_)
+			| Middleware::Mirror { .. }
 			| Middleware::Oidc(_) => None,
 		}
 	}
 
 	/// Runs the response side (also on answers of later middlewares).
 	pub fn on_response(&self, headers: &mut HeaderMap, ctx: &Ctx) {
+		if let Middleware::Cors(c) = self {
+			c.on_response(headers, ctx.origin.as_ref());
+			return;
+		}
 		let Middleware::Headers(h) = self else { return };
 		apply(headers, &h.response);
 		for (n, v) in &h.fixed {
@@ -456,7 +530,8 @@ fn allowed_origin(cors: &CorsSpec, origin: Option<&HeaderValue>) -> Option<Heade
 	cors.allow_origins.iter().any(|a| a.eq_ignore_ascii_case(o)).then(|| origin.clone())
 }
 
-/// `set` with an empty value removes the header, as in Traefik.
+/// `set` with an empty value removes the header, as in Traefik. `add` appends to
+/// an existing value with `,` (one field, as Envoy and the Gateway API expect).
 fn apply(headers: &mut HeaderMap, ops: &HeaderOps) {
 	for n in &ops.remove {
 		if let Ok(n) = HeaderName::from_bytes(n.as_bytes()) {
@@ -470,6 +545,26 @@ fn apply(headers: &mut HeaderMap, ops: &HeaderOps) {
 		} else if let Ok(v) = HeaderValue::from_str(v) {
 			headers.insert(n, v);
 		}
+	}
+	for (n, v) in &ops.add {
+		let Ok(n) = HeaderName::from_bytes(n.as_bytes()) else { continue };
+		let mut joined: Vec<u8> = vec![];
+		for old in headers.get_all(&n) {
+			joined.extend_from_slice(old.as_bytes());
+			joined.push(b',');
+		}
+		joined.extend_from_slice(v.as_bytes());
+		if let Ok(v) = HeaderValue::from_bytes(&joined) {
+			headers.insert(n, v);
+		}
+	}
+}
+
+fn redirect_status(status: Option<u16>, what: &str) -> Result<Option<StatusCode>, ApiError> {
+	match status {
+		None => Ok(None),
+		Some(s @ (301 | 302 | 303 | 307 | 308)) => Ok(StatusCode::from_u16(s).ok()),
+		Some(s) => Err(ApiError::invalid(format!("{what}: status {s} must be 301, 302, 303, 307 or 308"))),
 	}
 }
 
@@ -539,14 +634,15 @@ fn limited(name: &str) -> Response<Body> {
 }
 
 /// 301/302 for GET and HEAD; 308/307 keep the method and body of others.
-fn redirect(location: &str, permanent: bool, method: &Method) -> Response<Body> {
+/// A `status` given in the settings is used as it is (#226).
+fn redirect(location: &str, permanent: bool, status: Option<StatusCode>, method: &Method) -> Response<Body> {
 	let simple = method == Method::GET || method == Method::HEAD;
-	let status = match (permanent, simple) {
+	let status = status.unwrap_or(match (permanent, simple) {
 		(true, true) => StatusCode::MOVED_PERMANENTLY,
 		(true, false) => StatusCode::PERMANENT_REDIRECT,
 		(false, true) => StatusCode::FOUND,
 		(false, false) => StatusCode::TEMPORARY_REDIRECT,
-	};
+	});
 	let mut resp = text(status, status.canonical_reason().unwrap_or(""));
 	*resp.status_mut() = status;
 	match HeaderValue::from_str(location) {
@@ -599,6 +695,35 @@ mod tests {
 		let r = m.on_request(&mut parts("GET", "/p", &[("host", "www.a.example")]), &ctx(false)).unwrap();
 		assert_eq!(location(&r), "https://a.example/p");
 		assert!(m.on_request(&mut parts("GET", "/p", &[("host", "a.example")]), &ctx(false)).is_none());
+	}
+
+	#[test]
+	fn headers_add_redirect_status_and_mirror_share() {
+		// #224: appended with ',' (one field), after remove and set
+		let m = mw("headers: {request: {add: {X-A: v, X-New: n}, set: {X-S: s}, remove: [X-R]}}");
+		let mut p = parts("GET", "/", &[("x-a", "a"), ("x-a", "b"), ("x-r", "1"), ("x-s", "old")]);
+		m.on_request(&mut p, &ctx(false));
+		assert_eq!(p.headers.get_all("x-a").iter().collect::<Vec<_>>(), ["a,b,v"]);
+		assert_eq!((p.headers["x-new"].to_str().unwrap(), p.headers["x-s"].to_str().unwrap()), ("n", "s"));
+		assert!(!p.headers.contains_key("x-r"));
+		// #226
+		let m = mw("redirect_scheme: {scheme: https, status: 303}");
+		assert_eq!(m.on_request(&mut parts("POST", "/", &[]), &ctx(false)).unwrap().status(), StatusCode::SEE_OTHER);
+		let m = mw("redirect_regex: {regex: '^(.*)$', replacement: 'https://x/', permanent: true, status: 307}");
+		assert_eq!(m.on_request(&mut parts("GET", "/", &[]), &ctx(false)).unwrap().status(), StatusCode::TEMPORARY_REDIRECT);
+		// #232: a share kept by count
+		for (num, den) in [(20u32, 100u32), (1, 3), (25, 50), (0, 7)] {
+			let share = Share::new(num, den);
+			let taken = (0..3000).filter(|_| share.take()).count() as f64;
+			let want = 3000.0 * f64::from(num) / f64::from(den);
+			assert!((taken - want).abs() <= 3.0, "{num}/{den}: {taken} of 3000");
+		}
+		assert!((0..10).all(|_| Share::new(5, 5).take()));
+		// #228
+		let mut p = parts("GET", "/", &[("host", "a.example")]);
+		assert!(mw("replace_host: {host: 'one.example.org:8080'}").on_request(&mut p, &ctx(false)).is_none());
+		assert_eq!(p.extensions.get::<HostOverride>().unwrap().0, "one.example.org:8080");
+		assert_eq!(p.headers["host"], "a.example", "the client's Host stays for X-Forwarded-Host");
 	}
 
 	#[test]

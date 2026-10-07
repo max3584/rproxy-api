@@ -54,14 +54,14 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 
 | Traefik | rproxy |
 |---|---|
-| `loadBalancer.servers[].url` / `weight` | `http.services.<name>.servers` |
+| `loadBalancer.servers[].url` / `weight` | `http.services.<name>.servers` (`h2c://` URLs become `http://` with `protocol: h2c`) |
 | `passHostHeader: false` | `pass_host_header: false` |
 | `healthCheck.path` / `interval` / `timeout` | `health_check` |
 | `sticky.cookie.name` | `sticky.cookie` |
 | `serversTransport` (`insecureSkipVerify`, `rootCAs`, `serverName`) | `tls.upstream` of the TLS-terminating rule (applies to all `https://` targets of the rule) |
 | `weighted` | The targets of the inner services are merged into one, with weights multiplied (same for TCP / UDP) |
 | `failover` | The primary service's targets followed by the `fallback` targets, with `balance: failover` (in order from the top, the first live target; no round robin even within the primary service). If there is no `health_check`, it is reported in the list |
-| `mirroring` | Only the primary service is used |
+| `mirroring` | Only the primary service is used (add a `mirror` middleware to the routes by hand for copies) |
 | Multiple targets in a TCP / UDP service | The rule's `targets` (`balance: round_robin`, weighted). Per-server-name targets (`tls.routes`) take only one, so only the first is used there |
 | `healthCheck` of a TCP / UDP service | Not converted (rproxy's L4 `health_check` checks with a TCP connection; add it if needed) |
 

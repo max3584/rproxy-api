@@ -131,8 +131,11 @@ fn failover_services() {
 	}
 	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/failover/traefik.yml"]);
 	let http = rule(&doc, 8080).http.as_ref().unwrap();
-	let svc = http.services.values().next().unwrap();
+	let svc = http.services.values().find(|s| s.servers.len() == 3).unwrap();
 	let urls: Vec<&str> = svc.servers.iter().map(|s| s.url.as_str()).collect();
+	// h2c:// becomes protocol h2c (#233)
+	let grpc = http.services.values().find(|s| s.servers.len() == 1).unwrap();
+	assert_eq!((grpc.servers[0].url.as_str(), grpc.protocol), ("http://10.0.4.1:50051", rproxy_api::l7::UpstreamProtocol::H2c));
 	assert_eq!(urls, ["http://10.0.2.1:80", "http://10.0.2.2:80", "http://10.0.3.1:80"], "main first, then the fallback");
 	assert_eq!(svc.balance, rproxy_api::core::balance::Balance::Failover);
 	assert!(svc.health_check.is_some());
