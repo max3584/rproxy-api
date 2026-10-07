@@ -431,7 +431,9 @@ async fn refusals_and_changes_are_audited_with_the_client() {
 		),
 	)
 	.unwrap();
-	let h = harness_with(Tokens::from_file(file).unwrap()).await;
+	// the lockout (#167) is off here: the flood below is about the log
+	let off = rproxy_api::control::hardening::LockoutConfig { failures: 0, ..Default::default() };
+	let h = harness_with(Tokens::from_file(file).unwrap().with_lockout(off)).await;
 	let port = free_port();
 	let path = format!("/rules/tcp/127.0.0.1/{port}");
 	let send = |method: reqwest::Method, token: Option<&str>| {

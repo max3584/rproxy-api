@@ -30,7 +30,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
-SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
+SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`token.expiring` / `token.expired`（`tests/api_hardening.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
 
 ## 単体テスト（`src/`）
 
@@ -60,6 +60,11 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 の TLV（AUTHORITY、SSL、CN）と長さ |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | listener が panic すると、そのルールだけが `failed` になる |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | 古い世代の監視タスクは、作り直したルールに触らない |
+| `core/ruleset.rs` | `etags_follow_the_rules_and_the_generation` | etag はルールの順に依らず、ルールか世代が変わると変わる。`If-Match` の書き方（引用符・`W/`・リスト・`*`） |
+| | `last_transition_moves_only_when_the_status_changes` | `last_transition` は `status` が変わったときだけ動く（`reason` だけでは動かない）。消すと最初から |
+| | `conditions_from_the_view` | 状態・誤りの `code` から 4 つの `conditions` の status と reason |
+| | `label_metrics_lines` | `rproxy_rule_labels` の行（名前の置き換え、同じ名前になるキー、値のエスケープ） |
+| | `readiness_states` | `starting` → ready → `draining`（ready に戻らない） |
 
 ## 結合テスト：制御 API（`tests/api.rs`）
 
@@ -185,11 +190,38 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 
 | テスト | 確かめること |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false、`performance` が空。実装した `geoip`・`outlier_detection`（ミドルウェアの `geoip`・サービスの `outlier_detection`）は true |
-| `labels_…`・`limits_…`・`bandwidth_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。GeoIP（#168）と受け身のヘルスチェック（#170）は実装したので `tests/geoip.rs`・`tests/outlier.rs` |
-| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
+| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout`・`rulesets`・`labels`・`conditions`・`readyz`・`geoip`・`outlier_detection`（ミドルウェアの `geoip`・サービスの `outlier_detection`）は true）、`performance` が空 |
+| `limits_…`・`bandwidth_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。GeoIP（#168）と受け身のヘルスチェック（#170）は実装したので `tests/geoip.rs`・`tests/outlier.rs` |
+| `dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
 | `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
-| `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り、制御 API のクライアント証明書（まだ使えない）は起動を止める |
+| `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
+
+## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
+
+| テスト | 確かめること |
+|---|---|
+| `client_certificates_authenticate_alone_or_bound_to_a_token` | main.rs と同じ TLS（`ClientCertAcceptor`）で、`optional` では証明書だけのエントリが証明書（SAN、なければ CN）で通り、スコープも効く。知らない名前・証明書なしは 401、トークンは証明書なしでも通る。証明書に結びついたトークンは、その証明書がないと 401。ほかの CA の証明書はハンドシェイクで断る。`required` では証明書のない接続を断る |
+| `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | 窓の中の 401 が上限に達した送信元は、正しいトークンでも `429 locked_out`（`Retry-After`）。Unix ソケットの失敗は数えず、止めている間も Unix ソケットは通る。`/healthz` は止めない。`/metrics` の `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`。時間が過ぎれば戻る |
+| `lockout_is_on_by_default` | 既定（オーナーの決定）で 20 回目の失敗で止まる |
+| `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
+| `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
+
+## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）
+
+Kubernetes のコントローラ（`max3584/rproxy-gateway`）が使う口。
+
+| テスト | 確かめること |
+|---|---|
+| `capabilities_turn_the_controller_features_on` | `features` の `rulesets`・`labels`・`conditions`・`readyz` が true |
+| `a_set_is_applied_as_a_whole_with_minimal_disruption` | `/` を含む名前の組を作る（`ETag` ヘッダ、`GET /rules` の `ruleset`・`labels`・`conditions`、`GET /rulesets`）。同じ本文はすべて `none` で etag も同じ。宛先だけの違いは `in_place` で、前からの接続は切れずに新しい接続が新しい宛先へ。`source_ip` の違いは `recreate`。外したルールは `delete`。`DELETE /rulesets/{name}` で全部止まる |
+| `sets_refuse_stale_writes_and_do_not_take_other_rules` | `If-Match` の食い違い・まだない組への `If-Match`（412）、古い `generation`（409 `stale_generation`）、引用符なし・リスト・`W/` の `If-Match`。組のルールの個別の PATCH / DELETE は `409 owned`、ほかの組は `owned`、POST のルールは `already_exists`（何も作らない）。不正なルールが 1 つあれば何も変えず、`errors` にすべての問題。本文の中の重なり。`dry_run` はまだ `unsupported`（何も変えない）。名前の誤り |
+| `a_rule_that_cannot_bind_fails_alone` | 使用中のポートのルールだけ `failed`（`Programmed` が `False`・`BindFailed`、`BackendsHealthy` が `Unknown`、読み直しても `last_transition` は同じ）、残りは動く。ポートが空いてから同じ本文を PUT すると作り直して動く |
+| `conditions_report_targets_that_are_down` | 宛先がすべて down のルールは `BackendsHealthy` が `False`・`AllTargetsDown`（組でないルールにも `conditions`） |
+| `labels_are_kept_replaced_and_exported` | `labels` の表示、`/metrics` の `rproxy_rule_labels`、PATCH で丸ごと置き換え・省けばそのまま・`{}` で外す、誤ったキーは `invalid` |
+| `readyz_follows_the_startup_and_the_shutdown` | トークンなしで `starting`（503）→ ready（200）→ `draining`（503。ready に戻らない） |
+| `sets_need_rules_write_within_the_allowed_ports` | `rules:read` のトークンは読めるが PUT / DELETE は 403、`allow_listen_ports` の外のルールは 403、`updated_by` はトークンの名前 |
+
+起動した rproxy が復元の後に `GET /readyz` で 200 を返すことは `tests/startup.rs` の `readyz_answers_once_started`。
 
 ## 結合テスト：GeoIP（`tests/geoip.rs`、#168）
 

@@ -91,14 +91,14 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 
-v0.4 で足す項目（形だけ。中身が入るまでは、指定すると `degraded` を出して無視する。制御 API のクライアント証明書だけは起動しない。docs/API.md の「v0.4 の設定」）：
+v0.4 で足す項目（中身が入るまでは、指定すると `degraded` を出して無視する。制御 API の守り（#167）は動く。docs/API.md の「v0.4 の設定」・「制御 API の守り」）：
 
 | 環境変数 | 引数 | 既定 | 説明 |
 |---|---|---|---|
-| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | なし | 制御 API のクライアント証明書を確かめる CA（PEM）（#167） |
-| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | `none`・`optional`・`required`（#167） |
+| `RPROXY_TLS_CLIENT_CA` | `--tls-client-ca` | なし | 制御 API のクライアント証明書を確かめる CA（PEM）。SIGHUP で読み直す（#167） |
+| `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | 制御 API のクライアント証明書：`none`・`optional`（あれば確かめる）・`required`（ない接続はハンドシェイクで断る）。トークンファイルの `client_cert` で証明書を認証に使う（#167） |
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
-| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | 認証の失敗が続いた送信元を止める（`0` で止めない）（#167） |
+| `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
 | `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前（#144） |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174） |
 | `RPROXY_UPDATE` | `--update` | `off` | 自動更新：`off`・`check`・`auto`（#174）。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も |
@@ -287,12 +287,15 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 
 | `event` | 内容 |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止 |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も） |
+| `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |
 | `api.listening` / `api.retry` / `api.stopped` | 制御 API の待ち受けの開始 / 開けないので再試行 / 止まった |
-| `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |
+| `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）、一時停止中（`outcome: locked_out`）。認証の方法（`auth`：`token`・`cert`・`token+cert`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |
+| `token.expiring` / `token.expired` | 制御 API のトークンの期限が近い（`RPROXY_TOKEN_WARN_DAYS` より近い）/ 切れた（`token`、`expires`、`days_left`）。起動・SIGHUP・1 日 1 回、状態が変わったときに 1 回だけ |
+| `api.lockout` / `api.unlock` | 認証の失敗が続いた送信元（`client`。IPv6 は /64）を止めた（`failures`、`until`）/ 解いた |
 | `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP でトークン・制御 API の証明書・ルールの証明書・CrowdSec の鍵を読み直した（読めなければ今のものを使い続ける） |
 | `geoip.reload` | `global.geoip` のデータベースを読んだ・読み直した（`db`：`country` / `asn`、`path`、`build_epoch`）。読めないときは `degraded`（`part: geoip`）で今のものを使い続ける |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |

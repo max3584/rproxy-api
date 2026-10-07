@@ -205,6 +205,25 @@ async fn http_servers_that_keep_failing_are_ejected() {
 }
 
 #[tokio::test]
+async fn wrong_settings_are_invalid() {
+	let h = harness().await;
+	let backend = tcp_backend("W:").await;
+	let mut body = rule("tcp", free_port(), backend);
+	body["outlier_detection"] = json!({"ejection_time": "1m", "max_ejection_time": "10s"});
+	assert_eq!(h.post(body).await.1["code"], "invalid");
+	let mut body = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+		"routes": [{"name": "a", "match": "PathPrefix(`/`)", "service": "s"}],
+		"services": {"s": {"servers": [{"url": "http://127.0.0.1:9"}], "outlier_detection": {"failure_percent": 0}}}
+	}});
+	assert_eq!(h.post(body.clone()).await.1["code"], "invalid");
+	// a rule's outlier_detection is for L4 only
+	body["http"]["services"]["s"]["outlier_detection"] = Value::Null;
+	body["outlier_detection"] = json!({"consecutive_failures": 2});
+	let (_, v) = h.post(body).await;
+	assert_eq!(v["code"], "invalid", "{v}");
+}
+
+#[tokio::test]
 async fn http_ejection_leaves_at_least_half_by_default() {
 	let h = harness().await;
 	let (a, a_hits) = http_backend("a", true).await;

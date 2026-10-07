@@ -2,6 +2,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use crate::control::hardening::{ClientAuth, Lockout, LockoutConfig};
+
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -45,12 +47,15 @@ pub struct Principal {
 	ports: Option<(u16, u16)>,
 	/// Rules this token creates, changes or deletes are stored in `rproxy_rules` (#144, v0.4).
 	pub persist: bool,
+	/// How the request was authenticated, for the audit log (#167): `token`,
+	/// `cert` or `token+cert` (empty without a token file).
+	pub auth: &'static str,
 }
 
 impl Principal {
 	/// Without a token file every request is allowed.
 	fn anonymous() -> Self {
-		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false }
+		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "" }
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -71,7 +76,10 @@ enum Secret {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Token {
-	secret: Secret,
+	/// None: authenticated by the client certificate alone.
+	secret: Option<Secret>,
+	/// The client certificate's name the request must come with (#167).
+	client_cert: Option<String>,
 	principal: Principal,
 	expires: Option<time::Date>,
 }
@@ -151,19 +159,22 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 				if name.trim().is_empty() || name.contains(char::is_whitespace) {
 					return Err(invalid(path, format!("{}: client_cert must be a certificate name (DNS or URI SAN, or CN)", e.name)));
 				}
-				// tokens that cannot be checked as written are not silently weakened
-				if !crate::core::rule::Features::CURRENT.client_cert_auth {
-					return Err(invalid(
-						path,
-						format!("{}: client_cert is not available in this version (see GET /capabilities features)", e.name),
-					));
+				// a certificate alone must point at one token
+				if e.sha256.is_none()
+					&& tokens.iter().any(|t: &Token| t.secret.is_none() && t.client_cert.as_deref() == Some(name.as_str()))
+				{
+					return Err(invalid(path, format!("{}: another token without sha256 has client_cert {name}", e.name)));
 				}
 			}
-			let Some(sha256) = &e.sha256 else {
+			if e.sha256.is_none() && e.client_cert.is_none() {
 				return Err(invalid(path, format!("{}: give sha256 (sha256sum of the token) or client_cert", e.name)));
+			}
+			let secret = match &e.sha256 {
+				Some(sha256) => Some(Secret::Sha256(parse_hex(sha256).ok_or_else(|| {
+					invalid(path, format!("{}: sha256 must be 64 hex digits (sha256sum of the token)", e.name))
+				})?)),
+				None => None,
 			};
-			let hash = parse_hex(sha256)
-				.ok_or_else(|| invalid(path, format!("{}: sha256 must be 64 hex digits (sha256sum of the token)", e.name)))?;
 			if e.scopes.is_empty() {
 				return Err(invalid(path, format!("{}: scopes must not be empty", e.name)));
 			}
@@ -175,9 +186,15 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 				Some(d) => Some(parse_date(d).ok_or_else(|| invalid(path, format!("{}: expires must be YYYY-MM-DD: {d}", e.name)))?),
 				None => None,
 			};
+			let auth = match (&secret, &e.client_cert) {
+				(Some(_), Some(_)) => "token+cert",
+				(None, _) => "cert",
+				_ => "token",
+			};
 			tokens.push(Token {
-				secret: Secret::Sha256(hash),
-				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist },
+				secret,
+				client_cert: e.client_cert,
+				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist, auth },
 				expires,
 			});
 		}
@@ -188,8 +205,15 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			.filter(|l| !l.is_empty() && !l.starts_with('#'))
 			.enumerate()
 			.map(|(i, l)| Token {
-				secret: Secret::Plain(l.to_string()),
-				principal: Principal { name: format!("token-{}", i + 1), scopes: vec![Scope::Admin], ports: None, persist: false },
+				secret: Some(Secret::Plain(l.to_string())),
+				client_cert: None,
+				principal: Principal {
+					name: format!("token-{}", i + 1),
+					scopes: vec![Scope::Admin],
+					ports: None,
+					persist: false,
+					auth: "token",
+				},
 				expires: None,
 			})
 			.collect()
@@ -209,23 +233,77 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 pub struct Tokens {
 	path: Option<PathBuf>,
 	tokens: RwLock<Vec<Token>>,
+	/// Whether the control API asks for client certificates
+	/// (`--tls-client-auth`); without, tokens with `client_cert` are refused.
+	client_auth: ClientAuth,
+	/// Sources failing authentication over TCP (#167).
+	lockout: Lockout,
 }
 
 impl Tokens {
 	/// No token file: every request is allowed.
 	pub fn disabled() -> Self {
-		Tokens { path: None, tokens: RwLock::default() }
+		Self::with(None, vec![])
+	}
+
+	fn with(path: Option<PathBuf>, tokens: Vec<Token>) -> Self {
+		// until with_client_auth says otherwise, client_cert entries are not refused
+		Tokens { path, tokens: RwLock::new(tokens), client_auth: ClientAuth::Optional, lockout: Lockout::default() }
 	}
 
 	pub fn from_file(path: PathBuf) -> io::Result<Self> {
 		let tokens = read_tokens(&path)?;
-		Ok(Tokens { path: Some(path), tokens: RwLock::new(tokens) })
+		Ok(Self::with(Some(path), tokens))
 	}
 
 	/// Authentication is on but no token is known yet (the file could not be
 	/// read): every request is refused until a reload succeeds.
 	pub fn locked(path: PathBuf) -> Self {
-		Tokens { path: Some(path), tokens: RwLock::default() }
+		Self::with(Some(path), vec![])
+	}
+
+	/// How the control API asks for client certificates. A token with
+	/// `client_cert` while it asks for none is a mistake (now and on reload):
+	/// the entry could never be used as written.
+	pub fn with_client_auth(mut self, auth: ClientAuth) -> io::Result<Self> {
+		self.client_auth = auth;
+		let tokens = self.tokens.read().unwrap_or_else(|e| e.into_inner());
+		self.check_client_auth(&tokens)?;
+		drop(tokens);
+		Ok(self)
+	}
+
+	fn check_client_auth(&self, tokens: &[Token]) -> io::Result<()> {
+		if self.client_auth != ClientAuth::None {
+			return Ok(());
+		}
+		match tokens.iter().find(|t| t.client_cert.is_some()) {
+			Some(t) => Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				format!(
+					"{}: token {}: client_cert needs --tls-client-auth optional or required (RPROXY_TLS_CLIENT_AUTH) and --tls-client-ca",
+					self.path.as_deref().unwrap_or(std::path::Path::new("")).display(),
+					t.principal.name
+				),
+			)),
+			None => Ok(()),
+		}
+	}
+
+	/// `--api-lockout-*` (on by default: 20 failures in 1m lock out for 5m).
+	pub fn with_lockout(mut self, config: LockoutConfig) -> Self {
+		self.lockout = Lockout::new(config);
+		self
+	}
+
+	pub fn lockout(&self) -> &Lockout {
+		&self.lockout
+	}
+
+	/// Tokens with `expires` (name, last valid day), for `token.expiring` and `/metrics`.
+	pub fn expiries(&self) -> Vec<(String, time::Date)> {
+		let tokens = self.tokens.read().unwrap_or_else(|e| e.into_inner());
+		tokens.iter().filter_map(|t| t.expires.map(|d| (t.principal.name.clone(), d))).collect()
 	}
 
 	pub fn enabled(&self) -> bool {
@@ -241,6 +319,7 @@ impl Tokens {
 	pub fn reload(&self) -> io::Result<usize> {
 		let Some(path) = &self.path else { return Ok(0) };
 		let tokens = read_tokens(path)?;
+		self.check_client_auth(&tokens)?;
 		let count = tokens.len();
 		*self.tokens.write().unwrap() = tokens;
 		Ok(count)
@@ -254,24 +333,42 @@ impl Tokens {
 	/// Like `authenticate`, with why a request is refused (for the audit log; never
 	/// the token): `missing` (no bearer token), `invalid` (unknown) or `expired`.
 	pub fn check(&self, header: Option<&str>) -> Result<Principal, &'static str> {
-		self.authenticate_on(header, time::OffsetDateTime::now_utc().date())
+		self.check_with(header, &[])
 	}
 
-	fn authenticate_on(&self, header: Option<&str>, today: time::Date) -> Result<Principal, &'static str> {
+	/// Like `check`, with the names of the connection's verified client
+	/// certificate (#167; empty without one). A bearer token, when given,
+	/// decides (and needs its `client_cert` when it has one, else
+	/// `client_cert`); without one, a token with `client_cert` and no `sha256`
+	/// whose name the certificate has is used.
+	pub fn check_with(&self, header: Option<&str>, cert: &[String]) -> Result<Principal, &'static str> {
+		self.authenticate_on(header, cert, time::OffsetDateTime::now_utc().date())
+	}
+
+	fn authenticate_on(&self, header: Option<&str>, cert: &[String], today: time::Date) -> Result<Principal, &'static str> {
 		if !self.enabled() {
 			return Ok(Principal::anonymous());
 		}
-		let presented = header.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim).ok_or("missing")?;
+		let valid = |t: &Token| if t.expires.is_none_or(|d| today <= d) { Ok(t.principal.clone()) } else { Err("expired") };
+		let has_cert = |t: &Token| t.client_cert.as_ref().is_some_and(|c| cert.iter().any(|n| n == c));
+		let tokens = self.tokens.read().unwrap_or_else(|e| e.into_inner());
+		let Some(presented) = header.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim) else {
+			if cert.is_empty() {
+				return Err("missing");
+			}
+			return tokens.iter().find(|t| t.secret.is_none() && has_cert(t)).map_or(Err("invalid"), valid);
+		};
 		let hash: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
 		// check every token so the time taken does not reveal which one matched
 		let mut found = Err("invalid");
-		for t in self.tokens.read().unwrap().iter() {
+		for t in tokens.iter() {
 			let ok = match &t.secret {
-				Secret::Plain(s) => constant_time_eq(s.as_bytes(), presented.as_bytes()),
-				Secret::Sha256(h) => constant_time_eq(h, &hash),
+				Some(Secret::Plain(s)) => constant_time_eq(s.as_bytes(), presented.as_bytes()),
+				Some(Secret::Sha256(h)) => constant_time_eq(h, &hash),
+				None => false,
 			};
 			if ok && found.is_err() {
-				found = if t.expires.is_none_or(|d| today <= d) { Ok(t.principal.clone()) } else { Err("expired") };
+				found = if t.client_cert.is_some() && !has_cert(t) { Err("client_cert") } else { valid(t) };
 			}
 		}
 		found
@@ -336,10 +433,10 @@ mod tests {
 		assert!(tokens.authenticate(Some(&format!("Bearer {}", sha("ui-secret")))).is_none(), "the hash is not the token");
 
 		let day = |s| parse_date(s).unwrap();
-		let ci = tokens.authenticate_on(Some("Bearer ci-secret"), day("2027-03-31")).unwrap();
+		let ci = tokens.authenticate_on(Some("Bearer ci-secret"), &[], day("2027-03-31")).unwrap();
 		assert!(!ci.has(Scope::RulesRead));
 		assert!(ci.may_use_ports(20000, 20010) && !ci.may_use_ports(19999, 20000) && !ci.may_use_ports(29999, 30000));
-		assert_eq!(tokens.authenticate_on(Some("Bearer ci-secret"), day("2027-04-01")).err(), Some("expired"));
+		assert_eq!(tokens.authenticate_on(Some("Bearer ci-secret"), &[], day("2027-04-01")).err(), Some("expired"));
 		// why a request is refused, for the audit log
 		assert_eq!(tokens.check(None).err(), Some("missing"));
 		assert_eq!(tokens.check(Some("Basic dTpw")).err(), Some("missing"));
@@ -361,8 +458,7 @@ mod tests {
 			(&format!("tokens:\n  - {{name: a, sha256: {}, scopes: [admin], expires: 2027-02-30}}\n", sha("a")), "YYYY-MM-DD"),
 			(&format!("tokens:\n  - {{name: a, sha256: {}, scope: [admin]}}\n", sha("a")), "unknown field"),
 			("tokens:\n  - {name: a, scopes: [admin]}\n", "give sha256"),
-			// v0.4 (#167): client certificates are refused until available
-			(&format!("tokens:\n  - {{name: a, sha256: {}, client_cert: ui.example, scopes: [admin]}}\n", sha("a")), "client_cert is not available"),
+			("tokens:\n  - {name: a, client_cert: ui.example, scopes: [admin]}\n  - {name: b, client_cert: ui.example, scopes: [admin]}\n", "another token"),
 			("tokens:\n  - {name: a, client_cert: 'a b', scopes: [admin]}\n", "certificate name"),
 			("tokens: []\n", "no tokens"),
 		] {
@@ -388,6 +484,53 @@ mod tests {
 		assert_eq!(tokens.persisting(), ["ci"]);
 		assert!(!tokens.authenticate(Some("Bearer ui")).unwrap().persist);
 		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+	}
+
+	/// v0.4 (#167): `client_cert` alone, or bound to a token.
+	#[test]
+	fn client_certificates() {
+		let file = tempfile(
+			"certs",
+			&format!(
+				"tokens:\n  - {{name: ui, client_cert: ui.rproxy.internal, scopes: [rules:read]}}\n  - {{name: ctl, sha256: {}, client_cert: 'spiffe://c/ns/x/sa/ctl', scopes: [admin], expires: 2027-01-31}}\n  - {{name: ci, sha256: {}, scopes: [rules:write]}}\n",
+				sha("ctl"),
+				sha("ci")
+			),
+		);
+		let tokens = Tokens::from_file(file.clone()).unwrap();
+		let day = |s| parse_date(s).unwrap();
+		let today = day("2027-01-01");
+		let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		let check = |h: Option<&str>, cert: &[String]| tokens.authenticate_on(h, cert, today);
+		// the certificate alone
+		let ui = check(None, &names(&["other", "ui.rproxy.internal"])).unwrap();
+		assert_eq!((ui.name.as_str(), ui.auth), ("ui", "cert"));
+		assert_eq!(check(None, &names(&["nobody"])).err(), Some("invalid"));
+		assert_eq!(check(None, &[]).err(), Some("missing"));
+		// a bearer token decides: an unknown one is not saved by the certificate
+		assert_eq!(check(Some("Bearer nope"), &names(&["ui.rproxy.internal"])).err(), Some("invalid"));
+		// a token bound to a certificate needs both
+		let ctl = check(Some("Bearer ctl"), &names(&["spiffe://c/ns/x/sa/ctl"])).unwrap();
+		assert_eq!((ctl.name.as_str(), ctl.auth), ("ctl", "token+cert"));
+		assert_eq!(check(Some("Bearer ctl"), &[]).err(), Some("client_cert"));
+		assert_eq!(check(Some("Bearer ctl"), &names(&["ui.rproxy.internal"])).err(), Some("client_cert"));
+		assert_eq!(tokens.authenticate_on(Some("Bearer ctl"), &names(&["spiffe://c/ns/x/sa/ctl"]), day("2027-02-01")).err(), Some("expired"));
+		// plain tokens work with or without a certificate
+		assert_eq!(check(Some("Bearer ci"), &names(&["ui.rproxy.internal"])).unwrap().auth, "token");
+		assert_eq!(tokens.expiries(), [("ctl".to_string(), day("2027-01-31"))]);
+
+		// client_cert needs the control API to ask for certificates
+		let e = Tokens::from_file(file.clone()).unwrap().with_client_auth(ClientAuth::None).err().unwrap().to_string();
+		assert!(e.contains("token ui: client_cert needs --tls-client-auth"), "{e}");
+		let tokens = Tokens::from_file(file.clone()).unwrap().with_client_auth(ClientAuth::Required).unwrap();
+		assert!(tokens.reload().is_ok());
+		let plain = tempfile("plain", "secret\n");
+		let tokens = Tokens::from_file(plain.clone()).unwrap().with_client_auth(ClientAuth::None).unwrap();
+		std::fs::copy(&file, &plain).unwrap();
+		assert!(tokens.reload().is_err(), "a reload adding client_cert is refused too");
+		assert!(tokens.authenticate(Some("Bearer secret")).is_some(), "the current tokens stay");
+		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+		std::fs::remove_dir_all(plain.parent().unwrap()).unwrap();
 	}
 
 	#[test]

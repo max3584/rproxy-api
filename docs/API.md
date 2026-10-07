@@ -28,10 +28,79 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 
     - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
-    - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`）、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
+    - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
   - SIGHUP を受けるとトークンファイルを読み直す。
 - `--api-addr` に loopback 以外のアドレスを含める場合は、`--token-file`、`--tls-cert`、`--tls-key` の指定が必須。どれかが欠けていると起動を拒否する。
+
+### 制御 API の守り（v0.4、#167）
+
+TCP の制御 API の守りを足す：クライアント証明書（mTLS）、トークンの期限の知らせ、認証の失敗が続く送信元の一時停止。**Unix ソケットはどれの対象でもない**（TLS がなく、ソケットのファイルの権限で守る。止められることもない）。
+
+| 引数 / 環境変数 | 既定 | 意味 |
+|---|---|---|
+| `--tls-client-ca` / `RPROXY_TLS_CLIENT_CA` | なし | クライアント証明書を確かめる CA（PEM。複数可）。`--tls-cert` が要る。SIGHUP と証明書のファイルの確認（`RPROXY_CERT_CHECK_SECS`）で読み直す |
+| `--tls-client-auth` / `RPROXY_TLS_CLIENT_AUTH` | `none` | `none`・`optional`（出されれば確かめる。ない接続はトークンで）・`required`（証明書がない・確かめられない接続は TLS のハンドシェイクで断る）。`optional` / `required` は `--tls-client-ca` が要る |
+| `--token-warn-days` / `RPROXY_TOKEN_WARN_DAYS` | `14` | トークンの `expires` がこの日数より近いと `token.expiring` を出す（1〜3650） |
+| `--api-lockout-failures` / `RPROXY_API_LOCKOUT_FAILURES` | `20` | `window` の間に認証に失敗（401）した回数がこれに達した送信元を止める。`0` で止めない |
+| `--api-lockout-window` / `RPROXY_API_LOCKOUT_WINDOW` | `1m` | 数える時間（1s〜24h） |
+| `--api-lockout-duration` / `RPROXY_API_LOCKOUT_DURATION` | `5m` | 止める時間（1s〜24h） |
+
+**クライアント証明書（mTLS）**：トークンファイル（YAML）のエントリに `client_cert` を書く。値は証明書の名前で、DNS か URI の subjectAltName（なければ subject の CN）と完全一致で比べる。
+
+```yaml
+tokens:
+  - name: ui
+    client_cert: ui.rproxy.internal      # 証明書だけで通す（Authorization は要らない）
+    scopes: [rules:read, rules:write, metrics:read]
+  - name: gateway-controller
+    sha256: 9f86d0...
+    client_cert: spiffe://cluster.local/ns/rproxy/sa/controller   # トークンと証明書の両方が要る
+    scopes: [rules:read, rules:write]
+```
+
+- `sha256` と `client_cert` のどちらかは要る。**両方あれば両方が要る**：トークンが合っても、接続の証明書にその名前がなければ `401`（監査ログの `reason: "client_cert"`）。`client_cert` だけのエントリは証明書だけで通す（`sha256` のない 2 つのエントリに同じ `client_cert` は書けない）。
+- `Authorization: Bearer` を付けたリクエストは、そのトークンで確かめる（知らないトークンなら、証明書だけで通るエントリがあっても `401`）。付けなければ、証明書の名前で `client_cert` だけのエントリを探す。
+- 証明書は `--tls-client-ca` の CA が発行したもの（期限内・クライアント認証の用途）だけが通る。ほかの CA のものはハンドシェイクで断る。
+- `client_cert` のあるトークンファイルで `--tls-client-auth` が `none` なら、起動を止める設定のエラー（SIGHUP の読み直しなら今のトークンを使い続ける）。使えないエントリを黙って無視しない。平文の HTTP や Unix ソケットでは証明書がないので、`client_cert` だけのエントリは使えない。
+- 監査ログ（`event = "audit"`）に `auth`（`token`・`cert`・`token+cert`）が付く。
+
+**トークンの期限**：
+
+- 起動・SIGHUP・1 日 1 回、`expires` が `--token-warn-days` より近いトークンを `token.expiring`（`token`・`expires`・`days_left`）、切れたトークンを `token.expired`（`token`・`expires`）で知らせる（`warn`）。トークンごとに状態が変わったときに 1 回だけ。`expires` の日（UTC）の終わりまで有効。
+- `/metrics` に `rproxy_token_expiry_timestamp_seconds{token}`（有効でなくなる時刻、Unix 秒）。
+
+**失敗が続く送信元の一時停止**（既定で有効：1 分に 20 回で 5 分）：
+
+- TCP の制御 API で、`401` になった送信元の IP（IPv6 は /64 でまとめる）ごとに数え、`window` の間に `failures` に達したら `duration` の間、その送信元のリクエストをトークンを見ずに `429 locked_out` で断る（`Retry-After` に残りの秒）。`/healthz`・`/readyz` は止めない。`403`（スコープ不足）は数えない。
+- 止めたときに `api.lockout`（`client`・`failures`・`until`（Unix 秒）・`duration_secs`、`warn`）、解いたときに `api.unlock`（`client`）。止めている間の拒否は `event = "audit"`・`outcome: "locked_out"`（ほかの拒否と同じく送信元ごとに間引く）。
+- `/metrics` に `rproxy_api_lockouts_total`（止めた回数）・`rproxy_api_locked_sources`（今止めている送信元の数）。
+- 覚える送信元は 4096 まで（あふれたら、止めていない送信元のうち古いものから忘れる）。プロセスの中だけで覚え、再起動で消える。
+- 同じ IP の後ろにいる正しいクライアントも一緒に止まる。UI を同じホストに置くなら Unix ソケットでつなぐと影響を受けない。
+
+**トークン・証明書の入れ替え**（止めずに入れ替える）：
+
+1. 新しいトークン（`sha256`）をトークンファイルに足して SIGHUP（`systemctl reload rproxy-api`）。この間は新旧どちらでも通る。
+2. クライアント（UI・CI など）を新しいトークンに切り替える。
+3. 古いトークンをトークンファイルから消して SIGHUP。
+
+- `expires` を付けておくと、切れる前に `token.expiring` で知らせる（`--token-warn-days`）。
+- クライアント証明書は、同じ名前で新しい証明書を発行してクライアントに配る（トークンファイルは変えなくてよい）。名前を変えるときは、新しい名前のエントリを足す → クライアントを切り替える → 古いエントリを消す（どれも SIGHUP）。
+- CA を入れ替えるときは、`--tls-client-ca` のファイルに新旧の CA を並べて SIGHUP → クライアントの証明書を新しい CA のものに替える → 古い CA を消して SIGHUP。
+
+**UI（TCP-UDP-rproxy-ui）の側**（UI が実装するときの取り決め）：
+
+| UI の環境変数 / `nodes.yaml` のノードの項目 | 意味 |
+|---|---|
+| `RPROXY_API_CA_FILE` / `ca_file` | rproxy の制御 API のサーバ証明書を確かめる CA（PEM）。`https://` で、公的な CA でないときに使う |
+| `RPROXY_API_CERT_FILE` / `cert_file` | UI が出すクライアント証明書（PEM。中間 CA があれば続けて書く） |
+| `RPROXY_API_KEY_FILE` / `key_file` | その秘密鍵（PEM）。UI を動かすユーザーだけが読めるようにする |
+
+- `RPROXY_API_URL`（ノードの `url`）は `https://` にする。`unix:` では証明書を使わない（トークンで通す）。
+- `cert_file` / `key_file` を指定し、rproxy の `client_cert` だけのエントリ（例：`client_cert: ui.rproxy.internal`）に当たるなら、`RPROXY_API_TOKEN`（`token_file`）は省ける。`sha256` と `client_cert` の両方があるエントリなら両方を指定する。
+- 片方だけ（`cert_file` だけ・`key_file` だけ）は UI の設定のエラー。ファイルが変わったら（証明書の更新）新しい接続から読み直す（または UI を再起動する）。
+- rproxy が `429 locked_out` を返したら、`Retry-After` の間は送り直さず、画面に「認証の失敗が続いたため一時的に止められている」と出す。`401` を自動で繰り返さない（一時停止の回数に入る）。
+- `GET /capabilities` の `features.client_cert_auth` で、rproxy がクライアント証明書に対応しているかを確かめられる。
 
 ## ルール
 
@@ -393,16 +462,59 @@ v0.4.0 で形を決めた設定（docs/DESIGN-v0.4.md）。v0.4.0 は全部の�
 | GeoIP（#168。**動く**、下の「GeoIP」） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
 | 受け身のヘルスチェック（#170。**動く**、下の「受け身のヘルスチェック」） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
 | performance（#194・#184） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）。環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` より設定ファイルが先。再起動まで効かない | `performance`（効く項目の名前） |
-| ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「エンドポイント」 | `rulesets` |
-| 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy` | `conditions` |
+| ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「ルールの組・状態・readiness」 | `rulesets` |
+| 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy`（下の「ルールの組・状態・readiness」） | `conditions` |
 | readiness（#28） | `GET /readyz` | 認証なし。`200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
 | 変更前の差分（#169） | `?dry_run=true`（`POST /rules`・`PATCH`・`DELETE`・`PUT /rulesets/{name}`・`POST /config/reload`）、`POST /config/plan`、`--check-config --diff` | 応答は `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`。`change` は `none`・`in_place`・`recreate` | `dry_run` |
 | API で作ったルールの保存（#144） | トークンの `persist: true`、テーブル `rproxy_rules`、`--node-name` | 表示に `origin: "api"`・`persisted`・`created_by`・`created_at` | `persistence` |
-| 制御 API の守り（#167） | `--tls-client-ca`・`--tls-client-auth`、トークンの `client_cert`、`--token-warn-days`、`--api-lockout-failures`・`--api-lockout-window`・`--api-lockout-duration` | `client_cert` はトークンの `sha256` の代わり、両方あれば両方が要る。期限が近いトークンは `token.expiring`、続けて失敗した送信元は `429 locked_out` | `client_cert_auth`、`token_expiry`、`api_lockout` |
+| 制御 API の守り（#167。動く） | `--tls-client-ca`・`--tls-client-auth`、トークンの `client_cert`、`--token-warn-days`、`--api-lockout-failures`・`--api-lockout-window`・`--api-lockout-duration` | `client_cert` はトークンの `sha256` の代わり、両方あれば両方が要る。期限が近いトークンは `token.expiring`、続けて失敗した送信元は `429 locked_out`（既定で有効）。上の「制御 API の守り」 | `client_cert_auth`、`token_expiry`、`api_lockout` |
 | 再起動なしの更新・自動更新（#174） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから | `handoff`、`self_update` |
 
 - `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。DB の `options` でも同じ形で読む。
 - ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）、`stats.targets[]` に `ejected_until`・`ejections`（#170）が、動くようになったら出る。
+- トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。詳しくは上の「制御 API の守り」。
+
+### ルールの組・状態・readiness（Kubernetes のコントローラ向け、#28）
+
+Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway`）は、この API だけで rproxy を動かす。正確な形は `docs/openapi.json`（`GET /openapi.json`）。
+
+**ルールの組（ruleset）**：`PUT /rulesets/{name}` に「その組のルールの全体」を毎回まとめて送ると、rproxy が今のルールとの差を当てる（宣言的。途中で落ちても次の PUT で揃う）。
+
+- 名前は `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?`（例 `k8s/default/web-gateway`）。パスの `/` はそのまま書く（`PUT /rulesets/k8s/default/web-gateway`）。
+- 本文は `{"generation": <整数>, "rules": [<POST /rules と同じルール>...]}`（ルールは 10,000 個まで、本文は 32 MiB まで）。同じキーのルールを 2 つ書くと `400 invalid`。
+- 順番：まず全部を確かめ、どれかが通らなければ**何も変えない**。
+  1. `If-Match`（あれば）：今の etag と違う、または組がまだないと `412 precondition_failed`。`*` は「組があれば」。ETag ヘッダの引用符つきの値でも、本文の `etag` の値そのままでもよい（`W/`・カンマ区切りも受ける）。
+  2. `generation`：覚えている値より小さいと `409 stale_generation`（同じ値はよい）。
+  3. 各ルールの形（`POST /rules` と同じ検証。この版で動かせない設定は `unsupported`）と、本文の中のルール同士の重なり（`400 invalid`）。
+  4. 組の外のルールとの取り合い：設定ファイルのルールと同じキーは `409 static`、ほかの組のルールは `409 owned`、`POST /rules` で作ったルールや待ち受けが重なるルールは `409 already_exists`、制御 API のアドレスは `409 reserved`。
+  5. 作る・変える・消すルールの待ち受けポートがトークンの `allow_listen_ports` の内か（外なら `403`）、ACME の証明書を使うルールには `acme:write`。
+  6. 作る・変えるルールの証明書・秘密のファイルが読めるか（`400 tls_config` / `invalid`）。
+  - 断るときの本文は `{"code","error","errors":[{"index","rule","code","message"}]}`。`code` と `error`（`rules[i]: ...`）は最初の問題、`errors` はルールの問題のすべて（`index` は本文の `rules` の何番目か）。
+- 当て方：組から外れたルールを先に止め（接続は切れる）、変わったルールは PATCH で接続を切らずに変えられる違い（宛先・`balance`・`health_check`・時間・TLS・`allow_from`・`extra_listen_addrs`・`http`・`labels` などの v0.4 の設定）ならその場で変え（`change: in_place`）、そうでなければ（ポートの範囲・`source_ip`・`http` の有無）待ち受けを作り直す（`recreate`）。新しいルールは作り、変わらず動いているルールには触らない（`none`）。`failed` のルールは変わっていなくても作り直す。
+- bind・名前解決に失敗したルールはそのルールだけ `failed` に登録して（理由は `conditions`）、残りは当てる。応答は `200` で、ルールごとの結果を返す：`{"name","generation","etag","dry_run":false,"results":[{"rule":"tcp/0.0.0.0:443","action":"create|update|delete|none","change":"none|in_place|recreate","state":"running|failed","error"}]}`（本文の順、その後に消したルール。`delete` には `state` がない）。応答の `ETag` ヘッダは `etag` を `"` で囲んだもの。
+- etag は `g<generation>-<ルールの正規化した JSON（キーの順）の SHA-256 の先頭 16 桁>`。ルールか `generation` が変わると変わり、状態（`running` / `failed`）では変わらない。
+- `?dry_run=true`：同じ確かめをして、変えずに結果（`dry_run: true`、なるはずの `etag`、`update` には `diff`）を返す。`features.dry_run`（#169）が false の間は、確かめた後に `400 unsupported`。
+- 組のルールは `GET /rules` にも出て `ruleset: "<名前>"` が付く（`origin` は `dynamic`）。個別の `PATCH` / `DELETE /rules/...` は `409 owned`（変えるなら組を PUT する）。`POST /rules` で同じキーは `409 already_exists`。
+- `GET /rulesets/{name}`：`{"name","generation","etag","updated_at","updated_by","rules":[<GET /rules と同じ表示>...]}`（キーの順、`ETag` ヘッダつき）。`updated_by` は最後に PUT したトークンの名前（トークンファイルがなければ空）。`GET /rulesets` は名前の順の一覧（`rules` は数）。
+- `DELETE /rulesets/{name}?drain_secs=N`：組のルールを同時に止めて組を消す（`drain_secs` の間、各ルールの接続の終わりを待つ）。`If-Match` も使える。全部の接続が終わってから `204`。
+- 組は rproxy のメモリにだけあり、DB にも設定ファイルにも書かない。rproxy を再起動したら、コントローラは `GET /readyz` が 200 になってから組を PUT し直す。組の変更は 1 つずつ順に行う（読むのは待たない）。
+- ログ：`event = "ruleset.apply"`（`ruleset`・`generation`・`etag`・`created`・`updated`・`deleted`・`unchanged`・`failed`・`by`）、`ruleset.delete`（`ruleset`・`rules`）。個々のルールの `rule.create` / `rule.update` / `rule.delete` にも `ruleset` が付く。`audit` は `action: ruleset.put` / `ruleset.delete` と `ruleset`。
+
+**ラベル**：ルールの `labels`。動きには使わず、`rule.create` / `rule.update` のログ（`labels: "k=v,k2=v2"`）と `/metrics` の `rproxy_rule_labels{rule="tcp/0.0.0.0:443",label_tenant="act"} 1` に出す（キーの英数字以外は `_`。同じ名前になるキーは名前の順で先のものだけ）。`PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。
+
+**状態（conditions）**：どのルールの表示にも（組でなくても）、次の 4 つがこの順で付く（Gateway API の status にそのまま写せる形）。`message` は `True` のとき空。
+
+| type | `True` の reason | `False` の reason |
+|---|---|---|
+| `Accepted` | `Accepted` | `Unsupported`（この版・この環境で動かせない設定。起動時・再読み込みのルール） |
+| `Programmed` | `Listening`（`state: running`） | `BindFailed`（ポートを開けない）、`Pending`（転送先の名前解決を待って再試行中）、`Failed`（その他） |
+| `ResolvedRefs` | `ResolvedRefs` | `ResolveFailed`（名前解決できない転送先がある）、`CertificateExpired`（サーバ証明書が切れた）、`CertificateUnreadable`（証明書・鍵・CA を読めない）、`SecretUnreadable`（ミドルウェアの秘密のファイルを読めない） |
+| `BackendsHealthy` | `Healthy` | `AllTargetsDown`（すべての宛先が down）、`ServiceDown`（サーバがすべて down の `http` のサービスがある。`message` に名前）。動いていないルールは `status: "Unknown"`・`NotProgrammed` |
+
+- `last_transition` は `status` が最後に変わった Unix 秒（`reason`・`message` だけが変わっても動かない）。`Programmed` の `True` は `started_at` から。ほかの変化はルールを読んだとき（`GET /rules`・`GET /rulesets/{name}`・PUT の応答）に気づいた時刻。ルールを消す・作り直すと最初から。
+- 今までの `state`・`error`・`all_targets_down`・`down_services` もそのまま（UI が使う）。
+
+**readiness**：`GET /readyz`（認証なし、`/healthz` と同じ）。起動時の復元（設定ファイル・DB）が終わると `200 {"ready": true}`、その前と、終了の処理に入った後（#174 の引き継ぎでも）は `503 {"ready": false, "reason": "starting" | "draining"}`。ルールの失敗は readiness に含めない（ルールの状態は `conditions`）。生きているかは今までどおり `/healthz`。
 
 ### GeoIP（#168）
 
@@ -460,7 +572,6 @@ rules:
 - 外したサーバは `stats.http.services.<名前>` のサーバに `"ejected": true`（`up` は false。`outlier_detection` のあるサービスは `health_check` がなくても出る）、`/metrics` の `rproxy_http_server_up` も 0。すべてのサーバが外れていて（`max_ejected_percent: 100`）、ヘルスチェックで up のものがあれば、それを使う。
 - ログは `target.down`（`reason: "outlier"`、`rule`、`service`、`server`、`cause`：越えたしきい値 `consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`、`ejection_secs`、`ejections`）/ `target.up`（`reason: "outlier"`）。
 - `http` を変えると数え直し（`Router` を組み立て直すため）。
-- トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。
 
 ## エンドポイント
 
@@ -482,16 +593,16 @@ rules:
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
 | `POST /acme/accounts/{name}/register` | | 200 | アカウントを CA に作る（鍵があればそのアカウントを探す）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
 | `POST /acme/accounts/{name}/deactivate` | | 200 | アカウントを CA で無効にし、鍵を `<key_file>.deactivated` に退ける（次の注文で新しいアカウントを作る）。スコープと Unix ソケットは `POST /acme/renew` と同じ |
-| `GET /readyz` | | 200 / 503 | v0.4（#28）：認証不要の readiness。上の「v0.4 の設定」（`features.readyz` が false の間は `400 unsupported`） |
+| `GET /readyz` | | 200 / 503 | v0.4（#28）：認証不要の readiness。`200 {"ready":true}` / `503 {"ready":false,"reason":"starting"\|"draining"}`（上の「ルールの組・状態・readiness」） |
 | `GET /rulesets` | | 200 | v0.4（#28）：ルールの組の一覧 `[{"name","generation","etag","rules","updated_at","updated_by"}]`。`rules:read` |
-| `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
-| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。docs/DESIGN-v0.4.md 3. |
-| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて消す。`rules:write` |
+| `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","updated_at","updated_by","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
+| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。詳しくは上の「ルールの組・状態・readiness」 |
+| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて同時に止めて組を消す（`If-Match` も使える）。`rules:write` |
 | `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |
 | `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ）。`admin`、既定では Unix ソケットからだけ |
 | `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current","available","last_check","error","bad_versions"}`。`admin` |
 | `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ、`RPROXY_UPDATE=auto` なら入れ替える。`admin`、既定では Unix ソケットからだけ |
-| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total` |
+| `GET /metrics` | | 200 | Prometheus 形式。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
 
@@ -505,7 +616,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 
 | `code` | HTTP | 意味 |
 |---|---|---|
-| `unauthorized` | 401 | トークンがない、一致しない、または期限切れ |
+| `unauthorized` | 401 | トークンがない、一致しない、期限切れ、またはトークンに結びついたクライアント証明書がない |
 | `forbidden` | 403 | トークンのスコープ、または `allow_listen_ports` の外 |
 | `invalid` | 400 | 本文やパスが不正 |
 | `tls_config` | 400 | TLS の設定の組み合わせが不正、または証明書・鍵・CA のファイルを読めない |
@@ -524,13 +635,14 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 
 ## API・設定ファイル・UI（DB）の関係
 
-rproxy のルールには 3 つの出どころがある。どれも `GET /rules` に出る。
+rproxy のルールには 4 つの出どころがある。どれも `GET /rules` に出る。
 
 | 出どころ | `origin` | 正はどこか | 変え方 |
 |---|---|---|---|
 | 設定ファイル（`RPROXY_CONFIG`） | `static` | ファイル | ファイルを書き換える（自動で反映）。API からは `409 static` |
 | UI（TCP-UDP-rproxy-ui） | `dynamic` | UI の DB（`forward_rules`） | UI から。UI は DB に書いてから rproxy の API を呼ぶ。rproxy は起動時に DB から復元する |
 | API を直接呼ぶ（CI・スクリプト） | `dynamic` | rproxy のメモリだけ | API から。DB には書かれないので、rproxy を再起動すると消える |
+| ルールの組（Kubernetes のコントローラ、v0.4） | `dynamic`（`ruleset` つき） | コントローラ（rproxy はメモリだけ） | `PUT /rulesets/{name}`。個別の `PATCH` / `DELETE` は `409 owned`。再起動したらコントローラが PUT し直す |
 
 - 長く残すルールは、設定ファイルか UI（DB）で作る。API を直接呼んで作ったルールは一時的なもの（CI のプレビュー環境など）として扱う。
 - UI は DB にないルールを編集しない。API で作ったルールは UI の一覧に出ず、DB にあるが rproxy にないルールは UI で「未登録」（missing）になる。
