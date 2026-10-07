@@ -25,7 +25,8 @@ sleep 0.5
 [ "$(env_of RPROXY_API_PORT)" = 8081 ] || fail "did not move off the busy port 8080"
 systemctl is-active --quiet rproxy-api || fail "not running"
 systemctl is-enabled --quiet rproxy-api || fail "not enabled"
-[ "$(ps -o user= -C rproxy-api | tr -d ' ')" = rproxy ] || fail "not running as rproxy"
+[ "$(ps -o uid= -C rproxy-api | tr -d ' ')" = "$(id -u rproxy-api)" ] || fail "not running as rproxy-api"
+[ "$(id -gn rproxy-api)" = rproxy ] || fail "rproxy-api's primary group is not rproxy"
 [ "$(stat -c '%a %U:%G' /etc/rproxy/tokens)" = "640 root:rproxy" ] || fail "tokens mode/owner"
 [ "$(stat -c '%a %U:%G' /etc/rproxy/rproxy.env)" = "640 root:root" ] || fail "env mode/owner"
 grep -Eqx '[0-9a-f]{64}' /etc/rproxy/tokens || fail "token format"
@@ -120,6 +121,19 @@ echo "== binary: uninstall keeps the configuration, purge removes it"
 [ -e /etc/rproxy/tokens ] || fail "uninstall removed the token"
 "$install" --uninstall --purge
 if [ -e /etc/rproxy ] || [ -e /var/log/rproxy ]; then fail "purge left files behind"; fi
+
+echo "== binary: from v0.3 (user rproxy, same uid as rproxy-api)"
+userdel rproxy-api 2>/dev/null || true
+getent passwd rproxy >/dev/null || useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy
+old_uid=$(id -u rproxy)
+install -d -m 0750 /etc/rproxy
+install -o rproxy -g rproxy -m 0640 /dev/null /etc/rproxy/service.key
+"$install" --method binary --binary "$bin"
+! getent passwd rproxy >/dev/null || fail "the rproxy user is still there"
+[ "$(id -u rproxy-api)" = "$old_uid" ] || fail "rproxy-api does not have rproxy's uid"
+[ "$(stat -c '%U:%G' /etc/rproxy/service.key)" = rproxy-api:rproxy ] || fail "the service's files changed owner"
+systemctl is-active --quiet rproxy-api || fail "not running after the rename"
+"$install" --uninstall --purge
 
 echo "== apt: install the published package"
 "$install" --method apt

@@ -2,8 +2,23 @@
 set -e
 
 if [ "$1" = "configure" ]; then
-	if ! getent passwd rproxy >/dev/null; then
-		useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy
+	# v0.4: the service runs as user rproxy-api, primary group rproxy (the UI's user
+	# rproxy-ui may be a member of group rproxy to share files by group read)
+	if ! getent group rproxy >/dev/null; then
+		groupadd --system rproxy
+	fi
+	if getent passwd rproxy >/dev/null && ! getent passwd rproxy-api >/dev/null; then
+		# from v0.3: rename the user, keeping its uid (and so the owner of its files);
+		# usermod refuses while the old process runs, and v0.3 -> v0.4 restarts anyway
+		if [ -d /run/systemd/system ] && systemctl is-active --quiet rproxy-api; then
+			systemctl stop rproxy-api || true
+			restart_after_rename=1
+		fi
+		usermod -l rproxy-api -g rproxy rproxy
+		echo "rproxy-api: the user rproxy is now rproxy-api (same uid)"
+	fi
+	if ! getent passwd rproxy-api >/dev/null; then
+		useradd --system --gid rproxy --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin rproxy-api
 	fi
 	# the ACME helper's user (rproxy-acme-helper.service, docs/ACME.md): holds DNS-01 secrets
 	if ! getent passwd rproxy-acme >/dev/null; then
@@ -12,7 +27,7 @@ if [ "$1" = "configure" ]; then
 	chgrp rproxy /etc/rproxy
 	chmod 0750 /etc/rproxy
 	# RPROXY_LOG_FILE の既定の置き場所（systemd の LogsDirectory も同じ場所を使う）
-	install -d -o rproxy -g rproxy -m 0750 /var/log/rproxy
+	install -d -o rproxy-api -g rproxy -m 0750 /var/log/rproxy
 	# a first API token, only when there is none yet
 	if [ ! -e /etc/rproxy/tokens ]; then
 		umask 027
@@ -46,7 +61,10 @@ fi
 # (/usr/share/rproxy-api/restart-required), restarts it
 if [ "$1" = "configure" ] && [ -n "$2" ] && [ -d /run/systemd/system ]; then
 	systemctl daemon-reload || true
-	if systemctl is-active --quiet rproxy-api; then
+	if [ -n "${restart_after_rename:-}" ]; then
+		echo "rproxy-api: $2 -> $(dpkg-query -W -f='${Version}' rproxy-api 2>/dev/null || true); starting as rproxy-api"
+		systemctl start rproxy-api || true
+	elif systemctl is-active --quiet rproxy-api; then
 		new=$(dpkg-query -W -f='${Version}' rproxy-api 2>/dev/null || true)
 		old_minor=$(echo "$2" | cut -d. -f1,2)
 		new_minor=$(echo "$new" | cut -d. -f1,2)

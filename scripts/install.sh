@@ -221,13 +221,23 @@ install_binary() {
 	chmod 0755 "$tmp/rproxy-api"
 	"$tmp/rproxy-api" --version >/dev/null 2>&1 || die "このバイナリはこの環境で実行できません"
 
-	if ! getent passwd rproxy >/dev/null; then
-		log "rproxy ユーザーを作ります"
-		useradd --system --user-group --no-create-home --home-dir /nonexistent \
-			--shell "$(command -v nologin || echo /bin/false)" rproxy
+	# v0.4: user rproxy-api, primary group rproxy (the UI's user may join group rproxy)
+	getent group rproxy >/dev/null || groupadd --system rproxy
+	if getent passwd rproxy >/dev/null && ! getent passwd rproxy-api >/dev/null; then
+		# from v0.3: same uid, so its files stay its own; usermod refuses while it runs
+		log "rproxy ユーザーを rproxy-api に改名します（uid は同じ）"
+		if systemctl is-active --quiet "$UNIT"; then
+			systemctl stop "$UNIT" || true
+		fi
+		usermod -l rproxy-api -g rproxy rproxy
+	fi
+	if ! getent passwd rproxy-api >/dev/null; then
+		log "rproxy-api ユーザーを作ります"
+		useradd --system --gid rproxy --no-create-home --home-dir /nonexistent \
+			--shell "$(command -v nologin || echo /bin/false)" rproxy-api
 	fi
 	install -d -o root -g rproxy -m 0750 "$ETC"
-	install -d -o rproxy -g rproxy -m 0750 "$LOG_DIR"
+	install -d -o rproxy-api -g rproxy -m 0750 "$LOG_DIR"
 	if [ ! -e "$ENV_FILE" ]; then
 		template debian/rproxy.env "$tmp/rproxy.env"
 		install -o root -g root -m 0640 "$tmp/rproxy.env" "$ENV_FILE"
@@ -330,7 +340,7 @@ if [ -n "$static_rules" ]; then
 	case $static_rules in
 		/home/* | /root/* | /tmp/*) die "--static-rules は /etc/rproxy などに置いてください（サービスからは /home・/root・/tmp が見えません）" ;;
 	esac
-	runuser -u rproxy -- test -r "$static_rules" || die "rproxy ユーザーが $static_rules を読めません（chgrp rproxy と chmod g+r を）"
+	runuser -u rproxy-api -- test -r "$static_rules" || die "rproxy-api ユーザーが $static_rules を読めません（chgrp rproxy と chmod g+r を）"
 	set_env RPROXY_STATIC_RULES "$static_rules"
 fi
 case $log_file in
