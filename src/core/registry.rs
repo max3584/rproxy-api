@@ -1174,6 +1174,40 @@ impl Registry {
 		self.rules.lock().await.insert(key, Entry::Failed(Failed { generation, spec, error, retry }));
 	}
 
+	/// The running rules' runtimes (a live upgrade reads and adds counters, #174).
+	pub async fn runtimes(&self) -> Vec<(Key, Arc<Runtime>)> {
+		self.rules
+			.lock()
+			.await
+			.iter()
+			.filter_map(|(k, e)| match e {
+				Entry::Running(r) => Some((*k, r.rt.clone())),
+				Entry::Failed(_) => None,
+			})
+			.collect()
+	}
+
+	/// Stops accepting on every rule at once, lets the connections end until
+	/// `until` is done, then closes the rest (after a live upgrade, #174).
+	pub async fn drain_all(&self, until: impl std::future::Future<Output = ()>) {
+		let entries: Vec<(Key, Entry)> = self.rules.lock().await.drain().collect();
+		let mut trackers = vec![];
+		for (_, entry) in &entries {
+			if let Entry::Running(r) = entry {
+				r.rt.stop.cancel();
+				r.rt.tracker.close();
+				trackers.push(r.rt.tracker.clone());
+			}
+		}
+		tokio::select! {
+			_ = futures_util::future::join_all(trackers.iter().map(|t| t.wait())) => {}
+			_ = until => {}
+		}
+		for (key, entry) in entries {
+			self.stop_entry(&key, entry, None).await;
+		}
+	}
+
 	pub async fn shutdown(&self) {
 		let entries: Vec<(Key, Entry)> = self.rules.lock().await.drain().collect();
 		for (key, entry) in entries {

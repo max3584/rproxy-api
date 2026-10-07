@@ -64,7 +64,7 @@ English: [PERFORMANCE.md](en/PERFORMANCE.md)
 - UDP のセッションの 64 KiB のバッファは、musl では使わないページが RSS に出なかったが、mimalloc では全部数えられた（1 万ポートの範囲で 650 MiB）。この受信バッファだけ `std::alloc::System` から取る（`RecvBuf`）。
 
 ### UDP のソケットを既定で分割する（`SO_REUSEPORT`）
-- 分割（ワーカーの数）で届く量はさらに +3.5%、取りこぼし 45% → 34% だが、CPU が増え、CPU あたりの量は分割しないほうが上。受信が速くなった分、セッションの処理と受け側が詰まるようになった。既定は 1 本、`RPROXY_UDP_SHARDS` で増やせる（設定の形は v0.4.0）。コアに余裕のあるマシンで測ってから見直す。
+- 分割（ワーカーの数）で届く量はさらに +3.5%、取りこぼし 45% → 34% だが、CPU が増え、CPU あたりの量は分割しないほうが上。受信が速くなった分、セッションの処理と受け側が詰まるようになった。既定は 1 本、`global.performance.udp_shards`（v0.4。`auto` でワーカーの数）か `RPROXY_UDP_SHARDS` で増やせる。コアに余裕のあるマシンで測ってから見直す。
 - UDP の GRO / GSO（quinn-udp）は使っていない。quinn-udp は DF を立てる（`IP_MTU_DISCOVER`）ので、汎用の UDP の転送で動きが変わる。GRO は多数のクライアントからの小さなパケットにはほぼ効かない。
 
 ### HTTP/2 の大きな処理を Box に入れる

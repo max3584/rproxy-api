@@ -5,7 +5,10 @@ Wants=network-online.target
 After=network-online.target mariadb.service
 
 [Service]
-Type=simple
+# READY=1 once started; a live upgrade (SIGUSR2, #174) hands the service to the
+# new process with MAINPID= (sent by the old process, hence NotifyAccess=all)
+Type=notify
+NotifyAccess=all
 User=rproxy
 Group=rproxy
 # RPROXY_* settings, e.g. RPROXY_API_ADDR, RPROXY_TOKEN_FILE, RPROXY_STATIC_RULES, RPROXY_DATABASE_URL
@@ -16,6 +19,8 @@ ExecStart=/usr/local/bin/rproxy-api
 # without signalling (`systemctl reload` reports it; see journalctl)
 ExecReload=/usr/local/bin/rproxy-api --check-config
 ExecReload=/bin/kill -HUP $MAINPID
+# a live upgrade to the binary on disk (same major.minor; docs/UPGRADE.md):
+#   systemctl kill -s USR2 --kill-whom=main rproxy-api
 Restart=on-failure
 RestartSec=2
 

@@ -64,7 +64,7 @@ The work is tracked in the milestone "performance" with the label "area: perform
 - The 64 KiB UDP session buffers: under musl, untouched pages didn't count in RSS; under mimalloc they all did (650 MiB on a 10000-port range). These receive buffers now come from `std::alloc::System` (`RecvBuf`).
 
 ### UDP sharding by default (`SO_REUSEPORT`)
-- One socket per worker added +3.5% delivered and cut loss 45% → 34%, but used more CPU, and per-CPU throughput was better without it. Faster receiving moved the bottleneck to session handling and the receiver. Default is 1; `RPROXY_UDP_SHARDS` raises it (the setting's shape is decided in v0.4.0). Revisit on machines with spare cores.
+- One socket per worker added +3.5% delivered and cut loss 45% → 34%, but used more CPU, and per-CPU throughput was better without it. Faster receiving moved the bottleneck to session handling and the receiver. Default is 1; `global.performance.udp_shards` (v0.4; `auto` = the workers) or `RPROXY_UDP_SHARDS` raises it. Revisit on machines with spare cores.
 - UDP GRO / GSO (quinn-udp) isn't used: quinn-udp sets DF (`IP_MTU_DISCOVER`), which changes behaviour for generic UDP forwarding, and GRO barely helps with small packets from many clients.
 
 ### Boxing the large HTTP/2 futures

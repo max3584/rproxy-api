@@ -7,6 +7,7 @@ English: [TESTING.md](en/TESTING.md)
 | `cargo test` | 単体テスト（`src/`）と結合テスト（`tests/`） | `test` |
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore` | MariaDB からの復元。変数がなければスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
 | `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME（docs/ACME.md）：Pebble（ACME の試験用の CA）と PowerDNS を起動して、HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS の API・RFC 2136（PowerDNS の DNS UPDATE、TSIG の HMAC-SHA256 と SHA512）・acme-dns（小さな偽物）・CNAME の委任・汎用の REST）で実際に証明書を取る。変数がなければその部分はスキップ（API の守りの試験はいつも動く）。`RPROXY_TEST_REQUIRE_ACME=1` でスキップを失敗にする | `test`（同じコンテナで Alpine の `pebble`・`pdns`・`pdns-backend-sqlite3`・`pdns-doc`・`sqlite`。`RPROXY_TEST_REQUIRE_ACME=1`） |
+| `cargo test --test self_update` | 自動更新（#174）：署名つきのリリースのミラー（HTTPS）から取って確かめ、引き継ぎで入れ替える・起動役（`launch`）・ロールバック。minisign の道具で作った署名を確かめる試験は、`minisign` がなければスキップ（`RPROXY_TEST_REQUIRE_MINISIGN=1` でスキップを失敗にする） | `test`（Alpine の `minisign`。`RPROXY_TEST_REQUIRE_MINISIGN=1`） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
@@ -185,10 +186,11 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 
 | テスト | 確かめること |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout` は true）、`performance` が空 |
+| `capabilities_list_the_v0_4_features_as_off` | `features` のまだの v0.4 の印が false（実装した `client_cert_auth`・`token_expiry`・`api_lockout`・`handoff`・`self_update` は true） |
+| `upgrade_and_update_endpoints_answer`・`performance_keys_are_all_applied` | 実装した #174・performance：`handoff`・`self_update` が true、`build`、ライブラリとして組んだルーターでの `/admin/*` の答え（Unix ソケットだけの決まり、`GET /admin/update` は `mode: off`）、`features.performance` がすべての項目 |
 | `labels_…`・`limits_…`・`bandwidth_…`・`geoip_…`・`outlier_detection_…` | 正しい形は `400 unsupported`、誤った形は `400 invalid`。PATCH でも同じで、`{}` は外す（受け付ける）。ミドルウェアの `geoip`・サービスの `outlier_detection` も |
-| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`upgrade_and_update_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
-| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・`global.performance.*`・ルール）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
+| `rulesets_and_readyz_…`・`dry_run_…`・`config_plan_…`・`new_endpoints_need_their_scopes` | 新しいエンドポイントは本文・名前・`dry_run` を確かめてから `unsupported`。スコープと Unix ソケットだけの決まり。dry run は何も変えない |
+| `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラー、まだ動かない設定を警告にする（`global.geoip`・ルール。`global.performance` は動くので警告しない）。`--diff` はまだ使えない。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
 
 ## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
@@ -200,6 +202,35 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形を確かめ、まだ動かない�
 | `lockout_is_on_by_default` | 既定（オーナーの決定）で 20 回目の失敗で止まる |
 | `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
 | `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
+
+## 結合テスト：再起動なしの更新（`tests/handoff.rs`、#174）
+
+本物のバイナリを起動して、SIGUSR2 と `POST /admin/upgrade` で引き継ぐ（docs/UPGRADE.md）。
+
+| テスト | 確かめること |
+|---|---|
+| `tcp_connections_survive_and_new_ones_go_to_the_new_process` | 引き継ぎの前に開いた TCP の接続（固定ルールと API のルール）は古いプロセスが最後まで運ぶ。引き継ぎの後の新しい接続は新しいプロセスのもの（`/proc` でサーバ側のソケットの持ち主を確かめる）。UDP は新しいセッションで続く。API のルール（`targets`・`allow_from`）がそのまま移る。制御 API の TCP と Unix ソケットも移る。`rproxy_process_start_time_seconds` は変わらない。古いプロセスは接続が終わると正常に終わり、統計の数は減らず、古いプロセスが待っている間に数えた分も足される（接続数とバイト数がぴったり）。2 回目の引き継ぎを Unix ソケットの `POST /admin/upgrade` で。最後に普通に止めるとソケットのファイルを消す |
+| `a_failed_handoff_keeps_the_old_process` | 新しいプロセスにつなげない（引き継ぎ用のソケットのディレクトリがない）と `handoff.failed` で、古いプロセスが動き続ける。`rproxy_handoffs_total{outcome="failed"}`・`rproxy_build_info`。TCP からの `POST /admin/upgrade` は既定で 403 |
+
+## 結合テスト：performance（`tests/performance.rs`、#194・#184）
+
+本物のバイナリを起動して、`global.performance` の効き目を外から確かめる。
+
+| テスト | 確かめること |
+|---|---|
+| `the_settings_file_sets_workers_shards_and_pinning` | 設定ファイルが環境変数より先：ワーカーのスレッド（`rproxy-wrk-*`）の数、ワーカー i が一覧の i 番目の CPU に固定（`/proc/<pid>/task/*/status` の `Cpus_allowed_list`）、`udp_shards: auto` でポートのソケットがワーカーの数（`/proc/net/udp`）、`splice` の項目ごとの上書き、`performance` の行の `sources` |
+| `the_environment_applies_without_the_file` | 設定ファイルに `global.performance` がなければ `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS=auto`・`RPROXY_SPLICE=0` が効く。何もなければ既定（UDP のソケット 1 本、固定なし） |
+| `cpus_that_do_not_exist_are_left_out` | 存在しない CPU は除いて `degraded`、ワーカーは使える CPU の数 |
+
+## 結合テスト：自動更新（`tests/self_update.rs`、#174）
+
+HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitHub と同じくリダイレクトで渡す）に、このバイナリを次のパッチの番号で署名して置く。
+
+| テスト | 確かめること |
+|---|---|
+| `a_signed_patch_is_swapped_in_and_a_forged_one_refused` | `POST /admin/update` で新しいパッチを取って確かめ、引き継ぎで入れ替える（新しいプロセスはキャッシュのバイナリ）。`RPROXY_UPDATE_HEALTHY` の後によい版になる。署名がバイナリと合わないパッチは断り（`GET /admin/update` の `error`）、キャッシュにも入れない |
+| `launch_runs_the_newest_patch_follows_upgrades_and_rolls_back` | `rproxy-api launch` が最新のパッチを選んで起動する（trial）。SIGUSR2 を渡して引き継ぎの後の主プロセスを追う。trial の版が落ちたら悪い版にしてイメージの版で起動し直す。SIGTERM でサーバと一緒に終わる |
+| `signatures_of_the_minisign_tool_verify` | minisign の道具で作った鍵と署名（既定の事前ハッシュの形と古い形）を確かめられる |
 
 ## DB からの復元（`tests/db_restore.rs`）
 

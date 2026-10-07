@@ -10,7 +10,7 @@ Host configuration (package installation, policy routing) is done as root. rprox
 | Capability | Feature that uses it | If removed |
 |---|---|---|
 | `CAP_NET_BIND_SERVICE` | Listening on ports below 1024 (25, 443, etc.) | Only rules below 1024 become unusable. Creation via the API returns `bind_failed` (with the reason and the required permission); rules restored at startup and static rules remain as `failed` |
-| `CAP_NET_ADMIN` | `source_ip: transparent` (connecting while claiming the client's IP using `IP_TRANSPARENT`) | `transparent` in `GET /capabilities` becomes false and the option disappears from the UI (the reason is shown). Creation via the API returns `unsupported`. Transparent rules restored from the DB and static rules remain as `failed` (`needs Linux and CAP_NET_ADMIN`) |
+| `CAP_NET_ADMIN` | `source_ip: transparent` (connecting while claiming the client's IP using `IP_TRANSPARENT`) | `transparent` in `GET /capabilities` becomes false and the option disappears from the UI (the reason is shown). Creation via the API returns `unsupported`. Transparent rules restored from the DB and static rules remain as `failed` (`needs Linux and CAP_NET_ADMIN`). Also used to set `global.performance.busy_poll_usecs` above `net.core.busy_read` (without it: `degraded`, no busy polling) |
 
 rproxy-api starts even if either permission is removed, and the other rules keep working (the CI `install.sh` job verifies this with both removed via a drop-in). A static rules file only stops startup on writing errors (invalid addresses, overlapping rules, etc.), not on rules that merely lack permissions.
 
@@ -34,6 +34,7 @@ rproxy-api starts even if either permission is removed, and the other rules keep
 | `ProtectHome=yes` | `/home` and `/root` are not visible. Certificates, keys and static rules files placed there cannot be read |
 | `PrivateTmp=yes` | `/tmp` is private to the service. Files in the host's `/tmp` are not visible |
 | `LimitNOFILE=65536` | Port range rules use one socket per port (the limit is raised to the maximum at startup) |
+| `Type=notify`, `NotifyAccess=all`, `RuntimeDirectory=rproxy` | Live upgrades (#174, docs/en/UPGRADE.md): the old process passes its sockets over `/run/rproxy/handoff.sock` (0600; only the pid of the child it started is accepted) and makes the new process the main one with `MAINPID=`. The new process runs in the same unit with the same (ambient) capabilities |
 
 ### The ACME helper (`rproxy-acme-helper.service`, optional)
 

@@ -39,3 +39,40 @@ if [ "$1" = "configure" ]; then
 fi
 
 #DEBHELPER#
+
+# an upgrade of a running service (#174, docs/UPGRADE.md): within the same
+# major.minor the running process hands its sockets to the new binary (SIGUSR2,
+# no connection is cut); another minor, or a release that says so
+# (/usr/share/rproxy-api/restart-required), restarts it
+if [ "$1" = "configure" ] && [ -n "$2" ] && [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+	if systemctl is-active --quiet rproxy-api; then
+		new=$(dpkg-query -W -f='${Version}' rproxy-api 2>/dev/null || true)
+		old_minor=$(echo "$2" | cut -d. -f1,2)
+		new_minor=$(echo "$new" | cut -d. -f1,2)
+		if [ -n "$new" ] && [ "$old_minor" = "$new_minor" ] && [ ! -e /usr/share/rproxy-api/restart-required ]; then
+			pid=$(systemctl show -p MainPID --value rproxy-api)
+			now=$pid
+			kill -USR2 "$pid" 2>/dev/null || true
+			# the new process takes over within --handoff-timeout (30s); wait a little longer
+			i=0
+			while [ $i -lt 90 ]; do
+				now=$(systemctl show -p MainPID --value rproxy-api)
+				if [ -n "$now" ] && [ "$now" != 0 ] && [ "$now" != "$pid" ]; then
+					break
+				fi
+				sleep 0.5
+				i=$((i + 1))
+			done
+			if [ "$now" != "$pid" ] && [ "$now" != 0 ]; then
+				echo "rproxy-api: $2 -> $new without a restart (live upgrade: process $pid -> $now)"
+			else
+				echo "rproxy-api: the live upgrade did not complete (see journalctl -u rproxy-api); restarting"
+				systemctl restart rproxy-api || true
+			fi
+		else
+			echo "rproxy-api: $2 -> $new; restarting"
+			systemctl restart rproxy-api || true
+		fi
+	fi
+fi

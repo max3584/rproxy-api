@@ -91,10 +91,24 @@ echo "deb [signed-by=/usr/share/keyrings/rproxy-archive-keyring.gpg] http://127.
 sleep 0.5
 sudo apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/rproxy-api.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
 apt-cache policy rproxy-api | grep -q 'http://127.0.0.1:18765 stable/main' || fail "apt does not see the repository"
-sudo apt-get install -y --reinstall rproxy-api
+# the same major.minor: the package hands the running service over to the new
+# binary without a restart (#174); the rule made through the API stays
+pid=$(systemctl show -p MainPID --value rproxy-api)
+sudo apt-get install -y --reinstall rproxy-api | tee "$work/reinstall.log"
 [ "$(sudo cat /etc/rproxy/tokens)" = "$token" ] || fail "reinstall replaced the token"
 wait_api
 systemctl is-enabled --quiet rproxy-api || fail "reinstall disabled the service"
+grep -q 'without a restart' "$work/reinstall.log" || fail "the upgrade did not hand over (see the apt output)"
+now=$(systemctl show -p MainPID --value rproxy-api)
+[ "$now" != "$pid" ] || fail "the main process did not change"
+systemctl is-active --quiet rproxy-api || fail "not active after the live upgrade"
+curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/rules" | grep -q '"listen_port":25' ||
+	fail "the rule made through the API did not survive the live upgrade"
+for _ in $(seq 50); do
+	sudo grep -qh '"event":"handoff.done"' /var/log/rproxy/rproxy.*.log && break
+	sleep 0.2
+done
+sudo grep -qh '"event":"handoff.done"' /var/log/rproxy/rproxy.*.log || fail "no handoff.done in the log"
 
 echo "== purge"
 sudo apt-get purge -y rproxy-api

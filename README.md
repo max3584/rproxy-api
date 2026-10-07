@@ -100,9 +100,9 @@ v0.4 で足す項目（中身が入るまでは、指定すると `degraded` を
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
 | `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前（#144） |
-| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174） |
-| `RPROXY_UPDATE` | `--update` | `off` | 自動更新：`off`・`check`・`auto`（#174）。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も |
-| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。設定ファイルの `global.performance` が先） |
+| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174。動く）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
+| `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174。動く）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
+| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。動く。設定ファイルの `global.performance` が先）。`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_SPLICE*` も。docs/API.md の「performance」 |
 | `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | — | `--check-config --diff`：動いている rproxy との差分（#169） |
 
 `RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
@@ -315,6 +315,9 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
+| `performance` | 起動時の `global.performance` の値と出どころ（`sources`） |
+| `handoff.start` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.received` / `handoff.counters` | 再起動なしの更新：始めた / 新しいプロセス（`pid`）の準備ができた / 古いプロセスが今の接続を待つ / 終わった / できなかった（古いプロセスが動き続ける）/ マイナーが違うので断った / 新しいプロセスが受け取った / 古いプロセスの最後の数を足した（docs/UPGRADE.md） |
+| `update.available` / `update.fetched` / `update.healthy` / `update.rollback` / `update.error` / `launch.start` / `launch.mainpid` | 自動更新：新しいパッチがある / 確かめてキャッシュに入れた / よい版になった / 悪い版として戻した / 失敗（署名が合わないなど）/ 起動役がサーバを起動した・引き継ぎで主プロセスが変わった |
 | （`debug` だけ）`udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` | UDP のデータグラムを捨てた（数は `stats.dropped`）/ 送受信の失敗 / TCP_NODELAY を設定できない |
 
 ## 開発

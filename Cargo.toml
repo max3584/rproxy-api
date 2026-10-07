@@ -31,8 +31,10 @@ depends = "passwd"
 # rproxy-traefik-convert (the Traefik configuration converter) runs on python3; YAML needs python3-yaml
 suggests = "python3, python3-yaml"
 maintainer-scripts = "debian/"
-# not started on install: set /etc/rproxy/rproxy.env first, then systemctl enable --now rproxy-api
-systemd-units = { enable = false, start = false }
+# not started on install: set /etc/rproxy/rproxy.env first, then systemctl enable --now rproxy-api.
+# Not stopped or restarted by the package's systemd snippets on upgrade: postinst hands a running
+# service over to the new binary (same major.minor, #174) or restarts it
+systemd-units = { enable = false, start = false, restart-after-upgrade = false, stop-on-upgrade = false }
 assets = [
     ["target/release/rproxy-api", "usr/bin/", "755"],
     ["debian/rproxy.env", "etc/rproxy/rproxy.env", "640"],
@@ -57,6 +59,8 @@ assets = [
     ["docs/en/BACKUP.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["docs/PERFORMANCE.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/en/PERFORMANCE.md", "usr/share/doc/rproxy-api/en/", "644"],
+    ["docs/UPGRADE.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/en/UPGRADE.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["contrib/crowdsec/parsers/s01-parse/rproxy-logs.yaml", "usr/share/rproxy-api/crowdsec/parsers/s01-parse/", "644"],
     ["contrib/crowdsec/scenarios/rproxy-conn-denied.yaml", "usr/share/rproxy-api/crowdsec/scenarios/", "644"],
     ["contrib/crowdsec/scenarios/rproxy-conn-flood.yaml", "usr/share/rproxy-api/crowdsec/scenarios/", "644"],

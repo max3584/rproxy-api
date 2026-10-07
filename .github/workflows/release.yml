@@ -58,7 +58,11 @@ jobs:
         with:
           targets: ${{ matrix.job.target }}
 
+      # the self-update's release key (minisign.pub's base64 line, #174) is built in when
+      # the repository variable MINISIGN_PUBLIC_KEY is set (docs/RELEASING.md)
       - name: Build
+        env:
+          RPROXY_RELEASE_PUBKEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
         run: scripts/build-release.sh ${{ matrix.job.target }}
 
       # cargo-deb publishes only a glibc build (a .deb), so build it here
@@ -94,6 +98,67 @@ jobs:
           files: |
             target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ env.VERSION }}-${{ matrix.job.target }}${{ matrix.job.extension }}
             ${{ env.DEB }}
+
+  # The self-update's files (#174, docs/UPGRADE.md): manifest.json (version, whether a
+  # live upgrade may swap it in, SHA-256 of each binary), SHA256SUMS, and minisign
+  # signatures of the binaries and of both. The secret key is the repository secret
+  # MINISIGN_SECRET_KEY (the whole key file of `minisign -G -W`: no password); without
+  # it the files are published unsigned with a warning, and the self-update skips the
+  # release. Key generation: docs/RELEASING.md
+  sign:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Packages
+        run: apk add --no-cache bash git github-cli minisign coreutils
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Manifest and signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          mkdir -p "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP/assets"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'rproxy-api-v*'
+          rm -f ./*.minisig
+          version=${TAG#v}
+          # an exception patch that cannot be swapped in live (docs/RELEASING.md)
+          handoff=true
+          [ -e "$GITHUB_WORKSPACE/debian/restart-required" ] && handoff=false
+          sha256sum rproxy-api-v* > SHA256SUMS
+          {
+            printf '{"version":"%s","handoff":%s,"files":{' "$version" "$handoff"
+            first=1
+            while read -r sum name; do
+              [ $first = 1 ] || printf ','
+              first=0
+              printf '"%s":"%s"' "$name" "$sum"
+            done < SHA256SUMS
+            printf '}}\n'
+          } > manifest.json
+          cat manifest.json
+          files=(manifest.json SHA256SUMS)
+          if [ -n "$MINISIGN_SECRET_KEY" ]; then
+            umask 077
+            printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+            for f in rproxy-api-v* manifest.json SHA256SUMS; do
+              minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" -t "rproxy-api $TAG $f" </dev/null
+            done
+            rm -f "$RUNNER_TEMP/minisign.key"
+            files+=(./*.minisig)
+          else
+            echo "::warning::MINISIGN_SECRET_KEY is not set; the release is not signed and the self-update (RPROXY_UPDATE) will not use it"
+          fi
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
 
   # Publishes the packages to the apt repository on the gh-pages branch
   # (https://max3584.github.io/rproxy-api/). Needs the repository secrets

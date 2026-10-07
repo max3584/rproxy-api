@@ -67,13 +67,12 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let f = &caps["features"];
 	for flag in [
 		"rulesets", "labels", "conditions", "readyz", "limits", "bandwidth", "geoip", "outlier_detection", "dry_run",
-		"persistence", "handoff", "self_update",
+		"persistence",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
-	assert_eq!(f["performance"], json!([]), "{caps}");
-	// implemented (tests/api_hardening.rs)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout"] {
+	// implemented (tests/api_hardening.rs; #174 and performance below)
+	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "handoff", "self_update"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
 	assert!(!f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
@@ -234,14 +233,27 @@ async fn config_plan_checks_the_document_then_unsupported() {
 	assert_eq!(code(&r), INVALID, "country lists need global.geoip: {}", r.1);
 }
 
-/// #174
+/// #174 (implemented): tests/handoff.rs and tests/self_update.rs run the real
+/// binary; here the endpoints of a router without a server process.
 #[tokio::test]
-async fn upgrade_and_update_endpoints_are_unsupported() {
+async fn upgrade_and_update_endpoints_answer() {
 	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!((&caps["features"]["handoff"], &caps["features"]["self_update"]), (&json!(true), &json!(true)), "{caps}");
+	assert_eq!(caps["build"]["version"], caps["version"], "{caps}");
 	// strong operations: only over the Unix socket by default
 	assert_eq!(send(&h, Method::POST, "/admin/upgrade", None).await.0, StatusCode::FORBIDDEN);
 	assert_eq!(send(&h, Method::POST, "/admin/update", None).await.0, StatusCode::FORBIDDEN);
-	assert_eq!(code(&send(&h, Method::GET, "/admin/update", None).await), UNSUPPORTED);
+	let r = send(&h, Method::GET, "/admin/update", None).await;
+	assert_eq!((r.0, &r.1["mode"], &r.1["available"]), (StatusCode::OK, &json!("off"), &Value::Null), "{}", r.1);
+}
+
+/// #194, #184 (implemented): tests/performance.rs runs the real binary.
+#[tokio::test]
+async fn performance_keys_are_all_applied() {
+	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["performance"], json!(["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]), "{caps}");
 }
 
 /// Scopes of the new endpoints.
@@ -323,9 +335,10 @@ rules:
 	let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
 	assert_eq!((exit, &v["ok"]), (0, &json!(true)), "warnings only: {v}");
 	let warnings = v["warnings"].to_string();
-	for want in ["global.geoip", "global.performance.workers", "global.performance.udp_shards", "global.performance.splice", "rule #1", "rule #2"] {
+	for want in ["global.geoip", "rule #1", "rule #2"] {
 		assert!(warnings.contains(want), "{want}: {warnings}");
 	}
+	assert!(!warnings.contains("global.performance"), "applied now: {warnings}");
 
 	// mistakes in the shapes are errors
 	for (text, want) in [

@@ -10,7 +10,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | capability | 使う機能 | なくした場合 |
 |---|---|---|
 | `CAP_NET_BIND_SERVICE` | 1024 未満のポート（25、443 など）で待ち受ける | 1024 未満のルールだけが使えない。API での作成は `bind_failed`（理由と必要な権限つき）、起動時に復元するルールと固定ルールは `failed` として残る |
-| `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える（理由を表示する）。API での作成は `unsupported`。DB から復元する transparent のルールと固定ルールは `failed`（`needs Linux and CAP_NET_ADMIN`）として残る |
+| `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える（理由を表示する）。API での作成は `unsupported`。DB から復元する transparent のルールと固定ルールは `failed`（`needs Linux and CAP_NET_ADMIN`）として残る。`global.performance.busy_poll_usecs` を `net.core.busy_read` より大きくするのにも使う（なければ `degraded` を出して busy poll なしで動く） |
 
 どちらの権限を外しても rproxy-api は起動し、ほかのルールはそのまま動く（CI の `install.sh` ジョブで、drop-in で両方を外した状態を確かめている）。固定ルールのファイルで起動を止めるのは書き方の誤り（アドレスが不正、ルール同士の重なりなど）だけで、権限が足りないだけのルールでは止めない。
 
@@ -34,6 +34,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `ProtectHome=yes` | `/home`・`/root` が見えない。証明書・鍵・固定ルールのファイルをここに置くと読めない |
 | `PrivateTmp=yes` | `/tmp` はサービス専用。ホストの `/tmp` のファイルは見えない |
 | `LimitNOFILE=65536` | ポート範囲のルールは 1 ポートに 1 つのソケットを使う（起動時に上限まで引き上げる） |
+| `Type=notify`・`NotifyAccess=all`・`RuntimeDirectory=rproxy` | 再起動なしの更新（#174、docs/UPGRADE.md）：古いプロセスが `/run/rproxy/handoff.sock`（0600、起動した子の pid だけ受け付ける）でソケットを渡し、`MAINPID=` で新しいプロセスを主にする。新しいプロセスは同じユニットの中で動き、同じ権限（ambient の capability）を持つ |
 
 ### ACME の補助プロセス（`rproxy-acme-helper.service`、任意）
 
