@@ -544,6 +544,97 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
 ```
 
   `spec` is the rule's shape (the shape of a `POST /rules` body, as the dry run's `after`). `spec_version` is the version of how `spec` is read (1 now). Times are written in the DB session's time zone and read with `UNIX_TIMESTAMP`.
+### L7 and TLS features for the Gateway API (#224, #226-#236)
+
+Settings for rproxy-gateway (#28) to map the Gateway API's HTTPRoute, GRPCRoute, TLSRoute and BackendTLSPolicy. All are optional; left out, behavior is unchanged. `GET /capabilities` `features` tells whether they are available (`cors`, `mirror` and `replace_host` in `middlewares`, `protocol` and `tls` in `services`, the names below in `http_options`, and `tls_route_targets`).
+
+| Item | Where | Shape | features |
+|---|---|---|---|
+| Appending headers (#224) | `request` / `response` of `headers` | `add: {name: value}` | `headers_add` in `http_options` |
+| Redirect status (#226) | `redirect_scheme`, `redirect_regex` | `status`: 301, 302, 303, 307, 308 | `redirect_status` in `http_options` |
+| Route time limits (#227) | `http.routes[].timeouts` | `{"request": "10s", "backend_request": "5s"}` | `route_timeouts` in `http_options` |
+| Host rewrite (#228) | middleware `replace_host` | `{"host": "one.example.org"}` | `replace_host` in `middlewares` |
+| Per-server middlewares (#229) | `http.services.<name>.servers[].middlewares` | names from `http.middlewares` | `server_middlewares` in `http_options` |
+| CORS (#230) | middleware `cors` | `allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, `max_age` | `cors` in `middlewares` |
+| Retry on status (#231) | `retry` | `status: ["500", "502-504"]` | `retry_status` in `http_options` |
+| Mirroring (#232) | middleware `mirror` | `{"service": "<name>", "percent": 20}` or `{"service": "<name>", "fraction": {"numerator": 1, "denominator": 3}}` | `mirror` in `middlewares` |
+| HTTP/2 to backends (#233) | `http.services.<name>.protocol` | `http1` (default), `h2`, `h2c`, `auto` | `protocol` in `services` |
+| Per-service backend TLS (#236) | `http.services.<name>.tls` | `server_name`, `ca_file`, `subject_alt_names`, `cert_file`, `key_file`, `chain_file`, `insecure_skip_verify` | `tls` in `services` |
+| Several targets per name (#234) | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`, `balance` (instead of `remote_addr` / `remote_port`) | `tls_route_targets` |
+| Fixed-status servers (#235) | `http.services.<name>.servers[]` | `{"status": 500, "weight": 1}` (instead of `url`) | `server_status` in `http_options` |
+
+Example (one HTTPRoute rule mapped):
+
+```json
+{
+  "routes": [{
+    "name": "r0", "match": "Host(`app.example`) && PathPrefix(`/api/`)",
+    "service": "r0", "middlewares": ["r0-hdr", "r0-cors", "r0-mirror", "r0-retry"],
+    "timeouts": {"request": "10s", "backend_request": "2s"}
+  }],
+  "services": {
+    "r0": {
+      "protocol": "h2c",
+      "servers": [
+        {"url": "http://10.1.0.5:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"url": "http://10.1.0.6:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"status": 500, "weight": 10}
+      ]
+    },
+    "r0-shadow": {"servers": [{"url": "http://10.1.0.9:8080"}]},
+    "tls-svc": {"servers": [{"url": "https://10.1.0.7:8443"}],
+      "tls": {"server_name": "abc.example.com", "ca_file": "/var/run/rproxy-gateway/certs/0123456789abcdef.crt",
+              "subject_alt_names": ["abc.example.com", "spiffe://abc.example.com/test-identity"]}}
+  },
+  "middlewares": {
+    "r0-hdr": {"headers": {"request": {"set": {"X-Header-Set": "v"}, "add": {"X-Header-Add": "v"}, "remove": ["X-Header-Remove"]}}},
+    "r0-b0": {"headers": {"request": {"set": {"Backend": "v1"}}}},
+    "r0-cors": {"cors": {"allow_origins": ["https://www.foo.com", "https://*.bar.com"], "allow_methods": ["GET", "OPTIONS"],
+                         "allow_headers": ["x-header-1"], "expose_headers": ["x-header-3"], "allow_credentials": true, "max_age": 3600}},
+    "r0-mirror": {"mirror": {"service": "r0-shadow", "percent": 20}},
+    "r0-retry": {"retry": {"attempts": 4, "status": ["500", "502-504"], "initial_interval": "100ms"}},
+    "r0-host": {"replace_host": {"host": "one.example.org"}},
+    "r0-redirect": {"redirect_regex": {"regex": "^http://([^/:]+)(:\\d+)?/(.*)$", "replacement": "https://$1/$3", "status": 303}}
+  }
+}
+```
+
+- **`add` of `headers`** (#224): when a header of that name exists (names are case-insensitive), the value is appended after its value (several fields joined with `,`) with `,`, as one field (`a` → `a,v`); otherwise it is added. The order is `remove` → `set` → `add`, both towards the backend (`request`) and on the response (`response`).
+- **`status` of redirects** (#226): overrides `permanent` and the switch by method (308 / 307 for other than GET and HEAD). Other than 301, 302, 303, 307 and 308 is `400 invalid`.
+- **`timeouts` of a route** (#227): `0s` is no limit (the same as leaving it out).
+  - `request`: from receiving the request until the response body has been sent (middlewares, `retry` attempts and their waits included). Running out before the response headers gives 504 (`event: "http.error"`, `error: "request timed out"`); after them, the response is cut off (HTTP/1.1 closes the connection, HTTP/2 RST_STREAM, HTTP/3 resets the stream; it never looks complete).
+  - `backend_request`: one attempt to a backend, from starting to send until the end of the response body. Running out before the response headers gives 504 (`retry` goes to the next server when it may); after them it cuts off like `request`. For this route it replaces the service's `timeouts.response` (`timeouts.connect` still applies).
+  - A relay after 101 (WebSocket and the like) is not counted.
+- **`replace_host`** (#228): the `Host` sent to the backend (`:authority` for HTTP/2 backends) becomes `host` (`host[:port]`), over the service's `pass_host_header`. `X-Forwarded-Host` keeps what the client sent. It does not affect `match` (it runs after the route is chosen).
+- **Per-server middlewares** (#229): the middlewares in `servers[].middlewares` run only on requests sent to that server, after the route's middlewares (on a `retry` attempt, those of the server tried). On the response they run in reverse, before the response side of the route's middlewares. Allowed kinds: `headers`, `replace_host`, `strip_prefix`, `add_prefix`, `replace_path`, `replace_path_regex` (others are `400 invalid`).
+- **`cors`** (#230):
+  - `allow_origins`: `https://www.foo.com` (scheme, host and port exactly, case-insensitive), `*` (any), `https://*.bar.com` (`*` matches one or more of any characters, dots included).
+  - A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) from an allowed origin is answered by rproxy with 204: `Access-Control-Allow-Origin` (`*` when `allow_origins` is `*` and `allow_credentials` is false, otherwise the `Origin`), `Access-Control-Allow-Methods` (`allow_methods` comma-separated; with `*`, the requested method when `allow_credentials`, otherwise `*`), `Access-Control-Allow-Headers` (likewise; with `*` and `allow_credentials`, the value of `Access-Control-Request-Headers`), `Access-Control-Expose-Headers`, `Access-Control-Max-Age` (with `max_age`), `Access-Control-Allow-Credentials: true` (with `allow_credentials`), `Vary: Origin`. A preflight from an origin not allowed goes to the backend as it is (no CORS headers added).
+  - Other requests go to the backend; for an allowed origin the response gets `Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials`, `Access-Control-Expose-Headers` and `Vary: Origin` (replacing the backend's headers of those names).
+  - `cors` of `headers` stays as it was.
+- **`status` of `retry`** (#231): when the backend answers one of these statuses (values or ranges like `"500"`, `"502-504"`), that response is dropped and the request is sent again to the next server. The last attempt's response is returned as it is. When a request may be sent again (idempotent method, no body or one read by `buffering`, not an Upgrade), `attempts` (counting the first) and `initial_interval` (the wait, doubling each time) are unchanged. The Gateway API's `attempts` counts retries, so it maps to `attempts + 1`.
+- **`mirror`** (#232):
+  - A copy of the request sent to the backend also goes to a server of `service` (a name in `http.services`), as it is after the middlewares before it in the route's `middlewares` (after a header rewrite when written after it). `Host` follows that service's `pass_host_header`.
+  - Only the share `percent` (0-100) or `fraction` (`numerator` / `denominator`, `denominator` defaults to 100) is mirrored (both is `400 invalid`; left out, all). The share is kept by count (not random: the n-th request is spread by the golden ratio).
+  - The mirror's response is read and dropped; failures, slowness and errors do not affect the client's response (logged as `event: "http.mirror"` at debug). The body is copied as it streams; when the mirror falls behind (64 frames queued) only the mirrored request is cut off.
+  - Requests answered by an earlier middleware (redirects, refusals) are not mirrored. A route may have several.
+- **`protocol`** (#233):
+  - `http1` (default): HTTP/1.1, as before.
+  - `h2`: HTTP/2 over TLS (ALPN `h2`) with `https://` servers; 502 when the server does not pick `h2`.
+  - `h2c`: HTTP/2 starting with the preface (prior knowledge) with `http://` servers.
+  - `auto`: `https://` servers are offered `h2` and `http/1.1` by ALPN and spoken to in what they pick; `http://` servers get HTTP/1.1.
+  - `h2` with `http://` servers or `h2c` with `https://` ones is `400 invalid`.
+  - An HTTP/2 backend gets one connection per server, multiplexed and reused (reconnected on the next request when closed; up to the server's `SETTINGS_MAX_CONCURRENT_STREAMS` requests at once, more wait). Rules with `source_ip: transparent` use a new connection per client.
+  - Trailers pass both ways as they are (gRPC's `grpc-status` and so on). When the client's `TE` has `trailers`, `te: trailers` is passed to HTTP/2 backends (other hop-by-hop headers are removed as before).
+  - `timeouts`, `retry`, `health_check` (a `GET` over HTTP/2), `outlier_detection` and `sticky` work as with HTTP/1.1 backends. An Upgrade (WebSocket) to an HTTP/2 backend gets 502.
+  - gRPC: clients connect to rproxy over HTTP/2 (TLS or h2c). Match services and methods with `Path(`/<package.Service>/<Method>`)` and `PathPrefix(`/<package.Service>/`)`.
+- **`tls` of a service** (#236):
+  - Used for that service's `https://` servers instead of the rule's `tls.upstream` (fields are not mixed). Also works in plain-HTTP rules (no `tls`).
+  - `server_name`: the SNI and the name verified on the certificate (default: the URL's host). `ca_file`: the CA that verifies the backend's certificate (default: the Mozilla roots). `subject_alt_names`: when given, one of the certificate's SAN DNS names or URIs (`spiffe://...` and the like) must be in this list (instead of checking `server_name`; signature and validity are still checked). `cert_file`, `key_file` (and `chain_file`): the client certificate shown to the backend. `insecure_skip_verify`: no verification (for testing).
+  - The files are read when the rule is created or changed (a changed file is read again with a rule change; rproxy-gateway names files by their content hash). Ignored on a service with only `http://` servers.
+- **`targets` of `tls.routes[]`** (#234): instead of `remote_addr` / `remote_port`, `targets` (the shape of the rule's `targets`, with `weight` and `backup`) and `balance` (`round_robin` (default), `least_conn`, `failover`). One of the two is required (both or neither is `400 tls_config`). A target that cannot be connected to is skipped for the next and left out for 10 seconds (like the rule's `targets`). Works for `passthrough` routes and routes of `sni` rules. Names are re-resolved like the rule's `targets`; in a port-range rule each target's port moves along.
+- **`status` of `servers[]`** (#235): with `status` (100-599) instead of `url`, requests that land on that entry (its `weight` share) are answered by rproxy with that status (a body like `500 Internal Server Error`). Not health-checked, not in `outlier_detection` or `sticky` (no sticky cookie). `url` or `status`, exactly one (both or neither is `400 invalid`); no `middlewares`.
+
 ### Rule sets, conditions and readiness (for the Kubernetes controller, #28)
 
 The Kubernetes controller (a separate repository, `max3584/rproxy-gateway`) drives rproxy through this API only. The exact shapes are in `docs/openapi.json` (`GET /openapi.json`).

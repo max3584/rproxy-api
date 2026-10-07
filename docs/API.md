@@ -544,6 +544,97 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
 ```
 
   `spec` はルールの形（`POST /rules` の本文の形、dry run の `after` と同じ）。`spec_version` は `spec` の読み方の版（今は 1）。時刻は DB のセッションのタイムゾーンで書き、`UNIX_TIMESTAMP` で読む。
+### Gateway API 向けの L7・TLS（#224・#226〜#236）
+
+rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・BackendTLSPolicy を写すための設定。どれも省略でき、省略したときの動きはいままでと同じ。使えるかは `GET /capabilities` の `features` で分かる（`middlewares` に `cors`・`mirror`・`replace_host`、`services` に `protocol`・`tls`、`http_options` に下の名前、`tls_route_targets`）。
+
+| 項目 | 場所 | 形 | features |
+|---|---|---|---|
+| ヘッダを足す（#224） | `headers` の `request` / `response` | `add: {名前: 値}` | `http_options` の `headers_add` |
+| リダイレクトの状態コード（#226） | `redirect_scheme`・`redirect_regex` | `status`: 301・302・303・307・308 | `http_options` の `redirect_status` |
+| ルートの時間の上限（#227） | `http.routes[].timeouts` | `{"request": "10s", "backend_request": "5s"}` | `http_options` の `route_timeouts` |
+| Host の書き換え（#228） | ミドルウェア `replace_host` | `{"host": "one.example.org"}` | `middlewares` の `replace_host` |
+| 転送先ごとのミドルウェア（#229） | `http.services.<名前>.servers[].middlewares` | `http.middlewares` の名前の一覧 | `http_options` の `server_middlewares` |
+| CORS（#230） | ミドルウェア `cors` | `allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age` | `middlewares` の `cors` |
+| 状態コードでの送り直し（#231） | `retry` | `status: ["500", "502-504"]` | `http_options` の `retry_status` |
+| ミラー（#232） | ミドルウェア `mirror` | `{"service": "<名前>", "percent": 20}` か `{"service": "<名前>", "fraction": {"numerator": 1, "denominator": 3}}` | `middlewares` の `mirror` |
+| 転送先との HTTP/2（#233） | `http.services.<名前>.protocol` | `http1`（既定）・`h2`・`h2c`・`auto` | `services` の `protocol` |
+| サービスごとの転送先の TLS（#236） | `http.services.<名前>.tls` | `server_name`・`ca_file`・`subject_alt_names`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify` | `services` の `tls` |
+| 名前ごとの複数の宛先（#234） | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`・`balance`（`remote_addr` / `remote_port` の代わり） | `tls_route_targets` |
+| 固定の状態コードの転送先（#235） | `http.services.<名前>.servers[]` | `{"status": 500, "weight": 1}`（`url` の代わり） | `http_options` の `server_status` |
+
+例（HTTPRoute 1 つの規則を写したもの）：
+
+```json
+{
+  "routes": [{
+    "name": "r0", "match": "Host(`app.example`) && PathPrefix(`/api/`)",
+    "service": "r0", "middlewares": ["r0-hdr", "r0-cors", "r0-mirror", "r0-retry"],
+    "timeouts": {"request": "10s", "backend_request": "2s"}
+  }],
+  "services": {
+    "r0": {
+      "protocol": "h2c",
+      "servers": [
+        {"url": "http://10.1.0.5:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"url": "http://10.1.0.6:8080", "weight": 5, "middlewares": ["r0-b0"]},
+        {"status": 500, "weight": 10}
+      ]
+    },
+    "r0-shadow": {"servers": [{"url": "http://10.1.0.9:8080"}]},
+    "tls-svc": {"servers": [{"url": "https://10.1.0.7:8443"}],
+      "tls": {"server_name": "abc.example.com", "ca_file": "/var/run/rproxy-gateway/certs/0123456789abcdef.crt",
+              "subject_alt_names": ["abc.example.com", "spiffe://abc.example.com/test-identity"]}}
+  },
+  "middlewares": {
+    "r0-hdr": {"headers": {"request": {"set": {"X-Header-Set": "v"}, "add": {"X-Header-Add": "v"}, "remove": ["X-Header-Remove"]}}},
+    "r0-b0": {"headers": {"request": {"set": {"Backend": "v1"}}}},
+    "r0-cors": {"cors": {"allow_origins": ["https://www.foo.com", "https://*.bar.com"], "allow_methods": ["GET", "OPTIONS"],
+                         "allow_headers": ["x-header-1"], "expose_headers": ["x-header-3"], "allow_credentials": true, "max_age": 3600}},
+    "r0-mirror": {"mirror": {"service": "r0-shadow", "percent": 20}},
+    "r0-retry": {"retry": {"attempts": 4, "status": ["500", "502-504"], "initial_interval": "100ms"}},
+    "r0-host": {"replace_host": {"host": "one.example.org"}},
+    "r0-redirect": {"redirect_regex": {"regex": "^http://([^/:]+)(:\\d+)?/(.*)$", "replacement": "https://$1/$3", "status": 303}}
+  }
+}
+```
+
+- **`headers` の `add`**（#224）：同じ名前のヘッダ（大文字小文字を区別しない）があれば、その値（複数のフィールドなら `,` でつないだもの）の後ろに `,` で足して 1 本にする（`a` → `a,v`）。なければ足す。順は `remove` → `set` → `add`。転送先へ（`request`）も応答へ（`response`）も同じ。
+- **リダイレクトの `status`**（#226）：指定すると、`permanent` とメソッドによる切り替え（GET・HEAD 以外は 308 / 307）より優先する。301・302・303・307・308 のほかは `400 invalid`。
+- **ルートの `timeouts`**（#227）：`0s` は上限なし（省略と同じ）。
+  - `request`：リクエストを受けてから応答の本文を送り終えるまで（ミドルウェア・`retry` の送り直し・待ち時間を含む）。応答ヘッダの前に過ぎたら 504（`event: "http.error"`、`error: "request timed out"`）。応答ヘッダの後に過ぎたら応答を途中で切る（HTTP/1.1 は接続を閉じる、HTTP/2 は RST_STREAM、HTTP/3 はストリームのリセット。完全な応答に見せない）。
+  - `backend_request`：転送先への 1 回の送信の、送り始めから応答の本文の終わりまで。応答ヘッダの前に過ぎたら 504（`retry` が送り直せるなら次の転送先へ）。応答ヘッダの後は `request` と同じく切る。このルートではサービスの `timeouts.response` の代わりに使う（`timeouts.connect` はそのまま）。
+  - 101（WebSocket など）の後の中継は数えない。
+- **`replace_host`**（#228）：転送先へ送る `Host`（HTTP/2 の転送先なら `:authority`）を `host`（`host[:port]`）にする。サービスの `pass_host_header` より優先。`X-Forwarded-Host` はクライアントが送った値のまま。`match` には効かない（ルートを選んだ後に働く）。
+- **転送先ごとのミドルウェア**（#229）：`servers[].middlewares` のミドルウェアは、その転送先へ送るリクエストにだけ、ルートのミドルウェアの後に働く（`retry` の送り直しでは、送り直す先の転送先のもの）。応答へは逆の順で、ルートのミドルウェアの応答側より先に働く。使える種類は `headers`・`replace_host`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`（ほかは `400 invalid`）。
+- **`cors`**（#230）：
+  - `allow_origins`：`https://www.foo.com`（スキーム・ホスト・ポートの完全一致、大文字小文字を区別しない）、`*`（すべて）、`https://*.bar.com`（`*` は 1 文字以上の何にでも一致。`.` を含む）。
+  - プリフライト（`OPTIONS` で `Origin` と `Access-Control-Request-Method` があるもの）は、オリジンを許すなら rproxy が 204 で答える：`Access-Control-Allow-Origin`（`allow_origins` が `*` で `allow_credentials` が false なら `*`、ほかは `Origin` の値）、`Access-Control-Allow-Methods`（`allow_methods` をカンマ区切りで。`*` なら、`allow_credentials` のときは求められたメソッド、そうでなければ `*`）、`Access-Control-Allow-Headers`（同じく。`*` なら `allow_credentials` のときは `Access-Control-Request-Headers` の値）、`Access-Control-Expose-Headers`、`Access-Control-Max-Age`（`max_age` があれば）、`Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）、`Vary: Origin`。許さないオリジンのプリフライトは転送先へそのまま送る（CORS のヘッダは付けない）。
+  - ふつうのリクエストは転送先へ送り、オリジンを許すなら応答に `Access-Control-Allow-Origin`・`Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers`・`Vary: Origin` を付ける（転送先が返した同じ名前のヘッダは置き換える）。
+  - `headers` の `cors` はいままでのまま。
+- **`retry` の `status`**（#231）：転送先がこの状態コード（`"500"`・`"502-504"` のような値か範囲）を返したら、その応答を捨てて次の転送先へ送り直す。最後の回の応答はそのまま返す。送り直せる条件（冪等なメソッド、本文がないか `buffering` で読み切ったもの、Upgrade でない）と `attempts`（最初の 1 回を含む回数）・`initial_interval`（待ち時間。回ごとに倍）はいままでと同じ。Gateway API の `attempts` は送り直しの回数なので、写すときは `attempts + 1`。
+- **`mirror`**（#232）：
+  - 転送先へ送るリクエストの写しを、`service`（`http.services` の名前）の転送先へも送る。写しはルートの `middlewares` でそこまでのミドルウェアを通った形（ヘッダの書き換えの後ろに書けば書き換えた形）。`Host` は `service` の `pass_host_header` に従う。
+  - `percent`（0〜100）か `fraction`（`numerator` / `denominator`、`denominator` の既定 100）の割合だけ写す（両方は `400 invalid`。省略で全部）。割合は数で揃える（無作為ではなく、`n` 件目を黄金比で散らす）。
+  - ミラーの応答は読み捨て、つながらない・遅い・失敗はクライアントの応答に影響しない（ログは `event: "http.mirror"` の debug）。本文は流れてくる分を写し、ミラーが追いつかない（64 フレーム分たまった）ときはミラーの送信だけを途中で止める。
+  - 前のミドルウェアが答えたリクエスト（リダイレクト・拒否）は写さない。1 つのルートに複数書ける。
+- **`protocol`**（#233）：
+  - `http1`（既定）：いままでどおり HTTP/1.1。
+  - `h2`：`https://` の転送先と TLS（ALPN `h2`）の HTTP/2。転送先が `h2` を選ばなければ 502。
+  - `h2c`：`http://` の転送先と、前置きから始める HTTP/2（prior knowledge）。
+  - `auto`：`https://` の転送先は ALPN で `h2` と `http/1.1` を提示して、転送先が選んだほうで話す。`http://` の転送先は HTTP/1.1。
+  - `h2` は `http://`、`h2c` は `https://` の転送先とは組み合わせられない（`400 invalid`）。
+  - HTTP/2 の転送先とは、転送先ごとに 1 本の接続を多重化して使い回す（閉じられたら次のリクエストでつなぎ直す。同時に送れる数は転送先の `SETTINGS_MAX_CONCURRENT_STREAMS` まで、超えた分は空くのを待つ）。`source_ip: transparent` のルールではクライアントごとに新しい接続。
+  - トレーラーは両方向にそのまま流す（gRPC の `grpc-status` など）。クライアントの `TE` に `trailers` があれば、HTTP/2 の転送先へ `te: trailers` を渡す（ほかのホップごとのヘッダはいままでどおり取り除く）。
+  - `timeouts`・`retry`・`health_check`（HTTP/2 で `GET`）・`outlier_detection`・`sticky` は HTTP/1.1 の転送先と同じ。HTTP/2 の転送先への Upgrade（WebSocket）は 502。
+  - gRPC：クライアントは HTTP/2（TLS か h2c）で rproxy につなぐ。サービス・メソッドの一致は `Path(`/<package.Service>/<Method>`)`・`PathPrefix(`/<package.Service>/`)` で書く。
+- **サービスの `tls`**（#236）：
+  - そのサービスの `https://` の転送先には、ルールの `tls.upstream` の代わりにこれを使う（項目ごとに混ぜない）。平文の HTTP のルール（`tls` なし）でも使える。
+  - `server_name`：SNI と、証明書で確かめる名前（既定は URL のホスト）。`ca_file`：転送先の証明書を確かめる CA（既定は Mozilla のルート）。`subject_alt_names`：指定すると、証明書の SAN の DNS 名か URI（`spiffe://...` など）のどれかがこの一覧にあることを確かめる（`server_name` での名前の確認の代わり。署名・期限は確かめる）。`cert_file`・`key_file`（・`chain_file`）：転送先へ出すクライアント証明書。`insecure_skip_verify`：確かめない（試験用）。
+  - ファイルはルールを作る・変えるときに読む（変わったファイルはルールの変更で読み直す。rproxy-gateway は中身のハッシュの名前にする）。`http://` の転送先だけのサービスに書いても使わない。
+- **`tls.routes[]` の `targets`**（#234）：`remote_addr` / `remote_port` の代わりに `targets`（ルールの `targets` と同じ形、`weight`・`backup` も同じ）と `balance`（`round_robin`（既定）・`least_conn`・`failover`）。どちらか一方が要る（両方・どちらもなしは `400 tls_config`）。接続できない宛先は次の宛先へ移り、10 秒外す（ルールの `targets` と同じ）。`passthrough` の route、`sni` のルールの route のどちらでも使える。名前の再解決もルールの `targets` と同じ。ポート範囲のルールでは各宛先のポートも同じだけずれる。
+- **`servers[]` の `status`**（#235）：`url` の代わりに `status`（100〜599）を書くと、その転送先に当たったリクエスト（`weight` の割合）に rproxy がその状態コードで答える（本文は `500 Internal Server Error` のような文）。ヘルスチェック・`outlier_detection`・`sticky` の対象にしない（`sticky` のクッキーも付けない）。`url` と `status` はどちらか一方（両方・どちらもなしは `400 invalid`）。`middlewares` は付けられない。
+
 ### ルールの組・状態・readiness（Kubernetes のコントローラ向け、#28）
 
 Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway`）は、この API だけで rproxy を動かす。正確な形は `docs/openapi.json`（`GET /openapi.json`）。
