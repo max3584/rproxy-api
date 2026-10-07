@@ -77,7 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/acme/accounts/{name}/deactivate", post(super::acme_api::deactivate))
 		// v0.4 (docs/DESIGN-v0.4.md): rule sets (#28), plan (#169), upgrade / update (#174)
 		.route("/rulesets", get(super::ruleset_api::list))
-		.route("/rulesets/{*name}", get(super::ruleset_api::get).put(super::ruleset_api::put).delete(super::ruleset_api::delete))
+		.route("/rulesets/{*name}", get(super::ruleset_api::get).put(super::ruleset_api::put).delete(super::ruleset_api::delete).layer(axum::extract::DefaultBodyLimit::max(crate::core::ruleset::MAX_BODY)))
 		.route("/config/plan", post(config_plan))
 		.route("/admin/upgrade", post(super::upgrade::upgrade))
 		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))

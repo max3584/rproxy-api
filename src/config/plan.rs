@@ -198,6 +198,9 @@ pub async fn plan_delete(registry: &Registry, key: &Key) -> Result<RulePlan, Api
 			"{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes"
 		)));
 	}
+	if let Some(set) = &old.ruleset {
+		return Err(crate::core::ruleset::owned(key, set));
+	}
 	let warnings = connections_warning(&view);
 	Ok(rule_plan(Action::Delete, Change::None, key, Some(&old), Some(view), None, warnings))
 }
@@ -217,6 +220,13 @@ pub async fn plan_replace(registry: &Registry, spec: &RuleSpec) -> Result<RulePl
 	Ok(rule_plan(action, change, &key, Some(&old), Some(view), Some(spec), warnings))
 }
 
+/// The difference between two versions of a rule, compared in their shapes
+/// (`None`: no rule, compared as `{}`). What every dry run answers in `diff`.
+pub fn rule_diff(old: Option<&RuleSpec>, new: Option<&RuleSpec>) -> Vec<DiffEntry> {
+	let empty = Value::Object(Default::default());
+	diff(&old.map(shape).unwrap_or_else(|| empty.clone()), &new.map(shape).unwrap_or(empty))
+}
+
 fn rule_plan(
 	action: Action,
 	change: Change,
@@ -226,13 +236,8 @@ fn rule_plan(
 	new: Option<&RuleSpec>,
 	warnings: Vec<String>,
 ) -> RulePlan {
-	let empty = Value::Object(Default::default());
-	let before_shape = old.map(shape).unwrap_or_else(|| empty.clone());
 	let after = new.map(shape);
-	let diff = match &after {
-		Some(after) => diff(&before_shape, after),
-		None => diff(&before_shape, &empty),
-	};
+	let diff = rule_diff(old, new);
 	RulePlan {
 		dry_run: true,
 		action,

@@ -463,8 +463,8 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 | GeoIP (#168) | a rule's `geoip`, the `geoip` middleware, `global.geoip` | `allow_countries`, `deny_countries` (ISO 3166-1 alpha-2), `allow_asns`, `deny_asns`, `unknown` (`allow` / `deny`). `global.geoip`: `country_db`, `asn_db` (mmdb), `check_interval`, `log_country`. Country lists need `country_db`, ASN lists need `asn_db` | `geoip`, `geoip` in `middlewares` |
 | Passive health checks (#170) | a rule's `outlier_detection` (L4; `invalid` on `http` rules), `http.services.<name>.outlier_detection` | L4: `consecutive_failures`, `short_lived`, `ejection_time`, `max_ejection_time`, `max_ejected_percent`. L7: `consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`, `min_requests`, `window`, `ejection_time`, `max_ejection_time`, `max_ejected_percent` | `outlier_detection`, `outlier_detection` in `services` |
 | Performance (#194, #184) | `global.performance` | `workers`, `udp_shards` (1-64 or `auto`), `cpu_affinity` (`none` / `auto` / `"0-3,6"`), `busy_poll_usecs`, `splice` (`enabled`, `after`, `full_reads`, `pipe_size`). The settings file wins over `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE*`. Effective after a restart | `performance` (names of the keys that take effect) |
-| Rule sets (#28) | `GET /rulesets`, `GET` / `PUT` / `DELETE /rulesets/{name}` | See "Endpoints" | `rulesets` |
-| Conditions (#28) | `conditions` in the rule view | `[{"type","status","reason","message","last_transition"}]`; types `Accepted`, `Programmed`, `ResolvedRefs`, `BackendsHealthy` | `conditions` |
+| Rule sets (#28) | `GET /rulesets`, `GET` / `PUT` / `DELETE /rulesets/{name}` | See "Rule sets, conditions and readiness" below | `rulesets` |
+| Conditions (#28) | `conditions` in the rule view | `[{"type","status","reason","message","last_transition"}]`; types `Accepted`, `Programmed`, `ResolvedRefs`, `BackendsHealthy` (see "Rule sets, conditions and readiness" below) | `conditions` |
 | Readiness (#28) | `GET /readyz` | No token. `200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
 | Diff before change (#169) | `?dry_run=true` (`POST /rules`, `PATCH`, `DELETE`, `PUT /rulesets/{name}`, `POST /config/reload`), `POST /config/plan`, `--check-config --diff` | Answer `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`; `change` is `none`, `in_place` or `recreate` | `dry_run` |
 | Storing API-created rules (#144) | a token's `persist: true`, table `rproxy_rules`, `--node-name` | The view shows `origin: "api"`, `persisted`, `created_by`, `created_at` | `persistence` |
@@ -499,7 +499,7 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 - `rproxy-api --check-config [PATH] --diff [--diff-api unix:/path|URL] [--diff-token-file FILE]`: once the check passes, asks the running rproxy with `POST /config/plan` and prints the difference. Asked by default: `RPROXY_API_SOCKET`, else `http://<first RPROXY_API_ADDR (loopback for 0.0.0.0 / ::)>:<RPROXY_API_PORT>` (https with `RPROXY_TLS_CERT`, which is then trusted). The token is a file with one plain line (needs the `admin` scope).
   - `text` output: after the check, one line per change (`+` create, `~` change (with the changed values), `-` delete, `!` a `global` setting that needs a restart) and `plan: N to add, ...`. `json`: the `Report` with `plan` (the answer above).
   - Exit code: 1 for mistakes and failed questions (cannot connect, refused), 0 on success with or without differences.
-- Rule sets (`PUT /rulesets/{name}?dry_run=true`, #28) build the difference the same way (`plan_replace` and `plan_delete` of `config::plan`).
+- Rule sets (`PUT /rulesets/{name}?dry_run=true`, #28) build the difference the same way (`in_place` and `rule_diff` of `config::plan`), and `action` / `change` in their `results` mean the same (`diff` for `update` only).
 
 ### Storing API-created rules (#144)
 
@@ -527,6 +527,47 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
 ```
 
   `spec` is the rule's shape (the shape of a `POST /rules` body, as the dry run's `after`). `spec_version` is the version of how `spec` is read (1 now). Times are written in the DB session's time zone and read with `UNIX_TIMESTAMP`.
+### Rule sets, conditions and readiness (for the Kubernetes controller, #28)
+
+The Kubernetes controller (a separate repository, `max3584/rproxy-gateway`) drives rproxy through this API only. The exact shapes are in `docs/openapi.json` (`GET /openapi.json`).
+
+**Rule sets**: send the whole of a set to `PUT /rulesets/{name}` every time and rproxy applies the difference to what runs (declarative; a PUT after a crash puts things right).
+
+- Names: `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?` (e.g. `k8s/default/web-gateway`). Write the slashes in the path as they are (`PUT /rulesets/k8s/default/web-gateway`).
+- Body: `{"generation": <integer>, "rules": [<rules as for POST /rules>...]}` (up to 10,000 rules, a body up to 32 MiB). The same key twice is `400 invalid`.
+- Order: everything is checked first; if anything fails, **nothing changes**.
+  1. `If-Match` (when given): differing from the current etag, or no such set yet, is `412 precondition_failed`. `*` means "the set exists". Takes the quoted value of the ETag header or the body's `etag` as it is (`W/` and comma-separated lists too).
+  2. `generation`: lower than the stored one is `409 stale_generation` (the same is fine).
+  3. The shape of each rule (the same checks as `POST /rules`; settings this build cannot run are `unsupported`) and rules of the body that overlap each other (`400 invalid`).
+  4. Conflicts with rules outside the set: a rule of the settings file with the same key is `409 static`, a rule of another set `409 owned`, a rule made by `POST /rules` or one whose listeners overlap `409 already_exists`, the control API's address `409 reserved`.
+  5. The listen ports of every rule created, changed or deleted are within the token's `allow_listen_ports` (otherwise `403`); rules with ACME certificates need `acme:write`.
+  6. The certificate and secret files of every rule created or changed can be read (`400 tls_config` / `invalid`).
+  - A refusal is `{"code","error","errors":[{"index","rule","code","message"}]}`: `code` and `error` (`rules[i]: ...`) are the first problem, `errors` lists every problem with a rule (`index` is its place in `rules`).
+- Applying: rules left out of the set are stopped first (connections dropped); a changed rule is changed in place when PATCH can do it without dropping connections (targets, `balance`, `health_check`, timeouts, TLS, `allow_from`, `extra_listen_addrs`, `http`, `labels` and the other v0.4 settings; `change: in_place`), otherwise (port range, `source_ip`, `http` on or off) its listeners are opened again (`recreate`). New rules are created; unchanged running rules are not touched (`none`). A `failed` rule is re-created even when unchanged.
+- A rule that cannot bind or resolve its targets is registered as `failed` on its own (the reason in `conditions`) and the rest is applied. The answer is `200` with a result per rule: `{"name","generation","etag","dry_run":false,"results":[{"rule":"tcp/0.0.0.0:443","action":"create|update|delete|none","change":"none|in_place|recreate","state":"running|failed","error"}]}` (in the body's order, then the deleted rules; `delete` has no `state`). The `ETag` header is `etag` in double quotes.
+- The etag is `g<generation>-<the first 16 hex digits of the SHA-256 of the rules' normalized JSON in key order>`. It changes with the rules or the `generation`, not with their state (`running` / `failed`).
+- `?dry_run=true`: the same checks, then the result without changing anything (`dry_run: true`, the etag the set would have, `diff` for updates). `change` and `diff` mean what "Diff before change" above says.
+- Rules of a set appear in `GET /rules` with `ruleset: "<name>"` (`origin` stays `dynamic`). `PATCH` / `DELETE /rules/...` on one is `409 owned` (PUT the set instead); `POST /rules` with the same key is `409 already_exists`.
+- `GET /rulesets/{name}`: `{"name","generation","etag","updated_at","updated_by","rules":[<as GET /rules shows them>...]}` (in key order, with an `ETag` header). `updated_by` is the name of the token of the last PUT (empty without a token file). `GET /rulesets` lists the sets by name (`rules` is a count).
+- `DELETE /rulesets/{name}?drain_secs=N`: stops the set's rules at the same time and forgets the set (waiting up to `drain_secs` for the connections of each rule). `If-Match` works here too. `204` once every connection has ended.
+- Sets live in rproxy's memory only; they are written neither to the DB nor to the settings file. After rproxy restarts, the controller PUTs its sets again once `GET /readyz` answers 200. Changes to sets run one at a time (reads do not wait).
+- Logs: `event = "ruleset.apply"` (`ruleset`, `generation`, `etag`, `created`, `updated`, `deleted`, `unchanged`, `failed`, `by`) and `ruleset.delete` (`ruleset`, `rules`); the rules' own `rule.create` / `rule.update` / `rule.delete` carry `ruleset`. `audit` has `action: ruleset.put` / `ruleset.delete` and `ruleset`.
+
+**Labels**: a rule's `labels`. Not used for forwarding; shown in the `rule.create` / `rule.update` logs (`labels: "k=v,k2=v2"`) and in `/metrics` as `rproxy_rule_labels{rule="tcp/0.0.0.0:443",label_tenant="act"} 1` (characters of a key other than letters and digits become `_`; of keys that end up the same, only the first by name). `PATCH` with `labels` replaces them as a whole (`{}` removes them; left out keeps them).
+
+**Conditions**: every rule's view (in a set or not) has these four, in this order (shaped to copy into Gateway API status). `message` is empty when `True`.
+
+| type | `True` reason | `False` reasons |
+|---|---|---|
+| `Accepted` | `Accepted` | `Unsupported` (a setting this build or environment cannot run; rules from startup or a reload) |
+| `Programmed` | `Listening` (`state: running`) | `BindFailed` (the port cannot be opened), `Pending` (waiting to resolve its targets, retried), `Failed` (anything else) |
+| `ResolvedRefs` | `ResolvedRefs` | `ResolveFailed` (a target cannot be resolved), `CertificateExpired` (a server certificate expired), `CertificateUnreadable` (a certificate, key or CA cannot be read), `SecretUnreadable` (a middleware's secret file cannot be read) |
+| `BackendsHealthy` | `Healthy` | `AllTargetsDown` (every target is down), `ServiceDown` (an `http` service has every server down; names in `message`). A rule that is not running has `status: "Unknown"`, `NotProgrammed` |
+
+- `last_transition` is the Unix second when `status` last changed (a new `reason` or `message` alone keeps it). `Programmed` `True` starts at `started_at`; other changes are noted when the rule is read (`GET /rules`, `GET /rulesets/{name}`, the answer of a PUT). Deleting or re-creating the rule starts it over.
+- The existing `state`, `error`, `all_targets_down` and `down_services` stay (the UI uses them).
+
+**Readiness**: `GET /readyz` (no token, like `/healthz`). `200 {"ready": true}` once the startup restore (settings file, DB) is done; before that and once shutting down (also a #174 handoff), `503 {"ready": false, "reason": "starting" | "draining"}`. Failed rules do not make rproxy unready (rules report their state in `conditions`). Liveness stays `/healthz`.
 
 ## Endpoints
 
@@ -548,16 +589,16 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rules TO 'rproxy'@'%';
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | Revokes the issued certificate at the CA and orders a new one at once. Scope and Unix socket as for `POST /acme/renew`. `event=audit` (`action: acme.revoke`). docs/en/ACME.md |
 | `POST /acme/accounts/{name}/register` | | 200 | Creates the account at the CA (or finds the one of its key). Scope and Unix socket as for `POST /acme/renew` |
 | `POST /acme/accounts/{name}/deactivate` | | 200 | Deactivates the account at the CA and moves its key aside (`<key_file>.deactivated`; the next order creates a new account). Scope and Unix socket as for `POST /acme/renew` |
-| `GET /readyz` | | 200 / 503 | v0.4 (#28): readiness without a token. See "v0.4 settings" above (`400 unsupported` while `features.readyz` is false) |
+| `GET /readyz` | | 200 / 503 | v0.4 (#28): readiness without a token. `200 {"ready":true}` / `503 {"ready":false,"reason":"starting"\|"draining"}` (see "Rule sets, conditions and readiness" above) |
 | `GET /rulesets` | | 200 | v0.4 (#28): rule sets `[{"name","generation","etag","rules","updated_at","updated_by"}]`. `rules:read` |
-| `GET /rulesets/{name}` | | 200 | v0.4 (#28): `{"name","generation","etag","rules":[...]}` (and an `ETag` header). Slashes in the name may be written as they are. `rules:read` |
-| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<rule>...]}` | 200 | v0.4 (#28): makes the set's rules exactly the body (create, change, delete). `If-Match` differing from the current etag is `412 precondition_failed`, an older `generation` is `409 stale_generation`, a key taken by a rule outside the set is `409 already_exists` / `static`. Any rule with a wrong shape changes nothing (`400`, `rules[i]: ...`). Answer `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`. `rules:write`; every rule within `allow_listen_ports`. A single `PATCH` / `DELETE` of a set's rule is `409 owned`. docs/en/DESIGN-v0.4.md 3. |
-| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4 (#28): deletes every rule of the set. `rules:write` |
+| `GET /rulesets/{name}` | | 200 | v0.4 (#28): `{"name","generation","etag","updated_at","updated_by","rules":[...]}` (and an `ETag` header). Slashes in the name may be written as they are. `rules:read` |
+| `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<rule>...]}` | 200 | v0.4 (#28): makes the set's rules exactly the body (create, change, delete). `If-Match` differing from the current etag is `412 precondition_failed`, an older `generation` is `409 stale_generation`, a key taken by a rule outside the set is `409 already_exists` / `static`. Any rule with a wrong shape changes nothing (`400`, `rules[i]: ...`). Answer `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`. `rules:write`; every rule within `allow_listen_ports`. A single `PATCH` / `DELETE` of a set's rule is `409 owned`. Details in "Rule sets, conditions and readiness" above |
+| `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4 (#28): stops every rule of the set at the same time and forgets the set (`If-Match` works too). `rules:write` |
 | `POST /config/plan` | JSON in the settings file's shape | 200 | v0.4 (#169): compares the settings in the body with what runs and answers the difference (changes nothing; used by `--check-config --diff`). `admin`; by default only over the Unix socket |
 | `POST /admin/upgrade` | | 202 | v0.4 (#174): hands over to the binary now on disk (as SIGUSR2). `admin`; by default only over the Unix socket |
 | `GET /admin/update` | | 200 | v0.4 (#174): self-update state `{"mode","current","available","last_check","error","bad_versions"}`. `admin` |
 | `POST /admin/update` | | 202 | v0.4 (#174): looks for a new patch now and swaps it in under `RPROXY_UPDATE=auto`. `admin`; by default only over the Unix socket |
-| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total`; control API token expiry in `rproxy_token_expiry_timestamp_seconds`; lockouts in `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` ("Control API hardening" above) |
+| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total`; control API token expiry in `rproxy_token_expiry_timestamp_seconds`; lockouts in `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` ("Control API hardening" above); rule labels in `rproxy_rule_labels` (see "Rule sets, conditions and readiness" above) |
 
 When putting an IPv6 `listen_addr` in a path, URL-encode it.
 
@@ -590,7 +631,7 @@ On failure, responses take the following shape.
 
 ## Relationship between the API, config file and UI (DB)
 
-rproxy rules have three origins. All appear in `GET /rules`.
+rproxy rules have four origins. All appear in `GET /rules`.
 
 | Origin | `origin` | Source of truth | How to change |
 |---|---|---|---|
@@ -598,6 +639,7 @@ rproxy rules have three origins. All appear in `GET /rules`.
 | UI (TCP-UDP-rproxy-ui) | `dynamic` | The UI's DB (`forward_rules`) | From the UI. The UI writes to the DB and then calls the rproxy API. rproxy restores from the DB at startup |
 | Calling the API directly (CI, scripts) | `dynamic` | rproxy's memory only | From the API. Not written to the DB, so it disappears when rproxy restarts |
 | Calling the API with a `persist: true` token (v0.4, #144) | `api` | rproxy's table `rproxy_rules` | From the API. rproxy writes `rproxy_rules` on every create, change and delete and restores it at startup ("Storing API-created rules" above) |
+| Rule sets (the Kubernetes controller, v0.4) | `dynamic` (with `ruleset`) | The controller (rproxy keeps them in memory only) | `PUT /rulesets/{name}`. A single `PATCH` / `DELETE` is `409 owned`. After a restart the controller PUTs them again |
 
 - Create long-lived rules with the config file, the UI (DB) or a `persist: true` token (v0.4). Treat rules created by calling the API directly with a token that does not store as temporary (CI preview environments, etc.).
 - The UI does not edit rules that are not in the DB. Rules created via the API do not appear in the UI list, and rules in the DB but not in rproxy show as "missing" in the UI.

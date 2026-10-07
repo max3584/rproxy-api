@@ -1529,14 +1529,14 @@
           },
           "ruleset": {
             "type": "string",
-            "description": "The rule set it belongs to (v0.4, #28)"
+            "description": "The rule set (PUT /rulesets/{name}) that owns the rule (v0.4, #28); left out for other rules. PATCH / DELETE /rules on it is 409 owned."
           },
           "conditions": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Condition"
             },
-            "description": "Gateway API style (v0.4, #28): features.conditions"
+            "description": "Gateway API style state (v0.4, #28; features.conditions): every rule, whether in a set or not. state, error, all_targets_down and down_services stay as they are."
           },
           "persisted": {
             "type": "boolean",
@@ -2226,7 +2226,7 @@
           "maxLength": 253
         },
         "maxProperties": 16,
-        "description": "Free-form marks (owner, tenant, controller); keys [A-Za-z0-9]([A-Za-z0-9._/-]{0,61}[A-Za-z0-9])?. v0.4 (#28, #166): features.labels"
+        "description": "Free-form marks (owner, tenant, controller), not used for forwarding; keys [A-Za-z0-9]([A-Za-z0-9._/-]{0,61}[A-Za-z0-9])?, values without control characters. PATCH with labels replaces them as a whole ({} removes them; left out keeps them). Shown in the rule.create / rule.update logs and in /metrics as rproxy_rule_labels{rule=\"tcp/0.0.0.0:443\",label_<key with other characters than letters and digits as _>=\"value\"} 1. v0.4 (#28, #166): features.labels"
       },
       "Limits": {
         "type": "object",
@@ -2490,6 +2490,7 @@
       },
       "Condition": {
         "type": "object",
+        "description": "One condition of a rule (v0.4, #28), shaped for Gateway API status. Always the four types in this order: Accepted, Programmed, ResolvedRefs, BackendsHealthy.",
         "properties": {
           "type": {
             "type": "string",
@@ -2504,18 +2505,22 @@
             "type": "string",
             "enum": [
               "True",
-              "False"
-            ]
+              "False",
+              "Unknown"
+            ],
+            "description": "Unknown only for BackendsHealthy of a rule that is not running"
           },
           "reason": {
-            "type": "string"
+            "type": "string",
+            "description": "Accepted: Accepted | Unsupported (a setting this build cannot run). Programmed: Listening | BindFailed | Pending (waiting to resolve its targets; retried) | Failed. ResolvedRefs: ResolvedRefs | ResolveFailed | CertificateExpired | CertificateUnreadable | SecretUnreadable. BackendsHealthy: Healthy | AllTargetsDown | ServiceDown | NotProgrammed"
           },
           "message": {
-            "type": "string"
+            "type": "string",
+            "description": "Empty when status is True"
           },
           "last_transition": {
             "type": "integer",
-            "description": "Unix seconds"
+            "description": "Unix seconds when status last changed (a new reason or message alone keeps it). Programmed True starts at started_at; otherwise a change is noted when the rule is read (GET /rules, GET /rulesets/{name}, PUT /rulesets/{name}). Starts again when the rule is deleted or re-created."
           }
         },
         "required": [
@@ -2531,14 +2536,16 @@
         "properties": {
           "generation": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "The caller's generation (e.g. the Gateway's metadata.generation), stored and returned as is (observedGeneration). A PUT with a lower generation than the stored one is 409 stale_generation."
           },
           "rules": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RuleRequest"
             },
-            "maxItems": 10000
+            "maxItems": 10000,
+            "description": "Every rule of the set; each key (protocol, listen_addr, listen_port) at most once."
           }
         },
         "required": [
@@ -2557,7 +2564,16 @@
             "type": "integer"
           },
           "etag": {
-            "type": "string"
+            "type": "string",
+            "description": "g<generation>-<the first 16 hex digits of the SHA-256 of the rules' normalized JSON in key order>; changes when the rules or the generation change, not when their state does"
+          },
+          "updated_at": {
+            "type": "integer",
+            "description": "Unix seconds of the last PUT"
+          },
+          "updated_by": {
+            "type": "string",
+            "description": "The name of the token of the last PUT (empty without a token file)"
           },
           "rules": {
             "type": "array",
@@ -2565,7 +2581,15 @@
               "$ref": "#/components/schemas/Rule"
             }
           }
-        }
+        },
+        "required": [
+          "name",
+          "generation",
+          "etag",
+          "updated_at",
+          "updated_by",
+          "rules"
+        ]
       },
       "RulesetSummary": {
         "type": "object",
@@ -2580,21 +2604,32 @@
             "type": "string"
           },
           "rules": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Number of rules"
           },
           "updated_at": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Unix seconds of the last PUT"
           },
           "updated_by": {
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "name",
+          "generation",
+          "etag",
+          "rules",
+          "updated_at",
+          "updated_by"
+        ]
       },
       "ApplyResult": {
         "type": "object",
         "properties": {
           "rule": {
-            "type": "string"
+            "type": "string",
+            "description": "protocol/listen, e.g. tcp/0.0.0.0:443 (IPv6 in brackets)"
           },
           "action": {
             "type": "string",
@@ -2611,19 +2646,34 @@
               "none",
               "in_place",
               "recreate"
-            ]
+            ],
+            "description": "For update: in_place (connections kept) or recreate (listeners opened again, connections dropped; also a failed rule started again). none for create, delete and none"
           },
           "state": {
             "type": "string",
             "enum": [
               "running",
               "failed"
-            ]
+            ],
+            "description": "The rule's state after the PUT; left out for delete, dry runs, and a rule whose key was taken by another request meanwhile (error says so)"
           },
           "error": {
-            "type": "string"
+            "type": "string",
+            "description": "Why the rule failed (bind, name resolution)"
+          },
+          "diff": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffEntry"
+            },
+            "description": "Dry runs, update only: what would change"
           }
-        }
+        },
+        "required": [
+          "rule",
+          "action",
+          "change"
+        ]
       },
       "RulesetApplied": {
         "type": "object",
@@ -2635,7 +2685,8 @@
             "type": "integer"
           },
           "etag": {
-            "type": "string"
+            "type": "string",
+            "description": "The set's etag after the PUT (a dry run: what it would be); also the ETag header"
           },
           "dry_run": {
             "type": "boolean"
@@ -2644,9 +2695,17 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ApplyResult"
-            }
+            },
+            "description": "The body's rules in their order, then the deleted ones"
           }
-        }
+        },
+        "required": [
+          "name",
+          "generation",
+          "etag",
+          "dry_run",
+          "results"
+        ]
       },
       "DiffEntry": {
         "type": "object",
@@ -2820,6 +2879,68 @@
             }
           }
         }
+      },
+      "RulesetError": {
+        "type": "object",
+        "description": "A refused PUT /rulesets/{name}: code / error are the first problem (error starts with rules[i]: for a rule's problem), errors lists every problem with a rule (left out when the problem is not about one rule, e.g. stale_generation).",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "invalid",
+              "tls_config",
+              "unsupported",
+              "not_found",
+              "already_exists",
+              "static",
+              "reserved",
+              "bind_failed",
+              "resolve_failed",
+              "unauthorized",
+              "forbidden",
+              "internal",
+              "owned",
+              "precondition_failed",
+              "stale_generation",
+              "locked_out"
+            ]
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "description": "The rule's place in rules"
+                },
+                "rule": {
+                  "type": "string",
+                  "description": "protocol/listen of the rule"
+                },
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "index",
+                "rule",
+                "code",
+                "message"
+              ]
+            }
+          }
+        },
+        "required": [
+          "error",
+          "code"
+        ]
       }
     }
   },
@@ -3304,7 +3425,7 @@
             }
           },
           "409": {
-            "description": "static",
+            "description": "static (a rule of the settings file) / owned (a rule of a rule set: change it with PUT /rulesets/{name}; v0.4)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3383,7 +3504,7 @@
             }
           },
           "409": {
-            "description": "static",
+            "description": "static (a rule of the settings file) / owned (a rule of a rule set: change it with PUT /rulesets/{name}; v0.4)",
             "content": {
               "application/json": {
                 "schema": {
@@ -3785,7 +3906,7 @@
     },
     "/readyz": {
       "get": {
-        "summary": "Readiness (no token; v0.4, #28): 200 when the startup restore is done, 503 while starting or draining. unsupported until GET /capabilities features.readyz is true (v0.4)",
+        "summary": "Readiness (no token; v0.4, #28). 200 {\"ready\": true} once the startup restore (settings file, database) is done; 503 while starting or draining (shutting down, or handing over to a new process with #174). A failed rule does not make rproxy unready: rules report their own state in conditions. Use GET /healthz for liveness.",
         "security": [],
         "responses": {
           "200": {
@@ -3796,9 +3917,15 @@
                   "type": "object",
                   "properties": {
                     "ready": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
                     }
-                  }
+                  },
+                  "required": [
+                    "ready"
+                  ]
                 }
               }
             }
@@ -3811,7 +3938,10 @@
                   "type": "object",
                   "properties": {
                     "ready": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
                     },
                     "reason": {
                       "type": "string",
@@ -3820,17 +3950,11 @@
                         "draining"
                       ]
                     }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "unsupported",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  },
+                  "required": [
+                    "ready",
+                    "reason"
+                  ]
                 }
               }
             }
@@ -3840,7 +3964,7 @@
     },
     "/rulesets": {
       "get": {
-        "summary": "Rule sets (rules:read; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "summary": "Every rule set (rules:read; v0.4, #28), sorted by name. Rule sets are kept in memory only: after a restart there are none until the controller PUTs them again (wait for GET /readyz).",
         "responses": {
           "200": {
             "description": "OK",
@@ -3855,16 +3979,6 @@
               }
             }
           },
-          "400": {
-            "description": "invalid / unsupported",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
           "401": {
             "description": "Missing, unknown or expired token",
             "content": {
@@ -3876,7 +3990,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "description": "The token lacks the scope (rules:read for GET, rules:write otherwise), a rule's listen ports are outside the token's allow_listen_ports, or a rule uses acme certificates without acme:write",
             "content": {
               "application/json": {
                 "schema": {
@@ -3890,21 +4004,30 @@
     },
     "/rulesets/{name}": {
       "get": {
-        "summary": "One rule set (rules:read; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "summary": "One rule set with its rules as GET /rules shows them (with ruleset, labels and conditions), in key order (rules:read; v0.4, #28)",
         "parameters": [
           {
             "name": "name",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?$"
             },
-            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+            "description": "The rule set's name: [a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?, e.g. k8s/default/web-gateway. Slashes are written as they are (/rulesets/k8s/default/web-gateway); other characters need no encoding."
           }
         ],
         "responses": {
           "200": {
             "description": "OK",
+            "headers": {
+              "ETag": {
+                "description": "The set's etag, quoted: \"g<generation>-<16 hex digits>\" (the body's etag in double quotes)",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -3914,7 +4037,7 @@
             }
           },
           "400": {
-            "description": "invalid / unsupported",
+            "description": "invalid: not a rule set name",
             "content": {
               "application/json": {
                 "schema": {
@@ -3934,7 +4057,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "description": "The token lacks the scope (rules:read for GET, rules:write otherwise), a rule's listen ports are outside the token's allow_listen_ports, or a rule uses acme certificates without acme:write",
             "content": {
               "application/json": {
                 "schema": {
@@ -3944,7 +4067,7 @@
             }
           },
           "404": {
-            "description": "not_found",
+            "description": "not_found: no such rule set",
             "content": {
               "application/json": {
                 "schema": {
@@ -3956,16 +4079,18 @@
         }
       },
       "put": {
-        "summary": "Make the set's rules exactly these (rules:write; v0.4, #28). If-Match: <etag> for optimistic concurrency. unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "summary": "Apply a whole rule set (rules:write; v0.4, #28)",
+        "description": "Make the set's rules exactly the body's (rules:write; v0.4, #28). Declarative: send the whole set every time; rules of the set missing from the body are deleted. Checked first, all or nothing: the name, the body, If-Match (412), the generation (409 stale_generation when lower than the stored one; equal is accepted), the shape of every rule (400; every problem in errors, the first in code/error as \"rules[i]: ...\"), rules of the body that overlap each other (400 invalid), conflicts with rules outside the set (409: static for a rule of the settings file, owned for a rule of another set, already_exists for a rule made by POST /rules or an overlap, reserved for the control API's address), the token's allow_listen_ports for every rule created, changed or deleted (403), and the certificate and secret files of every rule created or changed (400 tls_config / invalid). Then: rules left out are stopped first (connections dropped), changed rules are changed in place when PATCH could do it without dropping connections (targets, balance, health_check, timeouts, TLS, allow_from, extra_listen_addrs, http, labels and the other v0.4 settings) and re-created otherwise (port range, source_ip, http on/off), new rules are started, unchanged running rules are left alone, and failed rules are started again. A rule that cannot bind or resolve its targets is registered as failed (state failed, conditions say why) and the rest is applied; the answer is still 200 with the per-rule results. Rules of a set appear in GET /rules with ruleset; PATCH / DELETE /rules on them is 409 owned. Rule sets are not stored in the database. Changes to rule sets run one at a time.",
         "parameters": [
           {
             "name": "name",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?$"
             },
-            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+            "description": "The rule set's name: [a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?, e.g. k8s/default/web-gateway. Slashes are written as they are (/rulesets/k8s/default/web-gateway); other characters need no encoding."
           },
           {
             "name": "dry_run",
@@ -3974,7 +4099,7 @@
             "schema": {
               "type": "boolean"
             },
-            "description": "Validate and answer the difference without changing anything (RulePlan, 200). (v0.4, #169)"
+            "description": "Run every check and answer what would change (RulesetApplied with dry_run true, the etag the set would have, and diff for updates) without changing anything (v0.4, #169)."
           },
           {
             "name": "If-Match",
@@ -3982,7 +4107,8 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "Optimistic concurrency: the request is refused with 412 precondition_failed unless the set exists and its etag is listed. Takes the etag quoted (as in the ETag header) or as in the body, a comma-separated list, W/ prefixes, or * (any existing set)."
           }
         ],
         "requestBody": {
@@ -3993,11 +4119,20 @@
                 "$ref": "#/components/schemas/RulesetRequest"
               }
             }
-          }
+          },
+          "description": "At most 32 MiB."
         },
         "responses": {
           "200": {
-            "description": "OK",
+            "description": "Applied (per-rule outcome in results)",
+            "headers": {
+              "ETag": {
+                "description": "The set's etag, quoted: \"g<generation>-<16 hex digits>\" (the body's etag in double quotes)",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -4007,11 +4142,11 @@
             }
           },
           "400": {
-            "description": "invalid / unsupported",
+            "description": "invalid / tls_config / unsupported (nothing changed)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/RulesetError"
                 }
               }
             }
@@ -4027,7 +4162,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "description": "The token lacks the scope (rules:read for GET, rules:write otherwise), a rule's listen ports are outside the token's allow_listen_ports, or a rule uses acme certificates without acme:write",
             "content": {
               "application/json": {
                 "schema": {
@@ -4037,7 +4172,17 @@
             }
           },
           "409": {
-            "description": "stale_generation / static / already_exists",
+            "description": "stale_generation / static / owned / already_exists / reserved (nothing changed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RulesetError"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed: If-Match does not match the set's etag, or the set does not exist (nothing changed)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4046,29 +4191,23 @@
               }
             }
           },
-          "412": {
-            "description": "precondition_failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
+          "413": {
+            "description": "The body is larger than 32 MiB"
           }
         }
       },
       "delete": {
-        "summary": "Delete every rule of the set (rules:write; v0.4, #28). unsupported until GET /capabilities features.rulesets is true (v0.4)",
+        "summary": "Delete a rule set and stop all of its rules at once (rules:write; v0.4, #28)",
         "parameters": [
           {
             "name": "name",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?$"
             },
-            "description": "[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?; slashes may be written as they are"
+            "description": "The rule set's name: [a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?, e.g. k8s/default/web-gateway. Slashes are written as they are (/rulesets/k8s/default/web-gateway); other characters need no encoding."
           },
           {
             "name": "drain_secs",
@@ -4077,15 +4216,25 @@
             "schema": {
               "type": "integer",
               "minimum": 0
-            }
+            },
+            "description": "Stop accepting, wait up to this many seconds for the connections of each rule to end (all rules at the same time), then close the rest"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optimistic concurrency: the request is refused with 412 precondition_failed unless the set exists and its etag is listed. Takes the etag quoted (as in the ETag header) or as in the body, a comma-separated list, W/ prefixes, or * (any existing set)."
           }
         ],
         "responses": {
           "204": {
-            "description": "Done"
+            "description": "Deleted (returns once every listener is closed and every connection has ended)"
           },
           "400": {
-            "description": "invalid / unsupported",
+            "description": "invalid: not a rule set name, or drain_secs",
             "content": {
               "application/json": {
                 "schema": {
@@ -4105,7 +4254,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope (or the listen port), or the request came over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true",
+            "description": "The token lacks the scope (rules:read for GET, rules:write otherwise), a rule's listen ports are outside the token's allow_listen_ports, or a rule uses acme certificates without acme:write",
             "content": {
               "application/json": {
                 "schema": {
@@ -4115,7 +4264,17 @@
             }
           },
           "404": {
-            "description": "not_found",
+            "description": "not_found: no such rule set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed: If-Match does not match the set's etag",
             "content": {
               "application/json": {
                 "schema": {

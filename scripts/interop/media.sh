@@ -130,7 +130,9 @@ echo "== a 10000-port range rule"
 # stop the servers above so none of their ports (MediaMTX also listens on 8892, ...) is inside the range
 kill "${PIDS[@]:1}" 2>/dev/null || true
 sleep 1
-fds() { find "/proc/$RP/fd" -mindepth 1 -maxdepth 1 | wc -l; }
+# rproxy が数えている間にも fd を開け閉めするので、find が消えた fd を読めずに誤りを返すことがある。
+# 誤りは捨てて、見えた数だけを数える（pipefail でも止まらないように find の失敗は無視する）
+fds() { { find "/proc/$RP/fd" -mindepth 1 -maxdepth 1 2>/dev/null || true; } | wc -l; }
 rss() { awk '/VmRSS/ {print $2}' "/proc/$RP/status"; }
 before_fds=$(fds)
 before_rss=$(rss)

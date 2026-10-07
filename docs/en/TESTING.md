@@ -60,6 +60,11 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
+| `core/ruleset.rs` | `etags_follow_the_rules_and_the_generation` | The etag does not depend on the order of the rules and changes with the rules or the generation. How `If-Match` may be written (quoted, `W/`, a list, `*`) |
+| | `last_transition_moves_only_when_the_status_changes` | `last_transition` moves only when `status` changes (not for a new `reason` alone); deleting starts it over |
+| | `conditions_from_the_view` | The status and reason of the four `conditions` from the state and the error's `code` |
+| | `label_metrics_lines` | `rproxy_rule_labels` lines (names, keys that end up the same, escaped values) |
+| | `readiness_states` | `starting` → ready → `draining` (never ready again) |
 
 ## Integration tests: control API (`tests/api.rs`)
 
@@ -185,9 +190,9 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry` and `api_lockout` are true), `performance` is empty |
-| `labels_…`, `limits_…`, `bandwidth_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
-| `rulesets_and_readyz_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule |
+| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions` and `readyz` are true), `performance` is empty |
+| `limits_…`, `bandwidth_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
+| `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule |
 | `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
 
@@ -206,6 +211,7 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 | Test | What it checks |
 |---|---|
 | `dry_runs_of_the_rule_endpoints_change_nothing` | `dry_run` on `POST` / `PATCH` / `DELETE` answers `action`, `change`, `before` (view), `after` (shape) and `diff`, and creates, changes and deletes nothing (no listener is opened). Mistakes get the change's own answers (`invalid`, `tls_config` (certificates are read), `already_exists`, `unsupported`, `not_found`, `static`). Names are not resolved |
+| `rule_set_dry_runs_change_nothing` | `PUT /rulesets/{name}?dry_run=true` runs the set's checks and answers each rule's `action` and `change` (unchanged, in place (with `diff`), re-created, deleted, created) and the etag the set would have, changing neither the set nor its rules. An older `generation` is refused as in the PUT itself |
 | `dry_runs_need_the_same_permissions` | `allow_listen_ports` and scopes apply to dry runs |
 | `config_plan_compares_with_the_static_rules` | `POST /config/plan` answers the difference from the static rules (creates, in-place changes, re-creations, deletes, the unchanged count), `restart_needed`, and a warning for an address an API rule holds (`failed`), changing nothing. Mistakes: `400` with `errors` |
 | `config_reload_dry_run_reads_the_file_and_applies_nothing` | `POST /config/reload?dry_run=true` reads the file and only answers the difference. Mistakes: `400`. A real reload afterwards applies |
@@ -220,6 +226,22 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 | `restored_rows_are_api_rules` | Restored rows are `api` rules (`persisted: true`, the stored `created_at`). The UI's row wins on the same key |
 | `rules_survive_a_restart_with_mariadb` | MariaDB (`RPROXY_TEST_DATABASE_URL`) and the real binary: a created (and changed) rule is written to `rproxy_rules` and comes back as `api` after a restart. On the UI's key the UI's rule is used (`restore.conflict`); other nodes' rows stay out. Deleting removes the row |
 | `a_blank_node_name_stops_the_startup` | A blank `RPROXY_NODE_NAME` is a configuration error |
+## Integration tests: rule sets, labels, conditions, readiness (`tests/rulesets.rs`, #28)
+
+What the Kubernetes controller (`max3584/rproxy-gateway`) uses.
+
+| Test | What it checks |
+|---|---|
+| `capabilities_turn_the_controller_features_on` | `rulesets`, `labels`, `conditions` and `readyz` in `features` are true |
+| `a_set_is_applied_as_a_whole_with_minimal_disruption` | A set whose name has `/` is created (`ETag` header, `ruleset`, `labels` and `conditions` in `GET /rules`, `GET /rulesets`). The same body is all `none` with the same etag. A new target alone is `in_place`: an earlier connection stays while new ones go to the new target. A different `source_ip` is `recreate`. A rule left out is `delete`. `DELETE /rulesets/{name}` stops everything |
+| `sets_refuse_stale_writes_and_do_not_take_other_rules` | A wrong `If-Match` and `If-Match` on a set that does not exist (412), an older `generation` (409 `stale_generation`), unquoted / list / `W/` `If-Match`. PATCH / DELETE of a set's rule is `409 owned`, another set's rule `owned`, a POSTed rule `already_exists` (nothing created). One invalid rule changes nothing and `errors` lists every problem. Overlaps within the body. `dry_run` answers the rules that would go and changes nothing (more in tests/plan.rs). Wrong names |
+| `a_rule_that_cannot_bind_fails_alone` | Only the rule on a busy port is `failed` (`Programmed` `False` / `BindFailed`, `BackendsHealthy` `Unknown`, `last_transition` unchanged when read again); the rest runs. Once the port is free, the same body re-creates it and it runs |
+| `conditions_report_targets_that_are_down` | A rule with every target down has `BackendsHealthy` `False` / `AllTargetsDown` (rules outside sets have `conditions` too) |
+| `labels_are_kept_replaced_and_exported` | `labels` in the view, `rproxy_rule_labels` in `/metrics`, PATCH replacing them as a whole / keeping them when left out / `{}` removing them, a wrong key is `invalid` |
+| `readyz_follows_the_startup_and_the_shutdown` | Without a token: `starting` (503) → ready (200) → `draining` (503; never ready again) |
+| `sets_need_rules_write_within_the_allowed_ports` | A `rules:read` token can read but not PUT / DELETE (403), rules outside `allow_listen_ports` are 403, `updated_by` is the token's name |
+
+That a started rproxy answers 200 on `GET /readyz` after the restore is `readyz_answers_once_started` in `tests/startup.rs`.
 
 ## Restoring from the DB (`tests/db_restore.rs`)
 

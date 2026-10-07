@@ -288,7 +288,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 
 | `event` | 内容 |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止 |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も） |
+| `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |

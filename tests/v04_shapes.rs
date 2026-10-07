@@ -66,25 +66,18 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
 	for flag in [
-		"rulesets", "labels", "conditions", "readyz", "limits", "bandwidth", "geoip", "outlier_detection",
+		"limits", "bandwidth", "geoip", "outlier_detection",
 		"handoff", "self_update",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
 	assert_eq!(f["performance"], json!([]), "{caps}");
-	// implemented (tests/api_hardening.rs)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout"] {
+	// implemented (tests/api_hardening.rs, tests/rulesets.rs)
+	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
 	assert!(!f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
 	assert!(!f["services"].as_array().unwrap().contains(&json!("outlier_detection")));
-}
-
-/// #28 labels
-#[tokio::test]
-async fn labels_are_checked_then_unsupported() {
-	let h = harness().await;
-	rule_setting(&h, "tcp", "labels", json!({"tenant": "act"}), json!({"bad key": "x"})).await;
 }
 
 /// #165
@@ -145,34 +138,6 @@ async fn outlier_detection_is_checked_then_unsupported() {
 	assert_eq!(code(&r), INVALID, "{}", r.1);
 }
 
-/// #28 rule sets and readiness
-#[tokio::test]
-async fn rulesets_and_readyz_are_checked_then_unsupported() {
-	let h = harness().await;
-	let backend = tcp_backend("R:").await;
-	let set = json!({"generation": 1, "rules": [rule("tcp", free_port(), backend)]});
-	let r = send(&h, Method::PUT, "/rulesets/k8s/default/web", Some(set.clone())).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	let r = send(&h, Method::PUT, "/rulesets/Bad%20Name", Some(set.clone())).await;
-	assert_eq!(code(&r), INVALID, "{}", r.1);
-	let r = send(&h, Method::PUT, "/rulesets/k8s/web", Some(json!({"rules": []}))).await;
-	assert_eq!(code(&r), INVALID, "generation is required: {}", r.1);
-	let mut twice = set.clone();
-	twice["rules"] = json!([set["rules"][0], set["rules"][0]]);
-	assert_eq!(code(&send(&h, Method::PUT, "/rulesets/k8s/web", Some(twice)).await), INVALID);
-	let mut wrong = set.clone();
-	wrong["rules"][0]["remote_port"] = json!(0);
-	let r = send(&h, Method::PUT, "/rulesets/k8s/web", Some(wrong)).await;
-	assert_eq!(code(&r), INVALID);
-	assert!(r.1["error"].as_str().unwrap().starts_with("rules[0]"), "{}", r.1);
-	assert_eq!(code(&send(&h, Method::PUT, "/rulesets/k8s/web?dry_run=maybe", Some(set)).await), INVALID);
-	assert_eq!(code(&send(&h, Method::GET, "/rulesets", None).await), UNSUPPORTED);
-	assert_eq!(code(&send(&h, Method::GET, "/rulesets/k8s/web", None).await), UNSUPPORTED);
-	assert_eq!(code(&send(&h, Method::DELETE, "/rulesets/k8s/web", None).await), UNSUPPORTED);
-	// no token needed, like /healthz
-	assert_eq!(code(&send(&h, Method::GET, "/readyz", None).await), UNSUPPORTED);
-}
-
 // #169 (dry runs) and #144 (persistence) work: tests/plan.rs and tests/persist.rs
 
 /// #174
@@ -200,11 +165,8 @@ async fn new_endpoints_need_their_scopes() {
 	let as_reader = |method: Method, path: &str| {
 		h.http.request(method, format!("{}{path}", h.base)).bearer_auth("reader").json(&json!({"generation": 1, "rules": []})).send()
 	};
-	assert_eq!(as_reader(Method::GET, "/rulesets").await.unwrap().status(), StatusCode::BAD_REQUEST, "rules:read may list");
-	assert_eq!(as_reader(Method::PUT, "/rulesets/a").await.unwrap().status(), StatusCode::FORBIDDEN);
 	assert_eq!(as_reader(Method::GET, "/admin/update").await.unwrap().status(), StatusCode::FORBIDDEN);
 	assert_eq!(as_reader(Method::POST, "/config/plan").await.unwrap().status(), StatusCode::FORBIDDEN);
-	assert_eq!(h.http.get(format!("{}/readyz", h.base)).send().await.unwrap().status(), StatusCode::BAD_REQUEST, "no token");
 	fs::remove_dir_all(dir).unwrap();
 }
 

@@ -122,6 +122,50 @@ async fn dry_runs_of_the_rule_endpoints_change_nothing() {
 	assert_eq!(r.1["code"], "static");
 }
 
+/// `PUT /rulesets/{name}?dry_run=true` (#28): the set's checks, then what
+/// would happen to each rule, through the same plan engine; nothing changes.
+#[tokio::test]
+async fn rule_set_dry_runs_change_nothing() {
+	let h = harness().await;
+	let backend = tcp_backend("U:").await;
+	let (keep, moved, proto, dropped, added) = (free_port(), free_port(), free_port(), free_port(), free_port());
+	let set = json!({"generation": 1, "rules": [rule("tcp", keep, backend), rule("tcp", moved, backend), rule("tcp", proto, backend), rule("tcp", dropped, backend)]});
+	let r = send(&h, Method::PUT, "/rulesets/k8s/plan", Some(set)).await;
+	assert_eq!(r.0, StatusCode::OK, "{}", r.1);
+	let etag = r.1["etag"].clone();
+
+	let mut changed = rule("tcp", moved, backend);
+	changed["remote_port"] = json!(backend.port() + 1);
+	let mut v2 = rule("tcp", proto, backend);
+	v2["source_ip"] = json!("proxy_v2");
+	let body = json!({"generation": 2, "rules": [rule("tcp", keep, backend), changed, v2, rule("tcp", added, backend)]});
+	let r = send(&h, Method::PUT, "/rulesets/k8s/plan?dry_run=true", Some(body)).await;
+	assert_eq!((r.0, r.1["dry_run"].as_bool()), (StatusCode::OK, Some(true)), "{}", r.1);
+	assert_ne!(r.1["etag"], etag, "the etag the set would have");
+	let result = |port: u16| {
+		r.1["results"].as_array().unwrap().iter().find(|x| x["rule"] == format!("tcp/127.0.0.1:{port}")).unwrap_or_else(|| panic!("{port}: {}", r.1)).clone()
+	};
+	let pair = |v: &Value| (v["action"].as_str().unwrap().to_string(), v["change"].as_str().unwrap().to_string());
+	assert_eq!(pair(&result(keep)), ("none".into(), "none".into()));
+	assert_eq!(pair(&result(moved)), ("update".into(), "in_place".into()));
+	assert_eq!(result(moved)["diff"], json!([{"path": "remote_port", "before": backend.port(), "after": backend.port() + 1}]));
+	assert_eq!(pair(&result(proto)), ("update".into(), "recreate".into()), "source_ip cannot change in place");
+	assert_eq!(pair(&result(dropped)), ("delete".into(), "none".into()));
+	assert_eq!(pair(&result(added)), ("create".into(), "none".into()));
+	// a rule of the set is changed only through it, dry runs included
+	let r = send(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{keep}?dry_run=true"), None).await;
+	assert_eq!(r.1["code"], "owned", "{}", r.1);
+
+	let (_, now) = h.get("/rulesets/k8s/plan").await;
+	assert_eq!((&now["generation"], &now["etag"]), (&json!(1), &etag), "nothing changed: {now}");
+	assert_eq!(h.get(&format!("/rules/tcp/127.0.0.1/{dropped}")).await.0, StatusCode::OK);
+	assert_eq!(h.get(&format!("/rules/tcp/127.0.0.1/{moved}")).await.1["remote_port"], backend.port());
+	assert!(std::net::TcpListener::bind(("127.0.0.1", added)).is_ok(), "nothing bound");
+	// refused like the PUT itself
+	let r = send(&h, Method::PUT, "/rulesets/k8s/plan?dry_run=true", Some(json!({"generation": 0, "rules": []}))).await;
+	assert_eq!(r.1["code"], "stale_generation", "{}", r.1);
+}
+
 /// A token's allow_listen_ports applies to dry runs too.
 #[tokio::test]
 async fn dry_runs_need_the_same_permissions() {
