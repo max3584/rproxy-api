@@ -87,13 +87,13 @@ pub struct RouteTarget {
 	pub patterns: Vec<String>,
 	/// Relay without terminating TLS (`passthrough: true` in a `terminate` rule).
 	pub passthrough: bool,
-	pub host: String,
-	pub target: watch::Receiver<Vec<SocketAddr>>,
+	/// Its targets (`remote_addr` / `remote_port` as one, or `targets`, #234).
+	pub pool: Arc<Pool>,
 }
 
 /// One backend a connection may go to.
 pub struct Candidate {
-	/// The rule's target (None for a `tls.routes` backend).
+	/// The target in its pool (the rule's, or a `tls.routes` one).
 	pub member: Option<Arc<Member>>,
 	pub addrs: Vec<SocketAddr>,
 	/// Host name as configured, for verifying the backend's certificate.
@@ -110,10 +110,12 @@ impl Candidate {
 /// Where one connection goes: the backends to try, best first.
 pub struct Target {
 	pub candidates: Vec<Candidate>,
-	/// The rule's targets, for marking one that refuses (None for `tls.routes`).
+	/// The targets chosen from, for marking one that refuses: the rule's, or the route's.
 	pub pool: Option<Arc<Pool>>,
 	/// A `passthrough` route: relay the TLS bytes as they are.
 	pub passthrough: bool,
+	/// Chosen by a `tls.routes` name (not the rule's own targets).
+	pub from_route: bool,
 }
 
 /// Everything a listener and its connections need at run time.
@@ -240,12 +242,13 @@ impl Runtime {
 		if let Some(name) = server_name {
 			if let Some(i) = best_match(routes.iter().map(|r| r.patterns.as_slice()), name) {
 				let route = &routes[i];
-				let addrs = route.target.borrow().iter().map(|a| shifted(*a, offset)).collect();
-				return Some(Target {
-					candidates: vec![Candidate { member: None, addrs, host: route.host.clone() }],
-					pool: None,
-					passthrough: route.passthrough,
-				});
+				let candidates = route
+					.pool
+					.order()
+					.into_iter()
+					.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
+					.collect();
+				return Some(Target { candidates, pool: Some(route.pool.clone()), passthrough: route.passthrough, from_route: true });
 			}
 		}
 		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
@@ -257,7 +260,7 @@ impl Runtime {
 			.into_iter()
 			.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 			.collect();
-		Some(Target { candidates, pool: Some(pool), passthrough: false })
+		Some(Target { candidates, pool: Some(pool), passthrough: false, from_route: false })
 	}
 }
 

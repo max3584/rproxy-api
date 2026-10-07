@@ -51,12 +51,25 @@ pub struct Route {
 	/// Several names for one backend (instead of `server_name`).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub server_names: Vec<String>,
+	/// The backend (or `targets` instead).
+	#[serde(default, skip_serializing_if = "String::is_empty")]
 	pub remote_addr: String,
+	#[serde(default, skip_serializing_if = "is_zero")]
 	pub remote_port: u16,
 	/// `terminate` only: send matching connections through without terminating
 	/// TLS (the ClientHello is replayed to the backend, as with mode `sni`).
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub passthrough: bool,
+	/// Several backends for these names (#234), instead of `remote_addr` / `remote_port`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<crate::core::balance::TargetSpec>,
+	/// How connections are spread over `targets`.
+	#[serde(default, skip_serializing_if = "crate::core::balance::Balance::is_default")]
+	pub balance: crate::core::balance::Balance,
+}
+
+fn is_zero(n: &u16) -> bool {
+	*n == 0
 }
 
 impl Route {
@@ -72,6 +85,14 @@ impl Route {
 	/// A name for messages.
 	pub fn label(&self) -> String {
 		self.patterns().join(",")
+	}
+
+	/// The backends: `targets`, or `remote_addr` / `remote_port` as one target.
+	pub fn members(&self) -> Vec<crate::core::balance::TargetSpec> {
+		if !self.targets.is_empty() {
+			return self.targets.clone();
+		}
+		vec![crate::core::balance::TargetSpec { addr: self.remote_addr.clone(), port: self.remote_port, weight: None, backup: false }]
 	}
 }
 
@@ -332,9 +353,24 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		if route.passthrough && starttls.is_some() {
 			return Err(tls_error("passthrough routes cannot be combined with starttls (TLS starts after the plain-text dialogue)"));
 		}
-		crate::core::rule::validate_remote(&route.remote_addr, route.remote_port)?;
-		if u32::from(route.remote_port) + u32::from(port_count) - 1 > 65_535 {
-			return Err(ApiError::invalid(format!("route {}: remote_port + range length exceeds 65535", route.label())));
+		if route.targets.is_empty() {
+			if route.remote_addr.is_empty() {
+				return Err(tls_error(format!("route {}: needs remote_addr and remote_port, or targets", route.label())));
+			}
+			if !route.balance.is_default() {
+				return Err(tls_error(format!("route {}: balance needs targets", route.label())));
+			}
+			crate::core::rule::validate_remote(&route.remote_addr, route.remote_port)?;
+			if u32::from(route.remote_port) + u32::from(port_count) - 1 > 65_535 {
+				return Err(ApiError::invalid(format!("route {}: remote_port + range length exceeds 65535", route.label())));
+			}
+		} else {
+			if !route.remote_addr.is_empty() || route.remote_port != 0 {
+				return Err(tls_error(format!("route {}: give remote_addr / remote_port or targets, not both", route.label())));
+			}
+			let mut targets = route.targets.clone();
+			crate::core::balance::validate_targets(&mut targets, port_count)
+				.map_err(|e| ApiError::invalid(format!("route {}: {}", route.label(), e.message)))?;
 		}
 	}
 	if let Some(proto) = starttls {
@@ -640,7 +676,7 @@ impl CertBundle {
 		Ok(CertBundle { not_after: earliest_expiry(&certs).unwrap_or(i64::MAX), certs })
 	}
 
-	fn roots(&self, file: &str) -> Result<RootCertStore, ApiError> {
+	pub(crate) fn roots(&self, file: &str) -> Result<RootCertStore, ApiError> {
 		let mut roots = RootCertStore::empty();
 		for cert in &self.certs {
 			roots.add(cert.clone()).map_err(|e| tls_error(format!("{file}: {e}")))?;
@@ -691,7 +727,7 @@ fn all_expired(spec: &TlsSpec) -> ApiError {
 	tls_error(format!("{CERT_EXPIRED}: every certificate of this rule has expired ({}); renew the files", files.join(", ")))
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 	Arc::new(rustls::crypto::ring::default_provider())
 }
 
@@ -1172,6 +1208,8 @@ mod tests {
 			remote_addr: "10.0.0.1".into(),
 			remote_port: 443,
 			passthrough: false,
+			targets: vec![],
+			balance: Default::default(),
 		}
 	}
 

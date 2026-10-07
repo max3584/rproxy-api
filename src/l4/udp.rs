@@ -214,7 +214,7 @@ async fn session(
 				return None;
 			}
 			// a `tls.routes` backend: its addresses as resolved now
-			Some(t) if t.pool.is_none() => t
+			Some(t) if t.from_route => t
 				.candidates
 				.iter()
 				.flat_map(|c| c.addrs.iter())
