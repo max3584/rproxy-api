@@ -30,7 +30,7 @@ Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc 
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
-Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
+Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `token.expiring` / `token.expired` (`tests/api_hardening.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).
 
 ## Unit tests (`src/`)
 
@@ -190,11 +190,21 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) and that what ca
 
 | Test | What it checks |
 |---|---|
-| `capabilities_list_the_v0_4_features_as_off` | Every v0.4 flag in `features` is false, `performance` is empty |
+| `capabilities_list_the_v0_4_features_as_off` | The v0.4 flags in `features` not implemented yet are false (the implemented `client_cert_auth`, `token_expiry`, `api_lockout`, `rulesets`, `labels`, `conditions` and `readyz` are true), `performance` is empty |
 | `limits_…`, `bandwidth_…`, `geoip_…`, `outlier_detection_…` | A valid shape is `400 unsupported`, a wrong one `400 invalid`. The same with PATCH, where `{}` removes it (accepted). Also the `geoip` middleware and services' `outlier_detection` |
 | `dry_run_…`, `config_plan_…`, `upgrade_and_update_…`, `new_endpoints_need_their_scopes` | New endpoints check the body, names and `dry_run`, then answer `unsupported`. Scopes and the Unix-socket-only rule. A dry run changes nothing |
 | `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors and settings that cannot run yet as warnings (`global.geoip`, `global.performance.*`, rules). `--diff` is not available yet. A 0.3 settings file passes without warnings |
-| `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables, and control API client certificates (not available yet), stop the startup |
+| `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
+
+## Integration tests: control API hardening (`tests/api_hardening.rs`, #167)
+
+| Test | What it checks |
+|---|---|
+| `client_certificates_authenticate_alone_or_bound_to_a_token` | With the TLS of main.rs (`ClientCertAcceptor`) in `optional` mode, a certificate-only entry authenticates by the certificate (SAN, else CN) with its scopes. An unknown name or no certificate is 401; tokens work without a certificate. A token bound to a certificate is 401 without it. A certificate from another CA fails the handshake. `required` refuses connections without a certificate |
+| `failing_sources_are_locked_out_over_tcp_but_not_the_unix_socket` | A source reaching the limit of 401s in the window gets `429 locked_out` (`Retry-After`) even with a good token. Failures over the Unix socket are not counted, and the Unix socket works while locked out. `/healthz` is never refused. `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` in `/metrics`. It recovers when the time is up |
+| `lockout_is_on_by_default` | By default (owner's decision) the 20th failure locks out |
+| `expiring_tokens_are_reported_and_exported` | A token close to expiry gives `token.expiring` (`days_left`), an expired one `token.expired`, once per change. `rproxy_token_expiry_timestamp_seconds` in `/metrics` |
+| `the_binary_serves_client_certificates` | The real binary: a token file with `client_cert` and no `--tls-client-auth` stops the startup; with `required`, `/rules` is read with the certificate alone and connections without one are refused |
 
 ## Integration tests: rule sets, labels, conditions, readiness (`tests/rulesets.rs`, #28)
 

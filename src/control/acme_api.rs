@@ -27,7 +27,7 @@ fn audit(principal: &Principal, client: &Client, action: &str, target: &str, res
 		Err(e) if e.code == "forbidden" => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
-	info!(event = "audit", token = %principal.name, client = %client.0, action, rule = "", target, outcome, code);
+	info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action, rule = "", target, outcome, code);
 }
 
 /// Whether a rule (in a POST or PATCH body) has an ACME certificate.

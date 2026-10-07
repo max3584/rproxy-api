@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 
 use rproxy_api::control::api::{self, AppState};
 use rproxy_api::control::auth::Tokens;
+use rproxy_api::control::hardening::{ApiTlsError, ApiTlsFiles, ClientCertAcceptor, TokenExpiry};
 use rproxy_api::l7::access::{AccessLogError, HttpGlobal};
 use rproxy_api::l7::middleware::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::config::{ConfigDoc, LoadError};
@@ -295,18 +296,9 @@ fn raise_nofile_limit() -> Option<u64> {
 /// weaken the control API if ignored are errors; options this build cannot
 /// apply yet are returned to be logged as `degraded`.
 fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
-	use rproxy_api::control::{hardening::HardeningOptions, upgrade::UpgradeOptions};
+	use rproxy_api::control::upgrade::UpgradeOptions;
 	let features = rproxy_api::core::rule::Features::CURRENT;
-	let hardening = HardeningOptions {
-		tls_client_ca: opts.tls_client_ca.clone(),
-		tls_client_auth: opts.tls_client_auth,
-		has_tls_cert: opts.tls_cert.is_some(),
-		token_warn_days: opts.token_warn_days,
-		lockout_failures: opts.api_lockout_failures,
-		lockout_window: opts.api_lockout_window.clone(),
-		lockout_duration: opts.api_lockout_duration.clone(),
-	}
-	.check(&features);
+	let hardening = hardening_options(opts).check(&features);
 	let upgrade = UpgradeOptions {
 		handoff_socket: opts.handoff_socket.clone(),
 		handoff_timeout: opts.handoff_timeout.clone(),
@@ -351,6 +343,25 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 		}
 	}
 	Ok(ignored)
+}
+
+/// The control API hardening options (#167).
+fn hardening_options(opts: &Options) -> rproxy_api::control::hardening::HardeningOptions {
+	rproxy_api::control::hardening::HardeningOptions {
+		tls_client_ca: opts.tls_client_ca.clone(),
+		tls_client_auth: opts.tls_client_auth,
+		has_tls_cert: opts.tls_cert.is_some(),
+		token_warn_days: opts.token_warn_days,
+		lockout_failures: opts.api_lockout_failures,
+		lockout_window: opts.api_lockout_window.clone(),
+		lockout_duration: opts.api_lockout_duration.clone(),
+	}
+}
+
+/// The control API's TLS files (certificate, key, client CA), when it serves TLS.
+fn api_tls_files(opts: &Options) -> Option<ApiTlsFiles> {
+	let (cert, key) = opts.tls_cert.clone().zip(opts.tls_key.clone())?;
+	Some(ApiTlsFiles { cert, key, client_ca: opts.tls_client_ca.clone(), client_auth: opts.tls_client_auth.unwrap_or_default() })
 }
 
 /// `--diff-api`: `unix:/path` or an http(s) URL.
@@ -524,7 +535,8 @@ async fn run(opts: Options) -> Result<(), String> {
 		return Err("--tls-cert and --tls-key must be given together".into());
 	}
 
-	let tokens = Arc::new(match &opts.token_file {
+	let hardening = hardening_options(&opts);
+	let tokens = match &opts.token_file {
 		None => Tokens::disabled(),
 		Some(path) => match Tokens::from_file(path.clone()) {
 			Ok(tokens) => tokens,
@@ -537,7 +549,11 @@ async fn run(opts: Options) -> Result<(), String> {
 				Tokens::locked(path.clone())
 			}
 		},
-	});
+	};
+	// client_cert entries while the API asks for no certificates are a mistake
+	let tokens = Arc::new(tokens.with_client_auth(hardening.client_auth()).map_err(|e| e.to_string())?.with_lockout(hardening.lockout()));
+	let token_expiry = Arc::new(TokenExpiry::new(hardening.token_warn_days()));
+	token_expiry.check(&tokens.expiries());
 
 	if !rproxy_api::core::rule::Features::CURRENT.persistence {
 		for name in tokens.persisting() {
@@ -548,9 +564,10 @@ async fn run(opts: Options) -> Result<(), String> {
 
 	// the control API certificate; loaded later by the listener task when it cannot be read yet
 	let tls: Arc<OnceCell<RustlsConfig>> = Arc::default();
-	if let (Some(cert), Some(key)) = (&opts.tls_cert, &opts.tls_key) {
+	let tls_files = api_tls_files(&opts);
+	if let Some(files) = &tls_files {
 		let _ = rustls::crypto::ring::default_provider().install_default();
-		match load_api_tls(cert, key).await {
+		match files.rustls() {
 			Ok(config) => {
 				let _ = tls.set(config);
 			}
@@ -709,7 +726,7 @@ async fn run(opts: Options) -> Result<(), String> {
 			addr,
 			app: app.clone(),
 			tls: tls.clone(),
-			files: opts.tls_cert.clone().zip(opts.tls_key.clone()),
+			files: tls_files.clone(),
 			handles: handles.clone(),
 		};
 		// the rules keep running while a listener that cannot start is retried
@@ -745,10 +762,11 @@ async fn run(opts: Options) -> Result<(), String> {
 			every(opts.cert_expiry_check_secs),
 			registry.clone(),
 			tls.clone(),
-			opts.tls_cert.clone().zip(opts.tls_key.clone()),
+			tls_files.clone(),
 			stop.clone(),
 		));
 	}
+	tokio::spawn(watch_tokens(tokens.clone(), token_expiry.clone(), stop.clone()));
 
 	let config_hup = Arc::new(Notify::new());
 	if let Some(reloader) = reloader {
@@ -756,7 +774,7 @@ async fn run(opts: Options) -> Result<(), String> {
 		tokio::spawn(watch_config(every, reloader, config_hup.clone(), stop.clone()));
 	}
 
-	wait_for_shutdown(&tokens, &tls, &opts, &registry, &config_hup).await?;
+	wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup).await?;
 
 	info!(event = "shutdown");
 	registry.readiness().set_draining();
@@ -797,11 +815,11 @@ async fn watch_certificates(
 	expiry: Option<Duration>,
 	registry: Arc<Registry>,
 	api_tls: Arc<OnceCell<RustlsConfig>>,
-	api_files: Option<(PathBuf, PathBuf)>,
+	api_files: Option<ApiTlsFiles>,
 	stop: CancellationToken,
 ) {
 	use rproxy_api::tls::config::fingerprint;
-	let api_print = |(c, k): &(PathBuf, PathBuf)| fingerprint([c.to_str().unwrap_or(""), k.to_str().unwrap_or("")]);
+	let api_print = |f: &ApiTlsFiles| fingerprint(f.paths().into_iter().map(|p| p.to_str().unwrap_or("")));
 	let mut api_seen = api_files.as_ref().map(api_print);
 	let ticker = |every: Option<Duration>| {
 		every.map(|e| {
@@ -827,11 +845,11 @@ async fn watch_certificates(
 				if let (Some(files), Some(config)) = (&api_files, api_tls.get()) {
 					let now = api_print(files);
 					if api_seen != Some(now) {
-						match config.reload_from_pem_file(&files.0, &files.1).await {
+						match files.reload(config) {
 							Ok(()) => {
 								info!(event = "reload.tls", part = "api", reason = "files changed");
 								api_seen = Some(now);
-								note_api_cert(&registry, &files.0);
+								note_api_cert(&registry, &files.cert);
 							}
 							Err(e) => warn!(event = "reload.tls", part = "api", error = %e, "keeping current certificate"),
 						}
@@ -841,8 +859,8 @@ async fn watch_certificates(
 			_ = tick(&mut expiry_ticks) => {
 				let changed = registry.check_certificate_expiry().await;
 				info!(event = "cert.check", rules_updated = changed);
-				if let Some((cert, _)) = &api_files {
-					note_api_cert(&registry, cert);
+				if let Some(files) = &api_files {
+					note_api_cert(&registry, &files.cert);
 				}
 			}
 		}
@@ -873,12 +891,30 @@ async fn watch_config(every: Option<Duration>, reloader: Arc<ConfigReloader>, hu
 	}
 }
 
+/// Checks token expiry once a day and unlocks locked-out sources whose time
+/// is up (#167).
+async fn watch_tokens(tokens: Arc<Tokens>, expiry: Arc<TokenExpiry>, stop: CancellationToken) {
+	let start = tokio::time::Instant::now();
+	let mut day = tokio::time::interval_at(start + Duration::from_secs(86_400), Duration::from_secs(86_400));
+	let mut sweep = tokio::time::interval_at(start + Duration::from_secs(5), Duration::from_secs(5));
+	loop {
+		tokio::select! {
+			_ = stop.cancelled() => return,
+			_ = day.tick() => {
+				expiry.check(&tokens.expiries());
+			}
+			_ = sweep.tick() => tokens.lockout().sweep(),
+		}
+	}
+}
+
 /// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.
 #[cfg(unix)]
 async fn wait_for_shutdown(
 	tokens: &Tokens,
+	token_expiry: &TokenExpiry,
 	tls: &OnceCell<RustlsConfig>,
-	opts: &Options,
+	tls_files: Option<&ApiTlsFiles>,
 	registry: &Arc<Registry>,
 	config_hup: &Notify,
 ) -> Result<(), String> {
@@ -893,11 +929,12 @@ async fn wait_for_shutdown(
 					Ok(n) => info!(event = "reload.tokens", tokens = n),
 					Err(e) => warn!(event = "reload.tokens", error = %e, "keeping current tokens"),
 				}
-				if let (Some(tls), Some(cert), Some(key)) = (tls.get(), &opts.tls_cert, &opts.tls_key) {
-					match tls.reload_from_pem_file(cert, key).await {
+				token_expiry.check(&tokens.expiries());
+				if let (Some(tls), Some(files)) = (tls.get(), tls_files) {
+					match files.reload(tls) {
 						Ok(()) => {
 							info!(event = "reload.tls");
-							note_api_cert(registry, cert);
+							note_api_cert(registry, &files.cert);
 						}
 						Err(e) => warn!(event = "reload.tls", error = %e, "keeping current certificate"),
 					}
@@ -919,7 +956,14 @@ async fn wait_for_shutdown(
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(_: &Tokens, _: &OnceCell<RustlsConfig>, _: &Options, _: &Arc<Registry>, _: &Notify) -> Result<(), String> {
+async fn wait_for_shutdown(
+	_: &Tokens,
+	_: &TokenExpiry,
+	_: &OnceCell<RustlsConfig>,
+	_: Option<&ApiTlsFiles>,
+	_: &Arc<Registry>,
+	_: &Notify,
+) -> Result<(), String> {
 	tokio::signal::ctrl_c().await.map_err(|e| e.to_string())
 }
 
@@ -930,35 +974,13 @@ fn config_error(e: &io::Error) -> bool {
 	matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput)
 }
 
-enum ApiTlsError {
-	/// Wrong path or not a certificate / key: stop the startup.
-	Config(String),
-	/// Exists but cannot be read now: retry.
-	Unreadable(String),
-}
-
-async fn load_api_tls(cert: &Path, key: &Path) -> Result<RustlsConfig, ApiTlsError> {
-	let read = |path: &Path| {
-		std::fs::read(path).map_err(|e| {
-			let msg = format!("TLS {}: {e}", path.display());
-			if config_error(&e) {
-				ApiTlsError::Config(msg)
-			} else {
-				ApiTlsError::Unreadable(msg)
-			}
-		})
-	};
-	let (cert_pem, key_pem) = (read(cert)?, read(key)?);
-	RustlsConfig::from_pem(cert_pem, key_pem).await.map_err(|e| ApiTlsError::Config(format!("TLS: {e}")))
-}
-
 /// One address of the control API.
 struct ApiListener {
 	addr: SocketAddr,
 	app: axum::Router,
 	tls: Arc<OnceCell<RustlsConfig>>,
-	/// (cert, key) when the API is served over TLS
-	files: Option<(PathBuf, PathBuf)>,
+	/// the TLS files when the API is served over TLS
+	files: Option<ApiTlsFiles>,
 	handles: Arc<Mutex<Vec<Handle>>>,
 }
 
@@ -966,12 +988,10 @@ impl ApiListener {
 	async fn start(&self) -> Result<(), String> {
 		let tls = match &self.files {
 			None => None,
-			Some((cert, key)) => match self.tls.get() {
+			Some(files) => match self.tls.get() {
 				Some(config) => Some(config.clone()),
 				None => {
-					let config = load_api_tls(cert, key).await.map_err(|e| match e {
-						ApiTlsError::Config(e) | ApiTlsError::Unreadable(e) => e,
-					})?;
+					let config = files.rustls().map_err(|e| e.to_string())?;
 					let _ = self.tls.set(config);
 					self.tls.get().cloned()
 				}
@@ -987,7 +1007,11 @@ impl ApiListener {
 		let addr = self.addr;
 		match tls {
 			Some(tls) => {
-				let server = axum_server::from_tcp_rustls(listener, tls).map_err(|e| e.to_string())?.handle(handle.clone());
+				// requests carry the client certificate's names (#167)
+				let server = axum_server::from_tcp(listener)
+					.map_err(|e| e.to_string())?
+					.acceptor(ClientCertAcceptor::new(tls))
+					.handle(handle.clone());
 				tokio::spawn(async move {
 					if let Err(e) = server.serve(app).await {
 						error!(event = "api.stopped", addr = %addr, error = %e);

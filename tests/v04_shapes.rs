@@ -67,11 +67,15 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let f = &caps["features"];
 	for flag in [
 		"limits", "bandwidth", "geoip", "outlier_detection", "dry_run",
-		"persistence", "client_cert_auth", "token_expiry", "api_lockout", "handoff", "self_update",
+		"persistence", "handoff", "self_update",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
 	assert_eq!(f["performance"], json!([]), "{caps}");
+	// implemented (tests/api_hardening.rs, tests/rulesets.rs)
+	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz"] {
+		assert_eq!(f[flag], true, "{flag}: {caps}");
+	}
 	assert!(!f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
 	assert!(!f["services"].as_array().unwrap().contains(&json!("outlier_detection")));
 }
@@ -329,13 +333,14 @@ fn a_0_3_settings_file_still_passes() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
-/// #167, #174, #144, performance flags: mistakes stop the startup, client
-/// certificates (which would weaken the control API if ignored) too.
+/// #167, #174, #144, performance flags: mistakes stop the startup.
 #[test]
 fn v0_4_flags_are_checked_at_startup() {
 	let dir = workdir("flags");
 	for (env, want) in [
-		(vec![("RPROXY_TLS_CLIENT_AUTH", "required"), ("RPROXY_TLS_CLIENT_CA", "/ca.pem")], "not available"),
+		(vec![("RPROXY_TLS_CLIENT_AUTH", "required"), ("RPROXY_TLS_CLIENT_CA", "/ca.pem")], "needs --tls-cert"),
+		(vec![("RPROXY_TLS_CLIENT_AUTH", "optional")], "needs --tls-client-ca"),
+		(vec![("RPROXY_TOKEN_WARN_DAYS", "0")], "--token-warn-days"),
 		(vec![("RPROXY_TLS_CLIENT_AUTH", "sometimes")], "sometimes"),
 		(vec![("RPROXY_API_LOCKOUT_WINDOW", "soon")], "--api-lockout-window"),
 		(vec![("RPROXY_UPDATE_PIN", "99.0.0")], "RPROXY_UPDATE_PIN"),

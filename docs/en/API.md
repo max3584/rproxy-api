@@ -28,10 +28,79 @@ The contract between the UI (TCP-UDP-rproxy-ui) and rproxy-api. When changing ei
 
     - Scopes: `rules:read` (`GET /rules`, `/interfaces`), `rules:write` (`POST` / `PATCH` / `DELETE /rules`), `metrics:read` (`GET /metrics`), `acme:write` (creating and changing rules with ACME certificates, and `POST /acme/...`; docs/en/ACME.md), `admin` (everything). `GET /capabilities` can be read with any token. Insufficient scope gives `403 forbidden`.
     - Creating, modifying and deleting rules is recorded in `event: "audit"` logs (`token`, `client`, `action`, `rule`, `outcome` (`ok` / `error` / `forbidden`), and `code` on failure). `client` is the sender's IP (`unix` over the Unix socket).
-    - Refused requests are recorded in `event: "audit"` too (with `client`, `method` and `path`; the token itself is never logged): a missing, unknown or expired token (401) as `outcome: "unauthorized"` with `reason` (`missing` / `invalid` / `expired`), a missing scope (403) as `outcome: "forbidden"` with `token` and `scope`. So that the log does not overflow, refused requests are logged up to 20 lines in a row per sender, then one line a second. `suppressed` in a line is the number of lines left out for that sender before it (the total is `rproxy_log_suppressed_total` in `/metrics`).
+    - Refused requests are recorded in `event: "audit"` too (with `client`, `method` and `path`; the token itself is never logged): a missing, unknown or expired token (401) as `outcome: "unauthorized"` with `reason` (`missing` / `invalid` / `expired`, or `client_cert` when the client certificate bound to the token is missing), a lockout (429) as `outcome: "locked_out"`, a missing scope (403) as `outcome: "forbidden"` with `token` and `scope`. So that the log does not overflow, refused requests are logged up to 20 lines in a row per sender, then one line a second. `suppressed` in a line is the number of lines left out for that sender before it (the total is `rproxy_log_suppressed_total` in `/metrics`).
   - Multiple tokens can be valid at the same time. To rotate, list both the old and new ones, then remove the old one later.
   - On SIGHUP the token file is reloaded.
 - If `--api-addr` includes a non-loopback address, `--token-file`, `--tls-cert` and `--tls-key` are all required. If any is missing, startup is refused.
+
+### Control API hardening (v0.4, #167)
+
+Hardening of the TCP control API: client certificates (mTLS), token expiry notices, and locking out sources that keep failing authentication. **The Unix socket is outside all of it** (it has no TLS and is guarded by the socket file's permissions; it is never locked out).
+
+| Flag / environment variable | Default | Meaning |
+|---|---|---|
+| `--tls-client-ca` / `RPROXY_TLS_CLIENT_CA` | none | CA (PEM, may hold several) verifying client certificates. Needs `--tls-cert`. Re-read on SIGHUP and by the certificate file check (`RPROXY_CERT_CHECK_SECS`) |
+| `--tls-client-auth` / `RPROXY_TLS_CLIENT_AUTH` | `none` | `none`, `optional` (verified when presented; connections without one use tokens) or `required` (connections without a valid certificate fail the TLS handshake). `optional` / `required` need `--tls-client-ca` |
+| `--token-warn-days` / `RPROXY_TOKEN_WARN_DAYS` | `14` | `token.expiring` is logged when a token's `expires` is closer than this many days (1-3650) |
+| `--api-lockout-failures` / `RPROXY_API_LOCKOUT_FAILURES` | `20` | A source whose failed authentications (401) within `window` reach this is locked out. `0`: never |
+| `--api-lockout-window` / `RPROXY_API_LOCKOUT_WINDOW` | `1m` | Counting window (1s-24h) |
+| `--api-lockout-duration` / `RPROXY_API_LOCKOUT_DURATION` | `5m` | How long a source stays locked out (1s-24h) |
+
+**Client certificates (mTLS)**: give an entry of the token file (YAML) a `client_cert`. Its value is the certificate's name, compared exactly with the DNS or URI subjectAltNames (the subject CN when there is none).
+
+```yaml
+tokens:
+  - name: ui
+    client_cert: ui.rproxy.internal      # the certificate alone (no Authorization needed)
+    scopes: [rules:read, rules:write, metrics:read]
+  - name: gateway-controller
+    sha256: 9f86d0...
+    client_cert: spiffe://cluster.local/ns/rproxy/sa/controller   # both the token and the certificate
+    scopes: [rules:read, rules:write]
+```
+
+- Either `sha256` or `client_cert` is required. **With both, both are required**: a matching token on a connection whose certificate lacks that name gives `401` (`reason: "client_cert"` in the audit log). An entry with only `client_cert` authenticates by the certificate alone (two entries without `sha256` cannot share a `client_cert`).
+- A request with `Authorization: Bearer` is checked by that token (an unknown token gives `401` even if a certificate-only entry would match). Without it, a certificate-only entry is looked up by the certificate's names.
+- Only certificates issued by the `--tls-client-ca` CA (valid, for client authentication) pass; others fail the handshake.
+- A token file with `client_cert` while `--tls-client-auth` is `none` is a configuration error that stops the startup (on a SIGHUP reload the current tokens stay). Entries that cannot be used are not silently ignored. Plain HTTP and the Unix socket have no certificate, so certificate-only entries cannot be used there.
+- Audit lines (`event = "audit"`) carry `auth` (`token`, `cert` or `token+cert`).
+
+**Token expiry**:
+
+- At startup, on SIGHUP and once a day, tokens whose `expires` is closer than `--token-warn-days` are reported as `token.expiring` (`token`, `expires`, `days_left`) and expired ones as `token.expired` (`token`, `expires`), at `warn`, once per token each time its state changes. A token is valid until the end (UTC) of its `expires` day.
+- `/metrics` has `rproxy_token_expiry_timestamp_seconds{token}` (when it stops being valid, Unix seconds).
+
+**Locking out failing sources** (on by default: 20 failures in 1 minute lock out for 5 minutes):
+
+- On the TCP control API, `401`s are counted per source IP (IPv6 grouped by /64). When `failures` is reached within `window`, the source's requests are refused for `duration` with `429 locked_out` without looking at the token (`Retry-After` has the seconds left). `/healthz` and `/readyz` are never refused. `403` (missing scope) is not counted.
+- Locking logs `api.lockout` (`client`, `failures`, `until` (Unix seconds), `duration_secs`; `warn`), unlocking `api.unlock` (`client`). Refusals while locked out are `event = "audit"` with `outcome: "locked_out"` (thinned out per source like other refusals).
+- `/metrics` has `rproxy_api_lockouts_total` (lockouts) and `rproxy_api_locked_sources` (sources locked out now).
+- Up to 4096 sources are remembered (when full, the oldest not locked out are forgotten first), in memory only (a restart forgets them).
+- Good clients behind the same IP are locked out too. A UI on the same host is unaffected when it connects over the Unix socket.
+
+**Rotating tokens and certificates** (without a gap):
+
+1. Add the new token (`sha256`) to the token file and SIGHUP (`systemctl reload rproxy-api`). Both old and new work meanwhile.
+2. Switch the clients (UI, CI, ...) to the new token.
+3. Remove the old token from the file and SIGHUP.
+
+- With `expires`, `token.expiring` reports it before it runs out (`--token-warn-days`).
+- For client certificates, issue a new certificate with the same name and deploy it to the client (the token file stays). To change the name: add an entry with the new name, switch the client, remove the old entry (SIGHUP each time).
+- To replace the CA: put both old and new CAs in the `--tls-client-ca` file and SIGHUP, move the clients to certificates from the new CA, then remove the old CA and SIGHUP.
+
+**The UI side (TCP-UDP-rproxy-ui)** (the contract for the UI to implement):
+
+| UI environment variable / node key in `nodes.yaml` | Meaning |
+|---|---|
+| `RPROXY_API_CA_FILE` / `ca_file` | CA (PEM) verifying the rproxy control API's server certificate, for `https://` with a non-public CA |
+| `RPROXY_API_CERT_FILE` / `cert_file` | The client certificate the UI presents (PEM, intermediates following it) |
+| `RPROXY_API_KEY_FILE` / `key_file` | Its private key (PEM), readable only by the UI's user |
+
+- `RPROXY_API_URL` (a node's `url`) is `https://`. `unix:` uses no certificate (authenticate with a token).
+- With `cert_file` / `key_file` matching a certificate-only entry of rproxy (e.g. `client_cert: ui.rproxy.internal`), `RPROXY_API_TOKEN` (`token_file`) may be left out. For an entry with both `sha256` and `client_cert`, give both.
+- Only one of `cert_file` / `key_file` is a UI configuration error. When the files change (renewal), new connections read them again (or restart the UI).
+- On `429 locked_out`, do not resend for `Retry-After` and show that requests are blocked for a while after repeated authentication failures. Do not repeat `401`s automatically (they count towards the lockout).
+- `features.client_cert_auth` in `GET /capabilities` says whether rproxy supports client certificates.
 
 ## Rules
 
@@ -398,12 +467,12 @@ Settings whose shape v0.4.0 settles (docs/en/DESIGN-v0.4.md). v0.4.0 is released
 | Readiness (#28) | `GET /readyz` | No token. `200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
 | Diff before change (#169) | `?dry_run=true` (`POST /rules`, `PATCH`, `DELETE`, `PUT /rulesets/{name}`, `POST /config/reload`), `POST /config/plan`, `--check-config --diff` | Answer `{"dry_run","action","change","rule","before","after","diff":[{"path","before","after"}],"warnings"}`; `change` is `none`, `in_place` or `recreate` | `dry_run` |
 | Storing API-created rules (#144) | a token's `persist: true`, table `rproxy_rules`, `--node-name` | The view shows `origin: "api"`, `persisted`, `created_by`, `created_at` | `persistence` |
-| Control API hardening (#167) | `--tls-client-ca`, `--tls-client-auth`, a token's `client_cert`, `--token-warn-days`, `--api-lockout-failures`, `--api-lockout-window`, `--api-lockout-duration` | `client_cert` instead of a token's `sha256`; with both, both are required. Tokens close to expiry: `token.expiring`; sources failing repeatedly: `429 locked_out` | `client_cert_auth`, `token_expiry`, `api_lockout` |
+| Control API hardening (#167; works) | `--tls-client-ca`, `--tls-client-auth`, a token's `client_cert`, `--token-warn-days`, `--api-lockout-failures`, `--api-lockout-window`, `--api-lockout-duration` | `client_cert` instead of a token's `sha256`; with both, both are required. Tokens close to expiry: `token.expiring`; sources failing repeatedly: `429 locked_out` (on by default). See "Control API hardening" above | `client_cert_auth`, `token_expiry`, `api_lockout` |
 | Live upgrade, self-update (#174) | SIGUSR2, `POST /admin/upgrade`, `--handoff-*`, `RPROXY_UPDATE*`, `GET` / `POST /admin/update` | Hands the listening sockets to a new process within one minor. Self-update verifies signatures (minisign) first | `handoff`, `self_update` |
 
 - `limits`, `bandwidth`, `geoip`, `outlier_detection` and `labels` given to `PATCH` replace the current value as a whole (`{}` removes it; left out keeps it). The DB `options` carry the same shape.
 - Once they run, a rule's `stats` gets `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff), and `stats.targets[]` gets `ejected_until` and `ejections` (#170).
-- Token rotation: add the new token and SIGHUP, switch the clients, then remove the old token and SIGHUP (with `expires`, `token.expiring` reminds you).
+- Token rotation: add the new token and SIGHUP, switch the clients, then remove the old token and SIGHUP (with `expires`, `token.expiring` reminds you). Details in "Control API hardening" above.
 
 ### Rule sets, conditions and readiness (for the Kubernetes controller, #28)
 
@@ -476,7 +545,7 @@ The Kubernetes controller (a separate repository, `max3584/rproxy-gateway`) driv
 | `POST /admin/upgrade` | | 202 | v0.4 (#174): hands over to the binary now on disk (as SIGUSR2). `admin`; by default only over the Unix socket |
 | `GET /admin/update` | | 200 | v0.4 (#174): self-update state `{"mode","current","available","last_check","error","bad_versions"}`. `admin` |
 | `POST /admin/update` | | 202 | v0.4 (#174): looks for a new patch now and swaps it in under `RPROXY_UPDATE=auto`. `admin`; by default only over the Unix socket |
-| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total`, rule labels `rproxy_rule_labels` (v0.4; see "Rule sets, conditions and readiness" above) |
+| `GET /metrics` | | 200 | Prometheus format. Requests on `http` rules are in `rproxy_http_requests_total`, `rproxy_http_request_duration_seconds` and `rproxy_http_limited_total`; upstream health checks in `rproxy_http_server_up` and `rproxy_http_service_down` ("v0.3 settings" above); every destination down in `rproxy_rule_all_targets_down`; the CrowdSec LAPI in `rproxy_crowdsec_connected`; log lines left out in `rproxy_log_suppressed_total`; control API token expiry in `rproxy_token_expiry_timestamp_seconds`; lockouts in `rproxy_api_lockouts_total` and `rproxy_api_locked_sources` ("Control API hardening" above); rule labels in `rproxy_rule_labels` (see "Rule sets, conditions and readiness" above) |
 
 When putting an IPv6 `listen_addr` in a path, URL-encode it.
 
@@ -490,7 +559,7 @@ On failure, responses take the following shape.
 
 | `code` | HTTP | Meaning |
 |---|---|---|
-| `unauthorized` | 401 | Token missing, not matching, or expired |
+| `unauthorized` | 401 | Token missing, not matching, expired, or without the client certificate bound to it |
 | `forbidden` | 403 | Outside the token's scopes or `allow_listen_ports` |
 | `invalid` | 400 | Invalid body or path |
 | `tls_config` | 400 | Invalid combination of TLS settings, or certificate/key/CA files cannot be read |
