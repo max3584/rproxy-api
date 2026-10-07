@@ -317,6 +317,12 @@ impl Tokens {
 		self
 	}
 
+	/// `--api-lockout-exempt` (security review M4).
+	pub fn with_lockout_exempt(mut self, exempt: Vec<crate::net::cidr::Cidr>) -> Self {
+		self.lockout = std::mem::take(&mut self.lockout).with_exempt(exempt);
+		self
+	}
+
 	pub fn lockout(&self) -> &Lockout {
 		&self.lockout
 	}

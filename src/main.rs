@@ -145,6 +145,10 @@ struct Options {
 	/// How long a source stays locked out [default: 5m]
 	#[arg(long, env = "RPROXY_API_LOCKOUT_DURATION")]
 	api_lockout_duration: Option<String>,
+	/// Sources never locked out, comma-separated CIDRs (e.g. the controller's Pod network);
+	/// connections with a verified client certificate are never locked out either (v0.4)
+	#[arg(long, env = "RPROXY_API_LOCKOUT_EXEMPT")]
+	api_lockout_exempt: Option<String>,
 	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
@@ -421,6 +425,7 @@ fn hardening_options(opts: &Options) -> rproxy_api::control::hardening::Hardenin
 		lockout_failures: opts.api_lockout_failures,
 		lockout_window: opts.api_lockout_window.clone(),
 		lockout_duration: opts.api_lockout_duration.clone(),
+		lockout_exempt: opts.api_lockout_exempt.clone(),
 	}
 }
 
@@ -700,7 +705,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		},
 	};
 	// client_cert entries while the API asks for no certificates are a mistake
-	let tokens = Arc::new(tokens.with_client_auth(hardening.client_auth()).map_err(|e| e.to_string())?.with_lockout(hardening.lockout()));
+	let tokens = Arc::new(tokens.with_client_auth(hardening.client_auth()).map_err(|e| e.to_string())?.with_lockout(hardening.lockout()).with_lockout_exempt(hardening.lockout_exempt().unwrap_or_default()));
 	let token_expiry = Arc::new(TokenExpiry::new(hardening.token_warn_days()));
 	token_expiry.check(&tokens.expiries());
 
