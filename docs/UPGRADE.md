@@ -16,7 +16,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 
 1. 古いプロセスが引き継ぎ用の Unix ソケット（`--handoff-socket`、0600）を開き、ディスクの上の今のバイナリ（`/proc/self/exe` の指していたファイル。パッケージの更新で置き換わったもの）を同じ引数・環境で子として起動する。そのソケットにつなげるのは、起動した子（pid で確かめる）だけ。
 2. 新しいプロセスが版を名乗る。major.minor が違えば断り（`handoff.refused`）、古いプロセスがそのまま動き続ける（マイナーの更新は再起動で）。
-3. 古いプロセスが待ち受けのソケットをすべて渡す（`SCM_RIGHTS`）：ルールの TCP・UDP（`SO_REUSEPORT` の組ごと）、HTTP/3 の UDP、制御 API の TCP と Unix ソケット、`global.acme.http01_listen`。続けて状態（API で作ったルール、ルールの組（#28）とその世代、各ルールの統計の数）。
+3. 古いプロセスが待ち受けのソケットをすべて渡す（`SCM_RIGHTS`）：ルールの TCP・UDP（`SO_REUSEPORT` の組ごと）、HTTP/3 の UDP、制御 API の TCP と Unix ソケット、`global.acme.http01_listen`。続けて状態（API で作ったルール（`origin: api` は作ったトークン・時刻・`persisted` ごと）、ルールの組（#28）とその世代、各ルールの統計の数と `stats.http` のルートごとの数）。
 4. 新しいプロセスは普段どおりに起動するが、ソケットを開くところでは受け取ったソケットを使う（同じソケットなので、入れ替わりの間も接続を断らない）。ルールは設定ファイルと、古いプロセスから受け取った API のルール・ルールの組で作る（組は同じ世代・etag のまま。DB からは読み直さない：古いプロセスが起動時に読んだあとの変更が API のルールに入っているので）。統計の数は古いプロセスの数に足す（減らない）。`rproxy_process_start_time_seconds` も引き継ぐ。準備ができたら古いプロセスに知らせる（`handoff.ready`）。
 5. 古いプロセスは systemd（`Type=notify`・`NotifyAccess=all`）と `rproxy-api launch` に新しい主プロセスを知らせ（`MAINPID=`）、受け付けをやめ、今の接続が終わるのを `--handoff-drain`（既定 5 分）まで待ち、残りを切ってから、待っている間に数えた分を新しいプロセスに送って終わる（`handoff.done`）。`systemctl stop`（SIGTERM）が来たら待つのをやめる。
 6. 新しいプロセスが `--handoff-timeout`（既定 30 秒）の間に準備できなければ、古いプロセスは子を止めて今までどおり動き続ける（`handoff.failed`）。
@@ -57,7 +57,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 |---|---|---|
 | `RPROXY_UPDATE` | `off` | `off`・`check`・`auto` |
 | `RPROXY_UPDATE_PIN` | なし | 版を固定する（`0.4.3`。同じ X.Y の古いパッチにも戻せる） |
-| `RPROXY_UPDATE_SOURCE` | `https://github.com/max3584/rproxy-api/releases` | リリースの取り先（`https://` だけ）。ミラーは同じ道筋 `<source>/download/v<X.Y.Z>/<file>` で置く |
+| `RPROXY_UPDATE_SOURCE` | `https://github.com/max3584/rproxy-api/releases` | リリースの取り先（`https://` だけ）。ミラーは同じ道筋 `<source>/download/v<X.Y.Z>/<file>` と、索引 `<source>/latest/download/releases.json`（と `.minisig`）を置く |
 | `RPROXY_UPDATE_CACHE` | `/var/cache/rproxy/update` | キャッシュ（書き込めるボリューム。ルートのファイルシステムは読み取り専用でよい） |
 | `RPROXY_UPDATE_INTERVAL` | `6h` | 確かめる間隔（`0s` で起動時と API だけ） |
 | `RPROXY_UPDATE_PUBKEY` | バイナリに入れたリリースの鍵 | 署名を確かめる minisign の公開鍵のファイル（ミラーで自分で署名し直すとき）。鍵が入っていないビルドではこれが要る |
@@ -65,7 +65,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 
 ### 確かめること
 
-- 取るもの：`manifest.json`（版、`handoff` の可否、各バイナリの SHA-256）とその `.minisig`、このターゲットのバイナリ `rproxy-api-v<X.Y.Z>-<target>` とその `.minisig`。パッチは今の版の次から順に（X.Y.Z+1、+2、…）見つからなくなるまで探す。
+- 取るもの：`manifest.json`（版、`handoff` の可否、各バイナリの SHA-256）とその `.minisig`、このターゲットのバイナリ `rproxy-api-v<X.Y.Z>-<target>` とその `.minisig`。どの版があるかは、署名つきの索引 `<source>/latest/download/releases.json`（`{"releases":[{"version":"0.4.3"},...]}`。リリースのワークフローがリリースのたびに、すべてのマイナーのすべてのリリースを並べて書く）で知る。番号は飛ぶ（動くものが変わったリポジトリだけを出すため）ので、順に試すのではなく索引から、同じ X.Y で今より新しく悪い版でない最新のものを選ぶ（そのマニフェストが確かめられなければ 1 つ古いものへ）。
 - 署名は **minisign**（Ed25519。既定の BLAKE2b の事前ハッシュの形と古い形の両方）。マニフェストとバイナリの両方の署名、マニフェストの版、マニフェストの SHA-256 との一致がそろわないものは実行しない。キャッシュのものも起動の前に確かめ直す。
 - `"handoff": false` のパッチは入れ替えず、`update.restart_needed` を出す（次の起動で使う）。
 - `GET /admin/update`：`{"mode","current":{"version","sha256"},"available":{"version","sha256"}|null,"last_check","error","bad_versions":[...]}`。

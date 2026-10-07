@@ -49,8 +49,12 @@ const FAILED: u8 = b'X';
 const FINAL: u8 = b'C';
 const FINAL_END: u8 = b'Z';
 
-/// A rule's counters, by its key.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A rule's counters, by its key. Counters of other items (e.g. #165 / #166's
+/// `limited` and `counters_since`) are added here as `#[serde(default)]` fields:
+/// `of` reads them from the runtime, `since` takes the drain's difference and
+/// `add_to` adds them in the new process (a start time such as `counters_since`
+/// is set from the snapshot instead of added).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Counters {
 	pub protocol: String,
 	pub listen_addr: String,
@@ -61,6 +65,9 @@ pub struct Counters {
 	pub tls_failures: u64,
 	pub denied: u64,
 	pub dropped: u64,
+	/// `stats.http`: requests by route (`http` rules).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http: Option<crate::l7::access::HttpCounters>,
 }
 
 impl Counters {
@@ -76,6 +83,7 @@ impl Counters {
 			tls_failures: s.tls_failures.load(Ordering::Relaxed),
 			denied: s.denied.load(Ordering::Relaxed),
 			dropped: s.dropped.load(Ordering::Relaxed),
+			http: Some(rt.http_stats.export()).filter(|h| !h.is_empty()),
 		}
 	}
 
@@ -95,6 +103,10 @@ impl Counters {
 			tls_failures: self.tls_failures.saturating_sub(before.tls_failures),
 			denied: self.denied.saturating_sub(before.denied),
 			dropped: self.dropped.saturating_sub(before.dropped),
+			http: match (&self.http, &before.http) {
+				(Some(now), Some(then)) => Some(now.since(then)),
+				(now, _) => now.clone(),
+			},
 			..self.clone()
 		}
 	}
@@ -107,6 +119,9 @@ impl Counters {
 		s.tls_failures.fetch_add(self.tls_failures, Ordering::Relaxed);
 		s.denied.fetch_add(self.denied, Ordering::Relaxed);
 		s.dropped.fetch_add(self.dropped, Ordering::Relaxed);
+		if let Some(h) = &self.http {
+			rt.http_stats.add(h);
+		}
 	}
 }
 
@@ -491,19 +506,50 @@ pub struct Adopted {
 }
 
 impl Received {
-	/// The rules made through the API, to be started like restored ones.
-	pub fn rules(&self) -> Vec<RuleRequest> {
+	/// The rules made through the API, with their origin as they were.
+	pub fn rules(&self) -> Vec<(RuleRequest, &serde_json::Value)> {
 		self.state
 			.rules
 			.iter()
 			.filter_map(|v| match serde_json::from_value::<RuleRequest>(v.clone()) {
-				Ok(r) => Some(r),
+				Ok(r) => Some((r, v)),
 				Err(e) => {
 					warn!(event = "handoff.rule", error = %e, rule = %v, "a rule from the old process could not be read; dropped");
 					None
 				}
 			})
 			.collect()
+	}
+
+	/// Starts the old process's rules (not from the database, which it read at
+	/// its start): `dynamic` ones as restored rules, `api` ones (#144) as `api`
+	/// with who made them, when, and whether their row was up to date; then the
+	/// rule sets.
+	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
+		let (mut dynamic, mut api) = (vec![], vec![]);
+		for (req, view) in self.rules() {
+			if view["origin"] == "api" {
+				if let (Some(store), Ok(listen)) = (registry.persist(), crate::core::rule::parse_listen(&req.listen_addr, req.listen_port)) {
+					store.adopt(
+						Key { protocol: req.protocol, listen },
+						crate::config::persist::Meta {
+							created_by: view["created_by"].as_str().unwrap_or_default().to_string(),
+							created_at: view["created_at"].as_u64().unwrap_or(0),
+							persisted: view["persisted"].as_bool().unwrap_or(false),
+						},
+					);
+				}
+				api.push(req);
+			} else {
+				dynamic.push(req);
+			}
+		}
+		info!(event = "restore.start", rules = dynamic.len(), api_rules = api.len(), rulesets = self.state.rulesets.len(), from = "handoff");
+		registry.restore(dynamic).await;
+		if !api.is_empty() {
+			registry.restore_as(api, Origin::Api).await;
+		}
+		self.restore_rulesets(registry).await;
 	}
 
 	/// Applies the rule sets of the old process again (#28), as they were.

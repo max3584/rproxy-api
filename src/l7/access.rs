@@ -310,6 +310,93 @@ impl HttpStats {
 	}
 }
 
+/// `HttpStats` as plain data: handed over in a live upgrade (#174) and added to
+/// the new process's counters.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HttpCounters {
+	pub routes: Vec<RouteCountersData>,
+	/// (route, middleware, count)
+	pub limited: Vec<(String, String, u64)>,
+	pub blocked: Vec<(String, String, u64)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RouteCountersData {
+	pub route: String,
+	pub by_class: [u64; 5],
+	pub buckets: Vec<u64>,
+	pub duration_sum: f64,
+}
+
+impl HttpCounters {
+	pub fn is_empty(&self) -> bool {
+		self.routes.is_empty() && self.limited.is_empty() && self.blocked.is_empty()
+	}
+
+	/// `self - before`, never below zero.
+	pub fn since(&self, before: &HttpCounters) -> HttpCounters {
+		let sub = |a: u64, b: u64| a.saturating_sub(b);
+		let routes = self
+			.routes
+			.iter()
+			.map(|r| match before.routes.iter().find(|b| b.route == r.route) {
+				Some(b) => RouteCountersData {
+					route: r.route.clone(),
+					by_class: std::array::from_fn(|i| sub(r.by_class[i], b.by_class[i])),
+					buckets: r.buckets.iter().enumerate().map(|(i, n)| sub(*n, b.buckets.get(i).copied().unwrap_or(0))).collect(),
+					duration_sum: (r.duration_sum - b.duration_sum).max(0.0),
+				},
+				None => r.clone(),
+			})
+			.collect();
+		let minus = |now: &[(String, String, u64)], then: &[(String, String, u64)]| {
+			now.iter()
+				.map(|(r, m, n)| {
+					let old = then.iter().find(|(r2, m2, _)| r2 == r && m2 == m).map_or(0, |t| t.2);
+					(r.clone(), m.clone(), sub(*n, old))
+				})
+				.collect()
+		};
+		HttpCounters { routes, limited: minus(&self.limited, &before.limited), blocked: minus(&self.blocked, &before.blocked) }
+	}
+}
+
+impl HttpStats {
+	pub fn export(&self) -> HttpCounters {
+		HttpCounters {
+			routes: self
+				.snapshot()
+				.into_iter()
+				.map(|(route, c)| RouteCountersData { route, by_class: c.by_class, buckets: c.buckets.to_vec(), duration_sum: c.duration_sum })
+				.collect(),
+			limited: self.limited_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
+			blocked: self.blocked_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
+		}
+	}
+
+	/// Adds counters (of the old process, in a live upgrade).
+	pub fn add(&self, c: &HttpCounters) {
+		let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+		for r in &c.routes {
+			let mine = routes.entry(r.route.clone()).or_default();
+			for (a, b) in mine.by_class.iter_mut().zip(r.by_class) {
+				*a += b;
+			}
+			for (a, b) in mine.buckets.iter_mut().zip(&r.buckets) {
+				*a += b;
+			}
+			mine.duration_sum += r.duration_sum;
+		}
+		drop(routes);
+		for (map, list) in [(&self.limited, &c.limited), (&self.blocked, &c.blocked)] {
+			let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+			for (r, m, n) in list {
+				*map.entry((r.clone(), m.clone())).or_default() += n;
+			}
+		}
+	}
+}
+
 /// `stats.http` of a rule in the API.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct HttpStatsView {

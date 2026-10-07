@@ -93,6 +93,20 @@ fn publish(files: &Files, pair: &ring::signature::Ed25519KeyPair, v: Version, bi
 	f.insert(format!("{base}/manifest.json"), manifest.into());
 	f.insert(format!("{base}/{name}.minisig"), testing::sign(pair, KEY_ID, signed, &format!("file:{name}")).into());
 	f.insert(format!("{base}/{name}"), Bytes::copy_from_slice(binary));
+	drop(f);
+	list(files, pair, v);
+}
+
+/// Adds `v` to the signed release index (`releases.json` of the latest release),
+/// as the release workflow does with every release.
+fn list(files: &Files, pair: &ring::signature::Ed25519KeyPair, v: Version) {
+	let mut f = files.lock().unwrap();
+	let key = "/releases/latest/download/releases.json".to_string();
+	let mut index: Value = f.get(&key).map(|b| serde_json::from_slice(b).unwrap()).unwrap_or(json!({"releases": []}));
+	index["releases"].as_array_mut().unwrap().push(json!({"version": v.to_string()}));
+	let body = serde_json::to_vec(&index).unwrap();
+	f.insert(format!("{key}.minisig"), testing::sign(pair, KEY_ID, &body, "index").into());
+	f.insert(key, body.into());
 }
 
 struct Procs {
@@ -229,8 +243,12 @@ fn next(v: Version, n: u64) -> Version {
 async fn a_signed_patch_is_swapped_in_and_a_forged_one_refused() {
 	let s = setup("server").await;
 	let binary = fs::read(env!("CARGO_BIN_EXE_rproxy-api")).unwrap();
-	let v1 = next(Version::own(), 1);
+	// patch numbers have gaps (only the repository whose code changed is
+	// released): the next patch is +2; another minor in the index is ignored
+	let v1 = next(Version::own(), 2);
 	publish(&s.files, &s.pair, v1, &binary, false);
+	let own = Version::own();
+	list(&s.files, &s.pair, Version(own.0, own.1 + 1, 0));
 	let port = free_port();
 	let mut env = s.env.clone();
 	env.push(("RPROXY_API_PORT", port.to_string()));
@@ -267,7 +285,7 @@ async fn a_signed_patch_is_swapped_in_and_a_forged_one_refused() {
 	assert_eq!((&st["good"], &st["trial"]), (&json!(v1.to_string()), &Value::Null), "{st}");
 
 	// v2's binary is not what was signed: refused, nothing swapped
-	let v2 = next(Version::own(), 2);
+	let v2 = next(Version::own(), 5);
 	publish(&s.files, &s.pair, v2, &binary, true);
 	let (status, _) = api(port, reqwest::Method::POST, "/admin/update").await.unwrap();
 	assert_eq!(status, 202);

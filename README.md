@@ -91,7 +91,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 
-v0.4 で足す項目（中身が入るまでは、指定すると `degraded` を出して無視する。制御 API の守り（#167）は動く。docs/API.md の「v0.4 の設定」・「制御 API の守り」）：
+v0.4 で足した項目（どれも動く。ルールに付ける設定と `global` の項目は docs/API.md の「v0.4 の設定」。制御 API の守りは「制御 API の守り」、再起動なしの更新・自動更新は docs/UPGRADE.md）：
 
 | 環境変数 | 引数 | 既定 | 説明 |
 |---|---|---|---|
@@ -99,11 +99,11 @@ v0.4 で足す項目（中身が入るまでは、指定すると `degraded` を
 | `RPROXY_TLS_CLIENT_AUTH` | `--tls-client-auth` | `none` | 制御 API のクライアント証明書：`none`・`optional`（あれば確かめる）・`required`（ない接続はハンドシェイクで断る）。トークンファイルの `client_cert` で証明書を認証に使う（#167） |
 | `RPROXY_TOKEN_WARN_DAYS` | `--token-warn-days` | `14` | トークンの期限の何日前から `token.expiring` を出すか（#167） |
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
-| `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前（#144） |
-| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174。動く）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
-| `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174。動く）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
-| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。動く。設定ファイルの `global.performance` が先）。`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_SPLICE*` も。docs/API.md の「performance」 |
-| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | — | `--check-config --diff`：動いている rproxy との差分（#169） |
+| `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する（#144、docs/API.md の「API で作ったルールの保存」） |
+| `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
+| `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
+| `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。設定ファイルの `global.performance` が先）。`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_SPLICE*` も。docs/API.md の「performance」 |
+| `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | `RPROXY_API_SOCKET`、なければ制御 API / なし | `--check-config --diff`：動いている rproxy に `POST /config/plan` で問い合わせた差分（#169、docs/API.md の「変更前の差分」） |
 
 `RPROXY_API_ADDR` に loopback 以外を含める場合は、トークンファイルと TLS 証明書の指定が必須。どれかが欠けていると起動しない。
 
@@ -122,6 +122,7 @@ v0.4 で足す項目（中身が入るまでは、指定すると `degraded` を
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | `global.access_log` のディレクトリに書き込めない | アクセスログをメインのログに出す（`part: global.access_log`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
+| `rproxy_rules` を読めない・書けない（テーブルがない、権限、DB が落ちている） | 起動時は UI のルールだけを復元する。API のルールは動かしたまま `persisted: false`（`part: db`、#144） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
 
 
@@ -312,7 +313,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `outlier`。`outlier` は実際の通信の失敗で外した・戻した：`cause`、`ejection_secs`）。`http` のサービスの `outlier_detection` でも（`service`、`server`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
-| `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数） |
+| `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数。`restore.conflict` は `rproxy_rules` と UI の `forward_rules` に同じキーがあり UI の行を使った、#144） |
+| `rule.persist` | `persist: true` のトークンの API のルール（`origin: "api"`）を `rproxy_rules` に書いた・消した（`action: save` / `delete`、`token`。#144） |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |

@@ -66,13 +66,12 @@ async fn capabilities_list_the_v0_4_features_as_off() {
 	let (_, caps) = h.get("/capabilities").await;
 	let f = &caps["features"];
 	for flag in [
-		"limits", "bandwidth", "dry_run",
-		"persistence",
+		"limits", "bandwidth",
 	] {
 		assert_eq!(f[flag], false, "{flag}: {caps}");
 	}
-	// implemented (tests/api_hardening.rs, tests/rulesets.rs, tests/geoip.rs, tests/outlier.rs; #174 and performance below)
-	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection", "handoff", "self_update"] {
+	// implemented (tests/api_hardening.rs, rulesets.rs, geoip.rs, outlier.rs, plan.rs, persist.rs; #174 and performance below)
+	for flag in ["client_cert_auth", "token_expiry", "api_lockout", "rulesets", "labels", "conditions", "readyz", "geoip", "outlier_detection", "dry_run", "persistence", "handoff", "self_update"] {
 		assert_eq!(f[flag], true, "{flag}: {caps}");
 	}
 	assert!(f["middlewares"].as_array().unwrap().contains(&json!("geoip")));
@@ -99,66 +98,7 @@ async fn bandwidth_is_checked_then_unsupported() {
 
 // #168 GeoIP and #170 outlier detection are implemented: tests/geoip.rs and tests/outlier.rs.
 
-/// #169
-#[tokio::test]
-async fn dry_run_is_checked_then_unsupported() {
-	let h = harness().await;
-	let backend = tcp_backend("D:").await;
-	let port = free_port();
-	let r = send(&h, Method::POST, "/rules?dry_run=true", Some(rule("tcp", port, backend))).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	assert!(r.1["error"].as_str().unwrap().contains("dry_run"), "{}", r.1);
-	let mut bad = rule("tcp", port, backend);
-	bad["remote_port"] = json!(0);
-	assert_eq!(code(&send(&h, Method::POST, "/rules?dry_run=true", Some(bad)).await), INVALID);
-	assert_eq!(code(&send(&h, Method::POST, "/rules?dry_run=perhaps", Some(rule("tcp", port, backend))).await), INVALID);
-	let (_, rules) = h.get("/rules").await;
-	assert_eq!(rules, json!([]), "a dry run creates nothing");
-
-	assert_eq!(h.post(rule("tcp", port, backend)).await.0, StatusCode::CREATED);
-	let path = format!("/rules/tcp/127.0.0.1/{port}");
-	let patch = json!({"remote_addr": "127.0.0.1", "remote_port": backend.port()});
-	assert_eq!(code(&send(&h, Method::PATCH, &format!("{path}?dry_run=1"), Some(patch)).await), UNSUPPORTED);
-	assert_eq!(code(&send(&h, Method::DELETE, &format!("{path}?dry_run=true"), None).await), UNSUPPORTED);
-	assert_eq!(h.get(&path).await.0, StatusCode::OK, "still there");
-	// POST /config/plan and POST /config/reload are only over the Unix socket by default
-	let r = send(&h, Method::POST, "/config/plan", Some(json!({"version": 1, "rules": []}))).await;
-	assert_eq!(r.0, StatusCode::FORBIDDEN, "{}", r.1);
-}
-
-/// #169: `POST /config/plan` checks the document like a settings file.
-#[tokio::test]
-async fn config_plan_checks_the_document_then_unsupported() {
-	use rproxy_api::control::api::{router, AppState};
-	let h = harness().await;
-	let app = router(std::sync::Arc::new(AppState {
-		registry: h.registry.clone(),
-		tokens: std::sync::Arc::new(rproxy_api::control::auth::Tokens::disabled()),
-		reloader: None,
-		reload_unix_only: false,
-	}));
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let base = format!("http://{}", listener.local_addr().unwrap());
-	tokio::spawn(async move {
-		axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
-	});
-	let post = |body: Value| {
-		let (client, base) = (h.http.clone(), base.clone());
-		async move {
-			let r = client.post(format!("{base}/config/plan")).json(&body).send().await.unwrap();
-			let status = r.status();
-			(status, r.json::<Value>().await.unwrap_or(Value::Null))
-		}
-	};
-	let r = post(json!({"version": 1, "global": {"performance": {"workers": 2}}, "rules": []})).await;
-	assert_eq!(code(&r), UNSUPPORTED, "{}", r.1);
-	let r = post(json!({"version": 1, "global": {"performance": {"workers": 0}}})).await;
-	assert_eq!(code(&r), INVALID, "{}", r.1);
-	let r = post(json!({"version": 1, "rules": [{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 1,
-		"remote_addr": "a", "remote_port": 1, "geoip": {"allow_countries": ["JP"]}}]}))
-	.await;
-	assert_eq!(code(&r), INVALID, "country lists need global.geoip: {}", r.1);
-}
+// #169 (dry runs) and #144 (persistence) work: tests/plan.rs and tests/persist.rs
 
 /// #174 (implemented): tests/handoff.rs and tests/self_update.rs run the real
 /// binary; here the endpoints of a router without a server process.
@@ -280,13 +220,6 @@ rules:
 		let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap()], &[]);
 		assert!(exit == 1 && out.contains(want), "{text}: {out}");
 	}
-
-	// --diff (#169) is not available yet
-	fs::write(&file, "version: 1\n").unwrap();
-	let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap(), "--diff"], &[]);
-	assert!(exit == 1 && out.contains("--diff is not available"), "{out}");
-	let (exit, out) = run(&dir, &["--check-config", file.to_str().unwrap(), "--diff", "--diff-api", "ftp://x"], &[]);
-	assert!(exit == 1 && out.contains("--diff-api"), "{out}");
 	fs::remove_dir_all(dir).unwrap();
 }
 
@@ -306,7 +239,7 @@ fn a_0_3_settings_file_still_passes() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
-/// #167, #174, #144, performance flags: mistakes stop the startup.
+/// #167, #174, performance flags: mistakes stop the startup.
 #[test]
 fn v0_4_flags_are_checked_at_startup() {
 	let dir = workdir("flags");

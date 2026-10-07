@@ -343,3 +343,91 @@ async fn a_failed_handoff_keeps_the_old_process() {
 	drop(procs);
 	let _ = fs::remove_dir_all(dir);
 }
+
+/// Rules made by a `persist: true` token come back as `api` rules with who
+/// made them and when (#144), without the database; `stats.http` (requests by
+/// route) carries over too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_rules_and_http_counters_carry_over() {
+	let dir = workdir("api");
+	let sha = |s: &str| {
+		use sha2::Digest;
+		sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()
+	};
+	fs::write(
+		dir.join("tokens.yaml"),
+		format!("tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write, metrics:read, admin], persist: true}}\n", sha("secret")),
+	)
+	.unwrap();
+	let (api, port) = (free_port(), free_port());
+	let mut procs = start(
+		&dir,
+		&[
+			("RPROXY_API_PORT", api.to_string()),
+			("RPROXY_TOKEN_FILE", dir.join("tokens.yaml").display().to_string()),
+			("RPROXY_HANDOFF_SOCKET", dir.join("handoff.sock").display().to_string()),
+			("RPROXY_HANDOFF_DRAIN", "10s".into()),
+		],
+	);
+	let log = procs.log.clone();
+	let http = reqwest::Client::new();
+	let get = |path: String| {
+		let http = http.clone();
+		async move {
+			let r = http.get(format!("http://127.0.0.1:{api}{path}")).bearer_auth("secret").timeout(Duration::from_secs(5)).send().await.ok()?;
+			r.json::<Value>().await.ok()
+		}
+	};
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while get("/capabilities".into()).await.is_none() {
+		assert!(Instant::now() < deadline, "API down:\n{}", fs::read_to_string(&log).unwrap_or_default());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let rule = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "http": {
+		"routes": [{"name": "gone", "match": "PathPrefix(`/`)", "middlewares": ["410"]}],
+		"middlewares": {"410": {"respond": {"status": 410}}},
+	}});
+	let r = http.post(format!("http://127.0.0.1:{api}/rules")).bearer_auth("secret").json(&rule).send().await.unwrap();
+	assert_eq!(r.status(), 201, "{:?}", r.text().await);
+	let request = || async {
+		let c = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+		c.get(format!("http://127.0.0.1:{port}/x")).send().await.unwrap().status().as_u16()
+	};
+	for _ in 0..3 {
+		assert_eq!(request().await, 410);
+	}
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let deadline = Instant::now() + Duration::from_secs(10);
+	let before = loop {
+		let v = get(path.clone()).await.unwrap();
+		if v["stats"]["http"]["requests"] == 3 {
+			break v;
+		}
+		assert!(Instant::now() < deadline, "{v}");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	};
+	assert_eq!((&before["origin"], &before["created_by"], &before["persisted"]), (&json!("api"), &json!("ci"), &json!(false)), "{before}");
+
+	signal(procs.pids[0], libc::SIGUSR2);
+	let ready = wait_event(&log, "handoff.ready", 1).await;
+	procs.pids.push(ready["pid"].as_i64().unwrap() as i32);
+	wait_event(&log, "handoff.drain", 1).await;
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let after = get(path.clone()).await.unwrap();
+	for k in ["origin", "created_by", "created_at", "persisted"] {
+		assert_eq!(after[k], before[k], "{k}: {after}");
+	}
+	assert_eq!(after["stats"]["http"]["routes"]["gone"]["requests"], json!(3), "{after}");
+	assert_eq!(request().await, 410);
+	let deadline = Instant::now() + Duration::from_secs(10);
+	loop {
+		let v = get(path.clone()).await.unwrap();
+		if v["stats"]["http"]["requests"] == 4 && v["stats"]["http"]["by_status"]["4xx"] == 4 {
+			break;
+		}
+		assert!(Instant::now() < deadline, "{v}");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	drop(procs);
+	let _ = fs::remove_dir_all(dir);
+}

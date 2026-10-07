@@ -16,7 +16,7 @@ Steps:
 
 1. The old process opens the handoff Unix socket (`--handoff-socket`, 0600) and starts the binary on disk (the file `/proc/self/exe` pointed at, i.e. the one a package upgrade replaced) as its child, with the same arguments and environment. Only that child (checked by pid) may connect.
 2. The new process states its version. Another major.minor is refused (`handoff.refused`) and the old process keeps running (minor upgrades restart).
-3. The old process passes every listening socket (`SCM_RIGHTS`): the rules' TCP and UDP sockets (whole `SO_REUSEPORT` groups), HTTP/3's UDP sockets, the control API on TCP and on the Unix socket, `global.acme.http01_listen`. Then its state: the rules made through the API, the rule sets (#28) with their generations, and every rule's counters.
+3. The old process passes every listening socket (`SCM_RIGHTS`): the rules' TCP and UDP sockets (whole `SO_REUSEPORT` groups), HTTP/3's UDP sockets, the control API on TCP and on the Unix socket, `global.acme.http01_listen`. Then its state: the rules made through the API (`origin: api` ones with their creator, time and `persisted`), the rule sets (#28) with their generations, and every rule's counters including `stats.http` by route.
 4. The new process starts as usual, but wherever it would open a socket it takes the inherited one (the same socket, so nothing is refused while both run). Rules come from the settings file and from the API rules and rule sets of the old process (sets keep their generation and etag; not re-read from the database: the API rules include what changed since the old process read it at its start). The counters are added to the old process's (they never go down), and `rproxy_process_start_time_seconds` carries over. When ready, it tells the old process (`handoff.ready`).
 5. The old process tells systemd (`Type=notify`, `NotifyAccess=all`) and `rproxy-api launch` the new main pid (`MAINPID=`), stops accepting, waits up to `--handoff-drain` (default 5 minutes) for its connections to end, closes the rest, sends what it counted meanwhile to the new process and exits (`handoff.done`). `systemctl stop` (SIGTERM) cuts the wait short.
 6. If the new process is not ready within `--handoff-timeout` (default 30 seconds), the old process stops it and goes on as before (`handoff.failed`).
@@ -57,7 +57,7 @@ Make `rproxy-api launch` the image's entry point (with `RPROXY_UPDATE=auto` and 
 |---|---|---|
 | `RPROXY_UPDATE` | `off` | `off`, `check`, `auto` |
 | `RPROXY_UPDATE_PIN` | none | Pin a version (`0.4.3`; an older patch of the same X.Y works too) |
-| `RPROXY_UPDATE_SOURCE` | `https://github.com/max3584/rproxy-api/releases` | Where releases come from (`https://` only). A mirror uses the same paths `<source>/download/v<X.Y.Z>/<file>` |
+| `RPROXY_UPDATE_SOURCE` | `https://github.com/max3584/rproxy-api/releases` | Where releases come from (`https://` only). A mirror uses the same paths `<source>/download/v<X.Y.Z>/<file>` and the index `<source>/latest/download/releases.json` (and `.minisig`) |
 | `RPROXY_UPDATE_CACHE` | `/var/cache/rproxy/update` | Cache (a writable volume; the root file system may be read-only) |
 | `RPROXY_UPDATE_INTERVAL` | `6h` | How often to look (`0s`: at start and through the API only) |
 | `RPROXY_UPDATE_PUBKEY` | the release key built in | minisign public key file that verifies releases (for a mirror that signs again). Needed with builds that have no key built in |
@@ -65,7 +65,7 @@ Make `rproxy-api launch` the image's entry point (with `RPROXY_UPDATE=auto` and 
 
 ### What is verified
 
-- Fetched: `manifest.json` (version, whether a `handoff` is allowed, SHA-256 of each binary) and its `.minisig`, this target's binary `rproxy-api-v<X.Y.Z>-<target>` and its `.minisig`. Patches are tried from the one after the current version (X.Y.Z+1, +2, ...) until one is missing.
+- Fetched: `manifest.json` (version, whether a `handoff` is allowed, SHA-256 of each binary) and its `.minisig`, this target's binary `rproxy-api-v<X.Y.Z>-<target>` and its `.minisig`. Which releases exist comes from the signed index `<source>/latest/download/releases.json` (`{"releases":[{"version":"0.4.3"},...]}`; the release workflow writes it with every release, listing every release of every minor). Patch numbers have gaps (only the repository whose code changed is released), so the newest release of the same X.Y that is newer than the running one and not bad is picked from the index rather than probing numbers (if its manifest does not verify, the next older one).
 - Signatures are **minisign** (Ed25519; both the default BLAKE2b-prehashed form and the legacy one). Nothing runs unless the manifest's and the binary's signatures, the manifest's version and the SHA-256 in the manifest all check out. Cached releases are verified again before they run.
 - A patch with `"handoff": false` is not swapped in; `update.restart_needed` is logged (it runs at the next start).
 - `GET /admin/update`: `{"mode","current":{"version","sha256"},"available":{"version","sha256"}|null,"last_check","error","bad_versions":[...]}`.

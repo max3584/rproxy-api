@@ -53,7 +53,7 @@ rproxy-api（[max3584/rproxy-api](https://github.com/max3584/rproxy-api)）と U
 
 ## リリースの署名（minisign、#174）
 
-`release.yml` の `sign` ジョブが、各バイナリと `manifest.json`・`SHA256SUMS` に minisign の署名（`.minisig`）を付けてリリースに添付する。自動更新は署名を確かめられないものを実行しない。apt の GPG の鍵とは別の鍵（オーナーの決定）。
+`release.yml` の `sign` ジョブが、索引 `releases.json`（すべてのリリースの版。自動更新は最新のリリースのものを読む）を作り、各バイナリと `manifest.json`・`SHA256SUMS`・`releases.json` に minisign の署名（`.minisig`）を付けてリリースに添付する。自動更新は署名を確かめられないものを実行しない。apt の GPG の鍵とは別の鍵（オーナーの決定）。
 
 鍵を作る（手元で 1 回。秘密鍵はリポジトリに置かない）：
 

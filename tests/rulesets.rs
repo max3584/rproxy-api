@@ -214,9 +214,10 @@ async fn sets_refuse_stale_writes_and_do_not_take_other_rules() {
 	// DELETE with a wrong If-Match
 	let r = send(&h, Method::DELETE, "/rulesets/team-a", None, Some("\"nope\"")).await;
 	assert_eq!(r.0, StatusCode::PRECONDITION_FAILED);
-	// dry_run is not available yet (#169): checked, then unsupported, nothing changed
+	// a dry run (#169; more in tests/plan.rs) answers what would go and changes nothing
 	let r = put(&h, "team-a?dry_run=true", json!({"generation": 9, "rules": []})).await;
-	assert_eq!(code(&r), (StatusCode::BAD_REQUEST, Some("unsupported".into())), "{}", r.1);
+	assert_eq!((r.0, r.1["dry_run"].as_bool()), (StatusCode::OK, Some(true)), "{}", r.1);
+	assert!(actions(&r.1).iter().all(|(_, action, change)| action == "delete" && change == "none"), "{}", r.1);
 	assert_eq!(h.get("/rulesets/team-a").await.1["generation"], 5);
 	assert_eq!(code(&put(&h, "team-a?dry_run=maybe", set).await).1.as_deref(), Some("invalid"));
 	// names

@@ -20,7 +20,7 @@ use crate::config::reload::{ConfigReloader, Outcome};
 use crate::error::ApiError;
 use crate::logging::Throttle;
 use crate::core::registry::Registry;
-use crate::core::rule::{parse_listen, Key, RuleRequest, SourceIp, UpdateRequest};
+use crate::core::rule::{parse_listen, Features, Key, Origin, RuleRequest, RuleView, SourceIp, UpdateRequest};
 
 pub struct AppState {
 	pub registry: Arc<Registry>,
@@ -262,7 +262,18 @@ async fn config_reload(
 	};
 	match crate::config::plan::dry_run(&query) {
 		Ok(false) => {}
-		Ok(true) => return dry_run_unavailable().into_response(),
+		Ok(true) => {
+			let doc = match crate::config::ConfigDoc::load(reloader.path()) {
+				Ok(doc) => doc,
+				Err(e) => {
+					let (errors, warnings) = reloader.findings().await;
+					let error = e.to_string();
+					let errors = if errors.is_empty() { vec![Finding { rule: String::new(), message: error.clone() }] } else { errors };
+					return plan_failed(crate::config::plan::PlanError { error, errors, warnings });
+				}
+			};
+			return config_plan_answer(&state, reloader.base(), &doc).await;
+		}
 		Err(e) => return e.into_response(),
 	}
 	match reloader.reload(true).await {
@@ -298,8 +309,17 @@ pub(crate) fn unix_only(state: &AppState, over_unix: bool, what: &str) -> AppRes
 	Ok(())
 }
 
-fn dry_run_unavailable() -> ApiError {
-	ApiError::unsupported("dry_run is not available in this version (see GET /capabilities features)")
+/// `400 invalid` for settings that would not apply, with what `--check-config` finds.
+fn plan_failed(e: crate::config::plan::PlanError) -> Response {
+	(StatusCode::BAD_REQUEST, Json(json!({"code": "invalid", "error": e.error, "errors": e.errors, "warnings": e.warnings})))
+		.into_response()
+}
+
+async fn config_plan_answer(state: &AppState, base: &crate::config::ConfigDoc, doc: &crate::config::ConfigDoc) -> Response {
+	match crate::config::plan::plan_config(&state.registry, base, doc).await {
+		Ok(plan) => (StatusCode::OK, Json(plan)).into_response(),
+		Err(e) => plan_failed(e),
+	}
 }
 
 /// `POST /config/plan` (#169): the settings in the body against what runs.
@@ -307,11 +327,13 @@ async fn config_plan(
 	State(state): State<Arc<AppState>>,
 	transport: Option<Extension<Transport>>,
 	body: Bytes,
-) -> AppResult<StatusCode> {
+) -> AppResult<Response> {
 	unix_only(&state, transport.is_some(), "POST /config/plan")?;
 	let doc: serde_json::Value = parse_body(&body)?;
-	crate::config::ConfigDoc::from_value(doc).map_err(ApiError::invalid)?;
-	Err(dry_run_unavailable())
+	let doc = crate::config::ConfigDoc::from_value(doc).map_err(ApiError::invalid)?;
+	let none = crate::config::ConfigDoc::default();
+	let base = state.reloader.as_ref().map(|r| r.base()).unwrap_or(&none);
+	Ok(config_plan_answer(&state, base, &doc).await)
 }
 
 /// Addresses of this host that rules can listen on, and the ones rproxy keeps for itself.
@@ -363,20 +385,32 @@ async fn create(
 	let req: RuleRequest = parse_body(&body)?;
 	if crate::config::plan::dry_run(&query)? {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
-		let everything = crate::core::rule::Caps { features: crate::core::rule::Features::ALL, ..state.registry.caps() };
-		req.validate(&everything)?;
-		return Err(dry_run_unavailable());
+		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
+		return Ok((StatusCode::OK, Json(crate::config::plan::plan_create(&state.registry, req).await?)).into_response());
 	}
 	let rule = parse_listen(&req.listen_addr, req.listen_port).map_or_else(|_| req.listen_addr.clone(), |a| a.to_string());
 	let rule = format!("{}/{rule}", req.protocol);
+	// #144: rules of a persist: true token are stored in rproxy_rules
+	let store = state.registry.persist().filter(|_| principal.persist && Features::CURRENT.persistence).cloned();
+	let origin = if store.is_some() { Origin::Api } else { Origin::Dynamic };
 	let result = async {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
 		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
-		state.registry.create(req).await
+		state.registry.create_as(req, origin).await
 	}
 	.await;
 	audit(&principal, &client, "create", &rule, &result);
-	Ok((StatusCode::CREATED, Json(result?)))
+	let view = persisted(&state, store.as_deref(), result?, &principal).await;
+	Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// Writes an `api` rule's row after a change and answers its view with `persisted`.
+async fn persisted(state: &AppState, store: Option<&crate::config::persist::Store>, view: RuleView, principal: &Principal) -> RuleView {
+	let Some(store) = store.filter(|_| view.origin == Origin::Api) else { return view };
+	let Ok(listen) = parse_listen(&view.listen_addr, view.listen_port) else { return view };
+	let key = Key { protocol: view.protocol, listen };
+	store.save(&state.registry, &key, &principal.name).await;
+	state.registry.get(&key).await.unwrap_or(view)
 }
 
 /// Checks a change to an existing rule against the token's ports (the whole range).
@@ -400,7 +434,8 @@ async fn update(
 	let req: UpdateRequest = parse_body(&body)?;
 	if crate::config::plan::dry_run(&query)? {
 		check_rule_ports(&state, &principal, &key).await?;
-		return Err(dry_run_unavailable());
+		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
 	let result = async {
 		check_rule_ports(&state, &principal, &key).await?;
@@ -409,7 +444,8 @@ async fn update(
 	}
 	.await;
 	audit(&principal, &client, "update", &key.to_string(), &result);
-	Ok(Json(result?))
+	let store = state.registry.persist().filter(|_| Features::CURRENT.persistence).cloned();
+	Ok(Json(persisted(&state, store.as_deref(), result?, &principal).await).into_response())
 }
 
 async fn delete(
@@ -422,7 +458,7 @@ async fn delete(
 	let key = parse_key(&protocol, &addr, &port)?;
 	if crate::config::plan::dry_run(&query)? {
 		check_rule_ports(&state, &principal, &key).await?;
-		return Err(dry_run_unavailable());
+		return Ok(Json(crate::config::plan::plan_delete(&state.registry, &key).await?).into_response());
 	}
 	let drain = match query.get("drain_secs") {
 		Some(s) => {
@@ -431,6 +467,11 @@ async fn delete(
 		}
 		None => None,
 	};
+	// #144: the row of an api rule goes with it
+	let stored = match state.registry.persist() {
+		Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),
+		_ => None,
+	};
 	let result = async {
 		check_rule_ports(&state, &principal, &key).await?;
 		state.registry.delete(&key, drain).await
@@ -438,7 +479,10 @@ async fn delete(
 	.await;
 	audit(&principal, &client, "delete", &key.to_string(), &result);
 	result?;
-	Ok(StatusCode::NO_CONTENT)
+	if let Some(store) = stored {
+		store.remove(&key, &principal.name).await;
+	}
+	Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {

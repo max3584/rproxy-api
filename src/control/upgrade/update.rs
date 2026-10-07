@@ -4,8 +4,10 @@
 //! Releases are read from `RPROXY_UPDATE_SOURCE` (GitHub's releases, or a
 //! mirror with the same paths): `<source>/download/v<X.Y.Z>/manifest.json`,
 //! its `.minisig`, the binary `rproxy-api-v<X.Y.Z>-<target>` and its `.minisig`.
-//! The patches after the current one are tried in turn (X.Y.Z+1, +2, ...)
-//! until one is missing. The manifest (version, whether a handoff is allowed,
+//! Which releases exist comes from the signed index
+//! `<source>/latest/download/releases.json` (every release of every minor,
+//! written by the release workflow with each release: patch numbers have gaps,
+//! since only the repository whose code changed is released). The manifest (version, whether a handoff is allowed,
 //! SHA-256 of each file) and the binary must both be signed by the release key
 //! (`RPROXY_UPDATE_PUBKEY`, or the key built in), and the binary's hash must
 //! match the manifest; nothing else is run.
@@ -90,8 +92,8 @@ const BINARY: &str = "rproxy-api";
 /// to the cache as it arrives, not held in memory).
 const MAX_BINARY: u64 = 1 << 30;
 const MAX_SMALL: usize = 1 << 20;
-/// Patches tried after the newest one known before giving up.
-const MAX_PROBES: u64 = 64;
+/// The release index: `<source>/latest/download/releases.json` (and `.minisig`).
+pub const INDEX: &str = "releases.json";
 
 /// The release key built in (`RPROXY_RELEASE_PUBKEY` when the release was
 /// built: the base64 line of minisign.pub). None in builds without one.
@@ -283,6 +285,23 @@ fn check_manifest(key: &PublicKey, v: Version, bytes: &[u8], sig: &str) -> Resul
 }
 
 /// The binary at `path` is release `v`'s: its signature and the manifest's SHA-256.
+/// `releases.json`: `{"releases": [{"version": "0.4.3"}, ...]}`, signed.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Index {
+	pub releases: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IndexEntry {
+	pub version: String,
+}
+
+fn parse_index(key: &PublicKey, bytes: &[u8], sig: &str) -> Result<Vec<Version>, String> {
+	minisign::verify(key, sig, bytes).map_err(|e| format!("{INDEX}: {e}"))?;
+	let index: Index = serde_json::from_slice(bytes).map_err(|e| format!("{INDEX}: {e}"))?;
+	Ok(index.releases.iter().filter_map(|r| Version::parse(&r.version)).collect())
+}
+
 fn check_binary(key: &PublicKey, v: Version, manifest: &Manifest, path: &Path, sig: &str) -> Result<String, String> {
 	let name = asset_name(v);
 	let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -449,6 +468,17 @@ impl Fetcher {
 		Ok(self.get(url, MAX_SMALL).await?.map(|b| String::from_utf8_lossy(&b).into_owned()))
 	}
 
+	/// Every release version in the signed index (`releases.json`, written by
+	/// the release workflow with each release: all releases, every minor, so
+	/// numbers that were skipped do not matter).
+	async fn index(&self, key: &PublicKey) -> Result<Vec<Version>, String> {
+		let base = self.cfg.source.trim_end_matches('/');
+		let url = format!("{base}/latest/download/{INDEX}");
+		let bytes = self.get(&url, MAX_SMALL).await?.ok_or(format!("{url} is missing"))?;
+		let sig = self.get_text(&format!("{url}.minisig")).await?.ok_or(format!("{url}.minisig is missing"))?;
+		parse_index(key, &bytes, &sig)
+	}
+
 	/// The signed manifest of `v`; None when there is no such release.
 	async fn manifest(&self, key: &PublicKey, v: Version) -> Result<Option<(Manifest, Bytes, String)>, String> {
 		let Some(bytes) = self.get(&self.cfg.url(v, "manifest.json"), MAX_SMALL).await? else { return Ok(None) };
@@ -461,19 +491,25 @@ impl Fetcher {
 	/// in `bad`, downloaded and verified into the cache. None when there is none.
 	pub async fn newest(&self, current: Version, bad: &[String]) -> Result<Option<Fetched>, String> {
 		let key = self.cfg.key()?;
-		let candidates: Vec<Version> = match self.cfg.pin {
+		let is_bad = |v: &Version| bad.iter().any(|b| Version::parse(b) == Some(*v));
+		let mut candidates: Vec<Version> = match self.cfg.pin {
 			Some(pin) if pin != current && pin.same_minor(&current) => vec![pin],
 			Some(_) => vec![],
-			None => (1..=MAX_PROBES).map(|i| Version(current.0, current.1, current.2 + i)).collect(),
+			None => self.index(&key).await?.into_iter().filter(|v| v.same_minor(&current) && *v > current).collect(),
 		};
+		candidates.retain(|v| !is_bad(v));
+		candidates.sort_unstable_by(|a, b| b.cmp(a));
+		// the newest one whose signed manifest checks out
 		let mut best = None;
 		for v in candidates {
-			let found = self.manifest(&key, v).await?;
-			let Some(found) = found else { break };
-			if bad.iter().any(|b| Version::parse(b) == Some(v)) {
-				continue;
+			match self.manifest(&key, v).await {
+				Ok(Some(found)) => {
+					best = Some((v, found));
+					break;
+				}
+				Ok(None) => warn!(event = "update.error", version = %v, error = "listed in releases.json but its manifest.json is missing"),
+				Err(e) => warn!(event = "update.error", version = %v, error = %e, "trying an older release"),
 			}
-			best = Some((v, found));
 		}
 		let Some((v, (manifest, manifest_bytes, manifest_sig))) = best else { return Ok(None) };
 		// already here and still good
@@ -731,6 +767,17 @@ mod tests {
 		assert_eq!(c.url(Version(0, 4, 1), "manifest.json"), "https://example.invalid/releases/download/v0.4.1/manifest.json");
 		assert_eq!(c.cached_version_of(Path::new("/var/cache/rproxy/update/0.4.2/rproxy-api")), Some(Version(0, 4, 2)));
 		assert_eq!(c.cached_version_of(Path::new("/usr/bin/rproxy-api")), None);
+	}
+
+	#[test]
+	fn the_index_is_signed() {
+		let id = [3; 8];
+		let (pub_text, pair) = minisign::testing::key_pair([6; 32], id);
+		let key = PublicKey::parse(&pub_text).unwrap();
+		let body = br#"{"releases":[{"version":"0.4.0"},{"version":"0.4.7"},{"version":"0.5.0"},{"version":"junk"}]}"#;
+		let sig = minisign::testing::sign(&pair, id, body, "index");
+		assert_eq!(parse_index(&key, body, &sig).unwrap(), [Version(0, 4, 0), Version(0, 4, 7), Version(0, 5, 0)]);
+		assert!(parse_index(&key, br#"{"releases":[{"version":"0.4.9"}]}"#, &sig).unwrap_err().contains("does not match"));
 	}
 
 	#[test]

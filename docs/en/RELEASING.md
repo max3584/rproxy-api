@@ -53,7 +53,7 @@ Done only in the repository being released (the other one's version is not bumpe
 
 ## Release signatures (minisign, #174)
 
-The `sign` job of `release.yml` attaches minisign signatures (`.minisig`) of every binary, `manifest.json` and `SHA256SUMS` to the release. The self-update runs nothing it cannot verify. The key is separate from the apt GPG key (the owner's decision).
+The `sign` job of `release.yml` writes the index `releases.json` (every release's version; the self-update reads the latest release's) and attaches minisign signatures (`.minisig`) of every binary, `manifest.json`, `SHA256SUMS` and `releases.json` to the release. The self-update runs nothing it cannot verify. The key is separate from the apt GPG key (the owner's decision).
 
 Creating the key (once, locally; the secret key never goes into the repository):
 
