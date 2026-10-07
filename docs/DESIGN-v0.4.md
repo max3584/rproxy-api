@@ -508,14 +508,15 @@ UI の `forward_rules.options`（JSON）でも、ルールの `limits`・`bandwi
 
 `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。どれも接続を切らずに変える。
 
-## 14. 決めていないこと（オーナーに確かめる）
+## 14. 決めたこと（2026-10-07、オーナーの了承）
 
-- コントローラのリポジトリ名（`rproxy-gateway` の案）と言語（Rust / kube-rs の案。Go の controller-runtime の方が Gateway API の実装例が多い）。
-- 組に属するルールを個別に変えたとき `409 owned` で断る案でよいか（`?force=true` を足すか）。
-- #144 の `persist` の既定を false（保存したいトークンにだけ付ける）にした。既定を true にして UI のトークンに `persist: false` を付ける方がよいか。
-- #144 の `node` の列（複数の rproxy が 1 つの DB を使うとき）。UI の `forward_rules` にはノードの区別があるか（UI #98）。
-- `origin: "api"` を足すと UI の古い版が知らない値を受け取る。UI がまだ扱えないなら、`origin` は `dynamic` のままにして `persisted` だけで見分ける案もある。
-- #174 の systemd の `ExecReload`：SIGHUP（設定・証明書の読み直し）のまま残して引き継ぎは `systemctl kill -s USR2` にするか、reload を引き継ぎにするか。
-- #174 の署名を minisign にした（cosign / GPG にしない）。apt の GPG 鍵とは別の鍵になる。
-- #167 の一時停止を既定で有効（20 回 / 1 分で 5 分）にした。既定を無効にするか。
-- #166 の UDP の帯域の上限は捨てるだけ（待たせられない）。それでよいか。
+- コントローラは別のリポジトリ `max3584/rproxy-gateway`、Rust（kube-rs）。手元では rproxy-api・UI と同じフォルダに並べて置き、3 つを同じ時期に管理する（`../rproxy-gateway`）。
+- 組に属するルールを個別に変えたら `409 owned` で断る（`?force` は付けない。コントローラが元に戻すため）。
+- #144 の `persist` の既定は false（保存したいトークンにだけ付ける。UI は自分の DB に保存するので二重にしない）。
+- #144 の `node` の列は UI の `forward_rules` の `target`（ノード・グループ、UI #98）と合わせる。
+- API で作ったルールの `origin` は `"api"`。UI もそれに合わせる。
+- #174：`systemctl reload` は今までどおり SIGHUP（設定・証明書の読み直し）。引き継ぎは SIGUSR2（パッケージの更新のとき）。
+- #174 の署名は minisign（apt の GPG とは別の鍵）。
+- #167 の一時停止は既定で有効（20 回 / 1 分で 5 分。Unix ソケットは対象外）。
+- #166 の UDP の帯域の上限は、超えた分を捨てる。
+- 組の名前に `/` を使ってよい（k8s の `namespace/name`）。

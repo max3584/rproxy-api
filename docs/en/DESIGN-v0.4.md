@@ -508,14 +508,15 @@ The UI's `forward_rules.options` (JSON) also carries a rule's `limits`, `bandwid
 
 `limits`, `bandwidth`, `geoip`, `outlier_detection` and `labels` given to `PATCH` replace the current value as a whole (`{}` removes it; left out keeps it). None of them drops connections.
 
-## 14. Open questions (for the owner)
+## 14. Decisions (2026-10-07, approved by the owner)
 
-- The controller repository's name (proposed `rproxy-gateway`) and language (proposed Rust / kube-rs; Go controller-runtime has more Gateway API implementations to learn from).
-- Whether `409 owned` for single changes to a set's rule is right (or add `?force=true`).
-- #144 `persist` defaults to false (mark only tokens that should store). Would default true with `persist: false` on the UI's token be better?
-- #144 `node` column (several rproxy sharing one DB). Does the UI's `forward_rules` distinguish nodes (UI #98)?
-- Adding `origin: "api"` gives older UI versions an unknown value. If the UI cannot handle it yet, `origin` could stay `dynamic` with `persisted` telling them apart.
-- #174 systemd `ExecReload`: keep SIGHUP (re-reading settings and certificates) and do handoffs with `systemctl kill -s USR2`, or make reload the handoff.
-- #174 signatures are minisign (not cosign / GPG), a key separate from the apt GPG key.
-- #167 lockout is on by default (20 failures per minute → 5 minutes). Should it default to off?
-- #166 bandwidth limits on UDP only drop (datagrams cannot be delayed). Is that acceptable?
+- The controller is a separate repository, `max3584/rproxy-gateway`, in Rust (kube-rs). Locally it sits in the same folder as rproxy-api and the UI so all three are managed together (`../rproxy-gateway`).
+- Changing a single rule that belongs to a rule set is refused with `409 owned` (no `?force`; the controller would revert it anyway).
+- #144 `persist` defaults to false (set it only on tokens that should store; the UI stores in its own DB, so no double storage).
+- #144's `node` column matches the UI's `forward_rules.target` (node or group, UI #98).
+- API-created rules have `origin: "api"`; the UI follows.
+- #174: `systemctl reload` stays SIGHUP (reload settings and certificates); handoff is SIGUSR2 (used on package upgrades).
+- #174 signatures use minisign (a key separate from apt's GPG key).
+- #167 lockout is on by default (20 failures per minute → 5 minutes; the Unix socket is exempt).
+- #166 UDP bandwidth limits drop what exceeds the rate.
+- Rule-set names may contain `/` (Kubernetes `namespace/name`).
