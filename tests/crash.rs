@@ -705,7 +705,8 @@ async fn stored_rules_survive_kills_with_mariadb() {
 	let env = [("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())];
 	let api = free_port();
 	let mut known: Vec<Known> = ports.iter().map(|_| Known::default()).collect();
-	let mut step = 10u64;
+	// udp_idle_secs (1-86400) tells the changes apart: a range per round and writer
+	let mut step = 0u64;
 	for round in 0..rounds() {
 		let mut s = Server::start(&dir, &format!("round{round}"), api, &env);
 		s.ready().await;
@@ -713,14 +714,14 @@ async fn stored_rules_survive_kills_with_mariadb() {
 		let mut writers = vec![];
 		for (i, &port) in ports.iter().enumerate() {
 			let mut k = Known { acked: known[i].acked, inflight: None };
-			let base = step + i as u64 * 1000;
+			let base = step + i as u64 * 3000;
 			writers.push(tokio::spawn(async move {
 				let client = reqwest::Client::new();
 				let path = format!("http://127.0.0.1:{api}/rules/tcp/127.0.0.1/{port}");
 				let mut n = 0;
 				loop {
 					n += 1;
-					let idle = base + n;
+					let idle = 1 + (base + n) % 86_000;
 					let (req, target) = match k.acked {
 						None => {
 							let mut body = rule("tcp", port, backend);
@@ -756,7 +757,7 @@ async fn stored_rules_survive_kills_with_mariadb() {
 		for (i, w) in writers.into_iter().enumerate() {
 			known[i] = w.await.unwrap();
 		}
-		step += 100_000;
+		step += 20_000;
 		drop(s);
 
 		let s = Server::start(&dir, &format!("after{round}"), api, &env);
