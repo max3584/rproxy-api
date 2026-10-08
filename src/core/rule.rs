@@ -182,6 +182,8 @@ pub struct Features {
 	pub self_update: bool,
 	/// Keys of `global.performance` applied from the settings file (#194, #184)
 	pub performance: &'static [&'static str],
+	/// `RPROXY_SHUTDOWN_DELAY` / `RPROXY_SHUTDOWN_DRAIN` (v0.4.1, docs/DESIGN-v0.4.x.md 2.)
+	pub graceful_shutdown: bool,
 }
 
 /// Every name of `Features::http_options`.
@@ -220,6 +222,7 @@ impl Features {
 		handoff: true,
 		self_update: true,
 		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
+		graceful_shutdown: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -255,6 +258,7 @@ impl Features {
 		handoff: true,
 		self_update: true,
 		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
+		graceful_shutdown: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

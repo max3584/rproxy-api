@@ -244,8 +244,19 @@ pub fn metrics() -> String {
 /// While a live upgrade runs (and after it, in the old process), requests that
 /// change something get `503 upgrading`: the old process's state has been
 /// handed over, and a change it made now would be lost.
+///
+/// While the process shuts down gracefully (`RPROXY_SHUTDOWN_DELAY` /
+/// `_DRAIN`), every change gets `503 shutting_down` and reads still answer.
 pub async fn guard(req: Request, next: Next) -> Response {
 	let reads = matches!(*req.method(), Method::GET | Method::HEAD);
+	if crate::core::shutdown::active() && !reads {
+		return ApiError {
+			status: StatusCode::SERVICE_UNAVAILABLE,
+			code: "shutting_down",
+			message: "rproxy is shutting down; send changes to another instance".into(),
+		}
+		.into_response();
+	}
 	if handoff::active() && !reads && !req.uri().path().starts_with("/admin/") {
 		return upgrading("a live upgrade is in progress; send the request again in a moment").into_response();
 	}

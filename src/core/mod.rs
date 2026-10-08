@@ -8,4 +8,5 @@ pub mod proxy;
 pub mod registry;
 pub mod resolve;
 pub mod rule;
+pub mod shutdown;
 pub mod ruleset;

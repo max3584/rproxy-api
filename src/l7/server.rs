@@ -402,7 +402,17 @@ where
 	let stop = conn.rt.stop.clone();
 	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
 		let conn = conn.clone();
-		async move { Ok::<_, Infallible>(conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await) }
+		async move {
+			let http1 = req.version() < hyper::Version::HTTP_2;
+			let mut resp = conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await;
+			// stopping (a graceful shutdown's drain, DELETE with drain, a live
+			// upgrade): tell HTTP/1.1 clients this connection ends with this
+			// response (HTTP/2 gets GOAWAY from graceful_shutdown)
+			if http1 && conn.rt.stop.is_cancelled() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+				resp.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+			}
+			Ok::<_, Infallible>(resp)
+		}
 	});
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 	builder.http1().timer(TokioTimer::new());

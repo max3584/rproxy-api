@@ -237,6 +237,18 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `api_rules_and_http_counters_carry_over` | `persist: true` のトークンのルールが DB を読み直さずに `origin: "api"`・`created_by`・`created_at`・`persisted` のまま戻る。`stats.http` のルートごとの数が引き継がれて、その後も増える |
 | `a_failed_handoff_keeps_the_old_process` | 新しいプロセスにつなげない（引き継ぎ用のソケットのディレクトリがない）と `handoff.failed` で、古いプロセスが動き続ける。`rproxy_handoffs_total{outcome="failed"}`・`rproxy_build_info`。TCP からの `POST /admin/upgrade` は既定で 403 |
 
+## 結合テスト：SIGTERM での終わり方（`tests/shutdown.rs`、v0.4.1）
+
+本物のバイナリに SIGTERM を送る（docs/DESIGN-v0.4.x.md の 2.、`RPROXY_SHUTDOWN_DELAY` / `_DRAIN`）。
+
+| テスト | 確かめること |
+|---|---|
+| `by_default_sigterm_stops_at_once` | 既定（両方 `0s`）ではすぐ止まり、今の接続も切れる（今までと同じ）。`features.graceful_shutdown` |
+| `delay_keeps_accepting_then_drain_lets_connections_end` | `delay` の間：`/readyz` は 503、`GET /rules` は答え、`POST /rules` は `503 shutting_down`、新しい TCP の接続が通る。`drain` の間：新しい TCP の接続は断られ、前からの TCP の接続・UDP のセッションは続き、新しい UDP のセッションは作られない。アイドルの HTTP/1.1 の接続は閉じ、処理中のリクエストの応答は `Connection: close`。`drain` を過ぎると残りを切って終わる（`shutdown.done` の `cut`） |
+| `a_second_sigterm_stops_at_once` | `delay` の間の 2 回目の SIGTERM ですぐ止まる（`shutdown.now`） |
+| `a_second_sigterm_cuts_the_drain_short` | `drain` の間の 2 回目の SIGTERM で待つのをやめ、残りの接続を切る |
+| `values_out_of_range_stop_the_startup` | 1 時間を超える値は起動を止める |
+
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 
 本物のバイナリを起動して、`global.performance` の効き目を外から確かめる。

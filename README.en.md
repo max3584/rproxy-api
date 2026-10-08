@@ -103,6 +103,7 @@ Added in v0.4 (all of them work; settings of rules and `global` are in "v0.4 set
 | `RPROXY_FILES_TRUSTED_DIRS` | `--files-trusted-dirs` | none | Directories whose files rules may name even when root owns them (absolute paths separated by `:` or `,`; Kubernetes Secret volumes). `global.files.trusted_dirs` of the settings file wins (v0.4, docs/en/PERMISSIONS.md) |
 | `RPROXY_NODE_NAME` | `--node-name` | host name | Name in `rproxy_rules`; only rows with this name are restored at startup (#144, "Storing API-created rules" in docs/en/API.md) |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | Live upgrade (#174): SIGUSR2 or `POST /admin/upgrade` hands the listening sockets to the binary on disk. The handoff socket, how long to wait for the new process, how long the old one waits for its connections. docs/en/UPGRADE.md |
+| `RPROXY_SHUTDOWN_DELAY` / `RPROXY_SHUTDOWN_DRAIN` | `--shutdown-delay` / `--shutdown-drain` | `0s` / `0s` | How SIGTERM stops rproxy (v0.4.1). By default it stops at once (as before). During `DELAY` it keeps accepting while `/readyz` answers 503 `draining` (waiting for a load balancer in front to drop it), then it closes the listeners and waits up to `DRAIN` for current connections to end. Meanwhile the control API answers reads and refuses changes with `503 shutting_down`. A second SIGTERM stops at once. Each is at most one hour. Recommended values under systemd: "Shutting down on SIGTERM" below |
 | `RPROXY_UPDATE` | `--update` | `off` | Self-update (containers, #174): `off`, `check`, `auto`; also `RPROXY_UPDATE_PIN`, `_SOURCE`, `_CACHE`, `_INTERVAL`, `_PUBKEY`, `_HEALTHY`. The image's entry point is `rproxy-api launch`. docs/en/UPGRADE.md |
 | `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | number of CPUs / `none` / `0` | Performance (#194; `global.performance` in the settings file wins). Also `RPROXY_UDP_SHARDS` (a number or `auto`) and `RPROXY_SPLICE*`. "Performance" in docs/en/API.md |
 | `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | `RPROXY_API_SOCKET`, else the control API / none | `--check-config --diff`: the difference from the running rproxy, asked with `POST /config/plan` (#169, "Diff before change" in docs/en/API.md) |
@@ -130,6 +131,24 @@ For other environment problems, only the unusable part is stopped and startup co
 | The self-update cache directory cannot be created | Forwarding keeps running; the self-update fails until it is fixed (`part: update.cache`) |
 | A rule lacks the required permissions (capabilities) | Only that rule becomes `failed`, with a reason ([docs/en/PERMISSIONS.md](docs/en/PERMISSIONS.md)) |
 
+
+### Shutting down on SIGTERM (v0.4.1)
+
+By default, SIGTERM (`systemctl stop`) stops all forwarding at once (cutting current connections). With a load balancer or VIP in front, or to let current connections finish first, set `RPROXY_SHUTDOWN_DELAY` and `RPROXY_SHUTDOWN_DRAIN` in `/etc/rproxy/rproxy.env`:
+
+1. On SIGTERM, `/readyz` answers 503 `draining` and rproxy keeps accepting as before for `DELAY` (waiting for health checks to drop it).
+2. It closes the listeners (no new connections or UDP sessions) and waits up to `DRAIN` for current connections to end. HTTP requests in flight get `Connection: close` (HTTP/2 GOAWAY) and idle connections close at once. Current UDP sessions go on.
+3. It cuts what is left and exits. A second SIGTERM or Ctrl-C stops at once.
+
+Meanwhile the control API answers reads (`GET`, `/metrics`) and refuses changes with `503 shutting_down`.
+
+| In front of rproxy | `RPROXY_SHUTDOWN_DELAY` | `RPROXY_SHUTDOWN_DRAIN` |
+|---|---|---|
+| Nothing (clients connect directly) | `0s` | `10s` |
+| A load balancer health-checking `/readyz` | interval × failures to drop + 1 second (e.g. `5s`) | `10s`–`25s` |
+| A VIP such as keepalived | time for the VIP to move (e.g. `3s`) | `10s` |
+
+Keep systemd's `TimeoutStopSec` (default 90 seconds) above `DELAY + DRAIN + 5 seconds`. `systemctl restart` gets slower by the same amount, so update the binary with a live upgrade (SIGUSR2, [docs/en/UPGRADE.md](docs/en/UPGRADE.md)). In Kubernetes, rproxy-gateway passes `5s` / `25s`.
 
 ## Usage
 
@@ -300,6 +319,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `ruleset.apply` / `ruleset.delete` | A rule set (v0.4, #28) was applied (`ruleset`, `generation`, `etag`, counts created / updated / deleted / unchanged / failed, `by`) / deleted |
 | `config.reload` / `config.error` | Application of the configuration file (counts, `global` changes that need a restart) and the reason it could not be applied |
 | `start` / `shutdown` / `fatal` | Startup (`version`, whether transparent, authentication and TLS are on, …) / exit / a configuration mistake that stops the startup |
+| `shutdown.start` / `shutdown.drain` / `shutdown.now` / `shutdown.done` | SIGTERM with `RPROXY_SHUTDOWN_DELAY` / `_DRAIN`: began (`delay_secs`, `drain_secs`) / listeners closed (connections and sessions left, `connections`) / a second SIGTERM stops at once / stopped (connections and sessions cut, `cut`) |
 | `degraded` | Part of rproxy was left out because of the environment and the rest runs (`part`: `api`, `api_tls`, `tokens`, `log`, `global.*`, …) |
 | `api.listening` / `api.retry` / `api.stopped` | The control API started listening / cannot listen and retries / stopped |
 | `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`), a locked-out source (`outcome: locked_out`). How the caller authenticated (`auth`: `token`, `cert`, `token+cert`). Lines of refused requests are thinned out per sender (`suppressed`) |

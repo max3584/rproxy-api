@@ -1383,6 +1383,53 @@ impl Registry {
 		}
 	}
 
+	/// A graceful shutdown's drain (docs/DESIGN-v0.4.x.md 2.): every rule stops
+	/// accepting (HTTP closes its keep-alive connections after their request,
+	/// UDP makes no new sessions), then the connections may end until `until`
+	/// is done. The rules stay listed (`GET /rules`, `/metrics`) until
+	/// `shutdown`. Returns the connections and sessions open when the drain
+	/// began, and those still open at its end (cut by `shutdown`).
+	pub async fn drain_in_place(&self, until: impl std::future::Future<Output = ()>) -> (usize, usize) {
+		let mut trackers = vec![];
+		{
+			let mut rules = self.rules.lock().await;
+			for entry in rules.values_mut() {
+				match entry {
+					Entry::Running(r) => {
+						r.rt.stop.cancel();
+						r.rt.tracker.close();
+						trackers.push(r.rt.tracker.clone());
+					}
+					// a failed rule is not started again now
+					Entry::Failed(f) => {
+						if let Some(retry) = f.retry.take() {
+							retry.abort();
+						}
+					}
+				}
+			}
+		}
+		let open = trackers.iter().map(|t| t.len()).sum();
+		tokio::select! {
+			_ = futures_util::future::join_all(trackers.iter().map(|t| t.wait())) => {}
+			_ = until => {}
+		}
+		(open, trackers.iter().map(|t| t.len()).sum())
+	}
+
+	/// Connections and UDP sessions open on every rule.
+	pub async fn open_connections(&self) -> usize {
+		self.rules
+			.lock()
+			.await
+			.values()
+			.map(|e| match e {
+				Entry::Running(r) => r.rt.tracker.len(),
+				Entry::Failed(_) => 0,
+			})
+			.sum()
+	}
+
 	pub async fn shutdown(&self) {
 		let entries: Vec<(Key, Entry)> = self.rules.lock().await.drain().collect();
 		for (key, entry) in entries {

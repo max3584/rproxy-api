@@ -237,6 +237,18 @@ Starts the real binary and hands over with SIGUSR2 and `POST /admin/upgrade` (do
 | `api_rules_and_http_counters_carry_over` | Rules of a `persist: true` token come back as `origin: "api"` with `created_by`, `created_at` and `persisted`, without reading the database. `stats.http` by route carries over and keeps counting |
 | `a_failed_handoff_keeps_the_old_process` | When the new process cannot connect (the handoff socket's directory is missing): `handoff.failed`, and the old process keeps running. `rproxy_handoffs_total{outcome="failed"}`, `rproxy_build_info`. `POST /admin/upgrade` over TCP is 403 by default |
 
+## Integration tests: shutting down on SIGTERM (`tests/shutdown.rs`, v0.4.1)
+
+Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY_SHUTDOWN_DELAY` / `_DRAIN`).
+
+| Test | What it checks |
+|---|---|
+| `by_default_sigterm_stops_at_once` | By default (both `0s`) it stops at once and cuts current connections (as before). `features.graceful_shutdown` |
+| `delay_keeps_accepting_then_drain_lets_connections_end` | During `delay`: `/readyz` is 503, `GET /rules` answers, `POST /rules` is `503 shutting_down`, new TCP connections pass. During `drain`: new TCP connections are refused, existing TCP connections and UDP sessions go on, no new UDP session is made. An idle HTTP/1.1 connection is closed and the response of a request in flight carries `Connection: close`. Past `drain` the rest is cut and the process exits (`cut` in `shutdown.done`) |
+| `a_second_sigterm_stops_at_once` | A second SIGTERM during `delay` stops at once (`shutdown.now`) |
+| `a_second_sigterm_cuts_the_drain_short` | A second SIGTERM during `drain` stops waiting and cuts the connections left |
+| `values_out_of_range_stop_the_startup` | A value above one hour stops the startup |
+
 ## Integration tests: performance (`tests/performance.rs`, #194, #184)
 
 Starts the real binary and checks the effect of `global.performance` from outside.
