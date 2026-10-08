@@ -165,6 +165,12 @@ struct Options {
 	/// Longest the old process waits for its connections after a live upgrade [default: 5m]
 	#[arg(long, env = "RPROXY_HANDOFF_DRAIN")]
 	handoff_drain: Option<String>,
+	/// After SIGTERM, keep accepting this long while /readyz says draining (e.g. 5s) [default: 0s]
+	#[arg(long, env = "RPROXY_SHUTDOWN_DELAY")]
+	shutdown_delay: Option<String>,
+	/// Then close the listeners and let connections end for up to this long (e.g. 25s) [default: 0s: stop at once]
+	#[arg(long, env = "RPROXY_SHUTDOWN_DRAIN")]
+	shutdown_drain: Option<String>,
 	/// Self-update: off (default), check or auto (v0.4, #174)
 	#[arg(long, env = "RPROXY_UPDATE", value_enum)]
 	update: Option<rproxy_api::control::upgrade::UpdateMode>,
@@ -325,6 +331,9 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 	let hardening = hardening_options(opts).check(&features);
 	let upgrade = upgrade_options(opts).check(&features);
 	let mut errors: Vec<String> = hardening.errors.into_iter().chain(upgrade.errors).collect();
+	if let Err(e) = shutdown_config(opts) {
+		errors.push(e);
+	}
 	let perf = rproxy_api::config::performance::PerformanceSpec {
 		workers: opts.workers,
 		udp_shards: None,
@@ -355,6 +364,11 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 		}
 	}
 	Ok(ignored)
+}
+
+/// `--shutdown-delay` / `--shutdown-drain` (docs/DESIGN-v0.4.x.md 2.).
+fn shutdown_config(opts: &Options) -> Result<rproxy_api::core::shutdown::Config, String> {
+	rproxy_api::core::shutdown::Config::parse(opts.shutdown_delay.as_deref(), opts.shutdown_drain.as_deref())
 }
 
 /// The live upgrade and self-update options (#174).
@@ -660,6 +674,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	rproxy_api::config::performance::apply(&perf);
 	log_performance(&perf);
 	let upgrade_opts = upgrade_options(&opts);
+	let graceful = shutdown_config(&opts)?;
 	upgrade::hash_binary();
 	// a live upgrade (#174): take the old process's sockets and state before
 	// anything listens
@@ -1013,12 +1028,15 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 
 	// GET /readyz: draining (#28), here and after a handoff
 	registry.readiness().set_draining();
+	let mut cut = None;
 	match &handed {
 		Some(h) => {
 			handoff::set_draining();
 			info!(event = "handoff.drain", pid = h.pid, drain_secs = upgrader.config().drain.as_secs());
 		}
-		None => info!(event = "shutdown"),
+		None if graceful.immediate() => info!(event = "shutdown"),
+		// RPROXY_SHUTDOWN_DELAY / _DRAIN: the control API keeps answering meanwhile
+		None => cut = Some(graceful_drain(&registry, graceful).await),
 	}
 	stop.cancel();
 	for handle in handles.lock().unwrap().iter() {
@@ -1070,7 +1088,53 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		Some(h) => upgrader.finish(h, runtimes).await,
 		None => registry.shutdown().await,
 	}
+	if let Some(cut) = cut {
+		info!(event = "shutdown.done", cut);
+	}
 	Ok(())
+}
+
+/// A graceful shutdown (docs/DESIGN-v0.4.x.md 2.): changes are refused, the
+/// rules keep accepting for `delay`, then close their listeners and the
+/// connections may end for `drain`. A second SIGTERM or SIGINT ends either
+/// wait at once. Returns the connections and sessions left to cut.
+async fn graceful_drain(registry: &Registry, c: rproxy_api::core::shutdown::Config) -> usize {
+	use rproxy_api::core::shutdown;
+	shutdown::begin();
+	info!(event = "shutdown.start", delay_secs = c.delay.as_secs_f64(), drain_secs = c.drain.as_secs_f64());
+	let second = second_signal();
+	tokio::pin!(second);
+	let mut now = false;
+	tokio::select! {
+		_ = tokio::time::sleep(c.delay) => {}
+		_ = &mut second => now = true,
+	}
+	shutdown::start_drain();
+	if now {
+		info!(event = "shutdown.now", "second signal: stopping at once");
+		return registry.open_connections().await;
+	}
+	info!(event = "shutdown.drain", connections = registry.open_connections().await, drain_secs = c.drain.as_secs_f64());
+	let until = async {
+		tokio::select! {
+			_ = tokio::time::sleep(c.drain) => {}
+			_ = &mut second => info!(event = "shutdown.now", "second signal: stopping at once"),
+		}
+	};
+	registry.drain_in_place(until).await.1
+}
+
+/// The next SIGTERM or SIGINT.
+async fn second_signal() {
+	#[cfg(unix)]
+	if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+		tokio::select! {
+			_ = term.recv() => {}
+			_ = tokio::signal::ctrl_c() => {}
+		}
+		return;
+	}
+	let _ = tokio::signal::ctrl_c().await;
 }
 
 /// `event = "performance"`: the settings in effect and where each came from.
@@ -1182,6 +1246,10 @@ async fn watch_config(every: Option<Duration>, reloader: Arc<ConfigReloader>, hu
 			_ = hup.notified() => true,
 			_ = async { match ticks.as_mut() { Some(t) => { t.tick().await; } None => std::future::pending().await } } => false,
 		};
+		// a graceful shutdown (RPROXY_SHUTDOWN_DELAY) starts no new rules
+		if rproxy_api::core::shutdown::active() {
+			return;
+		}
 		reloader.reload(forced).await;
 	}
 }

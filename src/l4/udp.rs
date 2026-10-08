@@ -65,16 +65,26 @@ impl Port {
 /// own sessions: the kernel sends a client's datagrams to the same socket, so
 /// the shards share no table and take no lock of each other.
 /// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
+/// In a graceful shutdown (`core::shutdown::draining`), `stop` only ends new
+/// sessions: the open ones go on (their datagrams come in here) until the
+/// rule's `kill`.
 pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
 	let socket = Arc::new(Listener::new(socket));
 	let sessions: Sessions = Arc::default();
 	let next_id = AtomicU64::new(0);
 	let mut batch = Batch::new(port.batch);
+	let mut draining = false;
 
 	loop {
 		tokio::select! {
 			biased;
-			_ = stop.cancelled() => break,
+			_ = stop.cancelled(), if !draining => {
+				if !crate::core::shutdown::draining() {
+					break;
+				}
+				draining = true;
+			}
+			_ = rt.kill.cancelled(), if draining => break,
 			received = socket.recv_batch(&mut batch) => match received {
 				Ok(_) => {
 					// `limits` (#165): None after one relaxed load when the rule has none
@@ -101,6 +111,11 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 						}
 						let tx = match map.get(&(client, local)) {
 							Some((_, tx)) if !tx.is_closed() => tx.clone(),
+							_ if draining => {
+								// shutting down: no new sessions
+								rt.stats.dropped();
+								continue;
+							}
 							_ => {
 								// a new session: within the limits, or the datagram is dropped
 								let permit = match limiter.as_ref().map(|l| l.admit(client.ip())) {

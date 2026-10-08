@@ -300,6 +300,9 @@ impl Upgrader {
 	/// Starts a handoff to `exe` (default: the binary on disk) in the background.
 	/// Err when one is already running.
 	pub fn start(self: &Arc<Self>, exe: Option<PathBuf>, reason: &'static str) -> Result<(), String> {
+		if crate::core::shutdown::active() {
+			return Err("rproxy is shutting down".into());
+		}
 		if ACTIVE.swap(true, Ordering::AcqRel) {
 			return Err("a live upgrade is already in progress".into());
 		}

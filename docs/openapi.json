@@ -47,7 +47,8 @@
               "owned",
               "precondition_failed",
               "stale_generation",
-              "locked_out"
+              "locked_out",
+              "shutting_down"
             ]
           }
         },
@@ -1936,6 +1937,10 @@
                   "type": "string"
                 },
                 "description": "Keys of global.performance applied from the settings file"
+              },
+              "graceful_shutdown": {
+                "type": "boolean",
+                "description": "RPROXY_SHUTDOWN_DELAY / RPROXY_SHUTDOWN_DRAIN (v0.4.1)"
               }
             }
           },
@@ -3195,7 +3200,8 @@
               "owned",
               "precondition_failed",
               "stale_generation",
-              "locked_out"
+              "locked_out",
+              "shutting_down"
             ]
           },
           "errors": {

@@ -103,6 +103,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `RPROXY_FILES_TRUSTED_DIRS` | `--files-trusted-dirs` | なし | ルールが指すファイルを root のものでも使うディレクトリ（`:` か `,` 区切りの絶対パス。Kubernetes の Secret のボリューム）。設定ファイルの `global.files.trusted_dirs` があればそちら（v0.4、docs/PERMISSIONS.md） |
 | `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する（#144、docs/API.md の「API で作ったルールの保存」） |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
+| `RPROXY_SHUTDOWN_DELAY` / `RPROXY_SHUTDOWN_DRAIN` | `--shutdown-delay` / `--shutdown-drain` | `0s` / `0s` | SIGTERM での終わり方（v0.4.1）。既定はすぐ止める（今までと同じ）。`DELAY` の間は `/readyz` を 503 `draining` にしたまま受け付け（前のロードバランサから外れるのを待つ）、続けて待ち受けを閉じて今の接続の終わりを `DRAIN` まで待つ。その間、制御 API の読むだけの要求は答え、変更は `503 shutting_down`。2 回目の SIGTERM ですぐ止まる。それぞれ 1 時間まで。systemd での推奨値は下の「SIGTERM での終わり方」 |
 | `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
 | `RPROXY_WORKERS` / `RPROXY_CPU_AFFINITY` / `RPROXY_BUSY_POLL_USECS` | `--workers` / `--cpu-affinity` / `--busy-poll-usecs` | CPU の数 / `none` / `0` | performance（#194。設定ファイルの `global.performance` が先）。`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_SPLICE*` も。docs/API.md の「performance」 |
 | `RPROXY_DIFF_API` / `RPROXY_DIFF_TOKEN_FILE` | `--diff` / `--diff-api` / `--diff-token-file` | `RPROXY_API_SOCKET`、なければ制御 API / なし | `--check-config --diff`：動いている rproxy に `POST /config/plan` で問い合わせた差分（#169、docs/API.md の「変更前の差分」） |
@@ -130,6 +131,24 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | 自動更新のキャッシュのディレクトリを作れない | 転送は動かしたまま、直るまで自動更新は失敗する（`part: update.cache`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
 
+
+### SIGTERM での終わり方（v0.4.1）
+
+既定では、SIGTERM（`systemctl stop`）ですべての転送をすぐに止める（今の接続も切る）。前にロードバランサや VIP があるときや、今の接続を終わらせてから止めたいときは、`RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` を `/etc/rproxy/rproxy.env` に書く：
+
+1. SIGTERM が来たら `/readyz` を 503 `draining` にし、`DELAY` の間は今までどおり受け付ける（ヘルスチェックで外れるのを待つ）。
+2. 待ち受けを閉じ（新しい接続・UDP のセッションを受けない）、今の接続が終わるのを `DRAIN` まで待つ。HTTP は処理中のリクエストに `Connection: close`（HTTP/2 は GOAWAY）を付けて閉じ、アイドルの接続はすぐ閉じる。UDP の今のセッションは続く。
+3. 残りを切って終わる。2 回目の SIGTERM・Ctrl-C ではすぐに止める。
+
+その間、制御 API の読むだけの要求（`GET`・`/metrics`）は答え、変更は `503 shutting_down` で断る。
+
+| 前にあるもの | `RPROXY_SHUTDOWN_DELAY` | `RPROXY_SHUTDOWN_DRAIN` |
+|---|---|---|
+| なし（クライアントが直接つなぐ） | `0s` | `10s` |
+| `/readyz` をヘルスチェックするロードバランサ | 間隔 × 外すまでの回数 + 1 秒（例 `5s`） | `10s`〜`25s` |
+| keepalived などの VIP | VIP が移るまでの時間（例 `3s`） | `10s` |
+
+systemd の `TimeoutStopSec`（既定 90 秒）は `DELAY + DRAIN + 5 秒` より長くしておく。`systemctl restart` もこの分だけ遅くなるので、バイナリの更新には再起動なしの更新（SIGUSR2、[docs/UPGRADE.md](docs/UPGRADE.md)）を使う。Kubernetes では rproxy-gateway が `5s`・`25s` を渡す。
 
 ## 使い方
 
@@ -300,6 +319,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
+| `shutdown.start` / `shutdown.drain` / `shutdown.now` / `shutdown.done` | `RPROXY_SHUTDOWN_DELAY` / `_DRAIN` のある SIGTERM：始めた（`delay_secs`・`drain_secs`）/ 待ち受けを閉じた（残りの接続・セッションの数 `connections`）/ 2 回目の SIGTERM ですぐ止める / 止めた（切った接続・セッションの数 `cut`） |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |
 | `api.listening` / `api.retry` / `api.stopped` | 制御 API の待ち受けの開始 / 開けないので再試行 / 止まった |
 | `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）、一時停止中（`outcome: locked_out`）。認証の方法（`auth`：`token`・`cert`・`token+cert`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |

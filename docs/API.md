@@ -697,7 +697,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - `last_transition` は `status` が最後に変わった Unix 秒（`reason`・`message` だけが変わっても動かない）。`Programmed` の `True` は `started_at` から。ほかの変化はルールを読んだとき（`GET /rules`・`GET /rulesets/{name}`・PUT の応答）に気づいた時刻。ルールを消す・作り直すと最初から。
 - 今までの `state`・`error`・`all_targets_down`・`down_services` もそのまま（UI が使う）。
 
-**readiness**：`GET /readyz`（認証なし、`/healthz` と同じ）。起動時の復元（設定ファイル・DB）が終わると `200 {"ready": true}`、その前と、終了の処理に入った後（#174 の引き継ぎでも）は `503 {"ready": false, "reason": "starting" | "draining"}`。ルールの失敗は readiness に含めない（ルールの状態は `conditions`）。生きているかは今までどおり `/healthz`。
+**readiness**：`GET /readyz`（認証なし、`/healthz` と同じ）。起動時の復元（設定ファイル・DB）が終わると `200 {"ready": true}`、その前と、終了の処理に入った後（#174 の引き継ぎでも、`RPROXY_SHUTDOWN_DELAY` の間も）は `503 {"ready": false, "reason": "starting" | "draining"}`。ルールの失敗は readiness に含めない（ルールの状態は `conditions`）。生きているかは今までどおり `/healthz`。
 
 ### L4 の制限と帯域（#165・#166）の動き
 
@@ -771,12 +771,31 @@ rules:
 - ログは `target.down`（`reason: "outlier"`、`rule`、`service`、`server`、`cause`：越えたしきい値 `consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`、`ejection_secs`、`ejections`）/ `target.up`（`reason: "outlier"`）。
 - `http` を変えると数え直し（`Router` を組み立て直すため）。
 
+## v0.4.x で足した設定
+
+v0.4.0 の後にパッチで足した設定（docs/DESIGN-v0.4.x.md。足すだけの形はパッチで出す：docs/RELEASING.md の「v0.4.0 の後」）。どれも省略でき、省略したときの動きは v0.4.0 と同じ。使えるかは `GET /capabilities` の `features` で分かる。
+
+### SIGTERM での終わり方（v0.4.1、`features.graceful_shutdown`）
+
+| 引数 / 環境変数 | 既定 | 意味 |
+|---|---|---|
+| `--shutdown-delay` / `RPROXY_SHUTDOWN_DELAY` | `0s` | SIGTERM の後、`/readyz` を 503 `draining` にしたまま、これだけ今までどおり受け付ける |
+| `--shutdown-drain` / `RPROXY_SHUTDOWN_DRAIN` | `0s` | その後、待ち受けを閉じて、今の接続・セッションの終わりをこれだけ待つ。過ぎたら切る |
+
+- 既定（両方 `0s`）は今までと同じで、SIGTERM ですぐ止める。値は `30s`・`2m`・秒の数で、それぞれ 1 時間まで（超えると起動を止める設定のエラー）。
+- `delay` の間：転送は今のまま（新しい接続も受ける）。
+- `drain` の間：TCP の待ち受けを閉じ（新しい接続は断られる）、今の接続は続く。`http` のルールは処理中のリクエストの応答に `Connection: close` を付けてから閉じ（HTTP/2 は GOAWAY）、アイドルの接続はすぐ閉じる。HTTP/3 は新しい QUIC の接続を受けない。UDP は新しいセッションを作らず（そのデータグラムは `stats.dropped`）、今のセッションは続く。
+- `delay`・`drain` の間、制御 API の読むだけの要求（`GET`・`HEAD`。`/healthz`・`/readyz`・`/metrics` も）は答え、変更（`POST`・`PUT`・`PATCH`・`DELETE`、dry run も）は `503 shutting_down`。設定ファイルの変化は反映しない。再起動なしの更新（SIGUSR2・自動更新）も始めない。
+- 2 回目の SIGTERM・SIGINT で残りを待たずに止める。
+- 引き継ぎ（SIGUSR2）の後の古いプロセスの終わり方は今までどおり（`RPROXY_HANDOFF_DRAIN`）。
+- ログ：`shutdown.start`（`delay_secs`・`drain_secs`）、`shutdown.drain`（`connections`）、`shutdown.now`（2 回目のシグナル）、`shutdown.done`（`cut`）。systemd での推奨値は README の「SIGTERM での終わり方」。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"]},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
+| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"],"graceful_shutdown":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
@@ -830,6 +849,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `stale_generation` | 409 | v0.4：組の `generation` が今より古い |
 | `locked_out` | 429 | v0.4：認証の失敗が続いたので、この送信元を一時的に止めている（`Retry-After`） |
 | `upgrading` | 503 / 409 | v0.4（#174）：再起動なしの更新の途中なので変更を受け付けない（503。少し待って送り直す）／すでに更新が動いている（`POST /admin/upgrade` の 409） |
+| `shutting_down` | 503 | v0.4.1：SIGTERM の後の終わり方（`RPROXY_SHUTDOWN_DELAY` / `_DRAIN`）の途中なので変更を受け付けない（ほかの rproxy に送る） |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係
