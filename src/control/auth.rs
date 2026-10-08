@@ -1,6 +1,6 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use crate::control::hardening::{ClientAuth, Lockout, LockoutConfig};
 
@@ -282,6 +282,29 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 	Ok(tokens)
 }
 
+/// What the token file looks like on disk (#253): size, modification and
+/// change time, inode and permissions of the file the path leads to. The path
+/// is followed through symbolic links, so swapping the link (a Kubernetes
+/// Secret volume's `..data`) is a new version too, and so is `chmod` (an
+/// unreadable file that becomes readable).
+fn file_version(path: &std::path::Path) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	match std::fs::metadata(path) {
+		Ok(m) => {
+			m.len().hash(&mut h);
+			m.modified().ok().hash(&mut h);
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::MetadataExt;
+				(m.dev(), m.ino(), m.ctime(), m.ctime_nsec(), m.mode(), m.uid(), m.gid()).hash(&mut h);
+			}
+		}
+		Err(e) => e.kind().hash(&mut h),
+	}
+	h.finish()
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 	a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -296,6 +319,9 @@ pub struct Tokens {
 	client_auth: ClientAuth,
 	/// Sources failing authentication over TCP (#167).
 	lockout: Lockout,
+	/// The version of the file last read, successfully or not (#253):
+	/// `refresh` reads it again only when it changes.
+	seen: Mutex<Option<u64>>,
 }
 
 impl Tokens {
@@ -306,16 +332,22 @@ impl Tokens {
 
 	fn with(path: Option<PathBuf>, tokens: Vec<Token>) -> Self {
 		// until with_client_auth says otherwise, client_cert entries are not refused
-		Tokens { path, tokens: RwLock::new(tokens), client_auth: ClientAuth::Optional, lockout: Lockout::default() }
+		let seen = Mutex::new(path.as_deref().map(file_version));
+		Tokens { path, tokens: RwLock::new(tokens), client_auth: ClientAuth::Optional, lockout: Lockout::default(), seen }
 	}
 
 	pub fn from_file(path: PathBuf) -> io::Result<Self> {
+		// the version is taken before reading: a change while reading is seen next time
+		let version = file_version(&path);
 		let tokens = read_tokens(&path)?;
-		Ok(Self::with(Some(path), tokens))
+		let this = Self::with(Some(path), tokens);
+		*this.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
+		Ok(this)
 	}
 
 	/// Authentication is on but no token is known yet (the file could not be
-	/// read): every request is refused until a reload succeeds.
+	/// read): every request is refused until a reload succeeds (SIGHUP, or
+	/// `refresh` once the file or its permissions change).
 	pub fn locked(path: PathBuf) -> Self {
 		Self::with(Some(path), vec![])
 	}
@@ -382,11 +414,28 @@ impl Tokens {
 	/// Re-reads the token file; on error the current tokens stay in effect.
 	pub fn reload(&self) -> io::Result<usize> {
 		let Some(path) = &self.path else { return Ok(0) };
+		let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+		// remembered even when the version is refused, so `refresh` warns once per version
+		*seen = Some(file_version(path));
 		let tokens = read_tokens(path)?;
 		self.check_client_auth(&tokens)?;
 		let count = tokens.len();
-		*self.tokens.write().unwrap() = tokens;
+		// requests already authenticated keep their Principal; the lockout is separate
+		*self.tokens.write().unwrap_or_else(|e| e.into_inner()) = tokens;
 		Ok(count)
+	}
+
+	/// Re-reads the token file if it changed since it was last read (#253,
+	/// `RPROXY_TOKENS_CHECK_SECS`): `None` when it did not. A version that
+	/// cannot be read or has a mistake is tried once (the current tokens stay)
+	/// and again only when the file changes once more.
+	pub fn refresh(&self) -> Option<io::Result<usize>> {
+		let path = self.path.as_deref()?;
+		let unchanged = *self.seen.lock().unwrap_or_else(|e| e.into_inner()) == Some(file_version(path));
+		if unchanged {
+			return None;
+		}
+		Some(self.reload())
 	}
 
 	/// Checks an `Authorization` header value; `None` if it is missing, unknown or expired.
@@ -595,6 +644,54 @@ mod tests {
 		assert!(tokens.authenticate(Some("Bearer secret")).is_some(), "the current tokens stay");
 		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 		std::fs::remove_dir_all(plain.parent().unwrap()).unwrap();
+	}
+
+	/// #253: a change of the file (or of the symbolic link it is reached
+	/// through, as in a Kubernetes Secret volume) is read without SIGHUP; a
+	/// broken version keeps the current tokens and is tried once.
+	#[cfg(unix)]
+	#[test]
+	fn refresh_reads_changed_files() {
+		let file = tempfile("refresh", "first\n");
+		let config = LockoutConfig { failures: 1, window: std::time::Duration::from_secs(60), duration: std::time::Duration::from_secs(60) };
+		let tokens = Tokens::from_file(file.clone()).unwrap().with_lockout(config);
+		let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+		tokens.lockout().failed(ip);
+		assert!(tokens.refresh().is_none(), "unchanged");
+		std::fs::write(&file, "first\nsecond\n").unwrap();
+		assert_eq!(tokens.refresh().unwrap().unwrap(), 2);
+		assert!(tokens.lockout().locked(ip).is_some(), "a reload leaves the lockout alone");
+		assert!(tokens.authenticate(Some("Bearer second")).is_some());
+		assert!(tokens.refresh().is_none());
+		// a broken version: the current tokens stay, and it is reported once
+		std::fs::write(&file, "tokens: [\n").unwrap();
+		assert!(tokens.refresh().unwrap().is_err());
+		assert!(tokens.refresh().is_none(), "the same broken version is not tried again");
+		assert!(tokens.authenticate(Some("Bearer first")).is_some());
+		std::fs::write(&file, "second\n").unwrap();
+		assert_eq!(tokens.refresh().unwrap().unwrap(), 1);
+		assert!(tokens.authenticate(Some("Bearer first")).is_none(), "a removed token stops working");
+		// SIGHUP and the check do not read the same version twice
+		std::fs::write(&file, "third\n").unwrap();
+		assert_eq!(tokens.reload().unwrap(), 1);
+		assert!(tokens.refresh().is_none());
+
+		// a Secret volume: tokens -> ..data/tokens, ..data -> ..v1, swapped by rename
+		let dir = file.parent().unwrap().join("secret");
+		std::fs::create_dir_all(dir.join("..v1")).unwrap();
+		std::fs::create_dir_all(dir.join("..v2")).unwrap();
+		std::fs::write(dir.join("..v1/tokens"), "old\n").unwrap();
+		std::fs::write(dir.join("..v2/tokens"), "new\n").unwrap();
+		std::os::unix::fs::symlink("..v1", dir.join("..data")).unwrap();
+		std::os::unix::fs::symlink("..data/tokens", dir.join("tokens")).unwrap();
+		let tokens = Tokens::from_file(dir.join("tokens")).unwrap();
+		assert!(tokens.authenticate(Some("Bearer old")).is_some());
+		std::os::unix::fs::symlink("..v2", dir.join("..data_tmp")).unwrap();
+		std::fs::rename(dir.join("..data_tmp"), dir.join("..data")).unwrap();
+		assert_eq!(tokens.refresh().unwrap().unwrap(), 1);
+		assert!(tokens.authenticate(Some("Bearer new")).is_some());
+		assert!(tokens.authenticate(Some("Bearer old")).is_none());
+		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 	}
 
 	#[test]

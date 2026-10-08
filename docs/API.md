@@ -34,6 +34,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
     - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
   - SIGHUP を受けるとトークンファイルを読み直す。
+  - SIGHUP がなくても、`--tokens-check-secs` / `RPROXY_TOKENS_CHECK_SECS`（既定 10 秒、`0` なら SIGHUP のときだけ）ごとにファイルの大きさ・更新時刻・inode・権限を確かめ、変わっていれば読み直す（v0.4.2、#253、`features.tokens_reload`）。パスはシンボリックリンクをたどって確かめるので、Kubernetes の Secret のボリューム（`..data` のリンクの差し替え）の更新も見つける。消したトークンは次の確認から通らない。処理中のリクエストと一時停止（lockout）の状態はそのまま。
+  - 読めない・誤りのある版では今のトークンを使い続け、その版について `reload.tokens` の警告を 1 回だけ出す（ファイルがまた変われば読み直す）。読み直したときの `reload.tokens` はトークンの数（`tokens`）だけで、トークンやハッシュは出さない。起動時に読めなかった（権限）ファイルも、読めるようになれば次の確認で使い始める。
 - `--api-addr` に loopback 以外のアドレスを含める場合は、`--token-file`、`--tls-cert`、`--tls-key` の指定が必須。どれかが欠けていると起動を拒否する。
 
 ### 制御 API の守り（v0.4、#167）
@@ -84,7 +86,7 @@ tokens:
 
 **トークン・証明書の入れ替え**（止めずに入れ替える）：
 
-1. 新しいトークン（`sha256`）をトークンファイルに足して SIGHUP（`systemctl reload rproxy-api`）。この間は新旧どちらでも通る。
+1. 新しいトークン（`sha256`）をトークンファイルに足して SIGHUP（`systemctl reload rproxy-api`）。v0.4.2 からは SIGHUP を送らなくても `RPROXY_TOKENS_CHECK_SECS` のうちに読み直す。この間は新旧どちらでも通る。
 2. クライアント（UI・CI など）を新しいトークンに切り替える。
 3. 古いトークンをトークンファイルから消して SIGHUP。
 

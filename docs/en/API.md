@@ -34,6 +34,8 @@ The contract between the UI (TCP-UDP-rproxy-ui) and rproxy-api. When changing ei
     - Refused requests are recorded in `event: "audit"` too (with `client`, `method` and `path`; the token itself is never logged): a missing, unknown or expired token (401) as `outcome: "unauthorized"` with `reason` (`missing` / `invalid` / `expired`, or `client_cert` when the client certificate bound to the token is missing), a lockout (429) as `outcome: "locked_out"`, a missing scope (403) as `outcome: "forbidden"` with `token` and `scope`. So that the log does not overflow, refused requests are logged up to 20 lines in a row per sender, then one line a second. `suppressed` in a line is the number of lines left out for that sender before it (the total is `rproxy_log_suppressed_total` in `/metrics`).
   - Multiple tokens can be valid at the same time. To rotate, list both the old and new ones, then remove the old one later.
   - On SIGHUP the token file is reloaded.
+  - Without SIGHUP too: every `--tokens-check-secs` / `RPROXY_TOKENS_CHECK_SECS` (default 10 seconds; `0` means only on SIGHUP), the file's size, modification time, inode and permissions are checked, and it is reloaded if they changed (v0.4.2, #253, `features.tokens_reload`). The path is followed through symbolic links, so an update of a Kubernetes Secret volume (the `..data` link swapped) is found too. A removed token stops working from the next check. Requests in progress and the lockout state are not affected.
+  - A version that cannot be read or has a mistake keeps the current tokens, with one `reload.tokens` warning for that version (it is read again when the file changes once more). A successful `reload.tokens` carries only the number of tokens (`tokens`), never tokens or hashes. A file that could not be read at startup (permissions) is used from the next check once it becomes readable.
 - If `--api-addr` includes a non-loopback address, `--token-file`, `--tls-cert` and `--tls-key` are all required. If any is missing, startup is refused.
 
 ### Control API hardening (v0.4, #167)
@@ -84,7 +86,7 @@ tokens:
 
 **Rotating tokens and certificates** (without a gap):
 
-1. Add the new token (`sha256`) to the token file and SIGHUP (`systemctl reload rproxy-api`). Both old and new work meanwhile.
+1. Add the new token (`sha256`) to the token file and SIGHUP (`systemctl reload rproxy-api`). From v0.4.2 it is also read within `RPROXY_TOKENS_CHECK_SECS` without SIGHUP. Both old and new work meanwhile.
 2. Switch the clients (UI, CI, ...) to the new token.
 3. Remove the old token from the file and SIGHUP.
 
