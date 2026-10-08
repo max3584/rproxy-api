@@ -156,8 +156,9 @@ pub fn prepare() -> io::Result<()> {
 	Ok(())
 }
 
-/// Certificates a killed rproxy set aside in `remove` but did not delete yet
-/// (never read: not a valid name).
+/// Certificates set aside in `remove` but not deleted yet: by a killed rproxy
+/// (at the start) or a removal that failed (at the next write). Never read: not
+/// a valid name. Only the control API's writes call it, never the data path.
 fn clean_leftovers(dir: &Path) {
 	for e in fs::read_dir(dir).into_iter().flatten().flatten() {
 		if e.file_name().to_string_lossy().starts_with(REMOVING) {
@@ -336,6 +337,8 @@ pub fn put(name: &str, req: &PutRequest, by: &str, if_match_header: Option<&str>
 		Ok(())
 	};
 	write().map_err(store_error)?;
+	// a removal that failed earlier in this run is finished here, not only at the next start
+	clean_leftovers(&dir());
 	let meta = Meta { updated_by: by.to_string(), updated_at: now };
 	Ok(Stored { view: view_of(name, &chain, &meta), created: current.is_none(), warnings })
 }
@@ -360,7 +363,8 @@ pub fn remove(name: &str, if_match_header: Option<&str>) -> Result<CertView, Api
 	let aside = dir().join(format!("{REMOVING}{name}-{}", std::process::id()));
 	fs::rename(dir().join(name), &aside).map_err(store_error)?;
 	let _ = sync_dir(&dir());
-	let _ = fs::remove_dir_all(&aside);
+	// this one and any earlier removal that failed in this run
+	clean_leftovers(&dir());
 	Ok(current)
 }
 

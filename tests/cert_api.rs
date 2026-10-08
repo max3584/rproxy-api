@@ -256,3 +256,21 @@ async fn scopes_and_allow_certs() {
 	assert_eq!(r.status(), StatusCode::CREATED);
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// A removal left half done (a kill or a failed delete) is finished at the next write,
+/// not only at the next start.
+#[tokio::test]
+async fn leftovers_of_a_removal_are_cleaned_at_the_next_write() {
+	let store = store();
+	let h = harness().await;
+	let pki = Pki::new("certs-clean");
+	let leftover = store.join(".removing-gone-1");
+	fs::create_dir_all(leftover.join("0123456789abcdef")).unwrap();
+	fs::write(leftover.join("0123456789abcdef").join("tls.key"), "half").unwrap();
+	let (status, _, _) = put(&h, "site-clean", &body(&pki.server("clean.pem", &["clean.test"]))).await;
+	assert_eq!(status, StatusCode::CREATED);
+	assert!(!leftover.exists(), "the leftover is still there");
+	assert_eq!(h.http.delete(format!("{}/certs/site-clean", h.base)).send().await.unwrap().status(), StatusCode::NO_CONTENT);
+	let rest: Vec<_> = fs::read_dir(&store).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with(".removing-")).collect();
+	assert!(rest.is_empty(), "{rest:?}");
+}
