@@ -186,6 +186,8 @@ pub struct Features {
 	pub graceful_shutdown: bool,
 	/// Stored certificates: `PUT /certs/{name}`, `{"cert": name}` in rules (v0.4.2, #240)
 	pub cert_store: bool,
+	/// Rule sets of `persist: true` tokens kept in `rproxy_rule_sets` (v0.4.2, #241)
+	pub ruleset_persistence: bool,
 }
 
 /// Every name of `Features::http_options`.
@@ -226,6 +228,7 @@ impl Features {
 		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
 		graceful_shutdown: true,
 		cert_store: true,
+		ruleset_persistence: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -263,6 +266,7 @@ impl Features {
 		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"],
 		graceful_shutdown: true,
 		cert_store: true,
+		ruleset_persistence: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

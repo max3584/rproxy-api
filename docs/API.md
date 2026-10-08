@@ -681,7 +681,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - 組のルールは `GET /rules` にも出て `ruleset: "<名前>"` が付く（`origin` は `dynamic`）。個別の `PATCH` / `DELETE /rules/...` は `409 owned`（変えるなら組を PUT する）。`POST /rules` で同じキーは `409 already_exists`。
 - `GET /rulesets/{name}`：`{"name","generation","etag","updated_at","updated_by","owner","rules":[<GET /rules と同じ表示>...]}`（キーの順、`ETag` ヘッダつき）。`updated_by` は最後に PUT したトークンの名前（トークンファイルがなければ空）。`GET /rulesets` は名前の順の一覧（`rules` は数）。
 - `DELETE /rulesets/{name}?drain_secs=N`：組のルールを同時に止めて組を消す（`drain_secs` の間、各ルールの接続の終わりを待つ）。`If-Match` も使える。全部の接続が終わってから `204`。
-- 組は rproxy のメモリにだけあり、DB にも設定ファイルにも書かない。rproxy を再起動したら、コントローラは `GET /readyz` が 200 になってから組を PUT し直す。組の変更は 1 つずつ順に行う（読むのは待たない）。
+- 組は rproxy のメモリにだけあり、DB にも設定ファイルにも書かない（v0.4.2 から、`persist: true` のトークンの組だけは `rproxy_rule_sets` に保存できる：下の「ルールの組の保存」）。rproxy を再起動したら、コントローラは `GET /readyz` が 200 になってから組を PUT し直す。組の変更は 1 つずつ順に行う（読むのは待たない）。
 - ログ：`event = "ruleset.apply"`（`ruleset`・`generation`・`etag`・`created`・`updated`・`deleted`・`unchanged`・`failed`・`by`）、`ruleset.delete`（`ruleset`・`rules`）。個々のルールの `rule.create` / `rule.update` / `rule.delete` にも `ruleset` が付く。`audit` は `action: ruleset.put` / `ruleset.delete` と `ruleset`。
 
 **ラベル**：ルールの `labels`。動きには使わず、`rule.create` / `rule.update` のログ（`labels: "k=v,k2=v2"`）と `/metrics` の `rproxy_rule_labels{rule="tcp/0.0.0.0:443",label_tenant="act"} 1` に出す（キーの英数字以外は `_`。同じ名前になるキーは名前の順で先のものだけ）。`PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。
@@ -812,12 +812,39 @@ v0.4.0 の後にパッチで足した設定（docs/DESIGN-v0.4.x.md。足すだ�
 - 監査：`event=audit`、`action: cert.put` / `cert.delete`、`cert`（名前）・`fingerprint_sha256` だけ。
 - 引き継ぎ（#174）ではファイルなので何も渡さない。複数の rproxy にはノードごとに `PUT` する。rproxy-gateway は使わない（Secret のボリューム）。
 
+### ルールの組の保存（v0.4.2、#241、`features.ruleset_persistence`）
+
+- `persist: true` のトークン（上の「API で作ったルールの保存」と同じ印。`PUT` の本文には足さない）で `PUT /rulesets/{name}` した組を、テーブル `rproxy_rule_sets` に 1 行（組のルールを JSON で）保存する。一度保存した組は、どのトークンで変えても・消しても行を書き直す・消す。`persist` のないトークン（Kubernetes のコントローラなど）の組は今までどおりメモリだけ。
+- 書くのは `PUT` の応答の前（`dry_run` は書かない）。行の `generation` がこの `PUT` より新しければ書き換えない。`DELETE` で行を消す。書けなければ（DB に届かない、テーブルがない、`max_allowed_packet` を超える）組は動かしたまま `persisted: false`、ログに `event = "degraded"`（`part: "db"`）。保存したら `ruleset.persist`（`action: save` / `delete`）。
+- 表示：保存した組の `PUT` の応答・`GET /rulesets`・`GET /rulesets/{name}` に `persisted`（行が最新か）。保存しない組には付かない。
+- 起動時：設定ファイル → UI の `forward_rules` → `rproxy_rules` の後に、自分の `node` の行を戻す（持ち主・`generation` も。`etag` は同じルールなら同じ値になる）。前に戻したルールとキー・待ち受けが重なるルールや、ファイルを読めないルールはその組から外して（`restore.conflict` / `restore.skip`）、残りを当てる（`ruleset.restore`）。`/readyz` は戻し終わってから ready。テーブルがなければ（migration 012 の前）何もしない。
+- ノードの間では分けあわない（自分の `node` の行だけ）。複数の rproxy には呼ぶ側がそれぞれに `PUT` する。rproxy-gateway は使わない（正は Kubernetes にあり、再起動の後はコントローラが PUT し直す）。
+- 大きさ：`PUT` の本文は 32 MiB までだが、MariaDB の `max_allowed_packet`（既定 16 MiB）を超える組は書けない（`persisted: false`）。
+- テーブル（UI リポジトリの `db/migrations/012_rproxy_rule_sets.sql`）：
+
+```sql
+CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
+  node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (as in rproxy_rules)
+  name         VARCHAR(253) NOT NULL,   -- the rule set's name
+  generation   BIGINT UNSIGNED NOT NULL,
+  etag         VARCHAR(64)  NOT NULL,
+  owner        VARCHAR(255) NOT NULL,   -- the owning token's name
+  rules        JSON         NOT NULL,   -- the set's rules, each in the shape of the body of POST /rules
+  spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+  updated_by   VARCHAR(255) NOT NULL,
+  updated_at   DATETIME(3)  NOT NULL,
+  PRIMARY KEY (node, name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_sets TO 'rproxy'@'%';
+GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
+```
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"],"graceful_shutdown":true,"cert_store":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
+| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"],"graceful_shutdown":true,"cert_store":true,"ruleset_persistence":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
@@ -890,6 +917,7 @@ rproxy のルールには 4 つの出どころがある。どれも `GET /rules`
 | API を直接呼ぶ（CI・スクリプト） | `dynamic` | rproxy のメモリだけ | API から。DB には書かれないので、rproxy を再起動すると消える |
 | `persist: true` のトークンで API を呼ぶ（v0.4、#144） | `api` | rproxy のテーブル `rproxy_rules` | API から。rproxy が作成・変更・削除のたびに `rproxy_rules` に書き、起動時に復元する（上の「API で作ったルールの保存」） |
 | ルールの組（Kubernetes のコントローラ、v0.4） | `dynamic`（`ruleset` つき） | コントローラ（rproxy はメモリだけ） | `PUT /rulesets/{name}`。個別の `PATCH` / `DELETE` は `409 owned`。再起動したらコントローラが PUT し直す |
+| `persist: true` のトークンのルールの組（v0.4.2、#241） | `dynamic`（`ruleset` つき） | rproxy の `rproxy_rule_sets`（組ごとに 1 行） | `PUT` / `DELETE /rulesets/{name}`。起動時に `rproxy_rules` の後に戻す |
 
 - 長く残すルールは、設定ファイルか UI（DB）、または `persist: true` のトークン（v0.4）で作る。保存しないトークンで API を直接呼んで作ったルールは一時的なもの（CI のプレビュー環境など）として扱う。
 - UI は DB にないルールを編集しない。API で作ったルールは UI の一覧に出ず、DB にあるが rproxy にないルールは UI で「未登録」（missing）になる。

@@ -258,6 +258,14 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_failed_rule_starts_once_its_certificate_is_stored` | 設定ファイルのルールが保存していない名前を使うと `failed`、その名前を `PUT` すると動き出す |
 | `scopes_and_allow_certs` | `certs:read` / `certs:write` のスコープ、`allow_certs` の外の名前は `PUT`・ルールでの使用とも 403、`GET /certs` は `allow_certs` の内だけ |
 
+## 結合テスト：ルールの組の保存（`tests/ruleset_persist.rs`、#241、v0.4.2）
+
+| テスト | 確かめること |
+|---|---|
+| `persist_tokens_store_their_sets` | `persist: true` のトークンの組は 1 行（`generation`・`etag`・持ち主・ルール）で保存され、応答・`GET /rulesets`・`GET /rulesets/{name}` に `persisted`。dry run と `persist` のないトークンの組は書かない。保存した組は `admin` が変えても行が変わる（持ち主はそのまま）。書けなければ `persisted: false`。`DELETE` で行が消える。`features.ruleset_persistence` |
+| `stored_sets_are_restored` | 保存した組が `generation`・`etag`・持ち主ごと戻る。先に戻したルールとキーが重なるルールだけ外して、残りを当てる。持ち主が戻るので、ほかのトークンは変えられない |
+| `sets_survive_a_restart_with_mariadb` | 本物のバイナリと MariaDB（`RPROXY_TEST_DATABASE_URL`）：テーブルがなくても起動し `persisted: false`。保存 → 再起動で戻る。ほかのノードの行は戻さない。新しい `generation` の行を古い `PUT` で書き換えない。`DELETE` で行が消える |
+
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 
 本物のバイナリを起動して、`global.performance` の効き目を外から確かめる。

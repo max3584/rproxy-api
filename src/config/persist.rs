@@ -26,6 +26,26 @@ pub const TABLE: &str = "rproxy_rules";
 /// How `spec` is written; bumped when its reading changes.
 pub const SPEC_VERSION: u32 = 1;
 
+/// Rule sets of `persist: true` tokens (#241, v0.4.2): one row per set (the
+/// UI repository's migration 012; the DDL is in docs/API.md).
+pub const SETS_TABLE: &str = "rproxy_rule_sets";
+
+/// One row of `rproxy_rule_sets`.
+#[derive(Clone, Debug)]
+pub struct StoredSet {
+	pub name: String,
+	pub generation: u64,
+	pub etag: String,
+	/// The token that owns the set (security review M3).
+	pub owner: String,
+	/// The set's rules as in the body of `PUT /rulesets/{name}`.
+	pub rules: Vec<RuleRequest>,
+	pub spec_version: u32,
+	pub updated_by: String,
+	/// Unix seconds.
+	pub updated_at: u64,
+}
+
 /// Longest a write may hold up the answer.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,13 +84,19 @@ enum Backend {
 	None,
 	Db(MySqlPool),
 	/// For tests: rows kept in memory; `fail` makes writes fail.
-	Memory { rows: std::sync::Mutex<HashMap<Key, StoredRule>>, fail: std::sync::atomic::AtomicBool },
+	Memory {
+		rows: std::sync::Mutex<HashMap<Key, StoredRule>>,
+		sets: std::sync::Mutex<HashMap<String, StoredSet>>,
+		fail: std::sync::atomic::AtomicBool,
+	},
 }
 
 pub struct Store {
 	node: String,
 	backend: Backend,
 	meta: std::sync::Mutex<HashMap<Key, Meta>>,
+	/// Rule sets with a row (or that should have one): whether it is up to date (#241).
+	sets: std::sync::Mutex<HashMap<String, bool>>,
 	/// One write at a time, so rows follow the order of the changes.
 	writes: tokio::sync::Mutex<()>,
 }
@@ -109,7 +135,7 @@ impl Store {
 			),
 			None => Backend::None,
 		};
-		Ok(Store { node, backend, meta: Default::default(), writes: Default::default() })
+		Ok(Store { node, backend, meta: Default::default(), sets: Default::default(), writes: Default::default() })
 	}
 
 	/// A store that keeps its rows in memory (tests).
@@ -117,8 +143,9 @@ impl Store {
 	pub fn memory(node: &str) -> Store {
 		Store {
 			node: node.into(),
-			backend: Backend::Memory { rows: Default::default(), fail: Default::default() },
+			backend: Backend::Memory { rows: Default::default(), sets: Default::default(), fail: Default::default() },
 			meta: Default::default(),
+			sets: Default::default(),
 			writes: Default::default(),
 		}
 	}
@@ -137,6 +164,23 @@ impl Store {
 		match &self.backend {
 			Backend::Memory { rows, .. } => rows.lock().unwrap().values().cloned().collect(),
 			_ => vec![],
+		}
+	}
+
+	/// The set rows of a memory store (tests).
+	#[doc(hidden)]
+	pub fn memory_sets(&self) -> Vec<StoredSet> {
+		match &self.backend {
+			Backend::Memory { sets, .. } => sets.lock().unwrap().values().cloned().collect(),
+			_ => vec![],
+		}
+	}
+
+	/// Puts a set row into a memory store as if another process wrote it (tests).
+	#[doc(hidden)]
+	pub fn memory_put_set(&self, set: StoredSet) {
+		if let Backend::Memory { sets, .. } = &self.backend {
+			sets.lock().unwrap().insert(set.name.clone(), set);
 		}
 	}
 
@@ -240,7 +284,7 @@ impl Store {
 		let shape = crate::config::plan::shape(&spec);
 		let result = match &self.backend {
 			Backend::None => Err("no database (RPROXY_DATABASE_URL) is configured".to_string()),
-			Backend::Memory { rows, fail } => {
+			Backend::Memory { rows, fail, .. } => {
 				if fail.load(std::sync::atomic::Ordering::Relaxed) {
 					Err("writes fail (test)".into())
 				} else {
@@ -303,7 +347,7 @@ impl Store {
 		self.meta.lock().unwrap().remove(key);
 		let result = match &self.backend {
 			Backend::None => return false,
-			Backend::Memory { rows, fail } => {
+			Backend::Memory { rows, fail, .. } => {
 				if fail.load(std::sync::atomic::Ordering::Relaxed) {
 					Err("writes fail (test)".to_string())
 				} else {
@@ -333,6 +377,201 @@ impl Store {
 			Err(e) => {
 				warn!(event = "degraded", part = "db", rule = %key, error = %e,
 					"the row of the deleted rule stays in rproxy_rules (the rule comes back on restart)");
+				false
+			}
+		}
+	}
+}
+
+/// Whether a database error says the table is missing (before migration 012).
+fn missing_table(e: &sqlx::Error) -> bool {
+	e.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42S02") || d.message().contains("doesn't exist"))
+}
+
+/// What a `PUT /rulesets/{name}` left, to be written as one row.
+pub struct SetRow<'a> {
+	pub name: &'a str,
+	pub generation: u64,
+	pub etag: &'a str,
+	pub owner: &'a str,
+	/// The set's rules, each as `config::plan::shape`.
+	pub rules: serde_json::Value,
+	pub by: &'a str,
+}
+
+/// Rule sets (#241, v0.4.2): a set changed by a `persist: true` token gets a
+/// row in `rproxy_rule_sets`; from then on every change to it is written,
+/// whichever token makes it, and its deletion deletes the row.
+impl Store {
+	/// Whether the set has a row (or should have one).
+	pub fn knows_set(&self, name: &str) -> bool {
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).contains_key(name)
+	}
+
+	/// `persisted` in the views of a set: None for sets that are not stored.
+	pub fn set_persisted(&self, name: &str) -> Option<bool> {
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).copied()
+	}
+
+	/// Remembers sets that have rows (startup, a live upgrade).
+	pub fn sets_restored(&self, names: impl IntoIterator<Item = String>) {
+		let mut sets = self.sets.lock().unwrap_or_else(|e| e.into_inner());
+		for n in names {
+			sets.insert(n, true);
+		}
+	}
+
+	/// This node's set rows (startup). Without the table (before migration 012)
+	/// there are none; rows written by a newer rproxy or that do not read are
+	/// skipped with `restore.skip`.
+	pub async fn load_sets(&self) -> Result<Vec<StoredSet>, String> {
+		let rows = match &self.backend {
+			Backend::None => return Ok(vec![]),
+			Backend::Memory { sets, .. } => return Ok(sets.lock().unwrap().values().cloned().collect()),
+			Backend::Db(pool) => {
+				let query = sqlx::query(
+					"SELECT name, CAST(generation AS SIGNED) AS generation, etag, owner, CAST(rules AS CHAR) AS rules, \
+					 CAST(spec_version AS SIGNED) AS spec_version, updated_by, \
+					 CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) AS updated_at \
+					 FROM rproxy_rule_sets WHERE node = ? ORDER BY name",
+				)
+				.bind(&self.node);
+				match query.fetch_all(pool).await {
+					Ok(rows) => rows,
+					Err(e) if missing_table(&e) => return Ok(vec![]),
+					Err(e) => return Err(e.to_string()),
+				}
+			}
+		};
+		let mut out = vec![];
+		for row in rows {
+			let get_str = |c: &str| row.try_get::<String, _>(c).map_err(|e| format!("{c}: {e}"));
+			let get_int = |c: &str| row.try_get::<i64, _>(c).map_err(|e| format!("{c}: {e}"));
+			let read = || -> Result<StoredSet, String> {
+				let spec_version = u32::try_from(get_int("spec_version")?).unwrap_or(u32::MAX);
+				if spec_version > SPEC_VERSION {
+					return Err(format!("spec_version {spec_version} is newer than this build reads ({SPEC_VERSION})"));
+				}
+				Ok(StoredSet {
+					name: get_str("name")?,
+					generation: get_int("generation")?.max(0) as u64,
+					etag: get_str("etag")?,
+					owner: get_str("owner")?,
+					rules: serde_json::from_str(&get_str("rules")?).map_err(|e| format!("rules: {e}"))?,
+					spec_version,
+					updated_by: get_str("updated_by")?,
+					updated_at: get_int("updated_at")?.max(0) as u64,
+				})
+			};
+			match read() {
+				Ok(set) => out.push(set),
+				Err(e) => warn!(event = "restore.skip", table = SETS_TABLE, name = %get_str("name").unwrap_or_default(), error = %e),
+			}
+		}
+		Ok(out)
+	}
+
+	/// Writes a set's row after a `PUT` (a row with a newer `generation` is
+	/// kept). Returns whether the row is up to date.
+	pub async fn save_set(&self, row: SetRow<'_>) -> bool {
+		let _write = self.writes.lock().await;
+		let now = unix_millis();
+		let result = match &self.backend {
+			Backend::None => Err("no database (RPROXY_DATABASE_URL) is configured".to_string()),
+			Backend::Memory { sets, fail, .. } => {
+				if fail.load(std::sync::atomic::Ordering::Relaxed) {
+					Err("writes fail (test)".into())
+				} else {
+					serde_json::from_value::<Vec<RuleRequest>>(row.rules.clone()).map_err(|e| e.to_string()).map(|rules| {
+						let mut sets = sets.lock().unwrap();
+						if sets.get(row.name).is_none_or(|s| s.generation <= row.generation) {
+							sets.insert(
+								row.name.to_string(),
+								StoredSet {
+									name: row.name.to_string(),
+									generation: row.generation,
+									etag: row.etag.to_string(),
+									owner: row.owner.to_string(),
+									rules,
+									spec_version: SPEC_VERSION,
+									updated_by: row.by.to_string(),
+									updated_at: now / 1000,
+								},
+							);
+						}
+					})
+				}
+			}
+			Backend::Db(pool) => {
+				// generation last: the IFs before it compare with the stored one
+				let query = sqlx::query(
+					"INSERT INTO rproxy_rule_sets (node, name, generation, etag, owner, rules, spec_version, updated_by, updated_at) \
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(? / 1000)) \
+					 ON DUPLICATE KEY UPDATE \
+					 etag = IF(VALUES(generation) >= generation, VALUES(etag), etag), \
+					 owner = IF(VALUES(generation) >= generation, VALUES(owner), owner), \
+					 rules = IF(VALUES(generation) >= generation, VALUES(rules), rules), \
+					 spec_version = IF(VALUES(generation) >= generation, VALUES(spec_version), spec_version), \
+					 updated_by = IF(VALUES(generation) >= generation, VALUES(updated_by), updated_by), \
+					 updated_at = IF(VALUES(generation) >= generation, VALUES(updated_at), updated_at), \
+					 generation = GREATEST(generation, VALUES(generation))",
+				)
+				.bind(&self.node)
+				.bind(row.name)
+				.bind(row.generation)
+				.bind(row.etag)
+				.bind(row.owner)
+				.bind(row.rules.to_string())
+				.bind(SPEC_VERSION)
+				.bind(row.by)
+				.bind(now);
+				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
+					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
+					Err(_) => Err("timed out".into()),
+				}
+			}
+		};
+		let persisted = result.is_ok();
+		match result {
+			Ok(()) => info!(event = "ruleset.persist", ruleset = row.name, generation = row.generation, action = "save", token = row.by),
+			Err(_) if !self.enabled() => {}
+			Err(e) => warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = row.name, error = %e,
+				"the rule set runs but is not stored in rproxy_rule_sets (it is lost on restart)"),
+		}
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).insert(row.name.to_string(), persisted);
+		persisted
+	}
+
+	/// Deletes the row of a deleted set.
+	pub async fn remove_set(&self, name: &str, by: &str) -> bool {
+		let _write = self.writes.lock().await;
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+		let result = match &self.backend {
+			Backend::None => return false,
+			Backend::Memory { sets, fail, .. } => {
+				if fail.load(std::sync::atomic::Ordering::Relaxed) {
+					Err("writes fail (test)".to_string())
+				} else {
+					sets.lock().unwrap().remove(name);
+					Ok(())
+				}
+			}
+			Backend::Db(pool) => {
+				let query = sqlx::query("DELETE FROM rproxy_rule_sets WHERE node = ? AND name = ?").bind(&self.node).bind(name);
+				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
+					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
+					Err(_) => Err("timed out".into()),
+				}
+			}
+		};
+		match result {
+			Ok(()) => {
+				info!(event = "ruleset.persist", ruleset = name, action = "delete", token = by);
+				true
+			}
+			Err(e) => {
+				warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = name, error = %e,
+					"the row of the deleted rule set stays in rproxy_rule_sets (the set comes back on restart)");
 				false
 			}
 		}

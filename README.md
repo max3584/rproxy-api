@@ -346,6 +346,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
 | `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数。`restore.conflict` は `rproxy_rules` と UI の `forward_rules` に同じキーがあり UI の行を使った、#144） |
 | `rule.persist` | `persist: true` のトークンの API のルール（`origin: "api"`）を `rproxy_rules` に書いた・消した（`action: save` / `delete`、`token`。#144） |
+| `ruleset.persist` / `ruleset.restore` / `restore.rulesets` | `persist: true` のトークンのルールの組を `rproxy_rule_sets` に書いた・消した（`action: save` / `delete`、`token`。v0.4.2、#241）/ 起動時に組を 1 つ戻した（`ruleset`・`generation`・`etag`）/ 戻した組の数 |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |
 | `acme.helper` | ACME の補助プロセス（`rproxy-api acme-helper`）が待ち受けを始めた・許していない相手を断った・失敗した（`outcome`：`listening` / `refused` / `error`） |

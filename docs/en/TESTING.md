@@ -258,6 +258,14 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `a_failed_rule_starts_once_its_certificate_is_stored` | A settings-file rule naming a certificate not stored is `failed`, and starts once the name is `PUT` |
 | `scopes_and_allow_certs` | The `certs:read` / `certs:write` scopes; names outside `allow_certs` are 403 for `PUT` and in rules; `GET /certs` lists only names within `allow_certs` |
 
+## Integration tests: storing rule sets (`tests/ruleset_persist.rs`, #241, v0.4.2)
+
+| Test | What it checks |
+|---|---|
+| `persist_tokens_store_their_sets` | A set of a `persist: true` token is stored as one row (`generation`, `etag`, owner, rules), and the answer, `GET /rulesets` and `GET /rulesets/{name}` show `persisted`. Dry runs and sets of tokens without `persist` are not written. A stored set changed by an `admin` updates its row (the owner stays). A failing write gives `persisted: false`. `DELETE` removes the row. `features.ruleset_persistence` |
+| `stored_sets_are_restored` | A stored set comes back with its `generation`, `etag` and owner. Only a rule whose key overlaps a rule restored before is left out; the rest applies. The owner is restored, so other tokens may not change it |
+| `sets_survive_a_restart_with_mariadb` | The real binary with MariaDB (`RPROXY_TEST_DATABASE_URL`): it starts without the table and answers `persisted: false`; stored, restarted, restored; other nodes' rows stay out; an older `PUT` does not overwrite a row with a newer `generation`; `DELETE` removes the row |
+
 ## Integration tests: performance (`tests/performance.rs`, #194, #184)
 
 Starts the real binary and checks the effect of `global.performance` from outside.
