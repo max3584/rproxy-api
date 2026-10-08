@@ -13,7 +13,7 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 
 | Change | Component to bump | Example |
 |---|---|---|
-| Adding to or changing the shape of the config file, control API, or DB (`options`, etc.) (until 1.0, breaking changes also go here) | Minor | 0.2.x → 0.3.0 |
+| Adding to or changing the shape of the config file, control API, or DB (`options`, etc.) (until 1.0, breaking changes also go here; after v0.4.0, additions alone are a patch: "After v0.4.0" below) | Minor | 0.2.x → 0.3.0 |
 | Making the contents of a feature whose shape is already decided usable (`GET /capabilities` reports whether it is available) | Patch | 0.3.0 → 0.3.1 |
 | Bug fixes, dependency updates (they change what gets built), improvements to packaging and installers | Patch | 0.3.1 → 0.3.2 |
 | Changes only to the README, docs, CI or tests | No bump | Ship them with the next release that changes code |
@@ -23,6 +23,16 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 - If a change cannot be made without changing the shape, bundle it into the next minor release.
 - **v0.4.0 is an exception** (owner's decision, #215): instead of settling the shape and shipping the contents in patches, every content lands first and v0.4.0 ships once (no intermediate releases before v0.4.0). In v0.4.0 every v0.4 flag in `GET /capabilities` `features` is true (`features.performance` lists every key) and no v0.4 setting is refused with `unsupported`.
 
+### After v0.4.0: additive shapes ship in patches (owner's decision)
+
+After v0.4.0, **changes that only add shape (new settings, API endpoints, fields, scopes, `features` flags, new DB tables) also ship in patches** (v0.4.1, v0.4.2, ...). The minor version goes up only for **breaking changes** (changing or removing the shape or behaviour of existing settings, API or DB). "Adding shape" in the table above becomes a patch instead of a minor.
+
+- Everything added is optional, and leaving it out behaves as the previous patch (existing settings, .deb and VM setups keep their behaviour). To change a default, make the new behaviour selectable with a flag or environment variable, and leave switching the default to the next minor.
+- A new feature lands its shape and its implementation in the same PR, and adds a new flag to `features` in `GET /capabilities` set to true (no shipping a shape first with the flag false). The UI and rproxy-gateway tell features apart by these flags, so they keep working with an older patch of rproxy.
+- **Live upgrades (`handoff`) within one minor are still guaranteed** ("Live upgrades and patches" below). The state handed over only grows (in a shape an older version can skip what it does not know), so rolling back to an older patch still hands over.
+- Once you use settings a newer patch added (token file fields or scopes, `RPROXY_*`), an older patch that does not know them may treat them as an error (for example, the token file rejects unknown fields). Remove those settings before rolling back. The "Added" section of the release notes says which version a setting needs.
+- The design is in docs/en/DESIGN-v0.4.x.md (from v0.4.1).
+
 ### Before releasing v0.4.0
 
 - The release signing key ("Release signatures" below): set the secret `MINISIGN_SECRET_KEY` and the variable `MINISIGN_PUBLIC_KEY`. Tagging without them makes v0.4.0 unsigned and built without a key (the self-update of v0.4.0 binaries then always needs `RPROXY_UPDATE_PUBKEY`).
@@ -30,7 +40,7 @@ To avoid bumping the minor version too often, **decide the shape (interface) col
 
 ## Milestones
 
-- Keep "next patch" (e.g. v0.2.3), "next minor" (e.g. v0.3.0; the work of deciding the shape), and "implementation" (e.g. v0.3.x; the work of making the contents usable) open.
+- Keep "next patch" (e.g. v0.2.3), "next minor" (e.g. v0.3.0; the work of deciding the shape), and "implementation" (e.g. v0.3.x; the work of making the contents usable) open. After v0.4.0, new features also go to patch milestones (v0.4.1, v0.4.2, ...); "next minor" is only for breaking changes.
 - When creating a PR or issue, attach the milestone determined by the table above. For PRs where it was forgotten, `.github/workflows/milestone.yml` attaches the milestone of the nearest version (the same applies to Renovate PRs).
 - When releasing a patch, move the completed items in "implementation" to that patch's milestone (e.g. v0.3.1) and release.
 - Verification tasks that wait on the environment or on an administrator's action (testing on real hardware, installing an app, etc.) get no milestone, so that they do not block releases.
