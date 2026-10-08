@@ -493,7 +493,7 @@ v0.4.0 で形を決めて中身まで入れた設定（docs/DESIGN-v0.4.md。設
 | 再起動なしの更新・自動更新（#174） | SIGUSR2・`POST /admin/upgrade`、`--handoff-*`、`RPROXY_UPDATE*`、`GET` / `POST /admin/update`、`rproxy-api launch` | 同じマイナーの中で待ち受けのソケットを新しいプロセスに渡す。自動更新は署名（minisign）を確かめてから。docs/UPGRADE.md | `handoff`、`self_update` |
 
 - `limits`・`bandwidth`・`geoip`・`outlier_detection`・`labels` は `PATCH` で付けると丸ごと置き換える（`{}` で外す、省けば今のまま）。DB の `options` でも同じ形で読む。
-- ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）が出る（動いているルール）。`stats.targets[]` に `ejected_until`（外していなければ null）・`ejections`（#170）が出る。
+- ルールの `stats` に `limited`（#165）と `counters_since`（#166、数え始めの Unix 秒。引き継ぎでは変わらない）が出る（動いているルール）。数はメモリにだけあり、再起動（異常終了の後も）では 0 から数え直す（`counters_since` も起動の時刻になる）。`stats.targets[]` に `ejected_until`（外していなければ null）・`ejections`（#170）が出る。
 - トークンの入れ替え：新しいトークンを足して SIGHUP、クライアントを切り替えてから古いトークンを消して SIGHUP（`expires` を付けておくと `token.expiring` で知らせる）。詳しくは上の「制御 API の守り」。
 
 ### performance（`global.performance`、#194・#184）

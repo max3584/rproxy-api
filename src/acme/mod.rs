@@ -239,11 +239,18 @@ fn rfc3339(t: i64) -> String {
 	crate::tls::certstore::rfc3339(t)
 }
 
-/// Validity (notBefore, notAfter) of the first certificate in a PEM file.
-fn validity(cert_file: &str) -> Option<(i64, i64)> {
+/// Validity (notBefore, notAfter) of the first certificate in a PEM file;
+/// None (obtained again at once) also when the key beside it does not load or
+/// does not belong to it: rproxy was killed between writing the new key and the
+/// new certificate (`issue`), or a file is damaged.
+fn validity(cert_file: &str, key_file: &str) -> Option<(i64, i64)> {
 	let data = std::fs::read(cert_file).ok()?;
 	let first = CertificateDer::pem_slice_iter(&data).next()?.ok()?;
 	let check = crate::tls::config::inspect_certificate(first.as_ref(), now()).ok()?;
+	if let Err(e) = crate::tls::config::KeyedCert::load(cert_file, None, key_file) {
+		warn!(event = "acme.error", part = "storage", file = %cert_file, error = %e.message, "the stored certificate is obtained again");
+		return None;
+	}
 	Some((check.not_before, check.not_after))
 }
 
@@ -401,8 +408,8 @@ impl Acme {
 				if state.certs.contains_key(&id) {
 					continue;
 				}
-				let (cert, _) = self.files(&id);
-				state.certs.insert(id, Managed::new(validity(&cert)));
+				let (cert, key) = self.files(&id);
+				state.certs.insert(id, Managed::new(validity(&cert, &key)));
 				changed = true;
 			}
 		}
@@ -999,6 +1006,12 @@ mod tests {
 		assert!(s.not_after.is_some() && s.renew_at.is_some());
 		m.renew(&id).unwrap();
 		assert_eq!(m.status(&id).unwrap().state, "renewing");
+		// killed between writing a new key and its certificate: obtained again at once
+		m.set_wanted(BTreeSet::new());
+		store::write_private(Path::new(&key), rcgen::KeyPair::generate().unwrap().serialize_pem().as_bytes()).unwrap();
+		m.set_wanted([id.clone()].into());
+		assert_eq!(m.status(&id).unwrap().state, "pending", "a key that does not belong to the certificate");
+		store::write_private(Path::new(&key), k.serialize_pem().as_bytes()).unwrap();
 		let v = m.view();
 		assert_eq!(v["certificates"][0]["domains"][0], "a.example.com");
 		assert_eq!(v["resolvers"][0]["challenge"], "tls-alpn-01");

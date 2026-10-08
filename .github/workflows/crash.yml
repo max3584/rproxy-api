@@ -1,0 +1,46 @@
+name: Crash
+
+# 異常終了の試験（tests/crash.rs と tests/self_update.rs の a_trial_killed_three_times_is_bad）を、kill の時刻を
+# 変えながら多く繰り返す。CI の `clippy + tests` は各 3 回だけ。必要なときに手動で動かす（定期・PR では動かさない）。
+#   gh workflow run crash.yml -f rounds=50
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 1 つの試験の繰り返しの数（RPROXY_TEST_CRASH_ROUNDS）
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  crash:
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    timeout-minutes: 120
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev mariadb mariadb-client
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ci.yml と同じ MariaDB（rproxy_rules・rproxy_rule_sets を書きながら kill する）
+      - name: MariaDB
+        run: |
+          mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld
+          mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db > /dev/null
+          nohup mariadbd --user=mysql --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 --port=3306 \
+            > /tmp/mariadb.log 2>&1 &
+          for _ in $(seq 60); do mariadb-admin ping --silent 2>/dev/null && break; sleep 1; done
+          mariadb-admin ping --silent || { cat /tmp/mariadb.log; exit 1; }
+          mariadb <<'EOF'
+          CREATE DATABASE rproxy_test;
+          ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('root');
+          EOF
+      - name: tests/crash.rs (${{ inputs.rounds }} rounds)
+        env:
+          RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
+          RPROXY_TEST_CRASH_ROUNDS: ${{ inputs.rounds }}
+        run: cargo test --locked --test crash -- --nocapture
+      - name: launcher (3 strikes)
+        run: cargo test --locked --test self_update a_trial_killed_three_times_is_bad

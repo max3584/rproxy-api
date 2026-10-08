@@ -14,8 +14,9 @@
 //!   marked bad and the previous good version is started instead (rollback). One
 //!   stopped by a signal to the launcher (docker stop, a rolling restart) is not:
 //!   its trial ends, and it is tried again on the next start. A trial cut short
-//!   without the launcher seeing it (SIGKILL, OOM of the container) counts against
-//!   the version only `MAX_INTERRUPTED` times in a row (security review M1).
+//!   without the launcher seeing it (SIGKILL, OOM of the container), or a server on
+//!   trial killed with SIGKILL (the OOM killer takes the largest process), counts
+//!   against the version only `MAX_INTERRUPTED` times in a row (security review M1).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -266,6 +267,16 @@ async fn supervise(cfg: UpdateConfig, args: Vec<OsString>) -> Result<u8, String>
 					}
 					// a version on trial that stops is rolled back
 					let trial = cfg.load_state().trial.and_then(|t| Version::parse(&t.version));
+					// SIGKILL is not the version failing on its own: the OOM killer of the
+					// container's memory limit takes the server (the largest process) and
+					// leaves the launcher, or someone ran kill -9. Counted as an interrupted
+					// trial, as when the whole container is killed: `choose` counts it, makes
+					// it bad at MAX_INTERRUPTED, and starts the version it picks.
+					if cfg.mode == UpdateMode::Auto && trial.is_some() && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL {
+						choice = choose(&cfg).await?;
+						main = spawn(&choice, &args, &notify)?;
+						continue;
+					}
 					if cfg.mode == UpdateMode::Auto && trial.is_some() {
 						let v = trial.unwrap_or(choice.version);
 						mark_bad(&cfg, v, &format!("exited with status {code} before RPROXY_UPDATE_HEALTHY"));

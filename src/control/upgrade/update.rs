@@ -211,9 +211,8 @@ impl UpdateConfig {
 
 	pub fn save_state(&self, state: &CacheState) -> Result<(), String> {
 		let path = self.state_file();
-		let tmp = self.cache.join(".state.json.tmp");
 		let body = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
-		std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| format!("{}: {e}", path.display()))
+		write_durably(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
 	}
 
 	/// Changes the state file under a lock file (the launcher and the server
@@ -379,6 +378,39 @@ fn sha256_reader(mut r: impl std::io::Read) -> std::io::Result<String> {
 		}
 	}
 	Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Replaces `path` with `data` so that a kill or a power cut at any point
+/// leaves the old file or the new one, whole: a temporary file beside it,
+/// flushed, renamed over it, and the directory flushed.
+fn write_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+	use std::io::Write;
+	let mut name = path.file_name().unwrap_or_default().to_os_string();
+	name.push(".tmp");
+	let tmp = path.with_file_name(format!(".{}", name.to_string_lossy()));
+	let mut f = std::fs::File::create(&tmp)?;
+	f.write_all(data)?;
+	f.sync_all()?;
+	drop(f);
+	std::fs::rename(&tmp, path)?;
+	sync_dir(path.parent().unwrap_or(Path::new(".")))
+}
+
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+	std::fs::File::open(dir)?.sync_all()
+}
+
+/// Download directories (`.tmp-<version>-<pid>`) left by a process killed while
+/// downloading (a pid that is gone), or by this one (a download given up on:
+/// the launcher's timeout; one download at a time per process).
+fn clean_downloads(cache: &Path) {
+	for e in std::fs::read_dir(cache).into_iter().flatten().flatten() {
+		let name = e.file_name().to_string_lossy().into_owned();
+		let Some(pid) = name.strip_prefix(".tmp-").and_then(|r| r.rsplit_once('-')).and_then(|(_, p)| p.parse::<i32>().ok()) else { continue };
+		if pid == std::process::id() as i32 || !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+			let _ = std::fs::remove_dir_all(e.path());
+		}
+	}
 }
 
 /// Creates the cache's directories for this user only (security review L5).
@@ -607,6 +639,7 @@ impl Fetcher {
 		let sig = self.get_text(&self.cfg.url(v, &format!("{name}.minisig"))).await?.ok_or(format!("v{v}: {name}.minisig is missing"))?;
 		// into a directory of its own, moved into place once verified
 		let tmp = self.cfg.cache.join(format!(".tmp-{v}-{}", std::process::id()));
+		clean_downloads(&self.cfg.cache);
 		let _ = std::fs::remove_dir_all(&tmp);
 		private_dir(&tmp).map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
 		let result = async {
@@ -632,13 +665,20 @@ impl Fetcher {
 	fn store(&self, v: Version, tmp: &Path, sig: &str, manifest: &[u8], manifest_sig: &str) -> Result<PathBuf, String> {
 		use std::os::unix::fs::PermissionsExt;
 		let dir = self.cfg.dir(v);
+		// every file flushed before the directory takes the version's name (it is
+		// verified again before it runs either way)
 		let write = || -> std::io::Result<()> {
 			std::fs::set_permissions(tmp.join(BINARY), std::fs::Permissions::from_mode(0o755))?;
-			std::fs::write(tmp.join(format!("{BINARY}.minisig")), sig)?;
-			std::fs::write(tmp.join("manifest.json"), manifest)?;
-			std::fs::write(tmp.join("manifest.json.minisig"), manifest_sig)?;
+			for (name, data) in [(format!("{BINARY}.minisig"), sig.as_bytes()), ("manifest.json".into(), manifest), ("manifest.json.minisig".into(), manifest_sig.as_bytes())] {
+				use std::io::Write;
+				let mut f = std::fs::File::create(tmp.join(name))?;
+				f.write_all(data)?;
+				f.sync_all()?;
+			}
+			sync_dir(tmp)?;
 			let _ = std::fs::remove_dir_all(&dir);
-			std::fs::rename(tmp, &dir)
+			std::fs::rename(tmp, &dir)?;
+			sync_dir(&self.cfg.cache)
 		};
 		write().map_err(|e| format!("cache {}: {e}", self.cfg.cache.display()))?;
 		Ok(dir.join(BINARY))
@@ -907,9 +947,28 @@ mod tests {
 			.unwrap();
 		assert_eq!(c.verify_cached(&key, v).unwrap(), path);
 		assert_eq!(c.cached_versions(), [v]);
+		// cut short (a kill or a full disk while it was written): never run
+		std::fs::write(&path, &binary[..4]).unwrap();
+		assert!(c.verify_cached(&key, v).unwrap_err().contains("SHA-256 differs"), "a partial binary");
 		// tampered with in the cache
 		std::fs::write(&path, b"#!/bin/false\n").unwrap();
 		assert!(c.verify_cached(&key, v).unwrap_err().contains("SHA-256 differs"), "the SHA-256 is checked before the signature");
+		// downloads of processes killed while downloading are removed, not taken for a version
+		let gone = dir.join(format!(".tmp-0.4.11-{}", i32::MAX));
+		let mine = dir.join(format!(".tmp-0.4.12-{}", std::process::id()));
+		let live = dir.join(".tmp-0.4.13-1");
+		for d in [&gone, &mine, &live] {
+			std::fs::create_dir_all(d).unwrap();
+			std::fs::write(d.join(BINARY), &binary[..4]).unwrap();
+		}
+		assert_eq!(c.cached_versions(), [v]);
+		clean_downloads(&dir);
+		assert!(!gone.exists() && !mine.exists() && live.exists(), "pid 1 is alive");
+		std::fs::remove_dir_all(&live).unwrap();
+		// the state file is replaced whole: no temporary file is left
+		c.update_state(|s| s.index_generated_at = Some(7)).unwrap();
+		assert_eq!(c.load_state().index_generated_at, Some(7));
+		assert!(!dir.join(".state.json.tmp").exists());
 
 		// state: bad versions and promotion
 		mark_bad(&c, v, "test");

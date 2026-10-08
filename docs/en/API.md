@@ -493,7 +493,7 @@ Settings whose shape v0.4.0 settled and implemented (docs/en/DESIGN-v0.4.md; dev
 | Live upgrade, self-update (#174) | SIGUSR2, `POST /admin/upgrade`, `--handoff-*`, `RPROXY_UPDATE*`, `GET` / `POST /admin/update`, `rproxy-api launch` | Hands the listening sockets to a new process within one minor. Self-update verifies signatures (minisign) first. docs/en/UPGRADE.md | `handoff`, `self_update` |
 
 - `limits`, `bandwidth`, `geoip`, `outlier_detection` and `labels` given to `PATCH` replace the current value as a whole (`{}` removes it; left out keeps it). The DB `options` carry the same shape.
-- A running rule's `stats` has `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff). `stats.targets[]` has `ejected_until` (null when not ejected) and `ejections` (#170).
+- A running rule's `stats` has `limited` (#165) and `counters_since` (#166; Unix seconds when counting started, unchanged by a handoff). The counters live in memory only: a restart (after an abnormal end too) starts them from zero (and `counters_since` at the start). `stats.targets[]` has `ejected_until` (null when not ejected) and `ejections` (#170).
 - Token rotation: add the new token and SIGHUP, switch the clients, then remove the old token and SIGHUP (with `expires`, `token.expiring` reminds you). Details in "Control API hardening" above.
 
 ### Performance (`global.performance`, #194, #184)
