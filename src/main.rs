@@ -921,9 +921,18 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
 		}
 	}
+	let set_store = registry.persist().filter(|_| rproxy_api::core::rule::Features::CURRENT.ruleset_persistence).cloned();
 	if let Some(r) = &received {
 		// the old process's rules, as they were (not the database's, read at its start)
 		r.restore_rules(&registry).await;
+		// which of its sets are stored (#241): changes to them are written
+		if let Some(store) = &set_store {
+			match store.load_sets().await {
+				Ok(sets) => store.sets_restored(sets.into_iter().map(|s| s.name)),
+				Err(e) => error!(event = "degraded", part = "db", table = rproxy_api::config::persist::SETS_TABLE, error = %e,
+					"stored rule sets are not known after the live upgrade"),
+			}
+		}
 	} else if let Some(url) = &opts.database_url {
 		let ui = match db::load_rules(url).await {
 			Ok(rules) => rules,
@@ -950,6 +959,21 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		if let Some(store) = registry.persist().filter(|_| !stored.is_empty()) {
 			store.restored(&stored);
 			registry.restore_as(stored.into_iter().map(|r| r.spec).collect(), rproxy_api::core::rule::Origin::Api).await;
+		}
+		// #241: rule sets of persist: true tokens, last
+		if let Some(store) = &set_store {
+			match store.load_sets().await {
+				Ok(sets) if !sets.is_empty() => {
+					let names: Vec<String> = sets.iter().map(|s| s.name.clone()).collect();
+					let restored = registry.restore_rulesets(sets).await;
+					// changes to them are written, whichever token makes them
+					store.sets_restored(names);
+					info!(event = "restore.rulesets", rulesets = restored, node = store.node());
+				}
+				Ok(_) => {}
+				Err(e) => error!(event = "degraded", part = "db", table = rproxy_api::config::persist::SETS_TABLE, error = %e,
+					"stored rule sets are not restored"),
+			}
 		}
 	}
 

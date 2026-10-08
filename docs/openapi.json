@@ -1952,6 +1952,10 @@
               "cert_store": {
                 "type": "boolean",
                 "description": "PUT /certs/{name} and {\"cert\": name} in rules (v0.4.2)"
+              },
+              "ruleset_persistence": {
+                "type": "boolean",
+                "description": "Rule sets of persist: true tokens are stored in rproxy_rule_sets (v0.4.2)"
               }
             }
           },
@@ -2881,6 +2885,10 @@
           "owner": {
             "type": "string",
             "description": "the token that created the set; only it or an admin token may change or delete it (security review M3)"
+          },
+          "persisted": {
+            "type": "boolean",
+            "description": "Stored sets only (v0.4.2, #241): whether the row in rproxy_rule_sets is up to date"
           }
         },
         "required": [
@@ -2918,6 +2926,10 @@
           "owner": {
             "type": "string",
             "description": "the token that created the set; only it or an admin token may change or delete it (security review M3)"
+          },
+          "persisted": {
+            "type": "boolean",
+            "description": "Stored sets only (v0.4.2, #241): whether the row in rproxy_rule_sets is up to date"
           }
         },
         "required": [
@@ -3002,6 +3014,10 @@
               "$ref": "#/components/schemas/ApplyResult"
             },
             "description": "The body's rules in their order, then the deleted ones"
+          },
+          "persisted": {
+            "type": "boolean",
+            "description": "Stored sets only (v0.4.2, #241): whether the row in rproxy_rule_sets is up to date"
           }
         },
         "required": [

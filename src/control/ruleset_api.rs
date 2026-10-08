@@ -84,8 +84,29 @@ pub async fn put(
 	if !dry_run {
 		audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
 	}
-	let applied = result?;
+	let mut applied = result?;
+	if !dry_run {
+		applied.persisted = persist_set(&state, &principal, &name).await;
+	}
 	Ok((etag_header(&applied.etag), Json(applied)).into_response())
+}
+
+/// The store for a change to rule set `name` (#241): a `persist: true` token's
+/// sets, and every change to a set that is stored already.
+fn set_store(state: &AppState, principal: &Principal, name: &str) -> Option<Arc<crate::config::persist::Store>> {
+	state
+		.registry
+		.persist()
+		.filter(|s| state.registry.caps().features.ruleset_persistence && (principal.persist || s.knows_set(name)))
+		.cloned()
+}
+
+/// Writes the set's row after a `PUT`; `persisted` of the answer.
+async fn persist_set(state: &AppState, principal: &Principal, name: &str) -> Option<bool> {
+	let store = set_store(state, principal, name)?;
+	let (generation, etag, owner, rules) = state.registry.ruleset_row(name).await?;
+	let row = crate::config::persist::SetRow { name, generation, etag: &etag, owner: &owner, rules, by: &principal.name };
+	Some(store.save_set(row).await)
 }
 
 pub async fn delete(
@@ -106,8 +127,12 @@ pub async fn delete(
 	principal.may_use_ruleset(&name)?;
 	let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 	let admin = principal.has(crate::control::auth::Scope::Admin);
+	let store = set_store(&state, &principal, &name);
 	let result = state.registry.delete_ruleset(&name, if_match(&headers)?, drain, &may_use_ports, (&principal.name, admin)).await;
 	audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
 	result?;
+	if let Some(store) = store {
+		store.remove_set(&name, &principal.name).await;
+	}
 	Ok(StatusCode::NO_CONTENT)
 }

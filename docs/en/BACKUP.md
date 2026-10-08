@@ -20,6 +20,7 @@ Paths are the defaults of the .deb (apt) and of `scripts/install.sh`. Adjust the
 | Policy routing for transparent | `/etc/rproxy/transparent-routing.conf`, `/usr/local/sbin/rproxy-transparent-routing`, `/etc/systemd/system/rproxy-transparent-routing.service` | Only when installed with `install.sh --transparent-*` |
 | systemd overrides | `/etc/systemd/system/rproxy-api.service.d/` (drop-ins from `systemctl edit`), plus `/etc/systemd/system/rproxy-api.service` when installed with `install.sh` | Needed if you changed the permissions (capabilities) |
 | UI database | MariaDB `forward_rules` (rules) and `forward_rules_log` (change history) | The source of truth for rules made in the UI. The table definitions are `db/schema.sql` in the UI repository |
+| rproxy's DB tables | MariaDB `rproxy_rules` (rules of `persist: true` tokens, v0.4) and `rproxy_rule_sets` (rule sets of the same tokens, v0.4.2) | Written by rproxy; restored per node (`RPROXY_NODE_NAME`) at startup |
 | UI environment file | `/etc/rproxy-ui/rproxy-ui.env` (600) | Contains `NEXTAUTH_SECRET`, `KEYCLOAK_CLIENT_SECRET`, `DB_PASSWORD`, `RPROXY_API_TOKEN` |
 | Logs (optional) | `/var/log/rproxy/` (`RPROXY_LOG_FILE`; split daily into `rproxy.<date>.log`, files beyond `RPROXY_LOG_KEEP` are deleted), the `global.access_log` file | Not needed to run. Back them up if you keep them for investigation or auditing |
 

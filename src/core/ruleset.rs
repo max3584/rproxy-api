@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::core::registry::{overlaps, Entry, Registry};
 use crate::core::rule::{Key, Origin, RuleRequest, RuleSpec, RuleView, State};
@@ -164,6 +164,10 @@ pub struct RulesetApplied {
 	pub etag: String,
 	pub dry_run: bool,
 	pub results: Vec<ApplyResult>,
+	/// Whether the set's row in `rproxy_rule_sets` is up to date (#241; only
+	/// for stored sets).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub persisted: Option<bool>,
 }
 
 /// The largest `generation` (JSON's safe integers).
@@ -179,6 +183,9 @@ pub struct RulesetView {
 	pub updated_by: String,
 	/// The token that created the set; only it (or an `admin` token) may change or delete it.
 	pub owner: String,
+	/// Stored sets only (#241): whether the row is up to date.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub persisted: Option<bool>,
 	pub rules: Vec<RuleView>,
 }
 
@@ -192,6 +199,9 @@ pub struct RulesetSummary {
 	pub updated_at: u64,
 	pub updated_by: String,
 	pub owner: String,
+	/// Stored sets only (#241): whether the row is up to date.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub persisted: Option<bool>,
 }
 
 /// A refused `PUT /rulesets/{name}`: the first problem as `code` / `error`,
@@ -563,6 +573,7 @@ impl Registry {
 		sets.into_iter()
 			.map(|(name, s)| RulesetSummary {
 				rules: counts.get(&name).copied().unwrap_or(0),
+				persisted: self.set_persisted(&name),
 				name,
 				generation: s.generation,
 				etag: s.etag,
@@ -587,6 +598,7 @@ impl Registry {
 			updated_at: s.updated_at,
 			updated_by: s.updated_by,
 			owner: s.owner,
+			persisted: self.set_persisted(name),
 			rules: keys.into_iter().map(|k| self.view_of(&rules[k])).collect(),
 		})
 	}
@@ -857,7 +869,89 @@ impl Registry {
 		drop(write);
 		info!(event = "ruleset.apply", ruleset = name, generation = req.generation, etag = %etag, created, updated, deleted,
 			unchanged, failed, by = opts.by);
-		Ok(RulesetApplied { name: name.to_string(), generation: req.generation, etag, dry_run: false, results: results.into_iter().map(|(_, _, r)| r).collect() })
+		Ok(RulesetApplied {
+			name: name.to_string(),
+			generation: req.generation,
+			etag,
+			dry_run: false,
+			results: results.into_iter().map(|(_, _, r)| r).collect(),
+			persisted: None,
+		})
+	}
+
+	/// `persisted` of a set's views (#241): None unless it is stored.
+	fn set_persisted(&self, name: &str) -> Option<bool> {
+		self.persist().filter(|_| self.caps().features.ruleset_persistence).and_then(|s| s.set_persisted(name))
+	}
+
+	/// What a set's row in `rproxy_rule_sets` holds (#241): (generation, etag,
+	/// owner, the rules as `config::plan::shape` in key order).
+	pub async fn ruleset_row(&self, name: &str) -> Option<(u64, String, String, serde_json::Value)> {
+		let s = self.rulesets.get(name)?;
+		let rules = self.rules.lock().await;
+		let mut specs: Vec<&RuleSpec> = rules.values().map(|e| e.spec()).filter(|s| s.ruleset.as_deref() == Some(name)).collect();
+		specs.sort_by_key(|s| (s.key.protocol == crate::core::rule::Protocol::Udp, s.key.listen));
+		let shapes = serde_json::Value::Array(specs.into_iter().map(crate::config::plan::shape).collect());
+		Some((s.generation, s.etag, s.owner, shapes))
+	}
+
+	/// Restores the stored rule sets at startup (#241), after every other rule:
+	/// each as a `PUT` by its owner. A rule that cannot be applied (its key or
+	/// ports are taken by a rule restored before, a file it names is refused)
+	/// is left out with `restore.conflict` / `restore.skip`; the rest of its
+	/// set is applied.
+	pub async fn restore_rulesets(self: &Arc<Self>, sets: Vec<crate::config::persist::StoredSet>) -> usize {
+		let mut restored = 0;
+		let everything = |_: u16, _: u16| true;
+		for set in sets {
+			let mut rules: Vec<(usize, RuleRequest)> = set.rules.into_iter().enumerate().collect();
+			let mut outcome = Err(String::new());
+			// each round leaves out the rules the last one refused
+			for _ in 0..4 {
+				let req = RulesetRequest { generation: set.generation, rules: rules.iter().map(|(_, r)| r.clone()).collect() };
+				let opts = PutOptions {
+					if_match: None,
+					dry_run: false,
+					by: &set.updated_by,
+					admin: true,
+					owner: Some(&set.owner),
+					may_use_ports: &everything,
+				};
+				match self.put_ruleset(&set.name, req, opts).await {
+					Ok(applied) => {
+						outcome = Ok(applied.etag);
+						break;
+					}
+					Err(e) if e.errors.is_empty() => {
+						outcome = Err(e.error.message);
+						break;
+					}
+					Err(e) => {
+						let refused: HashSet<usize> = e.errors.iter().map(|f| f.index).collect();
+						for f in &e.errors {
+							let event = if matches!(f.code, "static" | "owned" | "already_exists" | "reserved") { "restore.conflict" } else { "restore.skip" };
+							warn!(event, ruleset = %set.name, rule = %f.rule, code = f.code, error = %f.message,
+								"left out of the stored rule set; the rest is restored");
+						}
+						rules = rules.into_iter().enumerate().filter(|(i, _)| !refused.contains(i)).map(|(_, r)| r).collect();
+						outcome = Err(e.error.message);
+					}
+				}
+			}
+			match outcome {
+				Ok(etag) => {
+					restored += 1;
+					if etag != set.etag {
+						info!(event = "ruleset.restore", ruleset = %set.name, generation = set.generation, etag = %etag,
+							stored_etag = %set.etag, "restored with a different etag (rules were left out)");
+					} else {
+						info!(event = "ruleset.restore", ruleset = %set.name, generation = set.generation, etag = %etag);
+					}
+				}
+				Err(e) => error!(event = "restore.error", ruleset = %set.name, error = %e, "the stored rule set is not restored"),
+			}
+		}
+		restored
 	}
 
 	/// `?dry_run=true` on `PUT /rulesets/{name}` (#169): what the PUT would do,
@@ -879,7 +973,7 @@ impl Registry {
 				},
 			})
 			.collect();
-		Ok(RulesetApplied { name: name.to_string(), generation, etag, dry_run: true, results })
+		Ok(RulesetApplied { name: name.to_string(), generation, etag, dry_run: true, results, persisted: None })
 	}
 
 	/// Starts a rule of a set. One that cannot bind or resolve its targets is

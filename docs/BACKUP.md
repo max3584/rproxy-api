@@ -20,6 +20,7 @@ rproxy-api と管理 UI（[TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP
 | transparent のポリシールーティング | `/etc/rproxy/transparent-routing.conf`、`/usr/local/sbin/rproxy-transparent-routing`、`/etc/systemd/system/rproxy-transparent-routing.service` | `install.sh --transparent-*` で入れたときだけ |
 | systemd の上書き | `/etc/systemd/system/rproxy-api.service.d/`（`systemctl edit` の drop-in）、`install.sh` で入れたときは `/etc/systemd/system/rproxy-api.service` も | 権限（capability）を変えていれば必要 |
 | UI の DB | MariaDB の `forward_rules`（ルール）、`forward_rules_log`（変更の履歴） | UI で作ったルールの正はここ。テーブルの定義は UI リポジトリの `db/schema.sql` |
+| rproxy の DB の表 | MariaDB の `rproxy_rules`（`persist: true` のトークンのルール、v0.4）、`rproxy_rule_sets`（同じトークンのルールの組、v0.4.2） | rproxy が書く。起動時にノード（`RPROXY_NODE_NAME`）ごとに戻す |
 | UI の環境変数ファイル | `/etc/rproxy-ui/rproxy-ui.env`（600） | `NEXTAUTH_SECRET`、`KEYCLOAK_CLIENT_SECRET`、`DB_PASSWORD`、`RPROXY_API_TOKEN` を含む |
 | ログ（任意） | `/var/log/rproxy/`（`RPROXY_LOG_FILE`。日ごとに `rproxy.<日付>.log`、`RPROXY_LOG_KEEP` 個を超えると消える）、`global.access_log` のファイル | 動かすのには要らない。調査・監査のために残すなら取る |
 
