@@ -36,8 +36,8 @@ English: [DESIGN-v0.4.x.md](en/DESIGN-v0.4.x.md)
 - 値は `RPROXY_HANDOFF_DRAIN` と同じ書き方（`30s`・`2m`・秒の数）。上限はそれぞれ 1 時間（超えると起動を止める設定のエラー）。
 - **既定は両方 `0s` で、今と同じ「すぐ止める」**（オーナーの決定）。VM・.deb の `systemctl stop` / `restart` は遅くならない。使うときは引数・環境変数で選ぶ。rproxy-gateway は自分の Pod に `5s`・`25s` を渡す。
 - 順：SIGTERM → `/readyz` 503 `draining`、`event=shutdown.start` → `delay` の間は今のまま受け付ける → 待ち受けを閉じる（引き継ぎの `drain_all` の道筋。引き継ぎの終わり方と同じ）→ TCP・HTTP の接続の終わりを `drain` まで待つ → 止める（残りを切る）。両方 `0s` なら今の処理そのもの。
-- HTTP：`drain` に入ったら keep-alive の接続に `Connection: close`（HTTP/2 は GOAWAY、HTTP/3 は QUIC の GOAWAY）を返し、終わったリクエストから閉じる（hyper の `graceful_shutdown`。引き継ぎと同じ）。
-- UDP：`delay` の間は今のまま。`drain` に入ったら新しいセッションを作らず、今のセッションは `drain` の終わりまで続ける（kube-proxy は外れた宛先の UDP の conntrack を消すので、多くは新しい Pod へ移る）。
+- HTTP：`drain` に入ったら、処理中のリクエストの応答に `Connection: close`（HTTP/2 は GOAWAY）を付けて閉じ、アイドルの keep-alive の接続はすぐ閉じる（hyper の `graceful_shutdown`。引き継ぎと同じ）。HTTP/3 は新しい QUIC の接続を受けず、今の接続は続く。
+- UDP：`delay` の間は今のまま。`drain` に入ったら新しいセッションを作らず（そのデータグラムは `stats.dropped`）、今のセッションは `drain` の終わりまで続ける（kube-proxy は外れた宛先の UDP の conntrack を消すので、多くは新しい Pod へ移る）。
 - 制御 API：`delay`・`drain` の間も、読むだけの API（`GET`）と `/healthz`・`/metrics` は答える（UI の利用量が最後まで取れる）。変更の API（`POST`・`PUT`・`PATCH`・`DELETE`）は `503 shutting_down`。制御 API は止める直前に閉じる。
 - 2 回目の SIGTERM・SIGINT（Ctrl-C）：残りを待たずにすぐ止める（今と同じ動き）。
 - ログ：`shutdown.start`（`delay_secs`・`drain_secs`）、`shutdown.drain`（待ち受けを閉じたとき。残りの接続・セッションの数）、`shutdown.done`（切った接続の数 `cut`）。
