@@ -13,6 +13,7 @@ Paths are the defaults of the .deb (apt) and of `scripts/install.sh`. Adjust the
 | Token file | `/etc/rproxy/tokens` (`RPROXY_TOKEN_FILE`) | One token per line (plain text), or YAML with names, SHA-256 and scopes (docs/en/API.md). In the plain format the file holds the API keys themselves |
 | Configuration file (static rules) | The file or directory of `RPROXY_CONFIG` (e.g. `/etc/rproxy/rproxy.yaml`) | `version`, `global`, `rules`. Static rules are not in the database, so this is their only copy |
 | Files the configuration refers to | Paths written in the configuration file and in rules | Certificates, keys and CAs (`cert_file`, `chain_file`, `key_file`, `ca_file`), `basic_auth` `users_file`, secret files of `oidc` and others, CrowdSec `api_key_file` |
+| Certificates and keys stored through the control API (v0.4.2) | `/var/lib/rproxy/certs/` (`RPROXY_CERT_STORE`) | Received by `PUT /certs/{name}` (#240). They hold keys: keep them 600. Not in the DB |
 | Control API certificate and key | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` (e.g. `/etc/rproxy/tls/`) | Only when the control API uses TLS |
 | TLS certificates of rules made in the UI | Paths written in the database `options` | The database holds only the paths. Back up the files separately |
 | Certificates from certbot and similar | e.g. `/etc/letsencrypt/` | Can be issued again, but when moving hosts take them with their renewal configuration |

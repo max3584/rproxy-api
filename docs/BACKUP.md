@@ -13,6 +13,7 @@ rproxy-api と管理 UI（[TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP
 | トークンファイル | `/etc/rproxy/tokens`（`RPROXY_TOKEN_FILE`） | 1 行 1 トークン（平文）か、名前・SHA-256・スコープの YAML（docs/API.md）。平文の形式ならそのまま API の鍵 |
 | 設定ファイル（固定ルール） | `RPROXY_CONFIG` のファイルかディレクトリ（例 `/etc/rproxy/rproxy.yaml`） | `version`・`global`・`rules`。固定ルールは DB に入らないので、ここにしかない |
 | 設定ファイルが指すファイル | 設定ファイル・ルールに書いたパス | 証明書・鍵・CA（`cert_file`・`chain_file`・`key_file`・`ca_file`）、`basic_auth` の `users_file`、`oidc` などの秘密のファイル、CrowdSec の `api_key_file` |
+| 制御 API で保存した証明書と鍵（v0.4.2） | `/var/lib/rproxy/certs/`（`RPROXY_CERT_STORE`） | `PUT /certs/{name}` で受け取ったもの（#240）。鍵を含むので 600 のまま取る。DB にはない |
 | 制御 API の証明書と鍵 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`（例 `/etc/rproxy/tls/`） | 制御 API を TLS で開いているときだけ |
 | UI で作ったルールの TLS の証明書 | DB の `options` に書いたパス | DB にあるのはパスだけ。ファイルは別に取る |
 | certbot などの証明書 | 例 `/etc/letsencrypt/` | 取り直せるが、移すなら更新の設定ごと取る |

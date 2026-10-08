@@ -41,6 +41,13 @@ pub fn check_rule_scope(principal: &Principal, create: Option<&RuleRequest>, upd
 	if acme && !principal.has(Scope::AcmeWrite) {
 		return Err(ApiError::forbidden("rules with acme certificates need the acme:write scope"));
 	}
+	// stored certificates (#240): only those within the token's allow_certs
+	let tls = create.and_then(|r| r.tls.as_ref()).into_iter().chain(update.and_then(|r| r.tls.as_ref()));
+	for c in tls.flat_map(|t| t.certificates.iter()) {
+		if let Some(name) = &c.cert {
+			principal.may_use_cert(name)?;
+		}
+	}
 	Ok(())
 }
 

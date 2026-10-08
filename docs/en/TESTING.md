@@ -249,6 +249,15 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `a_second_sigterm_cuts_the_drain_short` | A second SIGTERM during `drain` stops waiting and cuts the connections left |
 | `values_out_of_range_stop_the_startup` | A value above one hour stops the startup |
 
+## Integration tests: certificate API (`tests/cert_api.rs`, #240, v0.4.2)
+
+| Test | What it checks |
+|---|---|
+| `store_use_replace_and_delete` | `PUT /certs/{name}` answers 201 with an `ETag` (the fingerprint); files are 0600 and directories 0700. A rule with `{"cert": name}` terminates TLS with it (passing the owner check). A mismatching `If-Match` is 412; replacing it (200) keeps open connections and new ones get the new certificate; the old version is removed. `DELETE` while in use is `409 in_use` (`used_by`), 204 once unused. Audit lines have the name and fingerprint, never the key. `features.cert_store` |
+| `bad_certificates_and_names_are_refused` | Unreadable PEM, a mismatching key, expired, no key, unknown fields and bad names are `400 invalid` (no key in the answer); a body above 1 MiB is 413; expiring soon gives `warnings`. A rule naming a certificate that is not stored is `400 tls_config`; `cert` with `cert_file` is a mistake |
+| `a_failed_rule_starts_once_its_certificate_is_stored` | A settings-file rule naming a certificate not stored is `failed`, and starts once the name is `PUT` |
+| `scopes_and_allow_certs` | The `certs:read` / `certs:write` scopes; names outside `allow_certs` are 403 for `PUT` and in rules; `GET /certs` lists only names within `allow_certs` |
+
 ## Integration tests: performance (`tests/performance.rs`, #194, #184)
 
 Starts the real binary and checks the effect of `global.performance` from outside.

@@ -20,6 +20,12 @@ pub enum Scope {
 	/// operations (`POST /acme/...`, over the Unix socket by default).
 	#[serde(rename = "acme:write")]
 	AcmeWrite,
+	/// `GET /certs` (v0.4.2, #240).
+	#[serde(rename = "certs:read")]
+	CertsRead,
+	/// `PUT` / `DELETE /certs/{name}` (v0.4.2, #240).
+	#[serde(rename = "certs:write")]
+	CertsWrite,
 	/// Everything.
 	#[serde(rename = "admin")]
 	Admin,
@@ -32,6 +38,8 @@ impl Scope {
 			Scope::RulesWrite => "rules:write",
 			Scope::MetricsRead => "metrics:read",
 			Scope::AcmeWrite => "acme:write",
+			Scope::CertsRead => "certs:read",
+			Scope::CertsWrite => "certs:write",
 			Scope::Admin => "admin",
 		}
 	}
@@ -53,12 +61,15 @@ pub struct Principal {
 	/// Name prefixes of the rule sets the token may create, change or delete
 	/// (`allow_rulesets`; None: any). Security review M3.
 	rulesets: Option<Vec<String>>,
+	/// Name prefixes of the stored certificates (#240) the token may put,
+	/// delete, read and use in rules (`allow_certs`; None: any).
+	certs: Option<Vec<String>>,
 }
 
 impl Principal {
 	/// Without a token file every request is allowed.
 	fn anonymous() -> Self {
-		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "", rulesets: None }
+		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "", rulesets: None, certs: None }
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -75,6 +86,17 @@ impl Principal {
 		match &self.rulesets {
 			Some(prefixes) if !prefixes.iter().any(|p| name.starts_with(p.as_str())) => Err(crate::error::ApiError::forbidden(format!(
 				"this token may not change rule set {name:?} (allow_rulesets: {})",
+				prefixes.join(", ")
+			))),
+			_ => Ok(()),
+		}
+	}
+
+	/// Whether the token may use the stored certificate `name` (`allow_certs`).
+	pub fn may_use_cert(&self, name: &str) -> Result<(), crate::error::ApiError> {
+		match &self.certs {
+			Some(prefixes) if !prefixes.iter().any(|p| name.starts_with(p.as_str())) => Err(crate::error::ApiError::forbidden(format!(
+				"this token may not use certificate {name:?} (allow_certs: {})",
 				prefixes.join(", ")
 			))),
 			_ => Ok(()),
@@ -119,6 +141,9 @@ struct TokenEntry {
 	/// Name prefixes of the rule sets this token may change (security review M3).
 	#[serde(default)]
 	allow_rulesets: Option<Vec<String>>,
+	/// Name prefixes of the stored certificates this token may use (#240, v0.4.2).
+	#[serde(default)]
+	allow_certs: Option<Vec<String>>,
 	#[serde(default)]
 	expires: Option<String>,
 }
@@ -195,6 +220,9 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			if e.allow_rulesets.as_ref().is_some_and(|p| p.is_empty() || p.iter().any(|p| p.is_empty())) {
 				return Err(invalid(path, format!("{}: allow_rulesets must list name prefixes (none empty)", e.name)));
 			}
+			if e.allow_certs.as_ref().is_some_and(|p| p.is_empty() || p.iter().any(|p| p.is_empty())) {
+				return Err(invalid(path, format!("{}: allow_certs must list name prefixes (none empty)", e.name)));
+			}
 			if e.scopes.is_empty() {
 				return Err(invalid(path, format!("{}: scopes must not be empty", e.name)));
 			}
@@ -214,7 +242,15 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 			tokens.push(Token {
 				secret,
 				client_cert: e.client_cert,
-				principal: Principal { name: e.name, scopes: e.scopes, ports, persist: e.persist, auth, rulesets: e.allow_rulesets },
+				principal: Principal {
+					name: e.name,
+					scopes: e.scopes,
+					ports,
+					persist: e.persist,
+					auth,
+					rulesets: e.allow_rulesets,
+					certs: e.allow_certs,
+				},
 				expires,
 			});
 		}
@@ -234,6 +270,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					persist: false,
 					auth: "token",
 					rulesets: None,
+					certs: None,
 				},
 				expires: None,
 			})
