@@ -92,6 +92,9 @@ async fn body_backend() -> SocketAddr {
 }
 
 fn key_file(tag: &str, key: &str) -> PathBuf {
+	// the owner check refuses a key anyone can read; the umask is per process, so set it here
+	// rather than rely on another test having run first
+	rproxy_api::net::files::private_umask();
 	let dir = std::env::temp_dir().join(format!("rproxy-cs-it-{tag}-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let file = dir.join("key");
