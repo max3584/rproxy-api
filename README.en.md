@@ -74,7 +74,8 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_API_SOCKET` | `--api-socket` | none | Unix socket for the control API (e.g. `/run/rproxy/api.sock`). Can be used together with TCP. A token is required just as with TCP. Startup fails if the parent directory does not exist. A socket left over from a previous run is replaced |
 | `RPROXY_API_SOCKET_MODE` | `--api-socket-mode` | `660` | Mode of the socket file (octal) |
 | `RPROXY_API_SOCKET_GROUP` | `--api-socket-group` | none | Group of the socket file (name or ID). Use a group that the user running the UI belongs to |
-| `RPROXY_TOKEN_FILE` | `--token-file` | none | Bearer token file (one token per line, or YAML with name, SHA-256, and scopes; see docs/API.md). When set, authentication is required. Reloaded on SIGHUP |
+| `RPROXY_TOKEN_FILE` | `--token-file` | none | Bearer token file (one token per line, or YAML with name, SHA-256, and scopes; see docs/API.md). When set, authentication is required. Reloaded on SIGHUP and when the file changes (`RPROXY_TOKENS_CHECK_SECS`) |
+| `RPROXY_TOKENS_CHECK_SECS` | `--tokens-check-secs` | `10` | Interval (seconds) for checking whether the token file has changed: size, modification time, inode and permissions, following symbolic links (so a Kubernetes Secret volume update is found). A version with a mistake keeps the current tokens with one warning. `0` reloads only on SIGHUP (v0.4.2) |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | none | TLS certificate and private key (PEM) for the control API. Reloaded on SIGHUP |
 | `RPROXY_CERT_CHECK_SECS` | `--cert-check-secs` | `60` | Interval (seconds) for checking whether certificate files (rules' `tls` and the control API) have changed. Only changed ones are reloaded (certbot and cert-manager renewals are picked up as-is). `0` disables it |
 | `RPROXY_CERT_STORE` | `--cert-store` | `/var/lib/rproxy/certs` | Where certificates and keys received by `PUT /certs/{name}` are stored (v0.4.2, #240; directories 0700, files 0600; rules use `{"cert": "<name>"}`; "Certificate API" in docs/en/API.md). Cannot be under `trusted_dirs` |
@@ -119,7 +120,7 @@ For other environment problems, only the unusable part is stopped and startup co
 | Situation | Behavior |
 |---|---|
 | The log directory is not writable | Logs go to stdout (`part: log`) |
-| The token file cannot be read (permissions) | The control API rejects all requests with 401. Cleared by making it readable and sending SIGHUP (`part: tokens`) |
+| The token file cannot be read (permissions) | The control API rejects all requests with 401. Cleared by making it readable and sending SIGHUP, or by the `RPROXY_TOKENS_CHECK_SECS` check (`part: tokens`) |
 | The control API's TLS certificate/key cannot be read (permissions), or the port is in use | Rule forwarding keeps running, and only that control API address is retried (starting after 10 seconds, doubling the interval up to a maximum of 5 minutes) (`part: api_tls` / `part: api`) |
 | The control API's Unix socket cannot be created (permissions, used by another process) | Starts without the socket (`part: api_socket`) |
 | The UDP port of an `http.http3` rule cannot be used (in use, permissions) | That rule runs on TCP only (HTTP/1.1, HTTP/2). The reason appears in `stats.http.http3` (`part: http3`) |
@@ -326,7 +327,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`), a locked-out source (`outcome: locked_out`). How the caller authenticated (`auth`: `token`, `cert`, `token+cert`). Lines of refused requests are thinned out per sender (`suppressed`) |
 | `token.expiring` / `token.expired` | A control API token is close to expiry (closer than `RPROXY_TOKEN_WARN_DAYS`) / has expired (`token`, `expires`, `days_left`). At startup, on SIGHUP and daily, once per change of state |
 | `api.lockout` / `api.unlock` | A source that kept failing authentication (`client`; IPv6 by /64) was locked out (`failures`, `until`) / unlocked |
-| `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP re-read the tokens, the control API's certificate, the rules' certificates, the CrowdSec key (the current ones stay if a file cannot be read) |
+| `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP re-read the tokens, the control API's certificate, the rules' certificates, the CrowdSec key (the current ones stay if a file cannot be read). `reload.tokens` also appears when the token file changes (`reason: "file changed"`, only the count `tokens`; a version with a mistake is warned about once) |
 | `geoip.reload` | A `global.geoip` database was read or read again (`db`: `country` / `asn`, `path`, `build_epoch`). One that cannot be read logs `degraded` (`part: geoip`) and the current one stays |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | Static rules were loaded / a rule's listen addresses changed / a rule with the same key was skipped |
 | `conn.open` / `conn.close` | Start and end of a connection (session for UDP). `client`, `target`, `rx_bytes`, `tx_bytes`, `duration_ms`, `reason`. When TLS is terminated, `tls_version`, `tls_cipher`, etc. HTTP/3 QUIC connections have `transport: quic`. With `global.geoip.log_country`, `country` and `asn` |

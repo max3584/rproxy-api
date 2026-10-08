@@ -47,6 +47,7 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | `core/resolve.rs` | `keeps_cached_answer_while_dns_is_down` | While name resolution fails, the previous result keeps being used |
 | | `empty_answer_is_an_error` | An empty answer is `resolve_failed` |
 | `control/auth.rs` | `rotates_tokens` | Multiple tokens valid at the same time, reloading, and keeping the current state on an invalid file |
+| | `refresh_reads_changed_files` | #253: only a changed file (rewritten in place, or a symbolic link swapped as in a Secret volume) is read again. A version with a mistake keeps the current tokens and is tried once. After SIGHUP the same version is not read again. The lockout state stays |
 | | `disabled_allows_all` | Without a token file there is no authentication |
 | `net/source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | The bytes of the PROXY protocol headers |
 | | `port_ranges` | Range validation (reversed order, exceeding the limit, target port exceeding 65535) |
@@ -227,6 +228,7 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v
 | `lockout_is_on_by_default` | By default (owner's decision) the 20th failure locks out |
 | `expiring_tokens_are_reported_and_exported` | A token close to expiry gives `token.expiring` (`days_left`), an expired one `token.expired`, once per change. `rproxy_token_expiry_timestamp_seconds` in `/metrics` |
 | `the_binary_serves_client_certificates` | The real binary: a token file with `client_cert` and no `--tls-client-auth` stops the startup; with `required`, `/rules` is read with the certificate alone and connections without one are refused |
+| `the_binary_reads_a_changed_token_file_without_sighup` | #253: the real binary (`RPROXY_TOKENS_CHECK_SECS=1`) re-reads the token file without SIGHUP. A token added in place works; after a `..data` link swap as in a Secret volume the new token works and removed ones get 401. A version with a mistake keeps the current tokens with one warning. No token appears in the log. `features.tokens_reload` |
 
 ## Integration tests: live upgrades (`tests/handoff.rs`, #174)
 

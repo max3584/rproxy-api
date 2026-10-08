@@ -56,9 +56,15 @@ struct Options {
 	/// Accept POST /config/reload and the strong ACME operations (POST /acme/...) only over the Unix socket (true / false)
 	#[arg(long, env = "RPROXY_API_RELOAD_UNIX_ONLY", default_value_t = true, action = clap::ArgAction::Set)]
 	api_reload_unix_only: bool,
-	/// File of bearer tokens (one per line, or YAML with scopes); re-read on SIGHUP
+	/// File of bearer tokens (one per line, or YAML with scopes); re-read on
+	/// SIGHUP and when it changes (--tokens-check-secs)
 	#[arg(long, env = "RPROXY_TOKEN_FILE")]
 	token_file: Option<PathBuf>,
+	/// Seconds between checks of the token file for changes (size, times,
+	/// inode, also through symbolic links as in a Kubernetes Secret volume),
+	/// which is then re-read; 0: only on SIGHUP (#253)
+	#[arg(long, env = "RPROXY_TOKENS_CHECK_SECS", default_value_t = 10)]
+	tokens_check_secs: u64,
 	/// TLS certificate chain (PEM) for the control API; re-read on SIGHUP
 	#[arg(long, env = "RPROXY_TLS_CERT")]
 	tls_cert: Option<PathBuf>,
@@ -1052,7 +1058,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			stop.clone(),
 		));
 	}
-	tokio::spawn(watch_tokens(tokens.clone(), token_expiry.clone(), stop.clone()));
+	let tokens_every = (opts.tokens_check_secs > 0).then(|| Duration::from_secs(opts.tokens_check_secs));
+	tokio::spawn(watch_tokens(tokens.clone(), token_expiry.clone(), tokens_every, stop.clone()));
 
 	let config_hup = Arc::new(Notify::new());
 	if let Some(reloader) = reloader {
@@ -1302,12 +1309,17 @@ async fn watch_config(every: Option<Duration>, reloader: Arc<ConfigReloader>, hu
 	}
 }
 
-/// Checks token expiry once a day and unlocks locked-out sources whose time
-/// is up (#167).
-async fn watch_tokens(tokens: Arc<Tokens>, expiry: Arc<TokenExpiry>, stop: CancellationToken) {
+/// Checks token expiry once a day, unlocks locked-out sources whose time
+/// is up (#167) and re-reads the token file when it changes (`files`, #253).
+async fn watch_tokens(tokens: Arc<Tokens>, expiry: Arc<TokenExpiry>, files: Option<Duration>, stop: CancellationToken) {
 	let start = tokio::time::Instant::now();
 	let mut day = tokio::time::interval_at(start + Duration::from_secs(86_400), Duration::from_secs(86_400));
 	let mut sweep = tokio::time::interval_at(start + Duration::from_secs(5), Duration::from_secs(5));
+	let mut file_ticks = files.filter(|_| tokens.enabled()).map(|every| {
+		let mut t = tokio::time::interval_at(start + every, every);
+		t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		t
+	});
 	loop {
 		tokio::select! {
 			_ = stop.cancelled() => return,
@@ -1315,6 +1327,17 @@ async fn watch_tokens(tokens: Arc<Tokens>, expiry: Arc<TokenExpiry>, stop: Cance
 				expiry.check(&tokens.expiries());
 			}
 			_ = sweep.tick() => tokens.lockout().sweep(),
+			_ = async { match file_ticks.as_mut() { Some(t) => { t.tick().await; } None => std::future::pending().await } } => {
+				// a stat of one file; reading and parsing happen only when it changed
+				let t = tokens.clone();
+				let Ok(Some(result)) = tokio::task::spawn_blocking(move || t.refresh()).await else { continue };
+				match result {
+					// counts only: never the tokens or their hashes
+					Ok(n) => info!(event = "reload.tokens", tokens = n, reason = "file changed"),
+					Err(e) => warn!(event = "reload.tokens", reason = "file changed", error = %e, "keeping current tokens"),
+				}
+				expiry.check(&tokens.expiries());
+			}
 		}
 	}
 }

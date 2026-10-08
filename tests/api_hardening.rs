@@ -334,3 +334,91 @@ async fn the_binary_serves_client_certificates() {
 	let _ = child.wait();
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// #253: the real binary re-reads its token file when it changes, without
+/// SIGHUP (`RPROXY_TOKENS_CHECK_SECS`): written in place, or swapped through
+/// symbolic links as in a Kubernetes Secret volume. A removed token stops
+/// working, and a broken version keeps the current tokens (warned once).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_binary_reads_a_changed_token_file_without_sighup() {
+	use std::os::unix::fs::symlink;
+	let dir = workdir("tokens-reload");
+	// a Secret volume: tokens -> ..data/tokens, ..data -> ..v1
+	let secret = dir.join("secret");
+	fs::create_dir_all(secret.join("..v1")).unwrap();
+	fs::create_dir_all(secret.join("..v2")).unwrap();
+	fs::write(secret.join("..v1/tokens"), "tok-alpha-1f3c\n").unwrap();
+	symlink("..v1", secret.join("..data")).unwrap();
+	symlink("..data/tokens", secret.join("tokens")).unwrap();
+
+	let port = free_port();
+	let out = dir.join("out.log");
+	let log = fs::File::create(&out).unwrap();
+	let mut child = Command::new(env!("CARGO_BIN_EXE_rproxy-api"))
+		.current_dir(&dir)
+		.env_clear()
+		.env("RPROXY_API_PORT", port.to_string())
+		.env("RPROXY_TOKEN_FILE", secret.join("tokens"))
+		.env("RPROXY_TOKENS_CHECK_SECS", "1")
+		// the polling below fails on purpose; keep the source from being locked out
+		.env("RPROXY_API_LOCKOUT_FAILURES", "0")
+		.stdout(log.try_clone().unwrap())
+		.stderr(log)
+		.spawn()
+		.unwrap();
+	let http = reqwest::Client::new();
+	let base = format!("http://127.0.0.1:{port}");
+	let status = |token: &'static str| {
+		let req = http.get(format!("{base}/rules")).bearer_auth(token).send();
+		async move { req.await.map(|r| r.status().as_u16()).unwrap_or(0) }
+	};
+	// within a few check intervals
+	let until = |token: &'static str, want: u16, what: &'static str| {
+		let out = out.clone();
+		async move {
+			let deadline = Instant::now() + Duration::from_secs(15);
+			while status(token).await != want {
+				assert!(Instant::now() < deadline, "{what}: {}", fs::read_to_string(&out).unwrap_or_default());
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		}
+	};
+	until("tok-alpha-1f3c", 200, "started").await;
+	assert_eq!(status("tok-beta-7a0e").await, 401);
+	let caps: serde_json::Value =
+		http.get(format!("{base}/capabilities")).bearer_auth("tok-alpha-1f3c").send().await.unwrap().json().await.unwrap();
+	assert_eq!(caps["features"]["tokens_reload"], true, "{caps}");
+
+	// written in place (through the links): a new token works, the old one too
+	fs::write(secret.join("..v1/tokens"), "tok-alpha-1f3c\ntok-beta-7a0e\n").unwrap();
+	until("tok-beta-7a0e", 200, "added token").await;
+	assert_eq!(status("tok-alpha-1f3c").await, 200);
+
+	// the Secret is updated: ..data is swapped to a new directory by rename
+	fs::write(secret.join("..v2/tokens"), "tok-gamma-55d2\n").unwrap();
+	symlink("..v2", secret.join("..data_tmp")).unwrap();
+	fs::rename(secret.join("..data_tmp"), secret.join("..data")).unwrap();
+	until("tok-gamma-55d2", 200, "swapped secret").await;
+	assert_eq!(status("tok-alpha-1f3c").await, 401, "a removed token stops working");
+	assert_eq!(status("tok-beta-7a0e").await, 401);
+
+	// a broken version: the current tokens stay, with one warning
+	fs::write(secret.join("..v2/tokens"), "tokens: [\n").unwrap();
+	let deadline = Instant::now() + Duration::from_secs(15);
+	while !fs::read_to_string(&out).unwrap_or_default().contains("keeping current tokens") {
+		assert!(Instant::now() < deadline, "{}", fs::read_to_string(&out).unwrap_or_default());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	tokio::time::sleep(Duration::from_millis(2500)).await;
+	assert_eq!(status("tok-gamma-55d2").await, 200);
+	let text = fs::read_to_string(&out).unwrap_or_default();
+	assert_eq!(text.matches("keeping current tokens").count(), 1, "once per version: {text}");
+	assert!(text.lines().filter(|l| l.contains("reload.tokens")).count() >= 3, "{text}");
+	// counts only, never the tokens
+	assert!(!text.contains("tok-"), "{text}");
+
+	let _ = child.kill();
+	let _ = child.wait();
+	fs::remove_dir_all(dir).unwrap();
+}

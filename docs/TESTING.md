@@ -47,6 +47,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `core/resolve.rs` | `keeps_cached_answer_while_dns_is_down` | 名前解決に失敗している間も、前回の結果を使い続ける |
 | | `empty_answer_is_an_error` | 空の応答は `resolve_failed` |
 | `control/auth.rs` | `rotates_tokens` | 複数トークンの同時有効、読み直し、不正なファイルでは現状維持 |
+| | `refresh_reads_changed_files` | #253：変わったファイル（その場の書き換え・Secret のボリュームのようなシンボリックリンクの差し替え）だけを読み直す。誤りのある版は今のトークンのままで 1 回だけ試す。SIGHUP の後は同じ版を読まない。一時停止の状態は残る |
 | | `disabled_allows_all` | トークンファイルなしなら認証なし |
 | `net/source.rs` | `v1_header` / `v2_header_ipv4` / `v2_header_ipv6_length` | PROXY protocol ヘッダのバイト列 |
 | | `port_ranges` | 範囲の検証（逆順、上限超え、転送先のポートが 65535 を超える） |
@@ -227,6 +228,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `lockout_is_on_by_default` | 既定（オーナーの決定）で 20 回目の失敗で止まる |
 | `expiring_tokens_are_reported_and_exported` | 期限の近いトークンは `token.expiring`（`days_left`）、切れたものは `token.expired`、状態が変わったときに 1 回だけ。`/metrics` の `rproxy_token_expiry_timestamp_seconds` |
 | `the_binary_serves_client_certificates` | 本物のバイナリ：`client_cert` のあるトークンファイルで `--tls-client-auth` がなければ起動しない。`required` では証明書だけで `/rules` を読め、証明書のない接続は断る |
+| `the_binary_reads_a_changed_token_file_without_sighup` | #253：本物のバイナリ（`RPROXY_TOKENS_CHECK_SECS=1`）が SIGHUP なしでトークンファイルを読み直す。その場の書き換えで足したトークンが通り、Secret のボリュームのような `..data` のリンクの差し替えで新しいトークンが通って消したトークンは 401。誤りのある版では今のトークンのまま、警告は 1 回。ログにトークンは出ない。`features.tokens_reload` |
 
 ## 結合テスト：再起動なしの更新（`tests/handoff.rs`、#174）
 

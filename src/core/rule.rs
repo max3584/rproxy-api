@@ -188,6 +188,9 @@ pub struct Features {
 	pub cert_store: bool,
 	/// Rule sets of `persist: true` tokens kept in `rproxy_rule_sets` (v0.4.2, #241)
 	pub ruleset_persistence: bool,
+	/// The token file is re-read when it changes, without SIGHUP
+	/// (`RPROXY_TOKENS_CHECK_SECS`; v0.4.2, #253)
+	pub tokens_reload: bool,
 }
 
 /// Every name of `Features::http_options`.
@@ -229,6 +232,7 @@ impl Features {
 		graceful_shutdown: true,
 		cert_store: true,
 		ruleset_persistence: true,
+		tokens_reload: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -267,6 +271,7 @@ impl Features {
 		graceful_shutdown: true,
 		cert_store: true,
 		ruleset_persistence: true,
+		tokens_reload: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

@@ -1956,6 +1956,10 @@
               "ruleset_persistence": {
                 "type": "boolean",
                 "description": "Rule sets of persist: true tokens are stored in rproxy_rule_sets (v0.4.2)"
+              },
+              "tokens_reload": {
+                "type": "boolean",
+                "description": "The token file is re-read when it changes, without SIGHUP (RPROXY_TOKENS_CHECK_SECS; v0.4.2)"
               }
             }
           },

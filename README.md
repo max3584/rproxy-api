@@ -74,7 +74,8 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_API_SOCKET` | `--api-socket` | なし | 制御 API の Unix ソケット（例 `/run/rproxy/api.sock`）。TCP と併用できる。トークンは TCP と同じく要る。親ディレクトリがないと起動しない。前回の残りのソケットは置き換える |
 | `RPROXY_API_SOCKET_MODE` | `--api-socket-mode` | `660` | ソケットファイルのモード（8 進数） |
 | `RPROXY_API_SOCKET_GROUP` | `--api-socket-group` | なし | ソケットファイルのグループ（名前か ID）。UI を動かすユーザーが入っているグループにする |
-| `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP で読み直す |
+| `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP と、ファイルが変わったとき（`RPROXY_TOKENS_CHECK_SECS`）に読み直す |
+| `RPROXY_TOKENS_CHECK_SECS` | `--tokens-check-secs` | `10` | トークンファイルが変わったかを確かめる間隔（秒）。大きさ・更新時刻・inode・権限を、シンボリックリンクをたどって見る（Kubernetes の Secret のボリュームの更新も見つける）。誤りのある版では今のトークンのまま警告を 1 回。`0` なら SIGHUP のときだけ（v0.4.2） |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
 | `RPROXY_CERT_CHECK_SECS` | `--cert-check-secs` | `60` | 証明書ファイル（ルールの `tls` と制御 API）が変わったかを確かめる間隔（秒）。変わったものだけ読み直す（certbot・cert-manager の更新をそのまま反映）。`0` で止める |
 | `RPROXY_CERT_STORE` | `--cert-store` | `/var/lib/rproxy/certs` | `PUT /certs/{name}` で受け取った証明書と鍵の置き場所（v0.4.2、#240。ディレクトリ 0700・ファイル 0600。ルールからは `{"cert": "<name>"}`。docs/API.md の「証明書の API」）。`trusted_dirs` の下には置けない |
@@ -119,7 +120,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | 状況 | 動作 |
 |---|---|
 | ログのディレクトリに書けない | 標準出力にログを出す（`part: log`） |
-| トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP すると解除（`part: tokens`） |
+| トークンファイルが読めない（権限） | 制御 API はすべてのリクエストを 401 で拒否する。読めるようにして SIGHUP するか、`RPROXY_TOKENS_CHECK_SECS` の確認で解除（`part: tokens`） |
 | 制御 API の TLS 証明書・鍵が読めない（権限）、ポートが使用中 | ルールの転送は動かしたまま、その制御 API のアドレスだけを開き直す（10 秒後から間隔を倍々に延ばし、最大 5 分）（`part: api_tls` / `part: api`） |
 | 制御 API の Unix ソケットを作れない（権限、別のプロセスが使用中） | ソケットなしで起動する（`part: api_socket`） |
 | `http.http3` のルールの UDP のポートを使えない（使用中、権限） | そのルールは TCP（HTTP/1.1・HTTP/2）だけで動く。`stats.http.http3` に理由が出る（`part: http3`） |
@@ -326,7 +327,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）、一時停止中（`outcome: locked_out`）。認証の方法（`auth`：`token`・`cert`・`token+cert`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |
 | `token.expiring` / `token.expired` | 制御 API のトークンの期限が近い（`RPROXY_TOKEN_WARN_DAYS` より近い）/ 切れた（`token`、`expires`、`days_left`）。起動・SIGHUP・1 日 1 回、状態が変わったときに 1 回だけ |
 | `api.lockout` / `api.unlock` | 認証の失敗が続いた送信元（`client`。IPv6 は /64）を止めた（`failures`、`until`）/ 解いた |
-| `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP でトークン・制御 API の証明書・ルールの証明書・CrowdSec の鍵を読み直した（読めなければ今のものを使い続ける） |
+| `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP でトークン・制御 API の証明書・ルールの証明書・CrowdSec の鍵を読み直した（読めなければ今のものを使い続ける）。`reload.tokens` はトークンファイルが変わったときにも出る（`reason: "file changed"`、数の `tokens` だけ。誤りのある版の警告は版ごとに 1 回） |
 | `geoip.reload` | `global.geoip` のデータベースを読んだ・読み直した（`db`：`country` / `asn`、`path`、`build_epoch`）。読めないときは `degraded`（`part: geoip`）で今のものを使い続ける |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn` |
