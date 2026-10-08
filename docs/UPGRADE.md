@@ -51,7 +51,7 @@ rproxy-api は、動いたまま新しいバイナリに入れ替えられる（
 
 - 起動役（launch）は、イメージと同じ X.Y の最新のパッチを、キャッシュとリリースの取り先から選び、**署名を確かめてから**子として起動する。取り先に届かない（障害・閉じたネットワーク）ときはキャッシュの最新、なければイメージの版。そのあとはコンテナの init として残り、シグナル（TERM・INT・HUP・USR2）をサーバに渡し、引き継ぎで主プロセスが変わったら新しいほうを追う（`launch.mainpid`）。孤児になったプロセスも引き取る（`PR_SET_CHILD_SUBREAPER`）。
 - 動いている間：`RPROXY_UPDATE_INTERVAL` ごと、または `POST /admin/update`（`admin`、既定では Unix ソケットからだけ。`202 {"status":"checking"}`）で新しいパッチを探し、確かめたら引き継ぎで入れ替える。`check` なら知らせるだけ（ログ `update.available` と `GET /admin/update`）。
-- 新しい版は、`RPROXY_UPDATE_HEALTHY` の間動き続けたら「よい版」になる（`update.healthy`。前のよい版を 1 つ残し、ほかはキャッシュから消す）。それまでに自分で落ちたら（起動しない・引き継ぎに失敗した・すぐ落ちた）「悪い版」として覚えて二度と選ばず、前のよい版（なければイメージの版）で起動し直す（`update.rollback`）。起動役へのシグナル（`docker stop`・ローリング再起動）で止めた版は悪い版にしない（次の起動でまた試す）。起動役ごと止まった（SIGKILL・OOM）ときは `update.interrupted` で数え、続けて 3 回で悪い版にする（セキュリティレビュー M1。1 回の停止でセキュリティのパッチが止まらないように）。悪い版の印は `DELETE /admin/update/bad[?version=X.Y.Z]`（`admin`、既定では Unix ソケットからだけ）か `rproxy-api update-clear-bad [--version X.Y.Z]`（キャッシュの `state.json` を直す）で外せる。
+- 新しい版は、`RPROXY_UPDATE_HEALTHY` の間動き続けたら「よい版」になる（`update.healthy`。前のよい版を 1 つ残し、ほかはキャッシュから消す）。それまでに自分で落ちたら（起動しない・引き継ぎに失敗した・すぐ落ちた）「悪い版」として覚えて二度と選ばず、前のよい版（なければイメージの版）で起動し直す（`update.rollback`）。起動役へのシグナル（`docker stop`・ローリング再起動）で止めた版は悪い版にしない（次の起動でまた試す）。起動役ごと止まった（SIGKILL・OOM）ときと、サーバだけが SIGKILL で止められた（コンテナのメモリの上限で OOM killer がいちばん大きいサーバを選んだ、`kill -9`）ときは `update.interrupted` で数え（サーバだけのときは起動役がその場で同じ選び方で起動し直す）、続けて 3 回で悪い版にする（セキュリティレビュー M1。1 回の停止でセキュリティのパッチが止まらないように）。悪い版の印は `DELETE /admin/update/bad[?version=X.Y.Z]`（`admin`、既定では Unix ソケットからだけ）か `rproxy-api update-clear-bad [--version X.Y.Z]`（キャッシュの `state.json` を直す）で外せる。
 - k8s ではレプリカの入れ替えで更新するので `RPROXY_UPDATE=off` にする。
 
 | 環境変数（引数は同じ名前の `--update-*`） | 既定 | 意味 |

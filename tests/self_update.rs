@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -150,10 +151,39 @@ fn start(dir: &Path, args: &[&str], env: &[(&str, String)]) -> Procs {
 		.stdout(out.try_clone().unwrap())
 		.stderr(out)
 		.stdin(Stdio::null())
+		// a group of its own: `kill_group` stops everything, like the end of a container
+		.process_group(0)
 		.spawn()
 		.unwrap();
 	let pid = child.id() as i32;
 	Procs { first: child, pids: vec![pid], log }
+}
+
+/// SIGKILL to the launcher and everything it started (a container killed or out of memory).
+fn kill_group(procs: &mut Procs) {
+	// SAFETY: the process group this test started
+	unsafe { libc::killpg(procs.pids[0], libc::SIGKILL) };
+	let _ = procs.first.wait();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while fs::read_dir("/proc").unwrap().flatten().any(|e| {
+		let stat = fs::read_to_string(e.path().join("stat")).unwrap_or_default();
+		let rest: Vec<&str> = stat.rsplit_once(')').map(|(_, r)| r.split_whitespace().collect()).unwrap_or_default();
+		rest.first() != Some(&"Z") && rest.get(2).and_then(|g| g.parse::<i32>().ok()) == Some(procs.pids[0])
+	}) {
+		assert!(Instant::now() < deadline, "the process group did not stop");
+		std::thread::sleep(Duration::from_millis(20));
+	}
+}
+
+/// The server the launcher runs now (its child), once there is one.
+async fn server_of(launcher: i32, not: &[i32], log: &Path) -> i32 {
+	let mut server = 0;
+	wait_until("the server", log, || {
+		server = children_of(launcher).into_iter().find(|p| !not.contains(p)).unwrap_or(0);
+		server != 0
+	})
+	.await;
+	server
 }
 
 fn lines(log: &Path) -> Vec<Value> {
@@ -357,8 +387,9 @@ async fn launch_runs_the_newest_patch_follows_upgrades_and_rolls_back() {
 	assert_eq!((followed["old"].as_i64(), followed["new"].as_i64()), (Some(main as i64), Some(second as i64)), "{followed}");
 	wait_until("the first server to end", &log, || !alive(main)).await;
 
-	// v1 dies while on trial: marked bad, the image's version runs instead
-	signal(second, libc::SIGKILL);
+	// v1 dies while on trial (a crash of its own: SIGKILL counts as an interruption,
+	// `a_trial_killed_three_times_is_bad`): marked bad, the image's version runs instead
+	signal(second, libc::SIGABRT);
 	let rolled = wait_event(&log, "update.rollback", 1).await;
 	assert_eq!(rolled["version"], json!(v1.to_string()), "{rolled}");
 	let mut third = 0;
@@ -437,6 +468,72 @@ async fn a_trial_stopped_by_a_signal_is_not_bad_and_bad_marks_can_be_cleared() {
 	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap()["cleared"], json!([v1.to_string()]));
 	assert_eq!(state(&s.cache)["bad"], json!([]));
+	let _ = fs::remove_dir_all(&s.dir);
+}
+
+/// A version on trial cut short by SIGKILL, abnormal ends the launcher cannot
+/// tell from the version's fault (security review M1): the whole container
+/// killed (the launcher with it), or only the server killed (the OOM killer of
+/// the container's memory limit takes the largest process, the server). Each
+/// counts as `update.interrupted`; the third makes the version bad and the
+/// image's version runs instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trial_killed_three_times_is_bad() {
+	let s = setup("launch-kill").await;
+	let binary = fs::read(env!("CARGO_BIN_EXE_rproxy-api")).unwrap();
+	let v1 = next(Version::own(), 1);
+	publish(&s.files, &s.pair, v1, &binary, false);
+	let port = free_port();
+	let mut env = s.env.clone();
+	env.push(("RPROXY_API_PORT", port.to_string()));
+	env.retain(|(k, _)| *k != "RPROXY_UPDATE_HEALTHY");
+	env.push(("RPROXY_UPDATE_HEALTHY", "10m".into()));
+	let trial = |cache: &Path| state(cache)["trial"].clone();
+
+	// 1. the container is killed while v1 is on trial
+	let mut procs = start(&s.dir, &["launch"], &env);
+	let log = procs.log.clone();
+	assert_eq!(wait_event(&log, "launch.start", 1).await["version"], json!(v1.to_string()));
+	server_of(procs.pids[0], &[], &log).await;
+	assert_eq!(trial(&s.cache)["version"], json!(v1.to_string()));
+	kill_group(&mut procs);
+	drop(procs);
+
+	// 2. the next start counts it and tries v1 again
+	let mut procs = start(&s.dir, &["launch"], &env);
+	let log = procs.log.clone();
+	let launcher = procs.pids[0];
+	assert_eq!(wait_event(&log, "update.interrupted", 1).await["times"], json!(1));
+	assert_eq!(wait_event(&log, "launch.start", 1).await["version"], json!(v1.to_string()));
+	assert_eq!(trial(&s.cache)["interrupted"], json!(1), "{}", trial(&s.cache));
+	let server = server_of(launcher, &[], &log).await;
+
+	// 3. only the server is killed: counted the same, not bad at once
+	signal(server, libc::SIGKILL);
+	assert_eq!(wait_event(&log, "update.interrupted", 2).await["times"], json!(2));
+	assert_eq!(wait_event(&log, "launch.start", 2).await["version"], json!(v1.to_string()));
+	let st = state(&s.cache);
+	assert_eq!((&st["trial"]["interrupted"], st["bad"].as_array().map_or(0, |b| b.len())), (&json!(2), 0), "{st}");
+	assert!(lines(&log).iter().all(|l| l["event"] != "update.rollback"), "not rolled back");
+	let second = server_of(launcher, &[server], &log).await;
+
+	// 4. the third time: bad, and the image's version runs
+	signal(second, libc::SIGKILL);
+	assert_eq!(wait_event(&log, "launch.start", 3).await["version"], json!(Version::own().to_string()));
+	let st = state(&s.cache);
+	assert_eq!((&st["bad"], &st["trial"]), (&json!([v1.to_string()]), &Value::Null), "{st}");
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while api(port, reqwest::Method::GET, "/capabilities").await.is_none() {
+		assert!(Instant::now() < deadline, "API down:\n{}", fs::read_to_string(&log).unwrap_or_default());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	signal(launcher, libc::SIGTERM);
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while procs.first.try_wait().unwrap().is_none() {
+		assert!(Instant::now() < deadline, "the launcher did not stop");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	drop(procs);
 	let _ = fs::remove_dir_all(&s.dir);
 }
 

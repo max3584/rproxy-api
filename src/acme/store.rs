@@ -62,7 +62,12 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 	f.write_all(data)?;
 	f.sync_all()?;
 	drop(f);
-	std::fs::rename(&tmp, path)
+	std::fs::rename(&tmp, path)?;
+	// the rename itself survives a power cut
+	if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+		std::fs::File::open(parent)?.sync_all()?;
+	}
+	Ok(())
 }
 
 /// PEM text of one DER object.

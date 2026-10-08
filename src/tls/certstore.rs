@@ -179,13 +179,31 @@ impl Material {
 					// expired on disk (rproxy was stopped past the renewal): the stand-in until it is renewed
 					Some(k) if !k.expired(tlsconf::unix_now()) => Material::Keyed(Arc::new(k)),
 					// not issued yet: a self-signed stand-in (never written to disk)
-					_ => {
-						let (chain, der) = crate::acme::placeholder(&id.domains).map_err(ApiError::tls_config)?;
-						Material::Keyed(Arc::new(KeyedCert::from_parts(chain, der, cert, key)?))
-					}
+					_ => Material::acme_placeholder(cert, key, id)?,
 				}
 			}
 		})
+	}
+
+	/// The self-signed stand-in of an ACME certificate (never written to disk).
+	fn acme_placeholder(cert: &str, key: &str, id: &crate::acme::CertId) -> Result<Material, ApiError> {
+		let (chain, der) = crate::acme::placeholder(&id.domains).map_err(ApiError::tls_config)?;
+		Ok(Material::Keyed(Arc::new(KeyedCert::from_parts(chain, der, cert, key)?)))
+	}
+
+	/// `load` the first time a rule uses `source`. An ACME pair on disk that
+	/// does not load (rproxy was killed between writing the new key and the new
+	/// certificate, or a file is damaged) gives the stand-in instead of failing
+	/// the rule; `Acme` sees the same and obtains the certificate again.
+	fn load_first(source: &Source) -> Result<Material, ApiError> {
+		match (Material::load(source), source) {
+			(Err(e), Source::Acme { cert, key, id }) => {
+				warn!(event = "acme.error", part = "storage", file = %cert, error = %e.message,
+					"the stored certificate and key do not load; serving a stand-in until it is obtained again");
+				Material::acme_placeholder(cert, key, id)
+			}
+			(result, _) => result,
+		}
 	}
 
 	fn not_after(&self) -> i64 {
@@ -253,7 +271,7 @@ impl CertStore {
 			return Ok(material);
 		}
 		let print = tlsconf::fingerprint(source.files());
-		let material = Material::load(source)?;
+		let material = Material::load_first(source)?;
 		let now = tlsconf::unix_now();
 		let mut slot = Slot { material: Some(material.clone()), print, failed: None, logged: None, expired: material.not_after() <= now };
 		log_change(&mut slot.logged, source.file(), material.not_after(), now, self.warn_secs());
@@ -406,6 +424,27 @@ fn log_change(logged: &mut Option<CertState>, file: &str, not_after: i64, now: i
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// rproxy killed between `issue` writing the new key and the new certificate:
+	/// the rule starts with the stand-in instead of failing.
+	#[test]
+	fn an_acme_pair_that_does_not_match_gives_the_stand_in() {
+		crate::net::files::private_umask();
+		let dir = std::env::temp_dir().join(format!("rproxy-certstore-acme-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let domains = vec!["a.example.com".to_string()];
+		let (cert, key) = crate::acme::store::cert_files(&dir, "le", &domains);
+		let issued = rcgen::CertificateParams::new(domains.clone()).unwrap().self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+		crate::acme::store::write_private(std::path::Path::new(&cert), issued.pem().as_bytes()).unwrap();
+		crate::acme::store::write_private(std::path::Path::new(&key), rcgen::KeyPair::generate().unwrap().serialize_pem().as_bytes()).unwrap();
+		let source = Source::Acme { cert: cert.clone(), key: key.clone(), id: crate::acme::CertId::new("le", &domains) };
+		assert!(Material::load(&source).is_err(), "the pair does not match");
+		let store = CertStore::default();
+		let stand_in = store.keyed(&source).unwrap();
+		assert_ne!(stand_in.chain[0].as_ref(), issued.der().as_ref(), "not the certificate on disk");
+		assert_eq!(stand_in.names, domains);
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
 
 	#[test]
 	fn states() {

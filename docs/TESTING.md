@@ -8,6 +8,7 @@ English: [TESTING.md](en/TESTING.md)
 | `RPROXY_TEST_DATABASE_URL=mysql://... cargo test --test db_restore --test persist` | MariaDB からの復元（`forward_rules`）と、API で作ったルールの保存・再起動をまたぐ復元（`rproxy_rules`、#144）。変数がなければその部分はスキップ | `test`（同じコンテナで Alpine の MariaDB を動かす） |
 | `RPROXY_TEST_PEBBLE=… RPROXY_TEST_PDNS=… RPROXY_TEST_PDNS_SCHEMA=… RPROXY_TEST_SQLITE3=… cargo test --test acme` | ACME（docs/ACME.md）：Pebble（ACME の試験用の CA）と PowerDNS を起動して、HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS の API・RFC 2136（PowerDNS の DNS UPDATE、TSIG の HMAC-SHA256 と SHA512）・acme-dns（小さな偽物）・CNAME の委任・汎用の REST）で実際に証明書を取る。変数がなければその部分はスキップ（API の守りの試験はいつも動く）。`RPROXY_TEST_REQUIRE_ACME=1` でスキップを失敗にする | `test`（同じコンテナで Alpine の `pebble`・`pdns`・`pdns-backend-sqlite3`・`pdns-doc`・`sqlite`。`RPROXY_TEST_REQUIRE_ACME=1`） |
 | `cargo test --test self_update` | 自動更新（#174）：署名つきのリリースのミラー（HTTPS）から取って確かめ、引き継ぎで入れ替える・起動役（`launch`）・ロールバック。minisign の道具で作った署名を確かめる試験は、`minisign` がなければスキップ（`RPROXY_TEST_REQUIRE_MINISIGN=1` でスキップを失敗にする） | `test`（Alpine の `minisign`。`RPROXY_TEST_REQUIRE_MINISIGN=1`） |
+| `RPROXY_TEST_CRASH_ROUNDS=50 cargo test --test crash` | 異常終了（SIGKILL）の試験の繰り返しを増やす（下の「異常終了」。既定は各 3 回、MariaDB の試験は `RPROXY_TEST_DATABASE_URL` があるときだけ） | Crash ワークフロー（手動だけ） |
 | `scripts/test-transparent.sh` | `source_ip` の実経路（ネットワーク名前空間。root 不要） | `transparent` |
 | `cargo bench --bench '*'` | 性能のベンチマーク（`benches/`、criterion）。`cargo test` では各ベンチマークを 1 回だけ動かして壊れていないことを確かめる | `test`（1 回だけ）、`Benchmarks`（比較） |
 | `cargo +nightly fuzz run <ターゲット>` | 自前のパーサーのファジング（下の「ファジング」） | Fuzz ワークフローの `fuzz` |
@@ -285,7 +286,21 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_signed_patch_is_swapped_in_and_a_forged_one_refused` | 署名つきの索引（番号が飛んでいて、ほかのマイナーも並ぶ）から新しいパッチを選び、`POST /admin/update` で取って確かめ、引き継ぎで入れ替える（新しいプロセスはキャッシュのバイナリ）。`RPROXY_UPDATE_HEALTHY` の後によい版になる。署名がバイナリと合わないパッチは断り（`GET /admin/update` の `error`）、キャッシュにも入れない |
 | `launch_runs_the_newest_patch_follows_upgrades_and_rolls_back` | `rproxy-api launch` が最新のパッチを選んで起動する（trial）。SIGUSR2 を渡して引き継ぎの後の主プロセスを追う。trial の版が落ちたら悪い版にしてイメージの版で起動し直す。SIGTERM でサーバと一緒に終わる |
 | `a_trial_stopped_by_a_signal_is_not_bad_and_bad_marks_can_be_cleared` | 試している版を起動役への SIGTERM で止めても悪い版にしない（`trial` は消える）。`rproxy-api update-clear-bad --version` で悪い版の印を外せる（セキュリティレビュー M1） |
+| `a_trial_killed_three_times_is_bad` | 試している版が SIGKILL で止まる：コンテナごと（起動役も）と、サーバだけ（コンテナのメモリの上限の OOM killer はいちばん大きいサーバを選ぶ）。どちらも `update.interrupted` で数え（サーバだけのときは起動役がその場で起動し直す）、3 回目で悪い版にしてイメージの版を起動する（セキュリティレビュー M1） |
 | `signatures_of_the_minisign_tool_verify` | minisign の道具で作った鍵と署名（既定の事前ハッシュの形と古い形）を確かめられる |
+
+## 結合テスト：異常終了（`tests/crash.rs`）
+
+本物のバイナリを SIGKILL（OOM killer・`kill -9` と同じ）で止め、同じファイルで起動し直す（systemd・起動役の再起動と同じ）。kill の時刻はでたらめに変え、各試験を `RPROXY_TEST_CRASH_ROUNDS` 回（既定 3）繰り返す。多く回すのは手動の Crash ワークフロー（`gh workflow run crash.yml -f rounds=50`）。プロセスは自分のプロセスグループで動かし、引き継ぎの新しいプロセスもまとめて止める（systemd の `KillMode=control-group`・コンテナの終わりと同じ）。
+
+| テスト | 確かめること |
+|---|---|
+| `stored_certificates_survive_kills_during_writes` | `PUT` / `DELETE /certs` を 4 本で続けている間に kill。起動し直すと、保存した証明書はどれも送ったもののどれかで、鍵と組になって読める（ディスクの `current/` を直接確かめる）。`GET /certs` とディスクが一致し、`remove` が脇に置いたもの（`.removing-*`）は残らない。その証明書を使うルールは送った証明書で動く |
+| `leftovers_of_a_killed_process_do_not_stop_the_startup` | kill されたプロセスが残すもの（制御 API の Unix ソケット・引き継ぎのソケットのファイル、証明書のストアの一時ファイル・`current.tmp`・`current` のない名前・`.removing-*`）があっても起動し、Unix ソケットで答え、引き継ぎもできる |
+| `a_kill_under_traffic_comes_back_with_the_same_rules` | TCP・UDP・HTTP を流している間に kill。起動し直すと `/readyz` が最初に 200 を返したときにはルールがすべてそろっていて（`GET /rules` が kill の前と同じ。数・`started_at` を除く）、流れ、数は 0 から（`counters_since` が起動の時刻） |
+| `kills_during_a_live_upgrade_leave_a_service_that_starts_again` | 引き継ぎ（SIGUSR2）の途中（すぐ・`handoff.start`・`handoff.received`・`handoff.sent`・`restore.start`・`handoff.ready` の直後）に古いプロセス・新しいプロセス・両方を kill。準備の前に新しいプロセスが死んだら古いプロセスが変更も含めて動き続け、古いプロセスだけが死んだら新しいプロセスは引き継ぐか自分で終わる（止まったままにならない）。どの場合も起動し直すと、ルール・制御 API（TCP と Unix ソケット）が戻る |
+| `stored_rules_survive_kills_with_mariadb` | `persist: true` のトークンでルールの作成・変更・削除を 6 本で続けている間に kill。起動し直すと、各ルールは最後に答えた変更のとおりか、kill のときに送っていた変更のとおり（`origin: api`・`persisted: true`）で、`rproxy_rules` の行とも一致する |
+| `stored_rule_sets_survive_kills_with_mariadb` | `persist: true` のトークンでルールの組を世代を上げながら `PUT` し続けている間に kill。起動し直すと、組は最後に答えた世代か kill のときに送っていた世代で、その世代のルールがちょうどそろう |
 
 ## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
 

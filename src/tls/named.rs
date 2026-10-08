@@ -151,7 +151,19 @@ pub fn prepare() -> io::Result<()> {
 	fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
 	let probe = dir.join(format!(".probe-{}", std::process::id()));
 	fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&probe)?;
-	fs::remove_file(&probe)
+	fs::remove_file(&probe)?;
+	clean_leftovers(&dir);
+	Ok(())
+}
+
+/// Certificates a killed rproxy set aside in `remove` but did not delete yet
+/// (never read: not a valid name).
+fn clean_leftovers(dir: &Path) {
+	for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+		if e.file_name().to_string_lossy().starts_with(REMOVING) {
+			let _ = fs::remove_dir_all(e.path());
+		}
+	}
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -310,6 +322,10 @@ pub fn put(name: &str, req: &PutRequest, by: &str, if_match_header: Option<&str>
 		std::os::unix::fs::symlink(version, &link)?;
 		fs::rename(&link, base.join(CURRENT))?;
 		sync_dir(&base)?;
+		if current.is_none() {
+			// a new name: its directory survives a power cut too
+			sync_dir(&dir())?;
+		}
 		// older versions
 		for e in fs::read_dir(&base)?.flatten() {
 			let n = e.file_name();
@@ -339,10 +355,17 @@ pub fn remove(name: &str, if_match_header: Option<&str>) -> Result<CertView, Api
 			});
 		}
 	}
-	fs::remove_dir_all(dir().join(name)).map_err(store_error)?;
+	// out of sight in one rename first: a kill during the removal leaves no
+	// half-removed certificate (a certificate without its key) under its name
+	let aside = dir().join(format!("{REMOVING}{name}-{}", std::process::id()));
+	fs::rename(dir().join(name), &aside).map_err(store_error)?;
 	let _ = sync_dir(&dir());
+	let _ = fs::remove_dir_all(&aside);
 	Ok(current)
 }
+
+/// Prefix of a certificate being removed (never a valid name: it starts with a dot).
+const REMOVING: &str = ".removing-";
 
 fn pem_block(label: &str, der: &[u8]) -> String {
 	use base64::Engine;
