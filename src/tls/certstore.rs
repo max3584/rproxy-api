@@ -28,13 +28,16 @@ pub enum Source {
 	/// under `global.acme.storage`, or a self-signed stand-in for `id`'s names
 	/// until they are written.
 	Acme { cert: String, key: String, id: crate::acme::CertId },
+	/// A certificate stored through the control API (`tls.certificates[].cert`,
+	/// #240): the files of `name` in the store (`tls::named`).
+	Named { name: String, cert: String, key: String },
 }
 
 impl Source {
 	/// The certificate file, as shown in views, metrics and logs.
 	pub fn file(&self) -> &str {
 		match self {
-			Source::Keyed { cert, .. } | Source::Acme { cert, .. } => cert,
+			Source::Keyed { cert, .. } | Source::Acme { cert, .. } | Source::Named { cert, .. } => cert,
 			Source::Bundle(file) => file,
 		}
 	}
@@ -44,7 +47,7 @@ impl Source {
 		match self {
 			Source::Keyed { cert, chain, key } => [Some(cert.as_str()), chain.as_deref(), Some(key.as_str())].into_iter().flatten().collect(),
 			Source::Bundle(file) => vec![file],
-			Source::Acme { cert, key, .. } => vec![cert, key],
+			Source::Acme { cert, key, .. } | Source::Named { cert, key, .. } => vec![cert, key],
 		}
 	}
 
@@ -69,6 +72,11 @@ pub fn sources_with(spec: &TlsSpec, acme: Option<&crate::acme::Acme>) -> Vec<(Ce
 		.certificates
 		.iter()
 		.filter_map(|c| match (&c.acme, acme) {
+			_ if c.cert.is_some() => {
+				let name = c.cert.clone().unwrap_or_default();
+				let (cert, key) = crate::tls::named::files(&name);
+				Some((CertRole::Certificate, Source::Named { name, cert, key }))
+			}
 			(None, _) => Some((CertRole::Certificate, Source::keyed(&c.cert_file, c.chain_file.as_deref(), &c.key_file))),
 			(Some(resolver), Some(acme)) => {
 				let id = crate::acme::CertId::new(resolver, &c.domains);
@@ -156,6 +164,12 @@ impl Material {
 		Ok(match source {
 			Source::Keyed { cert, chain, key } => Material::Keyed(Arc::new(KeyedCert::load(cert, chain.as_deref(), key)?)),
 			Source::Bundle(file) => Material::Bundle(Arc::new(CertBundle::load(file)?)),
+			Source::Named { name, cert, key } => {
+				if !std::path::Path::new(cert).exists() {
+					return Err(crate::tls::named::missing(name));
+				}
+				Material::Keyed(Arc::new(KeyedCert::load(cert, None, key)?))
+			}
 			Source::Acme { cert, key, id } => {
 				let stored = match std::path::Path::new(cert).exists() {
 					true => Some(KeyedCert::load(cert, None, key)?),

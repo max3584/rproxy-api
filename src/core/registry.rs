@@ -1124,6 +1124,30 @@ impl Registry {
 		self.apply_certs(&changes, false).await
 	}
 
+	/// A certificate was stored or replaced through `PUT /certs/{name}` (#240):
+	/// the rules using it take it now (without waiting for
+	/// `RPROXY_CERT_CHECK_SECS`), and failed rules waiting for it start.
+	pub async fn cert_stored(self: &Arc<Self>, name: &str) -> (usize, usize) {
+		let mut changes = self.certs.refresh();
+		let (cert, key) = crate::tls::named::files(name);
+		changes.changed.insert(Source::Named { name: name.to_string(), cert, key });
+		self.apply_certs(&changes, false).await
+	}
+
+	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
+	pub async fn rules_using_cert(&self, name: &str) -> Vec<String> {
+		let mut keys: Vec<String> = self
+			.rules
+			.lock()
+			.await
+			.values()
+			.filter(|e| e.spec().tls.certificates.iter().any(|c| c.cert.as_deref() == Some(name)))
+			.map(|e| e.spec().key.to_string())
+			.collect();
+		keys.sort();
+		keys
+	}
+
 	/// The daily expiry check: rules drop server certificates that have expired
 	/// since the last check, and stop when none is left. Returns the rules updated.
 	pub async fn check_certificate_expiry(self: &Arc<Self>) -> usize {
@@ -1171,7 +1195,11 @@ impl Registry {
 							}
 						}
 					}
-					Entry::Failed(f) if tlsconf::is_cert_expired_text(&f.error) && (all || uses(&f.spec, &changes.changed)) => {
+					// expired, or waiting for a stored certificate (#240)
+					Entry::Failed(f)
+						if (tlsconf::is_cert_expired_text(&f.error) || crate::tls::named::is_missing(&f.error))
+							&& (all || uses(&f.spec, &changes.changed)) =>
+					{
 						CertAction::Restart(Box::new(f.spec.clone()), f.generation)
 					}
 					Entry::Failed(_) => CertAction::Nothing,

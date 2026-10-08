@@ -165,6 +165,9 @@ struct Options {
 	/// Longest the old process waits for its connections after a live upgrade [default: 5m]
 	#[arg(long, env = "RPROXY_HANDOFF_DRAIN")]
 	handoff_drain: Option<String>,
+	/// Where PUT /certs/{name} stores certificates and keys [default: /var/lib/rproxy/certs] (v0.4.2, #240)
+	#[arg(long, env = "RPROXY_CERT_STORE")]
+	cert_store: Option<PathBuf>,
 	/// After SIGTERM, keep accepting this long while /readyz says draining (e.g. 5s) [default: 0s]
 	#[arg(long, env = "RPROXY_SHUTDOWN_DELAY")]
 	shutdown_delay: Option<String>,
@@ -532,6 +535,10 @@ fn main() -> ExitCode {
 	let handoff_from = std::env::var_os(rproxy_api::control::upgrade::handoff::ENV_FROM).map(PathBuf::from);
 	std::env::remove_var(rproxy_api::control::upgrade::handoff::ENV_FROM);
 	let opts = Options::parse();
+	// stored certificates (#240): rules name them, also for --check-config
+	if let Some(dir) = &opts.cert_store {
+		rproxy_api::tls::named::set_dir(dir.clone());
+	}
 	if let Some(Command::Launch { .. }) = &opts.command {
 		return launch(&opts);
 	}
@@ -791,6 +798,23 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	rproxy_api::net::files::check_dirs(&trusted).map_err(|e| format!("RPROXY_FILES_TRUSTED_DIRS: {e}"))?;
 	if !trusted.is_empty() {
 		info!(event = "files.trusted_dirs", dirs = %trusted.join(":"), "files under these directories may be owned by root too");
+	}
+	// the certificate store (#240): rproxy's own files, never under a trusted directory
+	let store = rproxy_api::tls::named::dir();
+	let real = std::fs::canonicalize(&store).unwrap_or_else(|_| store.clone());
+	if trusted.iter().filter_map(|d| std::fs::canonicalize(d).ok()).any(|d| real.starts_with(d)) {
+		return Err(format!(
+			"RPROXY_CERT_STORE {} is under a trusted directory ({}); keep stored keys in rproxy's own directory",
+			store.display(),
+			trusted.join(":")
+		));
+	}
+	match rproxy_api::tls::named::prepare() {
+		Ok(()) => info!(event = "cert_store", dir = %store.display()),
+		Err(e) if opts.cert_store.is_some() => error!(event = "degraded", part = "cert_store", dir = %store.display(), error = %e,
+			"PUT /certs answers 503 cert_store_unavailable until the directory can be written"),
+		Err(e) => info!(event = "cert_store", dir = %store.display(), error = %e,
+			"the certificate API is unavailable here (set RPROXY_CERT_STORE to use it)"),
 	}
 	rproxy_api::net::files::set_trusted_dirs(trusted);
 	if let Some((_, d)) = &doc {

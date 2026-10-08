@@ -249,6 +249,15 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_second_sigterm_cuts_the_drain_short` | `drain` の間の 2 回目の SIGTERM で待つのをやめ、残りの接続を切る |
 | `values_out_of_range_stop_the_startup` | 1 時間を超える値は起動を止める |
 
+## 結合テスト：証明書の API（`tests/cert_api.rs`、#240、v0.4.2）
+
+| テスト | 確かめること |
+|---|---|
+| `store_use_replace_and_delete` | `PUT /certs/{name}` が 201 と `ETag`（指紋）、ファイルは 0600・ディレクトリは 0700。`{"cert": name}` のルールがその証明書で TLS を終える（owner check を通る）。`If-Match` の違いは 412、差し替え（200）で開いている接続は続き、新しい接続は新しい証明書。古い版は消える。使っている間の `DELETE` は `409 in_use`（`used_by`）、使わなくなれば 204。監査の行に名前と指紋があり、鍵はない。`features.cert_store` |
+| `bad_certificates_and_names_are_refused` | 読めない PEM・鍵の不一致・期限切れ・鍵なし・知らない項目・名前の誤りは `400 invalid`（応答に鍵を出さない）、1 MiB を超える本文は 413、期限が近いものは `warnings`。保存していない名前を使うルールは `400 tls_config`、`cert` と `cert_file` の両方は誤り |
+| `a_failed_rule_starts_once_its_certificate_is_stored` | 設定ファイルのルールが保存していない名前を使うと `failed`、その名前を `PUT` すると動き出す |
+| `scopes_and_allow_certs` | `certs:read` / `certs:write` のスコープ、`allow_certs` の外の名前は `PUT`・ルールでの使用とも 403、`GET /certs` は `allow_certs` の内だけ |
+
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 
 本物のバイナリを起動して、`global.performance` の効き目を外から確かめる。

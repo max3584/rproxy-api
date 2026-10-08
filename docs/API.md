@@ -24,11 +24,12 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           scopes: [rules:write]
           allow_listen_ports: 20000-29999   # 作成・変更・削除できる待ち受けポート（範囲ルールは全体が収まること）
           allow_rulesets: [ci/]             # v0.4：PUT / DELETE できるルールの組の名前の先頭（省略ですべて）
+          allow_certs: [ci-]                # v0.4.2（#240）：PUT / DELETE / 読む・ルールで使える保存した証明書の名前の先頭（省略ですべて）
           expires: 2027-03-31               # この日（UTC）まで有効
           persist: true                     # v0.4（#144）：作ったルールを rproxy_rules に保存する（既定 false）
       ```
 
-    - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
+    - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`certs:read`（`GET /certs`。v0.4.2）、`certs:write`（`PUT` / `DELETE /certs/{name}`。v0.4.2）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
     - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
@@ -790,12 +791,33 @@ v0.4.0 の後にパッチで足した設定（docs/DESIGN-v0.4.x.md。足すだ�
 - 引き継ぎ（SIGUSR2）の後の古いプロセスの終わり方は今までどおり（`RPROXY_HANDOFF_DRAIN`）。
 - ログ：`shutdown.start`（`delay_secs`・`drain_secs`）、`shutdown.drain`（`connections`）、`shutdown.now`（2 回目のシグナル）、`shutdown.done`（`cut`）。systemd での推奨値は README の「SIGTERM での終わり方」。
 
+### 証明書の API（v0.4.2、#240、`features.cert_store`）
+
+証明書と鍵を制御 API で渡して rproxy に保存し、ルールから名前で使う（cert-manager などの Secret を外から押し込む使い方）。鍵は DB に置かず、応答・ログに出さない。
+
+| メソッドとパス | 本文 | 成功時 | 説明 |
+|---|---|---|---|
+| `PUT /certs/{name}` | `{"cert": "<PEM>", "key": "<PEM>", "chain": "<PEM>"?}` | 201（新しく）/ 200（差し替え） | 確かめて保存する：PEM が読める、鍵と証明書が合う、チェーンの順、期限内（切れていれば `400 invalid`、`RPROXY_CERT_WARN_DAYS` 以内なら応答に `warnings`）。`If-Match`（`fingerprint_sha256`、`*` はあれば）が違えば `412 precondition_failed`。応答は下の 1 件の形と `ETag`。本文は 1 MiB まで（超えると 413） |
+| `GET /certs` | | 200 | `[{"name","sans","not_before","not_after","fingerprint_sha256","issuer","used_by":["tcp/0.0.0.0:443",...],"updated_at","updated_by"}]`（トークンの `allow_certs` の内だけ）。鍵は返さない |
+| `GET /certs/{name}` | | 200 | 上の 1 件（なければ `404 not_found`） |
+| `DELETE /certs/{name}` | | 204 | 使うルール（設定ファイル・API・組）があれば `409 in_use`（本文に `used_by`）。`If-Match` も受ける |
+
+- 名前：`[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?`（外は `400 invalid`）。
+- スコープ：`certs:read`（`GET`）、`certs:write`（`PUT`・`DELETE`）。トークンの `allow_certs`（名前の先頭）の外は `403 forbidden`。
+- 鍵が流れるので、TCP の制御 API では TLS か loopback からだけ受け付ける（Unix ソケットもよい）。ほかの平文の TCP からの `PUT` は `403 tls_required`。
+- ルールからは `tls.certificates[]` に `{"cert": "<name>"}`（`cert_file`・`key_file`・`chain_file`・`acme` の代わり。どれか 1 つ）。API・設定ファイル・DB・組で同じ形。`tcp` の `terminate`（`http` のルールを含む）と `udp` の DTLS で使える。`client_auth`・転送先の証明書にはまだ使えない。使うには `rules:write` と、名前がトークンの `allow_certs` の内であること（外は `403`）。
+  - 保存していない名前：API の作成・変更・組の PUT は `400 tls_config`（`certificate "<name>" is not in the certificate store`）。起動時・再読み込みのルールは `failed` になり、その名前が `PUT` されると動き出す。
+  - 差し替え（同じ名前の `PUT`）：使っているルールは接続を切らずに新しい証明書になる（`RPROXY_CERT_CHECK_SECS` を待たない）。
+- 保存先：`--cert-store` / `RPROXY_CERT_STORE`（既定 `/var/lib/rproxy/certs`）。`<name>/<指紋の先頭 16 桁>/tls.crt`（チェーンつき）・`tls.key` に書き、`<name>/current` のシンボリックリンクを付け替える。ディレクトリは 0700、ファイルは 0600 で rproxy-api のもの（`global.files.owner_check: strict` で使える）。`trusted_dirs` の下には置けない（起動を止める）。書けないときは `PUT` が `503 cert_store_unavailable`（`RPROXY_CERT_STORE` を指定していれば起動時に `degraded`、`part: "cert_store"`）。
+- 監査：`event=audit`、`action: cert.put` / `cert.delete`、`cert`（名前）・`fingerprint_sha256` だけ。
+- 引き継ぎ（#174）ではファイルなので何も渡さない。複数の rproxy にはノードごとに `PUT` する。rproxy-gateway は使わない（Secret のボリューム）。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
 |---|---|---|---|
 | `GET /healthz` | | 200 `ok` | 認証不要 |
-| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"],"graceful_shutdown":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
+| `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice"],"graceful_shutdown":true,"cert_store":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
 | `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
@@ -819,6 +841,8 @@ v0.4.0 の後にパッチで足した設定（docs/DESIGN-v0.4.x.md。足すだ�
 | `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ。docs/UPGRADE.md）。`{"status":"started"}` を返し、引き継ぎは後ろで進む（結果はログの `handoff.*` と `/metrics` の `rproxy_handoffs_total`）。すでに動いていれば `409 upgrading`。`admin`、既定では Unix ソケットからだけ |
 | `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current":{"version","sha256"},"available":{"version","sha256"}\|null,"last_check","error","bad_versions"}`。`admin` |
 | `POST /admin/update` | | 202 | v0.4（#174）：今すぐ新しいパッチを確かめ（`{"status":"checking"}`。結果は `GET /admin/update`）、`RPROXY_UPDATE=auto` なら入れ替える。`RPROXY_UPDATE=off` なら `400 unsupported`。`admin`、既定では Unix ソケットからだけ |
+| `GET /certs` | | 200 | v0.4.2（#240）：保存した証明書（`certs:read`、`allow_certs` の内だけ）。上の「証明書の API」 |
+| `GET` / `PUT` / `DELETE /certs/{name}` | `{"cert","key","chain"?}` | 200 / 201 / 204 | v0.4.2（#240）：1 件を読む（`certs:read`）・保存する・消す（`certs:write`。`PUT` は TLS か loopback か Unix ソケットから）。上の「証明書の API」 |
 | `GET /metrics` | | 200 | Prometheus 形式。ルールの数は `rproxy_rules{state}`（`running` / `failed`）、ルールごと（ラベル `protocol`・`listen`）に `rproxy_rule_up`（動いていれば 1）・`rproxy_connections`（開いている TCP の接続・UDP のセッション）・`rproxy_connections_total`・`rproxy_bytes_total{direction}`（`rx` はクライアントから転送先、`tx` はその逆）・`rproxy_tls_failures_total`（TLS / DTLS のハンドシェイクと STARTTLS のやり取りの失敗）・`rproxy_udp_dropped_total`（UDP のルールだけ）。`http` のルールのリクエストは `rproxy_http_requests_total`・`rproxy_http_request_duration_seconds`・`rproxy_http_limited_total`、転送先のヘルスチェックは `rproxy_http_server_up`・`rproxy_http_service_down`（上の「v0.3 の設定」）、宛先の全滅は `rproxy_rule_all_targets_down`、CrowdSec の LAPI は `rproxy_crowdsec_connected`、間引いたログの行は `rproxy_log_suppressed_total`、制御 API のトークンの期限は `rproxy_token_expiry_timestamp_seconds`、一時停止は `rproxy_api_lockouts_total`・`rproxy_api_locked_sources`（上の「制御 API の守り」）、ルールのラベルは `rproxy_rule_labels`（上の「ルールの組・状態・readiness」）、L4 の制限・帯域は `rproxy_rule_limited_total`・`rproxy_rule_bandwidth_dropped_total`、プロセスの開始時刻は `rproxy_process_start_time_seconds`（上の「v0.4 の設定」）。動いているバイナリは `rproxy_build_info{version,sha256}`、引き継ぎは `rproxy_handoffs_total{outcome}`（#174。`rproxy_process_start_time_seconds` は引き継ぎでも変わらない） |
 
 IPv6 の `listen_addr` をパスに入れるときは URL エンコードする。
@@ -850,6 +874,9 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `locked_out` | 429 | v0.4：認証の失敗が続いたので、この送信元を一時的に止めている（`Retry-After`） |
 | `upgrading` | 503 / 409 | v0.4（#174）：再起動なしの更新の途中なので変更を受け付けない（503。少し待って送り直す）／すでに更新が動いている（`POST /admin/upgrade` の 409） |
 | `shutting_down` | 503 | v0.4.1：SIGTERM の後の終わり方（`RPROXY_SHUTDOWN_DELAY` / `_DRAIN`）の途中なので変更を受け付けない（ほかの rproxy に送る） |
+| `tls_required` | 403 | v0.4.2：鍵を含む `PUT /certs` を平文の TCP（loopback 以外）で送った |
+| `in_use` | 409 | v0.4.2：保存した証明書をルールが使っている（`used_by`） |
+| `cert_store_unavailable` | 503 | v0.4.2：証明書の保存先に書けない |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係

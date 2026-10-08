@@ -77,6 +77,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_TOKEN_FILE` | `--token-file` | なし | Bearer トークンのファイル（1 行 1 トークン、または名前・SHA-256・スコープを書いた YAML。docs/API.md）。指定すると認証が必須になる。SIGHUP で読み直す |
 | `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` | `--tls-cert` / `--tls-key` | なし | 制御 API の TLS 証明書と秘密鍵（PEM）。SIGHUP で読み直す |
 | `RPROXY_CERT_CHECK_SECS` | `--cert-check-secs` | `60` | 証明書ファイル（ルールの `tls` と制御 API）が変わったかを確かめる間隔（秒）。変わったものだけ読み直す（certbot・cert-manager の更新をそのまま反映）。`0` で止める |
+| `RPROXY_CERT_STORE` | `--cert-store` | `/var/lib/rproxy/certs` | `PUT /certs/{name}` で受け取った証明書と鍵の置き場所（v0.4.2、#240。ディレクトリ 0700・ファイル 0600。ルールからは `{"cert": "<name>"}`。docs/API.md の「証明書の API」）。`trusted_dirs` の下には置けない |
 | `RPROXY_CERT_EXPIRY_CHECK_SECS` | `--cert-expiry-check-secs` | `86400` | 証明書の期限を確かめる間隔（秒。読み込むときにも確かめる）。切れたサーバ証明書は外し、ルールの証明書がすべて切れたらそのルールを止める（docs/API.md の「証明書の期限」）。`0` で止める |
 | `RPROXY_CERT_WARN_DAYS` | `--cert-warn-days` | `14` | 期限の何日前から `expiring`（警告）にするか |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
@@ -246,7 +247,7 @@ curl --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" 
 | `starttls: smtp / imap / pop3` | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する |
 | `listen_port_end` | ポート範囲をまとめて転送する（RTP、TURN のリレー、WebRTC のメディア、FTP のパッシブモード） |
 
-証明書はファイルで指定するか、ACME（Let's Encrypt など。HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・RFC 2136・acme-dns・汎用の REST））で rproxy に取らせます（`{acme: <resolver>, domains: [...]}`、[docs/ACME.md](docs/ACME.md)）。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。ACME で取った証明書も期限の前に自分で更新し、同じ仕組みで差し替えます。DNS-01 の秘密は、別のユーザーで動かす補助プロセス `rproxy-api acme-helper`（`rproxy-acme-helper.service`）だけに持たせることもできます。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
+証明書はファイルで指定するか、ACME（Let's Encrypt など。HTTP-01・TLS-ALPN-01・DNS-01（PowerDNS・RFC 2136・acme-dns・汎用の REST））で rproxy に取らせます（`{acme: <resolver>, domains: [...]}`、[docs/ACME.md](docs/ACME.md)）。制御 API の `PUT /certs/{name}` で証明書と鍵を渡して保存し、ルールから `{cert: <name>}` で使うこともできます（v0.4.2、docs/API.md の「証明書の API」）。ファイルが変わると自動で読み直すので（`RPROXY_CERT_CHECK_SECS`）、certbot や cert-manager で更新した証明書がそのまま使われます（SIGHUP ですぐに読み直すこともできます）。ACME で取った証明書も期限の前に自分で更新し、同じ仕組みで差し替えます。DNS-01 の秘密は、別のユーザーで動かす補助プロセス `rproxy-api acme-helper`（`rproxy-acme-helper.service`）だけに持たせることもできます。`source_ip: proxy_v2` と組み合わせると、SNI・ALPN・クライアント証明書の CN を PROXY v2 の TLV で転送先に渡します。
 
 ## CrowdSec
 

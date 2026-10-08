@@ -79,6 +79,9 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/rulesets", get(super::ruleset_api::list))
 		.route("/rulesets/{*name}", get(super::ruleset_api::get).put(super::ruleset_api::put).delete(super::ruleset_api::delete).layer(axum::extract::DefaultBodyLimit::max(crate::core::ruleset::MAX_BODY)))
 		.route("/config/plan", post(config_plan))
+		// v0.4.2 (#240): stored certificates
+		.route("/certs", get(super::cert_api::list))
+		.route("/certs/{name}", get(super::cert_api::get).put(super::cert_api::put).delete(super::cert_api::delete).layer(axum::extract::DefaultBodyLimit::max(crate::tls::named::MAX_BODY)))
 		.route("/admin/upgrade", post(super::upgrade::upgrade))
 		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))
 		.route("/admin/update/bad", axum::routing::delete(super::upgrade::clear_bad))
@@ -100,6 +103,10 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 		// re-reads files on the host: only for administrators
 		"/config/reload" | "/config/plan" => Some(Scope::Admin),
 		_ if path.starts_with("/admin/") => Some(Scope::Admin),
+		// stored certificates (#240): certs:read / certs:write
+		"/certs" => Some(Scope::CertsRead),
+		_ if path.starts_with("/certs/") && method == Method::GET => Some(Scope::CertsRead),
+		_ if path.starts_with("/certs/") => Some(Scope::CertsWrite),
 		// the handlers check acme:write (and the Unix socket) themselves, to answer why
 		_ if path.starts_with("/acme/") && method == Method::POST => None,
 		_ if method == Method::GET => Some(Scope::RulesRead),

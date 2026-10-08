@@ -48,7 +48,10 @@
               "precondition_failed",
               "stale_generation",
               "locked_out",
-              "shutting_down"
+              "shutting_down",
+              "tls_required",
+              "in_use",
+              "cert_store_unavailable"
             ]
           }
         },
@@ -145,6 +148,10 @@
               "type": "string"
             },
             "description": "Names of the ACME certificate (with acme); *.example.com needs a dns-01 resolver."
+          },
+          "cert": {
+            "type": "string",
+            "description": "A certificate stored through PUT /certs/{name} (v0.4.2, #240), instead of cert_file / key_file / acme. Needs the name within the token's allow_certs; a name not stored is 400 tls_config."
           }
         },
         "additionalProperties": false
@@ -1941,6 +1948,10 @@
               "graceful_shutdown": {
                 "type": "boolean",
                 "description": "RPROXY_SHUTDOWN_DELAY / RPROXY_SHUTDOWN_DRAIN (v0.4.1)"
+              },
+              "cert_store": {
+                "type": "boolean",
+                "description": "PUT /certs/{name} and {\"cert\": name} in rules (v0.4.2)"
               }
             }
           },
@@ -3236,6 +3247,92 @@
         "required": [
           "error",
           "code"
+        ]
+      },
+      "StoredCert": {
+        "type": "object",
+        "description": "A certificate stored through PUT /certs/{name} (v0.4.2, #240). The key is never returned.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "sans": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DNS names (subjectAltName, else the common name)"
+          },
+          "not_before": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "not_after": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "fingerprint_sha256": {
+            "type": "string",
+            "description": "SHA-256 of the certificate (DER), hex; also the ETag and what If-Match takes"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "used_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Rules naming it (protocol/addr:port)"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_by": {
+            "type": "string",
+            "description": "Name of the token that stored it"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "PUT only: e.g. it expires within RPROXY_CERT_WARN_DAYS"
+          }
+        },
+        "required": [
+          "name",
+          "sans",
+          "not_before",
+          "not_after",
+          "fingerprint_sha256",
+          "issuer",
+          "used_by",
+          "updated_at",
+          "updated_by"
+        ]
+      },
+      "StoredCertPut": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "cert": {
+            "type": "string",
+            "description": "PEM certificate (may hold its chain after it)"
+          },
+          "key": {
+            "type": "string",
+            "description": "PEM private key (PKCS#8, PKCS#1 or SEC1)"
+          },
+          "chain": {
+            "type": "string",
+            "description": "PEM intermediate CA certificates"
+          }
+        },
+        "required": [
+          "cert",
+          "key"
         ]
       }
     }
@@ -4830,6 +4927,252 @@
           },
           "400": {
             "description": "invalid version or the Unix socket is required"
+          }
+        }
+      }
+    },
+    "/certs": {
+      "get": {
+        "summary": "Stored certificates within the token's allow_certs (certs:read; v0.4.2, #240)",
+        "responses": {
+          "200": {
+            "description": "Stored certificates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StoredCert"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks certs:read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/certs/{name}": {
+      "parameters": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$"
+          }
+        }
+      ],
+      "get": {
+        "summary": "One stored certificate (certs:read)",
+        "responses": {
+          "200": {
+            "description": "The stored certificate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredCert"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "certs:read missing, or outside allow_certs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Store or replace a certificate and its key (certs:write; over TCP only with TLS or from loopback). Rules using it switch without cutting connections.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The current fingerprint_sha256, or * (it exists)"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoredCertPut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored certificate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredCert"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "The stored certificate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredCert"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid: the PEM does not parse, the key does not match, it has expired, or a bad name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden (certs:write, allow_certs) or tls_required (plain TCP from elsewhere than loopback)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed: If-Match",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "cert_store_unavailable: the store's directory cannot be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove a stored certificate (certs:write)",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "403": {
+            "description": "certs:write missing, or outside allow_certs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "in_use: rules name it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "used_by": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed: If-Match",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }

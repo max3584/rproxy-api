@@ -115,6 +115,9 @@ pub struct CertFiles {
 	/// Names the ACME certificate covers.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub domains: Vec<String>,
+	/// A certificate stored through `PUT /certs/{name}` (#240, v0.4.2).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cert: Option<String>,
 }
 
 /// TLS protocol settings (v0.3; see GET /capabilities features.tls_options).
@@ -283,6 +286,13 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		_ => {}
 	}
 	for c in &tls.certificates {
+		if let Some(name) = &c.cert {
+			crate::tls::named::validate_name(name).map_err(|e| tls_error(e.message))?;
+			if c.acme.is_some() || !c.cert_file.is_empty() || !c.key_file.is_empty() || c.chain_file.is_some() || !c.domains.is_empty() {
+				return Err(tls_error("a stored certificate (cert) takes no cert_file, key_file, chain_file, acme or domains"));
+			}
+			continue;
+		}
 		match &c.acme {
 			Some(resolver) => {
 				if resolver.is_empty() || c.domains.is_empty() {
@@ -293,7 +303,7 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 				}
 			}
 			None if c.cert_file.is_empty() || c.key_file.is_empty() => {
-				return Err(tls_error("a certificate needs cert_file and key_file (or acme and domains)"));
+				return Err(tls_error("a certificate needs cert_file and key_file (or cert, or acme and domains)"));
 			}
 			None if !c.domains.is_empty() => return Err(tls_error("domains is only used with acme")),
 			None => {}
@@ -462,12 +472,12 @@ fn load_full_chain(cert_file: &str, chain_file: Option<&str>) -> Result<Vec<Cert
 			}
 		}
 	}
-	check_order(&chain, chain_file.unwrap_or(cert_file))?;
+	check_chain_order(&chain, chain_file.unwrap_or(cert_file))?;
 	Ok(chain)
 }
 
 /// Each certificate must be issued by the next one: leaf, intermediates, (root).
-fn check_order(chain: &[CertificateDer<'_>], file: &str) -> Result<(), ApiError> {
+pub(crate) fn check_chain_order(chain: &[CertificateDer<'_>], file: &str) -> Result<(), ApiError> {
 	let parsed: Vec<_> = chain
 		.iter()
 		.map(|c| x509_parser::parse_x509_certificate(c.as_ref()).map(|(_, x)| x))
