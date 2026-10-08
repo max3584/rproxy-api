@@ -333,13 +333,18 @@ async fn stored_certificates_survive_kills_during_writes() {
 				}
 			}));
 		}
-		tokio::time::sleep(Duration::from_millis(random(20, 400))).await;
+		// some writes through first (debug builds on a busy runner are slow), then a kill in the middle of more
+		let deadline = Instant::now() + Duration::from_secs(20);
+		while done.load(Ordering::Relaxed) == 0 {
+			assert!(Instant::now() < deadline, "no write got through:\n{}", s.log());
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		tokio::time::sleep(Duration::from_millis(random(0, 300))).await;
 		s.kill9();
 		stop.store(true, Ordering::Relaxed);
 		for w in writers {
 			let _ = w.await;
 		}
-		assert!(done.load(Ordering::Relaxed) > 0, "no write got through before the kill:\n{}", s.log());
 		drop(s);
 
 		let s = Server::start(&dir, &format!("after{round}"), api, &env);
@@ -616,15 +621,22 @@ async fn kills_during_a_live_upgrade_leave_a_service_that_starts_again() {
 			}
 		}
 		if which == 0 {
-			// a new process left alone either took over or stops by itself (it does not hang)
+			// a new process left alone either took over or stops by itself (it does not
+			// hang). Only it can answer now; the old one may have died before it logged
+			// handoff.ready.
 			let deadline = Instant::now() + Duration::from_secs(15);
 			for p in &new {
 				while alive(*p) {
 					let r = reqwest::Client::new().get(format!("http://127.0.0.1:{api}/readyz")).timeout(Duration::from_secs(1)).send().await;
-					if r.is_ok_and(|r| r.status() == StatusCode::OK) && s.log().contains("\"handoff.ready\"") {
+					if r.is_ok_and(|r| r.status() == StatusCode::OK) {
 						break;
 					}
-					assert!(Instant::now() < deadline, "the new process neither took over nor stopped:\n{}", s.log());
+					assert!(
+						Instant::now() < deadline,
+						"the new process {p} neither took over nor stopped ({}):\n{}",
+						fs::read_to_string(format!("/proc/{p}/status")).unwrap_or_default().lines().take(3).collect::<Vec<_>>().join(", "),
+						s.log()
+					);
 					tokio::time::sleep(Duration::from_millis(50)).await;
 				}
 			}
