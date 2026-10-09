@@ -78,6 +78,7 @@ English: [PERFORMANCE.md](en/PERFORMANCE.md)
 
 ## 次の候補
 - カーネルでの転送（#260、進めている）：`global.performance.ebpf`（平文の L4 TCP を BPF の sockmap で）・`global.performance.xdp`（UDP を AF_XDP で）。オプトインで、起動時にテストデータを流して確かめた速い道だけを使う（`rproxy-api --check-kernel`）。枠組み（設定の形・試験・`GET /capabilities`）を先に入れ、速い道は 1 つずつ足して、ここに結果を書く。
+  - **sockmap（`ebpf.tcp: sockmap`、平文の L4 TCP）**：rproxy が両側の TCP を張った後（ハンドシェイク・PROXY protocol・`source_ip`・`allow_from`・`crowdsec`・`limits` の判定はユーザー空間）、接続ごとの sockmap（2 スロット）に 2 本のソケットを入れ、小さな stream-verdict の BPF プログラム（`skb->local_port` で向きを決める）が相手側へ渡す。カーネルの中でソケットからソケットへ（システムコールもコピーもなし、splice の上位版）。aya のツールチェーン（nightly・rust-src・bpf-linker）はディスクと 6 ターゲットのビルドのために入れず、約 9 命令の BPF バイトコードを直接 bpf(2) で load する（既定のビルドは変わらない、新しい依存なし）。バイト数・帯域の BPF の数え手はまだないので、`bandwidth` のあるルールでは使わず splice に戻る。バイト数は終わりに `TCP_INFO` から読む。正しさは CI の root のジョブ（`offload`）で：起動時の試験（ループバックの組・64 KiB 超・分割・SHA-256・FIN と、sockmap のソケットの EOF）と、本物の rproxy を sockmap で動かした往復（`tests/kernel_offload.rs`）。**速さの測定（master と比べる Load ワークフロー）はこれから。結果をここに書く。**
 - HTTP/2：プロファイルで残っているのは memcpy（約 11%）、アロケータ（約 12%）、カーネルの起床（約 7%）。h2 の書き込みをまとめて大きくする。
 - 複数のコアの使い方（#194）：キューの深さで動きを変える（役ごとのパイプライン・コアごとの並列・バックプレッシャー）。
 - メモリ（#185）：UDP のセッションのバッファをワーカーごとに共有する。

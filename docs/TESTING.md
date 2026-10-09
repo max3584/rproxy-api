@@ -23,6 +23,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 |---|---|
 | CI の `test`・`package`、Benchmarks、Integrity、Soak、Fuzz、Dependencies（cargo-deny）、Milestone、Interop の `build`・`mail`・`media` | `alpine:3.24` |
 | CI の `transparent` | `alpine:3.24`（特権つき。名前空間・veth・nft / iptables） |
+| CI の `offload`（#260） | `alpine:3.24`（特権つき。`CAP_BPF`・`CAP_NET_ADMIN`・ホストのカーネルの BTF。eBPF の sockmap・XDP） |
 | Load | `alpine:3.24`（特権つき。名前空間・veth・tc netem。`sch_netem` はホストの `/lib/modules` から読む） |
 | Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
 | Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
@@ -291,6 +292,8 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | `fallback: false` で使えなければ起動を止める |
 | `mistakes_in_the_settings_stop_startup_and_the_check` | `RPROXY_XDP_*` / `RPROXY_EBPF_*` と設定ファイルの値の誤りで起動と `--check-kernel` が止まる |
 | `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` がすべての速い道の行とホストの情報を出す。終わりの状態が求めたものの結果と合う、JSON も同じ |
+| `sockmap_relays_test_data_when_the_kernel_allows` | sockmap が使える host（CI の `offload` ジョブ、`RPROXY_TEST_REQUIRE_SOCKMAP`）では起動時の試験の各項目（load+attach・両方向・64 KiB 超・分割・FIN・ソケットの EOF）が通る。使えない host では理由が付くだけ（スキップ） |
+| `a_real_rproxy_relays_plain_tcp_through_sockmap` | 本物の rproxy を `RPROXY_EBPF_TCP=sockmap` で動かし、平文 TCP の往復（256 KiB・半分閉じ）がバイトまで一致。sockmap が active でなければスキップ |
 
 ## 結合テスト：自動更新（`tests/self_update.rs`、#174）
 

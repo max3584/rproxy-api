@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
+#[cfg(target_os = "linux")]
+use tracing::debug;
 use tracing::{info, warn};
 
 use crate::core::balance::Lease;
@@ -315,6 +317,14 @@ async fn relay_hello(
 /// direction that carries a bulk transfer moves on to splice(2) (#184,
 /// `l4::splice`) while the rule has no `bandwidth` limit.
 async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> io::Result<()> {
+	// eBPF sockmap (#260): relay in the kernel when proved usable and the rule
+	// has no bandwidth limit (no in-kernel shaping yet). Falls back otherwise.
+	#[cfg(target_os = "linux")]
+	if crate::net::offload::probe::ebpf_tcp_active() && !rt.bandwidth.is_on() {
+		if let Some(result) = sockmap_relay(rt, a, b, detail).await {
+			return result;
+		}
+	}
 	#[cfg(target_os = "linux")]
 	if crate::l4::splice::settings().enabled {
 		let (rx, tx) = (AtomicU64::new(0), AtomicU64::new(0));
@@ -332,6 +342,59 @@ async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &m
 	}
 	let backend = b.as_raw_fd();
 	finish(rt, client, a, b, backend, PLAIN, detail).await
+}
+
+/// Reads `s` until EOF, which the kernel reports when the peer's FIN arrives
+/// even while the socket is in a sockmap; the bytes themselves are redirected
+/// in the kernel, so anything delivered here is unexpected.
+#[cfg(target_os = "linux")]
+async fn drain_eof(s: &mut TcpStream) -> io::Result<()> {
+	use tokio::io::AsyncReadExt;
+	let mut buf = [0u8; 64];
+	match s.read(&mut buf).await {
+		Ok(0) => Ok(()),
+		Ok(_) => Err(io::Error::other("sockmap delivered data to user space")),
+		Err(e) => Err(e),
+	}
+}
+
+/// Relays `a` <-> `b` through an eBPF sockmap (#260). `None` when it could not
+/// be set up (the caller falls back to splice / user space); `Some` once it ran
+/// (both sides closed, or it failed and the backend was reset). Byte totals come
+/// from `TCP_INFO` (the kernel moved the data, so user space never saw it).
+#[cfg(target_os = "linux")]
+async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> Option<io::Result<()>> {
+	use crate::net::offload::sockmap;
+	let (la, lb) = (a.local_addr().ok()?, b.local_addr().ok()?);
+	// the verdict program tells the two sockets apart by their local port
+	if la.port() == lb.port() {
+		return None;
+	}
+	let rx0 = sockmap::bytes_received(a.as_fd()).unwrap_or(0);
+	let tx0 = sockmap::bytes_received(b.as_fd()).unwrap_or(0);
+	let relay = match sockmap::Relay::start(a.as_fd(), b.as_fd(), la.port()) {
+		Ok(r) => r,
+		Err(e) => {
+			debug!(event = "offload.fallback", rule = %rt.key, error = %e, "sockmap did not start; using the current path");
+			return None;
+		}
+	};
+	let result = tokio::try_join!(drain_eof(a), drain_eof(b)).map(|_| ());
+	let rx = sockmap::bytes_received(a.as_fd()).unwrap_or(rx0).saturating_sub(rx0);
+	let tx = sockmap::bytes_received(b.as_fd()).unwrap_or(tx0).saturating_sub(tx0);
+	detail.rx += rx;
+	detail.tx += tx;
+	rt.stats.add_rx(rx);
+	rt.stats.add_tx(tx);
+	drop(relay);
+	match &result {
+		Ok(()) => detail.reason = "closed",
+		Err(e) => {
+			debug!(event = "offload.reset", rule = %rt.key, error = %e, "sockmap relay failed; resetting the backend");
+			reset_on_close(b);
+		}
+	}
+	Some(result)
 }
 
 /// A stream that first yields bytes already read from it (the ClientHello read

@@ -168,6 +168,12 @@ pub fn publish(features: Vec<Feature>) {
 	let _ = PUBLISHED.set(features);
 }
 
+/// Whether the eBPF sockmap fast path for plain L4 TCP is in use (its startup
+/// probe passed). The data plane asks this per connection (`finish_plain`).
+pub fn ebpf_tcp_active() -> bool {
+	PUBLISHED.get().is_some_and(|f| f.iter().any(|x| x.name == "ebpf_tcp" && x.active))
+}
+
 /// `GET /capabilities` `performance`: `{feature: {requested, active, mode, reason}}`.
 pub fn capabilities() -> serde_json::Value {
 	let features = match PUBLISHED.get() {
@@ -244,7 +250,17 @@ fn not_built(host: &Host, needs_net_bpf: bool) -> Outcome {
 
 /// sockmap: loopback TCP pairs spliced in the kernel, data compared.
 fn test_sockmap(host: &Host, _perf: &Effective) -> Outcome {
-	not_built(host, true)
+	if let Some(why) = host.missing_for_net_bpf() {
+		return Outcome::unusable(why, vec![]);
+	}
+	#[cfg(target_os = "linux")]
+	{
+		super::sockmap::prove()
+	}
+	#[cfg(not(target_os = "linux"))]
+	{
+		Outcome::unusable("BPF needs Linux", vec![])
+	}
 }
 
 /// TC / XDP NAT: packets through a temporary namespace and veth pair.

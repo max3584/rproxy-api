@@ -106,6 +106,32 @@ jobs:
       - name: scripts/test-freebind.sh
         run: scripts/test-freebind.sh
 
+  # kernel offload (#260): the fast paths need CAP_BPF / CAP_NET_ADMIN, so they
+  # can only be exercised in a privileged (root) container, like transparent.
+  # Generic XDP on veth; sockmap on loopback. RPROXY_TEST_REQUIRE_* makes the
+  # tests fail (not skip) if the kernel does not allow what should work here.
+  offload:
+    name: kernel offload (eBPF / XDP)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      # CAP_BPF / CAP_SYS_ADMIN / CAP_NET_ADMIN and BTF from the host kernel
+      options: --privileged
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # the sockmap probe (loopback pairs, SHA-256, FIN) and the --check-kernel table
+      - name: sockmap and --check-kernel
+        env:
+          # sockmap must be usable here (fail, don't skip, if the kernel refuses)
+          RPROXY_TEST_REQUIRE_SOCKMAP: "1"
+        run: cargo test --locked --test kernel_offload
+      - name: rproxy-api --check-kernel
+        run: cargo run --locked -- --check-kernel
+
   # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
   package:
     name: release binary and .deb (musl)

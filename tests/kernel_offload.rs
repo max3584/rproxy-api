@@ -153,6 +153,117 @@ async fn mistakes_in_the_settings_stop_startup_and_the_check() {
 	let _ = fs::remove_dir_all(dir);
 }
 
+/// On a host that allows BPF (the CI root job sets `RPROXY_TEST_REQUIRE_SOCKMAP`)
+/// sockmap must actually relay the probe's test data; elsewhere this only
+/// checks the outcome is reported consistently.
+#[test]
+fn sockmap_relays_test_data_when_the_kernel_allows() {
+	let dir = workdir("sockmap");
+	let out = command(&dir, &[("RPROXY_EBPF_TCP", "sockmap".into())]).args(["--check-kernel", "--check-kernel-format", "json"]).output().unwrap();
+	let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+	let sockmap = report["paths"].as_array().unwrap().iter().find(|p| p["key"] == "ebpf.tcp" && p["mode"] == "sockmap").unwrap().clone();
+	let required = std::env::var("RPROXY_TEST_REQUIRE_SOCKMAP").is_ok();
+	if required {
+		assert_eq!(sockmap["usable"], true, "sockmap must work on this host: {report}");
+	}
+	if sockmap["usable"] == true {
+		// every sub-test (load+attach, both directions, >64 KiB, split, FIN) passed
+		for t in sockmap["tests"].as_array().unwrap() {
+			assert_eq!(t["ok"], true, "sub-test {}: {report}", t["name"]);
+		}
+		assert!(out.status.success(), "exit 0 when the requested path works: {report}");
+		assert!(sockmap["tests"].as_array().unwrap().iter().any(|t| t["name"] == "fin"), "FIN is checked: {report}");
+	} else {
+		assert!(sockmap["detail"].as_str().is_some_and(|d| !d.is_empty()), "a reason when not usable: {report}");
+	}
+	let _ = fs::remove_dir_all(dir);
+}
+
+/// End to end: a real rproxy with a plain TCP rule and `RPROXY_EBPF_TCP=sockmap`
+/// relays a stream (including >64 KiB) and a half-close through the kernel. On a
+/// host that allows BPF (the CI root job) this must use sockmap and match byte
+/// for byte; elsewhere sockmap is not active and the test skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_real_rproxy_relays_plain_tcp_through_sockmap() {
+	use std::io::{Read, Write};
+	use std::net::{Shutdown, TcpListener, TcpStream};
+	let dir = workdir("relay");
+	// an echo backend
+	let backend = TcpListener::bind("127.0.0.1:0").unwrap();
+	let bport = backend.local_addr().unwrap().port();
+	std::thread::spawn(move || {
+		for s in backend.incoming().flatten() {
+			std::thread::spawn(move || {
+				let mut r = s.try_clone().unwrap();
+				let mut w = s;
+				let _ = std::io::copy(&mut r, &mut w);
+			});
+		}
+	});
+	let lport = free_port();
+	let cfg = dir.join("rproxy.yaml");
+	fs::write(
+		&cfg,
+		format!("version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {lport}, remote_addr: 127.0.0.1, remote_port: {bport}}}\n"),
+	)
+	.unwrap();
+	let rp = Rproxy::start(&dir, &[("RPROXY_CONFIG", cfg.display().to_string()), ("RPROXY_EBPF_TCP", "sockmap".into())]);
+	let caps = rp.capabilities().await;
+	let active = caps["performance"]["ebpf_tcp"]["active"] == true;
+	let required = std::env::var("RPROXY_TEST_REQUIRE_SOCKMAP").is_ok();
+	if required {
+		assert!(active, "sockmap must be active on this host: {caps}");
+	}
+	if !active {
+		drop(rp);
+		let _ = fs::remove_dir_all(dir);
+		return;
+	}
+
+	let data: Vec<u8> = (0..(256usize << 10)).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+	let got = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let mut conn = loop {
+			match TcpStream::connect(("127.0.0.1", lport)) {
+				Ok(c) => break c,
+				Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+				Err(e) => return Err(e),
+			}
+		};
+		conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+		let want = data.len();
+		let mut reader = conn.try_clone()?;
+		let send = std::thread::spawn(move || -> std::io::Result<()> {
+			for chunk in data.chunks(13 << 10) {
+				conn.write_all(chunk)?;
+			}
+			conn.flush()?;
+			conn.shutdown(Shutdown::Write)?; // half-close: the echo must still drain back
+			Ok(())
+		});
+		let mut got = Vec::with_capacity(want);
+		let mut buf = [0u8; 32 << 10];
+		loop {
+			let n = reader.read(&mut buf)?;
+			if n == 0 {
+				break;
+			}
+			got.extend_from_slice(&buf[..n]);
+		}
+		send.join().unwrap()?;
+		Ok(got)
+	})
+	.await
+	.unwrap()
+	.unwrap();
+
+	let expect: Vec<u8> = (0..(256usize << 10)).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
+	assert_eq!(got.len(), expect.len(), "echoed length");
+	assert!(got == expect, "echoed bytes differ");
+	drop(rp);
+	let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn check_kernel_tests_every_fast_path_and_prints_a_table() {
 	let dir = workdir("check");

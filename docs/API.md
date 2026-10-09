@@ -542,7 +542,7 @@ global:
   - 起動時に、求められた速い道ごとにテストデータを実際に流して確かめてから使う（カーネルの版では決めない）。結果は機能ごとに `event = "performance.probe"` の行（`feature`・`requested`・`active`・`mode`・`reason`・`tests`）と `GET /capabilities` の `performance`（`{"ebpf_tcp": {"requested", "active", "mode", "reason"}, "xdp": {...}}`）に出る。使えなければ `degraded`（`part: global.performance.ebpf.tcp` / `global.performance.xdp.mode`、`reason`）を出して今の処理で動く。`fallback: false` なら起動を止める。何も求めなければ何も試さない。
   - 動いている間は数えたり見張ったりしない。速い道の操作が失敗して接続を今の処理に戻したときだけログに出す。
   - `rproxy-api --check-kernel`（`--config` / `RPROXY_CONFIG` で何を求めているかを読む）：すべての速い道を同じテストで確かめて表で出す（`--check-kernel-format json` で JSON）。求めたものがすべて使えれば 0、そうでなければ 1 で終わる（導入前の確認・Kubernetes の initContainer）。
-  - 要る権限は `CAP_BPF`（古いカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`（AF_XDP は `CAP_NET_RAW` も）。docs/PERMISSIONS.md。この版では速い道そのものはまだ入っておらず、求めても理由つきで今の処理に戻る（順に入れる。docs/PERFORMANCE.md）。
+  - 要る権限は `CAP_BPF`（古いカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`（AF_XDP は `CAP_NET_RAW` も）。docs/PERMISSIONS.md。この版では `ebpf.tcp: sockmap`（平文の L4 TCP）が入っている：rproxy が両側の TCP をいつもどおり張った後、2 本のソケットを接続ごとの sockmap に入れ、小さな stream-verdict プログラムが相手側へ渡す（カーネルの中で、システムコールもコピーもなし。splice の上位版）。バイト数・帯域の BPF の数え手はまだないので、`bandwidth` のあるルールでは使わず今の処理（splice）に戻る（`limits` の判定は受け付け時にユーザー空間で済んでいる）。バイト数は接続の終わりに `TCP_INFO` から読む。`xdp`（AF_XDP）と `ebpf.tcp: nat` はまだで、求めても理由つきで今の処理に戻る（順に入れる。docs/PERFORMANCE.md）。
 
 ### 変更前の差分（dry run、#169）
 

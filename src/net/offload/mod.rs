@@ -16,3 +16,5 @@
 pub mod bpf;
 pub mod host;
 pub mod probe;
+#[cfg(target_os = "linux")]
+pub mod sockmap;

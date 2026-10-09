@@ -23,6 +23,7 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 |---|---|
 | CI `test` and `package`, Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.24` |
 | CI `transparent` | `alpine:3.24` (privileged: namespaces, veth, nft / iptables) |
+| CI `offload` (#260) | `alpine:3.24` (privileged: `CAP_BPF`, `CAP_NET_ADMIN`, BTF from the host kernel; eBPF sockmap, XDP) |
 | Load | `alpine:3.24` (privileged: namespaces, veth, tc netem; `sch_netem` is loaded from the host's `/lib/modules`) |
 | Interop `crowdsec` | `crowdsecurity/crowdsec` (CrowdSec's official image, Alpine-based; Alpine has no CrowdSec package), privileged |
 | Cross build and Release `build` | `alpine:3.24`. x86_64 musl natively, the others cross-built with cargo-zigbuild (zig); gnu is linked against glibc 2.17 (`scripts/build-release.sh`) |
@@ -291,6 +292,8 @@ Checks the startup test of `global.performance.ebpf` / `xdp` and `--check-kernel
 | `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | With `fallback: false` an unusable fast path stops startup |
 | `mistakes_in_the_settings_stop_startup_and_the_check` | Wrong `RPROXY_XDP_*` / `RPROXY_EBPF_*` and settings-file values stop startup and `--check-kernel` |
 | `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` prints a row per fast path and the host; its exit status matches the requested one's result; the JSON says the same |
+| `sockmap_relays_test_data_when_the_kernel_allows` | On a host where sockmap works (the CI `offload` job, `RPROXY_TEST_REQUIRE_SOCKMAP`) every startup sub-test passes (load+attach, both directions, >64 KiB, split, FIN, socket EOF); elsewhere it only carries a reason (skipped) |
+| `a_real_rproxy_relays_plain_tcp_through_sockmap` | A real rproxy with `RPROXY_EBPF_TCP=sockmap` relays a plain-TCP round trip (256 KiB, half-close) byte for byte; skipped when sockmap is not active |
 
 ## Integration tests: self-update (`tests/self_update.rs`, #174)
 
