@@ -539,7 +539,7 @@ global:
   - 起動時に、求められた速い道ごとにテストデータを実際に流して確かめてから使う（カーネルの版では決めない）。結果は機能ごとに `event = "performance.probe"` の行（`feature`・`requested`・`active`・`mode`・`reason`・`tests`）と `GET /capabilities` の `performance`（`{"xdp": {"requested", "active", "mode", "reason"}}`）に出る。使えなければ `degraded`（`part: global.performance.xdp.mode`、`reason`）を出して今の処理で動く。`fallback: false` なら起動を止める。何も求めなければ何も試さない。
   - 動いている間は数えたり見張ったりしない。速い道の操作が失敗して接続を今の処理に戻したときだけログに出す。
   - `rproxy-api --check-kernel`（`--config` / `RPROXY_CONFIG` で何を求めているかを読む）：すべての速い道を同じテストで確かめて表で出す（`--check-kernel-format json` で JSON）。求めたものがすべて使えれば 0、そうでなければ 1 で終わる（導入前の確認・Kubernetes の initContainer）。
-  - 要る権限は `CAP_BPF`（古いカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`（AF_XDP は `CAP_NET_RAW` も）。docs/PERMISSIONS.md。この版では速い道そのものはまだ入っておらず、求めても理由つきで今の処理に戻る（順に入れる。docs/PERFORMANCE.md）。
+  - 要る権限は `CAP_BPF`（古いカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`（AF_XDP は `CAP_NET_RAW` も）。docs/PERMISSIONS.md。この版では速い道で転送する処理は入っておらず、求めても理由つきで今の処理に戻る。AF_XDP は cargo の機能 `kernel-offload` のビルドで起動時の試験（`--check-kernel`）まで入っているが、試験に通っても転送には使わない（`active: false`。NIC・キューの調整と実機での測定が要るので保留、docs/PERFORMANCE.md）。
   - 平文の L4 TCP を eBPF の sockmap でカーネルの中で中継する案（`global.performance.ebpf`）は試して採らなかった（並列・両方向の大きな転送でカーネルのバックログが止まる。docs/PERFORMANCE.md）。設定にはない（書けば誤り）。
 
 ### 変更前の差分（dry run、#169）
