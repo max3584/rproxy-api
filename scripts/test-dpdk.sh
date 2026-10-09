@@ -143,7 +143,8 @@ for rnd in range(5):
             body = os.urandom(size)
             seq = f"{rnd}-{i}-{size}".encode()
             msg = seq + b"|" + body
-            msg = msg[:1472]
+            # the answer ("<port>:" + msg) must fit one 1500-byte frame too: IP fragments are not forwarded
+            msg = msg[:1472 - len(backend) - 1]
             sent += 1
             s.send(msg)
             want = backend.encode() + b":" + msg
@@ -160,6 +161,8 @@ for rnd in range(5):
                 break
             else:
                 print("no answer", seq, file=sys.stderr)
+            if sent - ok > 20:
+                sys.exit(f"{to}:{port}: more than 20 lost; giving up")
 print(f"{to}:{port} -> :{backend}: {ok}/{sent} answers intact")
 sys.exit(0 if ok == sent else 1)
 EOF
