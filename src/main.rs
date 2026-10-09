@@ -595,7 +595,10 @@ fn main() -> ExitCode {
 			return ExitCode::FAILURE;
 		}
 	};
-	match runtime.block_on(run(opts, perf, handoff_from)) {
+	let result = runtime.block_on(run(opts, perf, handoff_from));
+	#[cfg(feature = "dpdk")]
+	rproxy_api::l4::dpdk::shutdown();
+	match result {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(e) => {
 			error!(event = "fatal", error = %e);
@@ -734,6 +737,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	}
 	rproxy_api::config::performance::apply(&perf);
 	log_performance(&perf);
+	// the DPDK data plane (#261) is probed like the kernel fast paths, and stays up when it passes
+	// (before any rule binds: UDP rules on its addresses go to it)
+	#[cfg(feature = "dpdk")]
+	rproxy_api::l4::dpdk::keep_running();
 	probe_offload(&perf)?;
 	let upgrade_opts = upgrade_options(&opts);
 	let graceful = shutdown_config(&opts)?;

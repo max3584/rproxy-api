@@ -1,7 +1,7 @@
 name: Fuzz
 
 # 自前で読んでいるパーサーのファジング（fuzz/、cargo-fuzz、issue #162）。
-# PR（src/ か fuzz/ を変えたもの）では各ターゲットを 60 秒、毎日は 10 分、手動では秒数を指定して動かす。
+# PR（src/・crates/・fuzz/ を変えたもの）では各ターゲットを 60 秒、毎日は 10 分、手動では秒数を指定して動かす。
 # debug assertions（整数のあふれの検査を含む）を有効にしてビルドする。見つかった入力（fuzz/artifacts/）は成果物に上げる。直したら、その入力を単体テストに足す（docs/TESTING.md）。
 # 必須のチェックではない。
 # Alpine（musl）のコンテナで動かす（#191）。Rust の sanitizer（AddressSanitizer）は x86_64-unknown-linux-gnu
@@ -12,6 +12,7 @@ on:
   pull_request:
     paths:
       - src/**
+      - crates/**
       - fuzz/**
       - .github/workflows/fuzz.yml
   schedule:

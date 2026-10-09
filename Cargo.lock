@@ -2636,6 +2636,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "rproxy-dpdk",
  "rustls",
  "serde",
  "serde_json",
@@ -2656,6 +2657,15 @@ dependencies = [
  "webrtc-util",
  "x509-parser 0.18.1",
  "zstd",
+]
+
+[[package]]
+name = "rproxy-dpdk"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "tracing",
 ]
 
 [[package]]

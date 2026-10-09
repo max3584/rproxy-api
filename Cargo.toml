@@ -69,6 +69,10 @@ assets = [
     ["contrib/crowdsec/acquis.d/appsec.yaml", "usr/share/rproxy-api/crowdsec/acquis.d/", "644"],
 ]
 
+# crates/rproxy-dpdk (#261): pure Rust without its `ffi` feature, so its tests run in the normal CI
+[workspace]
+members = ["crates/rproxy-dpdk"]
+
 [package.metadata.cargo-machete]
 # md-5 is used as `md5` (src/l7/middleware/auth.rs, htpasswd APR1)
 ignored = ["md-5"]
@@ -79,9 +83,14 @@ ignored = ["md-5"]
 [features]
 default = []
 alloc-mimalloc = ["dep:mimalloc"]
+# the DPDK data plane for L4 UDP (#261, experimental): global.performance.dpdk. Needs DPDK
+# (pkg-config libdpdk) to build; not in the default build or the release targets
+# (docs/PERFORMANCE.md, the dpdk.yml workflow)
+dpdk = ["dep:rproxy-dpdk", "rproxy-dpdk/ffi"]
 
 [dependencies]
 mimalloc = { version = "0.1.52", optional = true }
+rproxy-dpdk = { path = "crates/rproxy-dpdk", optional = true }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "query", "form"] }

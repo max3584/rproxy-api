@@ -495,7 +495,7 @@ Settings whose shape v0.4.0 settled and implemented (docs/en/DESIGN-v0.4.md; dev
 | Bandwidth (#166) | a rule's `bandwidth` | `upload`, `download` (`"10Mbps"`, 8kbps-100Gbps), `burst` (`"1MiB"`), `per_source` (`upload`, `download`, `prefix_v4`, `prefix_v6`, `max_sources`). TCP waits, UDP drops | `bandwidth` |
 | GeoIP (#168; see "GeoIP" below) | a rule's `geoip`, the `geoip` middleware, `global.geoip` | `allow_countries`, `deny_countries` (ISO 3166-1 alpha-2), `allow_asns`, `deny_asns`, `unknown` (`allow` / `deny`). `global.geoip`: `country_db`, `asn_db` (mmdb), `check_interval`, `log_country`. Country lists need `country_db`, ASN lists need `asn_db` | `geoip`, `geoip` in `middlewares` |
 | Passive health checks (#170; see "Passive health checks" below) | a rule's `outlier_detection` (L4; `invalid` on `http` rules), `http.services.<name>.outlier_detection` | L4: `consecutive_failures`, `short_lived`, `ejection_time`, `max_ejection_time`, `max_ejected_percent`. L7: `consecutive_5xx`, `consecutive_gateway_failures`, `failure_percent`, `min_requests`, `window`, `ejection_time`, `max_ejection_time`, `max_ejected_percent` | `outlier_detection`, `outlier_detection` in `services` |
-| Performance (#194, #184) | `global.performance` | `workers`, `udp_shards` (1-64 or `auto`), `cpu_affinity` (`none` / `auto` / `"0-3,6"`), `busy_poll_usecs`, `splice` (`enabled`, `after`, `full_reads`, `pipe_size`), `ebpf` and `xdp` (#260, forwarding in the kernel; "Performance" below). Per key: the settings file, then `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS` (a number or `auto`), `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE*`, then the default. Effective after a restart. See "Performance" below | `performance` (names of the keys that take effect; all of them) |
+| Performance (#194, #184) | `global.performance` | `workers`, `udp_shards` (1-64 or `auto`), `cpu_affinity` (`none` / `auto` / `"0-3,6"`), `busy_poll_usecs`, `splice` (`enabled`, `after`, `full_reads`, `pipe_size`), `ebpf` and `xdp` (#260, forwarding in the kernel; "Performance" below), `dpdk` (#261, the DPDK data plane; builds with `--features dpdk` only). Per key: the settings file, then `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS` (a number or `auto`), `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE*`, then the default. Effective after a restart. See "Performance" below | `performance` (names of the keys that take effect; all of them) |
 | Rule sets (#28) | `GET /rulesets`, `GET` / `PUT` / `DELETE /rulesets/{name}` | See "Rule sets, conditions and readiness" below | `rulesets` |
 | Conditions (#28) | `conditions` in the rule view | `[{"type","status","reason","message","last_transition"}]`; types `Accepted`, `Programmed`, `ResolvedRefs`, `BackendsHealthy` (see "Rule sets, conditions and readiness" below) | `conditions` |
 | Readiness (#28) | `GET /readyz` | No token. `200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
@@ -532,6 +532,22 @@ global:
       batch: 64             # packets per batch (1-1024, at most ring_size)
       busy_poll: false      # SO_PREFER_BUSY_POLL
       fallback: true
+    dpdk:                   # L4 UDP through DPDK (#261, experimental; builds with --features dpdk only; docs/en/PERFORMANCE.md)
+      enabled: false        # off by default
+      eal_args: []          # passed to the EAL as they are (e.g. ["--in-memory", "--file-prefix=rproxy"]); -l, -a and --vdev come from the keys below
+      lcores: "2-5"         # CPUs the forwarding lcores take (required when enabled; not overlapping cpu_affinity)
+      ports:                # pci or vdev, one of them
+        - pci: "0000:3b:00.0"         # a NIC bound to vfio-pci (vdev: "net_tap0,iface=dtap0", "net_af_packet0,iface=eth1", ...)
+          rx_queues: 4                # 1-64, default 1 (RSS spreads them over the lcores)
+          tx_queues: 4                # 1-64, default 1; at least the number of lcores
+          rx_desc: 1024               # 64-16384, default 1024
+          tx_desc: 1024
+          addresses: ["198.51.100.2/24"]   # the port's IPv4 addresses (required when enabled); UDP rules listen on them
+          gateway: 198.51.100.1       # next hop to other networks (on the port's network)
+      mempool: { mbufs: 65535, cache: 256 }   # mbufs 1023-16777216, cache at most 512 (and mbufs / 1.5)
+      hugepages: { size: 2MB }       # 2MB or 1GB; free pages are only checked before the EAL starts (the host sets them up)
+      burst: 32             # 1-512
+      fallback: true        # when it cannot be used, run the current path (false: stop startup)
 ```
 
 - Per key: the settings file, then the environment variable / flag (`RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE`, `RPROXY_SPLICE_AFTER`, `RPROXY_SPLICE_FULL_READS`, `RPROXY_SPLICE_PIPE_SIZE`), then the default; the keys of `splice` one by one too. All are decided at startup; a changed file shows them in `restart_needed`.
@@ -542,6 +558,7 @@ global:
   - At startup each requested fast path is used only after test data was pushed through it and compared (not decided by kernel versions). The result per feature is in an `event = "performance.probe"` line (`feature`, `requested`, `active`, `mode`, `reason`, `tests`) and in `performance` of `GET /capabilities` (`{"ebpf_tcp": {"requested", "active", "mode", "reason"}, "xdp": {...}}`). When it cannot be used, `degraded` is logged (`part: global.performance.ebpf.tcp` / `global.performance.xdp.mode`, `reason`) and the current path runs; with `fallback: false` startup stops. Nothing is tested when nothing is requested.
   - While running nothing is counted or watched; only a fast-path operation that failed and sent a connection back to the current path is logged.
   - `rproxy-api --check-kernel` (reads what is requested from `--config` / `RPROXY_CONFIG`): runs the same tests for every fast path and prints a table (`--check-kernel-format json` for JSON). Exits 0 when every requested one works, else 1 (checks before rollout, Kubernetes initContainers).
+  - `dpdk` (#261): no environment variables (the settings file only). `features.performance` lists `dpdk` only in builds with `--features dpdk`; other builds ignore it with `degraded`. Its startup test (hugepages, EAL, mempool, test datagrams through rproxy's loopback port `net_ring_rpchk` compared, the ports started) goes through the same framework: `performance.probe` (`feature: dpdk`), `degraded` (`part: global.performance.dpdk`), `performance.dpdk` of `GET /capabilities` (`requested` is `on` / `off`; `mode` has the DPDK version, the lcores and the port links), and the `dpdk.enabled=true` row of `--check-kernel`. When usable, UDP rules whose listen address is one of `ports[].addresses` are forwarded by the DPDK lcores (`path: dpdk` in `conn.open` and the like, one `dpdk.rule` line per rule). On those addresses `source_ip` `proxy_v1` / `proxy_v2` / `transparent`, `tls` (DTLS, sni) and `http` cannot be used (`bind_failed`). IPv4 only. Needs root (or access to vfio and hugetlbfs), hugepages, and the NIC bound to vfio-pci (steps in docs/en/PERFORMANCE.md).
   - Privileges: `CAP_BPF` (`CAP_SYS_ADMIN` on old kernels) and `CAP_NET_ADMIN` (AF_XDP also `CAP_NET_RAW`); docs/en/PERMISSIONS.md. This version has no fast path built in yet: requesting one falls back with the reason (they come one by one; docs/en/PERFORMANCE.md).
 
 ### Diff before change (dry run, #169)

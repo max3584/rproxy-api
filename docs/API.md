@@ -495,7 +495,7 @@ v0.4.0 で形を決めて中身まで入れた設定（docs/DESIGN-v0.4.md。設
 | 帯域（#166） | ルールの `bandwidth` | `upload`・`download`（`"10Mbps"`、8kbps〜100Gbps）、`burst`（`"1MiB"`）、`per_source`（`upload`・`download`・`prefix_v4`・`prefix_v6`・`max_sources`）。TCP は待たせ、UDP は捨てる | `bandwidth` |
 | GeoIP（#168。下の「GeoIP」） | ルールの `geoip`、ミドルウェアの `geoip`、`global.geoip` | `allow_countries`・`deny_countries`（ISO 3166-1 alpha-2）、`allow_asns`・`deny_asns`、`unknown`（`allow` / `deny`）。`global.geoip` は `country_db`・`asn_db`（mmdb）・`check_interval`・`log_country`。国のリストは `country_db`、ASN のリストは `asn_db` が要る | `geoip`、`middlewares` の `geoip` |
 | 受け身のヘルスチェック（#170。下の「受け身のヘルスチェック」） | ルールの `outlier_detection`（L4。`http` のルールでは `invalid`）、`http.services.<名前>.outlier_detection` | L4：`consecutive_failures`・`short_lived`・`ejection_time`・`max_ejection_time`・`max_ejected_percent`。L7：`consecutive_5xx`・`consecutive_gateway_failures`・`failure_percent`・`min_requests`・`window`・`ejection_time`・`max_ejection_time`・`max_ejected_percent` | `outlier_detection`、`services` の `outlier_detection` |
-| performance（#194・#184） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）、`ebpf`・`xdp`（#260、カーネルでの転送。下の「performance」）。項目ごとに、設定ファイル → 環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` → 既定の順。再起動まで効かない。下の「performance」 | `performance`（効く項目の名前。すべて） |
+| performance（#194・#184） | `global.performance` | `workers`、`udp_shards`（1〜64 か `auto`）、`cpu_affinity`（`none` / `auto` / `"0-3,6"`）、`busy_poll_usecs`、`splice`（`enabled`・`after`・`full_reads`・`pipe_size`）、`ebpf`・`xdp`（#260、カーネルでの転送。下の「performance」）、`dpdk`（#261、DPDK のデータプレーン。`--features dpdk` のビルドだけ）。項目ごとに、設定ファイル → 環境変数 `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`（数か `auto`）・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE*` → 既定の順。再起動まで効かない。下の「performance」 | `performance`（効く項目の名前。すべて） |
 | ルールの組（#28） | `GET /rulesets`、`GET` / `PUT` / `DELETE /rulesets/{name}` | 下の「ルールの組・状態・readiness」 | `rulesets` |
 | 状態（#28） | ルールの表示の `conditions` | `[{"type","status","reason","message","last_transition"}]`。type は `Accepted`・`Programmed`・`ResolvedRefs`・`BackendsHealthy`（下の「ルールの組・状態・readiness」） | `conditions` |
 | readiness（#28） | `GET /readyz` | 認証なし。`200 {"ready": true}` / `503 {"ready": false, "reason": "starting" \| "draining"}` | `readyz` |
@@ -532,6 +532,22 @@ global:
       batch: 64             # 1 回にまとめるパケットの数（1〜1024、ring_size 以下）
       busy_poll: false      # SO_PREFER_BUSY_POLL
       fallback: true
+    dpdk:                   # L4 の UDP を DPDK で（#261、実験。--features dpdk のビルドだけ。docs/PERFORMANCE.md）
+      enabled: false        # 既定 off
+      eal_args: []          # EAL にそのまま渡す（例 ["--in-memory", "--file-prefix=rproxy"]）。-l・-a・--vdev は下の項目から作るので書かない
+      lcores: "2-5"         # 転送に専有する CPU（enabled のとき必須。cpu_affinity と重ねない）
+      ports:                # pci か vdev のどちらか
+        - pci: "0000:3b:00.0"         # vfio-pci に付け替えた NIC（vdev なら "net_tap0,iface=dtap0"・"net_af_packet0,iface=eth1" など）
+          rx_queues: 4                # 1〜64、既定 1（RSS で lcore に配る）
+          tx_queues: 4                # 1〜64、既定 1。lcore の数以上
+          rx_desc: 1024               # 64〜16384、既定 1024
+          tx_desc: 1024
+          addresses: ["198.51.100.2/24"]   # ポートの IPv4 のアドレス（enabled のとき必須）。UDP のルールはここで待ち受ける
+          gateway: 198.51.100.1       # ほかのネットワークへの次の宛先（ポートのネットワークの中）
+      mempool: { mbufs: 65535, cache: 256 }   # mbufs 1023〜16777216、cache 512 まで（mbufs / 1.5 まで）
+      hugepages: { size: 2MB }       # 2MB か 1GB。起動の前に空きを確かめるだけ（用意はホストで）
+      burst: 32             # 1〜512
+      fallback: true        # 使えないとき今の処理に戻る（false なら起動を止める）
 ```
 
 - 項目ごとに、設定ファイル → 環境変数・引数（`RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE`）→ 既定の順で決める。`splice` の中も項目ごと。どれも起動のときだけ決まり、ファイルを変えたら `restart_needed` に出る。
@@ -542,6 +558,7 @@ global:
   - 起動時に、求められた速い道ごとにテストデータを実際に流して確かめてから使う（カーネルの版では決めない）。結果は機能ごとに `event = "performance.probe"` の行（`feature`・`requested`・`active`・`mode`・`reason`・`tests`）と `GET /capabilities` の `performance`（`{"ebpf_tcp": {"requested", "active", "mode", "reason"}, "xdp": {...}}`）に出る。使えなければ `degraded`（`part: global.performance.ebpf.tcp` / `global.performance.xdp.mode`、`reason`）を出して今の処理で動く。`fallback: false` なら起動を止める。何も求めなければ何も試さない。
   - 動いている間は数えたり見張ったりしない。速い道の操作が失敗して接続を今の処理に戻したときだけログに出す。
   - `rproxy-api --check-kernel`（`--config` / `RPROXY_CONFIG` で何を求めているかを読む）：すべての速い道を同じテストで確かめて表で出す（`--check-kernel-format json` で JSON）。求めたものがすべて使えれば 0、そうでなければ 1 で終わる（導入前の確認・Kubernetes の initContainer）。
+  - `dpdk`（#261）：環境変数はなし（設定ファイルだけ）。`features.performance` に `dpdk` があるのは `--features dpdk` のビルドだけで、ほかのビルドでは無視して `degraded`。起動時の試験（ヒュージページ・EAL・mempool・rproxy のループバックのポート `net_ring_rpchk` にテストのデータグラムを通して比べる・ポートの起動）も同じ枠組みで、`performance.probe`（`feature: dpdk`）・`degraded`（`part: global.performance.dpdk`）・`GET /capabilities` の `performance.dpdk`（`requested` は `on` / `off`、`mode` に DPDK の版・lcore・ポートのリンク）・`--check-kernel` の `dpdk.enabled=true` の行に出る。使えるときは、待ち受けのアドレスが `ports[].addresses` の UDP のルールを DPDK の lcore が転送する（ログの `conn.open` などに `path: dpdk`、ルールごとに `dpdk.rule`）。そのアドレスでは `source_ip` の `proxy_v1` / `proxy_v2` / `transparent`、`tls`（DTLS・sni）、`http` は使えない（`bind_failed`）。IPv4 だけ。要るもの：root（か vfio と hugetlbfs への権限）、ヒュージページ、NIC の vfio-pci への付け替え（docs/PERFORMANCE.md の手順）。
   - 要る権限は `CAP_BPF`（古いカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`（AF_XDP は `CAP_NET_RAW` も）。docs/PERMISSIONS.md。この版では速い道そのものはまだ入っておらず、求めても理由つきで今の処理に戻る（順に入れる。docs/PERFORMANCE.md）。
 
 ### 変更前の差分（dry run、#169）
