@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 use super::access::{AccessEntry, NO_ROUTE};
 use crate::core::bandwidth::{Dir, Gate};
 use super::middleware::auth::{BasicVerdict, ForwardAuth};
+use super::middleware::ext_authz;
 use super::middleware::oidc::{self, Oidc};
 use super::backend::{self, Dialer, Sender, ServerHealth, Service};
 use super::compress;
@@ -126,8 +127,12 @@ impl std::fmt::Debug for Router {
 impl Router {
 	pub fn compile(spec: &HttpSpec, upstream: &Upstream, lookup: Lookup) -> Result<Router, ApiError> {
 		let mut services = std::collections::HashMap::new();
-		for (name, s) in &spec.services {
-			let mut service = Service::compile(name, s, &spec.middlewares)?;
+		// services whose servers copy requests (a server's `mirror`) need the services they copy
+		// to: compiled after the others (validation keeps those from copying again)
+		let copies = |s: &super::ServiceSpec| super::copies_per_server(s, &spec.middlewares);
+		let ordered = spec.services.iter().filter(|(_, s)| !copies(s)).chain(spec.services.iter().filter(|(_, s)| copies(s)));
+		for (name, s) in ordered {
+			let mut service = Service::compile_with(name, s, &spec.middlewares, &services)?;
 			// HTTP/2 over the rule's tls.upstream: its own ALPN
 			if service.tls.is_none() && !service.protocol.is_default() && service.servers.iter().any(|v| v.https) {
 				let config = (*crate::tls::config::client_config(upstream)?).clone();
@@ -382,6 +387,16 @@ impl Conn {
 		}
 	}
 
+	/// `tls.misdirected`: the request's Host is in another group of names than the TLS
+	/// server name of this connection. Plain HTTP and connections without SNI are not checked.
+	fn misdirected(&self, host: &str) -> bool {
+		let Some(server_name) = self.tls.as_ref().and_then(|t| t.server_name.as_deref()) else {
+			return false;
+		};
+		let tls = self.rt.tls();
+		tls.spec.misdirected.as_ref().is_some_and(|m| m.misdirected(server_name, host))
+	}
+
 	/// The rule asks clients for certificates (`tls.client_auth`, any mode).
 	fn client_auth(&self) -> bool {
 		self.tls.is_some() && self.rt.tls().spec.client_auth.mode != crate::tls::config::ClientAuthMode::None
@@ -557,6 +572,14 @@ fn te_trailers(headers: &HeaderMap) -> bool {
 		.any(|t| t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("trailers")))
 }
 
+/// What `forward_auth` decided.
+enum AuthOutcome {
+	/// Go on; headers for the client's response (ext_authz's `response_headers_to_add`).
+	Allow(Vec<ext_authz::HeaderOption>),
+	/// The answer for the client: the auth server's refusal, or an error.
+	Deny(Response<Body>),
+}
+
 /// What the response side of the chain needs to know about the request.
 struct Sent {
 	accept_encoding: String,
@@ -605,8 +628,12 @@ impl Conn {
 			headers: &headers,
 			client: client_ip,
 		};
-		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info) {
+		// tls.misdirected: a coalesced HTTP/2 connection (or any) carrying a request for a name of
+		// another group than its TLS server name gets 421, before routing (RFC 9110 §15.5.20)
+		let misdirected = self.misdirected(&host);
+		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !misdirected) {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
+			None if misdirected => ("", None, &[][..], &[][..], None, None),
 			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
 		};
 		// timeouts.request (#227) counts from here
@@ -666,13 +693,19 @@ impl Conn {
 		let mut mirrors: Vec<mirror::Copy> = vec![];
 		// cookies of the authentication middlewares for the response
 		let mut set_cookies: Vec<HeaderValue> = vec![];
+		// headers an ext_authz server adds to the response (`forward_auth`, protocol grpc)
+		let mut response_headers: Vec<ext_authz::HeaderOption> = vec![];
 		let authority = request_authority(&parts.uri, &parts.headers)
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.clone());
 		// which middleware answered (kind, name), for `refused_by` in the access log
 		let mut answered_by: Option<(&'static str, &str)> = None;
+		if misdirected {
+			answer = Some(error_response(StatusCode::MISDIRECTED_REQUEST));
+			answered_by = Some(("misdirected", ""));
+		}
 		// sign-in callbacks and logout of `oidc`, whichever route matched
-		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
+		if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
 			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
 			answered_by = Some(("oidc", o.name.as_str()));
 		}
@@ -713,7 +746,13 @@ impl Conn {
 						Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
 					}
 				},
-				Middleware::ForwardAuth(fa) => self.forward_auth(&router, fa, &mut parts, client_ip, &host).await,
+				Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
+					AuthOutcome::Allow(add) => {
+						response_headers.extend(add);
+						None
+					}
+					AuthOutcome::Deny(resp) => Some(resp),
+				},
 				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
 					oidc::Outcome::Pass { session, set_cookie } => {
 						o.pass_identity(&mut parts.headers, &session);
@@ -762,6 +801,7 @@ impl Conn {
 							headers: parts.headers.clone(),
 							client_ip,
 							host: host.clone(),
+							forwarded: false,
 						});
 					}
 					None
@@ -839,6 +879,9 @@ impl Conn {
 		};
 		for c in set_cookies {
 			resp.headers_mut().append(header::SET_COOKIE, c);
+		}
+		for h in &response_headers {
+			h.apply(resp.headers_mut());
 		}
 		// response side in reverse, also for answers of the middlewares
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
@@ -926,39 +969,221 @@ impl Conn {
 		}
 	}
 
-	/// `forward_auth`: asks the auth server; `Some` is its refusal (or an error) for the client.
+	/// `forward_auth`: asks the auth server. `body` and `replay` change when the body is sent
+	/// along (`forward_body`): it is read first (as `buffering` does) and sent from memory.
+	#[allow(clippy::too_many_arguments)]
 	async fn forward_auth(
 		&self,
 		router: &Router,
 		fa: &ForwardAuth,
 		parts: &mut hyper::http::request::Parts,
+		body: &mut Body,
+		replay: &mut Option<Bytes>,
 		client: IpAddr,
 		host: &str,
-	) -> Option<Response<Body>> {
-		let server = &fa.service.servers[0];
-		let mut req = Request::get(fa.path.as_str()).body(empty_body()).ok()?;
+	) -> AuthOutcome {
+		let along = match fa.forward_body {
+			Some(max) => {
+				let bytes = match replay.clone() {
+					Some(b) => b,
+					None => {
+						let taken = std::mem::replace(body, empty_body());
+						match resilience::buffer(&parts.headers, taken, max).await {
+							Ok(b) => {
+								*body = full_body(b.clone());
+								*replay = Some(b.clone());
+								b
+							}
+							Err(true) => return AuthOutcome::Deny(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
+							Err(false) => return AuthOutcome::Deny(error_response(StatusCode::BAD_REQUEST)),
+						}
+					}
+				};
+				if bytes.len() as u64 > max {
+					return AuthOutcome::Deny(error_response(StatusCode::PAYLOAD_TOO_LARGE));
+				}
+				Some(bytes)
+			}
+			None => None,
+		};
+		let Some(index) = fa.service.pick(None) else {
+			warn!(event = "http.error", rule = %self.rt.key, middleware = %fa.name, service = %fa.service.name, error = "no auth server is up");
+			return AuthOutcome::Deny(error_response(StatusCode::SERVICE_UNAVAILABLE));
+		};
+		let server = &fa.service.servers[index];
+		let authority = request_authority(&parts.uri, &parts.headers)
+			.and_then(|h| h.to_str().ok().map(str::to_string))
+			.unwrap_or_else(|| host.to_string());
+		if fa.grpc {
+			return self.ext_authz(router, fa, index, parts, along, client, &authority).await;
+		}
+		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+		let (method, path) = if fa.client_request {
+			(parts.method.clone(), format!("{}{pq}", fa.path.trim_end_matches('/')))
+		} else {
+			(hyper::Method::GET, fa.path.clone())
+		};
+		let length = along.as_ref().map_or(0, |b| b.len());
+		let Ok(mut req) = Request::builder().method(method).uri(path).body(along.map(full_body).unwrap_or_else(empty_body)) else {
+			return AuthOutcome::Deny(error_response(StatusCode::BAD_REQUEST));
+		};
 		*req.headers_mut() = fa.request_headers(parts, client, self.https, host);
 		// the auth server sees the client certificate as rproxy did, never a client's claim (#238)
 		self.client_cert_headers(req.headers_mut());
-		req.headers_mut().insert(header::HOST, HeaderValue::from_str(&server.authority).ok()?);
-		match self.send(router, &fa.service, 0, req, None).await {
-			Ok(resp) if resp.status().is_success() => {
+		// Envoy's HTTP ext_authz (client_request): the client's Host, and the length of what is sent
+		let host_value = if fa.client_request { HeaderValue::from_str(&authority) } else { HeaderValue::from_str(&server.authority) };
+		let Ok(host_value) = host_value else {
+			return AuthOutcome::Deny(error_response(StatusCode::BAD_REQUEST));
+		};
+		req.headers_mut().insert(header::HOST, host_value);
+		if fa.client_request || length > 0 {
+			req.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+		}
+		match self.send(router, &fa.service, index, req, fa.limit).await {
+			Ok(resp) if fa.allows(resp.status().as_u16()) => {
 				let (answer, body) = resp.into_parts();
 				// read the rest so the connection can be used again
 				let _ = body.collect().await;
 				fa.copy_answer(&answer.headers, parts);
-				None
+				AuthOutcome::Allow(vec![])
 			}
 			Ok(mut resp) => {
 				strip_hop_by_hop(resp.headers_mut());
-				Some(resp)
+				AuthOutcome::Deny(resp)
 			}
 			Err(Failure::Status(status, error)) => {
 				warn!(event = "http.error", rule = %self.rt.key, middleware = %fa.name, backend = %server.addr(), error = %error,
 					"the auth server did not answer");
-				Some(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }))
+				AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }))
 			}
 		}
+	}
+
+	/// `forward_auth` with `protocol: grpc` (v0.4.3): Envoy's ext_authz v3 Check over HTTP/2.
+	#[allow(clippy::too_many_arguments)]
+	async fn ext_authz(
+		&self,
+		router: &Router,
+		fa: &ForwardAuth,
+		index: usize,
+		parts: &mut hyper::http::request::Parts,
+		along: Option<Bytes>,
+		client: IpAddr,
+		authority: &str,
+	) -> AuthOutcome {
+		let server = &fa.service.servers[index];
+		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+		let scheme = if self.https { "https" } else { "http" };
+		// the client's headers (all, or `request_headers`) without hop-by-hop ones, and the
+		// client certificate's as rproxy saw it; a name repeated is joined with "," as Envoy does
+		let mut picked = HeaderMap::new();
+		for (name, value) in &parts.headers {
+			if (fa.request_headers.is_empty() || fa.request_headers.contains(name)) && !HOP_BY_HOP.contains(name) && name != header::UPGRADE {
+				picked.append(name.clone(), value.clone());
+			}
+		}
+		self.client_cert_headers(&mut picked);
+		let mut headers: Vec<(String, String)> = vec![
+			(":authority".into(), authority.to_string()),
+			(":method".into(), parts.method.to_string()),
+			(":path".into(), pq.clone()),
+			(":scheme".into(), scheme.into()),
+		];
+		for name in picked.keys() {
+			let joined = picked.get_all(name).iter().map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).collect::<Vec<_>>().join(",");
+			headers.push((name.as_str().to_string(), joined));
+		}
+		let size = along
+			.as_ref()
+			.map(|b| b.len() as i64)
+			.or_else(|| parts.headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()))
+			.unwrap_or(-1);
+		let protocol = match parts.version {
+			Version::HTTP_2 => "HTTP/2",
+			Version::HTTP_3 => "HTTP/3",
+			Version::HTTP_10 => "HTTP/1.0",
+			_ => "HTTP/1.1",
+		};
+		let attributes = ext_authz::Attributes {
+			source: SocketAddr::new(client, self.client.port()),
+			destination: self.local,
+			id: "",
+			method: parts.method.as_str(),
+			headers: &headers,
+			path: &pq,
+			host: authority,
+			scheme,
+			protocol,
+			body: along.as_deref(),
+			size,
+			time: std::time::SystemTime::now(),
+		};
+		let message = ext_authz::check_request(&attributes);
+		let Ok(mut req) = Request::post(ext_authz::CHECK_PATH)
+			.header(header::CONTENT_TYPE, "application/grpc")
+			.header(header::HOST, server.authority.as_str())
+			.body(full_body(message))
+		else {
+			return AuthOutcome::Deny(error_response(StatusCode::BAD_REQUEST));
+		};
+		req.extensions_mut().insert(backend::WantsTrailers);
+		let failed = |error: &str| {
+			warn!(event = "http.error", rule = %self.rt.key, middleware = %fa.name, backend = %server.addr(), error = %error,
+				"the ext_authz server did not answer");
+		};
+		let resp = match self.send(router, &fa.service, index, req, fa.limit).await {
+			Ok(resp) => resp,
+			Err(Failure::Status(status, error)) => {
+				failed(&error);
+				return AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }));
+			}
+		};
+		let (head, body) = resp.into_parts();
+		let collected = match http_body_util::Limited::new(body, ext_authz::MAX_RESPONSE).collect().await {
+			Ok(c) => c,
+			Err(e) => {
+				failed(&e.to_string());
+				return AuthOutcome::Deny(error_response(StatusCode::FORBIDDEN));
+			}
+		};
+		let grpc_status = collected
+			.trailers()
+			.and_then(|t| t.get("grpc-status"))
+			.or_else(|| head.headers.get("grpc-status"))
+			.and_then(|v| v.to_str().ok())
+			.map(str::to_string);
+		if head.status != StatusCode::OK || grpc_status.as_deref() != Some("0") {
+			failed(&format!("HTTP {} grpc-status {}", head.status.as_u16(), grpc_status.as_deref().unwrap_or("none")));
+			// a broken auth server lets nothing through (Envoy's status_on_error)
+			return AuthOutcome::Deny(error_response(StatusCode::FORBIDDEN));
+		}
+		let answer = match ext_authz::check_response(&collected.to_bytes()) {
+			Ok(a) => a,
+			Err(e) => {
+				failed(&e);
+				return AuthOutcome::Deny(error_response(StatusCode::FORBIDDEN));
+			}
+		};
+		if answer.code == 0 {
+			for name in &answer.ok_remove {
+				// the request's own identity stays rproxy's
+				if *name != header::HOST {
+					parts.headers.remove(name);
+				}
+			}
+			for h in answer.ok_headers.iter().filter(|h| h.name != header::HOST) {
+				h.apply(&mut parts.headers);
+			}
+			return AuthOutcome::Allow(answer.ok_response_headers);
+		}
+		let status = StatusCode::from_u16(answer.denied_status).ok().filter(|s| s.as_u16() >= 200).unwrap_or(StatusCode::FORBIDDEN);
+		let mut resp = Response::new(full_body(answer.denied_body));
+		*resp.status_mut() = status;
+		for h in &answer.denied_headers {
+			h.apply(resp.headers_mut());
+		}
+		strip_hop_by_hop(resp.headers_mut());
+		AuthOutcome::Deny(resp)
 	}
 
 	/// The `crowdsec` middleware: the LAPI's decisions, then AppSec. `Some` refuses the request.
@@ -1005,7 +1230,7 @@ impl Conn {
 		&self,
 		target: Target<'_>,
 		mut req: Request<Body>,
-		replay: Option<Bytes>,
+		mut replay: Option<Bytes>,
 		retry: Option<RetryPolicy>,
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
@@ -1038,6 +1263,10 @@ impl Conn {
 		let mut first = Some((parts, body));
 
 		let mut attempt = 0;
+		// a server's `mirror` copies once, on the first attempt that reaches such a server
+		let mut mirrored = false;
+		// headers a server's ext_authz adds to the response
+		let mut server_headers: Vec<ext_authz::HeaderOption> = vec![];
 		let (mut resp, index, counted) = loop {
 			attempt += 1;
 			let Some(index) = service.pick(sticky.as_deref()) else {
@@ -1061,7 +1290,7 @@ impl Conn {
 				}
 				break (error_response(status), index, counted);
 			}
-			let (mut p, body) = match first.take() {
+			let (mut p, mut body) = match first.take() {
 				Some((p, body)) => (p, match &replay {
 					Some(bytes) => full_body(bytes.clone()),
 					None => body,
@@ -1078,9 +1307,62 @@ impl Conn {
 			};
 			p.uri = Uri::from(path_and_query.clone());
 			p.version = Version::HTTP_11;
-			// the server's own middlewares (#229), after the route's
-			if let Some(answer) = server.middlewares.iter().find_map(|m| m.on_request(&mut p, ctx)) {
+			// the server's own middlewares (#229), after the route's; a server's `mirror`
+			// (v0.4.3) copies the request as it is at that point, once per request
+			let mut copies = vec![];
+			let mut answered = None;
+			for m in &server.middlewares {
+				// a server's forward_auth (v0.4.3, the Gateway API's ExternalAuth on a backendRef)
+				if let Middleware::ForwardAuth(fa) = m.as_ref() {
+					match self.forward_auth(router, fa, &mut p, &mut body, &mut replay, client_ip, host).await {
+						AuthOutcome::Allow(add) => server_headers.extend(add),
+						AuthOutcome::Deny(resp) => {
+							answered = Some(resp);
+							break;
+						}
+					}
+					continue;
+				}
+				if let Middleware::Mirror { name, service: to, share } = m.as_ref() {
+					if !mirrored && share.take() {
+						let mut headers = p.headers.clone();
+						if let Some(h) = &original_host {
+							headers.insert(header::HOST, h.clone());
+						}
+						copies.push(mirror::Copy {
+							name: name.clone(),
+							service: to.clone(),
+							method: p.method.clone(),
+							uri: p.uri.clone(),
+							headers,
+							client_ip,
+							host: host.to_string(),
+							forwarded: true,
+						});
+					}
+					continue;
+				}
+				if let Some(answer) = m.on_request(&mut p, ctx) {
+					answered = Some(answer);
+					break;
+				}
+			}
+			if let Some(answer) = answered {
 				break (answer, index, counted);
+			}
+			if !copies.is_empty() {
+				mirrored = true;
+				let bodies = match &replay {
+					Some(bytes) => (0..copies.len()).map(|_| full_body(bytes.clone())).collect(),
+					None => {
+						let (main, bodies) = mirror::tee(body, copies.len());
+						body = main;
+						bodies
+					}
+				};
+				for (copy, b) in copies.into_iter().zip(bodies) {
+					self.mirror(router.clone(), copy, b);
+				}
 			}
 			if !server.prefix.is_empty() {
 				let pq = p.uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
@@ -1158,6 +1440,9 @@ impl Conn {
 		for m in server.middlewares.iter().rev() {
 			m.on_response(resp.headers_mut(), ctx);
 		}
+		for h in &server_headers {
+			h.apply(resp.headers_mut());
+		}
 		resp
 	}
 
@@ -1193,8 +1478,11 @@ impl Conn {
 		let original_host = request_authority(&copy.uri, &copy.headers);
 		let mut headers = copy.headers;
 		strip_hop_by_hop(&mut headers);
-		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238)
-		self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238);
+		// a server's copy has them already
+		if !copy.forwarded {
+			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+		}
 		headers.insert(header::HOST, host);
 		let mut req = Request::new(body);
 		*req.method_mut() = copy.method;
@@ -1413,7 +1701,7 @@ impl Conn {
 
 /// Where `forward` sends a request.
 struct Target<'a> {
-	router: &'a Router,
+	router: &'a Arc<Router>,
 	service: &'a Arc<Service>,
 	route: &'a str,
 	host: &'a str,

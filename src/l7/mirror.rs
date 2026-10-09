@@ -29,6 +29,8 @@ pub struct Copy {
 	/// The client as `global.trusted_proxies` decided, and the request's host (X-Forwarded-*).
 	pub client_ip: std::net::IpAddr,
 	pub host: String,
+	/// Taken after the request got its X-Forwarded-* headers (a server's `mirror`, v0.4.3).
+	pub forwarded: bool,
 }
 
 enum Item {

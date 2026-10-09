@@ -326,15 +326,32 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 #[derive(Debug)]
 pub struct ForwardAuth {
 	pub name: String,
+	/// `address` as a service of its own, or a service of the rule (`service`, v0.4.3).
 	pub service: Arc<crate::l7::backend::Service>,
-	/// Path and query of `address`.
+	/// Path and query of `address`, or `path` with `service`; with `client_request`, the
+	/// prefix of the client's path.
 	pub path: String,
 	/// Headers of the auth server's 2xx answer copied to the request for the backend.
 	pub response_headers: Vec<HeaderName>,
+	/// `response_headers: ["*"]` (v0.4.3): all but those about the answer itself.
+	pub all_response_headers: bool,
 	/// Headers of the client's request sent to the auth server; empty = all.
 	pub request_headers: Vec<HeaderName>,
 	pub trust_forward_header: bool,
+	/// The time for one ask, with a service of the rule (`address` has it as its response time).
+	pub limit: Option<Duration>,
+	/// Envoy's ext_authz over gRPC (v0.4.3).
+	pub grpc: bool,
+	/// The client's method, path and Host (v0.4.3).
+	pub client_request: bool,
+	/// Statuses meaning "allowed" (default 200-299).
+	pub allow: Vec<(u16, u16)>,
+	/// Bytes of the client's body sent along (v0.4.3).
+	pub forward_body: Option<u64>,
 }
+
+/// Headers of an auth server's answer never copied to the request (they describe the answer).
+const ANSWER_ONLY: [&str; 6] = ["host", "content-length", "content-type", "content-encoding", "transfer-encoding", "date"];
 
 const FORWARDED: [&str; 6] =
 	["x-forwarded-method", "x-forwarded-proto", "x-forwarded-host", "x-forwarded-uri", "x-forwarded-for", "x-forwarded-port"];
@@ -380,8 +397,26 @@ impl ForwardAuth {
 		out
 	}
 
-	/// After a 2xx: the named headers of the answer replace those of the request.
+	/// Whether the auth server's status allows the request.
+	pub fn allows(&self, status: u16) -> bool {
+		self.allow.iter().any(|(a, b)| (*a..=*b).contains(&status))
+	}
+
+	/// After a 2xx: the named headers of the answer replace those of the request
+	/// (all of them but those about the answer itself with `["*"]`).
 	pub fn copy_answer(&self, answer: &HeaderMap, parts: &mut Parts) {
+		if self.all_response_headers {
+			for name in answer.keys() {
+				if is_hop_by_hop(name) || ANSWER_ONLY.contains(&name.as_str()) {
+					continue;
+				}
+				parts.headers.remove(name);
+				for v in answer.get_all(name) {
+					parts.headers.append(name.clone(), v.clone());
+				}
+			}
+			return;
+		}
 		for name in &self.response_headers {
 			parts.headers.remove(name);
 			for v in answer.get_all(name) {
@@ -500,8 +535,14 @@ mod tests {
 			service,
 			path: "/auth".into(),
 			response_headers: vec![HeaderName::from_static("x-user")],
+			all_response_headers: false,
 			request_headers: vec![],
 			trust_forward_header: false,
+			limit: None,
+			grpc: false,
+			client_request: false,
+			allow: vec![(200, 299)],
+			forward_body: None,
 		};
 		let req = hyper::Request::post("/app/x?y=1")
 			.header("cookie", "a=b")
@@ -536,5 +577,15 @@ mod tests {
 		fa.copy_answer(&answer, &mut parts);
 		assert_eq!(parts.headers["x-user"], "alice");
 		assert!(!parts.headers.contains_key("x-other"));
+		// ["*"]: all, but not those about the answer
+		fa.all_response_headers = true;
+		answer.insert("content-length", HeaderValue::from_static("99"));
+		answer.insert("connection", HeaderValue::from_static("close"));
+		let (mut parts, _) = hyper::Request::post("/").header("content-length", "5").body(()).unwrap().into_parts();
+		fa.copy_answer(&answer, &mut parts);
+		assert_eq!((parts.headers["x-user"].as_bytes(), parts.headers["x-other"].as_bytes()), (&b"alice"[..], &b"1"[..]));
+		assert_eq!(parts.headers["content-length"], "5");
+		assert!(!parts.headers.contains_key("connection"));
+		assert!(fa.allows(204) && !fa.allows(302));
 	}
 }

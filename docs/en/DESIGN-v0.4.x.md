@@ -19,6 +19,9 @@
 | E. Shutting down on SIGTERM | v0.4.1 | `graceful_shutdown` | passes `5s` / `25s` to managed and fleet pods, readiness on `/readyz` | — |
 | D1. #240 certificate API | v0.4.2 | `cert_store` | not used | no screen yet |
 | D2. #241 persisting rule sets | v0.4.2 | `ruleset_persistence` | not used | migration 012, read-only view |
+| G1. 421 Misdirected Request (7.1) | v0.4.3 | `misdirected` in `http_options` | the names of the HTTPS listeners on one port go to `tls.misdirected` (`GatewayHTTPSListenerDetectMisdirectedRequests`, v0.4.5) | — |
+| G2. Per-server `cors`, redirects and `mirror` (7.2) | v0.4.3 | `server_middleware_kinds` | the `CORS`, `RequestRedirect` and `RequestMirror` filters on backendRefs (v0.4.5) | — |
+| G3. External authorization (`forward_auth` extended, 7.3) | v0.4.3 | `forward_auth` | HTTPRoute's `ExternalAuth` filter (HTTP and gRPC, v0.4.5) | — |
 
 ## 2. E. Shutting down on SIGTERM (v0.4.1)
 
@@ -155,7 +158,40 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 
 - **#241, conflicts on restore (approved by the owner, 2026-10-08)**: section 4 said "a rule whose key was already taken is `failed` alone", but the rule table holds one entry per key, so a second rule with the same key cannot be registered even as `failed`. Instead, a rule whose key or listen ports overlap a rule restored before is **left out of its set** with `restore.conflict` (a rule that cannot be applied for another reason, such as a refused file, gets `restore.skip`), and the rest of the set is applied. The set's `etag` then differs from the stored one; the `ruleset.restore` log line shows both the new `etag` and the `stored_etag`. The DB row is left as it is (the next `PUT` brings it in line).
 
-## 7. G. VIPs of a Kubernetes fleet and lost nodes (v0.4.3)
+## 7. The rest of the Gateway API (v0.4.3, rproxy-gateway v0.4.5)
+
+The Gateway API features rproxy-gateway does not claim yet ("Not claimed" in rproxy-gateway's docs/en/CONFORMANCE.md) that need something in rproxy. All are optional and, left out, behave as v0.4.2 (requested by the owner, 2026-10-08). As in 16. of v0.4.0 (docs/en/DESIGN-v0.4.md), the Gateway API's shapes become general rproxy settings that the controller maps.
+
+### 7.1 421 Misdirected Request (`tls.misdirected`)
+
+- The problem: rproxy-gateway makes the HTTPS listeners of one port (different host names) one rule, and the certificate is chosen by SNI. Browsers send requests for other names in the certificate's SANs on the same HTTP/2 connection (connection coalescing, RFC 9113 §9.1.1), so they reach the routes of another listener than the one chosen by SNI. The Gateway API (the description of `Listener.hostname`, conformance test `HTTPRouteHTTPSListenerDetectMisdirectedRequests`) asks for 421 when the Host belongs to another listener, and 404 when it belongs to none.
+- Shape: `tls.misdirected: {groups: [[pattern, ...], ...]}`. Patterns as in `tls.routes` (exact, `*.`, `**.`) plus `*`, which matches any name. A name belongs to the group of its closest pattern (the order of `tls::config::best_match`, `*` last). When the SNI and the Host are both in groups, and not the same one: 421. When either is in no group, or there is no SNI: nothing is checked (the routes choose).
+- "Listeners" stay out of rproxy's vocabulary: rproxy knows no listeners, so it gets groups of names. The controller makes one group per listener (`*` for a listener without a host name).
+- Where: `Conn::handle` in `server.rs`, before choosing a route. No route and no middleware runs (another listener's middlewares, authentication for one, do not run under this connection's name). The same for HTTP/1.1, HTTP/2 and HTTP/3 (421 is fine over HTTP/1.1 too).
+- Validation: only rules with `http` and `tls.mode: terminate`; a pattern may appear once. `features`: `misdirected` in `http_options`.
+- Tests: unit (the cases of the conformance test), `tests/gateway_l7.rs` (several `:authority` values on one HTTP/2 connection, HTTP/1.1).
+
+### 7.2 Per-server `cors`, redirects and `mirror`
+
+- The problem: the Gateway API's `filters` on a backendRef (applied only when sending to that backend) map to rproxy's `servers[].middlewares` (#229), but those allowed rewriting kinds only (`headers`, `replace_host`, path rewrites), so routes with `CORS`, `RequestRedirect` or `RequestMirror` filters on a backendRef were `UnsupportedValue`.
+- Shape: `cors`, `redirect_scheme`, `redirect_regex` and `mirror` join the kinds `servers[].middlewares` may use (no new shape). `features.server_middleware_kinds` lists the allowed kinds (the controller tells older rproxies by it; `server_middlewares` in `http_options` stays as it was).
+- `cors` and redirects already answer in `on_request` and add headers in `on_response`, so they run as they are in the per-server step of `forward` in `server.rs` (an answer is not retried).
+- `mirror` needs the copy's body and the target service, so `forward` handles it. Once a server is picked, its middlewares run in order and a `mirror` copies the request as it is then (after the headers for the backend, `X-Forwarded-*` and the certificate's, so they are not added again when the copy is sent: `mirror::Copy.forwarded`). Of `retry` attempts, only the first that lands on a server with a `mirror` copies (once per request).
+- The target service must be compiled first (`Service::compile_with`): services whose servers have a `mirror` are compiled after the others, and a `mirror` to a service whose servers have a `mirror` themselves is refused (copies are not copied, and the order is settled).
+- Tests: `per_server_cors_redirects_and_mirrors` in `tests/gateway_l7.rs` (of two servers, one with CORS and a copy, the other a redirect; copies only for requests sent to that server, one `X-Forwarded-For`, the body's length, preflights, the refused shapes).
+
+### 7.3 External authorization (`forward_auth` extended)
+
+- The problem: the Gateway API's `ExternalAuth` filter (experimental, shaped after Envoy's ext_authz) asks, over HTTP, with the client's method, path (after the `http.path` prefix) and Host, lets only 200 through, copies every header of the answer when `allowedResponseHeaders` is empty and sends the body up to `forwardBody.maxSize`; over gRPC it uses Envoy's `envoy.service.auth.v3.Authorization/Check`. rproxy's `forward_auth` had the Traefik shape only (`GET` with `X-Forwarded-Uri`, 2xx lets through, only the headers listed are copied).
+- Shape: no new middleware; `forward_auth` gets options (one place for authentication; the Traefik shape is unchanged): `service` and `path` (in Kubernetes the auth server is a list of pod IPs, more than `address`'s single URL; a service of the rule brings `balance`, `health_check` and BackendTLSPolicy's `tls` along), `client_request`, `allow_status`, `response_headers: ["*"]`, `forward_body: {max_size}`, `protocol: grpc`. `features.forward_auth` names the available options.
+- Not copied with `["*"]`: headers describing the answer itself (hop-by-hop ones, `Host`, `Content-Length`, `Content-Type`, `Content-Encoding`, `Transfer-Encoding`, `Date`); copied, they would break the length or the type of the request body for the backend.
+- `forward_body`: for larger bodies, the Gateway API's type description ("truncated to `maxSize`") and the filter's ("rejected with a 4xx") disagree; as Envoy's default (`allow_partial_message: false`), 413. The body read goes to the backend from memory too, as with `buffering`.
+- gRPC: no protobuf code generator dependency; only the fields used are written by hand (`l7/middleware/ext_authz.rs`; unknown fields are skipped). HTTP/2 is the backend HTTP/2 of #233 (an `address` is h2c only; TLS through a `service` with `protocol: h2` and `tls`). An `ok_response.headers` entry without `append` replaces (Envoy's ext_authz rule). `response_headers_to_add` go on the client's response. gRPC errors (a `grpc-status` other than 0, an unreadable answer) are 403 (Envoy's default `status_on_error`); no connection and no answer in time are 502 and 504, as for HTTP `forward_auth`.
+- Per server: `forward_auth` may be in `servers[].middlewares` (`ExternalAuth` on a backendRef). Services whose servers have a `forward_auth` with `service` are compiled later, as with the `mirror` of 7.2, and that service's servers may not send to other services themselves.
+- Tests: unit (building and reading `ext_authz`, `copy_answer` with `["*"]`), `tests/ext_authz.rs` (Envoy's HTTP shape: method, path, Host, `Content-Length`, body, the headers picked, `["*"]`, 200 only, 413; gRPC with `address` and `service`, headers set and removed, headers added to the response, denials, gRPC errors; per server; the refused shapes).
+- Safety: the auth server still gets the client certificate headers as rproxy saw them (#238). A gRPC `ok_response` cannot change or remove `Host` (the destination chosen by the route stays).
+
+## 8. G. VIPs of a Kubernetes fleet and lost nodes (v0.4.3)
 
 The rproxy-api part of two gaps found after rproxy-gateway v0.4.4 (fleet pods holding VIPs). The gateway side is in rproxy-gateway's docs/en/DESIGN-v0.4.x.md.
 

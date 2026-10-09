@@ -156,8 +156,27 @@ pub struct ServerSpec {
 	pub middlewares: Vec<String>,
 }
 
-/// Middleware kinds that `servers[].middlewares` may use (#229): those that only rewrite.
-pub const SERVER_MIDDLEWARES: &[&str] = &["headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex"];
+/// Middleware kinds that `servers[].middlewares` may use: those that only rewrite (#229), and
+/// since v0.4.3 CORS, redirects, copies and authentication (the Gateway API's filters on backendRefs).
+pub const SERVER_MIDDLEWARES: &[&str] = &[
+	"headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex", "cors", "redirect_scheme",
+	"redirect_regex", "mirror", "forward_auth",
+];
+
+/// The service a middleware sends to besides the request's (`mirror`, `forward_auth` with `service`).
+fn other_service(m: &MiddlewareSpec) -> Option<&String> {
+	match m {
+		MiddlewareSpec::Mirror { service, .. } => Some(service),
+		MiddlewareSpec::ForwardAuth { service, .. } => service.as_ref(),
+		_ => None,
+	}
+}
+
+/// Whether a service's servers send to other services themselves (a `mirror`, or a
+/// `forward_auth` with `service`, in `servers[].middlewares`).
+pub fn copies_per_server(service: &ServiceSpec, middlewares: &BTreeMap<String, MiddlewareSpec>) -> bool {
+	service.servers.iter().flat_map(|s| &s.middlewares).any(|m| middlewares.get(m).and_then(other_service).is_some())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,7 +270,10 @@ pub enum MiddlewareSpec {
 		cors: Option<CorsSpec>,
 	},
 	ForwardAuth {
+		/// The auth server's URL (or `service` instead).
+		#[serde(default, skip_serializing_if = "String::is_empty")]
 		address: String,
+		/// Headers of the auth server's answer copied to the request; `["*"]` for all (v0.4.3).
 		#[serde(default)]
 		response_headers: Vec<String>,
 		#[serde(default)]
@@ -262,6 +284,25 @@ pub enum MiddlewareSpec {
 		/// Time for the auth server to answer (default 10s).
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		timeout: Option<String>,
+		/// Instead of `address`: a service of the rule (its servers, balance, health checks, tls; v0.4.3).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		service: Option<String>,
+		/// With `service`: the path asked (default `/`; v0.4.3).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		path: Option<String>,
+		/// `http` (default) or `grpc`: Envoy's ext_authz v3 `Authorization/Check` (v0.4.3).
+		#[serde(default, skip_serializing_if = "AuthProtocol::is_default")]
+		protocol: AuthProtocol,
+		/// The auth request carries the client's method, its path after the auth path, and
+		/// its Host, as Envoy's HTTP ext_authz (instead of GET with X-Forwarded-Uri; v0.4.3).
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		client_request: bool,
+		/// Statuses of the auth server meaning "allowed" (default 200-299; v0.4.3).
+		#[serde(default, skip_serializing_if = "Vec::is_empty")]
+		allow_status: Vec<String>,
+		/// Send the client's body to the auth server, up to `max_size` bytes (larger: 413; v0.4.3).
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		forward_body: Option<ForwardBodySpec>,
 	},
 	Oidc {
 		issuer: String,
@@ -365,6 +406,29 @@ pub enum MiddlewareSpec {
 	ReplaceHost {
 		host: String,
 	},
+}
+
+/// `protocol` of `forward_auth` (v0.4.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProtocol {
+	#[default]
+	Http,
+	/// Envoy's ext_authz v3 over HTTP/2 (h2c for an http:// `address`).
+	Grpc,
+}
+
+impl AuthProtocol {
+	pub fn is_default(&self) -> bool {
+		*self == AuthProtocol::Http
+	}
+}
+
+/// `forward_body` of `forward_auth` (v0.4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardBodySpec {
+	pub max_size: u64,
 }
 
 /// `fraction` of `mirror`.
@@ -572,10 +636,54 @@ impl MiddlewareSpec {
 					bad(format!("host {host:?} must be host or host:port"))
 				}
 			}
-			MiddlewareSpec::ForwardAuth { address, timeout, .. } => {
-				check_url(address, &format!("middleware {name}"))?;
+			MiddlewareSpec::ForwardAuth {
+				address,
+				timeout,
+				service,
+				path,
+				protocol,
+				client_request,
+				allow_status,
+				forward_body,
+				response_headers,
+				..
+			} => {
+				match (address.is_empty(), service) {
+					(false, None) => check_url(address, &format!("middleware {name}"))?,
+					(true, Some(s)) => {
+						let Some(svc) = services.get(s) else {
+							return bad(format!("service {s:?} is not defined"));
+						};
+						if *protocol == AuthProtocol::Grpc && !matches!(svc.protocol, UpstreamProtocol::H2 | UpstreamProtocol::H2c) {
+							return bad(format!("protocol grpc needs service {s:?} to have protocol h2 or h2c"));
+						}
+					}
+					_ => return bad("give address or service (exactly one)".into()),
+				}
+				if let Some(p) = path {
+					if service.is_none() || !p.starts_with('/') || p.parse::<hyper::http::uri::PathAndQuery>().is_err() {
+						return bad(format!("path {p:?}: only with service, and must start with /"));
+					}
+				}
 				if let Some(t) = timeout {
 					parse_duration(t).map_err(|e| invalid(format!("middleware {name}: timeout: {e}")))?;
+				}
+				for s in allow_status {
+					parse_status_range(s).map_err(|e| invalid(format!("middleware {name}: allow_status: {e}")))?;
+				}
+				if forward_body.is_some_and(|b| b.max_size == 0) {
+					return bad("forward_body.max_size must be at least 1 (leave forward_body out not to send the body)".into());
+				}
+				if *protocol == AuthProtocol::Grpc {
+					if *client_request || !allow_status.is_empty() || path.is_some() || !response_headers.is_empty() {
+						return bad("protocol grpc takes no client_request, allow_status, path or response_headers (the auth server's answer says)".into());
+					}
+					if address.starts_with("https://") {
+						return bad("protocol grpc with address needs http:// (h2c); for TLS use a service with protocol h2 and tls".into());
+					}
+				}
+				if response_headers.iter().any(|h| h == "*") && response_headers.len() > 1 {
+					return bad("response_headers: \"*\" (all) stands alone".into());
 				}
 				Ok(())
 			}
@@ -673,6 +781,14 @@ impl HttpSpec {
 								"{what}: middleware {m:?} ({}) cannot run per server; only {}",
 								spec.kind(),
 								SERVER_MIDDLEWARES.join(", ")
+							)));
+						}
+						Some(spec)
+							if other_service(spec).and_then(|to| self.services.get(to)).is_some_and(|t| copies_per_server(t, &self.middlewares)) =>
+						{
+							let to = other_service(spec).map(String::as_str).unwrap_or_default();
+							return Err(invalid(format!(
+								"{what}: middleware {m:?} sends to service {to:?}, whose servers send to other services themselves (mirror, forward_auth)"
 							)));
 						}
 						Some(_) => {}
@@ -783,6 +899,28 @@ impl HttpSpec {
 		}
 		if servers().any(|s| s.status.is_some()) {
 			used.push("server_status");
+		}
+		used
+	}
+
+	/// Names in `Features::forward_auth` that these settings use (v0.4.3).
+	pub fn forward_auth_used(&self) -> Vec<&'static str> {
+		let mut used = vec![];
+		for m in self.middlewares.values() {
+			if let MiddlewareSpec::ForwardAuth { service, path, protocol, client_request, allow_status, forward_body, response_headers, .. } = m {
+				for (name, on) in [
+					("service", service.is_some() || path.is_some()),
+					("grpc", *protocol == AuthProtocol::Grpc),
+					("client_request", *client_request),
+					("allow_status", !allow_status.is_empty()),
+					("forward_body", forward_body.is_some()),
+					("all_response_headers", response_headers.iter().any(|h| h == "*")),
+				] {
+					if on && !used.contains(&name) {
+						used.push(name);
+					}
+				}
+			}
 		}
 		used
 	}

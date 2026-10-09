@@ -143,8 +143,15 @@ pub struct Features {
 	/// `protocol`, `tls`)
 	pub services: &'static [&'static str],
 	/// Other `http` options for the Gateway API (#224, #226-#235): `headers_add`, `redirect_status`,
-	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`
+	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`; `misdirected`
+	/// (`tls.misdirected`, v0.4.3)
 	pub http_options: &'static [&'static str],
+	/// Middleware kinds that `servers[].middlewares` may use (#229; `cors`, `redirect_scheme`,
+	/// `redirect_regex` and `mirror` since v0.4.3)
+	pub server_middleware_kinds: &'static [&'static str],
+	/// Options of `forward_auth` (v0.4.3, the Gateway API's ExternalAuth): `service`, `grpc`,
+	/// `client_request`, `allow_status`, `forward_body`, `all_response_headers`
+	pub forward_auth: &'static [&'static str],
 	/// `targets` and `balance` of `tls.routes[]` (#234)
 	pub tls_route_targets: bool,
 	/// Modes of `tls.client_auth` that can run (`optional_no_verify`, #238)
@@ -197,8 +204,12 @@ pub struct Features {
 	pub connect_timeout: bool,
 }
 
+/// Every name of `Features::forward_auth`.
+const FORWARD_AUTH: &[&str] = &["service", "grpc", "client_request", "allow_status", "forward_body", "all_response_headers"];
+
 /// Every name of `Features::http_options`.
-const HTTP_OPTIONS: &[&str] = &["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status"];
+const HTTP_OPTIONS: &[&str] =
+	&["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"];
 
 impl Features {
 	pub const CURRENT: Features =
@@ -215,6 +226,8 @@ impl Features {
 		],
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
+		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
+		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
@@ -256,6 +269,8 @@ impl Features {
 		],
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
+		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
+		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
@@ -319,6 +334,12 @@ impl Features {
 			if let Some(option) = h.options_used().into_iter().find(|o| !self.http_options.contains(o)) {
 				return missing(&format!("http option {option}"));
 			}
+			if let Some(option) = h.forward_auth_used().into_iter().find(|o| !self.forward_auth.contains(o)) {
+				return missing(&format!("forward_auth option {option}"));
+			}
+		}
+		if tls.misdirected.is_some() && !self.http_options.contains(&"misdirected") {
+			return missing("tls.misdirected");
 		}
 		if !self.tls_route_targets && tls.routes.iter().any(|r| !r.targets.is_empty()) {
 			return missing("targets of tls.routes");
@@ -750,6 +771,9 @@ impl RuleRequest {
 		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
+		if tls.misdirected.is_some() && self.http.is_none() {
+			return Err(ApiError::tls_config("tls.misdirected needs http (it answers HTTP requests with 421)"));
+		}
 		if self.starttls.is_none() && self.starttls_required == Some(false) {
 			return Err(ApiError::invalid("starttls_required needs starttls"));
 		}

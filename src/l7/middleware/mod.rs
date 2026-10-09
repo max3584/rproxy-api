@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod cors;
 pub mod crowdsec;
+pub mod ext_authz;
 pub mod limit;
 pub mod oidc;
 
@@ -279,35 +280,7 @@ impl Middleware {
 			MiddlewareSpec::BasicAuth { users_file, realm, keep_authorization, user_header } => Middleware::BasicAuth(Arc::new(
 				BasicAuth::new(label, users_file, realm.as_deref(), *keep_authorization, user_header.as_deref())?,
 			)),
-			MiddlewareSpec::ForwardAuth { address, response_headers, trust_forward_header, request_headers, timeout } => {
-				let spec = super::ServiceSpec {
-					servers: vec![super::ServerSpec { url: address.clone(), ..Default::default() }],
-					health_check: None,
-					sticky: None,
-					pass_host_header: Some(false),
-					timeouts: Some(super::TimeoutsSpec {
-						connect: None,
-						response: Some(timeout.clone().unwrap_or_else(|| format!("{}s", auth::DEFAULT_FORWARD_AUTH_TIMEOUT.as_secs()))),
-					}),
-					balance: Default::default(),
-					outlier_detection: None,
-					protocol: Default::default(),
-					tls: None,
-				};
-				let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
-				let path = match uri.path_and_query().map(|p| p.as_str()) {
-					Some(p) if !p.is_empty() => p.to_string(),
-					_ => "/".to_string(),
-				};
-				Middleware::ForwardAuth(Arc::new(ForwardAuth {
-					name: label.to_string(),
-					service: Arc::new(Service::compile(label, &spec, &Default::default())?),
-					path,
-					response_headers: auth::header_names(response_headers, &format!("{what}: response_headers"))?,
-					request_headers: auth::header_names(request_headers, &format!("{what}: request_headers"))?,
-					trust_forward_header: *trust_forward_header,
-				}))
-			}
+			MiddlewareSpec::ForwardAuth { .. } => forward_auth(label, spec, &Default::default())?,
 			MiddlewareSpec::Oidc {
 				issuer,
 				client_id,
@@ -349,6 +322,9 @@ impl Middleware {
 	/// `errors` and `mirror`: they use one of `services`, which must be compiled already.
 	pub fn errors(label: &str, spec: &MiddlewareSpec, services: &std::collections::HashMap<String, Arc<Service>>) -> Result<Middleware, ApiError> {
 		let what = format!("middleware {label}");
+		if let MiddlewareSpec::ForwardAuth { .. } = spec {
+			return forward_auth(label, spec, services);
+		}
 		if let MiddlewareSpec::Mirror { service, percent, fraction } = spec {
 			let service = services.get(service).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {service:?} is not defined")))?;
 			let share = match (percent, fraction) {
@@ -517,6 +493,78 @@ impl Middleware {
 			}
 		}
 	}
+}
+
+/// `forward_auth`: to `address` (a service of its own) or to one of `services` (v0.4.3).
+fn forward_auth(label: &str, spec: &MiddlewareSpec, services: &std::collections::HashMap<String, Arc<Service>>) -> Result<Middleware, ApiError> {
+	let MiddlewareSpec::ForwardAuth {
+		address,
+		response_headers,
+		trust_forward_header,
+		request_headers,
+		timeout,
+		service,
+		path,
+		protocol,
+		client_request,
+		allow_status,
+		forward_body,
+	} = spec
+	else {
+		return Err(ApiError::invalid(format!("middleware {label}: not forward_auth")));
+	};
+	let what = format!("middleware {label}");
+	let grpc = *protocol == super::AuthProtocol::Grpc;
+	let limit = match timeout {
+		Some(t) => parse_duration(t).map_err(|e| ApiError::invalid(format!("{what}: timeout: {e}")))?,
+		None => auth::DEFAULT_FORWARD_AUTH_TIMEOUT,
+	};
+	let (target, path, own) = match service {
+		Some(name) => {
+			let s = services.get(name).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {name:?} is not defined")))?;
+			(s, path.clone().unwrap_or_else(|| "/".into()), false)
+		}
+		None => {
+			let spec = super::ServiceSpec {
+				servers: vec![super::ServerSpec { url: address.clone(), ..Default::default() }],
+				health_check: None,
+				sticky: None,
+				pass_host_header: Some(false),
+				timeouts: Some(super::TimeoutsSpec { connect: None, response: Some(format!("{}ms", limit.as_millis())) }),
+				balance: Default::default(),
+				outlier_detection: None,
+				// gRPC: HTTP/2 with prior knowledge (validation allows http:// only)
+				protocol: if grpc { super::UpstreamProtocol::H2c } else { Default::default() },
+				tls: None,
+			};
+			let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
+			let path = match uri.path_and_query().map(|p| p.as_str()) {
+				Some(p) if !p.is_empty() => p.to_string(),
+				_ => "/".to_string(),
+			};
+			(Arc::new(Service::compile(label, &spec, &Default::default())?), path, true)
+		}
+	};
+	let all = response_headers.iter().any(|h| h == "*");
+	let allow = allow_status
+		.iter()
+		.map(|s| parse_status_range(s).map_err(|e| ApiError::invalid(format!("{what}: allow_status: {e}"))))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Middleware::ForwardAuth(Arc::new(ForwardAuth {
+		name: label.to_string(),
+		service: target,
+		path,
+		response_headers: if all { vec![] } else { auth::header_names(response_headers, &format!("{what}: response_headers"))? },
+		all_response_headers: all,
+		request_headers: auth::header_names(request_headers, &format!("{what}: request_headers"))?,
+		trust_forward_header: *trust_forward_header,
+		// a service of the rule keeps its own response time; the limit covers each ask
+		limit: (!own).then_some(limit),
+		grpc,
+		client_request: *client_request,
+		allow: if allow.is_empty() { vec![(200, 299)] } else { allow },
+		forward_body: forward_body.map(|b| b.max_size),
+	})))
 }
 
 /// The Allow-Origin value for this request's Origin, if the origin is allowed.
