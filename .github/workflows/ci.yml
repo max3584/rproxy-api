@@ -125,6 +125,8 @@ jobs:
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # the table first, always (its details explain a failure below)
       - name: rproxy-api --check-kernel

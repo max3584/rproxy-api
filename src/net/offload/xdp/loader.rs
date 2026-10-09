@@ -9,7 +9,9 @@ use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 
 /// The XDP redirect object, built from `bpf/xdp-redirect` (see `bpf/README.md`).
-static PROGRAM: &[u8] = include_bytes!("../bpf_obj/xdp_redirect.bpf.o");
+/// Aligned: the ELF parser reads the headers in place, so a plain
+/// `include_bytes!` (alignment 1) fails with "error parsing ELF data".
+static PROGRAM: &[u8] = aya::include_bytes_aligned!("../bpf_obj/xdp_redirect.bpf.o");
 
 /// How the program is attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,5 +72,19 @@ impl Steer {
 
 	pub fn mode(&self) -> Mode {
 		self.mode
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The committed object parses (loading it further needs CAP_BPF, which
+	/// only the CI offload job has): any error must come after the parse.
+	#[test]
+	fn the_committed_object_parses() {
+		if let Err(aya::EbpfError::ParseError(e)) = Ebpf::load(PROGRAM) {
+			panic!("the XDP object does not parse: {e}");
+		}
 	}
 }
