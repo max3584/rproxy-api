@@ -19,5 +19,7 @@
 pub mod bpf;
 pub mod host;
 pub mod probe;
+#[cfg(all(feature = "kernel-offload", target_os = "linux"))]
+pub mod xdp;
 #[cfg(all(feature = "offload-verify", target_os = "linux"))]
 pub mod verify;

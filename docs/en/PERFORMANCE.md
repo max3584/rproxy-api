@@ -82,13 +82,30 @@ The work is tracked in the milestone "performance" with the label "area: perform
 - **Revisit if:** a kernel fixes the backlog stall, and a test that reproduces it (parallel two-way bulk transfers checked by offload-verify) passes.
 - **Kept:** the startup-test framework, `--check-kernel` and `offload-verify`, for AF_XDP (#260 stage 3) and DPDK (#261). The four fixes are a reference for any fast path that hands sockets over.
 
+### Passing L4 UDP through AF_XDP (#260, #266, paused)
+- **What is in**: an XDP program that steers only the rules' UDP ports to an AF_XDP socket (`bpf/xdp-redirect/`, aya-ebpf; the built object is committed), the UMEM and the four rings (`src/net/offload/xdp/`, xdpilone), frame parsing and reply building, and the startup self-test (`--check-kernel`). Cargo feature `kernel-offload` (not in the default build or the releases).
+- **What is not**: carrying the UDP data plane (`l4/udp.rs`) over AF_XDP. Even when the self-test passes it is not used at startup; `GET /capabilities` `performance.xdp` shows `active: false` (reason: self-test passed, the data path is not in this build).
+- **Why it stopped** (owner's decision): the gains depend on kernel and NIC tuning, and there is no real hardware to measure on. Building the data path would only be checked for correctness in CI, adding complexity without knowing whether it is faster. Tuning is left for another time.
+- **Tuning needed in production** (the premise when resuming):
+  - NIC and driver supporting native XDP and AF_XDP zero-copy (veth and most virtual NICs only do generic and copy, the slow path).
+  - Queues: the number of NIC RX queues and RSS (which queue a packet lands on), IRQ CPU affinity. **Bind an AF_XDP socket on every RX queue** (the program hands a packet to the socket of the queue it arrived on; packets on a queue without one go up the normal stack).
+  - Privileges: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_NET_RAW` (privileged on Kubernetes).
+  - Measuring: compare with the current `recvmmsg` / `sendmmsg` on the same NIC (64-byte pps, loss, work per CPU), and with DPDK (#261).
+- **What tripped the startup self-test** (CI, kernel 6.17.0-azure, privileged container):
+  1. A BPF object embedded with `include_bytes!` is not aligned, and the ELF parse failed (`error parsing ELF data`). → aya's `include_bytes_aligned!`.
+  2. veth has one queue per CPU by default, so datagrams landed on queues other than 0 and missed the socket on queue 0. → the test's veth has one queue (in production, bind every queue).
+  3. With both veth ends in one network namespace, the kernel delivers to the peer's address as local and never uses the veth (the program counted 0 UDP packets). → the sender gets its own namespace and the veth peer is created in it (`IFLA_NET_NS_FD`).
+  4. Zero-copy bind on veth is `Not supported` (copy mode works).
+  - To find these, the self-test's failure reason includes the program's counters (UDP seen, port matched, redirect failed) and the socket's `XDP_STATISTICS`.
+- **Resuming**: on `perf/af-xdp`: (1) sockets on all RX queues, (2) `l4/udp.rs` receive/send over the XSK (falling back to the current path), (3) `offload-verify` checks (packet and byte counts, stalls, content), (4) the integrity / UDP tests over AF_XDP, (5) measuring on real hardware.
+
 ### Researched but not tried
 - **io_uring:** Google disabled it on production servers; little published data.
 - **XDP, busy poll:** hard to verify on GitHub runners.
 - **Thread-per-core runtime:** Pingora also defaults to work stealing. TCP / HTTP stay as they are.
 
 ## Next candidates
-- Forwarding in the kernel (#260, in progress): `global.performance.xdp` (UDP through AF_XDP; TCP through a sockmap is under "Not adopted" above). Opt-in; only fast paths whose startup test with real data passed are used (`rproxy-api --check-kernel`). The framework (settings, tests, `GET /capabilities`) comes first, then the fast paths one by one, with their results recorded here.
+- Forwarding in the kernel (#260, #261, paused): AF_XDP goes as far as the startup self-test ("Passing L4 UDP through AF_XDP" above); DPDK as far as a separate build checked for correctness in CI. Both need NIC/queue tuning and real hardware to measure, left for another time.
 - HTTP/2: the profile still shows memcpy (about 11%), the allocator (about 12%) and kernel wakeups (about 7%). Fewer, larger h2 writes.
 - Multi-core use (#194): adapt to queue depth (per-role pipeline, per-core parallelism, backpressure).
 - Memory (#185): share UDP session buffers per worker.

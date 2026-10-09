@@ -4,3 +4,6 @@ __pycache__/
 
 # Claude Code の作業用（エージェントの worktree）
 /.claude/worktrees/
+
+# eBPF program build output (#260; the checked-in object is src/net/offload/bpf_obj/)
+/bpf/*/target

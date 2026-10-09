@@ -65,12 +65,19 @@ pub struct PathSpec {
 	pub feature: &'static str,
 	pub requested: fn(&Effective) -> bool,
 	pub test: fn(&Host, &Effective) -> Outcome,
+	/// Whether this build carries traffic on the path. A path whose self-test
+	/// exists but whose data path does not (AF_XDP for now, paused: #260) is
+	/// never active at startup.
+	pub data_path: bool,
 }
+
+/// Why a path with a passing self-test is still not used.
+const NO_DATA_PATH: &str = "the data path is not in this build (#260, paused: needs NIC/queue tuning and real hardware to measure)";
 
 /// The fast paths this build knows, in the order of the table.
 pub const PATHS: &[PathSpec] = &[
-	PathSpec { key: "xdp.mode", mode: "af_xdp", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::AfXdp, test: test_af_xdp },
-	PathSpec { key: "xdp.mode", mode: "native", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::Native, test: test_xdp_native },
+	PathSpec { key: "xdp.mode", mode: "af_xdp", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::AfXdp, test: test_af_xdp, data_path: false },
+	PathSpec { key: "xdp.mode", mode: "native", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::Native, test: test_xdp_native, data_path: false },
 ];
 
 /// One fast path in the report.
@@ -152,7 +159,13 @@ pub fn run(perf: &Effective, scope: Scope) -> Report {
 	let paths: Vec<PathResult> = wanted
 		.into_iter()
 		.map(|s| {
-			let o = (s.test)(&host, perf);
+			let mut o = (s.test)(&host, perf);
+			if o.usable && !s.data_path {
+				// the self-test passed, but nothing carries traffic on this path yet:
+				// never report it active at startup; --check-kernel says what passed
+				o.detail = format!("self-test passed ({}); {NO_DATA_PATH}", o.detail);
+				o.usable = scope == Scope::All;
+			}
 			PathResult { feature: s.feature, key: s.key, mode: s.mode, requested: (s.requested)(perf), usable: o.usable, detail: o.detail, tests: o.tests }
 		})
 		.collect();
@@ -241,9 +254,24 @@ fn not_built(host: &Host, needs_net_bpf: bool) -> Outcome {
 	Outcome::unusable(NOT_BUILT, vec![])
 }
 
-/// AF_XDP: UDP round trips over a veth pair (zero-copy, then copy).
-fn test_af_xdp(host: &Host, _perf: &Effective) -> Outcome {
-	not_built(host, true)
+/// AF_XDP: UDP round trips over a veth pair in a private network namespace
+/// (zero-copy, then copy). Needs the `kernel-offload` build.
+fn test_af_xdp(host: &Host, perf: &Effective) -> Outcome {
+	if let Some(why) = host.missing_for_net_bpf() {
+		return Outcome::unusable(why, vec![]);
+	}
+	if let Some(e) = &host.bpf_error {
+		return Outcome::unusable(format!("bpf(2) failed: {e}"), vec![]);
+	}
+	#[cfg(all(feature = "kernel-offload", target_os = "linux"))]
+	{
+		super::xdp::selftest::run(perf.xdp.ring_size, perf.xdp.frame_size)
+	}
+	#[cfg(not(all(feature = "kernel-offload", target_os = "linux")))]
+	{
+		let _ = perf;
+		Outcome::unusable("this build has no AF_XDP (cargo feature kernel-offload)", vec![])
+	}
 }
 
 /// XDP forwarding by the program alone (stage 2).

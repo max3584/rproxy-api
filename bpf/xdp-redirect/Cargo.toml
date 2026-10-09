@@ -1,0 +1,28 @@
+[package]
+name = "xdp-redirect"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "xdp-redirect"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+
+[profile.dev]
+opt-level = 3
+debug = false
+panic = "abort"
+overflow-checks = false
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+overflow-checks = false
+lto = true
+codegen-units = 1
+
+[workspace]
