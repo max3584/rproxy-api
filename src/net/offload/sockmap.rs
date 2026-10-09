@@ -169,16 +169,47 @@ fn prove_inner(tests: &mut Vec<Test>) -> io::Result<()> {
 	if !eof {
 		return Err(io::Error::other("no EOF on the sockmap socket"));
 	}
+	// what the sockets look like, for the reason when a step fails
+	let state = |what: &str, e: io::Error| {
+		let st = |fd: BorrowedFd<'_>| tcp_info(fd).map(|i| i.tcpi_state).unwrap_or(255);
+		let moved = bytes_received(inner_a.as_fd()).map_or(0, |n| n.saturating_sub(rx0));
+		let put = bytes_written(inner_b.as_fd()).map_or(0, |n| n.saturating_sub(w0));
+		io::Error::new(
+			e.kind(),
+			format!("{what}: {e} (client socket state {}, backend socket state {}, moved {moved}, in backend queue {put})", st(inner_a.as_fd()), st(inner_b.as_fd())),
+		)
+	};
 	let deadline = std::time::Instant::now() + Duration::from_secs(5);
-	while !flushed(inner_a.as_fd(), rx0, inner_b.as_fd(), w0)? {
+	loop {
+		match flushed(inner_a.as_fd(), rx0, inner_b.as_fd(), w0) {
+			Ok(true) => break,
+			Ok(false) => {}
+			Err(e) => {
+				let e = state("waiting for the redirected data", e);
+				tests.push(Test { name: "fin".into(), ok: false, detail: e.to_string() });
+				return Err(e);
+			}
+		}
 		if std::time::Instant::now() > deadline {
-			tests.push(Test { name: "fin".into(), ok: false, detail: "redirected data did not reach the backend socket".into() });
-			return Err(io::Error::other("redirected data did not drain"));
+			let e = state("waiting for the redirected data", io::Error::other("timed out"));
+			tests.push(Test { name: "fin".into(), ok: false, detail: e.to_string() });
+			return Err(e);
 		}
 		std::thread::sleep(Duration::from_millis(1));
 	}
-	inner_b.shutdown(Shutdown::Write)?;
-	let got = read_all.join().map_err(|_| io::Error::other("reader thread panicked"))??;
+	if let Err(e) = inner_b.shutdown(Shutdown::Write) {
+		let e = state("shutting the backend socket down", e);
+		tests.push(Test { name: "fin".into(), ok: false, detail: e.to_string() });
+		return Err(e);
+	}
+	let got = match read_all.join().map_err(|_| io::Error::other("reader thread panicked"))? {
+		Ok(got) => got,
+		Err(e) => {
+			let e = state("reading at the backend", e);
+			tests.push(Test { name: "fin".into(), ok: false, detail: e.to_string() });
+			return Err(e);
+		}
+	};
 	let ok = got == data;
 	tests.push(Test { name: "fin".into(), ok, detail: if ok { String::new() } else { format!("{} of {} bytes before EOF", got.len(), data.len()) } });
 	drop(relay);

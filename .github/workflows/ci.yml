@@ -123,14 +123,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # the sockmap probe (loopback pairs, SHA-256, FIN) and the --check-kernel table
-      - name: sockmap and --check-kernel
+      # the table first, always (its details explain a failure below)
+      - name: rproxy-api --check-kernel
+        run: RPROXY_EBPF_TCP=sockmap cargo run --locked -- --check-kernel || true
+      # the sockmap probe (loopback pairs, SHA-256, data then FIN) and a real rproxy over sockmap
+      - name: tests/kernel_offload.rs
         env:
           # sockmap must be usable here (fail, don't skip, if the kernel refuses)
           RPROXY_TEST_REQUIRE_SOCKMAP: "1"
         run: cargo test --locked --test kernel_offload
-      - name: rproxy-api --check-kernel
-        run: cargo run --locked -- --check-kernel
 
   # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
   package:
