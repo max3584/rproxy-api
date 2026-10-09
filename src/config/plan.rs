@@ -128,6 +128,7 @@ pub fn in_place(old: &RuleSpec, new: &RuleSpec) -> bool {
 	old.key == new.key
 		&& old.port_count == new.port_count
 		&& old.source_ip == new.source_ip
+		&& old.listen_freebind == new.listen_freebind
 		&& old.http.is_some() == new.http.is_some()
 		&& !(is_dual_stack_wildcard(&old.key) && old.v6only() != new.v6only())
 }

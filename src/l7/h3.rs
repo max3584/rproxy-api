@@ -58,7 +58,7 @@ pub fn start(rt: &Arc<Runtime>) {
 	stop(rt);
 	let port = rt.key.listen.port();
 	let ips = rt.listen.read().unwrap().clone();
-	let v6only = ips.len() > 1;
+	let opts = crate::net::listen::Opts { v6only: ips.len() > 1, freebind: rt.listen_freebind };
 	let server = (|| {
 		let tls = rt.tls();
 		let config = match &tls.quic_config {
@@ -74,7 +74,7 @@ pub fn start(rt: &Arc<Runtime>) {
 		Ok(server) => {
 			for ip in ips {
 				let addr = SocketAddr::new(ip, port);
-				let endpoint = crate::net::listen::udp(addr, v6only).map_err(|e| format!("udp {addr}: {e}")).and_then(|socket| {
+				let endpoint = crate::net::listen::udp(addr, opts).map_err(|e| format!("udp {addr}: {e}")).and_then(|socket| {
 					quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(server.clone()), socket, Arc::new(quinn::TokioRuntime))
 						.map_err(|e| format!("udp {addr}: {e}"))
 				});

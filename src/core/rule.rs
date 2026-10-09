@@ -191,6 +191,8 @@ pub struct Features {
 	/// The token file is re-read when it changes, without SIGHUP
 	/// (`RPROXY_TOKENS_CHECK_SECS`; v0.4.2, #253)
 	pub tokens_reload: bool,
+	/// `listen_freebind` of a rule: listening on an address not on the host yet (IP_FREEBIND; v0.4.3)
+	pub listen_freebind: bool,
 }
 
 /// Every name of `Features::http_options`.
@@ -233,6 +235,7 @@ impl Features {
 		cert_store: true,
 		ruleset_persistence: true,
 		tokens_reload: true,
+		listen_freebind: crate::net::listen::FREEBIND,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -272,6 +275,7 @@ impl Features {
 		cert_store: true,
 		ruleset_persistence: true,
 		tokens_reload: true,
+		listen_freebind: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -325,6 +329,7 @@ impl Features {
 	/// The first v0.4 setting of a rule (docs/DESIGN-v0.4.md) that this build cannot run.
 	pub fn check_v04(&self, spec: &RuleSpec) -> Result<(), ApiError> {
 		for (what, used, available) in [
+			("listen_freebind (IP_FREEBIND: Linux)", spec.listen_freebind, self.listen_freebind),
 			("labels", !spec.labels.is_empty(), self.labels),
 			("limits", spec.limits.is_some(), self.limits),
 			("bandwidth", spec.bandwidth.is_some(), self.bandwidth),
@@ -391,6 +396,10 @@ pub struct RuleRequest {
 	/// address next to an IPv4 `listen_addr` (#99).
 	#[serde(default)]
 	pub extra_listen_addrs: Vec<String>,
+	/// Listen even while the addresses are not on the host (IP_FREEBIND / IPV6_FREEBIND), such as
+	/// a VIP another node holds now (v0.4.3).
+	#[serde(default)]
+	pub listen_freebind: bool,
 	/// The backend; left out on `http` rules, whose backends are `http.services`,
 	/// and on rules with `targets`.
 	#[serde(default)]
@@ -460,6 +469,8 @@ pub struct RuleSpec {
 	pub port_count: u16,
 	/// More addresses listening with the same ports as `key.listen`.
 	pub extra_listen: Vec<IpAddr>,
+	/// `listen_freebind`: the sockets bind addresses that are not on the host (yet).
+	pub listen_freebind: bool,
 	/// The backend; with `targets`, the first target (for logs and older clients).
 	pub remote_host: String,
 	pub remote_port: u16,
@@ -748,6 +759,7 @@ impl RuleRequest {
 			key: Key { protocol: self.protocol, listen },
 			port_count,
 			extra_listen,
+			listen_freebind: self.listen_freebind,
 			remote_host,
 			remote_port,
 			targets,
@@ -793,6 +805,8 @@ pub struct UpdateRequest {
 	pub health_check: Option<HealthCheckSpec>,
 	pub udp_idle_secs: Option<u64>,
 	pub source_ip: Option<SourceIp>,
+	/// Cannot change; accepted only if it matches (like `source_ip`).
+	pub listen_freebind: Option<bool>,
 	/// Replaces the TLS settings (with `starttls` / `starttls_required`) when present.
 	pub tls: Option<TlsSpec>,
 	pub starttls: Option<StartTls>,
@@ -856,6 +870,9 @@ pub struct RuleView {
 	pub listen_port_end: Option<u16>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub extra_listen_addrs: Vec<String>,
+	/// Shown only when true (v0.4.3).
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub listen_freebind: bool,
 	pub remote_addr: String,
 	pub remote_port: u16,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
@@ -928,6 +945,7 @@ impl RuleView {
 			listen_port: spec.key.listen.port(),
 			listen_port_end: (spec.port_count > 1).then(|| spec.key.listen.port() + spec.port_count - 1),
 			extra_listen_addrs: spec.extra_listen.iter().map(|ip| ip.to_string()).collect(),
+			listen_freebind: spec.listen_freebind,
 			remote_addr: spec.remote_host.clone(),
 			remote_port: spec.remote_port,
 			targets: spec.targets.clone(),
@@ -977,6 +995,7 @@ mod tests {
 			listen_port: 8888,
 			listen_port_end: None,
 			extra_listen_addrs: vec![],
+			listen_freebind: false,
 			remote_addr: "example.com".into(),
 			remote_port: 80,
 			targets: vec![],

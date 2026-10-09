@@ -6,14 +6,47 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use socket2::{Domain, Socket, Type};
 
-fn socket(addr: SocketAddr, kind: Type, v6only: bool) -> io::Result<Socket> {
+/// How a listening socket is opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Opts {
+	/// `IPV6_V6ONLY` on an IPv6 socket, so `::` and `0.0.0.0` can listen on the same port.
+	pub v6only: bool,
+	/// `IP_FREEBIND` / `IPV6_FREEBIND` (a rule's `listen_freebind`): bind an address that is not on
+	/// the host (yet), such as a VIP another node holds now; packets reach the socket once the
+	/// address is added. Linux; no privilege is needed.
+	pub freebind: bool,
+}
+
+impl Opts {
+	pub fn v6only(v6only: bool) -> Opts {
+		Opts { v6only, freebind: false }
+	}
+}
+
+fn socket(addr: SocketAddr, kind: Type, opts: Opts) -> io::Result<Socket> {
 	let sock = Socket::new(Domain::for_address(addr), kind, None)?;
-	if addr.is_ipv6() && v6only {
+	if addr.is_ipv6() && opts.v6only {
 		sock.set_only_v6(true)?;
+	}
+	if opts.freebind {
+		set_freebind(&sock, addr)?;
 	}
 	busy_poll(&sock);
 	Ok(sock)
 }
+
+#[cfg(target_os = "linux")]
+fn set_freebind(sock: &Socket, addr: SocketAddr) -> io::Result<()> {
+	if addr.is_ipv4() { sock.set_freebind_v4(true) } else { sock.set_freebind_v6(true) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_freebind(_: &Socket, _: SocketAddr) -> io::Result<()> {
+	Err(io::Error::new(io::ErrorKind::Unsupported, "listen_freebind needs Linux (IP_FREEBIND)"))
+}
+
+/// Whether this build can open sockets with `listen_freebind` (`features.listen_freebind`).
+pub const FREEBIND: bool = cfg!(target_os = "linux");
 
 /// `global.performance.busy_poll_usecs` (#194): SO_BUSY_POLL of the listening
 /// sockets (accepted connections take it over). 0: off.
@@ -61,13 +94,12 @@ fn inherited<T: Into<std::os::fd::OwnedFd> + From<std::os::fd::OwnedFd>>(sock: T
 	Ok(T::from(sock.into()))
 }
 
-/// A TCP listener. `v6only` makes an IPv6 socket take IPv6 only, so `::` and
-/// `0.0.0.0` can listen on the same port.
-pub fn tcp(addr: SocketAddr, v6only: bool) -> io::Result<std::net::TcpListener> {
+/// A TCP listener, opened as `opts` says.
+pub fn tcp(addr: SocketAddr, opts: Opts) -> io::Result<std::net::TcpListener> {
 	if let Some(l) = crate::control::upgrade::inherit::take_tcp(addr) {
 		return inherited(l);
 	}
-	let sock = socket(addr, Type::STREAM, v6only)?;
+	let sock = socket(addr, Type::STREAM, opts)?;
 	// lets a stopped rule's port be reused while old connections sit in TIME_WAIT
 	sock.set_reuse_address(true)?;
 	sock.set_nonblocking(true)?;
@@ -76,13 +108,13 @@ pub fn tcp(addr: SocketAddr, v6only: bool) -> io::Result<std::net::TcpListener> 
 	Ok(sock.into())
 }
 
-/// A UDP socket (non-blocking), with `v6only` as for [`tcp`].
-pub fn udp(addr: SocketAddr, v6only: bool) -> io::Result<std::net::UdpSocket> {
+/// A UDP socket (non-blocking), with `opts` as for [`tcp`].
+pub fn udp(addr: SocketAddr, opts: Opts) -> io::Result<std::net::UdpSocket> {
 	let mut old = crate::control::upgrade::inherit::take_udp(addr);
 	if let Some(s) = old.pop() {
 		return inherited(s);
 	}
-	let sock = socket(addr, Type::DGRAM, v6only)?;
+	let sock = socket(addr, Type::DGRAM, opts)?;
 	sock.set_nonblocking(true)?;
 	sock.bind(&addr.into())?;
 	Ok(sock.into())
@@ -111,7 +143,7 @@ fn udp_rcvbuf() -> usize {
 /// again: a group would otherwise join another process's group on the same
 /// port (of the same user) silently, where a single socket fails with
 /// "address in use" as it always did.
-pub fn udp_shards(addr: SocketAddr, v6only: bool, shards: usize) -> io::Result<Vec<std::net::UdpSocket>> {
+pub fn udp_shards(addr: SocketAddr, opts: Opts, shards: usize) -> io::Result<Vec<std::net::UdpSocket>> {
 	let shards = shards.max(1);
 	// a live upgrade (#174): the old process's group as it was (its size decides
 	// where the kernel sends clients)
@@ -125,7 +157,7 @@ pub fn udp_shards(addr: SocketAddr, v6only: bool, shards: usize) -> io::Result<V
 	}
 	let rcvbuf = udp_rcvbuf();
 	let open = |reuse: bool, addr: SocketAddr| -> io::Result<Socket> {
-		let sock = socket(addr, Type::DGRAM, v6only)?;
+		let sock = socket(addr, Type::DGRAM, opts)?;
 		#[cfg(target_os = "linux")]
 		if reuse {
 			sock.set_reuse_port(true)?;
@@ -195,15 +227,36 @@ mod tests {
 
 	#[test]
 	fn v4_and_v6_wildcards_listen_side_by_side() {
-		let v4 = tcp("0.0.0.0:0".parse().unwrap(), false).unwrap();
+		let v4 = tcp("0.0.0.0:0".parse().unwrap(), Opts::v6only(false)).unwrap();
 		let port = v4.local_addr().unwrap().port();
 		// no IPv6 on this host: nothing to check
-		let Ok(v6) = tcp(SocketAddr::new(ip("::"), port), true) else { return };
+		let Ok(v6) = tcp(SocketAddr::new(ip("::"), port), Opts::v6only(true)) else { return };
 		assert_eq!(v6.local_addr().unwrap().port(), port);
-		let u4 = udp("0.0.0.0:0".parse().unwrap(), false).unwrap();
+		let u4 = udp("0.0.0.0:0".parse().unwrap(), Opts::v6only(false)).unwrap();
 		let uport = u4.local_addr().unwrap().port();
-		if let Ok(u6) = udp(SocketAddr::new(ip("::"), uport), true) {
+		if let Ok(u6) = udp(SocketAddr::new(ip("::"), uport), Opts::v6only(true)) {
 			assert_eq!(u6.local_addr().unwrap().port(), uport);
+		}
+	}
+
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn freebind_binds_an_address_not_on_the_host() {
+		// TEST-NET-3: on no interface of a test host
+		let addr: SocketAddr = "203.0.113.77:0".parse().unwrap();
+		let nonlocal = std::fs::read_to_string("/proc/sys/net/ipv4/ip_nonlocal_bind").is_ok_and(|v| v.trim() != "0");
+		if !nonlocal {
+			assert!(tcp(addr, Opts::default()).is_err(), "without freebind the bind fails (EADDRNOTAVAIL)");
+		}
+		let opts = Opts { v6only: false, freebind: true };
+		let t = tcp(addr, opts).unwrap();
+		assert_eq!(t.local_addr().unwrap().ip(), addr.ip());
+		let u = udp_shards(addr, opts, 2).unwrap();
+		assert_eq!(u.len(), 2);
+		assert_eq!(u[0].local_addr().unwrap().ip(), addr.ip());
+		// IPv6 (documentation prefix); no IPv6 on this host: nothing to check
+		if let Ok(t6) = tcp("[2001:db8::77]:0".parse().unwrap(), Opts { v6only: true, freebind: true }) {
+			assert_eq!(t6.local_addr().unwrap().ip(), ip("2001:db8::77"));
 		}
 	}
 }

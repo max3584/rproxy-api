@@ -129,6 +129,7 @@ A rule is uniquely identified by the tuple `(protocol, listen_addr, listen_port)
 | `protocol` | `"tcp"` \| `"udp"` | ✓ | Case-insensitive. Always returned in lowercase in responses |
 | `listen_addr` | string | ✓ | IP address (host names are not allowed) |
 | `extra_listen_addrs` | string[] | | Additional IP addresses to listen on with the same port (range) (up to 16; e.g. `listen_addr` is the main IPv4 and this holds a GUA IPv6). The rule key stays `listen_addr`. Stats and logs are aggregated as one rule; the `listen` of `conn.open` shows the address that received the connection. IPv6 listeners of a rule with additional addresses are opened with `IPV6_V6ONLY`, so `0.0.0.0` and `::` can be listed together (a rule with only `::` keeps the OS default: on Linux the default also accepts IPv4). Overlap with other rules and the control API is checked including the additional addresses (`409 already_exists` / `reserved`). With `transparent`, if there is no destination (written as an IP) of an additional address's family, the result is `invalid`; IPv6 addresses need `transparent_ipv6`. QUIC for `http3` is also accepted on all addresses. Omitted from listings when empty. The source of UDP replies is the destination address the client sent to, even when listening on `0.0.0.0` / `::`, so there is no need to list addresses just to pin the reply source on a host with multiple addresses (since v0.3.10) |
+| `listen_freebind` | bool | | `true` listens even while the addresses (`listen_addr`, `extra_listen_addrs`) are not on the host yet (`IP_FREEBIND` / `IPV6_FREEBIND`; v0.4.3, `features.listen_freebind`). See "Listening on an address not on the host yet" below. Default `false`. Cannot change by PATCH (another value is `unsupported`). Shown in listings only when `true` |
 | `listen_port` | 1–65535 | ✓ | |
 | `remote_addr` | string | ✓ | IP address or host name. Host names are re-resolved every 30 seconds. Not written for `http` rules (destinations are in `http.services`; listings show `""` / `0`). Also not written when `targets` is used (listings show the first entry of `targets`) |
 | `remote_port` | 1–65535 | ✓ | Not written for `http` rules or rules using `targets` |
@@ -840,6 +841,18 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_sets TO 'rproxy'@'%';
 GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
 ```
+
+### Listening on an address not on the host yet (v0.4.3, `features.listen_freebind`)
+
+Listens on an address that another host holds now and that comes to this host later, such as a VIP (a Kubernetes fleet where each VIP's Gateway uses the same port; rproxy-gateway docs/en/DESIGN-v0.4.x.md 7.).
+
+- `"listen_freebind": true` on the rule. Its sockets are opened with `IP_FREEBIND` (`IPV6_FREEBIND` for IPv6), so they bind while the address is not on any interface and the rule is `running`. Once the address is added, what is sent to it arrives (the rule is not re-created). Removing the address leaves the listener as it is.
+- Linux only (elsewhere `features.listen_freebind` is false and using it is `400 unsupported`). No privilege is needed (unlike `IP_TRANSPARENT`, no `CAP_NET_ADMIN`). On a host with `net.ipv4.ip_nonlocal_bind=1` the bind works without it.
+- Rules without it are unchanged: an address not on the host fails to bind and the rule is `failed` (`bind_failed`). It is not set automatically, so that a mistyped address is not taken silently.
+- UDP: the socket listens on the address itself, so replies leave from it (no `IP_PKTINFO` needed). The QUIC socket of HTTP/3 (`http.http3`) is opened the same way.
+- It cannot change by PATCH (the sockets would be opened again; another value is `unsupported`, the same value or leaving it out is accepted). A rule set PUT and a settings file reload re-create the rule (`change: recreate`).
+- Two rules on the same port: specific addresses (`192.0.2.10:443` and `192.0.2.11:443`) sit side by side (the key includes `listen_addr`). A rule on `0.0.0.0` / `::` takes the port on every address, so it cannot sit next to a rule on a specific address of that port (whichever comes second gets `409 already_exists`; there is no `SO_REUSEADDR`-like "the narrower address wins": where traffic goes would then depend on which addresses are present, and the clash would be hidden). The error names the rule it overlaps with, and its rule set when it has one (`tcp/0.0.0.0:443 overlaps with tcp/192.0.2.10:443 (rule set k8s/a/web): a rule on 0.0.0.0 / :: takes the port on every address; ...`).
+- The real path is checked by `scripts/test-freebind.sh` (network namespaces; CI's transparent job).
 
 ## Endpoints
 

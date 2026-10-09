@@ -143,6 +143,8 @@ pub struct Runtime {
 	pub h3: crate::l7::h3::H3State,
 	/// The addresses the rule listens on (`listen_addr`, then `extra_listen_addrs`).
 	pub listen: RwLock<Vec<std::net::IpAddr>>,
+	/// The rule's `listen_freebind`: its sockets bind addresses not on the host (yet).
+	pub listen_freebind: bool,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused

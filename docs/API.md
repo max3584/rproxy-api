@@ -129,6 +129,7 @@ tokens:
 | `protocol` | `"tcp"` \| `"udp"` | ○ | 大文字・小文字は区別しない。応答では常に小文字で返す |
 | `listen_addr` | string | ○ | IP アドレス（ホスト名は不可） |
 | `extra_listen_addrs` | string[] | | 同じポート（範囲）で追加で待ち受ける IP アドレス（最大 16 件。例 `listen_addr` が代表の IPv4 で、ここに GUA の IPv6）。ルールのキーは `listen_addr` のまま。統計・ログは 1 つのルールとしてまとめ、`conn.open` の `listen` に受けたアドレスが出る。追加のアドレスがあるルールの IPv6 の待ち受けは `IPV6_V6ONLY` で開くので、`0.0.0.0` と `::` を並べられる（`::` だけのルールは OS の既定のまま：Linux の既定では IPv4 も受ける）。ほかのルール・制御 API との重なりは、追加のアドレスも含めて確かめる（`409 already_exists` / `reserved`）。`transparent` では、追加のアドレスのファミリーの宛先（IP で書いたもの）が 1 つもなければ `invalid`、IPv6 のアドレスは `transparent_ipv6` が要る。`http3` の QUIC も全部のアドレスで受ける。一覧では空なら省く。UDP の返信の送信元は、`0.0.0.0` / `::` で待ち受けていてもクライアントが送った宛先のアドレスになるので、アドレスを複数持つホストで返信元を固定するためにアドレスを並べる必要はない（v0.3.10 から） |
+| `listen_freebind` | bool | | `true` で、待ち受けるアドレス（`listen_addr`・`extra_listen_addrs`）がまだホストになくても待ち受ける（`IP_FREEBIND` / `IPV6_FREEBIND`。v0.4.3、`features.listen_freebind`）。下の「まだホストにないアドレスで待ち受ける」。既定 `false`。PATCH では変えられない（違う値は `unsupported`）。一覧では `true` のときだけ出す |
 | `listen_port` | 1–65535 | ○ | |
 | `remote_addr` | string | ○ | IP アドレスまたはホスト名。ホスト名は 30 秒ごとに再解決する。`http` のルールでは書かない（転送先は `http.services`。一覧では `""` / `0`）。`targets` を使うときも書かない（一覧では `targets` の先頭が入る） |
 | `remote_port` | 1–65535 | ○ | `http` のルール・`targets` を使うルールでは書かない |
@@ -840,6 +841,18 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_sets TO 'rproxy'@'%';
 GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
 ```
+
+### まだホストにないアドレスで待ち受ける（v0.4.3、`features.listen_freebind`）
+
+VIP のように、今は別のホストが持っていて後からこのホストに来るアドレスで待ち受ける（Kubernetes の fleet で、VIP ごとに別の Gateway が同じポートを使う形。rproxy-gateway の docs/DESIGN-v0.4.x.md 7.）。
+
+- ルールに `"listen_freebind": true`。ソケットを `IP_FREEBIND`（IPv6 は `IPV6_FREEBIND`）で開くので、アドレスがインタフェースになくても bind でき、ルールは `running` になる。アドレスが足されたら、そのアドレスに来たものから届く（ルールを作り直さない）。外されても待ち受けはそのまま。
+- Linux だけ（ほかでは `features.listen_freebind` が false で、使うと `400 unsupported`）。権限は要らない（`IP_TRANSPARENT` と違い `CAP_NET_ADMIN` は要らない）。`net.ipv4.ip_nonlocal_bind=1` のホストでは付けなくても bind できる。
+- 付けないルールは今までどおり：ホストにないアドレスは bind に失敗し、`failed`（`bind_failed`）。打ち間違えたアドレスを黙って受け付けないように、自動では付けない。
+- UDP：特定のアドレスで待ち受けるので、返信はそのアドレスから出る（`IP_PKTINFO` は要らない）。HTTP/3（`http.http3`）の QUIC のソケットも同じく開く。
+- PATCH では変えられない（ソケットを開き直すため。違う値は `unsupported`、同じ値か省けば受け付ける）。組の PUT と設定ファイルの再読み込みでは作り直し（`change: recreate`）。
+- 同じポートの 2 つのルール：特定のアドレスどうし（`192.0.2.10:443` と `192.0.2.11:443`）は並べられる（キーが `listen_addr` を含む）。`0.0.0.0` / `::` のルールはそのポートをすべてのアドレスで取るので、同じポートの特定のアドレスのルールとは並べられない（どちらを先に作っても後のものが `409 already_exists`。`SO_REUSEADDR` で「より狭いアドレスが勝つ」形にはしない：どちらに届くかがアドレスの有無で変わり、取り合いが見えなくなるため）。誤りの文に重なる相手のルールと、組のルールならその組の名前が出る（`tcp/0.0.0.0:443 overlaps with tcp/192.0.2.10:443 (rule set k8s/a/web): a rule on 0.0.0.0 / :: takes the port on every address; ...`）。
+- 実経路は `scripts/test-freebind.sh`（名前空間。CI の transparent のジョブ）で確かめる。
 
 ## エンドポイント
 

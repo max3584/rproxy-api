@@ -82,6 +82,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		listen_port: port(get_int("src_port")?, "src_port")?,
 		listen_port_end: None,
 		extra_listen_addrs: vec![],
+		listen_freebind: false,
 		remote_addr: get_str("dist_addr")?,
 		remote_port: port(get_int("dist_port")?, "dist_port")?,
 		targets: vec![],

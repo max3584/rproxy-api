@@ -253,3 +253,91 @@ async fn passthrough_names_on_an_extra_address() {
 		assert_eq!(String::from_utf8_lossy(&buf[..n]), want, "{addr} {name}");
 	}
 }
+
+/// `listen_freebind` (v0.4.3): a rule listens on an address that is not on the host yet (a VIP
+/// another node holds now). The same port on two such addresses is two rules; a wildcard rule on
+/// the port overlaps both and is refused, naming the rule (and its set) it overlaps with. The
+/// real path (the address added later) is `scripts/test-freebind.sh`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn freebind_listens_on_addresses_not_on_the_host() {
+	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["listen_freebind"], true, "{caps}");
+	let a = tcp_backend("A:").await;
+	let port = free_port();
+	let on = |addr: &str, protocol: &str, freebind: bool| {
+		let mut r = rule(protocol, port, a);
+		r["listen_addr"] = json!(addr);
+		if freebind {
+			r["listen_freebind"] = json!(true);
+		}
+		r
+	};
+	// TEST-NET-3: on no interface of a test host
+	let nonlocal = std::fs::read_to_string("/proc/sys/net/ipv4/ip_nonlocal_bind").is_ok_and(|v| v.trim() != "0");
+	if !nonlocal {
+		let (status, body) = h.post(on("203.0.113.70", "tcp", false)).await;
+		assert!(!status.is_success(), "without listen_freebind the bind fails: {body}");
+	}
+	for addr in ["203.0.113.70", "203.0.113.71"] {
+		for protocol in ["tcp", "udp"] {
+			let (status, body) = h.post(on(addr, protocol, true)).await;
+			assert_eq!(status, StatusCode::CREATED, "{protocol} {addr}: {body}");
+			assert_eq!(body["state"], "running", "{body}");
+			assert_eq!(body["listen_freebind"], true, "shown when true: {body}");
+		}
+	}
+	// a wildcard on the port overlaps both, both ways
+	let (status, body) = h.post(on("0.0.0.0", "tcp", false)).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	assert_eq!(body["code"], "already_exists");
+	let msg = body["error"].as_str().unwrap();
+	assert!(msg.contains(&format!("tcp/0.0.0.0:{port} overlaps with tcp/203.0.113.7")) && msg.contains("every address"), "{msg}");
+	// it cannot change by PATCH (the sockets are opened again)
+	let (status, body) = h
+		.patch(&format!("tcp/203.0.113.70/{port}"), json!({"remote_addr": a.ip().to_string(), "remote_port": a.port(), "listen_freebind": false}))
+		.await;
+	assert_eq!((status, body["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{body}");
+	// left out (or the same value): changed in place
+	let (status, body) = h.patch(&format!("tcp/203.0.113.70/{port}"), json!({"remote_addr": a.ip().to_string(), "remote_port": a.port()})).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["listen_freebind"], true, "{body}");
+	// a rule without it does not show it
+	let (_, plain) = h.post(rule("tcp", free_port(), a)).await;
+	assert!(plain.get("listen_freebind").is_none(), "{plain}");
+}
+
+/// Rule sets on two addresses of one port (two Gateways on two VIPs): both apply; a set with the
+/// wildcard on that port is refused with the set it overlaps with.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rule_sets_share_a_port_on_two_addresses() {
+	let h = harness().await;
+	let a = tcp_backend("A:").await;
+	let port = free_port();
+	let set = |addr: &str| {
+		let mut r = rule("tcp", port, a);
+		r["listen_addr"] = json!(addr);
+		r["listen_freebind"] = json!(true);
+		json!({"generation": 1, "rules": [r]})
+	};
+	let put = |name: &str, body: serde_json::Value| {
+		let req = h.http.put(format!("{}/rulesets/{name}", h.base)).json(&body);
+		async move {
+			let r = req.send().await.unwrap();
+			(r.status(), r.json::<serde_json::Value>().await.unwrap())
+		}
+	};
+	for (name, addr) in [("k8s/a/one", "203.0.113.80"), ("k8s/b/two", "203.0.113.81")] {
+		let (status, body) = put(name, set(addr)).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["results"][0]["state"], "running", "{body}");
+	}
+	let mut wild = set("0.0.0.0");
+	wild["rules"][0].as_object_mut().unwrap().remove("listen_freebind");
+	let (status, body) = put("k8s/c/three", wild).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	let msg = body["error"].as_str().unwrap();
+	assert!(msg.contains("(rule set k8s/"), "{msg}");
+}
