@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use serde::Serialize;
 
 use super::host::Host;
-use crate::config::offload::{TcpOffload, XdpMode};
+use crate::config::offload::XdpMode;
 use crate::config::performance::Effective;
 
 /// Which fast paths `run` tests.
@@ -58,7 +58,7 @@ impl Outcome {
 
 /// A fast path: `key` = `mode` in the settings.
 pub struct PathSpec {
-	/// `ebpf.tcp`, `xdp.mode`
+	/// `xdp.mode`
 	pub key: &'static str,
 	pub mode: &'static str,
 	/// The feature it belongs to (`Feature::name`).
@@ -69,8 +69,6 @@ pub struct PathSpec {
 
 /// The fast paths this build knows, in the order of the table.
 pub const PATHS: &[PathSpec] = &[
-	PathSpec { key: "ebpf.tcp", mode: "sockmap", feature: "ebpf_tcp", requested: |e| e.ebpf.tcp == TcpOffload::Sockmap, test: test_sockmap },
-	PathSpec { key: "ebpf.tcp", mode: "nat", feature: "ebpf_tcp", requested: |e| e.ebpf.tcp == TcpOffload::Nat, test: test_tcp_nat },
 	PathSpec { key: "xdp.mode", mode: "af_xdp", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::AfXdp, test: test_af_xdp },
 	PathSpec { key: "xdp.mode", mode: "native", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::Native, test: test_xdp_native },
 ];
@@ -92,7 +90,7 @@ pub struct PathResult {
 /// `performance.probe` line.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Feature {
-	/// `ebpf_tcp`, `xdp`
+	/// `xdp` (later also `dpdk`, #261)
 	pub name: &'static str,
 	/// The setting asked for (`off` when none).
 	pub requested: &'static str,
@@ -125,10 +123,11 @@ impl Report {
 }
 
 /// The features, all off (before `run`, or when nothing is requested).
+// one feature today; DPDK (#261) adds its row here
+#[allow(clippy::single_element_loop)]
 fn features_of(perf: &Effective, paths: &[PathResult]) -> Vec<Feature> {
 	let mut out = vec![];
 	for (name, part, requested, fallback) in [
-		("ebpf_tcp", "global.performance.ebpf.tcp", perf.ebpf.tcp.as_str(), perf.ebpf.fallback),
 		("xdp", "global.performance.xdp.mode", perf.xdp.mode.as_str(), perf.xdp.fallback),
 	] {
 		let path = paths.iter().find(|p| p.requested && p.feature == name);
@@ -242,16 +241,6 @@ fn not_built(host: &Host, needs_net_bpf: bool) -> Outcome {
 	Outcome::unusable(NOT_BUILT, vec![])
 }
 
-/// sockmap: loopback TCP pairs spliced in the kernel, data compared.
-fn test_sockmap(host: &Host, _perf: &Effective) -> Outcome {
-	not_built(host, true)
-}
-
-/// TC / XDP NAT: packets through a temporary namespace and veth pair.
-fn test_tcp_nat(host: &Host, _perf: &Effective) -> Outcome {
-	not_built(host, true)
-}
-
 /// AF_XDP: UDP round trips over a veth pair (zero-copy, then copy).
 fn test_af_xdp(host: &Host, _perf: &Effective) -> Outcome {
 	not_built(host, true)
@@ -277,28 +266,27 @@ mod tests {
 		let r = run(&perf("{}"), Scope::Requested);
 		assert!(r.paths.is_empty() && r.ok());
 		assert_eq!(r.host, Host::default(), "the host is not even inspected");
-		assert_eq!(r.features.iter().map(|f| (f.name, f.requested, f.active)).collect::<Vec<_>>(), [("ebpf_tcp", "off", false), ("xdp", "off", false)]);
+		assert_eq!(r.features.iter().map(|f| (f.name, f.requested, f.active)).collect::<Vec<_>>(), [("xdp", "off", false)]);
 		let caps = capabilities();
-		assert_eq!(caps["ebpf_tcp"], serde_json::json!({"requested": "off", "active": false, "mode": null, "reason": null}));
-		assert_eq!(caps["xdp"]["requested"], "off");
+		assert_eq!(caps["xdp"], serde_json::json!({"requested": "off", "active": false, "mode": null, "reason": null}));
+		assert!(caps.get("ebpf_tcp").is_none(), "sockmap was not adopted");
 	}
 
 	#[test]
 	fn requested_paths_fall_back_with_a_reason() {
-		let p = perf("{ebpf: {tcp: sockmap}, xdp: {mode: af_xdp, fallback: false}}");
+		let p = perf("{xdp: {mode: af_xdp, fallback: false}}");
 		let r = run(&p, Scope::Requested);
-		assert_eq!(r.paths.iter().map(|p| (p.key, p.mode, p.requested)).collect::<Vec<_>>(), [("ebpf.tcp", "sockmap", true), ("xdp.mode", "af_xdp", true)]);
+		assert_eq!(r.paths.iter().map(|p| (p.key, p.mode, p.requested)).collect::<Vec<_>>(), [("xdp.mode", "af_xdp", true)]);
 		assert!(!r.ok(), "no fast path is built in yet");
-		let tcp = &r.features[0];
-		assert_eq!((tcp.name, tcp.requested, tcp.active, tcp.fallback, tcp.part), ("ebpf_tcp", "sockmap", false, true, "global.performance.ebpf.tcp"));
-		assert!(tcp.reason.as_deref().is_some_and(|r| !r.is_empty()), "{tcp:?}");
-		assert!(!r.features[1].fallback);
+		let xdp = &r.features[0];
+		assert_eq!((xdp.name, xdp.requested, xdp.active, xdp.fallback, xdp.part), ("xdp", "af_xdp", false, false, "global.performance.xdp.mode"));
+		assert!(xdp.reason.as_deref().is_some_and(|r| !r.is_empty()), "{xdp:?}");
 
 		let all = run(&p, Scope::All);
 		assert_eq!(all.paths.len(), PATHS.len());
-		assert_eq!(all.paths.iter().filter(|p| p.requested).count(), 2);
+		assert_eq!(all.paths.iter().filter(|p| p.requested).count(), 1);
 		let text = to_text(&all);
-		assert!(text.contains("ebpf.tcp=sockmap") && text.contains("xdp.mode=native") && text.contains("kernel:"), "{text}");
+		assert!(text.contains("xdp.mode=af_xdp") && text.contains("xdp.mode=native") && text.contains("kernel:"), "{text}");
 	}
 
 	#[test]

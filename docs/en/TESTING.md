@@ -282,7 +282,7 @@ Starts the real binary and checks the effect of `global.performance` from outsid
 
 ## Integration tests: kernel offload (`tests/kernel_offload.rs`, #260)
 
-Checks the startup test of `global.performance.ebpf` / `xdp` and `--check-kernel` with the real binary. Whether a fast path works depends on the machine (privileges, kernel), so the tests check that the outcome is reported consistently either way.
+Checks the startup test of `global.performance.xdp` and `--check-kernel` with the real binary. Whether a fast path works depends on the machine (privileges, kernel), so the tests check that the outcome is reported consistently either way.
 
 | Test | What it checks |
 |---|---|
@@ -291,6 +291,10 @@ Checks the startup test of `global.performance.ebpf` / `xdp` and `--check-kernel
 | `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | With `fallback: false` an unusable fast path stops startup |
 | `mistakes_in_the_settings_stop_startup_and_the_check` | Wrong `RPROXY_XDP_*` / `RPROXY_EBPF_*` and settings-file values stop startup and `--check-kernel` |
 | `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` prints a row per fast path and the host; its exit status matches the requested one's result; the JSON says the same |
+
+### offload-verify (testing-only always-on cross-check, #260)
+
+The cargo feature `offload-verify` (off by default, never in release builds; the default build has none of this code). Each fast path cross-checks counts, stalls and how connections end while running and at the end; a mismatch logs `offload.verify` at `error` with the numbers (also on stderr) and counts on `/metrics` (`rproxy_offload_verify_failures_total`, this build only). Tests fail when it is not zero (`common::assert_offload_verified`, at the end of the TCP and UDP cases of tests/integrity.rs); content is compared end to end by tests/integrity.rs. The stall threshold is `RPROXY_OFFLOAD_VERIFY_STALL_SECS` (default 5 s). With `RPROXY_XDP_MODE` set, the in-process rproxy also runs the startup test and uses the fast path (`common::offload_from_env`; `RPROXY_TEST_REQUIRE_OFFLOAD` makes an unusable one a failure). In the sockmap experiment (docs/en/PERFORMANCE.md) it found four kernel quirks and the backlog stall.
 
 ## Integration tests: self-update (`tests/self_update.rs`, #174)
 

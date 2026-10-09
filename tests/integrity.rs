@@ -256,6 +256,8 @@ async fn tcp_streams_arrive_unchanged_on_every_path() {
 		async move { connector.connect(ServerName::try_from("a.test").unwrap(), plain(port).await).await.unwrap() }
 	})
 	.await;
+	// offload-verify builds: the kernel fast path (when on) matched throughout
+	assert_offload_verified();
 }
 
 /// A single-connection backend doing what `f` says with the accepted socket.
@@ -462,6 +464,8 @@ async fn udp_datagrams_arrive_unchanged_once_and_in_order() {
 	let (_, v) = h.get(&format!("/rules/udp/127.0.0.1/{port}")).await;
 	assert_eq!(v["stats"]["dropped"], 0, "{v}");
 	assert!(datagrams > 0);
+	// offload-verify builds: the kernel fast path (when on) matched throughout
+	assert_offload_verified();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

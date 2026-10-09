@@ -55,9 +55,38 @@ pub async fn harness_with(tokens: Tokens) -> Harness {
 }
 
 /// With `global` settings of `http` rules (trusted proxies, access log).
+/// Kernel offload for the in-process tests (#260): with `RPROXY_XDP_MODE` set
+/// (the CI offload job), the startup probe runs once and its result is
+/// published, so the data plane in these tests uses the fast path.
+/// `RPROXY_TEST_REQUIRE_OFFLOAD` makes it fail when the fast path does not work.
+pub fn offload_from_env() {
+	static ONCE: std::sync::Once = std::sync::Once::new();
+	ONCE.call_once(|| {
+		use rproxy_api::config::performance::{allowed_cpus, parallelism, resolve, EnvKnobs};
+		use rproxy_api::net::offload::probe;
+		if std::env::var("RPROXY_XDP_MODE").is_err() {
+			return;
+		}
+		let perf = resolve(None, &EnvKnobs::from_env(None, None, None), &allowed_cpus(), parallelism());
+		let report = probe::run(&perf, probe::Scope::Requested);
+		if std::env::var("RPROXY_TEST_REQUIRE_OFFLOAD").is_ok() {
+			assert!(report.ok(), "the kernel fast path must work here: {report:?}");
+		}
+		probe::publish(report.features);
+	});
+}
+
+/// In `offload-verify` builds (tests only), no fast-path mismatch may have been
+/// found so far in this test process.
+pub fn assert_offload_verified() {
+	#[cfg(all(feature = "offload-verify", target_os = "linux"))]
+	assert_eq!(rproxy_api::net::offload::verify::failures(), 0, "offload-verify found mismatches (see the offload.verify lines)");
+}
+
 pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::HttpGlobal) -> Harness {
 	// keys and secrets written by tests must pass the owner check (net::files)
 	rproxy_api::net::files::private_umask();
+	offload_from_env();
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_millis(100),

@@ -2067,35 +2067,8 @@
           },
           "performance": {
             "type": "object",
-            "description": "Kernel fast paths (#260, global.performance.ebpf / xdp): the actual state after the startup test",
+            "description": "Kernel fast paths (#260, global.performance.xdp): the actual state after the startup test",
             "properties": {
-              "ebpf_tcp": {
-                "type": "object",
-                "properties": {
-                  "requested": {
-                    "type": "string",
-                    "description": "the setting asked for (off when none)"
-                  },
-                  "active": {
-                    "type": "boolean",
-                    "description": "the fast path is in use (its startup test passed)"
-                  },
-                  "mode": {
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "description": "how it runs when active"
-                  },
-                  "reason": {
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "description": "why it is not used, when requested"
-                  }
-                }
-              },
               "xdp": {
                 "type": "object",
                 "properties": {

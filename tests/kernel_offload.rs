@@ -1,5 +1,5 @@
 //! Kernel offload (#260) with the real binary: the startup probe of
-//! `global.performance.ebpf` / `xdp` (`performance.probe`, `degraded`,
+//! `global.performance.xdp` (`performance.probe`, `degraded`,
 //! `GET /capabilities` `performance`), `fallback: false`, and
 //! `rproxy-api --check-kernel`. Whether a fast path is usable depends on the
 //! machine (privileges, kernel); the tests check that the outcome is reported
@@ -96,10 +96,11 @@ async fn nothing_requested_probes_nothing() {
 	let dir = workdir("off");
 	let rp = Rproxy::start(&dir, &[]);
 	let caps = rp.capabilities().await;
-	assert_eq!(caps["performance"]["ebpf_tcp"], serde_json::json!({"requested": "off", "active": false, "mode": null, "reason": null}), "{caps}");
+	assert_eq!(caps["performance"]["xdp"], serde_json::json!({"requested": "off", "active": false, "mode": null, "reason": null}), "{caps}");
+	assert!(caps["performance"].get("ebpf_tcp").is_none(), "sockmap was not adopted: {caps}");
 	assert_eq!(caps["performance"]["xdp"]["requested"], "off", "{caps}");
 	assert!(rp.lines("performance.probe").is_empty(), "{}", rp.text());
-	assert!(!rp.text().contains("global.performance.ebpf"), "{}", rp.text());
+	assert!(!rp.text().contains("global.performance.xdp"), "{}", rp.text());
 	drop(rp);
 	let _ = fs::remove_dir_all(dir);
 }
@@ -107,11 +108,12 @@ async fn nothing_requested_probes_nothing() {
 #[tokio::test]
 async fn requested_fast_paths_are_probed_and_fall_back_with_a_reason() {
 	let dir = workdir("probe");
-	let rp = Rproxy::start(&dir, &[("RPROXY_EBPF_TCP", "sockmap".into()), ("RPROXY_XDP_MODE", "af_xdp".into())]);
+	let rp = Rproxy::start(&dir, &[("RPROXY_XDP_MODE", "af_xdp".into())]);
 	let caps = rp.capabilities().await;
 	let probes = rp.lines("performance.probe");
-	assert_eq!(probes.len(), 2, "{}", rp.text());
-	for (name, requested, part) in [("ebpf_tcp", "sockmap", "global.performance.ebpf.tcp"), ("xdp", "af_xdp", "global.performance.xdp.mode")] {
+	assert_eq!(probes.len(), 1, "{}", rp.text());
+	{
+		let (name, requested, part) = ("xdp", "af_xdp", "global.performance.xdp.mode");
 		let c = &caps["performance"][name];
 		assert_eq!(c["requested"], requested, "{caps}");
 		let line = probes.iter().find(|l| l["feature"] == name).unwrap();
@@ -144,8 +146,13 @@ async fn mistakes_in_the_settings_stop_startup_and_the_check() {
 	let dir = workdir("mistakes");
 	let (ok, out) = Rproxy::start(&dir, &[("RPROXY_XDP_RING_SIZE", "1000".into())]).exited();
 	assert!(!ok && out.contains("RPROXY_XDP_RING_SIZE"), "{out}");
-	let out = command(&dir, &[("RPROXY_EBPF_TCP", "fast".into())]).arg("--check-kernel").output().unwrap();
-	assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("RPROXY_EBPF_TCP"), "{out:?}");
+	let out = command(&dir, &[("RPROXY_XDP_MODE", "fast".into())]).arg("--check-kernel").output().unwrap();
+	assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("RPROXY_XDP_MODE"), "{out:?}");
+	// the sockmap experiment's key is gone (not adopted): a mistake in the file
+	let cfg = dir.join("ebpf.yaml");
+	fs::write(&cfg, "version: 1\nglobal:\n  performance:\n    ebpf: {tcp: sockmap}\n").unwrap();
+	let out = command(&dir, &[("RPROXY_CONFIG", cfg.display().to_string())]).arg("--check-kernel").output().unwrap();
+	assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("ebpf"), "{out:?}");
 	let cfg = dir.join("rproxy.yaml");
 	fs::write(&cfg, "version: 1\nglobal:\n  performance:\n    xdp: {frame_size: 1024}\n").unwrap();
 	let out = command(&dir, &[("RPROXY_CONFIG", cfg.display().to_string())]).arg("--check-kernel").output().unwrap();
@@ -160,17 +167,17 @@ fn check_kernel_tests_every_fast_path_and_prints_a_table() {
 	let out = command(&dir, &[]).arg("--check-kernel").output().unwrap();
 	let text = String::from_utf8_lossy(&out.stdout).to_string();
 	assert!(out.status.success(), "{out:?}");
-	for row in ["ebpf.tcp=sockmap", "ebpf.tcp=nat", "xdp.mode=af_xdp", "xdp.mode=native", "kernel:", "capabilities:"] {
+	for row in ["xdp.mode=af_xdp", "xdp.mode=native", "kernel:", "capabilities:"] {
 		assert!(text.contains(row), "{row}:\n{text}");
 	}
 
 	// requested: the exit status says whether it works; JSON has the same report
-	let out = command(&dir, &[("RPROXY_EBPF_TCP", "sockmap".into())]).args(["--check-kernel", "--check-kernel-format", "json"]).output().unwrap();
+	let out = command(&dir, &[("RPROXY_XDP_MODE", "af_xdp".into())]).args(["--check-kernel", "--check-kernel-format", "json"]).output().unwrap();
 	let report: Value = serde_json::from_slice(&out.stdout).unwrap();
 	let paths = report["paths"].as_array().unwrap();
-	let sockmap = paths.iter().find(|p| p["key"] == "ebpf.tcp" && p["mode"] == "sockmap").unwrap();
-	assert_eq!(sockmap["requested"], true, "{report}");
-	assert_eq!(out.status.success(), sockmap["usable"] == true, "{report}");
+	let af_xdp = paths.iter().find(|p| p["key"] == "xdp.mode" && p["mode"] == "af_xdp").unwrap();
+	assert_eq!(af_xdp["requested"], true, "{report}");
+	assert_eq!(out.status.success(), af_xdp["usable"] == true, "{report}");
 	assert_eq!(paths.iter().filter(|p| p["requested"] == true).count(), 1, "{report}");
 	assert!(report["host"]["kernel"].is_string(), "{report}");
 	let _ = fs::remove_dir_all(dir);

@@ -70,14 +70,25 @@ The work is tracked in the milestone "performance" with the label "area: perform
 ### Boxing the large HTTP/2 futures
 - Meant to reduce memcpy; on its own it made no difference, so it was reverted (within #197).
 
+### Relaying plain L4 TCP inside the kernel with an eBPF sockmap (#260, #265, closed)
+- **Tried:** after rproxy sets up both TCP sockets as usual (handshake, PROXY protocol, `source_ip`, and the `allow_from` / `crowdsec` / `limits` checks in user space), the two sockets go into a per-connection SOCKMAP (2 slots) where a tiny stream-verdict BPF program (direction told by `skb->local_port`; the bytecode loaded straight through bpf(2)) hands each one's bytes to the other — socket to socket inside the kernel, no system calls or copies. Checked by the startup test with real data (loopback pairs, >64 KiB, split writes, SHA-256, data and FIN back to back) and by the testing-only always-on cross-check (`offload-verify`). CI kernel 6.17.0-azure, privileged container.
+- **Kernel quirks found and fixed on the way:**
+  1. The redirect does not pass a FIN on (a user-space read still returns EOF). → rproxy `shutdown(SHUT_WR)`s the other socket once the data has reached its send queue (`TCP_INFO` received bytes against the other's acked + `TIOCOUTQ`); the redirect goes through a backlog, so an early FIN would overtake data.
+  2. Redirecting the empty skb (the FIN) makes the kernel's backlog put EPIPE on the other socket (a send returning 0 counts as an error; moved 458,866 / queued 458,865, the difference being the FIN's sequence number). → the verdict returns `SK_PASS` for empty skbs.
+  3. When both sides close at once, a `shutdown` after the data was through fails with ENOTCONN / EPIPE, which was taken as a relay failure and reset the connection. → best effort.
+  4. Bytes queued before the sockets went into the sockmap (a client that sends at once) were picked up by the user-space read (the verdict only runs on the next data_ready). → `SO_RCVLOWAT` is set right after insertion, which runs the verdict.
+- **Why not adopted** (`tests/integrity.rs` over sockmap with offload-verify): with 4 connections each sending 8 MiB both ways at once, one sometimes stalled. Client → backend: 7,962,624 bytes redirected but 4,816,843 in the backend socket; the backend's send queue was empty and everything written was acknowledged (not TCP flow control). **About 3 MB stayed in the psock redirect backlog with no progress for more than 5 s** (backend → client also had 64 KiB left, and the client-side socket got EPIPE).
+- **Why it cannot be made safe:** sending a stalled connection back to user space drops what is left in the backlog (it would break the promise never to show a cut-off stream as complete). The startup test with test data cannot be relied on to reproduce this parallel two-way stall (the short tests and a real rproxy's 256 KiB round trip all passed). The same call Cilium made when it removed the feature in 1.14.
+- **Revisit if:** a kernel fixes the backlog stall, and a test that reproduces it (parallel two-way bulk transfers checked by offload-verify) passes.
+- **Kept:** the startup-test framework, `--check-kernel` and `offload-verify`, for AF_XDP (#260 stage 3) and DPDK (#261). The four fixes are a reference for any fast path that hands sockets over.
+
 ### Researched but not tried
-- **eBPF sockmap:** Cilium removed it in 1.14; many pitfalls for socket-to-socket forwarding.
 - **io_uring:** Google disabled it on production servers; little published data.
 - **XDP, busy poll:** hard to verify on GitHub runners.
 - **Thread-per-core runtime:** Pingora also defaults to work stealing. TCP / HTTP stay as they are.
 
 ## Next candidates
-- Forwarding in the kernel (#260, in progress): `global.performance.ebpf` (plain L4 TCP through a BPF sockmap) and `global.performance.xdp` (UDP through AF_XDP). Opt-in; only fast paths whose startup test with real data passed are used (`rproxy-api --check-kernel`). The framework (settings, tests, `GET /capabilities`) comes first, then the fast paths one by one, with their results recorded here.
+- Forwarding in the kernel (#260, in progress): `global.performance.xdp` (UDP through AF_XDP; TCP through a sockmap is under "Not adopted" above). Opt-in; only fast paths whose startup test with real data passed are used (`rproxy-api --check-kernel`). The framework (settings, tests, `GET /capabilities`) comes first, then the fast paths one by one, with their results recorded here.
 - HTTP/2: the profile still shows memcpy (about 11%), the allocator (about 12%) and kernel wakeups (about 7%). Fewer, larger h2 writes.
 - Multi-core use (#194): adapt to queue depth (per-role pipeline, per-core parallelism, backpressure).
 - Memory (#185): share UDP session buffers per worker.
