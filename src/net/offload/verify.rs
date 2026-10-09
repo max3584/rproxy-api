@@ -98,7 +98,7 @@ impl Dir {
 		Ok(Dir {
 			name,
 			src: src.as_raw_fd(),
-			rx0: sockmap::bytes_received(src)?,
+			rx0: sockmap::received_baseline(src)?,
 			dst: dst.as_raw_fd(),
 			w0: sockmap::bytes_written(dst)?,
 			acked0: sockmap::bytes_acked(dst)?,

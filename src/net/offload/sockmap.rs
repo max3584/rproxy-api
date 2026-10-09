@@ -99,6 +99,12 @@ impl Relay {
 		// sockets go in after the verdict program is attached
 		map.put_socket(0, client)?;
 		map.put_socket(1, backend)?;
+		// Bytes that arrived before the sockets went in sit in their receive
+		// queues; the verdict only runs on the next data_ready, and a read in
+		// user space would get them meanwhile. Setting SO_RCVLOWAT calls
+		// tcp_data_ready, which runs the verdict on what is queued, in order.
+		kick(client);
+		kick(backend);
 		Ok(Relay { _attached: attached, _prog: prog, _map: map })
 	}
 }
@@ -138,9 +144,30 @@ fn prove_inner(tests: &mut Vec<Test>) -> io::Result<()> {
 	let client_lport = inner_a.local_addr()?.port();
 	let rx0 = bytes_received(inner_a.as_fd())?;
 	let w0 = bytes_written(inner_b.as_fd())?;
+	// bytes that arrive before the sockets go in (a client that sends at once,
+	// while rproxy still dials the backend) must be relayed first, in order
+	let early = pattern(3000);
+	outer_a.write_all(&early)?;
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	while bytes_unread(inner_a.as_fd())? < early.len() as u64 {
+		if std::time::Instant::now() > deadline {
+			return Err(io::Error::other("the early bytes did not arrive"));
+		}
+		std::thread::sleep(Duration::from_millis(1));
+	}
 	// the map and verdict program load and attach: the main thing a host must allow
 	let relay = Relay::start(inner_a.as_fd(), inner_b.as_fd(), client_lport)?;
 	tests.push(Test { name: "load+attach".into(), ok: true, detail: String::new() });
+	let mut got = vec![0u8; early.len()];
+	let ok = outer_b.read_exact(&mut got).is_ok() && got == early;
+	tests.push(Test {
+		name: "queued_before".into(),
+		ok,
+		detail: if ok { String::new() } else { "bytes queued before the relay started were not relayed".into() },
+	});
+	if !ok {
+		return mismatch();
+	}
 
 	// client -> backend, several sizes, the big one split across writes
 	for (name, size, split) in [("small", 100usize, false), ("over_64k", (64 << 10) + 13, true), ("large", 256 << 10, true)] {
@@ -284,6 +311,37 @@ fn tcp_info(sock: BorrowedFd<'_>) -> io::Result<libc::tcp_info> {
 	} else {
 		Err(io::Error::last_os_error())
 	}
+}
+
+/// Runs the verdict on what is already queued on `sock` (see `Relay::start`).
+fn kick(sock: BorrowedFd<'_>) {
+	let one: libc::c_int = 1;
+	// SAFETY: SO_RCVLOWAT reads one int
+	unsafe {
+		libc::setsockopt(
+			sock.as_raw_fd(),
+			libc::SOL_SOCKET,
+			libc::SO_RCVLOWAT,
+			&one as *const _ as *const libc::c_void,
+			std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+		)
+	};
+}
+
+/// Bytes received on `sock` and not read yet (`FIONREAD`).
+pub fn bytes_unread(sock: BorrowedFd<'_>) -> io::Result<u64> {
+	let mut n: libc::c_int = 0;
+	// SAFETY: FIONREAD writes one int
+	if unsafe { libc::ioctl(sock.as_raw_fd(), libc::FIONREAD, &mut n) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(n.max(0) as u64)
+}
+
+/// The baseline for what the relay will move from `sock`: bytes received so
+/// far minus those still queued (the queued ones are relayed too).
+pub fn received_baseline(sock: BorrowedFd<'_>) -> io::Result<u64> {
+	Ok(bytes_received(sock)?.saturating_sub(bytes_unread(sock)?))
 }
 
 /// Bytes received on `sock` (`TCP_INFO`): while it is in the sockmap, what the

@@ -400,7 +400,8 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 	if la.port() == lb.port() {
 		return None;
 	}
-	let (rx0, tx0) = (sockmap::bytes_received(a.as_fd()).ok()?, sockmap::bytes_received(b.as_fd()).ok()?);
+	// queued, unread bytes are relayed too (Relay::start runs the verdict on them)
+	let (rx0, tx0) = (sockmap::received_baseline(a.as_fd()).ok()?, sockmap::received_baseline(b.as_fd()).ok()?);
 	let (wa0, wb0) = (sockmap::bytes_written(a.as_fd()).ok()?, sockmap::bytes_written(b.as_fd()).ok()?);
 	let relay = match sockmap::Relay::start(a.as_fd(), b.as_fd(), la.port()) {
 		Ok(r) => r,
