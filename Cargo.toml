@@ -79,6 +79,10 @@ ignored = ["md-5"]
 [features]
 default = []
 alloc-mimalloc = ["dep:mimalloc"]
+# testing only (#260): always-on cross-check of the kernel fast paths
+# (net::offload::verify). Never in release builds; the CI offload job and the
+# correctness runs of fast-path branches turn it on.
+offload-verify = []
 
 [dependencies]
 mimalloc = { version = "0.1.52", optional = true }

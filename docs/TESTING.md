@@ -280,6 +280,22 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `the_environment_applies_without_the_file` | 設定ファイルに `global.performance` がなければ `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS=auto`・`RPROXY_SPLICE=0` が効く。何もなければ既定（UDP のソケット 1 本、固定なし） |
 | `cpus_that_do_not_exist_are_left_out` | 存在しない CPU は除いて `degraded`、ワーカーは使える CPU の数 |
 
+## 結合テスト：カーネルでの転送（`tests/kernel_offload.rs`、#260）
+
+本物のバイナリで、`global.performance.xdp` の起動時の試験と `--check-kernel` を確かめる。速い道が使えるかはマシン（権限・カーネル）しだいなので、どちらの場合も結果の出し方が揃っていることを見る。
+
+| テスト | 確かめること |
+|---|---|
+| `nothing_requested_probes_nothing` | 何も求めなければ試さない（`performance.probe` の行なし）、`GET /capabilities` の `performance` はすべて `requested: off` |
+| `requested_fast_paths_are_probed_and_fall_back_with_a_reason` | 求めた機能ごとに `performance.probe` の行、`GET /capabilities` と同じ `active`。使えなければ `reason` と `degraded`（`part`） |
+| `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | `fallback: false` で使えなければ起動を止める |
+| `mistakes_in_the_settings_stop_startup_and_the_check` | `RPROXY_XDP_*` / `RPROXY_EBPF_*` と設定ファイルの値の誤りで起動と `--check-kernel` が止まる |
+| `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` がすべての速い道の行とホストの情報を出す。終わりの状態が求めたものの結果と合う、JSON も同じ |
+
+### offload-verify（テストだけの常時の照合、#260）
+
+cargo の機能 `offload-verify`（既定で無効、リリースのビルドには入らない。既定のビルドにはこのコードがない）。速い道ごとに、動いている間と終わりに量・止まり・閉じ方を照合し、合わなければ `error` の `offload.verify`（数字つき、標準エラーにも）と `/metrics` の `rproxy_offload_verify_failures_total`（このビルドだけ）。テストは 0 でなければ失敗する（`common::assert_offload_verified`、tests/integrity.rs の TCP・UDP の終わり）。データの中身は tests/integrity.rs が端から端まで比べる。止まりとみなす時間は `RPROXY_OFFLOAD_VERIFY_STALL_SECS`（既定 5 秒）。`RPROXY_XDP_MODE` があると、テストの中の rproxy も起動時の試験を通して速い道を使う（`common::offload_from_env`。`RPROXY_TEST_REQUIRE_OFFLOAD` で使えないことを失敗にする）。sockmap の試み（docs/PERFORMANCE.md）では、これが 4 つのカーネルの癖とバックログの詰まりを見つけた。
+
 ## 結合テスト：自動更新（`tests/self_update.rs`、#174）
 
 HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitHub と同じくリダイレクトで渡す）に、このバイナリを次のパッチの番号で署名して置く。

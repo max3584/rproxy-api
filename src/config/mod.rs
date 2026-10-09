@@ -2,6 +2,7 @@
 
 pub mod check;
 pub mod db;
+pub mod offload;
 pub mod performance;
 pub mod persist;
 pub mod plan;

@@ -87,6 +87,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
 | `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | `POST /config/reload`（設定ファイルをその場で読み直して結果を返す）と ACME の強い操作（`POST /acme/...`。docs/ACME.md）を Unix ソケットからだけ受け付ける。`false` で TCP の制御 API でも受け付ける（`admin` / `acme:write` のトークンが要る） |
+| — | `--check-kernel` | — | カーネルでの転送（`global.performance.xdp`、#260）の速い道をすべて、テストデータを流して確かめ、表で出して終わる（`--check-kernel-format json` で JSON）。`--config` / `RPROXY_CONFIG` で求めたものがすべて使えれば 0、そうでなければ 1 |
 | — | `--check-config [PATH]` | — | 設定ファイル（PATH、なければ `RPROXY_CONFIG`）を確かめて終わる。問題がなければ 0、誤りがあれば 1。`--check-config-format json` で JSON（下の「設定を確かめる」） |
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
@@ -130,6 +131,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `rproxy_rules` を読めない・書けない（テーブルがない、権限、DB が落ちている） | 起動時は UI のルールだけを復元する。API のルールは動かしたまま `persisted: false`（`part: db`、#144） |
 | `global.geoip` のデータベースが読めない（権限）・新しい版が壊れている | 読めるまで国・ASN は「分からない」（`unknown` の扱い）、読み直しでは今のものを使い続ける（`part: geoip`） |
 | `global.performance` の `busy_poll_usecs` を設定できない・`cpu_affinity` に存在しない CPU | `SO_BUSY_POLL` なしで動く / その CPU を除く（`part: global.performance.*`） |
+| `global.performance.xdp` の速い道が起動時の試験に通らない（権限、カーネル、ドライバ） | 今の処理（`recvmmsg`）で動く（`part: global.performance.xdp.mode`、`reason`）。`fallback: false` なら起動を止める（#260、docs/API.md の「performance」） |
 | 自動更新のキャッシュのディレクトリを作れない | 転送は動かしたまま、直るまで自動更新は失敗する（`part: update.cache`） |
 | 権限（capability）が足りないルール | そのルールだけを理由つきの `failed` にする（[docs/PERMISSIONS.md](docs/PERMISSIONS.md)） |
 
@@ -354,6 +356,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `cert.expiring` / `cert.expired` / `cert.ok` | 証明書の期限が近い（`RPROXY_CERT_WARN_DAYS` 以内）/ 切れた / 更新された（`file`、`not_after`、`days_left`）。状態が変わったときに 1 回だけ |
 | `cert.check` | 定期の期限の確認（`rules_updated`：切れた証明書を外した・止めたルールの数） |
 | `performance` | 起動時の `global.performance` の値と出どころ（`sources`）。`SO_BUSY_POLL` を設定できない・存在しない CPU は `degraded`（`part: global.performance.busy_poll_usecs` / `global.performance.cpu_affinity`） |
+| `performance.probe` | 求められたカーネルでの転送（`global.performance.xdp`、#260）の起動時の試験の結果（`feature`・`requested`・`active`・`mode`・`reason`・`tests`）。機能ごとに 1 行、何も求めなければ出ない |
 | `handoff.start` / `handoff.sent` / `handoff.ready` / `handoff.drain` / `handoff.done` / `handoff.failed` / `handoff.refused` / `handoff.busy` / `handoff.received` / `handoff.sockets` / `handoff.counters` / `handoff.rule` / `handoff.ruleset` | 再起動なしの更新：始めた / ソケットと状態を渡した / 新しいプロセス（`pid`）の準備ができた / 古いプロセスが今の接続を待つ / 終わった / できなかった（古いプロセスが動き続ける）/ マイナーが違う・別のプロセスがつないだので断った / もう動いている / 新しいプロセスが受け取った / 受け取ったソケットを使った・使わずに閉じた / 古いプロセスの最後の数を足した（届かなければ warn）/ 受け取った API のルール・ルールの組を読めない・当てられない（warn）（docs/UPGRADE.md） |
 | `update.check` / `update.available` / `update.fetched` / `update.restart_needed` / `update.healthy` / `update.rollback` / `update.interrupted` / `update.clear_bad` / `update.error` / `launch.start` / `launch.mainpid` / `launch.notify_refused` / `launch.exit` | 自動更新：探したが新しいパッチはない / 新しいパッチがある / 確かめてキャッシュに入れた / 引き継げないパッチなので次の再起動で使う / よい版になった / 悪い版として戻した / 試している版が起動役ごと止まった（3 回で悪い版）/ 悪い版の印を外した / 失敗（署名が合わないなど）/ 起動役（`rproxy-api launch`）がサーバを起動した / 引き継ぎで主プロセスが変わった / 自分の子孫でないプロセスからの `MAINPID=` を断った / サーバが終わった（`code`）。キャッシュに書けないときは `degraded`（`part: update.cache`） |
 | （`debug` だけ）`udp.drop` / `udp.send_error` / `udp.recv_error` / `tcp.nodelay` / `target.eject_skipped` | UDP のデータグラムを捨てた（数は `stats.dropped`）/ 送受信の失敗 / TCP_NODELAY を設定できない / `max_ejected_percent` のため失敗した宛先を外さなかった |
