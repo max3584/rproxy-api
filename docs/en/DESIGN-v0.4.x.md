@@ -19,6 +19,7 @@
 | E. Shutting down on SIGTERM | v0.4.1 | `graceful_shutdown` | passes `5s` / `25s` to managed and fleet pods, readiness on `/readyz` | — |
 | D1. #240 certificate API | v0.4.2 | `cert_store` | not used | no screen yet |
 | D2. #241 persisting rule sets | v0.4.2 | `ruleset_persistence` | not used | migration 012, read-only view |
+| G1. 421 Misdirected Request (7.1) | v0.4.3 | `misdirected` in `http_options` | the names of the HTTPS listeners on one port go to `tls.misdirected` (`GatewayHTTPSListenerDetectMisdirectedRequests`, v0.4.5) | — |
 
 ## 2. E. Shutting down on SIGTERM (v0.4.1)
 
@@ -154,3 +155,17 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 ## 6. Deviations in the implementation
 
 - **#241, conflicts on restore (approved by the owner, 2026-10-08)**: section 4 said "a rule whose key was already taken is `failed` alone", but the rule table holds one entry per key, so a second rule with the same key cannot be registered even as `failed`. Instead, a rule whose key or listen ports overlap a rule restored before is **left out of its set** with `restore.conflict` (a rule that cannot be applied for another reason, such as a refused file, gets `restore.skip`), and the rest of the set is applied. The set's `etag` then differs from the stored one; the `ruleset.restore` log line shows both the new `etag` and the `stored_etag`. The DB row is left as it is (the next `PUT` brings it in line).
+
+## 7. The rest of the Gateway API (v0.4.3, rproxy-gateway v0.4.5)
+
+The Gateway API features rproxy-gateway does not claim yet ("Not claimed" in rproxy-gateway's docs/en/CONFORMANCE.md) that need something in rproxy. All are optional and, left out, behave as v0.4.2 (requested by the owner, 2026-10-08). As in 16. of v0.4.0 (docs/en/DESIGN-v0.4.md), the Gateway API's shapes become general rproxy settings that the controller maps.
+
+### 7.1 421 Misdirected Request (`tls.misdirected`)
+
+- The problem: rproxy-gateway makes the HTTPS listeners of one port (different host names) one rule, and the certificate is chosen by SNI. Browsers send requests for other names in the certificate's SANs on the same HTTP/2 connection (connection coalescing, RFC 9113 §9.1.1), so they reach the routes of another listener than the one chosen by SNI. The Gateway API (the description of `Listener.hostname`, conformance test `HTTPRouteHTTPSListenerDetectMisdirectedRequests`) asks for 421 when the Host belongs to another listener, and 404 when it belongs to none.
+- Shape: `tls.misdirected: {groups: [[pattern, ...], ...]}`. Patterns as in `tls.routes` (exact, `*.`, `**.`) plus `*`, which matches any name. A name belongs to the group of its closest pattern (the order of `tls::config::best_match`, `*` last). When the SNI and the Host are both in groups, and not the same one: 421. When either is in no group, or there is no SNI: nothing is checked (the routes choose).
+- "Listeners" stay out of rproxy's vocabulary: rproxy knows no listeners, so it gets groups of names. The controller makes one group per listener (`*` for a listener without a host name).
+- Where: `Conn::handle` in `server.rs`, before choosing a route. No route and no middleware runs (another listener's middlewares, authentication for one, do not run under this connection's name). The same for HTTP/1.1, HTTP/2 and HTTP/3 (421 is fine over HTTP/1.1 too).
+- Validation: only rules with `http` and `tls.mode: terminate`; a pattern may appear once. `features`: `misdirected` in `http_options`.
+- Tests: unit (the cases of the conformance test), `tests/gateway_l7.rs` (several `:authority` values on one HTTP/2 connection, HTTP/1.1).
+

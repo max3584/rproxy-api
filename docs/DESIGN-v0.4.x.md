@@ -19,6 +19,7 @@ English: [DESIGN-v0.4.x.md](en/DESIGN-v0.4.x.md)
 | E. SIGTERM での終わり方 | v0.4.1 | `graceful_shutdown` | managed・fleet の Pod に `5s`・`25s` を渡し、readiness を `/readyz` に | — |
 | D1. #240 証明書の API | v0.4.2 | `cert_store` | 使わない | 画面は作らない（後で） |
 | D2. #241 組の保存 | v0.4.2 | `ruleset_persistence` | 使わない | migration 012、読むだけの表示 |
+| G1. 421 Misdirected Request（7.1） | v0.4.3 | `http_options` の `misdirected` | 同じポートの HTTPS のリスナーの名前を `tls.misdirected` に（`GatewayHTTPSListenerDetectMisdirectedRequests`、v0.4.5） | — |
 
 ## 2. E. SIGTERM での終わり方（v0.4.1）
 
@@ -154,3 +155,17 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 ## 6. 実装での設計との違い
 
 - **#241 の起動時の取り合い（オーナーの了承、2026-10-08）**：4. では「前のものと同じキーのルールはそのルールだけ `failed`」としていたが、ルールの表はキーごとに 1 つなので、同じキーの 2 つ目のルールは `failed` としても登録できない。そこで、前に戻したルールとキー・待ち受けが重なるルールは**その組から外して** `restore.conflict`（ファイルを読めないなど、ほかの理由で当てられないルールは `restore.skip`）を出し、組の残りを当てる。外したときは組の `etag` が保存したものと変わり、`ruleset.restore` のログに新しい `etag` と保存した `stored_etag` の両方を出す。DB の行はそのままにする（次の `PUT` で揃う）。
+
+## 7. Gateway API の残り（v0.4.3、rproxy-gateway v0.4.5）
+
+rproxy-gateway が名乗っていない Gateway API の機能（rproxy-gateway の docs/CONFORMANCE.md の「名乗っていないもの」）のうち、rproxy に口が要るもの。どれも省略でき、省略したときは v0.4.2 と同じ（オーナーの依頼、2026-10-08）。v0.4.0 の 16.（docs/DESIGN-v0.4.md）と同じく、Gateway API の形を rproxy の一般の設定にして、コントローラが写す。
+
+### 7.1 421 Misdirected Request（`tls.misdirected`）
+
+- 困ること：rproxy-gateway は同じポートの HTTPS のリスナー（ホスト名が違う）を 1 つのルールにまとめ、証明書を SNI で選ぶ。ブラウザは証明書の SAN にある別の名前のリクエストを同じ HTTP/2 の接続で送る（connection coalescing、RFC 9113 §9.1.1）ので、SNI で選んだリスナーとは別のリスナーのルートに届く。Gateway API（`Listener.hostname` の説明、conformance の `HTTPRouteHTTPSListenerDetectMisdirectedRequests`）は、Host がほかのリスナーに当たるなら 421、どのリスナーにも当たらなければ 404 を求める。
+- 形：`tls.misdirected: {groups: [[パターン, ...], ...]}`。パターンは `tls.routes` と同じ（完全一致・`*.`・`**.`）に、どの名前にも当たる `*` を足したもの。名前は最も近いパターンのグループに入る（`tls::config::best_match` と同じ順で、`*` が最後）。SNI と Host がどちらもグループに入り、違うグループなら 421。どちらかがどのグループにも入らない・SNI がないときは確かめない（ルートで選ぶ）。
+- 「リスナー」を rproxy の言葉にしない：rproxy はリスナーを知らないので、名前の集まりとして渡す。コントローラはリスナーごとに 1 つのグループ（ホスト名のないリスナーは `*`）を作る。
+- どこで：`server.rs` の `Conn::handle` で、ルートを選ぶ前に。ルートもミドルウェアも通らない（ほかのリスナーのルートのミドルウェア（認証など）を、この接続の名前で動かさない）。HTTP/1.1・HTTP/2・HTTP/3 のどれも同じ（421 は HTTP/1.1 でも正しい）。
+- 検証：`http` と `tls.mode: terminate` のルールだけ。同じパターンを 2 か所に書けない。`features`：`http_options` の `misdirected`。
+- 試験：単体（conformance の組み合わせ）、`tests/gateway_l7.rs`（1 つの HTTP/2 の接続で複数の `:authority`、HTTP/1.1）。
+

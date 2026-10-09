@@ -268,6 +268,25 @@
           },
           "options": {
             "$ref": "#/components/schemas/TlsOptions"
+          },
+          "misdirected": {
+            "type": "object",
+            "description": "421 Misdirected Request when the request's Host is in another group of server name patterns than the TLS server name (http rules with terminate; v0.4.3)",
+            "properties": {
+              "groups": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "required": [
+              "groups"
+            ],
+            "additionalProperties": false
           }
         },
         "additionalProperties": false
@@ -1881,7 +1900,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235)"
+                "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235), misdirected (tls.misdirected, v0.4.3)"
               },
               "tls_route_targets": {
                 "type": "boolean"

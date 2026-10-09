@@ -382,6 +382,16 @@ impl Conn {
 		}
 	}
 
+	/// `tls.misdirected`: the request's Host is in another group of names than the TLS
+	/// server name of this connection. Plain HTTP and connections without SNI are not checked.
+	fn misdirected(&self, host: &str) -> bool {
+		let Some(server_name) = self.tls.as_ref().and_then(|t| t.server_name.as_deref()) else {
+			return false;
+		};
+		let tls = self.rt.tls();
+		tls.spec.misdirected.as_ref().is_some_and(|m| m.misdirected(server_name, host))
+	}
+
 	/// The rule asks clients for certificates (`tls.client_auth`, any mode).
 	fn client_auth(&self) -> bool {
 		self.tls.is_some() && self.rt.tls().spec.client_auth.mode != crate::tls::config::ClientAuthMode::None
@@ -605,8 +615,12 @@ impl Conn {
 			headers: &headers,
 			client: client_ip,
 		};
-		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info) {
+		// tls.misdirected: a coalesced HTTP/2 connection (or any) carrying a request for a name of
+		// another group than its TLS server name gets 421, before routing (RFC 9110 §15.5.20)
+		let misdirected = self.misdirected(&host);
+		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !misdirected) {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
+			None if misdirected => ("", None, &[][..], &[][..], None, None),
 			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
 		};
 		// timeouts.request (#227) counts from here
@@ -671,8 +685,12 @@ impl Conn {
 			.unwrap_or_else(|| host.clone());
 		// which middleware answered (kind, name), for `refused_by` in the access log
 		let mut answered_by: Option<(&'static str, &str)> = None;
+		if misdirected {
+			answer = Some(error_response(StatusCode::MISDIRECTED_REQUEST));
+			answered_by = Some(("misdirected", ""));
+		}
 		// sign-in callbacks and logout of `oidc`, whichever route matched
-		if let Some(o) = router.oidc.iter().find(|o| o.owns(parts.uri.path())) {
+		if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
 			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
 			answered_by = Some(("oidc", o.name.as_str()));
 		}
