@@ -4,7 +4,7 @@
 
 use std::io;
 
-use aya::maps::{HashMap as BpfHashMap, XskMap};
+use aya::maps::{Array, HashMap as BpfHashMap, XskMap};
 use aya::programs::{Xdp, XdpFlags};
 use aya::Ebpf;
 
@@ -64,6 +64,13 @@ impl Steer {
 		use std::os::fd::AsRawFd;
 		let mut xsks: XskMap<_> = XskMap::try_from(self.ebpf.map_mut("XSKS").ok_or_else(|| io::Error::other("no XSKS map"))?).map_err(err)?;
 		xsks.set(queue, fd.as_raw_fd(), 0).map_err(err)
+	}
+
+	/// The program's diagnosis counters: UDP packets seen, destination port in
+	/// `PORTS`, redirect failed (`None` if the map cannot be read).
+	pub fn stats(&self) -> Option<[u64; 3]> {
+		let map: Array<_, u64> = Array::try_from(self.ebpf.map("STATS")?).ok()?;
+		Some([map.get(&0, 0).ok()?, map.get(&1, 0).ok()?, map.get(&2, 0).ok()?])
 	}
 
 	pub fn iface(&self) -> &str {

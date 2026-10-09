@@ -18,7 +18,7 @@
 use aya_ebpf::{
 	bindings::xdp_action::XDP_PASS,
 	macros::{map, xdp},
-	maps::{HashMap, XskMap},
+	maps::{Array, HashMap, XskMap},
 	programs::XdpContext,
 };
 use core::mem;
@@ -30,6 +30,19 @@ static XSKS: XskMap = XskMap::with_max_entries(256, 0);
 /// Destination UDP ports rproxy takes (key: port in host order, value: 1).
 #[map]
 static PORTS: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+
+/// Counters for diagnosis (the self-test reports them when it fails):
+/// 0 = UDP packets seen, 1 = destination port in `PORTS`, 2 = redirect failed.
+#[map]
+static STATS: Array<u64> = Array::with_max_entries(4, 0);
+
+#[inline(always)]
+fn count(i: u32) {
+	if let Some(p) = STATS.get_ptr_mut(i) {
+		// SAFETY: a valid pointer into the array map; a racy add is fine for counters
+		unsafe { *p += 1 };
+	}
+}
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86dd;
@@ -90,16 +103,24 @@ fn try_redirect(ctx: &XdpContext) -> Option<u32> {
 	if proto != IPPROTO_UDP {
 		return None;
 	}
+	count(0);
 	// UDP destination port is the second u16 of the UDP header
 	let dport = u16::from_be(load::<u16>(ctx, udp_off + 2)?);
 	// SAFETY: map lookup; the pointer is valid for the program's lifetime
 	if unsafe { PORTS.get(&dport) }.is_none() {
 		return None;
 	}
+	count(1);
 	// redirect to the XSK of this RX queue; if none is bound, pass it up
 	// SAFETY: reading a scalar context field
 	let queue = unsafe { (*ctx.ctx).rx_queue_index };
-	Some(XSKS.redirect(queue, XDP_PASS as u64).unwrap_or(XDP_PASS))
+	match XSKS.redirect(queue, 0) {
+		Ok(action) => Some(action),
+		Err(_) => {
+			count(2);
+			Some(XDP_PASS)
+		}
+	}
 }
 
 #[cfg(not(test))]

@@ -119,6 +119,13 @@ fn in_namespace(ring_size: u32, frame_size: u32) -> Outcome {
 		let mode = if zero_copy { "generic, zero-copy" } else { "generic, copy" };
 		Outcome { usable: true, detail: format!("udp round trips over veth ({mode})"), tests }
 	} else {
+		// where it stopped: the program's counters and the socket's statistics
+		let prog = steer.stats().map(|[seen, port, fail]| format!("program: udp seen {seen}, port matched {port}, redirect failed {fail}"));
+		let sock = xsk.statistics().map(|s| {
+			format!("socket: rx_dropped {} rx_invalid {} rx_ring_full {} fill_ring_empty {} tx_invalid {} tx_ring_empty {}", s[0], s[1], s[3], s[4], s[2], s[5])
+		});
+		let detail = [prog, sock].into_iter().flatten().collect::<Vec<_>>().join("; ");
+		step(&mut tests, "diagnosis", Err(detail));
 		Outcome::unusable("a test datagram did not come through intact", tests)
 	}
 }

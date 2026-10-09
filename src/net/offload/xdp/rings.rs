@@ -204,6 +204,19 @@ impl Xsk {
 		unsafe { libc::poll(&mut p, 1, timeout_ms) };
 	}
 
+	/// The socket's `XDP_STATISTICS` (for diagnosis): rx_dropped,
+	/// rx_invalid_descs, tx_invalid_descs, rx_ring_full,
+	/// rx_fill_ring_empty_descs, tx_ring_empty_descs.
+	pub fn statistics(&self) -> Option<[u64; 6]> {
+		const SOL_XDP: libc::c_int = 283;
+		const XDP_STATISTICS: libc::c_int = 7;
+		let mut st = [0u64; 6];
+		let mut len = std::mem::size_of_val(&st) as libc::socklen_t;
+		// SAFETY: getsockopt into our buffer of `len` bytes
+		let r = unsafe { libc::getsockopt(self.raw_fd(), SOL_XDP, XDP_STATISTICS, st.as_mut_ptr().cast(), &mut len) };
+		(r == 0).then_some(st)
+	}
+
 	/// Returns completed TX frames to the free list.
 	fn reclaim(&mut self) {
 		let mut reader = self.device.complete(self.frames);
