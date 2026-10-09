@@ -143,7 +143,8 @@ pub struct Features {
 	/// `protocol`, `tls`)
 	pub services: &'static [&'static str],
 	/// Other `http` options for the Gateway API (#224, #226-#235): `headers_add`, `redirect_status`,
-	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`
+	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`; `misdirected`
+	/// (`tls.misdirected`, v0.4.3)
 	pub http_options: &'static [&'static str],
 	/// `targets` and `balance` of `tls.routes[]` (#234)
 	pub tls_route_targets: bool,
@@ -194,7 +195,8 @@ pub struct Features {
 }
 
 /// Every name of `Features::http_options`.
-const HTTP_OPTIONS: &[&str] = &["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status"];
+const HTTP_OPTIONS: &[&str] =
+	&["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"];
 
 impl Features {
 	pub const CURRENT: Features =
@@ -311,6 +313,9 @@ impl Features {
 			if let Some(option) = h.options_used().into_iter().find(|o| !self.http_options.contains(o)) {
 				return missing(&format!("http option {option}"));
 			}
+		}
+		if tls.misdirected.is_some() && !self.http_options.contains(&"misdirected") {
+			return missing("tls.misdirected");
 		}
 		if !self.tls_route_targets && tls.routes.iter().any(|r| !r.targets.is_empty()) {
 			return missing("targets of tls.routes");
@@ -697,6 +702,9 @@ impl RuleRequest {
 		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
+		if tls.misdirected.is_some() && self.http.is_none() {
+			return Err(ApiError::tls_config("tls.misdirected needs http (it answers HTTP requests with 421)"));
+		}
 		if self.starttls.is_none() && self.starttls_required == Some(false) {
 			return Err(ApiError::invalid("starttls_required needs starttls"));
 		}

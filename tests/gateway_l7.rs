@@ -476,7 +476,7 @@ async fn capabilities_list_the_gateway_features() {
 	}
 	assert_eq!(
 		f["http_options"],
-		json!(["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status"])
+		json!(["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"])
 	);
 	assert_eq!(f["tls_route_targets"], true);
 }
@@ -582,4 +582,62 @@ async fn client_certificate_headers_cannot_be_forged_where_no_client_auth_applie
 			}
 		}
 	}
+}
+
+/// Statuses of requests for `hosts` sent on one HTTP/2 connection made for `sni`
+/// (connection coalescing, as browsers do for names of one certificate).
+async fn h2_statuses(pki: &common::pki::Pki, port: u16, sni: &str, hosts: &[&str]) -> Vec<u16> {
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let tls = pki.connector_alpn(None, &["h2"]).connect(sni.to_string().try_into().unwrap(), tcp).await.unwrap();
+	let (mut send, conn) =
+		hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+	tokio::spawn(conn);
+	let mut out = vec![];
+	for host in hosts {
+		let req = hyper::Request::get(format!("https://{host}/x")).body(http_body_util::Empty::<Bytes>::new()).unwrap();
+		out.push(send.send_request(req).await.unwrap().status().as_u16());
+	}
+	out
+}
+
+#[tokio::test]
+async fn misdirected_requests_get_421() {
+	// tls.misdirected (v0.4.3): the Gateway API's HTTPS listeners on one port; a request on a
+	// connection made for another listener's name gets 421 (HTTPRouteHTTPSListenerDetectMisdirectedRequests)
+	let pki = common::pki::Pki::new("gw-421");
+	let cert = pki.server("front", &["a.test", "b.test", "*.w.test", "x.w.test", "c.test"]);
+	let h = harness().await;
+	let (b, _) = backend("b").await;
+	let port = free_port();
+	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}],
+		"misdirected": {"groups": [["*"], ["b.test"], ["**.w.test"], ["x.w.test"]]}});
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "tls": tls,
+			"http": {
+				"routes": [{"name": "r", "match": "!Host(`c.test`)", "service": "b"}],
+				"services": {"b": {"servers": [{"url": format!("http://{b}")}]}},
+			}}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// the catch-all listener: its own names and unknown ones are routed (c.test: no route, 404)
+	assert_eq!(h2_statuses(&pki, port, "a.test", &["a.test", "b.test", "c.test", "y.w.test"]).await, [200, 421, 404, 421]);
+	assert_eq!(h2_statuses(&pki, port, "b.test", &["b.test", "a.test", "c.test"]).await, [200, 421, 421]);
+	assert_eq!(h2_statuses(&pki, port, "y.w.test", &["y.w.test", "z.w.test", "x.w.test", "b.test"]).await, [200, 200, 421, 421]);
+	assert_eq!(h2_statuses(&pki, port, "x.w.test", &["x.w.test", "y.w.test"]).await, [200, 421]);
+	// HTTP/1.1 on a connection for a.test asking for b.test, too
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let mut s = pki.connector_alpn(None, &["http/1.1"]).connect("a.test".to_string().try_into().unwrap(), tcp).await.unwrap();
+	s.write_all(b"GET /x HTTP/1.1\r\nHost: b.test\r\nConnection: close\r\n\r\n").await.unwrap();
+	let mut out = vec![];
+	let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+	assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 421"), "{}", String::from_utf8_lossy(&out));
+	// the rule's view keeps the setting; it needs http and terminate
+	let (_, view) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(view["tls"]["misdirected"]["groups"][1], json!(["b.test"]), "{view}");
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "remote_addr": "127.0.0.1", "remote_port": 1,
+			"tls": tls}))
+		.await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+	assert!(v["error"].as_str().unwrap().contains("needs http"), "{v}");
 }

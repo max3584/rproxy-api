@@ -202,6 +202,54 @@ pub struct TlsSpec {
 	pub unmatched: Unmatched,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub options: Option<TlsOptions>,
+	/// 421 Misdirected Request when a request's Host belongs to another group of
+	/// names than the TLS server name (`http` rules with `terminate`; the Gateway
+	/// API's listeners on one port, HTTP/2 connection coalescing).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub misdirected: Option<Misdirected>,
+}
+
+/// `tls.misdirected`: groups of server name patterns (as in `routes`, plus `*` for
+/// any name). A request whose Host falls in another group than the connection's
+/// server name (SNI) gets 421. Names in no group, and connections without SNI, are
+/// not checked.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Misdirected {
+	pub groups: Vec<Vec<String>>,
+}
+
+impl Misdirected {
+	fn validate(&self) -> Result<(), ApiError> {
+		if self.groups.is_empty() || self.groups.iter().any(Vec::is_empty) {
+			return Err(tls_error("misdirected.groups needs groups of at least one name"));
+		}
+		let mut seen = std::collections::HashSet::new();
+		for p in self.groups.iter().flatten() {
+			if p != "*" && !valid_pattern(p) {
+				return Err(tls_error(format!("misdirected.groups: {p:?} is not a server name pattern (name, *.name, **.name or *)")));
+			}
+			if !seen.insert(p.to_ascii_lowercase()) {
+				return Err(tls_error(format!("misdirected.groups: {p:?} is in more than one place")));
+			}
+		}
+		Ok(())
+	}
+
+	/// The group of `name`: the one with the closest pattern (exact, `*.`, the longest `**.`, then `*`).
+	pub fn group_of(&self, name: &str) -> Option<usize> {
+		let rank = |p: &str| if p == "*" { Some((3, 0)) } else { match_rank(p, name) };
+		self.groups.iter().enumerate().filter_map(|(i, g)| g.iter().filter_map(|p| rank(p)).min().map(|r| (r, i))).min().map(|(_, i)| i)
+	}
+
+	/// Whether a request for `host` on a connection made for `server_name` is misdirected:
+	/// both are in groups, and not the same one.
+	pub fn misdirected(&self, server_name: &str, host: &str) -> bool {
+		if host.is_empty() {
+			return false;
+		}
+		matches!((self.group_of(server_name), self.group_of(host)), (Some(a), Some(b)) if a != b)
+	}
 }
 
 impl TlsSpec {
@@ -284,6 +332,12 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 			return Err(tls_error("routes need mode sni or terminate"));
 		}
 		_ => {}
+	}
+	if let Some(m) = &tls.misdirected {
+		if tls.mode != TlsMode::Terminate || protocol != Protocol::Tcp {
+			return Err(tls_error("misdirected needs protocol tcp and tls mode terminate (with http)"));
+		}
+		m.validate()?;
 	}
 	for c in &tls.certificates {
 		if let Some(name) = &c.cert {
@@ -1282,6 +1336,54 @@ impl TlsRuntime {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn misdirected_requests_follow_the_listeners_of_a_port() {
+		// the Gateway API conformance test HTTPRouteHTTPSListenerDetectMisdirectedRequests:
+		// listeners without a host name, second-example.org, *.wildcard.org, fourth-example.wildcard.org
+		let m = Misdirected {
+			groups: vec![
+				vec!["*".into()],
+				vec!["second-example.org".into()],
+				vec!["**.wildcard.org".into()],
+				vec!["fourth-example.wildcard.org".into()],
+			],
+		};
+		m.validate().unwrap();
+		for (sni, host, want) in [
+			("example.org", "example.org", false),
+			("example.org", "second-example.org", true),
+			("example.org", "unknown-example.org", false),
+			("second-example.org", "second-example.org", false),
+			("second-example.org", "example.org", true),
+			("second-example.org", "unknown-example.org", true),
+			("third-example.wildcard.org", "fith-example.wildcard.org", false),
+			("third-example.wildcard.org", "fourth-example.wildcard.org", true),
+			("third-example.wildcard.org", "second-example.org", true),
+			("fourth-example.wildcard.org", "fourth-example.wildcard.org", false),
+			("fourth-example.wildcard.org", "fith-example.wildcard.org", true),
+			("unknown-example.org", "example.org", false),
+			("Second-Example.org", "second-example.org", false),
+			("second-example.org", "", false),
+		] {
+			assert_eq!(m.misdirected(sni, host), want, "{sni} / {host}");
+		}
+		// without a catch-all group, names of no group are not checked (404 from the routes)
+		let m = Misdirected { groups: vec![vec!["a.example".into()], vec!["b.example".into()]] };
+		assert!(m.misdirected("a.example", "b.example"));
+		assert!(!m.misdirected("a.example", "c.example"));
+		assert!(!m.misdirected("c.example", "a.example"), "a server name of no group");
+		for (groups, want) in [
+			(vec![], "at least one"),
+			(vec![vec![]], "at least one"),
+			(vec![vec!["a b".to_string()]], "not a server name pattern"),
+			(vec![vec!["a.example".to_string()], vec!["A.example".to_string()]], "more than one place"),
+		] {
+			let e = Misdirected { groups }.validate().unwrap_err();
+			assert!(e.message.contains(want), "{}", e.message);
+		}
+	}
+
 
 	#[test]
 	fn inspects_certificate_expiry() {
