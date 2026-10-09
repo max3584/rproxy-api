@@ -39,6 +39,9 @@ ip link add veth-k type veth peer name veth-d
 ip addr add 10.98.0.1/24 dev veth-k
 ip link set veth-k up
 ip link set veth-d up
+# the kernel leaves UDP checksums to the "hardware" on veth (CHECKSUM_PARTIAL): what af_packet reads on
+# veth-d would carry only the pseudo-header sum. A real NIC's wire always has full checksums
+ethtool -K veth-k tx off >/dev/null
 # the kernel must not answer on veth-d itself (DPDK owns it)
 sysctl -qw net.ipv6.conf.veth-d.disable_ipv6=1 || true
 
@@ -67,7 +70,7 @@ global:
 rules:
   - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5300, remote_addr: 10.99.0.1, remote_port: 7000 }
   - { protocol: udp, listen_addr: 10.98.0.2, listen_port: 5300, remote_addr: 10.99.0.1, remote_port: 7001 }
-  - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5400, port_count: 2, remote_addr: 10.99.0.1, remote_port: 7100 }
+  - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5400, listen_port_end: 5401, remote_addr: 10.99.0.1, remote_port: 7100 }
 EOF
 }
 
