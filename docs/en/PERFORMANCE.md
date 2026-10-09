@@ -70,8 +70,36 @@ The work is tracked in the milestone "performance" with the label "area: perform
 ### Boxing the large HTTP/2 futures
 - Meant to reduce memcpy; on its own it made no difference, so it was reverted (within #197).
 
+### Relaying plain L4 TCP inside the kernel with an eBPF sockmap (#260, #265, closed)
+- **Tried:** after rproxy sets up both TCP sockets as usual (handshake, PROXY protocol, `source_ip`, and the `allow_from` / `crowdsec` / `limits` checks in user space), the two sockets go into a per-connection SOCKMAP (2 slots) where a tiny stream-verdict BPF program (direction told by `skb->local_port`; the bytecode loaded straight through bpf(2)) hands each one's bytes to the other — socket to socket inside the kernel, no system calls or copies. Checked by the startup test with real data (loopback pairs, >64 KiB, split writes, SHA-256, data and FIN back to back) and by the testing-only always-on cross-check (`offload-verify`). CI kernel 6.17.0-azure, privileged container.
+- **Kernel quirks found and fixed on the way:**
+  1. The redirect does not pass a FIN on (a user-space read still returns EOF). → rproxy `shutdown(SHUT_WR)`s the other socket once the data has reached its send queue (`TCP_INFO` received bytes against the other's acked + `TIOCOUTQ`); the redirect goes through a backlog, so an early FIN would overtake data.
+  2. Redirecting the empty skb (the FIN) makes the kernel's backlog put EPIPE on the other socket (a send returning 0 counts as an error; moved 458,866 / queued 458,865, the difference being the FIN's sequence number). → the verdict returns `SK_PASS` for empty skbs.
+  3. When both sides close at once, a `shutdown` after the data was through fails with ENOTCONN / EPIPE, which was taken as a relay failure and reset the connection. → best effort.
+  4. Bytes queued before the sockets went into the sockmap (a client that sends at once) were picked up by the user-space read (the verdict only runs on the next data_ready). → `SO_RCVLOWAT` is set right after insertion, which runs the verdict.
+- **Why not adopted** (`tests/integrity.rs` over sockmap with offload-verify): with 4 connections each sending 8 MiB both ways at once, one sometimes stalled. Client → backend: 7,962,624 bytes redirected but 4,816,843 in the backend socket; the backend's send queue was empty and everything written was acknowledged (not TCP flow control). **About 3 MB stayed in the psock redirect backlog with no progress for more than 5 s** (backend → client also had 64 KiB left, and the client-side socket got EPIPE).
+- **Why it cannot be made safe:** sending a stalled connection back to user space drops what is left in the backlog (it would break the promise never to show a cut-off stream as complete). The startup test with test data cannot be relied on to reproduce this parallel two-way stall (the short tests and a real rproxy's 256 KiB round trip all passed). The same call Cilium made when it removed the feature in 1.14.
+- **Revisit if:** a kernel fixes the backlog stall, and a test that reproduces it (parallel two-way bulk transfers checked by offload-verify) passes.
+- **Kept:** the startup-test framework, `--check-kernel` and `offload-verify`, for AF_XDP (#260 stage 3) and DPDK (#261). The four fixes are a reference for any fast path that hands sockets over.
+
+### Passing L4 UDP through AF_XDP (#260, #266, paused)
+- **What is in**: an XDP program that steers only the rules' UDP ports to an AF_XDP socket (`bpf/xdp-redirect/`, aya-ebpf; the built object is committed), the UMEM and the four rings (`src/net/offload/xdp/`, xdpilone), frame parsing and reply building, and the startup self-test (`--check-kernel`). Cargo feature `kernel-offload` (not in the default build or the releases).
+- **What is not**: carrying the UDP data plane (`l4/udp.rs`) over AF_XDP. Even when the self-test passes it is not used at startup; `GET /capabilities` `performance.xdp` shows `active: false` (reason: self-test passed, the data path is not in this build).
+- **Why it stopped** (owner's decision): the gains depend on kernel and NIC tuning, and there is no real hardware to measure on. Building the data path would only be checked for correctness in CI, adding complexity without knowing whether it is faster. Tuning is left for another time.
+- **Tuning needed in production** (the premise when resuming):
+  - NIC and driver supporting native XDP and AF_XDP zero-copy (veth and most virtual NICs only do generic and copy, the slow path).
+  - Queues: the number of NIC RX queues and RSS (which queue a packet lands on), IRQ CPU affinity. **Bind an AF_XDP socket on every RX queue** (the program hands a packet to the socket of the queue it arrived on; packets on a queue without one go up the normal stack).
+  - Privileges: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_NET_RAW` (privileged on Kubernetes).
+  - Measuring: compare with the current `recvmmsg` / `sendmmsg` on the same NIC (64-byte pps, loss, work per CPU), and with DPDK (#261).
+- **What tripped the startup self-test** (CI, kernel 6.17.0-azure, privileged container):
+  1. A BPF object embedded with `include_bytes!` is not aligned, and the ELF parse failed (`error parsing ELF data`). → aya's `include_bytes_aligned!`.
+  2. veth has one queue per CPU by default, so datagrams landed on queues other than 0 and missed the socket on queue 0. → the test's veth has one queue (in production, bind every queue).
+  3. With both veth ends in one network namespace, the kernel delivers to the peer's address as local and never uses the veth (the program counted 0 UDP packets). → the sender gets its own namespace and the veth peer is created in it (`IFLA_NET_NS_FD`).
+  4. Zero-copy bind on veth is `Not supported` (copy mode works).
+  - To find these, the self-test's failure reason includes the program's counters (UDP seen, port matched, redirect failed) and the socket's `XDP_STATISTICS`.
+- **Resuming**: on `perf/af-xdp`: (1) sockets on all RX queues, (2) `l4/udp.rs` receive/send over the XSK (falling back to the current path), (3) `offload-verify` checks (packet and byte counts, stalls, content), (4) the integrity / UDP tests over AF_XDP, (5) measuring on real hardware.
+
 ### Researched but not tried
-- **eBPF sockmap:** Cilium removed it in 1.14; many pitfalls for socket-to-socket forwarding.
 - **io_uring:** Google disabled it on production servers; little published data.
 - **XDP, busy poll:** hard to verify on GitHub runners.
 - **Thread-per-core runtime:** Pingora also defaults to work stealing. TCP / HTTP stay as they are.
@@ -141,8 +169,7 @@ Takes the NIC away from the kernel and drives it from user space with a DPDK PMD
 - Known limits: IPv4 only, IP fragments dropped, no jumbo frames (one mbuf per frame), backend MACs are relearned only from ARP replies / gratuitous ARP, about 28,000 NAT ports per source address (add addresses for more sessions), UDP checksums are updated, not verified (a broken one is dropped by the backend's kernel; when the peer of a veth leaves checksums to the "hardware", frames read with `net_af_packet` carry a partial value, so when trying it on veth run `ethtool -K <veth> tx off` on the peer), sessions behind one Mutex per NAT port (contended when RSS delivers the answers to another lcore; if that matters, pick NAT ports whose answers hash to the same queue by computing Toeplitz).
 
 ## Next candidates
-- DPDK (#261): the "Experiment" above, waiting for numbers from real hardware.
-- Forwarding in the kernel (#260, in progress): `global.performance.ebpf` (plain L4 TCP through a BPF sockmap) and `global.performance.xdp` (UDP through AF_XDP). Opt-in; only fast paths whose startup test with real data passed are used (`rproxy-api --check-kernel`). The framework (settings, tests, `GET /capabilities`) comes first, then the fast paths one by one, with their results recorded here.
+- Forwarding in the kernel (#260, #261, paused): AF_XDP goes as far as the startup self-test ("Passing L4 UDP through AF_XDP" above); DPDK as far as a separate build checked for correctness in CI. Both need NIC/queue tuning and real hardware to measure, left for another time.
 - HTTP/2: the profile still shows memcpy (about 11%), the allocator (about 12%) and kernel wakeups (about 7%). Fewer, larger h2 writes.
 - Multi-core use (#194): adapt to queue depth (per-role pipeline, per-core parallelism, backpressure).
 - Memory (#185): share UDP session buffers per worker.

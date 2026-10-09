@@ -124,7 +124,7 @@ struct Options {
 	/// Output of --check-config: text or json
 	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
 	check_config_format: String,
-	/// Test the kernel fast paths of global.performance.ebpf / xdp (#260) by
+	/// Test the kernel fast paths of global.performance.xdp (#260) by
 	/// pushing test data through each, print a table, then exit: 0 when every
 	/// requested one works, 1 otherwise. Reads --config (RPROXY_CONFIG) for what
 	/// is requested; starts nothing else
@@ -622,7 +622,7 @@ fn performance_settings(opts: &Options) -> rproxy_api::config::performance::Effe
 }
 
 /// `--check-kernel` (#260): runs every fast-path test and prints the table.
-/// Mistakes in the settings file or `RPROXY_EBPF_*` / `RPROXY_XDP_*` fail.
+/// Mistakes in the settings file or `RPROXY_XDP_*` fail.
 fn check_kernel(opts: &Options) -> ExitCode {
 	use rproxy_api::config::performance::{allowed_cpus, parallelism, resolve, EnvKnobs};
 	use rproxy_api::net::offload::probe;

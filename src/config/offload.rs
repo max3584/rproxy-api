@@ -1,7 +1,9 @@
-//! `global.performance.ebpf` and `global.performance.xdp` (#260): kernel
-//! offload of the L4 data plane. Both are opt-in and take effect at startup
-//! only. Each key comes from the settings file, else its environment variable
-//! (`RPROXY_EBPF_*`, `RPROXY_XDP_*`), else the default (off).
+//! `global.performance.xdp` (#260): kernel offload of the L4 UDP data plane.
+//! Opt-in, takes effect at startup only. Each key comes from the settings file,
+//! else its environment variable (`RPROXY_XDP_*`), else the default (off).
+//!
+//! (`global.performance.ebpf` with `tcp: sockmap` was tried and not adopted;
+//! docs/PERFORMANCE.md.)
 //!
 //! What is requested here is only used after the startup probe
 //! (`net::offload::probe`) pushed test data through the fast path; what fails
@@ -17,29 +19,6 @@ pub const MAX_QUEUES: u32 = 256;
 pub const MAX_INTERFACES: usize = 64;
 /// IFNAMSIZ - 1
 const MAX_IFNAME: usize = 15;
-
-/// `ebpf.tcp`: how plain L4 TCP rules are relayed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TcpOffload {
-	/// splice(2) / user-space copy as before (default)
-	#[default]
-	Off,
-	/// both sockets in a BPF sockmap; the kernel moves the bytes
-	Sockmap,
-	/// TC / XDP rewrites the packets (no sockets)
-	Nat,
-}
-
-impl TcpOffload {
-	pub fn as_str(self) -> &'static str {
-		match self {
-			TcpOffload::Off => "off",
-			TcpOffload::Sockmap => "sockmap",
-			TcpOffload::Nat => "nat",
-		}
-	}
-}
 
 /// `xdp.mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,17 +84,6 @@ pub enum AutoBool {
 pub enum AutoCount {
 	Count(u32),
 	Auto(Auto),
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EbpfSpec {
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub tcp: Option<TcpOffload>,
-	/// Use the current path when the fast path is not usable (default true);
-	/// false stops startup instead.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub fallback: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,13 +173,6 @@ pub const DEFAULT_RING: u32 = 2048;
 pub const DEFAULT_FRAME: u32 = 4096;
 pub const DEFAULT_BATCH: u32 = 64;
 
-/// `ebpf` as resolved.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Ebpf {
-	pub tcp: TcpOffload,
-	pub fallback: bool,
-}
-
 /// `xdp` as resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Xdp {
@@ -263,17 +224,10 @@ fn number(key: &str, v: &str) -> Result<u32, String> {
 	v.parse().map_err(|_| format!("{key}={v:?} is not a number"))
 }
 
-/// `RPROXY_EBPF_*` and `RPROXY_XDP_*` as specs (None where unset), checked like
-/// the settings file. `var` reads one variable (blank counts as unset).
-pub fn from_env_with(var: impl Fn(&str) -> Option<String>) -> Result<(EbpfSpec, XdpSpec), String> {
+/// `RPROXY_XDP_*` as a spec (None where unset), checked like the settings
+/// file. `var` reads one variable (blank counts as unset).
+pub fn from_env_with(var: impl Fn(&str) -> Option<String>) -> Result<XdpSpec, String> {
 	let get = |k: &str| var(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-	let mut ebpf = EbpfSpec::default();
-	if let Some(v) = get("RPROXY_EBPF_TCP") {
-		ebpf.tcp = Some(word("RPROXY_EBPF_TCP", &v)?);
-	}
-	if let Some(v) = get("RPROXY_EBPF_FALLBACK") {
-		ebpf.fallback = Some(flag("RPROXY_EBPF_FALLBACK", &v)?);
-	}
 	let mut xdp = XdpSpec::default();
 	if let Some(v) = get("RPROXY_XDP_MODE") {
 		xdp.mode = Some(word("RPROXY_XDP_MODE", &v)?);
@@ -306,11 +260,11 @@ pub fn from_env_with(var: impl Fn(&str) -> Option<String>) -> Result<(EbpfSpec, 
 		xdp.fallback = Some(flag("RPROXY_XDP_FALLBACK", &v)?);
 	}
 	xdp.check("RPROXY_XDP").map_err(env_names)?;
-	Ok((ebpf, xdp))
+	Ok(xdp)
 }
 
 /// `from_env_with` on the process environment.
-pub fn from_env() -> Result<(EbpfSpec, XdpSpec), String> {
+pub fn from_env() -> Result<XdpSpec, String> {
 	from_env_with(|k| std::env::var(k).ok())
 }
 
@@ -324,17 +278,12 @@ fn env_names(e: String) -> String {
 }
 
 /// Each key from the file, else the environment, else the default.
-pub fn resolve(file_ebpf: Option<&EbpfSpec>, file_xdp: Option<&XdpSpec>, env: &(EbpfSpec, XdpSpec)) -> (Ebpf, Xdp) {
-	let none_e = EbpfSpec::default();
-	let none_x = XdpSpec::default();
-	let (fe, fx) = (file_ebpf.unwrap_or(&none_e), file_xdp.unwrap_or(&none_x));
-	let (ee, ex) = env;
-	let ebpf = Ebpf {
-		tcp: fe.tcp.or(ee.tcp).unwrap_or_default(),
-		fallback: fe.fallback.or(ee.fallback).unwrap_or(true),
-	};
+pub fn resolve(file: Option<&XdpSpec>, env: &XdpSpec) -> Xdp {
+	let none = XdpSpec::default();
+	let fx = file.unwrap_or(&none);
+	let ex = env;
 	let d = Xdp::default();
-	let xdp = Xdp {
+	Xdp {
 		mode: fx.mode.or(ex.mode).unwrap_or(d.mode),
 		interfaces: fx.interfaces.clone().or_else(|| ex.interfaces.clone()).unwrap_or_default(),
 		attach: fx.attach.or(ex.attach).unwrap_or(d.attach),
@@ -351,8 +300,7 @@ pub fn resolve(file_ebpf: Option<&EbpfSpec>, file_xdp: Option<&XdpSpec>, env: &(
 		batch: fx.batch.or(ex.batch).unwrap_or(d.batch),
 		busy_poll: fx.busy_poll.or(ex.busy_poll).unwrap_or(d.busy_poll),
 		fallback: fx.fallback.or(ex.fallback).unwrap_or(d.fallback),
-	};
-	(ebpf, xdp)
+	}
 }
 
 #[cfg(test)]
@@ -370,9 +318,6 @@ mod tests {
 		assert_eq!(x.zero_copy, Some(AutoBool::Auto(Auto::Auto)));
 		let x: XdpSpec = crate::config::from_yaml("{zero_copy: true, queues: auto}").unwrap();
 		assert_eq!((x.zero_copy, x.queues), (Some(AutoBool::Bool(true)), Some(AutoCount::Auto(Auto::Auto))));
-		let e: EbpfSpec = crate::config::from_yaml("{tcp: sockmap, fallback: false}").unwrap();
-		assert_eq!((e.tcp, e.fallback), (Some(TcpOffload::Sockmap), Some(false)));
-		assert!(crate::config::from_yaml::<EbpfSpec>("{tcp: fast}").is_err());
 		assert!(crate::config::from_yaml::<XdpSpec>("{mode: dpdk}").is_err());
 		assert!(crate::config::from_yaml::<XdpSpec>("{rings: 4}").is_err(), "unknown keys");
 		for bad in [
@@ -401,7 +346,6 @@ mod tests {
 			move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
 		};
 		let env = from_env_with(vars(&[
-			("RPROXY_EBPF_TCP", "sockmap"),
 			("RPROXY_XDP_MODE", "af_xdp"),
 			("RPROXY_XDP_INTERFACES", "eth0, eth1"),
 			("RPROXY_XDP_ZERO_COPY", "false"),
@@ -410,21 +354,17 @@ mod tests {
 			("RPROXY_XDP_BATCH", " "),
 		]))
 		.unwrap();
-		let (e, x) = resolve(None, None, &env);
-		assert_eq!((e.tcp, e.fallback), (TcpOffload::Sockmap, true));
+		let x = resolve(None, &env);
 		assert_eq!((x.mode, x.interfaces.clone(), x.zero_copy, x.ring_size, x.batch, x.fallback), (XdpMode::AfXdp, vec!["eth0".into(), "eth1".into()], Some(false), 4096, DEFAULT_BATCH, false));
 
-		let fe: EbpfSpec = crate::config::from_yaml("{tcp: off}").unwrap();
 		let fx: XdpSpec = crate::config::from_yaml("{ring_size: 512, zero_copy: auto}").unwrap();
-		let (e, x) = resolve(Some(&fe), Some(&fx), &env);
-		assert_eq!(e.tcp, TcpOffload::Off);
+		let x = resolve(Some(&fx), &env);
 		assert_eq!((x.mode, x.ring_size, x.zero_copy), (XdpMode::AfXdp, 512, None));
 
-		let (e, x) = resolve(None, None, &Default::default());
-		assert_eq!((e, x), (Ebpf { tcp: TcpOffload::Off, fallback: true }, Xdp::default()));
+		assert_eq!(resolve(None, &Default::default()), Xdp::default());
 
 		for bad in [
-			&[("RPROXY_EBPF_TCP", "fast")][..],
+			&[("RPROXY_XDP_MODE", "fast")][..],
 			&[("RPROXY_XDP_RING_SIZE", "1000")][..],
 			&[("RPROXY_XDP_BUSY_POLL", "maybe")][..],
 			&[("RPROXY_XDP_QUEUES", "x")][..],

@@ -12,7 +12,7 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 | `CAP_NET_BIND_SERVICE` | 1024 未満のポート（25、443 など）で待ち受ける | 1024 未満のルールだけが使えない。API での作成は `bind_failed`（理由と必要な権限つき）、起動時に復元するルールと固定ルールは `failed` として残る |
 | `CAP_NET_ADMIN` | `source_ip: transparent`（`IP_TRANSPARENT` でクライアントの IP を名乗って接続する） | `GET /capabilities` の `transparent` が false になり、UI の選択肢から消える（理由を表示する）。API での作成は `unsupported`。DB から復元する transparent のルールと固定ルールは `failed`（`needs Linux and CAP_NET_ADMIN`）として残る。`global.performance.busy_poll_usecs` を `net.core.busy_read` より大きくするのにも使う（なければ `degraded` を出して busy poll なしで動く） |
 
-カーネルでの転送（`global.performance.ebpf` / `xdp`、#260。既定は off）を使うときだけ、さらに `CAP_BPF`（5.8 より前のカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`、AF_XDP には `CAP_NET_RAW` が要る。ユニットは既定ではこれらを与えないので、使うときに `systemctl edit rproxy-api` で `AmbientCapabilities` と `CapabilityBoundingSet` に足す。足りなければ起動時の試験に通らず、`degraded`（`reason: missing CAP_BPF ...`）を出して今の処理で動く。`rproxy-api --check-kernel` で事前に確かめられる。
+カーネルでの転送（`global.performance.xdp`、#260。既定は off）を使うときだけ、さらに `CAP_BPF`（5.8 より前のカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`、AF_XDP には `CAP_NET_RAW` が要る。ユニットは既定ではこれらを与えないので、使うときに `systemctl edit rproxy-api` で `AmbientCapabilities` と `CapabilityBoundingSet` に足す。足りなければ起動時の試験に通らず、`degraded`（`reason: missing CAP_BPF ...`）を出して今の処理で動く。`rproxy-api --check-kernel` で事前に確かめられる。
 
 DPDK のデータプレーン（`global.performance.dpdk`、#261。`--features dpdk` のビルドだけ、既定は off）は、NIC を vfio-pci に付け替え（root の作業）、ヒュージページ（hugetlbfs）と `/dev/vfio/*` を開ける必要がある。実験の間は root で動かす前提（root 以外で動かすなら `/dev/vfio/<グループ>` と hugetlbfs のマウントの所有者を rproxy にし、`CAP_IPC_LOCK`、`net_tap` を使うなら `CAP_NET_ADMIN`）。手順は docs/PERFORMANCE.md の「DPDK」。
 

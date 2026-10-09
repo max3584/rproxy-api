@@ -1,6 +1,6 @@
 [package]
 name = "rproxy-api"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
 description = "L4 TCP/UDP forwarder managed through an HTTP API"
@@ -83,6 +83,16 @@ ignored = ["md-5"]
 [features]
 default = []
 alloc-mimalloc = ["dep:mimalloc"]
+# testing only (#260): always-on cross-check of the kernel fast paths
+# (net::offload::verify). Never in release builds; the CI offload job and the
+# correctness runs of fast-path branches turn it on.
+offload-verify = []
+# AF_XDP for L4 UDP (#260), opt-in and experimental. Heavy, Linux-only deps
+# (aya, xdpilone; both pure Rust, no C/libbpf), so it is OFF by default and not
+# in the 6 release targets unless results justify it. The CI offload job builds
+# with it. aya loads/attaches the XDP program and fills the maps; xdpilone runs
+# the AF_XDP socket rings.
+kernel-offload = ["dep:aya", "dep:xdpilone"]
 # the DPDK data plane for L4 UDP (#261, experimental): global.performance.dpdk. Needs DPDK
 # (pkg-config libdpdk) to build; not in the default build or the release targets
 # (docs/PERFORMANCE.md, the dpdk.yml workflow)
@@ -142,6 +152,8 @@ maxminddb = "0.32.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+aya = { version = "0.13", optional = true }
+xdpilone = { version = "1.0.5", optional = true }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", features = ["x509-parser"] }

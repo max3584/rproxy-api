@@ -1,0 +1,97 @@
+//! Loading and attaching the XDP redirect program and filling its maps (aya).
+//! Keeps the program attached and the maps alive for as long as `Steer` lives;
+//! dropping it detaches the program and the host goes back to normal.
+
+use std::io;
+
+use aya::maps::{Array, HashMap as BpfHashMap, XskMap};
+use aya::programs::{Xdp, XdpFlags};
+use aya::Ebpf;
+
+/// The XDP redirect object, built from `bpf/xdp-redirect` (see `bpf/README.md`).
+/// Aligned: the ELF parser reads the headers in place, so a plain
+/// `include_bytes!` (alignment 1) fails with "error parsing ELF data".
+static PROGRAM: &[u8] = aya::include_bytes_aligned!("../bpf_obj/xdp_redirect.bpf.o");
+
+/// How the program is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+	/// Native (driver) XDP.
+	Driver,
+	/// Generic (SKB) XDP: slower, works everywhere (veth, CI).
+	Generic,
+}
+
+impl Mode {
+	fn flags(self) -> XdpFlags {
+		match self {
+			Mode::Driver => XdpFlags::DRV_MODE,
+			Mode::Generic => XdpFlags::SKB_MODE,
+		}
+	}
+}
+
+fn err(e: impl std::fmt::Display) -> io::Error {
+	io::Error::other(e.to_string())
+}
+
+/// The loaded, attached program and its maps on one interface. Drop detaches.
+pub struct Steer {
+	ebpf: Ebpf,
+	iface: String,
+	mode: Mode,
+}
+
+impl Steer {
+	/// Loads the program and attaches it to `iface` in `mode`. The caller then
+	/// adds the rule ports (`add_port`) and the XSK of each queue (`set_xsk`).
+	pub fn attach(iface: &str, mode: Mode) -> io::Result<Steer> {
+		let mut ebpf = Ebpf::load(PROGRAM).map_err(err)?;
+		let program: &mut Xdp = ebpf.program_mut("xdp_redirect").ok_or_else(|| io::Error::other("xdp_redirect not in the object"))?.try_into().map_err(err)?;
+		program.load().map_err(err)?;
+		program.attach(iface, mode.flags()).map_err(err)?;
+		Ok(Steer { ebpf, iface: iface.to_string(), mode })
+	}
+
+	/// Steers this UDP destination port to the XSKs.
+	pub fn add_port(&mut self, port: u16) -> io::Result<()> {
+		let mut ports: BpfHashMap<_, u16, u8> = BpfHashMap::try_from(self.ebpf.map_mut("PORTS").ok_or_else(|| io::Error::other("no PORTS map"))?).map_err(err)?;
+		ports.insert(port, 1u8, 0).map_err(err)
+	}
+
+	/// Binds the AF_XDP socket `fd` as the target for RX `queue`.
+	pub fn set_xsk(&mut self, queue: u32, fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+		use std::os::fd::AsRawFd;
+		let mut xsks: XskMap<_> = XskMap::try_from(self.ebpf.map_mut("XSKS").ok_or_else(|| io::Error::other("no XSKS map"))?).map_err(err)?;
+		xsks.set(queue, fd.as_raw_fd(), 0).map_err(err)
+	}
+
+	/// The program's diagnosis counters: UDP packets seen, destination port in
+	/// `PORTS`, redirect failed (`None` if the map cannot be read).
+	pub fn stats(&self) -> Option<[u64; 3]> {
+		let map: Array<_, u64> = Array::try_from(self.ebpf.map("STATS")?).ok()?;
+		Some([map.get(&0, 0).ok()?, map.get(&1, 0).ok()?, map.get(&2, 0).ok()?])
+	}
+
+	pub fn iface(&self) -> &str {
+		&self.iface
+	}
+
+	pub fn mode(&self) -> Mode {
+		self.mode
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The committed object parses (loading it further needs CAP_BPF, which
+	/// only the CI offload job has): any error must come after the parse.
+	#[test]
+	fn the_committed_object_parses() {
+		if let Err(aya::EbpfError::ParseError(e)) = Ebpf::load(PROGRAM) {
+			panic!("the XDP object does not parse: {e}");
+		}
+	}
+}
