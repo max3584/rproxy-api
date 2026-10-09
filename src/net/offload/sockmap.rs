@@ -17,9 +17,16 @@
 //! kernel here); `limits` admission already happened in user space. Byte totals
 //! are read from `TCP_INFO` when the connection ends.
 //!
+//! The kernel does not pass a FIN through the redirect (seen on 6.17), but a
+//! user-space read on a sockmap socket still returns EOF. So rproxy passes the
+//! half-close on itself: on EOF from one side it waits until everything that
+//! side sent has reached the other socket's send queue (`flushed`; the
+//! redirect goes through a backlog, and an early FIN would overtake data), then
+//! shuts the other socket down for writing.
+//!
 //! The mechanism is proved per host at startup by `probe` (loopback pairs, data
-//! of several sizes including >64 KiB and split writes, SHA-256 compared, FIN
-//! propagation); only then is it used.
+//! of several sizes including >64 KiB and split writes, SHA-256 compared, data
+//! and FIN back to back); only then is it used.
 
 #![cfg(target_os = "linux")]
 
@@ -118,6 +125,8 @@ fn prove_inner(tests: &mut Vec<Test>) -> io::Result<()> {
 		s.set_write_timeout(Some(Duration::from_secs(5)))?;
 	}
 	let client_lport = inner_a.local_addr()?.port();
+	let rx0 = bytes_received(inner_a.as_fd())?;
+	let w0 = bytes_written(inner_b.as_fd())?;
 	// the map and verdict program load and attach: the main thing a host must allow
 	let relay = Relay::start(inner_a.as_fd(), inner_b.as_fd(), client_lport)?;
 	tests.push(Test { name: "load+attach".into(), ok: true, detail: String::new() });
@@ -140,21 +149,43 @@ fn prove_inner(tests: &mut Vec<Test>) -> io::Result<()> {
 	if !ok {
 		return mismatch();
 	}
-	// FIN: half-close the client write. The backend must see EOF (the FIN is
-	// forwarded), and a user-space read on the sockmap'd client socket must
-	// return 0 too (how the data plane learns the connection ended).
+	// FIN. The kernel does not forward a FIN through a sockmap redirect (seen
+	// on 6.17), so rproxy passes it on itself: the sockmap socket reports EOF to
+	// user space, then once everything redirected so far has reached the other
+	// socket's send queue, that one is shut down for writing. Data and FIN are
+	// sent back to back to check nothing is overtaken.
+	let data = pattern(128 << 10);
+	let mut reader = outer_b.try_clone()?;
+	let read_all = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+		let mut got = vec![];
+		reader.read_to_end(&mut got)?;
+		Ok(got)
+	});
+	outer_a.write_all(&data)?;
 	outer_a.shutdown(Shutdown::Write)?;
 	let mut buf = [0u8; 16];
-	let fwd = matches!(outer_b.read(&mut buf), Ok(0));
-	tests.push(Test { name: "fin".into(), ok: fwd, detail: if fwd { String::new() } else { "FIN not forwarded to the backend".into() } });
-	inner_a.set_read_timeout(Some(Duration::from_secs(5)))?;
 	let eof = matches!((&inner_a).read(&mut buf), Ok(0));
 	tests.push(Test { name: "fin_eof".into(), ok: eof, detail: if eof { String::new() } else { "no EOF on the sockmap socket".into() } });
+	if !eof {
+		return Err(io::Error::other("no EOF on the sockmap socket"));
+	}
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	while !flushed(inner_a.as_fd(), rx0, inner_b.as_fd(), w0)? {
+		if std::time::Instant::now() > deadline {
+			tests.push(Test { name: "fin".into(), ok: false, detail: "redirected data did not reach the backend socket".into() });
+			return Err(io::Error::other("redirected data did not drain"));
+		}
+		std::thread::sleep(Duration::from_millis(1));
+	}
+	inner_b.shutdown(Shutdown::Write)?;
+	let got = read_all.join().map_err(|_| io::Error::other("reader thread panicked"))??;
+	let ok = got == data;
+	tests.push(Test { name: "fin".into(), ok, detail: if ok { String::new() } else { format!("{} of {} bytes before EOF", got.len(), data.len()) } });
 	drop(relay);
-	if fwd && eof {
+	if ok {
 		Ok(())
 	} else {
-		Err(io::Error::other("FIN was not passed on"))
+		Err(io::Error::other("data before the FIN was lost"))
 	}
 }
 
@@ -199,14 +230,50 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 	Sha256::digest(data).into()
 }
 
-/// `TCP_INFO` bytes received on `sock` (what the kernel delivered to it while
-/// it was in the sockmap), for the stats after the relay. Best effort.
-pub fn bytes_received(sock: BorrowedFd<'_>) -> Option<u64> {
+fn tcp_info(sock: BorrowedFd<'_>) -> io::Result<libc::tcp_info> {
 	// SAFETY: a zeroed tcp_info is valid; getsockopt fills up to len
 	let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
 	let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
 	let r = unsafe {
 		libc::getsockopt(sock.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_INFO, &mut info as *mut _ as *mut libc::c_void, &mut len)
 	};
-	(r == 0).then_some(info.tcpi_bytes_received)
+	if r == 0 {
+		Ok(info)
+	} else {
+		Err(io::Error::last_os_error())
+	}
+}
+
+/// Bytes received on `sock` (`TCP_INFO`): while it is in the sockmap, what the
+/// kernel redirected from it.
+pub fn bytes_received(sock: BorrowedFd<'_>) -> io::Result<u64> {
+	Ok(tcp_info(sock)?.tcpi_bytes_received)
+}
+
+/// Bytes ever put in `sock`'s send queue: acknowledged plus still queued
+/// (`TIOCOUTQ`).
+pub fn bytes_written(sock: BorrowedFd<'_>) -> io::Result<u64> {
+	let acked = tcp_info(sock)?.tcpi_bytes_acked;
+	let mut queued: libc::c_int = 0;
+	// SAFETY: TIOCOUTQ writes one int
+	if unsafe { libc::ioctl(sock.as_raw_fd(), libc::TIOCOUTQ, &mut queued) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(acked + queued.max(0) as u64)
+}
+
+/// Whether everything `src` received since `rx0` has reached `dst`'s send
+/// queue since `w0` (the redirect goes through a backlog, so a FIN passed on
+/// earlier could overtake data). An error on `dst` is returned.
+pub fn flushed(src: BorrowedFd<'_>, rx0: u64, dst: BorrowedFd<'_>, w0: u64) -> io::Result<bool> {
+	let mut err: libc::c_int = 0;
+	let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+	// SAFETY: SO_ERROR writes one int
+	unsafe { libc::getsockopt(dst.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut libc::c_void, &mut len) };
+	if err != 0 {
+		return Err(io::Error::from_raw_os_error(err));
+	}
+	let moved = bytes_received(src)?.saturating_sub(rx0);
+	let put = bytes_written(dst)?.saturating_sub(w0);
+	Ok(put >= moved)
 }

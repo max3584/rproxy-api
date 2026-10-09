@@ -358,10 +358,33 @@ async fn drain_eof(s: &mut TcpStream) -> io::Result<()> {
 	}
 }
 
+/// Passes a half-close on (sockmap): once everything `src` sent since `rx0`
+/// has reached `dst`'s send queue since `w0`, shuts `dst` down for writing.
+#[cfg(target_os = "linux")]
+async fn pass_fin(src: RawFd, rx0: u64, dst: RawFd, w0: u64) -> io::Result<()> {
+	use crate::net::offload::sockmap;
+	let mut wait = Duration::from_millis(1);
+	loop {
+		// SAFETY: both sockets are borrowed by `sockmap_relay` for this whole call
+		let (s, d) = unsafe { (BorrowedFd::borrow_raw(src), BorrowedFd::borrow_raw(dst)) };
+		if sockmap::flushed(s, rx0, d, w0)? {
+			break;
+		}
+		tokio::time::sleep(wait).await;
+		wait = (wait * 2).min(Duration::from_millis(50));
+	}
+	// SAFETY: as above
+	if unsafe { libc::shutdown(dst, libc::SHUT_WR) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
+}
+
 /// Relays `a` <-> `b` through an eBPF sockmap (#260). `None` when it could not
 /// be set up (the caller falls back to splice / user space); `Some` once it ran
-/// (both sides closed, or it failed and the backend was reset). Byte totals come
-/// from `TCP_INFO` (the kernel moved the data, so user space never saw it).
+/// (both sides closed, or it failed and the backend was reset). The kernel
+/// moves the bytes; rproxy passes each half-close on (`pass_fin`) and reads the
+/// byte totals from `TCP_INFO` (user space never saw the data).
 #[cfg(target_os = "linux")]
 async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detail: &mut Detail) -> Option<io::Result<()>> {
 	use crate::net::offload::sockmap;
@@ -370,8 +393,8 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 	if la.port() == lb.port() {
 		return None;
 	}
-	let rx0 = sockmap::bytes_received(a.as_fd()).unwrap_or(0);
-	let tx0 = sockmap::bytes_received(b.as_fd()).unwrap_or(0);
+	let (rx0, tx0) = (sockmap::bytes_received(a.as_fd()).ok()?, sockmap::bytes_received(b.as_fd()).ok()?);
+	let (wa0, wb0) = (sockmap::bytes_written(a.as_fd()).ok()?, sockmap::bytes_written(b.as_fd()).ok()?);
 	let relay = match sockmap::Relay::start(a.as_fd(), b.as_fd(), la.port()) {
 		Ok(r) => r,
 		Err(e) => {
@@ -379,9 +402,18 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 			return None;
 		}
 	};
-	let result = tokio::try_join!(drain_eof(a), drain_eof(b)).map(|_| ());
-	let rx = sockmap::bytes_received(a.as_fd()).unwrap_or(rx0).saturating_sub(rx0);
-	let tx = sockmap::bytes_received(b.as_fd()).unwrap_or(tx0).saturating_sub(tx0);
+	let (fa, fb) = (a.as_raw_fd(), b.as_raw_fd());
+	let up = async {
+		drain_eof(a).await?;
+		pass_fin(fa, rx0, fb, wb0).await
+	};
+	let down = async {
+		drain_eof(b).await?;
+		pass_fin(fb, tx0, fa, wa0).await
+	};
+	let result = tokio::try_join!(up, down).map(|_| ());
+	let rx = sockmap::bytes_received(a.as_fd()).map_or(0, |n| n.saturating_sub(rx0));
+	let tx = sockmap::bytes_received(b.as_fd()).map_or(0, |n| n.saturating_sub(tx0));
 	detail.rx += rx;
 	detail.tx += tx;
 	rt.stats.add_rx(rx);
