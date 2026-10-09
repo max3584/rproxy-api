@@ -39,6 +39,8 @@ pub fn failures() -> u64 {
 pub fn fail(fast_path: &'static str, check: &'static str, rule: &str, detail: String) {
 	FAILURES.fetch_add(1, Ordering::Relaxed);
 	error!(event = "offload.verify", fast_path, check, rule = %rule, detail = %detail, "kernel fast path verification failed");
+	// also on stderr, so a failing test shows it whatever the log setup
+	eprintln!("offload.verify: {fast_path} {check} {rule}: {detail}");
 }
 
 /// How long data may wait without progress before it is a stall.

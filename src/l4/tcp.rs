@@ -353,7 +353,7 @@ async fn drain_eof(s: &mut TcpStream) -> io::Result<()> {
 	let mut buf = [0u8; 64];
 	match s.read(&mut buf).await {
 		Ok(0) => Ok(()),
-		Ok(_) => Err(io::Error::other("sockmap delivered data to user space")),
+		Ok(n) => Err(io::Error::other(format!("sockmap delivered {n} byte(s) to user space"))),
 		Err(e) => Err(e),
 	}
 }
@@ -419,13 +419,15 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 		}
 	};
 	let (fa, fb) = (a.as_raw_fd(), b.as_raw_fd());
+	// which side and stage failed, for the reason (error path only)
+	let stage = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
 	let up = async {
-		drain_eof(a).await?;
-		pass_fin(fa, rx0, fb, wb0).await
+		drain_eof(a).await.map_err(stage("client side, waiting for EOF"))?;
+		pass_fin(fa, rx0, fb, wb0).await.map_err(stage("client side, passing the FIN on"))
 	};
 	let down = async {
-		drain_eof(b).await?;
-		pass_fin(fb, tx0, fa, wa0).await
+		drain_eof(b).await.map_err(stage("backend side, waiting for EOF"))?;
+		pass_fin(fb, tx0, fa, wa0).await.map_err(stage("backend side, passing the FIN on"))
 	};
 	let relay_done = async { tokio::try_join!(up, down).map(|_| ()) };
 	// offload-verify (tests only): a stall watcher beside the relay
@@ -456,6 +458,9 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 		Ok(()) => detail.reason = "closed",
 		Err(e) => {
 			debug!(event = "offload.reset", rule = %rt.key, error = %e, "sockmap relay failed; resetting the backend");
+			// offload-verify (tests only): a fast-path failure is a finding
+			#[cfg(feature = "offload-verify")]
+			crate::net::offload::verify::fail("sockmap", "relay", &rt.key.to_string(), format!("{e} (rx {rx}, tx {tx})"));
 			reset_on_close(b);
 		}
 	}

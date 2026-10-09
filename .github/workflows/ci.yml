@@ -141,7 +141,8 @@ jobs:
         env:
           RPROXY_EBPF_TCP: sockmap
           RPROXY_TEST_REQUIRE_SOCKMAP: "1"
-        run: cargo test --locked --features offload-verify --test integrity -- --test-threads 2
+        # --nocapture: the offload.verify lines (stderr of the runtime's threads) show in the log
+        run: cargo test --locked --features offload-verify --test integrity -- --test-threads 2 --nocapture
 
   # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
   package:
