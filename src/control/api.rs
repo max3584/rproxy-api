@@ -220,6 +220,8 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 		"max_range_ports": state.registry.caps().max_range_ports,
 		// v0.3 / v0.4 settings this build can run (docs/DESIGN-v0.3.md, docs/DESIGN-v0.4.md)
 		"features": state.registry.caps().features,
+		// the kernel fast paths (#260): requested, in use, why not
+		"performance": crate::net::offload::probe::capabilities(),
 		// the running binary (#174)
 		"build": super::upgrade::build_view(),
 	}))

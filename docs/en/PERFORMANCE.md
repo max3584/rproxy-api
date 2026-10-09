@@ -77,6 +77,7 @@ The work is tracked in the milestone "performance" with the label "area: perform
 - **Thread-per-core runtime:** Pingora also defaults to work stealing. TCP / HTTP stay as they are.
 
 ## Next candidates
+- Forwarding in the kernel (#260, in progress): `global.performance.ebpf` (plain L4 TCP through a BPF sockmap) and `global.performance.xdp` (UDP through AF_XDP). Opt-in; only fast paths whose startup test with real data passed are used (`rproxy-api --check-kernel`). The framework (settings, tests, `GET /capabilities`) comes first, then the fast paths one by one, with their results recorded here.
 - HTTP/2: the profile still shows memcpy (about 11%), the allocator (about 12%) and kernel wakeups (about 7%). Fewer, larger h2 writes.
 - Multi-core use (#194): adapt to queue depth (per-role pipeline, per-core parallelism, backpressure).
 - Memory (#185): share UDP session buffers per worker.

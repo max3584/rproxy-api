@@ -39,6 +39,12 @@ pub struct PerformanceSpec {
 	pub busy_poll_usecs: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub splice: Option<SpliceSpec>,
+	/// Kernel offload of plain L4 TCP (#260): `tcp: off | sockmap | nat`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ebpf: Option<super::offload::EbpfSpec>,
+	/// XDP / AF_XDP for L4 UDP (#260).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub xdp: Option<super::offload::XdpSpec>,
 }
 
 /// `udp_shards`: a count or `auto`.
@@ -147,6 +153,9 @@ impl PerformanceSpec {
 				}
 			}
 		}
+		if let Some(x) = &self.xdp {
+			x.check(&format!("{p}.xdp"))?;
+		}
 		Ok(())
 	}
 
@@ -159,6 +168,8 @@ impl PerformanceSpec {
 			("cpu_affinity", self.cpu_affinity.is_some()),
 			("busy_poll_usecs", self.busy_poll_usecs.is_some()),
 			("splice", self.splice.is_some()),
+			("ebpf", self.ebpf.is_some()),
+			("xdp", self.xdp.is_some()),
 		] {
 			if set {
 				out.push(key);
@@ -206,6 +217,8 @@ pub struct EnvKnobs {
 	pub udp_shards: Option<String>,
 	/// `RPROXY_SPLICE*` (with the defaults where unset).
 	pub splice: crate::l4::splice::Settings,
+	/// `RPROXY_EBPF_*` / `RPROXY_XDP_*` (mistakes are reported by `check_env`).
+	pub offload: (super::offload::EbpfSpec, super::offload::XdpSpec),
 }
 
 impl EnvKnobs {
@@ -217,7 +230,14 @@ impl EnvKnobs {
 			busy_poll_usecs,
 			udp_shards: std::env::var("RPROXY_UDP_SHARDS").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
 			splice: crate::l4::splice::Settings::from_env(),
+			offload: super::offload::from_env().unwrap_or_default(),
 		}
+	}
+
+	/// Mistakes in the environment variables read here that have a shape
+	/// (`RPROXY_EBPF_*`, `RPROXY_XDP_*`): startup stops on them.
+	pub fn check_env() -> Result<(), String> {
+		super::offload::from_env().map(|_| ())
 	}
 }
 
@@ -229,6 +249,9 @@ pub struct Effective {
 	pub cpu_affinity: Affinity,
 	pub busy_poll_usecs: u32,
 	pub splice: crate::l4::splice::Settings,
+	/// Kernel offload requested (#260); used only after the probe passed.
+	pub ebpf: super::offload::Ebpf,
+	pub xdp: super::offload::Xdp,
 	/// Where each key came from: (key, source).
 	pub sources: Vec<(&'static str, Source)>,
 	/// CPUs of `cpu_affinity` this process may not use (left out, `degraded`).
@@ -349,7 +372,12 @@ pub fn resolve(spec: Option<&PerformanceSpec>, env: &EnvKnobs, allowed: &[usize]
 		splice.pipe_size = v as usize;
 	}
 
-	Effective { workers, udp_shards, cpu_affinity, busy_poll_usecs, splice, sources, missing_cpus }
+	let (ee, ex) = &env.offload;
+	pick("ebpf", spec.ebpf.is_some(), ee != &Default::default());
+	pick("xdp", spec.xdp.is_some(), ex != &Default::default());
+	let (ebpf, xdp) = super::offload::resolve(spec.ebpf.as_ref(), spec.xdp.as_ref(), &env.offload);
+
+	Effective { workers, udp_shards, cpu_affinity, busy_poll_usecs, splice, ebpf, xdp, sources, missing_cpus }
 }
 
 /// Name of the i-th worker thread; `pin_current_thread` reads it back.
@@ -422,10 +450,10 @@ mod tests {
 
 	#[test]
 	fn shape_and_validation() {
-		let ok = parse("{workers: 4, udp_shards: auto, cpu_affinity: '0-3,6', busy_poll_usecs: 50, splice: {enabled: true, after: 64KiB, full_reads: 4, pipe_size: 1MiB}}");
+		let ok = parse("{workers: 4, udp_shards: auto, cpu_affinity: '0-3,6', busy_poll_usecs: 50, splice: {enabled: true, after: 64KiB, full_reads: 4, pipe_size: 1MiB}, ebpf: {tcp: sockmap}, xdp: {mode: af_xdp}}");
 		ok.check().unwrap();
 		assert_eq!(ok.udp_shards, Some(Shards::Auto(AutoWord::Auto)));
-		assert_eq!(ok.keys(), ["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]);
+		assert_eq!(ok.keys(), ["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "ebpf", "xdp"]);
 		assert_eq!(parse("{udp_shards: 8}").udp_shards, Some(Shards::Count(8)));
 		for bad in [
 			"{workers: 0}",
@@ -436,6 +464,7 @@ mod tests {
 			"{splice: {full_reads: 100}}",
 			"{splice: {pipe_size: 100}}",
 			"{splice: {after: lots}}",
+			"{xdp: {ring_size: 100}}",
 		] {
 			assert!(parse(bad).check().is_err(), "{bad}");
 		}

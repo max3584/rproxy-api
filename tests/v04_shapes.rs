@@ -67,7 +67,7 @@ async fn upgrade_and_update_endpoints_answer() {
 async fn performance_keys_are_all_applied() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
-	assert_eq!(caps["features"]["performance"], json!(["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice"]), "{caps}");
+	assert_eq!(caps["features"]["performance"], json!(["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "ebpf", "xdp"]), "{caps}");
 }
 
 /// Scopes of the new endpoints.

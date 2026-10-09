@@ -77,6 +77,7 @@ English: [PERFORMANCE.md](en/PERFORMANCE.md)
 - **thread-per-core のランタイム**：Pingora も既定は work stealing。TCP / HTTP は今のまま。
 
 ## 次の候補
+- カーネルでの転送（#260、進めている）：`global.performance.ebpf`（平文の L4 TCP を BPF の sockmap で）・`global.performance.xdp`（UDP を AF_XDP で）。オプトインで、起動時にテストデータを流して確かめた速い道だけを使う（`rproxy-api --check-kernel`）。枠組み（設定の形・試験・`GET /capabilities`）を先に入れ、速い道は 1 つずつ足して、ここに結果を書く。
 - HTTP/2：プロファイルで残っているのは memcpy（約 11%）、アロケータ（約 12%）、カーネルの起床（約 7%）。h2 の書き込みをまとめて大きくする。
 - 複数のコアの使い方（#194）：キューの深さで動きを変える（役ごとのパイプライン・コアごとの並列・バックプレッシャー）。
 - メモリ（#185）：UDP のセッションのバッファをワーカーごとに共有する。

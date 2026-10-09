@@ -124,6 +124,15 @@ struct Options {
 	/// Output of --check-config: text or json
 	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
 	check_config_format: String,
+	/// Test the kernel fast paths of global.performance.ebpf / xdp (#260) by
+	/// pushing test data through each, print a table, then exit: 0 when every
+	/// requested one works, 1 otherwise. Reads --config (RPROXY_CONFIG) for what
+	/// is requested; starts nothing else
+	#[arg(long)]
+	check_kernel: bool,
+	/// Output of --check-kernel: text or json
+	#[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
+	check_kernel_format: String,
 	/// With --check-config: also ask the running rproxy what would change (v0.4, #169)
 	#[arg(long, requires = "check_config")]
 	diff: bool,
@@ -348,10 +357,13 @@ fn check_v04_options(opts: &Options) -> Result<Vec<&'static str>, String> {
 		udp_shards: None,
 		cpu_affinity: opts.cpu_affinity.clone(),
 		busy_poll_usecs: opts.busy_poll_usecs,
-		splice: None,
+		..Default::default()
 	};
 	if let Err(e) = perf.check() {
 		errors.push(e.replace("global.performance.", "--").replace('_', "-"));
+	}
+	if let Err(e) = rproxy_api::config::performance::EnvKnobs::check_env() {
+		errors.push(e);
 	}
 	if opts.node_name.as_deref().is_some_and(|n| n.trim().is_empty() || n.len() > 255) {
 		errors.push("--node-name must be 1-255 characters".into());
@@ -557,6 +569,9 @@ fn main() -> ExitCode {
 	if let Some(path) = &opts.check_config {
 		return check_config(&opts, path.clone());
 	}
+	if opts.check_kernel {
+		return check_kernel(&opts);
+	}
 
 	let _log_guard = match logging::init(&opts.log_level, opts.log_file.as_deref(), opts.log_keep) {
 		Ok((guard, fallback)) => {
@@ -601,6 +616,39 @@ fn performance_settings(opts: &Options) -> rproxy_api::config::performance::Effe
 		.and_then(|doc| doc.global.performance);
 	let env = EnvKnobs::from_env(opts.workers, opts.cpu_affinity.clone(), opts.busy_poll_usecs);
 	resolve(spec.as_ref(), &env, &allowed_cpus(), parallelism())
+}
+
+/// `--check-kernel` (#260): runs every fast-path test and prints the table.
+/// Mistakes in the settings file or `RPROXY_EBPF_*` / `RPROXY_XDP_*` fail.
+fn check_kernel(opts: &Options) -> ExitCode {
+	use rproxy_api::config::performance::{allowed_cpus, parallelism, resolve, EnvKnobs};
+	use rproxy_api::net::offload::probe;
+	let path = opts.config.as_ref().or(opts.static_rules.as_ref());
+	let spec = match path.map(|p| ConfigDoc::load(p)) {
+		None => None,
+		Some(Ok(doc)) => doc.global.performance,
+		Some(Err(e)) => {
+			eprintln!("rproxy-api: {e}");
+			return ExitCode::FAILURE;
+		}
+	};
+	if let Err(e) = EnvKnobs::check_env() {
+		eprintln!("rproxy-api: {e}");
+		return ExitCode::FAILURE;
+	}
+	let env = EnvKnobs::from_env(opts.workers, opts.cpu_affinity.clone(), opts.busy_poll_usecs);
+	let perf = resolve(spec.as_ref(), &env, &allowed_cpus(), parallelism());
+	let report = probe::run(&perf, probe::Scope::All);
+	if opts.check_kernel_format == "json" {
+		println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+	} else {
+		print!("{}", probe::to_text(&report));
+	}
+	if report.ok() {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
+	}
 }
 
 /// `--check-config`: validates the settings file and prints the result. No log
@@ -686,6 +734,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	}
 	rproxy_api::config::performance::apply(&perf);
 	log_performance(&perf);
+	probe_offload(&perf)?;
 	let upgrade_opts = upgrade_options(&opts);
 	let graceful = shutdown_config(&opts)?;
 	upgrade::hash_binary();
@@ -1190,6 +1239,39 @@ async fn second_signal() {
 		return;
 	}
 	let _ = tokio::signal::ctrl_c().await;
+}
+
+/// The kernel fast paths asked for (#260): tested with data before use; one
+/// `performance.probe` line each, `degraded` when one falls back, an error
+/// (startup stops) when it may not (`fallback: false`).
+fn probe_offload(perf: &rproxy_api::config::performance::Effective) -> Result<(), String> {
+	use rproxy_api::net::offload::probe;
+	let report = tokio::task::block_in_place(|| probe::run(perf, probe::Scope::Requested));
+	let mut fatal = vec![];
+	for f in report.features.iter().filter(|f| f.requested != "off") {
+		let tests: Vec<String> = report
+			.paths
+			.iter()
+			.filter(|p| p.requested && p.feature == f.name)
+			.flat_map(|p| p.tests.iter().map(|t| format!("{}={}", t.name, if t.ok { "ok" } else { "failed" })))
+			.collect();
+		info!(event = "performance.probe", feature = f.name, requested = f.requested, active = f.active,
+			mode = f.mode.as_deref().unwrap_or(""), reason = f.reason.as_deref().unwrap_or(""), tests = %tests.join(","));
+		if !f.active {
+			let reason = f.reason.as_deref().unwrap_or("not usable");
+			if f.fallback {
+				warn!(event = "degraded", part = f.part, requested = f.requested, reason = %reason, "the kernel fast path is not used; the current path runs");
+			} else {
+				fatal.push(format!("{} = {}: {reason} (fallback: false)", f.part, f.requested));
+			}
+		}
+	}
+	probe::publish(report.features);
+	if fatal.is_empty() {
+		Ok(())
+	} else {
+		Err(fatal.join("; "))
+	}
 }
 
 /// `event = "performance"`: the settings in effect and where each came from.
