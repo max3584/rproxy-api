@@ -241,9 +241,24 @@ fn not_built(host: &Host, needs_net_bpf: bool) -> Outcome {
 	Outcome::unusable(NOT_BUILT, vec![])
 }
 
-/// AF_XDP: UDP round trips over a veth pair (zero-copy, then copy).
-fn test_af_xdp(host: &Host, _perf: &Effective) -> Outcome {
-	not_built(host, true)
+/// AF_XDP: UDP round trips over a veth pair in a private network namespace
+/// (zero-copy, then copy). Needs the `kernel-offload` build.
+fn test_af_xdp(host: &Host, perf: &Effective) -> Outcome {
+	if let Some(why) = host.missing_for_net_bpf() {
+		return Outcome::unusable(why, vec![]);
+	}
+	if let Some(e) = &host.bpf_error {
+		return Outcome::unusable(format!("bpf(2) failed: {e}"), vec![]);
+	}
+	#[cfg(all(feature = "kernel-offload", target_os = "linux"))]
+	{
+		super::xdp::selftest::run(perf.xdp.ring_size, perf.xdp.frame_size)
+	}
+	#[cfg(not(all(feature = "kernel-offload", target_os = "linux")))]
+	{
+		let _ = perf;
+		Outcome::unusable("this build has no AF_XDP (cargo feature kernel-offload)", vec![])
+	}
 }
 
 /// XDP forwarding by the program alone (stage 2).

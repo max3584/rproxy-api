@@ -182,3 +182,25 @@ fn check_kernel_tests_every_fast_path_and_prints_a_table() {
 	assert!(report["host"]["kernel"].is_string(), "{report}");
 	let _ = fs::remove_dir_all(dir);
 }
+
+/// Where AF_XDP should work (the CI offload job: root, generic XDP on veth,
+/// a `kernel-offload` build), `RPROXY_TEST_REQUIRE_OFFLOAD=1` makes the
+/// self-test's result a requirement: every step passes, and the UDP round
+/// trips through the AF_XDP socket come back intact.
+#[test]
+fn af_xdp_self_test_passes_where_required() {
+	if std::env::var("RPROXY_TEST_REQUIRE_OFFLOAD").as_deref() != Ok("1") {
+		return;
+	}
+	let dir = workdir("afxdp");
+	let out = command(&dir, &[("RPROXY_XDP_MODE", "af_xdp".into())]).args(["--check-kernel", "--check-kernel-format", "json"]).output().unwrap();
+	let report: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+	let af_xdp = report["paths"].as_array().unwrap().iter().find(|p| p["mode"] == "af_xdp").cloned().unwrap();
+	assert_eq!(af_xdp["usable"], true, "AF_XDP not usable: {af_xdp:#}");
+	let steps: Vec<&str> = af_xdp["tests"].as_array().unwrap().iter().filter(|t| t["ok"] == true).map(|t| t["name"].as_str().unwrap()).collect();
+	for want in ["veth", "attach", "small", "1400 bytes"] {
+		assert!(steps.contains(&want), "step {want} missing: {af_xdp:#}");
+	}
+	assert!(out.status.success(), "{report}");
+	let _ = fs::remove_dir_all(dir);
+}

@@ -16,7 +16,7 @@
 #![no_main]
 
 use aya_ebpf::{
-	bindings::xdp_action::{XDP_ABORTED, XDP_PASS},
+	bindings::xdp_action::XDP_PASS,
 	macros::{map, xdp},
 	maps::{HashMap, XskMap},
 	programs::XdpContext,
@@ -71,11 +71,17 @@ fn try_redirect(ctx: &XdpContext) -> Option<u32> {
 			if ihl < 20 {
 				return None;
 			}
+			// fragments go to the stack, which reassembles them (the socket path)
+			let frag = u16::from_be(load::<u16>(ctx, ETH_HLEN + 6)?);
+			if frag & 0x3fff != 0 {
+				return None;
+			}
 			let proto = load::<u8>(ctx, ETH_HLEN + 9)?;
 			(ETH_HLEN + ihl, proto)
 		}
 		ETH_P_IPV6 => {
-			// no extension-header walking: only plain UDP (next header == UDP)
+			// no extension-header walking: only plain UDP (next header == UDP);
+			// anything else (fragments, options) goes to the stack
 			let proto = load::<u8>(ctx, ETH_HLEN + 6)?;
 			(ETH_HLEN + IPV6_HLEN, proto)
 		}
@@ -93,7 +99,7 @@ fn try_redirect(ctx: &XdpContext) -> Option<u32> {
 	// redirect to the XSK of this RX queue; if none is bound, pass it up
 	// SAFETY: reading a scalar context field
 	let queue = unsafe { (*ctx.ctx).rx_queue_index };
-	Some(XSKS.redirect(queue, XDP_PASS as u64).unwrap_or(XDP_ABORTED))
+	Some(XSKS.redirect(queue, XDP_PASS as u64).unwrap_or(XDP_PASS))
 }
 
 #[cfg(not(test))]
