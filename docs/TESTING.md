@@ -375,7 +375,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 |---|---|
 | `tests/check_config.rs` | `rproxy-api --check-config`（#140。ほかの人が読める鍵は誤り、`global.files.owner_check: off` なら通る）：起動・再読み込みと同じ道筋で設定ファイルを確かめ、何も開かず、終了コード・テキスト・JSON で答える |
 | `tests/startup.rs` | 本物のバイナリの起動：設定の誤りは止まり、環境の問題（権限・使用中のポート）は制限つきで動き続けて、直れば戻る。制御 API の TLS と SIGHUP の読み直し、`GET /readyz` |
-| `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き |
+| `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き。`connect_timeout`（v0.4.3。SYN を捨てる宛先） |
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |

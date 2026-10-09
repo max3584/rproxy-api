@@ -193,6 +193,8 @@ pub struct Features {
 	pub tokens_reload: bool,
 	/// `listen_freebind` of a rule: listening on an address not on the host yet (IP_FREEBIND; v0.4.3)
 	pub listen_freebind: bool,
+	/// `connect_timeout` of an L4 tcp rule: how long a connection to a target may take (v0.4.3)
+	pub connect_timeout: bool,
 }
 
 /// Every name of `Features::http_options`.
@@ -236,6 +238,7 @@ impl Features {
 		ruleset_persistence: true,
 		tokens_reload: true,
 		listen_freebind: crate::net::listen::FREEBIND,
+		connect_timeout: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -276,6 +279,7 @@ impl Features {
 		ruleset_persistence: true,
 		tokens_reload: true,
 		listen_freebind: true,
+		connect_timeout: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -330,6 +334,7 @@ impl Features {
 	pub fn check_v04(&self, spec: &RuleSpec) -> Result<(), ApiError> {
 		for (what, used, available) in [
 			("listen_freebind (IP_FREEBIND: Linux)", spec.listen_freebind, self.listen_freebind),
+			("connect_timeout", spec.connect_timeout.is_some(), self.connect_timeout),
 			("labels", !spec.labels.is_empty(), self.labels),
 			("limits", spec.limits.is_some(), self.limits),
 			("bandwidth", spec.bandwidth.is_some(), self.bandwidth),
@@ -415,6 +420,10 @@ pub struct RuleRequest {
 	/// TCP connection checks of the backends.
 	#[serde(default)]
 	pub health_check: Option<HealthCheckSpec>,
+	/// How long a connection to a target may take before the next one is tried (tcp, not http;
+	/// v0.4.3). Left out: 5 s with other targets to fall back on, else the OS's.
+	#[serde(default)]
+	pub connect_timeout: Option<String>,
 	#[serde(default)]
 	pub source_ip: SourceIp,
 	pub udp_idle_secs: Option<u64>,
@@ -478,6 +487,8 @@ pub struct RuleSpec {
 	pub targets: Vec<TargetSpec>,
 	pub balance: Balance,
 	pub health_check: Option<HealthCheckSpec>,
+	/// `connect_timeout` (tcp rules without http).
+	pub connect_timeout: Option<Duration>,
 	pub source_ip: SourceIp,
 	pub udp_idle: Duration,
 	pub tls: TlsSpec,
@@ -664,6 +675,36 @@ pub fn check_transparent_families(extra: &[IpAddr], members: &[TargetSpec], caps
 	Ok(())
 }
 
+/// The shortest and longest `connect_timeout`.
+pub const CONNECT_TIMEOUT_RANGE: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(600));
+
+/// `connect_timeout`: a duration (`100ms`-`10m`) of a tcp rule without `http`; `0s` (or left out)
+/// is none (the default).
+pub fn validate_connect_timeout(v: Option<&str>, protocol: Protocol, http: bool) -> Result<Option<Duration>, ApiError> {
+	let Some(s) = v else { return Ok(None) };
+	let d = crate::l7::parse_duration(s.trim()).map_err(|e| ApiError::invalid(format!("connect_timeout: {e}")))?;
+	if d.is_zero() {
+		return Ok(None);
+	}
+	if protocol != Protocol::Tcp {
+		return Err(ApiError::invalid("connect_timeout is for tcp rules (udp does not connect)"));
+	}
+	if http {
+		return Err(ApiError::invalid("connect_timeout of a rule is not used with http; use http.services.<name>.timeouts.connect"));
+	}
+	let (min, max) = CONNECT_TIMEOUT_RANGE;
+	if d < min || d > max {
+		return Err(ApiError::invalid("connect_timeout must be 100ms-10m"));
+	}
+	Ok(Some(d))
+}
+
+/// A duration as `connect_timeout` shows it: `2s`, `1500ms`.
+pub fn show_duration(d: Duration) -> String {
+	let ms = d.as_millis();
+	if ms.is_multiple_of(1000) { format!("{}s", ms / 1000) } else { format!("{ms}ms") }
+}
+
 pub fn validate_udp_idle(secs: Option<u64>) -> Result<Duration, ApiError> {
 	let secs = secs.unwrap_or(DEFAULT_UDP_IDLE_SECS);
 	if secs == 0 || secs > MAX_UDP_IDLE_SECS {
@@ -705,6 +746,7 @@ impl RuleRequest {
 			}
 			h.validate(self.protocol)?;
 		}
+		let connect_timeout = validate_connect_timeout(self.connect_timeout.as_deref(), self.protocol, self.http.is_some())?;
 		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
@@ -765,6 +807,7 @@ impl RuleRequest {
 			targets,
 			balance: self.balance,
 			health_check: self.health_check,
+			connect_timeout,
 			source_ip: self.source_ip,
 			udp_idle,
 			tls,
@@ -803,6 +846,8 @@ pub struct UpdateRequest {
 	pub targets: Vec<TargetSpec>,
 	pub balance: Option<Balance>,
 	pub health_check: Option<HealthCheckSpec>,
+	/// Replaces `connect_timeout` when present (`0s` removes it; left out keeps it).
+	pub connect_timeout: Option<String>,
 	pub udp_idle_secs: Option<u64>,
 	pub source_ip: Option<SourceIp>,
 	/// Cannot change; accepted only if it matches (like `source_ip`).
@@ -882,6 +927,8 @@ pub struct RuleView {
 	pub balance: Option<Balance>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub health_check: Option<HealthCheckSpec>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub connect_timeout: Option<String>,
 	pub source_ip: &'static str,
 	pub udp_idle_secs: u64,
 	pub tls: TlsSpec,
@@ -951,6 +998,7 @@ impl RuleView {
 			targets: spec.targets.clone(),
 			balance: (!spec.targets.is_empty()).then_some(spec.balance),
 			health_check: spec.health_check.clone(),
+			connect_timeout: spec.connect_timeout.map(show_duration),
 			source_ip: spec.source_ip.as_str(),
 			udp_idle_secs: spec.udp_idle.as_secs(),
 			tls: spec.tls.clone(),
@@ -1001,6 +1049,7 @@ mod tests {
 			targets: vec![],
 			balance: Balance::RoundRobin,
 			health_check: None,
+			connect_timeout: None,
 			source_ip: SourceIp::Proxy,
 			udp_idle_secs: None,
 			tls: None,

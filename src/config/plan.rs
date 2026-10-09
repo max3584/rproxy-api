@@ -528,6 +528,8 @@ mod tests {
 			json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 80, "remote_addr": "example.com", "remote_port": 8080}),
 			json!({"protocol": "udp", "listen_addr": "::", "listen_port": 5000, "listen_port_end": 5009, "remote_addr": "2001:db8::1",
 				"remote_port": 6000, "udp_idle_secs": 90, "extra_listen_addrs": ["0.0.0.0"], "source_ip": "proxy_v2"}),
+			json!({"protocol": "tcp", "listen_addr": "192.0.2.10", "listen_port": 443, "listen_freebind": true, "remote_addr": "10.0.0.1",
+				"remote_port": 443, "connect_timeout": "1500ms"}),
 			json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": 5432, "targets": [{"addr": "db1", "port": 5432, "weight": 2},
 				{"addr": "db2", "port": 5432, "backup": true}], "balance": "failover", "health_check": {"interval": "5s"},
 				"allow_from": ["10.0.0.0/8", "fd00::1"], "labels": {"tenant": "a"}}),

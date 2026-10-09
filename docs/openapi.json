@@ -1358,6 +1358,10 @@
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
           },
+          "connect_timeout": {
+            "type": "string",
+            "description": "How long a connection to a target may take before the next target is tried (tcp without http; 100ms-10m; v0.4.3, features.connect_timeout). Left out: 5s with other targets to fall back on, else the OS's."
+          },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
           },
@@ -1436,6 +1440,10 @@
           },
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "connect_timeout": {
+            "type": "string",
+            "description": "Replaces connect_timeout when present (0s removes it; left out keeps it)."
           },
           "udp_idle_secs": {
             "type": "integer",
@@ -1691,6 +1699,10 @@
           },
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "connect_timeout": {
+            "type": "string",
+            "description": "Left out when not set."
           },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
@@ -1976,6 +1988,10 @@
               "listen_freebind": {
                 "type": "boolean",
                 "description": "listen_freebind of a rule: listening on an address not on the host yet (IP_FREEBIND; v0.4.3)"
+              },
+              "connect_timeout": {
+                "type": "boolean",
+                "description": "connect_timeout of an L4 tcp rule (v0.4.3)"
               }
             }
           },

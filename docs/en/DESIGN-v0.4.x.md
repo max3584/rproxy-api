@@ -154,3 +154,18 @@ CREATE TABLE IF NOT EXISTS rproxy_rule_sets (
 ## 6. Deviations in the implementation
 
 - **#241, conflicts on restore (approved by the owner, 2026-10-08)**: section 4 said "a rule whose key was already taken is `failed` alone", but the rule table holds one entry per key, so a second rule with the same key cannot be registered even as `failed`. Instead, a rule whose key or listen ports overlap a rule restored before is **left out of its set** with `restore.conflict` (a rule that cannot be applied for another reason, such as a refused file, gets `restore.skip`), and the rest of the set is applied. The set's `etag` then differs from the stored one; the `ruleset.restore` log line shows both the new `etag` and the `stored_etag`. The DB row is left as it is (the next `PUT` brings it in line).
+
+## 7. G. VIPs of a Kubernetes fleet and lost nodes (v0.4.3)
+
+The rproxy-api part of two gaps found after rproxy-gateway v0.4.4 (fleet pods holding VIPs). The gateway side is in rproxy-gateway's docs/en/DESIGN-v0.4.x.md.
+
+| Item | Shape | `features` | Default |
+|---|---|---|---|
+| Listening on a VIP not on the host yet | `listen_freebind: true` on a rule (`IP_FREEBIND` / `IPV6_FREEBIND`) | `listen_freebind` (Linux) | false (as before, an address not on the host fails to bind) |
+| Giving up targets on a stopped node sooner | `connect_timeout` of an L4 `tcp` rule (`100ms`-`10m`) | `connect_timeout` | none (5 s when other targets can be tried, else the OS default) |
+
+- `listen_freebind` is not automatic ("automatically for addresses not on the host" would silently take a mistyped address). It needs no privilege, so `IP_TRANSPARENT` (`CAP_NET_ADMIN`) is not used. It is a per-rule mark so that the controller can choose it per Gateway without re-creating the fleet's pods (a process-wide setting would need the DaemonSet rolled).
+- `0.0.0.0` / `::` and a specific address on the same port: still refused with `409 already_exists` (no `SO_REUSEADDR`-like "the narrower one wins": where traffic goes would depend on which addresses are present, and the clash would be hidden). The error now names the other rule's set and why.
+- `connect_timeout` changes in place by PATCH (from the next connection). `listen_freebind` cannot change (the sockets are opened again: re-created).
+- Handoff and storage: only added to the rule's shape (in the `GET /rules` shape and `rproxy_rules.spec`; an older patch ignores the unknown key).
+- Tests: `scripts/test-freebind.sh` (real path in network namespaces; CI's transparent job), `tests/listen.rs`, `tests/targets.rs` (a target that drops SYNs).

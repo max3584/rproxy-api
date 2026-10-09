@@ -410,3 +410,72 @@ async fn http_services_balance_by_least_conn_and_failover() {
 		tokio::time::sleep(Duration::from_millis(50)).await;
 	}
 }
+
+/// A listener whose accept queue is full: its kernel drops new SYNs, so a connection to it
+/// neither succeeds nor is refused (a backend on a node that died). Keep the value alive.
+fn blackhole() -> (SocketAddr, Vec<std::net::TcpStream>, socket2::Socket) {
+	let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+	sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into()).unwrap();
+	sock.listen(0).unwrap();
+	let addr = sock.local_addr().unwrap().as_socket().unwrap();
+	// fill the queue (never accepted); later connects hang in SYN_SENT
+	let mut held = vec![];
+	for _ in 0..4 {
+		let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+		s.set_nonblocking(true).unwrap();
+		let _ = s.connect(&addr.into());
+		held.push(std::net::TcpStream::from(s));
+	}
+	std::thread::sleep(Duration::from_millis(100));
+	(addr, held, sock)
+}
+
+/// `connect_timeout` (v0.4.3): a target that does not answer is given up after it, and the next
+/// target is tried (5 s without it); with a single target the client's connection is closed then.
+#[tokio::test]
+async fn connect_timeout_gives_up_a_target_that_does_not_answer() {
+	let h = harness().await;
+	let (_, caps) = h.get("/capabilities").await;
+	assert_eq!(caps["features"]["connect_timeout"], true);
+	let (dead, _held, _l) = blackhole();
+	let a = tcp_backend("A:").await;
+	let port = free_port();
+	let (status, v) =
+		h.post(multi("tcp", port, vec![target(dead), target(a)], json!({"balance": "failover", "connect_timeout": "300ms"}))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["connect_timeout"], "300ms", "{v}");
+	let t0 = Instant::now();
+	assert_eq!(which(port).await, "A:");
+	let took = t0.elapsed();
+	assert!(took >= Duration::from_millis(250) && took < Duration::from_secs(2), "the dead target was given up after {took:?}");
+	// the dead target is ejected now: the next connection goes straight to A
+	let t0 = Instant::now();
+	assert_eq!(which(port).await, "A:");
+	assert!(t0.elapsed() < Duration::from_millis(250), "{:?}", t0.elapsed());
+
+	// one target: the client's connection ends after connect_timeout
+	let single = free_port();
+	let mut body = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": single, "connect_timeout": "300ms"});
+	body["remote_addr"] = json!("127.0.0.1");
+	body["remote_port"] = json!(dead.port());
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let mut s = TcpStream::connect(("127.0.0.1", single)).await.unwrap();
+	let t0 = Instant::now();
+	let mut buf = [0u8; 16];
+	let r = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf)).await.expect("closed by connect_timeout");
+	assert!(matches!(r, Ok(0) | Err(_)), "{r:?}");
+	assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+
+	// PATCH changes it in place and 0s removes it; udp and http rules do not take it
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{single}"), json!({"remote_addr": "127.0.0.1", "remote_port": a.port(), "connect_timeout": "2s"})).await;
+	assert_eq!((status, v["connect_timeout"].as_str()), (StatusCode::OK, Some("2s")), "{v}");
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{single}"), json!({"remote_addr": "127.0.0.1", "remote_port": a.port()})).await;
+	assert_eq!((status, v["connect_timeout"].as_str()), (StatusCode::OK, Some("2s")), "left out keeps it: {v}");
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{single}"), json!({"remote_addr": "127.0.0.1", "remote_port": a.port(), "connect_timeout": "0s"})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert!(v.get("connect_timeout").is_none(), "{v}");
+	assert!(refused(&h, multi("udp", free_udp_port(), vec![target(a)], json!({"connect_timeout": "1s"}))).await.contains("udp"));
+	assert!(refused(&h, multi("tcp", free_port(), vec![target(a)], json!({"connect_timeout": "10ms"}))).await.contains("100ms"));
+	assert!(refused(&h, multi("tcp", free_port(), vec![target(a)], json!({"connect_timeout": "soon"}))).await.contains("duration"));
+}

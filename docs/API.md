@@ -136,6 +136,7 @@ tokens:
 | `targets` | object の配列 | | 宛先を複数にする（v0.3.3、`remote_addr` / `remote_port` の代わり。どちらか一方）。`{"addr", "port", "weight"?, "backup"?}`：`addr` は IP かホスト名（それぞれ再解決する）、`weight` は 1 以上（既定 1）、`backup: true` はほかの宛先がすべて down のときだけ使う（全部を backup にはできない）。最大 64 件。ポート範囲では各宛先の `port` も範囲の分ずれる。下の「複数の宛先」 |
 | `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
+| `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くと今までどおり（ほかに宛先があれば 5 秒、なければ OS の既定（Linux は約 2 分））。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
@@ -853,6 +854,14 @@ VIP のように、今は別のホストが持っていて後からこのホス�
 - PATCH では変えられない（ソケットを開き直すため。違う値は `unsupported`、同じ値か省けば受け付ける）。組の PUT と設定ファイルの再読み込みでは作り直し（`change: recreate`）。
 - 同じポートの 2 つのルール：特定のアドレスどうし（`192.0.2.10:443` と `192.0.2.11:443`）は並べられる（キーが `listen_addr` を含む）。`0.0.0.0` / `::` のルールはそのポートをすべてのアドレスで取るので、同じポートの特定のアドレスのルールとは並べられない（どちらを先に作っても後のものが `409 already_exists`。`SO_REUSEADDR` で「より狭いアドレスが勝つ」形にはしない：どちらに届くかがアドレスの有無で変わり、取り合いが見えなくなるため）。誤りの文に重なる相手のルールと、組のルールならその組の名前が出る（`tcp/0.0.0.0:443 overlaps with tcp/192.0.2.10:443 (rule set k8s/a/web): a rule on 0.0.0.0 / :: takes the port on every address; ...`）。
 - 実経路は `scripts/test-freebind.sh`（名前空間。CI の transparent のジョブ）で確かめる。
+
+### 宛先への接続の時間（v0.4.3、`features.connect_timeout`）
+
+L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノードの宛先は SYN に答えないので、断られる（RST）のと違い、接続は OS の再送（Linux で約 2 分）か、ほかに宛先があるときの 5 秒まで待つ。`connect_timeout` でこれを短くすると、そのあいだに来た接続も早く次の宛先に移り、宛先は `outlier_detection` で外れる（既定は 1 回で 10 秒）。
+
+- 宛先が 1 つ・複数のどちらでも効く（複数のときは 5 秒の代わり）。`tls.routes` の宛先も同じ。
+- 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
+- `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
 
 ## エンドポイント
 
