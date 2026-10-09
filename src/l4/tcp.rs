@@ -458,9 +458,12 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 		Ok(()) => detail.reason = "closed",
 		Err(e) => {
 			debug!(event = "offload.reset", rule = %rt.key, error = %e, "sockmap relay failed; resetting the backend");
-			// offload-verify (tests only): a fast-path failure is a finding
+			// offload-verify (tests only): a fast-path failure is a finding; a reset
+			// from a peer is not (passing it on is the correct behaviour)
 			#[cfg(feature = "offload-verify")]
-			crate::net::offload::verify::fail("sockmap", "relay", &rt.key.to_string(), format!("{e} (rx {rx}, tx {tx})"));
+			if !matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted) {
+				crate::net::offload::verify::fail("sockmap", "relay", &rt.key.to_string(), format!("{e} (rx {rx}, tx {tx})"));
+			}
 			reset_on_close(b);
 		}
 	}
