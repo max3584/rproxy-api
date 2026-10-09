@@ -62,6 +62,7 @@ The work is tracked in the milestone "performance" with the label "area: perform
 ### mimalloc as the default allocator
 - Faster (HTTP +9–26%), but +8 MiB idle and +12 MiB after load. Following the minimal-memory policy, the default stays musl and mimalloc is opt-in (#201).
 - The 64 KiB UDP session buffers: under musl, untouched pages didn't count in RSS; under mimalloc they all did (650 MiB on a 10000-port range). These receive buffers now come from `std::alloc::System` (`RecvBuf`).
+- Later, the session buffers turned out to be resident under musl too (rproxy-gateway stress test, 120,000 random requests: 14,639 UDP sessions, VmRSS 867 MiB, anon 850 MiB, about 58 KiB per session). Plain sessions now read backend replies into one buffer per worker thread (#268). Same test: 23,080 UDP sessions, VmRSS 289 MiB, anon 272 MiB (about 12 KiB per session). DTLS sessions still hold two each.
 
 ### UDP sharding by default (`SO_REUSEPORT`)
 - One socket per worker added +3.5% delivered and cut loss 45% → 34%, but used more CPU, and per-CPU throughput was better without it. Faster receiving moved the bottleneck to session handling and the receiver. Default is 1; `global.performance.udp_shards` (v0.4; `auto` = the workers) or `RPROXY_UDP_SHARDS` raises it. Revisit on machines with spare cores.
@@ -172,4 +173,3 @@ Takes the NIC away from the kernel and drives it from user space with a DPDK PMD
 - Forwarding in the kernel (#260, #261, paused): AF_XDP goes as far as the startup self-test ("Passing L4 UDP through AF_XDP" above); DPDK as far as a separate build checked for correctness in CI. Both need NIC/queue tuning and real hardware to measure, left for another time.
 - HTTP/2: the profile still shows memcpy (about 11%), the allocator (about 12%) and kernel wakeups (about 7%). Fewer, larger h2 writes.
 - Multi-core use (#194): adapt to queue depth (per-role pipeline, per-core parallelism, backpressure).
-- Memory (#185): share UDP session buffers per worker.
