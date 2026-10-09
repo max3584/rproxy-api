@@ -1902,6 +1902,13 @@
                 },
                 "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235), misdirected (tls.misdirected, v0.4.3)"
               },
+              "server_middleware_kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "middleware kinds servers[].middlewares may use (#229; cors, redirect_scheme, redirect_regex, mirror since v0.4.3)"
+              },
               "tls_route_targets": {
                 "type": "boolean"
               },

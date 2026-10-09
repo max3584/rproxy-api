@@ -156,8 +156,17 @@ pub struct ServerSpec {
 	pub middlewares: Vec<String>,
 }
 
-/// Middleware kinds that `servers[].middlewares` may use (#229): those that only rewrite.
-pub const SERVER_MIDDLEWARES: &[&str] = &["headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex"];
+/// Middleware kinds that `servers[].middlewares` may use: those that only rewrite (#229), and
+/// since v0.4.3 CORS, redirects and copies (the Gateway API's filters on backendRefs).
+pub const SERVER_MIDDLEWARES: &[&str] = &[
+	"headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex", "cors", "redirect_scheme",
+	"redirect_regex", "mirror",
+];
+
+/// Whether a service's servers copy requests themselves (a `mirror` in `servers[].middlewares`).
+pub fn copies_per_server(service: &ServiceSpec, middlewares: &BTreeMap<String, MiddlewareSpec>) -> bool {
+	service.servers.iter().flat_map(|s| &s.middlewares).any(|m| matches!(middlewares.get(m), Some(MiddlewareSpec::Mirror { .. })))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -674,6 +683,11 @@ impl HttpSpec {
 								spec.kind(),
 								SERVER_MIDDLEWARES.join(", ")
 							)));
+						}
+						Some(MiddlewareSpec::Mirror { service: to, .. })
+							if self.services.get(to).is_some_and(|t| copies_per_server(t, &self.middlewares)) =>
+						{
+							return Err(invalid(format!("{what}: middleware {m:?} copies to service {to:?}, whose servers copy requests themselves")));
 						}
 						Some(_) => {}
 					}

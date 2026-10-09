@@ -641,3 +641,114 @@ async fn misdirected_requests_get_421() {
 	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
 	assert!(v["error"].as_str().unwrap().contains("needs http"), "{v}");
 }
+
+#[tokio::test]
+async fn per_server_cors_redirects_and_mirrors() {
+	// v0.4.3: the Gateway API's CORS, RequestRedirect and RequestMirror filters on a backendRef
+	let h = harness().await;
+	let (v1, seen1) = backend("v1").await;
+	let (v2, seen2) = backend("v2").await;
+	let (m, mirrored) = backend("mirror").await;
+	let port = rule(
+		&h,
+		json!({
+			"routes": [{"name": "w", "match": "PathPrefix(`/`)", "service": "pair"}],
+			"services": {
+				"pair": {"servers": [
+					{"url": format!("http://{v1}"), "middlewares": ["cors", "copy", "b1"]},
+					{"url": format!("http://{v2}"), "middlewares": ["redir"]},
+				]},
+				"shadow": {"servers": [{"url": format!("http://{m}")}]},
+			},
+			"middlewares": {
+				"cors": {"cors": {"allow_origins": ["https://www.foo.com"], "allow_methods": ["GET"]}},
+				"copy": {"mirror": {"service": "shadow"}},
+				"b1": {"headers": {"request": {"set": {"Backend": "v1"}}}},
+				"redir": {"redirect_regex": {"regex": "^http://([^/:]+)(:\\d+)?/(.*)$", "replacement": "https://$1/$3", "status": 302}},
+			},
+		}),
+	)
+	.await;
+	let base = format!("http://127.0.0.1:{port}");
+	let (mut statuses, mut cors, mut redirects) = (vec![], 0, 0);
+	for i in 0..10 {
+		let (status, headers, v) =
+			send(client().post(format!("{base}/p{i}")).header("origin", "https://www.foo.com").header("host", "app.example").body("hello")).await;
+		statuses.push(status.as_u16());
+		if status == 200 {
+			assert_eq!(v["tag"], "v1");
+			assert_eq!(headers["access-control-allow-origin"], "https://www.foo.com", "the server's cors marks its responses");
+			cors += 1;
+		} else {
+			assert_eq!(status, 302);
+			assert_eq!(headers["location"], format!("https://app.example/p{i}"), "the other server's redirect");
+			assert!(!headers.contains_key("access-control-allow-origin"));
+			redirects += 1;
+		}
+	}
+	assert_eq!((cors, redirects), (5, 5), "{statuses:?}");
+	assert!(seen2.lock().unwrap().is_empty(), "the redirecting server gets nothing");
+	// copies of the requests sent to v1 only, with the headers up to the copy, sent once
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while mirrored.lock().unwrap().len() < 5 {
+		assert!(Instant::now() < deadline, "the mirror got {}", mirrored.lock().unwrap().len());
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	{
+		let got = mirrored.lock().unwrap();
+		assert_eq!(got.len(), 5);
+		let sent: Vec<String> = seen1.lock().unwrap().iter().map(|(p, _)| p.clone()).collect();
+		for (path, headers) in got.iter() {
+			assert!(sent.contains(path), "{path} was copied but not sent to v1: {sent:?}");
+			assert_eq!(headers["host"], ["app.example"]);
+			assert_eq!(headers["x-forwarded-for"], ["127.0.0.1"], "X-Forwarded-For once");
+			assert_eq!(headers["content-length"], ["5"]);
+			assert!(!headers.contains_key("backend"), "the copy is taken before the later middlewares");
+		}
+	}
+	// a preflight that reaches the cors server is answered there
+	let before = seen1.lock().unwrap().len();
+	let mut answered = 0;
+	for _ in 0..4 {
+		let (status, headers, _) = send(
+			client()
+				.request(reqwest::Method::OPTIONS, format!("{base}/pre"))
+				.header("origin", "https://www.foo.com")
+				.header("access-control-request-method", "GET"),
+		)
+		.await;
+		if status == 204 {
+			assert_eq!(headers["access-control-allow-methods"], "GET");
+			answered += 1;
+		}
+	}
+	assert_eq!(answered, 2, "half of the preflights go to the cors server");
+	assert_eq!(seen1.lock().unwrap().len(), before, "answered without the backend");
+
+	// a server may not copy to a service whose servers copy again; other kinds stay refused
+	for (mws, services, want) in [
+		(
+			json!({"copy": {"mirror": {"service": "shadow"}}, "again": {"mirror": {"service": "s"}}}),
+			json!({"s": {"servers": [{"url": "http://127.0.0.1:1", "middlewares": ["copy"]}]},
+				"shadow": {"servers": [{"url": "http://127.0.0.1:2", "middlewares": ["again"]}]}}),
+			"copy requests themselves",
+		),
+		(
+			json!({"rl": {"rate_limit": {"average": 1}}}),
+			json!({"s": {"servers": [{"url": "http://127.0.0.1:1", "middlewares": ["rl"]}]}}),
+			"cannot run per server",
+		),
+	] {
+		let (status, v) = h
+			.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "service": "s"}], "services": services, "middlewares": mws}}))
+			.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+		assert!(v["error"].as_str().unwrap().contains(want), "{v}");
+	}
+	let (_, caps) = h.get("/capabilities").await;
+	for k in ["cors", "redirect_regex", "redirect_scheme", "mirror", "headers"] {
+		assert!(caps["features"]["server_middleware_kinds"].as_array().unwrap().iter().any(|x| x == k), "{k}: {caps}");
+	}
+}

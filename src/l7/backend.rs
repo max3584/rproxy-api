@@ -302,6 +302,16 @@ fn duration(d: Option<&String>, default: Duration) -> Result<Duration, ApiError>
 impl Service {
 	/// `middlewares` are the rule's, for the servers' own (#229).
 	pub fn compile(name: &str, spec: &ServiceSpec, middlewares: &BTreeMap<String, MiddlewareSpec>) -> Result<Service, ApiError> {
+		Service::compile_with(name, spec, middlewares, &Default::default())
+	}
+
+	/// `services`: those compiled already, for the servers' `mirror` (v0.4.3).
+	pub fn compile_with(
+		name: &str,
+		spec: &ServiceSpec,
+		middlewares: &BTreeMap<String, MiddlewareSpec>,
+		services: &std::collections::HashMap<String, Arc<Service>>,
+	) -> Result<Service, ApiError> {
 		let mut servers = vec![];
 		for (i, s) in spec.servers.iter().enumerate() {
 			let weight = s.weight.unwrap_or(1);
@@ -315,7 +325,7 @@ impl Service {
 				if !super::SERVER_MIDDLEWARES.contains(&spec.kind()) {
 					return Err(ApiError::invalid(format!("{what}: {} cannot run per server", spec.kind())));
 				}
-				server.middlewares.push(Arc::new(Middleware::compile(m, spec)?));
+				server.middlewares.push(Arc::new(Middleware::errors(m, spec, services)?));
 			}
 			servers.push(server);
 		}
