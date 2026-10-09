@@ -17,6 +17,7 @@ const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
+const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_NUM_TX_QUEUES: u16 = 31;
 const IFLA_NUM_RX_QUEUES: u16 = 32;
 const IFLA_INFO_KIND: u16 = 1;
@@ -128,7 +129,10 @@ impl Rtnl {
 	/// Creates the veth pair `a` <-> `b` with one TX and one RX queue on each
 	/// end (veth defaults to one queue per CPU, and a datagram then lands on
 	/// whichever RX queue matches the sender's CPU — not only queue 0).
-	pub fn add_veth(&mut self, a: &str, b: &str) -> io::Result<()> {
+	/// The peer `b` is created in the network namespace `peer_ns` (an open
+	/// `/proc/.../ns/net`): two ends in one namespace would talk through the
+	/// local route, never through the veth (and XDP would see nothing).
+	pub fn add_veth(&mut self, a: &str, b: &str, peer_ns: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
 		let mut body = ifinfomsg(0, 0, 0);
 		attr(&mut body, IFLA_IFNAME, &cstr(a));
 		attr(&mut body, IFLA_NUM_TX_QUEUES, &1u32.to_ne_bytes());
@@ -141,6 +145,7 @@ impl Rtnl {
 					attr(peer, IFLA_IFNAME, &cstr(b));
 					attr(peer, IFLA_NUM_TX_QUEUES, &1u32.to_ne_bytes());
 					attr(peer, IFLA_NUM_RX_QUEUES, &1u32.to_ne_bytes());
+					attr(peer, IFLA_NET_NS_FD, &(peer_ns.as_raw_fd() as u32).to_ne_bytes());
 				});
 			});
 		});
