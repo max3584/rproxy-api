@@ -207,6 +207,17 @@ impl Listener {
 		}
 		self.socket.send_to(data, client).await
 	}
+
+	/// `send_to` without waiting: `WouldBlock` when the socket's send buffer is full.
+	pub fn try_send_to(&self, data: &[u8], client: SocketAddr, local: Option<Local>) -> io::Result<usize> {
+		if let (true, Some(local)) = (self.pktinfo, local) {
+			match self.socket.try_io(tokio::io::Interest::WRITABLE, || sys::send(&self.socket, data, client, local)) {
+				Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EADDRNOTAVAIL)) => {}
+				other => return other,
+			}
+		}
+		self.socket.try_send_to(data, client)
+	}
 }
 
 /// Sends `datagrams` on a connected socket (to a backend), each behind `header`
@@ -661,7 +672,7 @@ mod tests {
 
 /// A zeroed receive buffer for one UDP datagram (64 KiB), taken from the libc's allocator rather than the global one.
 ///
-/// Every UDP session (and DTLS session) holds such buffers, but most of their bytes are never written (datagrams are
+/// Each worker thread holds one for the plain UDP sessions (`l4::udp`, #268) and each DTLS session holds two, but most of their bytes are never written (datagrams are
 /// small). The libc's calloc returns fresh pages from the kernel for blocks this large, so the untouched part costs no
 /// memory. mimalloc (`alloc-mimalloc`, #185) hands them out of its heap and they count in full (74 KiB instead of
 /// 20 KiB per session). The listeners' receive batches are `Batch` (mmap), outside any allocator.

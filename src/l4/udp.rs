@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep_until;
@@ -17,7 +18,7 @@ use dtls::conn::DTLSConn;
 use webrtc_util::conn::Conn;
 
 use crate::core::balance::{Lease, Member};
-use crate::core::bandwidth::{Dir, Gate};
+use crate::core::bandwidth::{Bandwidth, Dir, Gate};
 use crate::core::limits::{self, Permit, Reason};
 use crate::tls::dtls::SessionConn;
 use crate::core::proxy::{shifted, Runtime};
@@ -274,7 +275,6 @@ async fn session(
 	let mut first = first;
 	rx_bytes += forward(rt, &upstream, &header, client, &mut first, &mut up).await;
 	drop(first);
-	let mut buf = RecvBuf::new();
 	// datagrams taken from the queue at once, sent on with one `sendmmsg`
 	let (mut inbox, mut out) = (Vec::new(), Vec::new());
 	let mut deadline = tokio::time::Instant::now() + idle;
@@ -320,29 +320,49 @@ async fn session(
 					break "new connection";
 				}
 			},
-			received = upstream.recv(&mut buf) => match received {
-				Ok(n) if !down.admit(&rt.bandwidth, n) => {
-					rt.stats.bandwidth_dropped();
-					deadline = tokio::time::Instant::now() + idle;
+			// the backend's replies are read into the worker's buffer and sent on at once (#268)
+			ready = upstream.ready(Interest::READABLE | Interest::ERROR) => {
+				if let Err(e) = ready {
+					debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
+					continue;
 				}
-				Ok(n) => {
-					if let Err(e) = listener.send_to(&buf[..n], client, local).await {
-						rt.stats.dropped();
-						debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
-					}
+				for _ in 0..BATCH {
+					let n = match reply(&upstream, listener, client, local, &mut down, &rt.bandwidth) {
+						Reply::Empty => break,
+						Reply::OverBandwidth => {
+							rt.stats.bandwidth_dropped();
+							deadline = tokio::time::Instant::now() + idle;
+							continue;
+						}
+						Reply::Sent(n) => n,
+						Reply::SendFailed(n, e) => {
+							rt.stats.dropped();
+							debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
+							n
+						}
+						// the client side's send buffer is full: wait with a copy, not the shared buffer
+						Reply::Blocked(data) => {
+							if let Err(e) = listener.send_to(&data, client, local).await {
+								rt.stats.dropped();
+								debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
+							}
+							data.len()
+						}
+						// ICMP unreachable from the backend surfaces here on a connected socket
+						Reply::RecvFailed(e) => {
+							debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
+							if let (std::io::ErrorKind::ConnectionRefused, Some(lease)) = (e.kind(), &lease) {
+								let pool = rt.pool();
+								if pool.contains(lease.member()) {
+									pool.failed(&rt.key, lease.member(), "refused", &e.to_string());
+								}
+							}
+							break;
+						}
+					};
 					tx_bytes += n as u64;
 					rt.stats.add_tx(n as u64);
 					deadline = tokio::time::Instant::now() + idle;
-				}
-				// ICMP unreachable from the backend surfaces here on a connected socket
-				Err(e) => {
-					debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
-					if let (std::io::ErrorKind::ConnectionRefused, Some(lease)) = (e.kind(), &lease) {
-						let pool = rt.pool();
-						if pool.contains(lease.member()) {
-							pool.failed(&rt.key, lease.member(), "refused", &e.to_string());
-						}
-					}
 				}
 			},
 			// a target went down (or the targets changed): move off it
@@ -586,6 +606,60 @@ fn with_header<'a>(header: &Option<Vec<u8>>, data: &'a [u8]) -> std::borrow::Cow
 	}
 }
 
+thread_local! {
+	/// One receive buffer per worker thread for the plain sessions' backend replies (#268): a buffer per session cost
+	/// 64 KiB each, resident, for as long as the session lived (`udp_idle`). It is borrowed only between a readiness and
+	/// the send without waiting, never across an `.await`.
+	static REPLY_BUF: std::cell::RefCell<RecvBuf> = std::cell::RefCell::new(RecvBuf::new());
+}
+
+/// What one read of the backend's socket came to.
+#[derive(Debug)]
+enum Reply {
+	/// nothing more to read
+	Empty,
+	OverBandwidth,
+	Sent(usize),
+	SendFailed(usize, std::io::Error),
+	/// not sent yet: the client side would block
+	Blocked(Vec<u8>),
+	RecvFailed(std::io::Error),
+}
+
+/// Reads one datagram from the backend into the worker's buffer and sends it on to `client` without waiting.
+fn reply(upstream: &UdpSocket, listener: &Listener, client: SocketAddr, local: Option<Local>, down: &mut Gate, bandwidth: &Bandwidth) -> Reply {
+	REPLY_BUF.with_borrow_mut(|buf| {
+		// `try_recv` reads only when readable: an ICMP error alone (readiness ERROR) is read on its own, or it would stay
+		// pending and wake the session again and again (`try_io` takes one interest at a time)
+		let read = match upstream.try_recv(buf) {
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => upstream.try_io(Interest::ERROR, || {
+				use std::os::fd::AsRawFd;
+				// SAFETY: `buf` is valid for writes of its length for the duration of the call
+				let n = unsafe { libc::recv(upstream.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+				if n < 0 {
+					Err(std::io::Error::last_os_error())
+				} else {
+					Ok(n as usize)
+				}
+			}),
+			read => read,
+		};
+		let n = match read {
+			Ok(n) => n,
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Reply::Empty,
+			Err(e) => return Reply::RecvFailed(e),
+		};
+		if !down.admit(bandwidth, n) {
+			return Reply::OverBandwidth;
+		}
+		match listener.try_send_to(&buf[..n], client, local) {
+			Ok(_) => Reply::Sent(n),
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Reply::Blocked(buf[..n].to_vec()),
+			Err(e) => Reply::SendFailed(n, e),
+		}
+	})
+}
+
 /// The backend side of a DTLS session: plain UDP, or DTLS again.
 enum Upstream {
 	Plain(Arc<UdpSocket>),
@@ -764,5 +838,54 @@ fn remove(sessions: &Sessions, peer: Peer, id: u64) {
 	let mut map = sessions.lock().unwrap();
 	if map.get(&peer).is_some_and(|(current, _)| *current == id) {
 		map.remove(&peer);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn backend_replies_go_through_the_worker_buffer() {
+		let listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		upstream.connect(backend.local_addr().unwrap()).await.unwrap();
+		let (bandwidth, mut down) = (Bandwidth::default(), Gate::new(client.local_addr().unwrap().ip(), Dir::Down));
+
+		// sizes up to the largest datagram, one after another through the same buffer
+		for len in [1usize, 1400, 9000, RecvBuf::LEN - 28] {
+			let data: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
+			backend.send_to(&data, upstream.local_addr().unwrap()).await.unwrap();
+			upstream.ready(Interest::READABLE | Interest::ERROR).await.unwrap();
+			match reply(&upstream, &listener, client.local_addr().unwrap(), None, &mut down, &bandwidth) {
+				Reply::Sent(n) => assert_eq!(n, len),
+				r => panic!("not sent: {r:?}"),
+			}
+			let mut got = vec![0u8; RecvBuf::LEN];
+			let (n, from) = client.recv_from(&mut got).await.unwrap();
+			assert_eq!((&got[..n], from), (&data[..], listener.local_addr().unwrap()));
+		}
+		assert!(matches!(reply(&upstream, &listener, client.local_addr().unwrap(), None, &mut down, &bandwidth), Reply::Empty));
+	}
+
+	// ICMP port unreachable wakes the session (an error, not a readable datagram) and fails the target
+	#[tokio::test]
+	async fn a_refusing_backend_is_seen() {
+		let listener = Listener::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+		let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		upstream.connect(closed).await.unwrap();
+		let (bandwidth, mut down) = (Bandwidth::default(), Gate::new(closed.ip(), Dir::Down));
+		upstream.send(b"x").await.unwrap();
+		tokio::time::timeout(Duration::from_secs(5), upstream.ready(Interest::READABLE | Interest::ERROR)).await.unwrap().unwrap();
+		match reply(&upstream, &listener, closed, None, &mut down, &bandwidth) {
+			Reply::RecvFailed(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused),
+			r => panic!("no refusal: {r:?}"),
+		}
+		// read once: the session is not woken again for it
+		assert!(matches!(reply(&upstream, &listener, closed, None, &mut down, &bandwidth), Reply::Empty));
+		assert!(tokio::time::timeout(Duration::from_millis(200), upstream.ready(Interest::READABLE | Interest::ERROR)).await.is_err());
 	}
 }
