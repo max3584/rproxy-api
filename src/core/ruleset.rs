@@ -722,8 +722,8 @@ impl Registry {
 				problems.push(finding(*i, label, e));
 				continue;
 			}
-			if let Some((other, _)) = current.iter().find(|(k, c)| **k != spec.key && !ours(c) && overlaps(&c.spec, spec)) {
-				problems.push(finding(*i, label, ApiError::already_exists(format!("{} overlaps with {other}", spec.key))));
+			if let Some((_, c)) = current.iter().find(|(k, c)| **k != spec.key && !ours(c) && overlaps(&c.spec, spec)) {
+				problems.push(finding(*i, label, ApiError::already_exists(crate::core::registry::overlap_message(spec, &c.spec))));
 				continue;
 			}
 			let (first, last) = port_range(spec);

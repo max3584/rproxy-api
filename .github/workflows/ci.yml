@@ -102,6 +102,9 @@ jobs:
       # UDP replies leave from the address the client sent to (#137)
       - name: scripts/test-udp-source.sh
         run: scripts/test-udp-source.sh
+      # listen_freebind: rules on VIPs not on the host yet, the same port on two VIPs (v0.4.3)
+      - name: scripts/test-freebind.sh
+        run: scripts/test-freebind.sh
 
   # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
   package:

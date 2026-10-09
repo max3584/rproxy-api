@@ -191,3 +191,17 @@ The Gateway API features rproxy-gateway does not claim yet ("Not claimed" in rpr
 - Tests: unit (building and reading `ext_authz`, `copy_answer` with `["*"]`), `tests/ext_authz.rs` (Envoy's HTTP shape: method, path, Host, `Content-Length`, body, the headers picked, `["*"]`, 200 only, 413; gRPC with `address` and `service`, headers set and removed, headers added to the response, denials, gRPC errors; per server; the refused shapes).
 - Safety: the auth server still gets the client certificate headers as rproxy saw them (#238). A gRPC `ok_response` cannot change or remove `Host` (the destination chosen by the route stays).
 
+## 8. G. VIPs of a Kubernetes fleet and lost nodes (v0.4.3)
+
+The rproxy-api part of two gaps found after rproxy-gateway v0.4.4 (fleet pods holding VIPs). The gateway side is in rproxy-gateway's docs/en/DESIGN-v0.4.x.md.
+
+| Item | Shape | `features` | Default |
+|---|---|---|---|
+| Listening on a VIP not on the host yet | `listen_freebind: true` on a rule (`IP_FREEBIND` / `IPV6_FREEBIND`) | `listen_freebind` (Linux) | false (as before, an address not on the host fails to bind) |
+| Giving up targets on a stopped node sooner | `connect_timeout` of an L4 `tcp` rule (`100ms`-`10m`) | `connect_timeout` | none (5 s when other targets can be tried, else the OS default) |
+
+- `listen_freebind` is not automatic ("automatically for addresses not on the host" would silently take a mistyped address). It needs no privilege, so `IP_TRANSPARENT` (`CAP_NET_ADMIN`) is not used. It is a per-rule mark so that the controller can choose it per Gateway without re-creating the fleet's pods (a process-wide setting would need the DaemonSet rolled).
+- `0.0.0.0` / `::` and a specific address on the same port: still refused with `409 already_exists` (no `SO_REUSEADDR`-like "the narrower one wins": where traffic goes would depend on which addresses are present, and the clash would be hidden). The error now names the other rule's set and why.
+- `connect_timeout` changes in place by PATCH (from the next connection). `listen_freebind` cannot change (the sockets are opened again: re-created).
+- Handoff and storage: only added to the rule's shape (in the `GET /rules` shape and `rproxy_rules.spec`; an older patch ignores the unknown key).
+- Tests: `scripts/test-freebind.sh` (real path in network namespaces; CI's transparent job), `tests/listen.rs`, `tests/targets.rs` (a target that drops SYNs).

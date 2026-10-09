@@ -76,8 +76,10 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 		let lease = c.lease();
 		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
 			let attempt = source::connect_tcp(*addr, rt.bind_as(client));
-			let result = if fallback {
-				tokio::time::timeout(FAILOVER_CONNECT_TIMEOUT, attempt)
+			// the rule's connect_timeout (v0.4.3); without it, 5 s when another target can be tried
+			let limit = rt.connect_timeout().or(fallback.then_some(FAILOVER_CONNECT_TIMEOUT));
+			let result = if let Some(limit) = limit {
+				tokio::time::timeout(limit, attempt)
 					.await
 					.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
 			} else {

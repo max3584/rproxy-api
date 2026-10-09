@@ -143,6 +143,10 @@ pub struct Runtime {
 	pub h3: crate::l7::h3::H3State,
 	/// The addresses the rule listens on (`listen_addr`, then `extra_listen_addrs`).
 	pub listen: RwLock<Vec<std::net::IpAddr>>,
+	/// The rule's `listen_freebind`: its sockets bind addresses not on the host (yet).
+	pub listen_freebind: bool,
+	/// The rule's `connect_timeout` in ms (0: none); PATCH changes it for the next connection.
+	pub connect_timeout_ms: std::sync::atomic::AtomicU64,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
@@ -166,7 +170,24 @@ pub fn shifted(addr: SocketAddr, offset: u16) -> SocketAddr {
 	SocketAddr::new(addr.ip(), addr.port().wrapping_add(offset))
 }
 
+/// `connect_timeout` as kept in `Runtime::connect_timeout_ms` (0: none).
+pub fn timeout_ms(d: Option<Duration>) -> u64 {
+	d.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1))
+}
+
 impl Runtime {
+	/// The rule's `connect_timeout`, if it has one.
+	pub fn connect_timeout(&self) -> Option<Duration> {
+		match self.connect_timeout_ms.load(std::sync::atomic::Ordering::Relaxed) {
+			0 => None,
+			ms => Some(Duration::from_millis(ms)),
+		}
+	}
+
+	pub fn set_connect_timeout(&self, d: Option<Duration>) {
+		self.connect_timeout_ms.store(timeout_ms(d), std::sync::atomic::Ordering::Relaxed);
+	}
+
 	pub fn bind_as(&self, client: SocketAddr) -> Option<SocketAddr> {
 		(self.source_ip == SourceIp::Transparent).then_some(client)
 	}

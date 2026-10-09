@@ -1387,6 +1387,10 @@
             "maxItems": 16,
             "description": "More IP addresses to listen on with the same port or range (e.g. IPv6 next to an IPv4 listen_addr)."
           },
+          "listen_freebind": {
+            "type": "boolean",
+            "description": "Listen even while the addresses are not on the host (IP_FREEBIND / IPV6_FREEBIND), e.g. a VIP another node holds now (v0.4.3, features.listen_freebind). Cannot change by PATCH."
+          },
           "remote_addr": {
             "type": "string",
             "description": "Left out on http rules and rules with targets."
@@ -1409,6 +1413,10 @@
           },
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "connect_timeout": {
+            "type": "string",
+            "description": "How long a connection to a target may take before the next target is tried (tcp without http; 100ms-10m; v0.4.3, features.connect_timeout). Left out: 5s with other targets to fall back on, else the OS's."
           },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
@@ -1489,6 +1497,10 @@
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
           },
+          "connect_timeout": {
+            "type": "string",
+            "description": "Replaces connect_timeout when present (0s removes it; left out keeps it)."
+          },
           "udp_idle_secs": {
             "type": "integer",
             "minimum": 1,
@@ -1532,6 +1544,10 @@
             },
             "maxItems": 16,
             "description": "Replaces the extra listen addresses when present ([] removes them all; left out keeps them)."
+          },
+          "listen_freebind": {
+            "type": "boolean",
+            "description": "Cannot change; accepted only if it matches (like source_ip)."
           },
           "labels": {
             "$ref": "#/components/schemas/Labels"
@@ -1716,6 +1732,10 @@
             "maxItems": 16,
             "description": "Left out when empty."
           },
+          "listen_freebind": {
+            "type": "boolean",
+            "description": "Shown only when true."
+          },
           "remote_addr": {
             "type": "string"
           },
@@ -1735,6 +1755,10 @@
           },
           "health_check": {
             "$ref": "#/components/schemas/L4HealthCheck"
+          },
+          "connect_timeout": {
+            "type": "string",
+            "description": "Left out when not set."
           },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
@@ -2030,6 +2054,14 @@
               "tokens_reload": {
                 "type": "boolean",
                 "description": "The token file is re-read when it changes, without SIGHUP (RPROXY_TOKENS_CHECK_SECS; v0.4.2)"
+              },
+              "listen_freebind": {
+                "type": "boolean",
+                "description": "listen_freebind of a rule: listening on an address not on the host yet (IP_FREEBIND; v0.4.3)"
+              },
+              "connect_timeout": {
+                "type": "boolean",
+                "description": "connect_timeout of an L4 tcp rule (v0.4.3)"
               }
             }
           },

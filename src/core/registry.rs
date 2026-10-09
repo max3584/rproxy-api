@@ -296,12 +296,12 @@ fn bind_error(addr: SocketAddr, e: std::io::Error) -> ApiError {
 
 /// Binds every port of the rule on one address; all or nothing.
 fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
-	let v6only = spec.v6only();
+	let opts = crate::net::listen::Opts { v6only: spec.v6only(), freebind: spec.listen_freebind };
 	let addrs = (0..spec.port_count).map(|offset| SocketAddr::new(ip, spec.key.listen.port() + offset));
 	let bound = match spec.key.protocol {
 		Protocol::Tcp => Bound::Tcp(
 			addrs
-				.map(|addr| crate::net::listen::tcp(addr, v6only).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
+				.map(|addr| crate::net::listen::tcp(addr, opts).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
 		Protocol::Udp => {
@@ -309,7 +309,7 @@ fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
 			Bound::Udp(
 				addrs
 					.map(|addr| {
-						crate::net::listen::udp_shards(addr, v6only, shards)
+						crate::net::listen::udp_shards(addr, opts, shards)
 							.and_then(|group| group.into_iter().map(tokio::net::UdpSocket::from_std).collect())
 							.map_err(|e| bind_error(addr, e))
 					})
@@ -372,6 +372,20 @@ pub(crate) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
 	}
 	let (bs, av, bv) = (b.listen_ips(), a.v6only(), b.v6only());
 	a.listen_ips().into_iter().any(|x| bs.iter().any(|y| crate::net::listen::clash(x, av, *y, bv)))
+}
+
+/// The `already_exists` message for `spec` clashing with the rule `other`: which rule (and its rule
+/// set), and why a different address still clashes (a wildcard takes the port on every address).
+pub(crate) fn overlap_message(spec: &RuleSpec, other: &RuleSpec) -> String {
+	let mut m = format!("{} overlaps with {}", spec.key, other.key);
+	if let Some(set) = &other.ruleset {
+		m.push_str(&format!(" (rule set {set})"));
+	}
+	let wild = |s: &RuleSpec| s.listen_ips().iter().any(|ip| ip.is_unspecified());
+	if spec.key.listen.ip() != other.key.listen.ip() && (wild(spec) || wild(other)) {
+		m.push_str(": a rule on 0.0.0.0 / :: takes the port on every address; give both rules specific addresses (listen_freebind for addresses not on the host yet)");
+	}
+	m
 }
 
 /// A rule on `::`, whose socket takes IPv4 too unless it has extra addresses.
@@ -739,6 +753,8 @@ impl Registry {
 			http_stats: Default::default(),
 			h3: Default::default(),
 			listen: RwLock::new(spec.listen_ips()),
+			listen_freebind: spec.listen_freebind,
+			connect_timeout_ms: crate::core::proxy::timeout_ms(spec.connect_timeout).into(),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			denied_log: Default::default(),
@@ -813,8 +829,8 @@ impl Registry {
 		if rules.contains_key(&spec.key) {
 			return Err(ApiError::already_exists(spec.key.to_string()));
 		}
-		if let Some((other, _)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
-			return Err(ApiError::already_exists(format!("{} overlaps with {other}", spec.key)));
+		if let Some((_, e)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
+			return Err(ApiError::already_exists(overlap_message(&spec, e.spec())));
 		}
 		let key = spec.key;
 		let entry = Entry::Running(self.start(spec, prepared)?);
@@ -884,6 +900,9 @@ impl Registry {
 		if req.source_ip.is_some_and(|s| s != spec.source_ip) {
 			return Err(ApiError::unsupported("source_ip cannot be changed; delete and re-create the rule"));
 		}
+		if req.listen_freebind.is_some_and(|f| f != spec.listen_freebind) {
+			return Err(ApiError::unsupported("listen_freebind cannot be changed; delete and re-create the rule"));
+		}
 		if let Some(end) = req.listen_port_end {
 			if end != key.listen.port() + spec.port_count - 1 {
 				return Err(ApiError::unsupported("the port range cannot be changed; delete and re-create the rule"));
@@ -909,6 +928,9 @@ impl Registry {
 		}
 		if let Some(idle) = udp_idle {
 			spec.udp_idle = idle;
+		}
+		if let Some(t) = &req.connect_timeout {
+			spec.connect_timeout = crate::core::rule::validate_connect_timeout(Some(t), key.protocol, is_http)?;
 		}
 		let tls_changed = req.tls.is_some();
 		if let Some(tls) = req.tls {
@@ -981,10 +1003,8 @@ impl Registry {
 			if replacing != Some(&spec.key) && rules.contains_key(&spec.key) {
 				return Err(ApiError::already_exists(spec.key.to_string()));
 			}
-			if let Some((other, _)) =
-				rules.iter().find(|(k, e)| Some(*k) != replacing && **k != spec.key && overlaps(e.spec(), spec))
-			{
-				return Err(ApiError::already_exists(format!("{} overlaps with {other}", spec.key)));
+			if let Some((_, e)) = rules.iter().find(|(k, e)| Some(*k) != replacing && **k != spec.key && overlaps(e.spec(), spec)) {
+				return Err(ApiError::already_exists(overlap_message(spec, e.spec())));
 			}
 		}
 		self.build_parts(spec).map(|_| ())
@@ -1045,6 +1065,7 @@ impl Registry {
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
+				r.rt.set_connect_timeout(spec.connect_timeout);
 				// from the next connection / read on; what the limits count is kept
 				if r.spec.limits != spec.limits {
 					r.rt.limits.set(spec.limits.as_ref());

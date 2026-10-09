@@ -10,6 +10,7 @@
 | `cargo test --test self_update` | Self-update (#174): fetching and verifying from a signed release mirror (HTTPS), swapping in with a handoff, the launcher (`launch`), rollback. The test of signatures made by the minisign tool is skipped without `minisign` (`RPROXY_TEST_REQUIRE_MINISIGN=1` makes skipping a failure) | `test` (Alpine's `minisign`; `RPROXY_TEST_REQUIRE_MINISIGN=1`) |
 | `RPROXY_TEST_CRASH_ROUNDS=50 cargo test --test crash` | More rounds of the abnormal termination (SIGKILL) tests ("Abnormal termination" below; 3 each by default, the MariaDB ones only with `RPROXY_TEST_DATABASE_URL`) | Crash workflow (manual only) |
 | `scripts/test-transparent.sh` | The real path of `source_ip` (network namespaces; no root required) | `transparent` |
+| `scripts/test-freebind.sh` | The real path of `listen_freebind`: listening on addresses (VIPs) not on the host yet, which arrive once they are added; the same port on two VIPs (network namespaces; no root required) | `transparent` |
 | `cargo bench --bench '*'` | Performance benchmarks (`benches/`, criterion). `cargo test` runs each benchmark once to check that it still works | `test` (once), `Benchmarks` (comparison) |
 | `cargo +nightly fuzz run <target>` | Fuzzing the hand-written parsers (see "Fuzzing" below) | `fuzz` in the Fuzz workflow |
 | `scripts/load/run.sh` | Load and soak tests with large, long transfers (transfer efficiency; see "Load and soak tests" below) | Load workflow (manual only) |
@@ -374,8 +375,8 @@ Test files not covered by the sections above (see the description at the top of 
 |---|---|
 | `tests/check_config.rs` | `rproxy-api --check-config` (#140; a key readable by others is an error, fine with `global.files.owner_check: off`): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON |
 | `tests/startup.rs` | Starting the real binary: configuration mistakes stop it; problems in the environment (permissions, a busy port) leave it running in a restricted mode that recovers. TLS on the control API, reloads on SIGHUP, `GET /readyz` |
-| `tests/targets.rs` | Several destinations (#98): `targets`, `balance` (round_robin / least_conn / failover), `backup`, `health_check` (L4 and services of `http` rules). The default behaviour without `outlier_detection` |
-| `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99) |
+| `tests/targets.rs` | Several destinations (#98): `targets`, `balance` (round_robin / least_conn / failover), `backup`, `health_check` (L4 and services of `http` rules). The default behaviour without `outlier_detection`. `connect_timeout` (v0.4.3; a target that drops SYNs) |
+| `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99); listening on addresses not on the host yet (`listen_freebind`, v0.4.3; the real path is `scripts/test-freebind.sh`) |
 | `tests/udp_shards.rs` | Reading a UDP port with several `SO_REUSEPORT` sockets (#194): no session opened twice, the reply source (#137), counters add up |
 | `tests/udp_source.rs` | UDP replies on wildcard listeners leave from the address the client sent to (#137; to 127.0.0.2) |
 | `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends |

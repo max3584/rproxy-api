@@ -191,3 +191,17 @@ rproxy-gateway が名乗っていない Gateway API の機能（rproxy-gateway �
 - 試験：単体（`ext_authz` の組み立てと読み取り、`copy_answer` の `["*"]`）、`tests/ext_authz.rs`（Envoy の HTTP の形：メソッド・パス・Host・`Content-Length`・本文・ヘッダの選び方・`["*"]`・200 だけ・413、gRPC：`address` と `service`、ヘッダの付け外し・応答に足すヘッダ・断り・gRPC の誤り、転送先ごと、断る形）。
 - 守り：認証サーバへのヘッダは今までどおりクライアントの証明書のヘッダを rproxy の見たものにする（#238）。gRPC の `ok_response` が `Host` を変える・外すことは受け付けない（ルートを選んだ後の宛先を変えさせない）。
 
+## 8. G. Kubernetes の fleet の VIP とノードの喪失（v0.4.3）
+
+rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かった 2 つの穴のうち、rproxy-api の分。gateway の側は rproxy-gateway の docs/DESIGN-v0.4.x.md に書く。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| まだホストにない VIP で待ち受ける | ルールの `listen_freebind: true`（`IP_FREEBIND` / `IPV6_FREEBIND`） | `listen_freebind`（Linux） | false（今までどおり、ホストにないアドレスは bind に失敗） |
+| 止まったノードの宛先を早く諦める | L4 の `tcp` のルールの `connect_timeout`（`100ms`〜`10m`） | `connect_timeout` | なし（ほかに宛先があれば 5 秒、なければ OS の既定） |
+
+- `listen_freebind` は自動にしない（「ホストにないアドレスなら自動で」は、打ち間違えたアドレスを黙って受け付ける）。権限は要らないので、`IP_TRANSPARENT`（`CAP_NET_ADMIN`）は使わない。ルールごとの印にしたのは、fleet の Pod を作り直さずにコントローラが Gateway ごとに選べるように（プロセス全体の設定にすると DaemonSet の入れ替えが要る）。
+- `0.0.0.0` / `::` と同じポートの特定のアドレス：今までどおり `409 already_exists` で断る（`SO_REUSEADDR` で狭いほうが勝つ形にはしない。届く先がアドレスの有無で変わり、取り合いが見えなくなる）。誤りの文に、重なる相手のルールの組と理由を足した。
+- `connect_timeout` は PATCH でその場で変えられる（次の接続から）。`listen_freebind` は変えられない（ソケットを開き直すので作り直し）。
+- 引き継ぎ・保存：ルールの形に足すだけ（`GET /rules` の形・`rproxy_rules.spec` に入る。古いパッチは知らない項目を無視して読む）。
+- 試験：`scripts/test-freebind.sh`（名前空間の実経路。CI の transparent のジョブ）、`tests/listen.rs`、`tests/targets.rs`（SYN を捨てる宛先）。
