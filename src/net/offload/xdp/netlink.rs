@@ -17,6 +17,8 @@ const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
+const IFLA_NUM_TX_QUEUES: u16 = 31;
+const IFLA_NUM_RX_QUEUES: u16 = 32;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
 const VETH_INFO_PEER: u16 = 1;
@@ -123,16 +125,22 @@ impl Rtnl {
 		}
 	}
 
-	/// Creates the veth pair `a` <-> `b`.
+	/// Creates the veth pair `a` <-> `b` with one TX and one RX queue on each
+	/// end (veth defaults to one queue per CPU, and a datagram then lands on
+	/// whichever RX queue matches the sender's CPU — not only queue 0).
 	pub fn add_veth(&mut self, a: &str, b: &str) -> io::Result<()> {
 		let mut body = ifinfomsg(0, 0, 0);
 		attr(&mut body, IFLA_IFNAME, &cstr(a));
+		attr(&mut body, IFLA_NUM_TX_QUEUES, &1u32.to_ne_bytes());
+		attr(&mut body, IFLA_NUM_RX_QUEUES, &1u32.to_ne_bytes());
 		nested(&mut body, IFLA_LINKINFO, |li| {
 			attr(li, IFLA_INFO_KIND, b"veth");
 			nested(li, IFLA_INFO_DATA, |data| {
 				nested(data, VETH_INFO_PEER, |peer| {
 					peer.extend_from_slice(&ifinfomsg(0, 0, 0));
 					attr(peer, IFLA_IFNAME, &cstr(b));
+					attr(peer, IFLA_NUM_TX_QUEUES, &1u32.to_ne_bytes());
+					attr(peer, IFLA_NUM_RX_QUEUES, &1u32.to_ne_bytes());
 				});
 			});
 		});
