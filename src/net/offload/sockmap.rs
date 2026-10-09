@@ -307,12 +307,11 @@ pub fn bytes_written(sock: BorrowedFd<'_>) -> io::Result<u64> {
 /// Whether everything `src` received since `rx0` has reached `dst`'s send
 /// queue since `w0` (the redirect goes through a backlog, so a FIN passed on
 /// earlier could overtake data). Called after `src` read EOF: its FIN counts
-/// one in `tcpi_bytes_received` and is not data. An error on `dst` is returned.
+/// one in `tcpi_bytes_received` and is not data.
 pub fn flushed(src: BorrowedFd<'_>, rx0: u64, dst: BorrowedFd<'_>, w0: u64) -> io::Result<bool> {
-	let err = so_error(dst);
-	if err != 0 {
-		return Err(io::Error::from_raw_os_error(err));
-	}
+	// data only (not the error state; a simultaneous close sets a transient
+	// error that is not a relay failure). The FIN takes one of src's received
+	// sequence numbers and is not data.
 	let moved = bytes_received(src)?.saturating_sub(rx0).saturating_sub(1);
 	let put = bytes_written(dst)?.saturating_sub(w0);
 	Ok(put >= moved)

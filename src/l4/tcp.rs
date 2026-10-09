@@ -363,6 +363,8 @@ async fn drain_eof(s: &mut TcpStream) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 async fn pass_fin(src: RawFd, rx0: u64, dst: RawFd, w0: u64) -> io::Result<()> {
 	use crate::net::offload::sockmap;
+	// wait until the redirect delivered everything `src` sent to `dst`'s queue
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
 	let mut wait = Duration::from_millis(1);
 	loop {
 		// SAFETY: both sockets are borrowed by `sockmap_relay` for this whole call
@@ -370,13 +372,18 @@ async fn pass_fin(src: RawFd, rx0: u64, dst: RawFd, w0: u64) -> io::Result<()> {
 		if sockmap::flushed(s, rx0, d, w0)? {
 			break;
 		}
+		if tokio::time::Instant::now() >= deadline {
+			return Err(io::Error::other("sockmap: redirected data did not reach the backend"));
+		}
 		tokio::time::sleep(wait).await;
 		wait = (wait * 2).min(Duration::from_millis(50));
 	}
+	// Best effort: the data is through, so passing the half-close on is all that
+	// is left. The peer may already have closed the whole connection (both sides
+	// closing at once), which makes shutdown fail with ENOTCONN/EPIPE/EBADF —
+	// not a relay failure. A real reset shows up as an error on `drain_eof`.
 	// SAFETY: as above
-	if unsafe { libc::shutdown(dst, libc::SHUT_WR) } != 0 {
-		return Err(io::Error::last_os_error());
-	}
+	unsafe { libc::shutdown(dst, libc::SHUT_WR) };
 	Ok(())
 }
 
