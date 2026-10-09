@@ -20,6 +20,7 @@
 | D1. #240 certificate API | v0.4.2 | `cert_store` | not used | no screen yet |
 | D2. #241 persisting rule sets | v0.4.2 | `ruleset_persistence` | not used | migration 012, read-only view |
 | G1. 421 Misdirected Request (7.1) | v0.4.3 | `misdirected` in `http_options` | the names of the HTTPS listeners on one port go to `tls.misdirected` (`GatewayHTTPSListenerDetectMisdirectedRequests`, v0.4.5) | — |
+| G2. Per-server `cors`, redirects and `mirror` (7.2) | v0.4.3 | `server_middleware_kinds` | the `CORS`, `RequestRedirect` and `RequestMirror` filters on backendRefs (v0.4.5) | — |
 
 ## 2. E. Shutting down on SIGTERM (v0.4.1)
 
@@ -168,4 +169,13 @@ The Gateway API features rproxy-gateway does not claim yet ("Not claimed" in rpr
 - Where: `Conn::handle` in `server.rs`, before choosing a route. No route and no middleware runs (another listener's middlewares, authentication for one, do not run under this connection's name). The same for HTTP/1.1, HTTP/2 and HTTP/3 (421 is fine over HTTP/1.1 too).
 - Validation: only rules with `http` and `tls.mode: terminate`; a pattern may appear once. `features`: `misdirected` in `http_options`.
 - Tests: unit (the cases of the conformance test), `tests/gateway_l7.rs` (several `:authority` values on one HTTP/2 connection, HTTP/1.1).
+
+### 7.2 Per-server `cors`, redirects and `mirror`
+
+- The problem: the Gateway API's `filters` on a backendRef (applied only when sending to that backend) map to rproxy's `servers[].middlewares` (#229), but those allowed rewriting kinds only (`headers`, `replace_host`, path rewrites), so routes with `CORS`, `RequestRedirect` or `RequestMirror` filters on a backendRef were `UnsupportedValue`.
+- Shape: `cors`, `redirect_scheme`, `redirect_regex` and `mirror` join the kinds `servers[].middlewares` may use (no new shape). `features.server_middleware_kinds` lists the allowed kinds (the controller tells older rproxies by it; `server_middlewares` in `http_options` stays as it was).
+- `cors` and redirects already answer in `on_request` and add headers in `on_response`, so they run as they are in the per-server step of `forward` in `server.rs` (an answer is not retried).
+- `mirror` needs the copy's body and the target service, so `forward` handles it. Once a server is picked, its middlewares run in order and a `mirror` copies the request as it is then (after the headers for the backend, `X-Forwarded-*` and the certificate's, so they are not added again when the copy is sent: `mirror::Copy.forwarded`). Of `retry` attempts, only the first that lands on a server with a `mirror` copies (once per request).
+- The target service must be compiled first (`Service::compile_with`): services whose servers have a `mirror` are compiled after the others, and a `mirror` to a service whose servers have a `mirror` themselves is refused (copies are not copied, and the order is settled).
+- Tests: `per_server_cors_redirects_and_mirrors` in `tests/gateway_l7.rs` (of two servers, one with CORS and a copy, the other a redirect; copies only for requests sent to that server, one `X-Forwarded-For`, the body's length, preflights, the refused shapes).
 

@@ -146,6 +146,9 @@ pub struct Features {
 	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`; `misdirected`
 	/// (`tls.misdirected`, v0.4.3)
 	pub http_options: &'static [&'static str],
+	/// Middleware kinds that `servers[].middlewares` may use (#229; `cors`, `redirect_scheme`,
+	/// `redirect_regex` and `mirror` since v0.4.3)
+	pub server_middleware_kinds: &'static [&'static str],
 	/// `targets` and `balance` of `tls.routes[]` (#234)
 	pub tls_route_targets: bool,
 	/// Modes of `tls.client_auth` that can run (`optional_no_verify`, #238)
@@ -213,6 +216,7 @@ impl Features {
 		],
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
+		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
 		tls_route_targets: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
@@ -252,6 +256,7 @@ impl Features {
 		],
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
+		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
 		tls_route_targets: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,

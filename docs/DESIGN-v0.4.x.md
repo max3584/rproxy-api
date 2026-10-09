@@ -20,6 +20,7 @@ English: [DESIGN-v0.4.x.md](en/DESIGN-v0.4.x.md)
 | D1. #240 証明書の API | v0.4.2 | `cert_store` | 使わない | 画面は作らない（後で） |
 | D2. #241 組の保存 | v0.4.2 | `ruleset_persistence` | 使わない | migration 012、読むだけの表示 |
 | G1. 421 Misdirected Request（7.1） | v0.4.3 | `http_options` の `misdirected` | 同じポートの HTTPS のリスナーの名前を `tls.misdirected` に（`GatewayHTTPSListenerDetectMisdirectedRequests`、v0.4.5） | — |
+| G2. 転送先ごとの `cors`・リダイレクト・`mirror`（7.2） | v0.4.3 | `server_middleware_kinds` | backendRef の `CORS`・`RequestRedirect`・`RequestMirror` のフィルタ（v0.4.5） | — |
 
 ## 2. E. SIGTERM での終わり方（v0.4.1）
 
@@ -168,4 +169,13 @@ rproxy-gateway が名乗っていない Gateway API の機能（rproxy-gateway �
 - どこで：`server.rs` の `Conn::handle` で、ルートを選ぶ前に。ルートもミドルウェアも通らない（ほかのリスナーのルートのミドルウェア（認証など）を、この接続の名前で動かさない）。HTTP/1.1・HTTP/2・HTTP/3 のどれも同じ（421 は HTTP/1.1 でも正しい）。
 - 検証：`http` と `tls.mode: terminate` のルールだけ。同じパターンを 2 か所に書けない。`features`：`http_options` の `misdirected`。
 - 試験：単体（conformance の組み合わせ）、`tests/gateway_l7.rs`（1 つの HTTP/2 の接続で複数の `:authority`、HTTP/1.1）。
+
+### 7.2 転送先ごとの `cors`・リダイレクト・`mirror`
+
+- 困ること：Gateway API の backendRef の `filters`（その backend に送るときだけ働く）は、rproxy の `servers[].middlewares`（#229）に写しているが、使える種類が書き換えだけ（`headers`・`replace_host`・パスの書き換え）なので、`CORS`・`RequestRedirect`・`RequestMirror` のフィルタのルートは `UnsupportedValue` だった。
+- 形：`servers[].middlewares` に使える種類へ `cors`・`redirect_scheme`・`redirect_regex`・`mirror` を足す（形は増やさない）。`features.server_middleware_kinds` に使える種類の一覧（コントローラはこれで古い rproxy を見分ける。`http_options` の `server_middlewares` は前のまま）。
+- `cors`・リダイレクト：もともと `on_request` で答え、`on_response` でヘッダを付けるので、`server.rs` の `forward` の転送先ごとの処理でそのまま動く（答えたら送り直さない）。
+- `mirror`：写しの本文と送り先のサービスが要るので `forward` が扱う。転送先を選んだ後、その転送先のミドルウェアを順に通し、`mirror` のところでその時の形を写す（転送先へのヘッダ（`X-Forwarded-*`・証明書）を付けた後なので、写しを送るときに付け直さない：`mirror::Copy.forwarded`）。`retry` の送り直しでは、最初に `mirror` のある転送先に当たったときだけ写す（1 つのリクエストで 1 回）。
+- 写しの先のサービスは先に組み立てる必要がある（`Service::compile_with`）。転送先が `mirror` を持つサービスを後に組み立て、`mirror` の先のサービスの転送先が自分で `mirror` を持つことは断る（写しを写さない。順が決まる）。
+- 試験：`tests/gateway_l7.rs` の `per_server_cors_redirects_and_mirrors`（2 つの転送先の片方が CORS と写し、片方がリダイレクト。写しは送った転送先の分だけ・`X-Forwarded-For` は 1 つ・本文の長さ、プリフライト、断る形）。
 

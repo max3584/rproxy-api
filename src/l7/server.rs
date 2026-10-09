@@ -126,8 +126,12 @@ impl std::fmt::Debug for Router {
 impl Router {
 	pub fn compile(spec: &HttpSpec, upstream: &Upstream, lookup: Lookup) -> Result<Router, ApiError> {
 		let mut services = std::collections::HashMap::new();
-		for (name, s) in &spec.services {
-			let mut service = Service::compile(name, s, &spec.middlewares)?;
+		// services whose servers copy requests (a server's `mirror`) need the services they copy
+		// to: compiled after the others (validation keeps those from copying again)
+		let copies = |s: &super::ServiceSpec| super::copies_per_server(s, &spec.middlewares);
+		let ordered = spec.services.iter().filter(|(_, s)| !copies(s)).chain(spec.services.iter().filter(|(_, s)| copies(s)));
+		for (name, s) in ordered {
+			let mut service = Service::compile_with(name, s, &spec.middlewares, &services)?;
 			// HTTP/2 over the rule's tls.upstream: its own ALPN
 			if service.tls.is_none() && !service.protocol.is_default() && service.servers.iter().any(|v| v.https) {
 				let config = (*crate::tls::config::client_config(upstream)?).clone();
@@ -780,6 +784,7 @@ impl Conn {
 							headers: parts.headers.clone(),
 							client_ip,
 							host: host.clone(),
+							forwarded: false,
 						});
 					}
 					None
@@ -1056,6 +1061,8 @@ impl Conn {
 		let mut first = Some((parts, body));
 
 		let mut attempt = 0;
+		// a server's `mirror` copies once, on the first attempt that reaches such a server
+		let mut mirrored = false;
 		let (mut resp, index, counted) = loop {
 			attempt += 1;
 			let Some(index) = service.pick(sticky.as_deref()) else {
@@ -1079,7 +1086,7 @@ impl Conn {
 				}
 				break (error_response(status), index, counted);
 			}
-			let (mut p, body) = match first.take() {
+			let (mut p, mut body) = match first.take() {
 				Some((p, body)) => (p, match &replay {
 					Some(bytes) => full_body(bytes.clone()),
 					None => body,
@@ -1096,9 +1103,51 @@ impl Conn {
 			};
 			p.uri = Uri::from(path_and_query.clone());
 			p.version = Version::HTTP_11;
-			// the server's own middlewares (#229), after the route's
-			if let Some(answer) = server.middlewares.iter().find_map(|m| m.on_request(&mut p, ctx)) {
+			// the server's own middlewares (#229), after the route's; a server's `mirror`
+			// (v0.4.3) copies the request as it is at that point, once per request
+			let mut copies = vec![];
+			let mut answered = None;
+			for m in &server.middlewares {
+				if let Middleware::Mirror { name, service: to, share } = m.as_ref() {
+					if !mirrored && share.take() {
+						let mut headers = p.headers.clone();
+						if let Some(h) = &original_host {
+							headers.insert(header::HOST, h.clone());
+						}
+						copies.push(mirror::Copy {
+							name: name.clone(),
+							service: to.clone(),
+							method: p.method.clone(),
+							uri: p.uri.clone(),
+							headers,
+							client_ip,
+							host: host.to_string(),
+							forwarded: true,
+						});
+					}
+					continue;
+				}
+				if let Some(answer) = m.on_request(&mut p, ctx) {
+					answered = Some(answer);
+					break;
+				}
+			}
+			if let Some(answer) = answered {
 				break (answer, index, counted);
+			}
+			if !copies.is_empty() {
+				mirrored = true;
+				let bodies = match &replay {
+					Some(bytes) => (0..copies.len()).map(|_| full_body(bytes.clone())).collect(),
+					None => {
+						let (main, bodies) = mirror::tee(body, copies.len());
+						body = main;
+						bodies
+					}
+				};
+				for (copy, b) in copies.into_iter().zip(bodies) {
+					self.mirror(router.clone(), copy, b);
+				}
 			}
 			if !server.prefix.is_empty() {
 				let pq = p.uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
@@ -1211,8 +1260,11 @@ impl Conn {
 		let original_host = request_authority(&copy.uri, &copy.headers);
 		let mut headers = copy.headers;
 		strip_hop_by_hop(&mut headers);
-		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238)
-		self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238);
+		// a server's copy has them already
+		if !copy.forwarded {
+			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+		}
 		headers.insert(header::HOST, host);
 		let mut req = Request::new(body);
 		*req.method_mut() = copy.method;
@@ -1431,7 +1483,7 @@ impl Conn {
 
 /// Where `forward` sends a request.
 struct Target<'a> {
-	router: &'a Router,
+	router: &'a Arc<Router>,
 	service: &'a Arc<Service>,
 	route: &'a str,
 	host: &'a str,
