@@ -1,0 +1,25 @@
+# The DPDK data plane experiment (#261): L4 UDP forwarding without the kernel.
+# Optional and separate: rproxy-api uses it only with its `dpdk` feature, which
+# is in neither the default build nor the release targets (docs/PERFORMANCE.md).
+# Without the `ffi` feature this crate is pure Rust (frame parsing, the
+# forwarder, the startup check's scenario) and needs no DPDK: its tests run in
+# the normal CI, and the fuzz target uses it.
+[package]
+name = "rproxy-dpdk"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "DPDK UDP forwarding for rproxy-api (experimental)"
+
+[features]
+default = []
+# links DPDK (pkg-config libdpdk) through a small C shim (src/shim.c)
+ffi = ["dep:cc", "dep:pkg-config"]
+
+[dependencies]
+tracing = "0.1.44"
+
+[build-dependencies]
+cc = { version = "1.6.0", optional = true }
+pkg-config = { version = "0.3.34", optional = true }

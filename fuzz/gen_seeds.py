@@ -216,6 +216,57 @@ def main():
     head = struct.pack(">HHHHHH", 0x1234, 0xA800, 1, 0, 0, 1)
     put("tsig_answer", "signed", head + name("example.com") + struct.pack(">HH", 6, 1) + tsig)
     put("tsig_answer", "unsigned-notauth", struct.pack(">HHHHHH", 0x1234, 0xA809, 1, 0, 0, 0) + name("example.com") + struct.pack(">HH", 6, 1))
+    dpdk_seeds()
+
+
+def dpdk_seeds():
+    """dpdk_packet: Ethernet frames as the DPDK path receives them (#261)."""
+
+    def csum(data):
+        if len(data) % 2:
+            data += b"\0"
+        s = sum(struct.unpack(f">{len(data) // 2}H", data))
+        while s > 0xFFFF:
+            s = (s & 0xFFFF) + (s >> 16)
+        return ~s & 0xFFFF
+
+    def ip(a):
+        return bytes(int(x) for x in a.split("."))
+
+    ours, client_mac, backend_mac = bytes.fromhex("0200000000aa"), bytes.fromhex("020000000003"), bytes.fromhex("020000000002")
+
+    def eth(dst, src, ethertype, body):
+        return dst + src + struct.pack(">H", ethertype) + body
+
+    def ipv4(src, dst, proto, body, frag=0x4000):
+        head = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(body), 1, frag, 64, proto, 0, ip(src), ip(dst))
+        head = head[:10] + struct.pack(">H", csum(head)) + head[12:]
+        return head + body
+
+    def udp(src, sport, dst, dport, payload, checksum=True):
+        body = struct.pack(">HHHH", sport, dport, 8 + len(payload), 0) + payload
+        if checksum:
+            pseudo = ip(src) + ip(dst) + struct.pack(">BBH", 0, 17, len(body))
+            c = csum(pseudo + body) or 0xFFFF
+            body = body[:6] + struct.pack(">H", c) + body[8:]
+        return ipv4(src, dst, 17, body)
+
+    def arp(op, smac, sip, tip):
+        return eth(b"\xff" * 6 if op == 1 else ours, smac, 0x0806,
+                   struct.pack(">HHBBH", 1, 0x0800, 6, 4, op) + smac + ip(sip) + bytes(6) + ip(tip) + bytes(18))
+
+    req = arp(1, client_mac, "10.0.0.30", "10.0.0.10")
+    reply = arp(2, backend_mac, "10.0.0.20", "10.0.0.10")
+    first = eth(ours, client_mac, 0x0800, udp("10.0.0.30", 40000, "10.0.0.10", 5001, b"hello"))
+    odd = eth(ours, client_mac, 0x0800, udp("10.0.0.30", 40000, "10.0.0.10", 5001, b"odd", checksum=False))
+    answer = eth(ours, backend_mac, 0x0800, udp("10.0.0.20", 6001, "10.0.0.10", 32768, b"world"))
+    icmp = struct.pack(">BBHHH", 8, 0, 0, 1, 1) + b"ping"
+    icmp = icmp[:2] + struct.pack(">H", csum(icmp)) + icmp[4:]
+    ping = eth(ours, client_mac, 0x0800, ipv4("10.0.0.30", "10.0.0.10", 1, icmp))
+    frag = eth(ours, client_mac, 0x0800, udp("10.0.0.30", 1, "10.0.0.10", 5000, b"x")[:6] + b"\x20\x00" + udp("10.0.0.30", 1, "10.0.0.10", 5000, b"x")[8:])
+    put("dpdk_packet", "arp-then-udp", framed([req, reply, first, first, answer]))
+    put("dpdk_packet", "no-checksum", framed([reply, odd, odd]))
+    put("dpdk_packet", "ping-fragment", framed([ping, frag]))
 
 
 if __name__ == "__main__":

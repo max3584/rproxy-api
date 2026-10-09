@@ -14,6 +14,8 @@ rproxy-api は root やネットワークの強い権限を持つホストで動
 
 カーネルでの転送（`global.performance.xdp`、#260。既定は off）を使うときだけ、さらに `CAP_BPF`（5.8 より前のカーネルは `CAP_SYS_ADMIN`）と `CAP_NET_ADMIN`、AF_XDP には `CAP_NET_RAW` が要る。ユニットは既定ではこれらを与えないので、使うときに `systemctl edit rproxy-api` で `AmbientCapabilities` と `CapabilityBoundingSet` に足す。足りなければ起動時の試験に通らず、`degraded`（`reason: missing CAP_BPF ...`）を出して今の処理で動く。`rproxy-api --check-kernel` で事前に確かめられる。
 
+DPDK のデータプレーン（`global.performance.dpdk`、#261。`--features dpdk` のビルドだけ、既定は off）は、NIC を vfio-pci に付け替え（root の作業）、ヒュージページ（hugetlbfs）と `/dev/vfio/*` を開ける必要がある。実験の間は root で動かす前提（root 以外で動かすなら `/dev/vfio/<グループ>` と hugetlbfs のマウントの所有者を rproxy にし、`CAP_IPC_LOCK`、`net_tap` を使うなら `CAP_NET_ADMIN`）。手順は docs/PERFORMANCE.md の「DPDK」。
+
 どちらの権限を外しても rproxy-api は起動し、ほかのルールはそのまま動く（CI の `install.sh` ジョブで、drop-in で両方を外した状態を確かめている）。固定ルールのファイルで起動を止めるのは書き方の誤り（アドレスが不正、ルール同士の重なりなど）だけで、権限が足りないだけのルールでは止めない。
 
 - どちらもユニット（`/usr/lib/systemd/system/rproxy-api.service`、install.sh のバイナリなら `/etc/systemd/system/`）の `AmbientCapabilities` と `CapabilityBoundingSet` で与えている。ほかの capability は持たない。

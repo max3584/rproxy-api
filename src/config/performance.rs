@@ -42,6 +42,9 @@ pub struct PerformanceSpec {
 	/// XDP / AF_XDP for L4 UDP (#260).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub xdp: Option<super::offload::XdpSpec>,
+	/// The DPDK data plane for L4 UDP (#261): builds with the `dpdk` feature only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub dpdk: Option<DpdkSpec>,
 }
 
 /// `udp_shards`: a count or `auto`.
@@ -91,6 +94,229 @@ pub struct SpliceSpec {
 	pub pipe_size: Option<Size>,
 }
 
+/// `global.performance.dpdk` (#261, docs/PERFORMANCE.md): UDP rules on the
+/// addresses of these ports are forwarded by DPDK lcores instead of the kernel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpdkSpec {
+	/// Off by default.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enabled: Option<bool>,
+	/// Passed to the EAL as they are (after the ones rproxy makes: -l, -a / --no-pci, --vdev).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub eal_args: Vec<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub ports: Vec<DpdkPortSpec>,
+	/// The CPUs of the forwarding lcores (`"2-5"`); required when enabled.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lcores: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mempool: Option<DpdkMempool>,
+	/// Checked before the EAL starts (the host sets them up).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hugepages: Option<DpdkHugepages>,
+	/// Frames received / sent at once (1-512, default 32).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub burst: Option<u32>,
+	/// When DPDK cannot be used: true (default) goes on with the kernel path, false stops the start.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fallback: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpdkPortSpec {
+	/// A PCI address bound to vfio-pci (`"0000:3b:00.0"`) ...
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pci: Option<String>,
+	/// ... or a virtual device (`"net_tap0,iface=dtap0"`, `"net_af_packet0,iface=eth1"`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vdev: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rx_queues: Option<u16>,
+	/// At least one per lcore (each lcore sends on its own queue).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tx_queues: Option<u16>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rx_desc: Option<u16>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tx_desc: Option<u16>,
+	/// The port's IPv4 addresses with prefix (`"198.51.100.2/24"`); rules listen on them.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub addresses: Vec<String>,
+	/// The next hop for backends off the port's links.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub gateway: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpdkMempool {
+	/// mbufs in the pool (default 65535; 2^n - 1 is best).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mbufs: Option<u32>,
+	/// Per-lcore cache (default 256, at most 512).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpdkHugepages {
+	/// `2MB` (default) or `1GB`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub size: Option<String>,
+}
+
+pub const DPDK_MAX_QUEUES: u16 = 64;
+pub const DPDK_MAX_BURST: u32 = 512;
+/// The pre-check's loopback port (`net_ring`), added to the EAL by rproxy.
+pub const DPDK_CHECK_PORT: &str = "net_ring_rpchk";
+
+impl DpdkPortSpec {
+	/// The name DPDK gives the port: the PCI address, or the vdev's name.
+	pub fn name(&self) -> String {
+		match (&self.pci, &self.vdev) {
+			(Some(pci), _) => pci.trim().to_string(),
+			(None, Some(v)) => v.split(',').next().unwrap_or_default().trim().to_string(),
+			(None, None) => String::new(),
+		}
+	}
+
+	pub fn queues(&self) -> (u16, u16, u16, u16) {
+		(self.rx_queues.unwrap_or(1), self.tx_queues.unwrap_or(1), self.rx_desc.unwrap_or(1024), self.tx_desc.unwrap_or(1024))
+	}
+}
+
+/// `"a.b.c.d/len"`.
+pub fn parse_ipv4_cidr(s: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+	let bad = || format!("{s:?} is not an IPv4 address with a prefix length (e.g. 198.51.100.2/24)");
+	let (ip, len) = s.trim().split_once('/').ok_or_else(bad)?;
+	let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| bad())?;
+	let len: u8 = len.parse().map_err(|_| bad())?;
+	if len == 0 || len > 32 || ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+		return Err(bad());
+	}
+	Ok((ip, len))
+}
+
+/// The hugepage size in KiB (`2MB` / `1GB`).
+pub fn hugepage_kib(size: Option<&str>) -> Result<u64, String> {
+	match size.map(|s| s.trim().to_ascii_uppercase()).as_deref() {
+		None | Some("2MB") | Some("2MIB") | Some("2M") => Ok(2048),
+		Some("1GB") | Some("1GIB") | Some("1G") => Ok(1 << 20),
+		Some(other) => Err(format!("{other:?} is not a hugepage size (2MB or 1GB)")),
+	}
+}
+
+impl DpdkSpec {
+	pub fn enabled(&self) -> bool {
+		self.enabled.unwrap_or(false)
+	}
+
+	pub fn fallback(&self) -> bool {
+		self.fallback.unwrap_or(true)
+	}
+
+	pub fn burst(&self) -> usize {
+		self.burst.unwrap_or(32) as usize
+	}
+
+	pub fn mempool(&self) -> (u32, u32) {
+		let m = self.mempool.clone().unwrap_or_default();
+		(m.mbufs.unwrap_or(65535), m.cache.unwrap_or(256))
+	}
+
+	pub fn check(&self) -> Result<(), String> {
+		let p = "global.performance.dpdk";
+		let lcores = match &self.lcores {
+			Some(l) => Some(parse_cpu_list(l).map_err(|e| format!("{p}.lcores: {e}"))?),
+			None if self.enabled() => return Err(format!("{p}.lcores is required: the CPUs the forwarding lcores take (e.g. \"2-5\")")),
+			None => None,
+		};
+		if self.enabled() && self.ports.is_empty() {
+			return Err(format!("{p}.ports: give at least one port"));
+		}
+		for a in &self.eal_args {
+			let flag = a.split('=').next().unwrap_or_default();
+			if ["-l", "-c", "--lcores", "--main-lcore", "-a", "--allow", "--vdev"].contains(&flag) {
+				return Err(format!("{p}.eal_args: {flag} comes from lcores / ports; give it there"));
+			}
+		}
+		let mut seen = vec![];
+		for (i, port) in self.ports.iter().enumerate() {
+			let at = format!("{p}.ports[{i}]");
+			match (&port.pci, &port.vdev) {
+				(Some(_), Some(_)) | (None, None) => return Err(format!("{at}: give pci or vdev (one of them)")),
+				(Some(pci), None) if pci.trim().is_empty() || pci.contains(char::is_whitespace) => return Err(format!("{at}.pci {pci:?} is not a PCI address")),
+				(None, Some(v)) if !v.starts_with("net_") || v.contains(char::is_whitespace) => {
+					return Err(format!("{at}.vdev {v:?} is not a DPDK virtual device (net_tap0,iface=..., net_af_packet0,iface=..., net_memif0,...)"))
+				}
+				_ => {}
+			}
+			if port.name() == DPDK_CHECK_PORT {
+				return Err(format!("{at}: {DPDK_CHECK_PORT} is rproxy's own check port"));
+			}
+			let (rxq, txq, rxd, txd) = port.queues();
+			for (key, n) in [("rx_queues", rxq), ("tx_queues", txq)] {
+				if n == 0 || n > DPDK_MAX_QUEUES {
+					return Err(format!("{at}.{key} must be 1-{DPDK_MAX_QUEUES}"));
+				}
+			}
+			for (key, n) in [("rx_desc", rxd), ("tx_desc", txd)] {
+				if !(64..=16384).contains(&n) {
+					return Err(format!("{at}.{key} must be 64-16384"));
+				}
+			}
+			if let Some(l) = &lcores {
+				if usize::from(txq) < l.len() {
+					return Err(format!("{at}.tx_queues ({txq}) must be at least the number of lcores ({}): each lcore sends on its own queue", l.len()));
+				}
+			}
+			if self.enabled() && port.addresses.is_empty() {
+				return Err(format!("{at}.addresses: give the port's IPv4 address(es), e.g. [\"198.51.100.2/24\"]"));
+			}
+			let mut nets = vec![];
+			for a in &port.addresses {
+				let (ip, len) = parse_ipv4_cidr(a).map_err(|e| format!("{at}.addresses: {e}"))?;
+				if seen.contains(&ip) {
+					return Err(format!("{at}.addresses: {ip} is given twice"));
+				}
+				seen.push(ip);
+				nets.push((ip, len));
+			}
+			if let Some(gw) = &port.gateway {
+				let gw: std::net::Ipv4Addr = gw.trim().parse().map_err(|_| format!("{at}.gateway {gw:?} is not an IPv4 address"))?;
+				let on_link = nets.iter().any(|(ip, len)| {
+					let mask = u32::MAX << (32 - u32::from(*len));
+					u32::from(gw) & mask == u32::from(*ip) & mask
+				});
+				if !on_link {
+					return Err(format!("{at}.gateway {gw} is on none of the port's networks"));
+				}
+			}
+		}
+		let names: Vec<String> = self.ports.iter().map(|p| p.name()).collect();
+		if let Some(dup) = names.iter().enumerate().find_map(|(i, n)| names[..i].contains(n).then_some(n)) {
+			return Err(format!("{p}.ports: {dup} is given twice"));
+		}
+		let (mbufs, cache) = self.mempool();
+		if !(1023..=(16 << 20)).contains(&mbufs) {
+			return Err(format!("{p}.mempool.mbufs must be 1023-16777216"));
+		}
+		if cache > 512 || cache as f64 > f64::from(mbufs) / 1.5 {
+			return Err(format!("{p}.mempool.cache must be at most 512 and mbufs / 1.5"));
+		}
+		if let Some(h) = &self.hugepages {
+			hugepage_kib(h.size.as_deref()).map_err(|e| format!("{p}.hugepages.size: {e}"))?;
+		}
+		if self.burst.is_some_and(|b| b == 0 || b > DPDK_MAX_BURST) {
+			return Err(format!("{p}.burst must be 1-{DPDK_MAX_BURST}"));
+		}
+		Ok(())
+	}
+}
+
 /// Parses a CPU list: `"0-3,6"`.
 pub fn parse_cpu_list(s: &str) -> Result<Vec<usize>, String> {
 	let bad = || format!("{s:?} is not a CPU list (e.g. 0-3,6)");
@@ -136,6 +362,17 @@ impl PerformanceSpec {
 		if self.busy_poll_usecs.is_some_and(|n| n > MAX_BUSY_POLL_USECS) {
 			return Err(format!("{p}.busy_poll_usecs must be 0-{MAX_BUSY_POLL_USECS}"));
 		}
+		if let Some(d) = &self.dpdk {
+			d.check()?;
+			// the lcores spin on their CPUs: the workers must not be pinned there
+			if let (Some(l), Some(list)) = (&d.lcores, self.cpu_affinity.as_deref()) {
+				if let (Ok(lcores), Ok(cpus)) = (parse_cpu_list(l), parse_cpu_list(list)) {
+					if let Some(c) = cpus.iter().find(|c| lcores.contains(c)) {
+						return Err(format!("{p}.cpu_affinity includes CPU {c} of dpdk.lcores (the lcores take their CPUs for themselves)"));
+					}
+				}
+			}
+		}
 		if let Some(s) = &self.splice {
 			if let Some(a) = &s.after {
 				a.bytes().map_err(|e| format!("{p}.splice.after: {e}"))?;
@@ -166,6 +403,7 @@ impl PerformanceSpec {
 			("busy_poll_usecs", self.busy_poll_usecs.is_some()),
 			("splice", self.splice.is_some()),
 			("xdp", self.xdp.is_some()),
+			("dpdk", self.dpdk.is_some()),
 		] {
 			if set {
 				out.push(key);
@@ -251,6 +489,8 @@ pub struct Effective {
 	pub sources: Vec<(&'static str, Source)>,
 	/// CPUs of `cpu_affinity` this process may not use (left out, `degraded`).
 	pub missing_cpus: Vec<usize>,
+	/// `dpdk` from the settings file (no environment variable), started by `l4::dpdk::start`.
+	pub dpdk: Option<DpdkSpec>,
 }
 
 /// The CPUs this process may run on (sched_getaffinity), in order.
@@ -370,7 +610,7 @@ pub fn resolve(spec: Option<&PerformanceSpec>, env: &EnvKnobs, allowed: &[usize]
 	pick("xdp", spec.xdp.is_some(), env.offload != Default::default());
 	let xdp = super::offload::resolve(spec.xdp.as_ref(), &env.offload);
 
-	Effective { workers, udp_shards, cpu_affinity, busy_poll_usecs, splice, xdp, sources, missing_cpus }
+	Effective { workers, udp_shards, cpu_affinity, busy_poll_usecs, splice, xdp, sources, missing_cpus, dpdk: spec.dpdk.clone() }
 }
 
 /// Name of the i-th worker thread; `pin_current_thread` reads it back.
@@ -464,6 +704,49 @@ mod tests {
 		assert!(crate::config::from_yaml::<PerformanceSpec>("{udp_shards: many}").is_err());
 		assert!(crate::config::from_yaml::<PerformanceSpec>("{threads: 4}").is_err(), "unknown keys");
 		assert_eq!(parse_cpu_list("0-2,1,5").unwrap(), [0, 1, 2, 5]);
+	}
+
+	#[test]
+	fn dpdk_shape_and_validation() {
+		let ok = parse(
+			"{cpu_affinity: '0-1', dpdk: {enabled: true, lcores: '2-3', eal_args: ['--in-memory'], mempool: {mbufs: 65535, cache: 256}, hugepages: {size: 2MB}, burst: 64, fallback: false,
+			  ports: [{pci: '0000:3b:00.0', rx_queues: 4, tx_queues: 2, rx_desc: 1024, tx_desc: 1024, addresses: ['198.51.100.2/24', '198.51.100.3/24'], gateway: 198.51.100.1},
+			          {vdev: 'net_tap0,iface=dtap0', tx_queues: 2, addresses: ['203.0.113.2/24']}]}}",
+		);
+		ok.check().unwrap();
+		assert_eq!(ok.keys(), ["cpu_affinity", "dpdk"]);
+		let d = ok.dpdk.as_ref().unwrap();
+		assert_eq!((d.enabled(), d.fallback(), d.burst(), d.mempool()), (true, false, 64, (65535, 256)));
+		assert_eq!(d.ports[1].name(), "net_tap0");
+		assert_eq!(d.ports[1].queues(), (1, 2, 1024, 1024));
+		// off: only the shape is checked
+		parse("{dpdk: {enabled: false}}").check().unwrap();
+		assert!(!parse("{dpdk: {}}").dpdk.unwrap().enabled());
+		let port = "ports: [{vdev: net_tap0, tx_queues: 2, addresses: ['10.0.0.2/24']}]";
+		for bad in [
+			"{dpdk: {enabled: true, ports: [{vdev: net_tap0, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3'}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 1, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{pci: '0000:01:00.0', vdev: net_tap0, tx_queues: 2, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: tap0, tx_queues: 2, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2, addresses: ['10.0.0.2']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2, addresses: ['10.0.0.2/24'], gateway: 10.1.0.1}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2, rx_queues: 65, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2, rx_desc: 32, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_ring_rpchk, tx_queues: 2, addresses: ['10.0.0.2/24']}]}}".to_string(),
+			format!("{{dpdk: {{enabled: true, lcores: '2-3', {port}, eal_args: ['-l', '4']}}}}"),
+			format!("{{dpdk: {{enabled: true, lcores: '2-3', {port}, burst: 0}}}}"),
+			format!("{{dpdk: {{enabled: true, lcores: '2-3', {port}, mempool: {{mbufs: 100}}}}}}"),
+			format!("{{dpdk: {{enabled: true, lcores: '2-3', {port}, mempool: {{mbufs: 2047, cache: 2000}}}}}}"),
+			format!("{{dpdk: {{enabled: true, lcores: '2-3', {port}, hugepages: {{size: 4MB}}}}}}"),
+			format!("{{cpu_affinity: '1-2', dpdk: {{enabled: true, lcores: '2-3', {port}}}}}"),
+			"{dpdk: {enabled: true, lcores: '2-3', ports: [{vdev: net_tap0, tx_queues: 2, addresses: ['10.0.0.2/24']}, {vdev: net_tap1, tx_queues: 2, addresses: ['10.0.0.2/24']}]}}".to_string(),
+		] {
+			assert!(parse(&bad).check().is_err(), "{bad}");
+		}
+		assert!(crate::config::from_yaml::<PerformanceSpec>("{dpdk: {ports: [{pci: x, mtu: 9000}]}}").is_err(), "unknown keys");
+		assert_eq!(hugepage_kib(Some("1GB")), Ok(1 << 20));
 	}
 
 	fn env() -> EnvKnobs {

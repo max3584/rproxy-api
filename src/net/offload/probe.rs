@@ -78,7 +78,16 @@ const NO_DATA_PATH: &str = "the data path is not in this build (#260, paused: ne
 pub const PATHS: &[PathSpec] = &[
 	PathSpec { key: "xdp.mode", mode: "af_xdp", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::AfXdp, test: test_af_xdp, data_path: false },
 	PathSpec { key: "xdp.mode", mode: "native", feature: "xdp", requested: |e| e.xdp.mode == XdpMode::Native, test: test_xdp_native, data_path: false },
+	// the DPDK data plane for L4 UDP (#261): not the kernel's, but probed the same way (builds with `dpdk`)
+	#[cfg(feature = "dpdk")]
+	PathSpec { key: "dpdk.enabled", mode: "true", feature: "dpdk", requested: |e| e.dpdk.as_ref().is_some_and(|d| d.enabled()), test: test_dpdk, data_path: true },
 ];
+
+/// DPDK: hugepages, EAL, ports, and test datagrams through the forwarder (`l4::dpdk::test`).
+#[cfg(feature = "dpdk")]
+fn test_dpdk(_: &Host, perf: &Effective) -> Outcome {
+	crate::l4::dpdk::test(perf.dpdk.as_ref())
+}
 
 /// One fast path in the report.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -134,9 +143,16 @@ impl Report {
 #[allow(clippy::single_element_loop)]
 fn features_of(perf: &Effective, paths: &[PathResult]) -> Vec<Feature> {
 	let mut out = vec![];
-	for (name, part, requested, fallback) in [
+	#[allow(unused_mut)]
+	let mut features = vec![
 		("xdp", "global.performance.xdp.mode", perf.xdp.mode.as_str(), perf.xdp.fallback),
-	] {
+	];
+	#[cfg(feature = "dpdk")]
+	{
+		let d = perf.dpdk.as_ref().filter(|d| d.enabled());
+		features.push(("dpdk", "global.performance.dpdk", if d.is_some() { "on" } else { "off" }, d.is_none_or(|d| d.fallback())));
+	}
+	for (name, part, requested, fallback) in features {
 		let path = paths.iter().find(|p| p.requested && p.feature == name);
 		let (active, mode, reason) = match path {
 			Some(p) if p.usable => (true, Some(p.detail.clone()), None),

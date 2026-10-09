@@ -51,6 +51,9 @@ type ListenerTask = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + S
 enum Bound {
 	Tcp(Vec<tokio::net::TcpListener>),
 	Udp(Vec<Vec<tokio::net::UdpSocket>>),
+	/// A UDP rule on an address of a DPDK port (#261): forwarded by the lcores.
+	#[cfg(feature = "dpdk")]
+	Dpdk(crate::l4::dpdk::Claim),
 }
 
 /// Sockets per UDP port of a rule (#194). One by default: batching
@@ -304,6 +307,10 @@ fn bind_all(spec: &RuleSpec, ip: IpAddr) -> Result<Bound, ApiError> {
 				.map(|addr| crate::net::listen::tcp(addr, opts).and_then(tokio::net::TcpListener::from_std).map_err(|e| bind_error(addr, e)))
 				.collect::<Result<_, _>>()?,
 		),
+		#[cfg(feature = "dpdk")]
+		Protocol::Udp if crate::l4::dpdk::claim(spec, ip).is_some() => {
+			Bound::Dpdk(crate::l4::dpdk::claim(spec, ip).expect("checked")?)
+		}
 		Protocol::Udp => {
 			let shards = udp_shards(spec.port_count);
 			Bound::Udp(
@@ -332,6 +339,11 @@ fn listener_tasks(bound: Bound, rt: &Arc<Runtime>, stop: &CancellationToken) -> 
 					stop.is_cancelled()
 				}));
 			}
+		}
+		#[cfg(feature = "dpdk")]
+		Bound::Dpdk(claim) => {
+			let (rt, stop) = (rt.clone(), stop.clone());
+			tasks.push(Box::pin(crate::l4::dpdk::serve(claim, rt, stop)));
 		}
 		Bound::Udp(sockets) => {
 			let ports = u16::try_from(sockets.len()).unwrap_or(u16::MAX);

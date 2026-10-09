@@ -1,0 +1,68 @@
+name: DPDK
+
+# DPDK のデータプレーン（L4 の UDP、#261。cargo の機能 dpdk、既定のビルドとリリースには入らない）の正しさだけを確かめる。
+# 速さはランナーでは測れない（仮想の NIC・共有の CPU）。実機での測り方は docs/PERFORMANCE.md の「DPDK」。
+# ランナーの VM（Ubuntu）で直接動かす（#191 の Alpine のコンテナの例外）：DPDK は Ubuntu のパッケージ（libdpdk-dev）から
+# 入れる（Alpine には PMD のそろったパッケージがない）、ヒュージページと net_tap（TAP のデバイス）にホストのカーネルと
+# sudo が要る。
+# - crates/rproxy-dpdk の単体テスト（DPDK なし）と tests/ring.rs（DPDK あり・root なし・--no-huge）：起動時の確かめを
+#   net_ring のループバックのポートに、lcore のループを net_memif の組に通す
+# - scripts/test-dpdk.sh（root・ヒュージページ）：rproxy-api を global.performance.dpdk で起動し、net_tap と
+#   net_af_packet（veth）のポートでカーネルの UDP のソケットと往復させて中身を比べる。使えないとき（fallback）も
+# 必須のチェックではない。
+on:
+  pull_request:
+    paths:
+      - crates/**
+      - src/l4/dpdk.rs
+      - src/config/performance.rs
+      - src/core/registry.rs
+      - Cargo.toml
+      - Cargo.lock
+      - scripts/test-dpdk.sh
+      - .github/workflows/dpdk.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dpdk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dpdk:
+    name: DPDK (vdev PMDs, correctness only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: DPDK (Ubuntu packages)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libdpdk-dev dpdk pkg-config python3
+          pkg-config --modversion libdpdk
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dpdk
+      - name: clippy (--features dpdk)
+        run: cargo clippy --locked --all-targets --features dpdk -p rproxy-api -p rproxy-dpdk -- -D warnings
+      - name: rproxy-dpdk tests (frames, forwarder, startup check; net_ring and net_memif without root)
+        run: cargo test --locked -p rproxy-dpdk --features ffi -- --nocapture
+      - name: rproxy-api unit tests (--features dpdk)
+        run: cargo test --locked --features dpdk --lib -- dpdk performance
+      - name: build
+        run: cargo build --locked --features dpdk
+      - name: hugepages
+        run: |
+          sudo sysctl -w vm.nr_hugepages=256
+          grep -i huge /proc/meminfo
+          mount | grep hugetlbfs || sudo mount -t hugetlbfs nodev /dev/hugepages
+      - name: end to end (net_tap, net_af_packet, kernel UDP sockets)
+        run: sudo env BIN="$PWD/target/debug/rproxy-api" LCORES=1-2 scripts/test-dpdk.sh

@@ -28,6 +28,7 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 | Cross build and Release `build` | `alpine:3.24`. x86_64 musl natively, the others cross-built with cargo-zigbuild (zig); gnu is linked against glibc 2.17 (`scripts/build-release.sh`) |
 | Release `apt` and Cross build `apt (dry run)` | `debian:13-slim` (apt-ftparchive, which builds the apt repository, is a Debian tool) |
 | CI `deb` and `install` | Directly on the runner VM (Ubuntu). They check installing the .deb, upgrading from an apt repository and purging, and install.sh (which requires systemd), so systemd has to run as PID 1, which a container cannot do. They build no Rust: they check the musl binary and .deb made by the `package` job (Alpine) |
+| DPDK (`dpdk.yml`, #261) | Directly on the runner VM (Ubuntu). DPDK comes from Ubuntu's packages (`libdpdk-dev`); hugepages and `net_tap` (TAP devices) need the host kernel and sudo. See "The DPDK data plane" below |
 
 Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc targets; see "Fuzzing" below).
 
@@ -289,12 +290,24 @@ Checks the startup test of `global.performance.xdp` and `--check-kernel` with th
 | `nothing_requested_probes_nothing` | Nothing requested: nothing is tested (no `performance.probe` line), `performance` of `GET /capabilities` says `requested: off` everywhere |
 | `requested_fast_paths_are_probed_and_fall_back_with_a_reason` | One `performance.probe` line per requested feature with the same `active` as `GET /capabilities`; when not usable, a `reason` and `degraded` (`part`) |
 | `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | With `fallback: false` an unusable fast path stops startup |
-| `mistakes_in_the_settings_stop_startup_and_the_check` | Wrong `RPROXY_XDP_*` / `RPROXY_EBPF_*` and settings-file values stop startup and `--check-kernel` |
+| `mistakes_in_the_settings_stop_startup_and_the_check` | Wrong `RPROXY_XDP_*` and settings-file values stop startup and `--check-kernel` |
 | `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` prints a row per fast path and the host; its exit status matches the requested one's result; the JSON says the same |
 
 ### offload-verify (testing-only always-on cross-check, #260)
 
 The cargo feature `offload-verify` (off by default, never in release builds; the default build has none of this code). Each fast path cross-checks counts, stalls and how connections end while running and at the end; a mismatch logs `offload.verify` at `error` with the numbers (also on stderr) and counts on `/metrics` (`rproxy_offload_verify_failures_total`, this build only). Tests fail when it is not zero (`common::assert_offload_verified`, at the end of the TCP and UDP cases of tests/integrity.rs); content is compared end to end by tests/integrity.rs. The stall threshold is `RPROXY_OFFLOAD_VERIFY_STALL_SECS` (default 5 s). With `RPROXY_XDP_MODE` set, the in-process rproxy also runs the startup test and uses the fast path (`common::offload_from_env`; `RPROXY_TEST_REQUIRE_OFFLOAD` makes an unusable one a failure). In the sockmap experiment (docs/en/PERFORMANCE.md) it found four kernel quirks and the backlog stall.
+
+## The DPDK data plane (`dpdk.yml`, #261)
+
+Only for builds with the cargo feature `dpdk` (not in the default CI's `cargo test`). `.github/workflows/dpdk.yml` runs on PRs that change `crates/`, `src/l4/dpdk.rs` and the like (not a required check). Correctness only (speed is measured on real hardware; docs/en/PERFORMANCE.md).
+
+| What | Checks |
+|---|---|
+| Unit tests of `crates/rproxy-dpdk` (no DPDK; `cargo test -p rproxy-dpdk`) | Frame parsing and rewriting (the incremental checksum update equals one computed from scratch; fragments, broken headers), ARP and ping replies, NAT sessions (both ways, answers from other addresses dropped, idle, stopping rules, the gateway, retargeting, 2,000 clients), the startup check's scenario (it notices corruption) |
+| `crates/rproxy-dpdk/tests/ring.rs` (DPDK, no root, `--no-huge`) | The startup check through the `net_ring` loopback port in real mbufs. The lcore loop (`io::run`) on one end of a `net_memif` pair, 500 datagrams there and back from the other end, compared |
+| `scripts/test-dpdk.sh` (sudo, hugepages) | The real `rproxy-api` with two ports, `net_tap` and `net_af_packet` (veth), against kernel UDP sockets (20 clients × 70 datagrams of 0-1472 bytes, a rule across ports, a port range), ping, `performance.dpdk` of `GET /capabilities`, `--check-kernel`, and when it cannot be used `fallback: true` (degraded) / `false` (no start) |
+
+Locally: after `sudo apt install libdpdk-dev`, `cargo test -p rproxy-dpdk --features ffi` and `cargo build --features dpdk && sudo scripts/test-dpdk.sh`.
 
 ## Integration tests: self-update (`tests/self_update.rs`, #174)
 
@@ -594,10 +607,11 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |
 | `dns_response` | `acme::dnsq::parse_response`: DNS answers read for DNS-01 (CNAME, SOA, TXT, name compression and its loops) | The bytes as they are |
 | `tsig_answer` | `acme::rfc2136::verify_answer`: the TSIG of answers to RFC 2136 updates (nothing unsigned or forged passes) | The bytes as they are |
+| `dpdk_packet` | `rproxy_dpdk::packet` and the forwarder `rproxy_dpdk::engine`: frames the DPDK path receives (Ethernet, ARP, IPv4, UDP, ICMP echo). A UDP datagram with right checksums keeps right checksums and its payload when rewritten and passed on | Frames, each prefixed with a 16-bit length |
 
 The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
 
-`.github/workflows/fuzz.yml` runs each target for 60 seconds on pull requests that change `src/` or `fuzz/`, and for 10 minutes every day (not a required check). CI runs on Alpine (musl), so without a sanitizer (`--sanitizer none`; Rust's AddressSanitizer exists only for glibc targets), with debug assertions (integer overflow checks) on. The targeted parsers are Rust without unsafe, so an out-of-bounds access panics on the bounds check even without a sanitizer. The corpus grown by the daily runs is kept in the Actions cache and seeds the next run. When a target crashes, the input is in the `fuzz-artifacts-*` artifact: reproduce it with `cargo +nightly fuzz run <target> <input file>`, and once fixed, add the input to a unit test.
+`.github/workflows/fuzz.yml` runs each target for 60 seconds on pull requests that change `src/`, `crates/` or `fuzz/`, and for 10 minutes every day (not a required check). CI runs on Alpine (musl), so without a sanitizer (`--sanitizer none`; Rust's AddressSanitizer exists only for glibc targets), with debug assertions (integer overflow checks) on. The targeted parsers are Rust without unsafe, so an out-of-bounds access panics on the bounds check even without a sanitizer. The corpus grown by the daily runs is kept in the Actions cache and seeds the next run. When a target crashes, the input is in the `fuzz-artifacts-*` artifact: reproduce it with `cargo +nightly fuzz run <target> <input file>`, and once fixed, add the input to a unit test.
 
 Locally (needs nightly and a C/C++ compiler):
 

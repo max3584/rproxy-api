@@ -28,6 +28,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 | Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
 | Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
 | CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる |
+| DPDK（`dpdk.yml`、#261） | ランナーの VM（Ubuntu）で直接。DPDK は Ubuntu のパッケージ（`libdpdk-dev`）から入れ、ヒュージページと `net_tap`（TAP のデバイス）にホストのカーネルと sudo が要る。下の「DPDK のデータプレーン」 |
 
 ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。
 
@@ -289,12 +290,24 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `nothing_requested_probes_nothing` | 何も求めなければ試さない（`performance.probe` の行なし）、`GET /capabilities` の `performance` はすべて `requested: off` |
 | `requested_fast_paths_are_probed_and_fall_back_with_a_reason` | 求めた機能ごとに `performance.probe` の行、`GET /capabilities` と同じ `active`。使えなければ `reason` と `degraded`（`part`） |
 | `fallback_false_stops_startup_when_the_fast_path_is_not_usable` | `fallback: false` で使えなければ起動を止める |
-| `mistakes_in_the_settings_stop_startup_and_the_check` | `RPROXY_XDP_*` / `RPROXY_EBPF_*` と設定ファイルの値の誤りで起動と `--check-kernel` が止まる |
+| `mistakes_in_the_settings_stop_startup_and_the_check` | `RPROXY_XDP_*` と設定ファイルの値の誤りで起動と `--check-kernel` が止まる |
 | `check_kernel_tests_every_fast_path_and_prints_a_table` | `--check-kernel` がすべての速い道の行とホストの情報を出す。終わりの状態が求めたものの結果と合う、JSON も同じ |
 
 ### offload-verify（テストだけの常時の照合、#260）
 
 cargo の機能 `offload-verify`（既定で無効、リリースのビルドには入らない。既定のビルドにはこのコードがない）。速い道ごとに、動いている間と終わりに量・止まり・閉じ方を照合し、合わなければ `error` の `offload.verify`（数字つき、標準エラーにも）と `/metrics` の `rproxy_offload_verify_failures_total`（このビルドだけ）。テストは 0 でなければ失敗する（`common::assert_offload_verified`、tests/integrity.rs の TCP・UDP の終わり）。データの中身は tests/integrity.rs が端から端まで比べる。止まりとみなす時間は `RPROXY_OFFLOAD_VERIFY_STALL_SECS`（既定 5 秒）。`RPROXY_XDP_MODE` があると、テストの中の rproxy も起動時の試験を通して速い道を使う（`common::offload_from_env`。`RPROXY_TEST_REQUIRE_OFFLOAD` で使えないことを失敗にする）。sockmap の試み（docs/PERFORMANCE.md）では、これが 4 つのカーネルの癖とバックログの詰まりを見つけた。
+
+## DPDK のデータプレーン（`dpdk.yml`、#261）
+
+cargo の機能 `dpdk` のビルドだけのもの（既定の CI の `cargo test` には入らない）。`.github/workflows/dpdk.yml` が `crates/`・`src/l4/dpdk.rs` などを変えた PR で動かす（必須のチェックではない）。正しさだけを確かめる（速さは実機で、docs/PERFORMANCE.md）。
+
+| もの | 確かめること |
+|---|---|
+| `crates/rproxy-dpdk` の単体テスト（DPDK なし。`cargo test -p rproxy-dpdk`） | フレームの解析・書き換え（チェックサムの差分の更新が一から計算したものと同じ、断片・壊れたヘッダ）、ARP・ping への返事、NAT のセッション（両向き・別のアドレスからの返事を捨てる・アイドル・ルールの止め方・ゲートウェイ・宛先の切り替え・2,000 クライアント）、起動時の確かめの筋書き（壊れたものを見つける） |
+| `crates/rproxy-dpdk/tests/ring.rs`（DPDK あり、root なし、`--no-huge`） | 起動時の確かめを `net_ring` のループバックのポートに本物の mbuf で通す。lcore のループ（`io::run`）を `net_memif` の組の片側で動かし、もう片側から 500 個のデータグラムを往復させて比べる |
+| `scripts/test-dpdk.sh`（sudo、ヒュージページ） | 本物の `rproxy-api` を `net_tap` と `net_af_packet`（veth）の 2 つのポートで起動し、カーネルの UDP のソケットと往復（クライアント 20 個 × 70 個、0〜1472 バイト、ポートをまたぐルール、ポートの範囲）、ping、`GET /capabilities` の `performance.dpdk`、`--check-kernel`、使えないときの `fallback: true`（degraded）・`false`（起動しない） |
+
+手元では `sudo apt install libdpdk-dev` のあと `cargo test -p rproxy-dpdk --features ffi` と `cargo build --features dpdk && sudo scripts/test-dpdk.sh`。
 
 ## 結合テスト：自動更新（`tests/self_update.rs`、#174）
 
@@ -594,10 +607,11 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 | `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |
 | `dns_response` | `acme::dnsq::parse_response`：DNS-01 で読む DNS の応答（CNAME・SOA・TXT、名前の圧縮とそのループ） | バイト列そのまま |
 | `tsig_answer` | `acme::rfc2136::verify_answer`：RFC 2136 の UPDATE への応答の TSIG（署名のないもの・作ったものが通らないこと） | バイト列そのまま |
+| `dpdk_packet` | `rproxy_dpdk::packet` と転送の `rproxy_dpdk::engine`：DPDK の道が受け取るフレーム（Ethernet・ARP・IPv4・UDP・ICMP の echo）。チェックサムの正しい UDP は、書き換えて送ってもチェックサムと中身が正しいまま | フレームごとに 16 ビットの長さを前に付ける |
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。
 
-`.github/workflows/fuzz.yml` が、`src/` か `fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。CI は Alpine（musl）なので sanitizer なし（`--sanitizer none`。Rust の AddressSanitizer は glibc のターゲットにしかない）で、debug assertions（整数のあふれの検査）を有効にする。ターゲットのパーサーは unsafe のない Rust なので、範囲外へのアクセスは sanitizer がなくても境界の検査で panic になる。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
+`.github/workflows/fuzz.yml` が、`src/`・`crates/`・`fuzz/` を変えた PR で各ターゲットを 60 秒、毎日 10 分動かす（必須のチェックではない）。CI は Alpine（musl）なので sanitizer なし（`--sanitizer none`。Rust の AddressSanitizer は glibc のターゲットにしかない）で、debug assertions（整数のあふれの検査）を有効にする。ターゲットのパーサーは unsafe のない Rust なので、範囲外へのアクセスは sanitizer がなくても境界の検査で panic になる。毎日の実行で育てたコーパスは Actions のキャッシュに残し、次の実行の種にする。落ちたら `fuzz-artifacts-*` の成果物に入力が残るので、`cargo +nightly fuzz run <ターゲット> <入力のファイル>` で再現し、直したらその入力を単体テストに足す。
 
 手元では（nightly と C/C++ コンパイラが要る）：
 

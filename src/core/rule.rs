@@ -211,6 +211,13 @@ const FORWARD_AUTH: &[&str] = &["service", "grpc", "client_request", "allow_stat
 const HTTP_OPTIONS: &[&str] =
 	&["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"];
 
+/// `features.performance`: the `global.performance` keys this build applies;
+/// `dpdk` only in builds with the `dpdk` feature (#261).
+#[cfg(not(feature = "dpdk"))]
+const PERFORMANCE: &[&str] = &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "xdp"];
+#[cfg(feature = "dpdk")]
+const PERFORMANCE: &[&str] = &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "xdp", "dpdk"];
+
 impl Features {
 	pub const CURRENT: Features =
 		Features {
@@ -245,7 +252,7 @@ impl Features {
 		api_lockout: true,
 		handoff: true,
 		self_update: true,
-		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "xdp"],
+		performance: PERFORMANCE,
 		graceful_shutdown: true,
 		cert_store: true,
 		ruleset_persistence: true,
@@ -288,7 +295,7 @@ impl Features {
 		api_lockout: true,
 		handoff: true,
 		self_update: true,
-		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "xdp"],
+		performance: &["workers", "udp_shards", "cpu_affinity", "busy_poll_usecs", "splice", "xdp", "dpdk"],
 		graceful_shutdown: true,
 		cert_store: true,
 		ruleset_persistence: true,

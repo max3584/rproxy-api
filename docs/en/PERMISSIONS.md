@@ -14,6 +14,8 @@ Host configuration (package installation, policy routing) is done as root. rprox
 
 Kernel offload (`global.performance.xdp`, #260; off by default) additionally needs `CAP_BPF` (`CAP_SYS_ADMIN` on kernels before 5.8) and `CAP_NET_ADMIN`, and AF_XDP `CAP_NET_RAW`. The unit does not grant these by default; add them to `AmbientCapabilities` and `CapabilityBoundingSet` with `systemctl edit rproxy-api` when using it. Without them the startup test fails, `degraded` is logged (`reason: missing CAP_BPF ...`) and the current path runs. `rproxy-api --check-kernel` checks this beforehand.
 
+The DPDK data plane (`global.performance.dpdk`, #261; builds with `--features dpdk` only, off by default) needs the NIC bound to vfio-pci (done as root), and access to hugepages (hugetlbfs) and `/dev/vfio/*`. During the experiment it is meant to run as root (to run as another user, give rproxy the `/dev/vfio/<group>` device and the hugetlbfs mount, plus `CAP_IPC_LOCK`, and `CAP_NET_ADMIN` for `net_tap`). The steps are in docs/en/PERFORMANCE.md, "DPDK".
+
 rproxy-api starts even if either permission is removed, and the other rules keep working (the CI `install.sh` job verifies this with both removed via a drop-in). A static rules file only stops startup on writing errors (invalid addresses, overlapping rules, etc.), not on rules that merely lack permissions.
 
 - Both are granted by `AmbientCapabilities` and `CapabilityBoundingSet` in the unit (`/usr/lib/systemd/system/rproxy-api.service`, or `/etc/systemd/system/` for the install.sh binary). No other capabilities are held.

@@ -13,6 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rproxy-api = { path = ".." }
+# the DPDK path's frame parsing and forwarder, without DPDK (no ffi feature)
+rproxy-dpdk = { path = "../crates/rproxy-dpdk" }
 # the same versions as the main crate (Cargo.lock)
 ring = "0.17.14"
 tokio = { version = "1.53.1", features = ["rt", "time", "io-util"] }
@@ -83,6 +85,13 @@ bench = false
 [[bin]]
 name = "tsig_answer"
 path = "fuzz_targets/tsig_answer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dpdk_packet"
+path = "fuzz_targets/dpdk_packet.rs"
 test = false
 doc = false
 bench = false
