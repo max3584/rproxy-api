@@ -39,20 +39,31 @@ use super::bpf::{Attached, Insn, Map, Prog, BPF_SK_SKB_STREAM_VERDICT};
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 /// `bpf_sk_redirect_map` helper id.
 const BPF_FUNC_SK_REDIRECT_MAP: i32 = 52;
+/// `struct __sk_buff` byte offset of `len`.
+const SK_BUFF_LEN: i16 = 0;
 /// `struct __sk_buff` byte offset of `local_port` (host byte order).
 const SK_BUFF_LOCAL_PORT: i16 = 136;
 
-/// The stream-verdict program: redirect to key 1 when the socket's local port
-/// is `client_lport` (the client side), else to key 0. `map_fd` is embedded.
-fn verdict_insns(client_lport: u16, map_fd: i32) -> [Insn; 9] {
+/// The stream-verdict program: an empty skb (the FIN) is passed to the socket
+/// itself (redirecting it makes the kernel's backlog fail with EPIPE on the
+/// other socket, seen on 6.17; user space then reads EOF and passes the
+/// half-close on). Otherwise redirect to key 1 when the socket's local port is
+/// `client_lport` (the client side), else to key 0. `map_fd` is embedded.
+fn verdict_insns(client_lport: u16, map_fd: i32) -> [Insn; 13] {
 	// opcodes
 	const LDX_W: u8 = 0x61; // r0 = *(u32*)(r1 + off)
 	const MOV64_IMM: u8 = 0xb7;
 	const JEQ_K: u8 = 0x15;
+	const JNE_K: u8 = 0x55;
+	const SK_PASS: i32 = 1;
 	const LD_IMM64: u8 = 0x18;
 	const CALL: u8 = 0x85;
 	const EXIT: u8 = 0x95;
 	[
+		Insn::new(LDX_W, 0, 1, SK_BUFF_LEN, 0),        // r0 = skb->len
+		Insn::new(JNE_K, 0, 0, 2, 0),                  // if r0 != 0 skip the next two
+		Insn::new(MOV64_IMM, 0, 0, 0, SK_PASS),        // r0 = SK_PASS (empty: the FIN)
+		Insn::new(EXIT, 0, 0, 0, 0),                   // return r0
 		Insn::new(LDX_W, 0, 1, SK_BUFF_LOCAL_PORT, 0), // r0 = skb->local_port (r1 = skb)
 		Insn::new(MOV64_IMM, 3, 0, 0, 1),              // r3 = 1 (assume client -> backend)
 		Insn::new(JEQ_K, 0, 0, 1, client_lport as i32), // if r0 == client_lport skip next
@@ -295,7 +306,8 @@ pub fn bytes_written(sock: BorrowedFd<'_>) -> io::Result<u64> {
 
 /// Whether everything `src` received since `rx0` has reached `dst`'s send
 /// queue since `w0` (the redirect goes through a backlog, so a FIN passed on
-/// earlier could overtake data). An error on `dst` is returned.
+/// earlier could overtake data). Called after `src` read EOF: its FIN counts
+/// one in `tcpi_bytes_received` and is not data. An error on `dst` is returned.
 pub fn flushed(src: BorrowedFd<'_>, rx0: u64, dst: BorrowedFd<'_>, w0: u64) -> io::Result<bool> {
 	let mut err: libc::c_int = 0;
 	let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -304,7 +316,7 @@ pub fn flushed(src: BorrowedFd<'_>, rx0: u64, dst: BorrowedFd<'_>, w0: u64) -> i
 	if err != 0 {
 		return Err(io::Error::from_raw_os_error(err));
 	}
-	let moved = bytes_received(src)?.saturating_sub(rx0);
+	let moved = bytes_received(src)?.saturating_sub(rx0).saturating_sub(1);
 	let put = bytes_written(dst)?.saturating_sub(w0);
 	Ok(put >= moved)
 }

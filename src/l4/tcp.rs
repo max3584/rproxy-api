@@ -412,8 +412,10 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 		pass_fin(fb, tx0, fa, wa0).await
 	};
 	let result = tokio::try_join!(up, down).map(|_| ());
-	let rx = sockmap::bytes_received(a.as_fd()).map_or(0, |n| n.saturating_sub(rx0));
-	let tx = sockmap::bytes_received(b.as_fd()).map_or(0, |n| n.saturating_sub(tx0));
+	// each side's FIN takes one sequence number in tcpi_bytes_received
+	let fin = u64::from(result.is_ok());
+	let rx = sockmap::bytes_received(a.as_fd()).map_or(0, |n| n.saturating_sub(rx0).saturating_sub(fin));
+	let tx = sockmap::bytes_received(b.as_fd()).map_or(0, |n| n.saturating_sub(tx0).saturating_sub(fin));
 	detail.rx += rx;
 	detail.tx += tx;
 	rt.stats.add_rx(rx);
