@@ -51,6 +51,7 @@ struct Dataplane {
 }
 
 static DATAPLANE: OnceLock<Dataplane> = OnceLock::new();
+static IO_STATS: OnceLock<Arc<IoStats>> = OnceLock::new();
 /// Set by `main` before the startup probe: a passing test leaves the data
 /// plane running. Unset (`--check-kernel`), the test releases everything.
 static KEEP: AtomicBool = AtomicBool::new(false);
@@ -271,6 +272,7 @@ fn bring_up(spec: &DpdkSpec, stop: &Arc<AtomicBool>, tests: &mut Vec<Test>) -> R
 		debug!(event = "dpdk.lcores", expected, got = lcores.len());
 	}
 	let stats = Arc::new(IoStats::default());
+	let _ = IO_STATS.set(stats.clone());
 	let jobs: Vec<(u32, Job<RtRule>)> = lcores
 		.iter()
 		.enumerate()
@@ -314,6 +316,11 @@ pub fn shutdown() {
 	if let Some(main) = main {
 		let _ = main.join();
 	}
+	// what the lcores counted, once at the end (nothing watches them while they run)
+	let (c, io) = (&d.engine.counters, IO_STATS.get().cloned().unwrap_or_default());
+	let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+	info!(event = "dpdk.stop", rx = n(&io.rx), tx = n(&io.tx), tx_full = n(&io.tx_full), chained = n(&io.chained), no_mbuf = n(&io.no_mbuf),
+		not_ours = n(&c.not_ours), fragments = n(&c.fragments), malformed = n(&c.malformed), no_neighbor = n(&c.no_neighbor), nat_full = n(&c.nat_full));
 }
 
 /// A UDP rule's address taken by the DPDK path (`Registry`'s binding step).

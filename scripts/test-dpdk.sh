@@ -61,7 +61,7 @@ global:
           tx_queues: 2
           addresses: ["10.99.0.2/24"]
         - vdev: "$1"
-          rx_queues: 1
+          rx_queues: 2
           tx_queues: 2
           addresses: ["10.98.0.2/24"]
 rules:
@@ -168,10 +168,20 @@ sys.exit(0 if ok == sent else 1)
 EOF
 }
 
-check 10.99.0.2 5300 7000 10.99.0.1 || FAIL=1
-check 10.98.0.2 5300 7001 10.98.0.1 || FAIL=1
-check 10.99.0.2 5400 7100 10.99.0.1 || FAIL=1
-check 10.99.0.2 5401 7101 10.99.0.1 || FAIL=1
+# what crosses the wires, for the log when a check fails
+traced() {
+  timeout 20 tcpdump -lni dtap0 -c 12 udp > "$WORK/tap.$2.txt" 2>/dev/null &
+  timeout 20 tcpdump -lni veth-k -c 12 'udp or arp' > "$WORK/veth.$2.txt" 2>/dev/null &
+  sleep 0.5
+  if ! check "$@"; then
+    FAIL=1
+    echo "--- dtap0"; cat "$WORK/tap.$2.txt"; echo "--- veth-k"; cat "$WORK/veth.$2.txt"
+  fi
+}
+traced 10.99.0.2 5300 7000 10.99.0.1
+traced 10.98.0.2 5300 7001 10.98.0.1
+traced 10.99.0.2 5400 7100 10.99.0.1
+traced 10.99.0.2 5401 7101 10.99.0.1
 
 # the kernel answered ARP for nothing on DPDK's ports, and DPDK answers ping on its addresses
 ping -c 2 -W 2 10.99.0.2 >/dev/null || { echo "no ping answer from 10.99.0.2"; FAIL=1; }
@@ -188,6 +198,12 @@ for r in rules:
 grep -h '"event":"performance.probe"' "$WORK/rproxy.out" | head -1
 grep -qh '"path":"dpdk"' "$WORK/rproxy.out" || { echo "no conn.open with path=dpdk in the log"; FAIL=1; }
 stop
+grep -h '"event":"dpdk.stop"' "$WORK/rproxy.out"
+if [ -n "$FAIL" ]; then
+  echo "--- the forwarding run's log (first lines of each kind)"
+  grep -v '^EAL\|^TAP\|^MEMIF' "$WORK/rproxy.out" | awk -F'"event":' '{k=substr($2,1,40)} c[k]++ < 3' | cut -c1-400
+fi
+mv "$WORK/rproxy.out" "$WORK/rproxy-forwarding.out"
 
 # --- the same probe without starting: --check-kernel ---
 "$BIN" --check-kernel --config "$WORK/rproxy.yaml" > "$WORK/check.txt" 2>&1 || true
