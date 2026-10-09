@@ -21,6 +21,7 @@ English: [DESIGN-v0.4.x.md](en/DESIGN-v0.4.x.md)
 | D2. #241 組の保存 | v0.4.2 | `ruleset_persistence` | 使わない | migration 012、読むだけの表示 |
 | G1. 421 Misdirected Request（7.1） | v0.4.3 | `http_options` の `misdirected` | 同じポートの HTTPS のリスナーの名前を `tls.misdirected` に（`GatewayHTTPSListenerDetectMisdirectedRequests`、v0.4.5） | — |
 | G2. 転送先ごとの `cors`・リダイレクト・`mirror`（7.2） | v0.4.3 | `server_middleware_kinds` | backendRef の `CORS`・`RequestRedirect`・`RequestMirror` のフィルタ（v0.4.5） | — |
+| G3. 外部の認可（`forward_auth` の拡張、7.3） | v0.4.3 | `forward_auth` | HTTPRoute の `ExternalAuth` フィルタ（HTTP・gRPC、v0.4.5） | — |
 
 ## 2. E. SIGTERM での終わり方（v0.4.1）
 
@@ -178,4 +179,15 @@ rproxy-gateway が名乗っていない Gateway API の機能（rproxy-gateway �
 - `mirror`：写しの本文と送り先のサービスが要るので `forward` が扱う。転送先を選んだ後、その転送先のミドルウェアを順に通し、`mirror` のところでその時の形を写す（転送先へのヘッダ（`X-Forwarded-*`・証明書）を付けた後なので、写しを送るときに付け直さない：`mirror::Copy.forwarded`）。`retry` の送り直しでは、最初に `mirror` のある転送先に当たったときだけ写す（1 つのリクエストで 1 回）。
 - 写しの先のサービスは先に組み立てる必要がある（`Service::compile_with`）。転送先が `mirror` を持つサービスを後に組み立て、`mirror` の先のサービスの転送先が自分で `mirror` を持つことは断る（写しを写さない。順が決まる）。
 - 試験：`tests/gateway_l7.rs` の `per_server_cors_redirects_and_mirrors`（2 つの転送先の片方が CORS と写し、片方がリダイレクト。写しは送った転送先の分だけ・`X-Forwarded-For` は 1 つ・本文の長さ、プリフライト、断る形）。
+
+### 7.3 外部の認可（`forward_auth` の拡張）
+
+- 困ること：Gateway API の `ExternalAuth` フィルタ（experimental、Envoy の ext_authz の形）は、HTTP なら「クライアントのメソッド・パス（`http.path` の接頭辞の後ろ）・Host で問い合わせ、200 だけを通し、`allowedResponseHeaders` が空なら応答のヘッダをすべて写す、`forwardBody.maxSize` まで本文も送る」、gRPC なら Envoy の `envoy.service.auth.v3.Authorization/Check`。rproxy の `forward_auth` は Traefik の形（`GET` に `X-Forwarded-Uri`、2xx で通す、書いたヘッダだけ写す）だけだった。
+- 形：新しいミドルウェアを作らず `forward_auth` に項目を足す（認証の口を 1 つに保つ。Traefik の形はそのまま）：`service`・`path`（Kubernetes では宛先が Pod の IP の一覧で、`address` の 1 つの URL では足りない。ルールのサービスを使えば `balance`・`health_check`・BackendTLSPolicy の `tls` もそのまま）、`client_request`、`allow_status`、`response_headers: ["*"]`、`forward_body: {max_size}`、`protocol: grpc`。`features.forward_auth` に使える項目の名前。
+- `["*"]` で写さないヘッダ：応答そのものを表すもの（ホップごと、`Host`・`Content-Length`・`Content-Type`・`Content-Encoding`・`Transfer-Encoding`・`Date`）。写すと転送先へのリクエストの本文の長さや種類が壊れる。
+- `forward_body`：大きいものは Gateway API の型の説明（「`maxSize` で切って送る」）とフィルタの説明（「4xx で断る」）が食い違う。Envoy の既定（`allow_partial_message: false`）と同じく 413 で断る。読んだ本文は `buffering` と同じく転送先にもメモリから送る。
+- gRPC：protobuf のコード生成の依存を足さず、使う欄だけを手で書いた（`l7/middleware/ext_authz.rs`。知らない欄は読み飛ばす）。HTTP/2 は転送先の HTTP/2（#233）をそのまま使う（`address` は h2c だけ、TLS は `service` の `protocol: h2`・`tls`）。`ok_response.headers` の `append` がないときは置き換え（Envoy の ext_authz の決まり）。`response_headers_to_add` はクライアントへの応答に付ける。gRPC の誤り（`grpc-status` が 0 でない・応答が読めない）は 403（Envoy の `status_on_error` の既定）、つながらない・時間切れは HTTP の `forward_auth` と同じ 502・504。
+- 転送先ごと：`servers[].middlewares` にも `forward_auth` を書ける（backendRef の `ExternalAuth`）。`service` を使う `forward_auth` を転送先が持つサービスは、7.2 の `mirror` と同じく後に組み立て、その先のサービスの転送先が自分で別のサービスへ送ることは断る。
+- 試験：単体（`ext_authz` の組み立てと読み取り、`copy_answer` の `["*"]`）、`tests/ext_authz.rs`（Envoy の HTTP の形：メソッド・パス・Host・`Content-Length`・本文・ヘッダの選び方・`["*"]`・200 だけ・413、gRPC：`address` と `service`、ヘッダの付け外し・応答に足すヘッダ・断り・gRPC の誤り、転送先ごと、断る形）。
+- 守り：認証サーバへのヘッダは今までどおりクライアントの証明書のヘッダを rproxy の見たものにする（#238）。gRPC の `ok_response` が `Host` を変える・外すことは受け付けない（ルートを選んだ後の宛先を変えさせない）。
 

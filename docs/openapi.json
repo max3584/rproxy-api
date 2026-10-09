@@ -804,11 +804,48 @@
                   "timeout": {
                     "type": "string",
                     "description": "default 10s"
+                  },
+                  "service": {
+                    "type": "string",
+                    "description": "instead of address: a service of the rule (v0.4.3)"
+                  },
+                  "path": {
+                    "type": "string",
+                    "description": "with service: the path asked (default /; v0.4.3)"
+                  },
+                  "protocol": {
+                    "type": "string",
+                    "enum": [
+                      "http",
+                      "grpc"
+                    ],
+                    "description": "grpc: Envoy's ext_authz v3 Authorization/Check (v0.4.3)"
+                  },
+                  "client_request": {
+                    "type": "boolean",
+                    "description": "the client's method, path (after the auth path) and Host (v0.4.3)"
+                  },
+                  "allow_status": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "statuses that allow, e.g. [\"200\"] (default 200-299; v0.4.3)"
+                  },
+                  "forward_body": {
+                    "type": "object",
+                    "properties": {
+                      "max_size": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "max_size"
+                    ],
+                    "additionalProperties": false
                   }
                 },
-                "required": [
-                  "address"
-                ],
                 "additionalProperties": false
               }
             },
@@ -1901,6 +1938,13 @@
                   "type": "string"
                 },
                 "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235), misdirected (tls.misdirected, v0.4.3)"
+              },
+              "forward_auth": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "options of forward_auth (v0.4.3): service, grpc, client_request, allow_status, forward_body, all_response_headers"
               },
               "server_middleware_kinds": {
                 "type": "array",

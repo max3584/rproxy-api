@@ -732,7 +732,7 @@ async fn per_server_cors_redirects_and_mirrors() {
 			json!({"copy": {"mirror": {"service": "shadow"}}, "again": {"mirror": {"service": "s"}}}),
 			json!({"s": {"servers": [{"url": "http://127.0.0.1:1", "middlewares": ["copy"]}]},
 				"shadow": {"servers": [{"url": "http://127.0.0.1:2", "middlewares": ["again"]}]}}),
-			"copy requests themselves",
+			"send to other services themselves",
 		),
 		(
 			json!({"rl": {"rate_limit": {"average": 1}}}),
