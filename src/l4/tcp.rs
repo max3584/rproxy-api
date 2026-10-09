@@ -402,6 +402,14 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 			return None;
 		}
 	};
+	#[cfg(feature = "offload-verify")]
+	let dirs = {
+		use crate::net::offload::verify::Dir;
+		match (Dir::start("client->backend", a.as_fd(), b.as_fd()), Dir::start("backend->client", b.as_fd(), a.as_fd())) {
+			(Ok(up), Ok(down)) => Some([up, down]),
+			_ => None,
+		}
+	};
 	let (fa, fb) = (a.as_raw_fd(), b.as_raw_fd());
 	let up = async {
 		drain_eof(a).await?;
@@ -411,7 +419,22 @@ async fn sockmap_relay(rt: &Runtime, a: &mut TcpStream, b: &mut TcpStream, detai
 		drain_eof(b).await?;
 		pass_fin(fb, tx0, fa, wa0).await
 	};
-	let result = tokio::try_join!(up, down).map(|_| ());
+	let relay_done = async { tokio::try_join!(up, down).map(|_| ()) };
+	// offload-verify (tests only): a stall watcher beside the relay
+	#[cfg(feature = "offload-verify")]
+	let result = match dirs {
+		Some(d) => tokio::select! {
+			r = relay_done => r,
+			never = crate::net::offload::verify::watch_sockmap(rt.key.to_string(), d) => match never {},
+		},
+		None => relay_done.await,
+	};
+	#[cfg(not(feature = "offload-verify"))]
+	let result = relay_done.await;
+	#[cfg(feature = "offload-verify")]
+	if let Some(d) = dirs {
+		crate::net::offload::verify::check_sockmap_end(&rt.key.to_string(), d, result.is_ok());
+	}
 	// each side's FIN takes one sequence number in tcpi_bytes_received
 	let fin = u64::from(result.is_ok());
 	let rx = sockmap::bytes_received(a.as_fd()).map_or(0, |n| n.saturating_sub(rx0).saturating_sub(fin));

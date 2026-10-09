@@ -44,6 +44,9 @@ jobs:
       # the optional mimalloc allocator (off by default, #185) still builds
       - name: clippy (alloc-mimalloc)
         run: cargo clippy --locked --bin rproxy-api --features alloc-mimalloc -- -D warnings
+      # the testing-only cross-check of the kernel fast paths (#260) still builds
+      - name: clippy (offload-verify)
+        run: cargo clippy --locked --all-targets --features offload-verify -- -D warnings
       # Alpine の MariaDB（11.8）を同じコンテナで動かす（公式の mariadb のイメージは Ubuntu）
       - name: MariaDB
         run: |
@@ -126,12 +129,19 @@ jobs:
       # the table first, always (its details explain a failure below)
       - name: rproxy-api --check-kernel
         run: RPROXY_EBPF_TCP=sockmap cargo run --locked -- --check-kernel || true
-      # the sockmap probe (loopback pairs, SHA-256, data then FIN) and a real rproxy over sockmap
-      - name: tests/kernel_offload.rs
+      # the sockmap probe (loopback pairs, SHA-256, data then FIN) and a real rproxy over sockmap,
+      # built with offload-verify (testing only: every sockmap connection is cross-checked)
+      - name: tests/kernel_offload.rs (offload-verify)
         env:
           # sockmap must be usable here (fail, don't skip, if the kernel refuses)
           RPROXY_TEST_REQUIRE_SOCKMAP: "1"
-        run: cargo test --locked --test kernel_offload
+        run: cargo test --locked --features offload-verify --test kernel_offload
+      # the data integrity suite with plain TCP through sockmap, cross-checked by offload-verify
+      - name: tests/integrity.rs over sockmap (offload-verify)
+        env:
+          RPROXY_EBPF_TCP: sockmap
+          RPROXY_TEST_REQUIRE_SOCKMAP: "1"
+        run: cargo test --locked --features offload-verify --test integrity -- --test-threads 2
 
   # deb と install.sh のジョブが確かめるもの：リリースと同じ musl の静的リンクのバイナリと、それから作った .deb
   package:

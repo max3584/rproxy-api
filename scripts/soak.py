@@ -159,6 +159,11 @@ async def main():
     work = tempfile.mkdtemp(prefix="rproxy-soak-")
     log = open(os.path.join(work, "rproxy.log"), "w")
     env = {"PATH": os.environ.get("PATH", ""), "RPROXY_API_PORT": str(API_PORT), "RPROXY_LOG_LEVEL": "warn"}
+    # SOAK_RPROXY_ENV="RPROXY_EBPF_TCP=sockmap ...": settings for rproxy (#260)
+    for kv in os.environ.get("SOAK_RPROXY_ENV", "").split():
+        k, _, v = kv.partition("=")
+        if k.startswith("RPROXY_"):
+            env[k] = v
     rp = subprocess.Popen([os.path.abspath(args.bin)], cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
         for _ in range(50):
@@ -229,6 +234,12 @@ async def main():
         problems.append(f"RSS kept growing: {early:.0f} -> {late:.0f} kB")
     if fail_rate > 0.001:
         problems.append(f"too many failed transfers: {fail_rate:.4%}")
+    # offload-verify builds (#260): a mismatch of a kernel fast path
+    log.flush()
+    with open(os.path.join(work, "rproxy.log"), errors="replace") as f:
+        verify = sum('"event":"offload.verify"' in line for line in f)
+    if verify:
+        problems.append(f"offload-verify found {verify} mismatch(es)")
     if problems:
         print("FAIL: " + "; ".join(problems) + f" (rproxy log: {work}/rproxy.log)")
         sys.exit(1)

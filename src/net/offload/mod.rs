@@ -12,9 +12,14 @@
 //! - `bpf`: the bpf(2) calls the fast paths share
 //! - `probe`: the per-feature tests, their report (`performance.probe`,
 //!   `degraded`, `GET /capabilities` `performance`) and the text table
+//! - `sockmap`: plain L4 TCP through a BPF sockmap
+//! - `verify` (cargo feature `offload-verify`, tests only): the always-on
+//!   cross-check of the fast paths; not in release builds
 
 pub mod bpf;
 pub mod host;
 pub mod probe;
 #[cfg(target_os = "linux")]
 pub mod sockmap;
+#[cfg(all(feature = "offload-verify", target_os = "linux"))]
+pub mod verify;

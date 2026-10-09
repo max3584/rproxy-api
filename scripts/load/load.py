@@ -258,6 +258,12 @@ class Rproxy:
 		for k in list(env):
 			if k.startswith("RPROXY_") and k not in ("RPROXY_API_PORT", "RPROXY_LOG_LEVEL"):
 				del env[k]
+		# LOAD_RPROXY_ENV="RPROXY_EBPF_TCP=sockmap ...": settings for every rproxy build
+		# (#260; a build that does not know a variable ignores it)
+		for kv in E.get("LOAD_RPROXY_ENV", "").split():
+			k, _, v = kv.partition("=")
+			if k.startswith("RPROXY_"):
+				env[k] = v
 		self.proc = subprocess.Popen([BINS[idx][1]], cwd=WORK, env=env, stdout=self.log, stderr=subprocess.STDOUT)
 		self.pid = self.proc.pid
 		for _ in range(100):
@@ -327,6 +333,11 @@ class Rproxy:
 				self.proc.kill()
 				self.proc.wait()
 		self.log.close()
+		# offload-verify builds (#260): a mismatch of a kernel fast path fails the run
+		with open(self.log.name, errors="replace") as f:
+			bad = [l for l in f if '"event":"offload.verify"' in l]
+		if bad:
+			check(f"offload-verify via {self.name} ({self.label})", False, "".join(bad[:5])[-2000:])
 
 
 class Haproxy:

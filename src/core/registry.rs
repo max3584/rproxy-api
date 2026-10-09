@@ -1770,6 +1770,13 @@ impl Registry {
 		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals under attack do not flood the log (UDP conn.denied, control API audit).");
 		let _ = writeln!(out, "# TYPE rproxy_log_suppressed_total counter");
 		let _ = writeln!(out, "rproxy_log_suppressed_total {}", crate::logging::suppressed_total());
+		// offload-verify builds only (tests, #260): mismatches of the kernel fast paths
+		#[cfg(all(feature = "offload-verify", target_os = "linux"))]
+		{
+			let _ = writeln!(out, "# HELP rproxy_offload_verify_failures_total Mismatches the offload-verify build found in the kernel fast paths (testing builds only).");
+			let _ = writeln!(out, "# TYPE rproxy_offload_verify_failures_total counter");
+			let _ = writeln!(out, "rproxy_offload_verify_failures_total {}", crate::net::offload::verify::failures());
+		}
 		out
 	}
 }

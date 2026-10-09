@@ -8,6 +8,13 @@ on:
       duration:
         description: 負荷をかける秒数
         default: "3600"
+      rproxy_env:
+        description: rproxy に渡す設定（例 RPROXY_EBPF_TCP=sockmap。#260 のカーネルでの転送の確かめ。空なら何も足さない）
+        default: ""
+      offload_verify:
+        description: offload-verify（テスト用の常時の照合、#260）を入れてビルドする（リリースのビルドには入らない）
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,17 +22,21 @@ permissions:
 jobs:
   soak:
     runs-on: ubuntu-latest
-    container: alpine:3.24
+    container:
+      image: alpine:3.24
+      # the kernel fast paths (#260) need CAP_BPF / CAP_NET_ADMIN
+      options: ${{ inputs.rproxy_env != '' && '--privileged' || '' }}
     timeout-minutes: 360
     env:
       DURATION: ${{ inputs.duration }}
+      SOAK_RPROXY_ENV: ${{ inputs.rproxy_env }}
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev python3
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release
+      - run: cargo build --locked --release ${{ inputs.offload_verify && '--features offload-verify' || '' }}
       - name: scripts/soak.py (${{ env.DURATION }} s)
         run: |
           ulimit -n 65536

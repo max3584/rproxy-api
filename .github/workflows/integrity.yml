@@ -34,3 +34,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: tests/integrity.rs (${{ env.RPROXY_TEST_INTEGRITY_MB }} MiB per case)
         run: cargo test --locked --release --test integrity -- --test-threads 2
+
+  # the same streams with plain TCP through the eBPF sockmap (#260), built with
+  # offload-verify (testing only; every sockmap connection is cross-checked).
+  # Privileged for CAP_BPF / CAP_NET_ADMIN.
+  integrity-sockmap:
+    name: integrity (sockmap, offload-verify)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.24
+      options: --privileged
+    timeout-minutes: 120
+    env:
+      RPROXY_TEST_INTEGRITY_MB: ${{ inputs.mb || (github.event_name == 'pull_request' && '64') || '512' }}
+      RPROXY_EBPF_TCP: sockmap
+      RPROXY_TEST_REQUIRE_SOCKMAP: "1"
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: tests/integrity.rs over sockmap (${{ env.RPROXY_TEST_INTEGRITY_MB }} MiB per case)
+        run: cargo test --locked --release --features offload-verify --test integrity -- --test-threads 2

@@ -35,6 +35,13 @@ on:
       scenarios:
         description: 動かすシナリオ（カンマ区切り。空ならすべて）
         default: ""
+      rproxy_env:
+        description: すべての rproxy に渡す設定（例 RPROXY_EBPF_TCP=sockmap。#260 の速い道を比べる。知らない変数はその版が無視する）
+        default: ""
+      offload_verify:
+        description: offload-verify（テスト用の常時の照合、#260）を入れてビルドする（正しさの確かめ用。数字はふだんの実行と比べない。機能を持つ ref だけ）
+        type: boolean
+        default: false
       profile:
         description: clean のジョブで HTTP の小さなリクエストの間の rproxy を perf で記録し、フレームグラフ（SVG）を残す（フレームポインタとデバッグ情報つきでビルドするので、数字はふだんの実行と比べない）
         type: boolean
@@ -84,6 +91,9 @@ jobs:
       SCENARIOS: ${{ matrix.variant == 'netem' && 'tcp,verify,tls,http,udp,latency' || inputs.scenarios || 'tcp,verify,tls,http,udp,latency,churn,memory,soak' }}
       # perf record of rproxy during the small HTTP requests (clean only; scripts/load/load.py writes load-results/profile/)
       PROFILE: ${{ inputs.profile && matrix.variant == 'clean' && '1' || '' }}
+      # #260: settings for every rproxy build, and the testing-only cross-check
+      LOAD_RPROXY_ENV: ${{ inputs.rproxy_env }}
+      OFFLOAD_VERIFY: ${{ inputs.offload_verify && '1' || '' }}
     steps:
       # bash, unshare / nsenter (util-linux-misc), ip / tc (iproute2), python3, gh (github-cli) for the previous results;
       # iperf3, h2load (nghttp2), socat, openssl, HAProxy for the scenarios
@@ -128,8 +138,11 @@ jobs:
             dir="$RUNNER_TEMP/src/$name"
             git worktree add --detach "$dir" "$sha"
             echo "::group::$ref ($sha)"
+            features=""
+            # offload-verify only for refs that have the feature (#260)
+            if [ -n "$OFFLOAD_VERIFY" ] && grep -q '^offload-verify' "$dir/Cargo.toml"; then features="--features offload-verify"; fi
             (cd "$dir" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo clean --release -p rproxy-api \
-              && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release)
+              && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --release $features)
             echo "::endgroup::"
             mkdir -p bins
             cp target/release/rproxy-api "bins/$name"

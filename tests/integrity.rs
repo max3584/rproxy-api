@@ -256,6 +256,8 @@ async fn tcp_streams_arrive_unchanged_on_every_path() {
 		async move { connector.connect(ServerName::try_from("a.test").unwrap(), plain(port).await).await.unwrap() }
 	})
 	.await;
+	// offload-verify builds: the kernel fast path (when on) matched throughout
+	assert_offload_verified();
 }
 
 /// A single-connection backend doing what `f` says with the accepted socket.
@@ -362,6 +364,7 @@ async fn a_reset_is_passed_on_as_a_reset_and_a_close_as_a_close() {
 	let (got, end) = read_until_end(&mut c).await;
 	assert_eq!(got, sent);
 	assert!(end.is_err(), "the TLS stream must not end cleanly");
+	assert_offload_verified();
 }
 
 // ---- UDP ----------------------------------------------------------------------

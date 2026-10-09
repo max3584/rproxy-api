@@ -295,6 +295,13 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `sockmap_relays_test_data_when_the_kernel_allows` | sockmap が使える host（CI の `offload` ジョブ、`RPROXY_TEST_REQUIRE_SOCKMAP`）では起動時の試験の各項目（load+attach・両方向・64 KiB 超・分割・FIN・ソケットの EOF）が通る。使えない host では理由が付くだけ（スキップ） |
 | `a_real_rproxy_relays_plain_tcp_through_sockmap` | 本物の rproxy を `RPROXY_EBPF_TCP=sockmap` で動かし、平文 TCP の往復（256 KiB・半分閉じ）がバイトまで一致。sockmap が active でなければスキップ |
 
+### offload-verify（テストだけの常時の照合、#260）
+
+cargo の機能 `offload-verify`（既定で無効、リリースのビルドには入らない。既定のビルドにはこのコードがない）。カーネルでの転送の接続ごとに、動いている間と終わりに照合する（`src/net/offload/verify.rs`）。sockmap では：片側が受け取った量（`TCP_INFO`）と、相手のソケットの送信キューに入った量（acked + `TIOCOUTQ`）と相手が確認した量を比べる。データが待っているのに `RPROXY_OFFLOAD_VERIFY_STALL_SECS`（既定 5 秒）進まなければ止まり。終わりには、量が合うか、半分閉じを渡したか（相手が FIN を出した状態か）、正常な終わりの裏にソケットの誤りがないかを見る。データの中身は tests/integrity.rs が SHA-256 で端から端まで比べる。合わなければ `error` の `offload.verify`（数字つき）と数え（`/metrics` の `rproxy_offload_verify_failures_total`、このビルドだけ）。テストは 0 でなければ失敗（`common::assert_offload_verified`・ログの行）。
+
+- CI の `offload` ジョブ：`--features offload-verify` で `tests/kernel_offload.rs` と、`RPROXY_EBPF_TCP=sockmap` で `tests/integrity.rs`（テストの中の rproxy も起動時の試験を通して sockmap を使う：`common::offload_from_env`）。
+- Integrity ワークフローの `integrity (sockmap, offload-verify)`、Soak・Load の `rproxy_env`（例 `RPROXY_EBPF_TCP=sockmap`）と `offload_verify` の入力：速い道のブランチの正しさの確かめ用（数字はふだんの実行と比べない）。`offload.verify` の行があれば失敗。
+
 ## 結合テスト：自動更新（`tests/self_update.rs`、#174）
 
 HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitHub と同じくリダイレクトで渡す）に、このバイナリを次のパッチの番号で署名して置く。

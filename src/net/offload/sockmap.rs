@@ -309,14 +309,30 @@ pub fn bytes_written(sock: BorrowedFd<'_>) -> io::Result<u64> {
 /// earlier could overtake data). Called after `src` read EOF: its FIN counts
 /// one in `tcpi_bytes_received` and is not data. An error on `dst` is returned.
 pub fn flushed(src: BorrowedFd<'_>, rx0: u64, dst: BorrowedFd<'_>, w0: u64) -> io::Result<bool> {
-	let mut err: libc::c_int = 0;
-	let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-	// SAFETY: SO_ERROR writes one int
-	unsafe { libc::getsockopt(dst.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut libc::c_void, &mut len) };
+	let err = so_error(dst);
 	if err != 0 {
 		return Err(io::Error::from_raw_os_error(err));
 	}
 	let moved = bytes_received(src)?.saturating_sub(rx0).saturating_sub(1);
 	let put = bytes_written(dst)?.saturating_sub(w0);
 	Ok(put >= moved)
+}
+
+/// The pending error of `sock` (`SO_ERROR`, which clears it); 0 when none.
+pub fn so_error(sock: BorrowedFd<'_>) -> i32 {
+	let mut err: libc::c_int = 0;
+	let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+	// SAFETY: SO_ERROR writes one int
+	unsafe { libc::getsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut libc::c_void, &mut len) };
+	err
+}
+
+/// The TCP state of `sock` (`TCP_ESTABLISHED` = 1, ... as in linux/tcp_states.h).
+pub fn tcp_state(sock: BorrowedFd<'_>) -> io::Result<u8> {
+	Ok(tcp_info(sock)?.tcpi_state)
+}
+
+/// Bytes the peer of `sock` acknowledged (`TCP_INFO`; a FIN counts one).
+pub fn bytes_acked(sock: BorrowedFd<'_>) -> io::Result<u64> {
+	Ok(tcp_info(sock)?.tcpi_bytes_acked)
 }

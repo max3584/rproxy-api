@@ -295,6 +295,13 @@ Checks the startup test of `global.performance.ebpf` / `xdp` and `--check-kernel
 | `sockmap_relays_test_data_when_the_kernel_allows` | On a host where sockmap works (the CI `offload` job, `RPROXY_TEST_REQUIRE_SOCKMAP`) every startup sub-test passes (load+attach, both directions, >64 KiB, split, FIN, socket EOF); elsewhere it only carries a reason (skipped) |
 | `a_real_rproxy_relays_plain_tcp_through_sockmap` | A real rproxy with `RPROXY_EBPF_TCP=sockmap` relays a plain-TCP round trip (256 KiB, half-close) byte for byte; skipped when sockmap is not active |
 
+### offload-verify (testing-only always-on cross-check, #260)
+
+The cargo feature `offload-verify` (off by default, never in release builds; the default build has none of this code) cross-checks every kernel fast-path connection while it runs and when it ends (`src/net/offload/verify.rs`). For sockmap: the bytes one side received (`TCP_INFO`) against what reached the other socket's send queue (acked + `TIOCOUTQ`) and what its peer acknowledged; a stall is data waiting with no progress for `RPROXY_OFFLOAD_VERIFY_STALL_SECS` (default 5 s); at the end, that the counts match, that each half-close was passed on (the other socket sent its FIN) and that no socket error hides behind a clean close. Data content is SHA-256 compared end to end by tests/integrity.rs. A mismatch logs `offload.verify` at `error` with the numbers and is counted (`rproxy_offload_verify_failures_total` on `/metrics`, in this build only); the tests fail when it is not zero (`common::assert_offload_verified`, the log lines).
+
+- CI `offload` job: `tests/kernel_offload.rs` with `--features offload-verify`, and `tests/integrity.rs` with `RPROXY_EBPF_TCP=sockmap` (the in-process rproxy also runs the startup probe and uses sockmap: `common::offload_from_env`).
+- The Integrity workflow's `integrity (sockmap, offload-verify)`, and the `rproxy_env` (e.g. `RPROXY_EBPF_TCP=sockmap`) and `offload_verify` inputs of Soak and Load: correctness runs of fast-path branches (do not compare their numbers with ordinary runs). Any `offload.verify` line fails the run.
+
 ## Integration tests: self-update (`tests/self_update.rs`, #174)
 
 An HTTPS mirror (a small server in the test; binaries are answered with a redirect, as GitHub does) carries this binary signed under the next patch number.

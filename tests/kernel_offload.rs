@@ -260,6 +260,10 @@ async fn a_real_rproxy_relays_plain_tcp_through_sockmap() {
 	let expect: Vec<u8> = (0..(256usize << 10)).map(|i| (i.wrapping_mul(2654435761) >> 11) as u8).collect();
 	assert_eq!(got.len(), expect.len(), "echoed length");
 	assert!(got == expect, "echoed bytes differ");
+	// offload-verify builds cross-check every sockmap connection; give the
+	// relay a moment to finish its end-of-connection checks
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert!(rp.lines("offload.verify").is_empty(), "offload-verify found mismatches:\n{}", rp.text());
 	drop(rp);
 	let _ = fs::remove_dir_all(dir);
 }
