@@ -435,6 +435,34 @@ async fn leftovers_of_a_killed_process_do_not_stop_the_startup() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
+/// A signal sent while the process is still starting (a `systemctl reload` right after the start, a live
+/// upgrade) is served once it runs, instead of ending the process with the signal's default action: the
+/// handlers are taken before anything listens or says ready (the live upgrade test hit that window).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signals_during_the_startup_do_not_end_the_process() {
+	let dir = workdir("early-signal");
+	token_file(&dir);
+	let api = free_port();
+	for round in 0..rounds() {
+		let s = Server::start(&dir, &format!("round{round}"), api, &[]);
+		let deadline = Instant::now() + Duration::from_secs(30);
+		while !s.log().contains("\"event\":\"start\"") {
+			assert!(Instant::now() < deadline, "no start:\n{}", s.log());
+			std::thread::sleep(Duration::from_micros(200));
+		}
+		signal(s.pid(), libc::SIGHUP);
+		s.ready().await;
+		assert!(alive(s.pid()), "ended by SIGHUP during the startup:\n{}", s.log());
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !s.log().contains("\"event\":\"reload.tokens\"") {
+			assert!(Instant::now() < deadline, "the SIGHUP was not served:\n{}", s.log());
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		drop(s);
+	}
+	let _ = fs::remove_dir_all(&dir);
+}
+
 /// An HTTP backend answering `ok`.
 async fn http_backend() -> std::net::SocketAddr {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

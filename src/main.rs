@@ -727,6 +727,9 @@ fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 
 async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, handoff_from: Option<PathBuf>) -> Result<(), String> {
 	use rproxy_api::control::upgrade::{self as upgrade, handoff};
+	// before anything listens or says ready: a SIGHUP / SIGUSR2 / SIGTERM sent then is kept for
+	// wait_for_shutdown instead of ending the process (the default action)
+	let mut signals = Signals::new()?;
 	let addrs = if opts.api_port == 0 { vec![] } else { opts.api_addr.clone() };
 	if addrs.is_empty() && opts.api_socket.is_none() {
 		return Err("--api-port 0 turns TCP off; give --api-socket (RPROXY_API_SOCKET) for the control API".into());
@@ -1135,7 +1138,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	updater.spawn(Some(upgrader.clone()));
 	upgrade::notify::notify("READY=1");
 
-	let handed = wait_for_shutdown(&tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup, &upgrader).await?;
+	let handed = wait_for_shutdown(&mut signals, &tokens, &token_expiry, &tls, tls_files.as_ref(), &registry, &config_hup, &upgrader).await?;
 
 	// GET /readyz: draining (#28), here and after a handoff
 	registry.readiness().set_draining();
@@ -1431,9 +1434,46 @@ async fn watch_tokens(tokens: Arc<Tokens>, expiry: Arc<TokenExpiry>, files: Opti
 	}
 }
 
+/// The signals the running process serves, taken at the start of `run`: a signal that comes before
+/// `wait_for_shutdown` waits for it is kept (tokio keeps one per kind) instead of ending the process.
+#[cfg(unix)]
+struct Signals {
+	hup: tokio::signal::unix::Signal,
+	term: tokio::signal::unix::Signal,
+	int: tokio::signal::unix::Signal,
+	/// a live upgrade to the binary on disk (#174)
+	usr2: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Signals {
+	fn new() -> Result<Self, String> {
+		use tokio::signal::unix::{signal, SignalKind};
+		let take = |k: SignalKind| signal(k).map_err(|e| e.to_string());
+		Ok(Signals {
+			hup: take(SignalKind::hangup())?,
+			term: take(SignalKind::terminate())?,
+			int: take(SignalKind::interrupt())?,
+			usr2: take(SignalKind::user_defined2())?,
+		})
+	}
+}
+
+#[cfg(not(unix))]
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+	fn new() -> Result<Self, String> {
+		Ok(Signals)
+	}
+}
+
 /// Serves SIGHUP (reload tokens and certificate) until SIGINT or SIGTERM.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_shutdown(
+	signals: &mut Signals,
 	tokens: &Tokens,
 	token_expiry: &TokenExpiry,
 	tls: &OnceCell<RustlsConfig>,
@@ -1442,12 +1482,7 @@ async fn wait_for_shutdown(
 	config_hup: &Notify,
 	upgrader: &Arc<rproxy_api::control::upgrade::handoff::Upgrader>,
 ) -> Result<Option<rproxy_api::control::upgrade::handoff::HandedOff>, String> {
-	use tokio::signal::unix::{signal, SignalKind};
-
-	let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
-	let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
-	// a live upgrade to the binary on disk (#174)
-	let mut usr2 = signal(SignalKind::user_defined2()).map_err(|e| e.to_string())?;
+	let Signals { hup, term, int, usr2 } = signals;
 	loop {
 		tokio::select! {
 			_ = usr2.recv() => {
@@ -1485,13 +1520,15 @@ async fn wait_for_shutdown(
 				}
 			}
 			_ = term.recv() => return Ok(None),
-			_ = tokio::signal::ctrl_c() => return Ok(None),
+			_ = int.recv() => return Ok(None),
 		}
 	}
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_shutdown(
+	_: &mut Signals,
 	_: &Tokens,
 	_: &TokenExpiry,
 	_: &OnceCell<RustlsConfig>,
