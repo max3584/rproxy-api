@@ -479,6 +479,7 @@ async fn capabilities_list_the_gateway_features() {
 		json!(["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"])
 	);
 	assert_eq!(f["tls_route_targets"], true);
+	assert_eq!(f["tls_route_upstream"], true);
 }
 
 /// An HTTPS request (HTTP/1.1) with an optional client certificate; the backend's JSON.

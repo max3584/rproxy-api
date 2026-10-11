@@ -296,6 +296,57 @@ async fn terminate_can_re_encrypt_towards_the_backend() {
 	assert!(tls_roundtrip(&pki, port2, "front.test", None, "z").await.is_err());
 }
 
+/// `tls.routes[].upstream` (v0.4.7): each name reaches its backend its own way, instead of the rule's
+/// `upstream` (the Gateway API's BackendTLSPolicy on a TLSRoute rproxy terminates).
+#[tokio::test]
+async fn each_route_can_reach_its_backend_its_own_way() {
+	let pki = Pki::new("routeup");
+	let front = pki.server("front", &["tls.test", "plain.test", "rule.test"]);
+	let back = pki.server("back", &["back.test"]);
+	let tls_backend_addr = tls_backend(&pki, &back, "TLS:").await;
+	let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let plain_addr = plain.local_addr().unwrap();
+	serve_tag(plain, "PLAIN:".into());
+	let h = harness().await;
+	let port = free_port();
+	// the rule's own upstream is TLS; one route goes plain, one re-encrypts with its own name and CA
+	let tls = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"upstream": {"tls": true, "server_name": "back.test", "ca_file": pki.ca_file},
+		"routes": [
+			{"server_name": "tls.test", "remote_addr": "127.0.0.1", "remote_port": tls_backend_addr.port(),
+			 "upstream": {"tls": true, "server_name": "back.test", "ca_file": pki.ca_file}},
+			{"server_name": "plain.test", "remote_addr": "127.0.0.1", "remote_port": plain_addr.port(), "upstream": {"tls": false}},
+		],
+	});
+	let (status, v) = h.post(tcp_rule(port, tls_backend_addr, tls.clone())).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(v["tls"]["routes"][1]["upstream"]["tls"], false, "{v}");
+	assert_eq!(tls_roundtrip(&pki, port, "tls.test", None, "a").await.unwrap(), "TLS:a");
+	assert_eq!(tls_roundtrip(&pki, port, "plain.test", None, "b").await.unwrap(), "PLAIN:b");
+	// a name without a route: the rule's own upstream
+	assert_eq!(tls_roundtrip(&pki, port, "rule.test", None, "c").await.unwrap(), "TLS:c");
+
+	// a route's wrong expected name fails only that route
+	let mut wrong = tls.clone();
+	wrong["routes"][0]["upstream"]["server_name"] = json!("wrong.test");
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{port}"), json!({"remote_addr": "127.0.0.1", "remote_port": tls_backend_addr.port(), "tls": wrong})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert!(tls_roundtrip(&pki, port, "tls.test", None, "a").await.is_err());
+	assert_eq!(tls_roundtrip(&pki, port, "plain.test", None, "b").await.unwrap(), "PLAIN:b");
+
+	// only on terminated routes
+	let mut through = tls.clone();
+	through["routes"][1]["passthrough"] = json!(true);
+	let (status, v) = h.post(tcp_rule(free_port(), tls_backend_addr, through)).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+	assert!(v["error"].as_str().unwrap().contains("upstream is for terminated routes"), "{v}");
+	let (status, v) = h.post(tcp_rule(free_port(), tls_backend_addr, json!({"mode": "sni", "routes": [
+		{"server_name": "a.test", "remote_addr": "127.0.0.1", "remote_port": 1, "upstream": {"tls": true}}]}))).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+}
+
 #[tokio::test]
 async fn certificates_are_chosen_by_sni() {
 	let pki = Pki::new("multi");

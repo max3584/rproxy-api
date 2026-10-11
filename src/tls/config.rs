@@ -65,6 +65,11 @@ pub struct Route {
 	/// How connections are spread over `targets`.
 	#[serde(default, skip_serializing_if = "crate::core::balance::Balance::is_default")]
 	pub balance: crate::core::balance::Balance,
+	/// `terminate` (tcp) only: how to reach this route's backends, instead of the rule's `upstream`
+	/// (the Gateway API's BackendTLSPolicy on a TLSRoute's backend). The files are read when the rule
+	/// is created or changed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub upstream: Option<Upstream>,
 }
 
 fn is_zero(n: &u16) -> bool {
@@ -423,6 +428,17 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		}
 		if route.passthrough && starttls.is_some() {
 			return Err(tls_error("passthrough routes cannot be combined with starttls (TLS starts after the plain-text dialogue)"));
+		}
+		if let Some(up) = &route.upstream {
+			if protocol != Protocol::Tcp || tls.mode != TlsMode::Terminate || route.passthrough {
+				return Err(tls_error(format!("route {}: upstream is for terminated routes of tcp rules (mode terminate, not passthrough)", route.label())));
+			}
+			if up.cert_file.is_some() != up.key_file.is_some() {
+				return Err(tls_error(format!("route {}: upstream cert_file and key_file must be given together", route.label())));
+			}
+			if up.chain_file.is_some() && up.cert_file.is_none() {
+				return Err(tls_error(format!("route {}: upstream chain_file needs cert_file", route.label())));
+			}
 		}
 		if route.targets.is_empty() {
 			if route.remote_addr.is_empty() {
@@ -1177,6 +1193,9 @@ pub struct TlsRuntime {
 	/// Server side of QUIC for HTTP/3 (tcp terminate); an error text when it cannot be used.
 	pub quic_config: Option<QuicConfig>,
 	pub connector: Option<tokio_rustls::TlsConnector>,
+	/// `tls.routes[].upstream`, by the route's place in `spec.routes`: `Some` replaces the rule's
+	/// `upstream` for that route (a connector, or `None` for plain TCP).
+	pub route_upstreams: Vec<Option<RouteUpstream>>,
 	dtls_certs: Vec<dtls::crypto::Certificate>,
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
@@ -1211,6 +1230,7 @@ impl TlsRuntime {
 			server_config: None,
 			quic_config: None,
 			connector: None,
+			route_upstreams: vec![],
 			dtls_certs: vec![],
 			dtls_client_verifier: None,
 			dtls_upstream_roots: None,
@@ -1237,6 +1257,11 @@ impl TlsRuntime {
 				if spec.upstream.tls {
 					rt.connector = Some(tokio_rustls::TlsConnector::from(client_config_from(&spec.upstream, loaded)?));
 				}
+				rt.route_upstreams = spec
+					.routes
+					.iter()
+					.map(|r| r.upstream.as_ref().map(RouteUpstream::new).transpose())
+					.collect::<Result<_, _>>()?;
 			}
 			Protocol::Udp => {
 				for cert in &loaded.servers {
@@ -1328,8 +1353,43 @@ impl TlsRuntime {
 
 	/// Server name to verify on the backend's TLS certificate.
 	pub fn upstream_name(&self, target_host: &str) -> Result<ServerName<'static>, ApiError> {
-		let name = self.spec.upstream.server_name.clone().unwrap_or_else(|| target_host.to_string());
-		ServerName::try_from(name.clone()).map_err(|_| tls_error(format!("invalid upstream server_name: {name}")))
+		upstream_server_name(self.spec.upstream.server_name.as_deref(), target_host)
+	}
+
+	/// How to reach the backend of a connection: the route's `upstream` when the route has one
+	/// (`route`: its place in `spec.routes`), else the rule's. The connector (None: plain TCP) and
+	/// the name for the backend's certificate.
+	pub fn upstream_for(&self, route: Option<usize>, target_host: &str) -> Result<Option<(tokio_rustls::TlsConnector, ServerName<'static>)>, ApiError> {
+		match route.and_then(|i| self.route_upstreams.get(i)).and_then(Option::as_ref) {
+			Some(up) => match &up.connector {
+				Some(c) => Ok(Some((c.clone(), upstream_server_name(up.server_name.as_deref(), target_host)?))),
+				None => Ok(None),
+			},
+			None => match &self.connector {
+				Some(c) => Ok(Some((c.clone(), self.upstream_name(target_host)?))),
+				None => Ok(None),
+			},
+		}
+	}
+}
+
+fn upstream_server_name(configured: Option<&str>, target_host: &str) -> Result<ServerName<'static>, ApiError> {
+	let name = configured.unwrap_or(target_host).to_string();
+	ServerName::try_from(name.clone()).map_err(|_| tls_error(format!("invalid upstream server_name: {name}")))
+}
+
+/// A route's own `upstream` (`tls.routes[].upstream`), ready for connections.
+#[derive(Clone)]
+pub struct RouteUpstream {
+	/// None: plain TCP to this route's backends (`tls: false`)
+	pub connector: Option<tokio_rustls::TlsConnector>,
+	pub server_name: Option<String>,
+}
+
+impl RouteUpstream {
+	fn new(up: &Upstream) -> Result<Self, ApiError> {
+		let connector = if up.tls { Some(tokio_rustls::TlsConnector::from(client_config(up)?)) } else { None };
+		Ok(RouteUpstream { connector, server_name: up.server_name.clone() })
 	}
 }
 
@@ -1408,6 +1468,7 @@ mod tests {
 			passthrough: false,
 			targets: vec![],
 			balance: Default::default(),
+			upstream: None,
 		}
 	}
 
