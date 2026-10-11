@@ -152,7 +152,7 @@ maxminddb = "0.32.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
-aya = { version = "0.13", optional = true }
+aya = { version = "0.14", optional = true }
 xdpilone = { version = "1.0.5", optional = true }
 
 [dev-dependencies]
