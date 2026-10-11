@@ -116,6 +116,8 @@ pub struct Target {
 	pub passthrough: bool,
 	/// Chosen by a `tls.routes` name (not the rule's own targets).
 	pub from_route: bool,
+	/// That route's place in `tls.routes` (its own `upstream`, `TlsRuntime::upstream_for`).
+	pub route: Option<usize>,
 }
 
 /// Everything a listener and its connections need at run time.
@@ -269,7 +271,7 @@ impl Runtime {
 					.into_iter()
 					.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 					.collect();
-				return Some(Target { candidates, pool: Some(route.pool.clone()), passthrough: route.passthrough, from_route: true });
+				return Some(Target { candidates, pool: Some(route.pool.clone()), passthrough: route.passthrough, from_route: true, route: Some(i) });
 			}
 		}
 		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
@@ -281,7 +283,7 @@ impl Runtime {
 			.into_iter()
 			.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 			.collect();
-		Some(Target { candidates, pool: Some(pool), passthrough: false, from_route: false })
+		Some(Target { candidates, pool: Some(pool), passthrough: false, from_route: false, route: None })
 	}
 }
 

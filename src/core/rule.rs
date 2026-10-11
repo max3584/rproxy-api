@@ -154,6 +154,8 @@ pub struct Features {
 	pub forward_auth: &'static [&'static str],
 	/// `targets` and `balance` of `tls.routes[]` (#234)
 	pub tls_route_targets: bool,
+	/// `upstream` of `tls.routes[]` (v0.4.7, the Gateway API's BackendTLSPolicy on a TLSRoute terminated by rproxy)
+	pub tls_route_upstream: bool,
 	/// Modes of `tls.client_auth` that can run (`optional_no_verify`, #238)
 	pub client_auth_modes: &'static [&'static str],
 	// v0.4 (docs/DESIGN-v0.4.md)
@@ -236,6 +238,7 @@ impl Features {
 		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
 		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
+		tls_route_upstream: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
 		labels: true,
@@ -279,6 +282,7 @@ impl Features {
 		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
 		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
+		tls_route_upstream: true,
 		client_auth_modes: &["none", "optional", "required", "optional_no_verify"],
 		rulesets: true,
 		labels: true,
@@ -350,6 +354,9 @@ impl Features {
 		}
 		if !self.tls_route_targets && tls.routes.iter().any(|r| !r.targets.is_empty()) {
 			return missing("targets of tls.routes");
+		}
+		if !self.tls_route_upstream && tls.routes.iter().any(|r| r.upstream.is_some()) {
+			return missing("upstream of tls.routes");
 		}
 		let mode = serde_json::to_value(tls.client_auth.mode).ok();
 		if let Some(m) = mode.as_ref().and_then(|v| v.as_str()).filter(|m| !self.client_auth_modes.contains(m)) {

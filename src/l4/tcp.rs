@@ -552,9 +552,11 @@ async fn terminate(
 	detail.tls = Some(info);
 
 	let backend = out.as_raw_fd();
-	let mut upstream: Box<dyn Stream> = match &tls.connector {
-		Some(connector) => {
-			let name = tls.upstream_name(&host).map_err(|e| io::Error::other(e.message))?;
+	// the route's own upstream (tls.routes[].upstream), else the rule's
+	let reach = tls.upstream_for(target.route, &host).map_err(|e| io::Error::other(e.message))?;
+	let encrypted = reach.is_some();
+	let mut upstream: Box<dyn Stream> = match reach {
+		Some((connector, name)) => {
 			Box::new(
 				tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, out))
 					.await
@@ -573,7 +575,7 @@ async fn terminate(
 			session.write_all(&to_client).await?;
 		}
 	}
-	let upstream_read = if tls.connector.is_some() { relay::TLS_READ_SIZE } else { relay::BUFFER_SIZE };
+	let upstream_read = if encrypted { relay::TLS_READ_SIZE } else { relay::BUFFER_SIZE };
 	finish(rt, client, &mut session, &mut upstream, backend, (relay::TLS_READ_SIZE, upstream_read), detail).await
 }
 

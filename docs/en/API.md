@@ -628,6 +628,7 @@ Settings for rproxy-gateway (#28) to map the Gateway API's HTTPRoute, GRPCRoute,
 | HTTP/2 to backends (#233) | `http.services.<name>.protocol` | `http1` (default), `h2`, `h2c`, `auto` | `protocol` in `services` |
 | Per-service backend TLS (#236) | `http.services.<name>.tls` | `server_name`, `ca_file`, `subject_alt_names`, `cert_file`, `key_file`, `chain_file`, `insecure_skip_verify` | `tls` in `services` |
 | Several targets per name (#234) | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`, `balance` (instead of `remote_addr` / `remote_port`) | `tls_route_targets` |
+| Backend TLS per name (v0.4.7, BackendTLSPolicy on a terminated TLSRoute) | `tls.routes[].upstream` | The fields of the rule's `tls.upstream` (`tls`, `server_name`, `ca_file`, `cert_file`, `key_file`, `chain_file`, `insecure_skip_verify`). Only on routes of tcp `terminate` rules that are not passthrough. When present, that route uses it instead of the rule's `tls.upstream` (`tls: false` means plain TCP). The files are read when the rule is created or changed | `tls_route_upstream` |
 | Client certificates not verified (#238, `AllowInsecureFallback`) | `tls.client_auth.mode` | `optional_no_verify` (see "`optional_no_verify`" above) | `client_auth_modes` |
 | Fixed-status servers (#235) | `http.services.<name>.servers[]` | `{"status": 500, "weight": 1}` (instead of `url`) | `server_status` in `http_options` |
 | 421 Misdirected Request (v0.4.3) | `tls.misdirected` | `{"groups": [["*"], ["b.example"], ["**.w.example"]]}` | `misdirected` in `http_options` |

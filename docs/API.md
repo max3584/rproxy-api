@@ -628,6 +628,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
 | 転送先との HTTP/2（#233） | `http.services.<名前>.protocol` | `http1`（既定）・`h2`・`h2c`・`auto` | `services` の `protocol` |
 | サービスごとの転送先の TLS（#236） | `http.services.<名前>.tls` | `server_name`・`ca_file`・`subject_alt_names`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify` | `services` の `tls` |
 | 名前ごとの複数の宛先（#234） | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`・`balance`（`remote_addr` / `remote_port` の代わり） | `tls_route_targets` |
+| 名前ごとの転送先への TLS（v0.4.7、TLSRoute の終端の BackendTLSPolicy） | `tls.routes[].upstream` | ルールの `tls.upstream` と同じ項目（`tls`・`server_name`・`ca_file`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify`）。tcp の `terminate` の passthrough でない route だけ。あればその route ではルールの `tls.upstream` の代わりに使う（`tls: false` なら平文）。ファイルはルールの作成・変更のときに読む | `tls_route_upstream` |
 | クライアント証明書を確かめない（#238、`AllowInsecureFallback`） | `tls.client_auth.mode` | `optional_no_verify`（上の「証明書を確かめない `optional_no_verify`」） | `client_auth_modes` |
 | 固定の状態コードの転送先（#235） | `http.services.<名前>.servers[]` | `{"status": 500, "weight": 1}`（`url` の代わり） | `http_options` の `server_status` |
 | 421 Misdirected Request（v0.4.3） | `tls.misdirected` | `{"groups": [["*"], ["b.example"], ["**.w.example"]]}` | `http_options` の `misdirected` |
