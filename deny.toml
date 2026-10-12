@@ -18,7 +18,12 @@ targets = [
 # vulnerabilities, unmaintained and unsound crates and yanked versions all fail the check
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # unsafe-libyaml (serde_yaml_ng's YAML parser and emitter) is archived. rproxy-api has read its
+    # settings file through serde_yaml_ng since v0.3 (the converter crates/rproxy-traefik too);
+    # there is no fixed version. Remove when serde_yaml_ng (or a replacement) no longer uses it.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is archived; serde_yaml_ng still uses it and has no replacement yet" },
+]
 
 [licenses]
 # what the dependency tree uses today (cargo deny list); all permissive
