@@ -84,7 +84,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
-| `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない |
+| `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない。YAML は 1.2 として読む（`yes`・`on` は文字列。`010`・`1_000` のような数は数になるので、文字列にするなら引用符で囲む。マージキー `<<` が使える） |
 | `RPROXY_CONFIG_CHECK_SECS` | `--config-check-secs` | `10` | 設定ファイルが変わったかを確かめる間隔（秒）。`0` なら SIGHUP のときだけ読み直す |
 | `RPROXY_API_RELOAD_UNIX_ONLY` | `--api-reload-unix-only` | `true` | `POST /config/reload`（設定ファイルをその場で読み直して結果を返す）と ACME の強い操作（`POST /acme/...`。docs/ACME.md）を Unix ソケットからだけ受け付ける。`false` で TCP の制御 API でも受け付ける（`admin` / `acme:write` のトークンが要る） |
 | — | `--check-kernel` | — | カーネルでの転送（`global.performance.xdp`、#260）の速い道をすべて、テストデータを流して確かめ、表で出して終わる（`--check-kernel-format json` で JSON）。`--config` / `RPROXY_CONFIG` で求めたものがすべて使えれば 0、そうでなければ 1 |

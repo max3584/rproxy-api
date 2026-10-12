@@ -25,6 +25,16 @@ fn ext_of(path: &Path) -> String {
 	path.extension().map(|e| format!(".{}", e.to_string_lossy().to_lowercase())).unwrap_or_default()
 }
 
+/// YAML 1.2 (serde-saphyr): `yes` / `on` stay strings, duplicate keys are refused, one-line errors. Merge keys
+/// (`<<`) are kept as ordinary keys here and expanded by `apply_yaml_merge`, in PyYAML's order.
+pub(crate) fn yaml_from_slice<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, String> {
+	let mut options = serde_saphyr::Options::default();
+	options.strict_booleans = true;
+	options.with_snippet = false;
+	options.merge_keys = serde_saphyr::options::MergeKeyPolicy::AsOrdinary;
+	serde_saphyr::from_slice_with_options(data, options).map_err(|e| e.to_string())
+}
+
 /// Parses configuration text by its file type (`.yml`, `.yaml`, `.toml`, `.json`).
 /// An empty YAML document is an empty map.
 pub fn parse_text(path: &Path, data: &[u8]) -> Result<Value, InputError> {
@@ -34,7 +44,7 @@ pub fn parse_text(path: &Path, data: &[u8]) -> Result<Value, InputError> {
 			if data.iter().all(u8::is_ascii_whitespace) {
 				return Ok(Value::Map(Map::new()));
 			}
-			let mut v: Value = serde_yaml_ng::from_slice(data).map_err(|e| InputError(format!("{shown}: {e}")))?;
+			let mut v: Value = yaml_from_slice(data).map_err(|e| InputError(format!("{shown}: {e}")))?;
 			apply_yaml_merge(&mut v);
 			Ok(if v.truthy() { v } else { Value::Map(Map::new()) })
 		}

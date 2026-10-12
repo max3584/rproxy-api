@@ -365,7 +365,7 @@ pub fn document_json(path: &std::path::Path) -> Result<Value, String> {
 	for file in crate::config::config_files(path).map_err(|e| format!("{}: {e}", path.display()))? {
 		let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
 		let value: Value = match file.extension().and_then(|e| e.to_str()) {
-			Some("yaml" | "yml") => serde_yaml_ng::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?,
+			Some("yaml" | "yml") => crate::config::yaml(&text).map_err(|e| format!("{}: {e}", file.display()))?,
 			_ => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?,
 		};
 		match value {
