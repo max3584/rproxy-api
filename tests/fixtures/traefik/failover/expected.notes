@@ -1,0 +1,1 @@
+router app: failover service app: the servers of main then spare, balance: failover (the first server that is up; within main no round robin)

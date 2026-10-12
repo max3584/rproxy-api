@@ -1,0 +1,3 @@
+default --static traefik.yml
+certbot --static traefik.yml --certs certbot
+certbot-live --static traefik.yml --certs certbot --certbot-live /srv/certs/

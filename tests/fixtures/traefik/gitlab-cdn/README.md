@@ -1,0 +1,1 @@
+source: modelled on the Traefik setup in docs/DESIGN-v0.3.md section 7 (GitLab and a CDN behind CrowdSec, Kubernetes passthrough on the same port). Names are example.com; the bouncer key is a placeholder (not-a-real-key). Internal 10.0.0.0/8 addresses are kept as private ones.

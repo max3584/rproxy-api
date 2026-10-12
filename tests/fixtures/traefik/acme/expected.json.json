@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "global": {
+    "acme": {
+      "accounts": {
+        "wildcard": {
+          "directory": "https://acme-staging-v02.api.letsencrypt.org/directory",
+          "contact": [
+            "mailto:ops@example.org"
+          ],
+          "allowed_names": [
+            "apps.example.org",
+            "*.apps.example.org"
+          ],
+          "eab": {
+            "kid": "kid-123",
+            "hmac_key_file": "/etc/rproxy/acme/wildcard-eab.key"
+          }
+        },
+        "web": {
+          "contact": [
+            "mailto:ops@example.org"
+          ],
+          "allowed_names": [
+            "www.example.net",
+            "example.net"
+          ]
+        },
+        "cloud": {
+          "contact": [
+            "mailto:ops@example.org"
+          ],
+          "allowed_names": [
+            "shop.example.com"
+          ]
+        }
+      },
+      "resolvers": {
+        "wildcard": {
+          "account": "wildcard",
+          "challenge": "dns-01",
+          "dns_provider": "wildcard-dns"
+        },
+        "web": {
+          "account": "web",
+          "challenge": "http-01"
+        },
+        "cloud": {
+          "account": "cloud",
+          "challenge": "dns-01",
+          "dns_provider": "cloud-dns"
+        }
+      },
+      "dns_servers": [
+        "10.0.0.53:53"
+      ],
+      "dns_providers": {
+        "wildcard-dns": {
+          "type": "powerdns",
+          "api_url": "http://CHANGE-ME.invalid:8081",
+          "api_key_file": "/etc/rproxy/acme/wildcard-pdns.key",
+          "allowed_names": [
+            "apps.example.org",
+            "*.apps.example.org"
+          ]
+        },
+        "cloud-dns": {
+          "type": "http",
+          "add": {
+            "url": "https://CHANGE-ME.invalid/{fqdn}",
+            "headers": {
+              "Authorization": "Bearer {secret}"
+            },
+            "body": "{\"value\":\"{value}\"}",
+            "method": "POST"
+          },
+          "remove": {
+            "url": "https://CHANGE-ME.invalid/{fqdn}",
+            "headers": {
+              "Authorization": "Bearer {secret}"
+            },
+            "body": "{\"value\":\"{value}\"}",
+            "method": "DELETE"
+          },
+          "secret_file": "/etc/rproxy/acme/cloud-dns.token",
+          "allowed_names": [
+            "shop.example.com"
+          ]
+        }
+      }
+    }
+  },
+  "rules": [
+    {
+      "protocol": "tcp",
+      "listen_addr": "0.0.0.0",
+      "listen_port": 443,
+      "tls": {
+        "mode": "terminate",
+        "certificates": [
+          {
+            "acme": "wildcard",
+            "domains": [
+              "apps.example.org",
+              "*.apps.example.org"
+            ]
+          },
+          {
+            "acme": "web",
+            "domains": [
+              "www.example.net",
+              "example.net"
+            ]
+          },
+          {
+            "acme": "cloud",
+            "domains": [
+              "shop.example.com"
+            ]
+          }
+        ]
+      },
+      "http": {
+        "routes": [
+          {
+            "name": "apps",
+            "match": "HostRegexp(`^.+\\.apps\\.example\\.org$`)",
+            "service": "apps"
+          },
+          {
+            "name": "site",
+            "match": "Host(`www.example.net`) || Host(`example.net`)",
+            "service": "site"
+          },
+          {
+            "name": "shop",
+            "match": "Host(`shop.example.com`)",
+            "service": "site"
+          }
+        ],
+        "services": {
+          "apps": {
+            "servers": [
+              {
+                "url": "http://10.0.5.1:8080"
+              }
+            ]
+          },
+          "site": {
+            "servers": [
+              {
+                "url": "http://10.0.5.2:8080"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

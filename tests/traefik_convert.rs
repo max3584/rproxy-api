@@ -1,51 +1,86 @@
-//! contrib/traefik2rproxy.py: converts the Traefik configurations in
-//! tests/fixtures/traefik/ and checks that rproxy reads and accepts the result.
-//! Needs python3 with PyYAML; skipped without them unless
-//! RPROXY_TEST_REQUIRE_PYTHON is set (CI sets it).
+//! The Traefik converter (crates/rproxy-traefik, `rproxy-traefik-convert`):
+//! converts the Traefik configurations in tests/fixtures/traefik/ and checks that
+//! rproxy reads and accepts the result. The crate's own tests
+//! (crates/rproxy-traefik/tests/fixtures.rs) hold the output to the expected files
+//! byte for byte; these check what the result means to rproxy.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
+use clap::Parser;
 use rproxy_api::config::ConfigDoc;
-use rproxy_api::l7::MiddlewareSpec;
 use rproxy_api::core::rule::{Caps, Features, RuleRequest};
+use rproxy_api::l7::MiddlewareSpec;
+use rproxy_traefik::cli::{self, Args};
 
 fn root() -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn python_ready() -> bool {
-	let ok = Command::new("python3").args(["-c", "import yaml"]).output().is_ok_and(|o| o.status.success());
-	if !ok {
-		assert!(std::env::var_os("RPROXY_TEST_REQUIRE_PYTHON").is_none(), "python3 with PyYAML is required");
-		eprintln!("skipped: python3 with PyYAML is not available");
+/// Runs the converter on arguments as the command takes them (paths relative to
+/// `dir`); returns (settings text, notes).
+fn run_in(dir: &Path, args: &[&str]) -> (String, String) {
+	let mut argv = vec!["rproxy-traefik-convert".to_string()];
+	let mut path_next = false;
+	for a in args {
+		argv.push(if path_next { dir.join(a).to_string_lossy().into_owned() } else { a.to_string() });
+		path_next = matches!(*a, "--static" | "--dynamic" | "--docker" | "--capabilities");
 	}
-	ok
+	let out = cli::run(&Args::try_parse_from(&argv).unwrap()).unwrap_or_else(|e| panic!("{args:?}: {e:?}"));
+	(out.text, out.notes.join("\n"))
 }
 
-/// Runs the converter; returns (settings document, stderr).
-fn convert(args: &[&str]) -> (ConfigDoc, String) {
-	let out = Command::new("python3").arg(root().join("contrib/traefik2rproxy.py")).args(args).current_dir(root()).output().unwrap();
-	let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-	assert!(out.status.success(), "converter failed:\n{stderr}");
-	let text = String::from_utf8(out.stdout).unwrap();
-	let doc = ConfigDoc::parse(Path::new("converted.yaml"), &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+/// Converts and checks that rproxy reads the settings and accepts every rule.
+fn accepted(text: &str, what: &str) -> ConfigDoc {
+	let doc = ConfigDoc::parse(Path::new("converted.yaml"), text).unwrap_or_else(|e| panic!("{what}: {e}\n{text}"));
 	let caps = Caps { transparent: true, transparent_ipv6: true, features: Features::ALL, ..Default::default() };
 	for r in &doc.rules {
-		r.clone().validate(&caps).unwrap_or_else(|e| panic!("{}:{}: {}\n{text}", r.protocol, r.listen_port, e.message));
+		r.clone().validate(&caps).unwrap_or_else(|e| panic!("{what}: {}:{}: {}\n{text}", r.protocol, r.listen_port, e.message));
 	}
-	(doc, stderr)
+	doc
+}
+
+/// Runs the converter (paths relative to the repository); returns (settings document, notes).
+fn convert(args: &[&str]) -> (ConfigDoc, String) {
+	let (text, notes) = run_in(&root(), args);
+	(accepted(&text, &format!("{args:?}")), notes)
 }
 
 fn rule(doc: &ConfigDoc, port: u16) -> &RuleRequest {
 	doc.rules.iter().find(|r| r.listen_port == port).unwrap_or_else(|| panic!("no rule on {port}"))
 }
 
+/// Every case of every fixture (tests/fixtures/traefik/*/cases) converts into
+/// settings that rproxy accepts.
+#[test]
+fn every_fixture_is_accepted() {
+	let base = root().join("tests/fixtures/traefik");
+	let mut n = 0;
+	for dir in std::fs::read_dir(&base).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_dir()) {
+		let cases = std::fs::read_to_string(dir.join("cases")).unwrap();
+		for line in cases.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+			let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+			let (text, _) = run_in(&dir, &args);
+			accepted(&text, &format!("{} {line}", dir.display()));
+			n += 1;
+		}
+	}
+	assert!(n >= 10, "{n} cases");
+}
+
+/// What the converter assumes rproxy runs (without --capabilities) is what this
+/// build runs.
+#[test]
+fn known_features_are_current() {
+	for m in rproxy_traefik::KNOWN_MIDDLEWARES {
+		assert!(Features::CURRENT.middlewares.contains(m), "KNOWN_MIDDLEWARES has {m}, which rproxy does not run");
+	}
+	for s in rproxy_traefik::KNOWN_SERVICE_OPTIONS {
+		assert!(Features::CURRENT.services.contains(s), "KNOWN_SERVICE_OPTIONS has {s}");
+	}
+}
+
 #[test]
 fn gitlab_and_cdn_behind_crowdsec() {
-	if !python_ready() {
-		return;
-	}
 	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/gitlab-cdn/traefik.yml"]);
 	assert_eq!(doc.rules.len(), 2);
 
@@ -99,11 +134,6 @@ fn gitlab_and_cdn_behind_crowdsec() {
 
 #[test]
 fn tcp_and_udp_routers_from_toml() {
-	if !python_ready()
-		|| !Command::new("python3").args(["-c", "import tomllib"]).output().is_ok_and(|o| o.status.success())
-	{
-		return;
-	}
 	let (doc, _) = convert(&["--static", "tests/fixtures/traefik/tcp-udp/traefik.toml"]);
 	assert_eq!(doc.rules.len(), 4);
 	let sni = rule(&doc, 443);
@@ -126,9 +156,6 @@ fn tcp_and_udp_routers_from_toml() {
 
 #[test]
 fn failover_services() {
-	if !python_ready() {
-		return;
-	}
 	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/failover/traefik.yml"]);
 	let http = rule(&doc, 8080).http.as_ref().unwrap();
 	let svc = http.services.values().find(|s| s.servers.len() == 3).unwrap();
@@ -144,9 +171,6 @@ fn failover_services() {
 
 #[test]
 fn docker_labels_with_middlewares() {
-	if !python_ready() {
-		return;
-	}
 	let (doc, notes) = convert(&[
 		"--static",
 		"tests/fixtures/traefik/docker/traefik.yml",
@@ -172,13 +196,20 @@ fn docker_labels_with_middlewares() {
 	let MiddlewareSpec::BasicAuth { keep_authorization, .. } = &http.middlewares["auth"] else { panic!() };
 	assert!(*keep_authorization, "Traefik passes Authorization on unless removeHeader");
 	assert!(!notes.contains("$apr1$"), "password hashes are not copied");
+	// an older rproxy (GET /capabilities) lacks the authentication middlewares
+	let (_, notes) = convert(&[
+		"--static",
+		"tests/fixtures/traefik/docker/traefik.yml",
+		"--docker",
+		"tests/fixtures/traefik/docker/inspect.json",
+		"--capabilities",
+		"tests/fixtures/traefik/docker/capabilities.json",
+	]);
+	assert!(notes.contains("GET /capabilities does not list yet") && notes.contains("basic_auth, forward_auth, sticky"), "{notes}");
 }
 
 #[test]
 fn cert_resolvers_become_acme_resolvers() {
-	if !python_ready() {
-		return;
-	}
 	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/acme/traefik.yml"]);
 	let acme = doc.global.acme.as_ref().unwrap();
 	// every challenge: dnsChallenge (pdns, a provider rproxy lacks), httpChallenge
@@ -199,15 +230,78 @@ fn cert_resolvers_become_acme_resolvers() {
 	// secrets are not copied; the wildcard comes with its apex in one certificate
 	let text = std::fs::read_to_string(root().join("tests/fixtures/traefik/acme/traefik.yml")).unwrap();
 	assert!(text.contains("not-a-real-hmac-SECRET"));
-	let out = Command::new("python3")
-		.arg(root().join("contrib/traefik2rproxy.py"))
-		.args(["--static", "tests/fixtures/traefik/acme/traefik.yml"])
-		.current_dir(root())
-		.output()
-		.unwrap();
-	assert!(!String::from_utf8_lossy(&out.stdout).contains("SECRET") && !notes.contains("SECRET"));
+	let (out, _) = run_in(&root(), &["--static", "tests/fixtures/traefik/acme/traefik.yml"]);
+	assert!(!out.contains("SECRET") && !notes.contains("SECRET"));
 	let certs = &rule(&doc, 443).tls.as_ref().unwrap().certificates;
 	let got: Vec<(Option<&str>, usize)> = certs.iter().map(|c| (c.acme.as_deref(), c.domains.len())).collect();
 	assert_eq!(got, [(Some("wildcard"), 2), (Some("web"), 2), (Some("cloud"), 1)]);
 	assert!(notes.contains("acme.json") && notes.contains("CHANGE-ME"), "{notes}");
+}
+
+#[test]
+fn every_middleware_kind() {
+	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/middlewares/traefik.yml"]);
+	let http = rule(&doc, 8443).http.as_ref().unwrap();
+	let mut kinds: Vec<&str> = http.middlewares.values().map(MiddlewareSpec::kind).collect();
+	kinds.sort();
+	kinds.dedup();
+	assert_eq!(
+		kinds,
+		[
+			"add_prefix",
+			"basic_auth",
+			"buffering",
+			"circuit_breaker",
+			"compress",
+			"forward_auth",
+			"headers",
+			"in_flight",
+			"ip_allow",
+			"rate_limit",
+			"redirect_regex",
+			"redirect_scheme",
+			"replace_path",
+			"replace_path_regex",
+			"retry",
+			"strip_prefix",
+		]
+	);
+	let MiddlewareSpec::BasicAuth { keep_authorization, users_file, .. } = &http.middlewares["users"] else { panic!() };
+	assert_eq!((users_file.as_str(), *keep_authorization), ("/etc/traefik/users.htpasswd", false), "removeHeader: true");
+	// the chain inside a chain comes in order
+	let admin = http.routes.iter().find(|r| r.name == "admin").unwrap();
+	assert_eq!(admin.middlewares, ["security", "office", "users", "in-flight", "breaker"]);
+	// a router to Traefik's own service stays when a middleware answers by itself
+	assert!(http.routes.iter().any(|r| r.name == "to-dashboard" && r.service.is_none()));
+	// weighted: flattened with the weights multiplied
+	let weights: Vec<Option<u32>> = http.services["api-split"].servers.iter().map(|s| s.weight).collect();
+	assert_eq!(weights, [Some(3), Some(2)]);
+	let tls = rule(&doc, 8443).tls.as_ref().unwrap();
+	assert_eq!(tls.upstream.ca_file.as_deref(), Some("/etc/traefik/ca/internal.pem"));
+	for want in ["digestAuth has no rproxy equivalent", "plugin geoblock", "not one middleware type", "middleware missing is not defined"] {
+		assert!(notes.contains(want), "{want}: {notes}");
+	}
+	// the redirecting entry point goes to the port given by number
+	let MiddlewareSpec::RedirectScheme { port, permanent, .. } = &rule(&doc, 80).http.as_ref().unwrap().middlewares["redirect"] else {
+		panic!()
+	};
+	assert_eq!((*port, *permanent), (Some(8443), false));
+}
+
+#[test]
+fn tcp_routers_that_terminate_tls() {
+	let (doc, notes) = convert(&["--static", "tests/fixtures/traefik/tls-tcp/traefik.toml"]);
+	let smtps = rule(&doc, 465);
+	assert_eq!(smtps.allow_from, ["192.0.2.0/24", "2001:db8::/32"]);
+	let certs: Vec<Option<&str>> = smtps.tls.as_ref().unwrap().certificates.iter().map(|c| c.acme.as_deref()).collect();
+	assert_eq!(certs, [Some("le"), Some("zone")]);
+	let acme = doc.global.acme.as_ref().unwrap();
+	assert_eq!((acme.dns_providers["le-dns"].kind.as_str(), acme.dns_providers["zone-dns"].kind.as_str()), ("rfc2136", "acme_dns"));
+	assert!(notes.contains("terminating routers left out: term"), "{notes}");
+	let (doc, _) = convert(&["--static", "tests/fixtures/traefik/tls-tcp/traefik.toml", "--certs", "certbot"]);
+	let certs: Vec<&str> = rule(&doc, 465).tls.as_ref().unwrap().certificates.iter().map(|c| c.cert_file.as_str()).collect();
+	assert_eq!(certs, ["/etc/letsencrypt/live/mail.example.net/fullchain.pem", "/etc/letsencrypt/live/mx.example.net/fullchain.pem"]);
+	let game = rule(&doc, 27015);
+	let weights: Vec<Option<u32>> = game.targets.iter().map(|t| t.weight).collect();
+	assert_eq!(weights, [Some(6), None]);
 }

@@ -1,0 +1,90 @@
+http:
+  routers:
+    cloud:
+      rule: Host(`cloud.example.com`)
+      entryPoints: [websecure]
+      middlewares: [well-known, upload, retry-slow]
+      service: cloud
+      priority: 10
+    api:
+      rule: Host(`api.example.com`) && PathPrefix(`/api/v1`)
+      entryPoints: [websecure]
+      middlewares: [api-v1, per-token, gzip, sso]
+      service: api-split
+    legacy:
+      rule: Host(`legacy.example.com`) && Path(`/old`)
+      entryPoints: [websecure]
+      middlewares: [old-path, add-app, strip-slash, per-host, unlimited, no-limit-buffer, latency-only]
+      service: legacy
+    admin:
+      rule: HostHeader(`admin.example.com`) && ClientIP(`192.0.2.0/24`)
+      entryPoints: [websecure, admin]
+      middlewares: [protected@file, digest, geoblock, two-kinds, missing]
+      service: shadowed
+      tls:
+        options: strict
+    plain-http:
+      rule: PathPrefix(`/plain`)
+      entryPoints: [websecure]
+      service: cloud
+      tls: "false"
+    to-dashboard:
+      rule: Host(`traefik.example.com`)
+      entryPoints: [websecure]
+      middlewares: [to-https]
+      service: dashboard@internal
+    templated:
+      rule: HostRegexp(`{sub:[a-z]+}.example.org`, `example.org`) || Method(`PURGE`)
+      entryPoints: [websecure]
+      service: cloud
+    unknown-matcher:
+      rule: Host(`x.example.com`) && Foo(`bar`)
+      service: cloud
+    on-web:
+      rule: Host(`web.example.com`)
+      entryPoints: [web]
+      service: cloud
+  services:
+    cloud:
+      loadBalancer:
+        servers:
+          - url: https://192.0.2.10:443
+            weight: 2
+          - url: https://192.0.2.11:443
+        serversTransport: internal-ca
+        passHostHeader: false
+        healthCheck:
+          path: /status.php
+          interval: 30s
+          timeout: 5s
+          hostname: cloud.example.com
+        responseForwarding:
+          flushInterval: 100ms
+    api-split:
+      weighted:
+        services:
+          - name: api-blue
+            weight: 3
+          - name: api-green@file
+            weight: 1
+    api-blue:
+      loadBalancer:
+        servers: [{url: "http://192.0.2.20:8080"}]
+        sticky:
+          cookie: {}
+    api-green:
+      loadBalancer:
+        servers: [{url: "http://192.0.2.21:8080", weight: 2}]
+    legacy:
+      loadBalancer:
+        servers: [{url: "http://[2001:db8::30]:8080"}]
+    shadowed:
+      mirroring:
+        service: legacy
+        mirrors:
+          - name: api-blue
+            percent: 10
+  serversTransports:
+    internal-ca:
+      serverName: cloud.internal.example.com
+      rootCAs: ["/etc/traefik/ca/internal.pem", "/etc/traefik/ca/old.pem"]

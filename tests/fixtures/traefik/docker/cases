@@ -1,0 +1,2 @@
+default --static traefik.yml --docker inspect.json
+capabilities --static traefik.yml --docker inspect.json --capabilities capabilities.json

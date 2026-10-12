@@ -1,0 +1,111 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - certificatesResolvers.wildcard: eab: write the HMAC key (hmacEncoded) into /etc/rproxy/acme/wildcard-eab.key (not copied here)
+# - certificatesResolvers.wildcard: storage /letsencrypt/acme.json (acme.json) is not read: rproxy creates a new account and obtains the certificates again
+# - certificatesResolvers.wildcard: dnsChallenge pdns: set api_url and write the API key into /etc/rproxy/acme/wildcard-pdns.key
+# - certificatesResolvers.web: httpChallenge: rproxy's http rules on port 80 answer HTTP-01 before their routes (or set global.acme.http01_listen)
+# - certificatesResolvers.cloud: dnsChallenge route53: rproxy has no such provider; a generic REST template (type http) with placeholders is written: point it at the provider's API or a small relay (docs/en/ACME.md)
+# - global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)
+
+version: 1
+global:
+  acme:
+    accounts:
+      wildcard:
+        directory: https://acme-staging-v02.api.letsencrypt.org/directory
+        contact:
+        - mailto:ops@example.org
+        allowed_names:
+        - apps.example.org
+        - '*.apps.example.org'
+        eab:
+          kid: kid-123
+          hmac_key_file: /etc/rproxy/acme/wildcard-eab.key
+      web:
+        contact:
+        - mailto:ops@example.org
+        allowed_names:
+        - www.example.net
+        - example.net
+      cloud:
+        contact:
+        - mailto:ops@example.org
+        allowed_names:
+        - shop.example.com
+    resolvers:
+      wildcard:
+        account: wildcard
+        challenge: dns-01
+        dns_provider: wildcard-dns
+      web:
+        account: web
+        challenge: http-01
+      cloud:
+        account: cloud
+        challenge: dns-01
+        dns_provider: cloud-dns
+    dns_servers:
+    - 10.0.0.53:53
+    dns_providers:
+      wildcard-dns:
+        type: powerdns
+        api_url: http://CHANGE-ME.invalid:8081
+        api_key_file: /etc/rproxy/acme/wildcard-pdns.key
+        allowed_names:
+        - apps.example.org
+        - '*.apps.example.org'
+      cloud-dns:
+        type: http
+        add:
+          url: https://CHANGE-ME.invalid/{fqdn}
+          headers:
+            Authorization: Bearer {secret}
+          body: '{"value":"{value}"}'
+          method: POST
+        remove:
+          url: https://CHANGE-ME.invalid/{fqdn}
+          headers:
+            Authorization: Bearer {secret}
+          body: '{"value":"{value}"}'
+          method: DELETE
+        secret_file: /etc/rproxy/acme/cloud-dns.token
+        allowed_names:
+        - shop.example.com
+rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 443
+  tls:
+    mode: terminate
+    certificates:
+    - acme: wildcard
+      domains:
+      - apps.example.org
+      - '*.apps.example.org'
+    - acme: web
+      domains:
+      - www.example.net
+      - example.net
+    - acme: cloud
+      domains:
+      - shop.example.com
+  http:
+    routes:
+    - name: apps
+      match: HostRegexp(`^.+\.apps\.example\.org$`)
+      service: apps
+    - name: site
+      match: Host(`www.example.net`) || Host(`example.net`)
+      service: site
+    - name: shop
+      match: Host(`shop.example.com`)
+      service: site
+    services:
+      apps:
+        servers:
+        - url: http://10.0.5.1:8080
+      site:
+        servers:
+        - url: http://10.0.5.2:8080

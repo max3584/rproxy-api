@@ -1,0 +1,1 @@
+source: synthetic, TOML: TCP routers that terminate TLS with certResolvers (rfc2136, acme-dns), a passthrough catch-all next to a terminating router, ClientIP, PROXY protocol versions, two UDP routers on one entry point. Documentation addresses only.

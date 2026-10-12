@@ -1,0 +1,8 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - static: no entryPoints; using web (:80) and websecure (:443)
+
+version: 1
+rules: []

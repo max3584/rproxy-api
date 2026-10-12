@@ -1,0 +1,29 @@
+# Every middleware kind the converter knows, a few it does not, and the HTTP
+# service kinds (weighted, mirroring, https backends with a serversTransport)
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: "8443"
+          scheme: https
+          permanent: false
+  websecure:
+    address: "192.0.2.1:8443"
+    http:
+      tls: {}
+      middlewares: [security@file]
+  admin:
+    address: "[2001:db8::1]:9443"
+    proxyProtocol:
+      trustedIPs: ["198.51.100.0/24"]
+    forwardedHeaders:
+      insecure: true
+providers:
+  file:
+    directory: dynamic
+  docker: {}
+metrics:
+  prometheus: {}
+accessLog: {}

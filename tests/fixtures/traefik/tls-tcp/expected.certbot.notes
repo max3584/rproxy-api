@@ -1,0 +1,19 @@
+serversTransport: insecureSkipVerify: applies to every https:// backend of the rule in rproxy
+tcp router submission: combined rule: only its HostSNI part is used
+tcp router submission-alt: backend address 'not-an-address' not understood; left out
+tcp router submission-alt: service postfix-pool: healthCheck is not converted (rproxy checks L4 targets with a TCP connection: health_check)
+tcp router weird: HostSNIRegexp `^(smtp|mail)\.example\.org$` is not a plain suffix; not converted (rproxy takes names, *.suffix for one label and **.suffix for any depth)
+tcp router weird: ALPN is not converted (rproxy L4 routes by SNI only)
+tls.options.modern: maxVersion / curvePreferences / sniStrict are not converted
+tcp router imap2: entry point tls13: routers use different TLS options; rproxy has one set per rule
+udp router game-copy: entry point games already has a UDP router; left out
+udp router nowhere: service missing is not defined
+udp router nowhere: service missing has no servers; left out
+certificates: get mail.example.net with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) into /etc/letsencrypt/live/mail.example.net/; rproxy re-reads renewed files by itself
+certificates: get *.mx.example.net with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) into /etc/letsencrypt/live/mx.example.net/; rproxy re-reads renewed files by itself
+certificatesResolvers: le: not converted (--certs certbot); use certbot / cert-manager and point cert_file / key_file at the files
+certificatesResolvers: zone: not converted (--certs certbot); use certbot / cert-manager and point cert_file / key_file at the files
+entry point smtps: ClientIP of TCP routers applies to the whole rule (allow_from)
+entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule (the first is used)
+entry point tls13: no certificate found; put one at /etc/rproxy/tls/tls13.pem
+entry point mixed: a HostSNI(`*`) passthrough router cannot share a port with terminating routers; terminating routers left out: term

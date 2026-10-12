@@ -1,0 +1,1 @@
+source: synthetic: every middleware kind the converter knows and some it does not, weighted / mirroring services, a serversTransport, TLS options in a TOML file next to YAML ones. Documentation addresses only.

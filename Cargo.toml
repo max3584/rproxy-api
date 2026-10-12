@@ -71,7 +71,7 @@ assets = [
 
 # crates/rproxy-dpdk (#261): pure Rust without its `ffi` feature, so its tests run in the normal CI
 [workspace]
-members = ["crates/rproxy-dpdk"]
+members = ["crates/rproxy-dpdk", "crates/rproxy-traefik"]
 
 [package.metadata.cargo-machete]
 # md-5 is used as `md5` (src/l7/middleware/auth.rs, htpasswd APR1)
@@ -156,6 +156,8 @@ aya = { version = "0.14", optional = true }
 xdpilone = { version = "1.0.5", optional = true }
 
 [dev-dependencies]
+# tests/traefik_convert.rs: the converter's output read and accepted by rproxy
+rproxy-traefik = { path = "crates/rproxy-traefik" }
 rcgen = { version = "0.14.10", features = ["x509-parser"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }

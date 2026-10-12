@@ -1,0 +1,150 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - middleware crowdsec: the CrowdSec bouncer key is not copied; write it to /etc/rproxy/crowdsec.key (owner root, group rproxy, mode 640)
+# - router dashboard: service api@internal is Traefik's own; router left out
+# - certificates: get gitlab.example.com, cdn.example.com with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) into /srv/certs/gitlab.example.com/; rproxy re-reads renewed files by itself
+# - certificatesResolvers: letsencrypt: not converted (--certs certbot); use certbot / cert-manager and point cert_file / key_file at the files
+# - api: Traefik's dashboard has no equivalent; use the rproxy UI (TCP-UDP-rproxy-ui)
+# - accessLog: rproxy writes JSON Lines (event http.access); Traefik's format and filters are not converted
+
+version: 1
+global:
+  trusted_proxies:
+  - 10.0.0.0/8
+  - 192.0.2.0/24
+  access_log: /var/log/traefik/access.log
+  crowdsec:
+    lapi_url: http://127.0.0.1:8080
+    api_key_file: /etc/rproxy/crowdsec.key
+    appsec_url: http://127.0.0.1:7422
+    update_interval: 15s
+rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 80
+  http:
+    routes:
+    - name: redirect
+      match: PathPrefix(`/`)
+      priority: 1000000
+      middlewares:
+      - redirect
+    middlewares:
+      redirect:
+        redirect_scheme:
+          scheme: https
+          permanent: true
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 443
+  tls:
+    mode: terminate
+    certificates:
+    - cert_file: /srv/certs/gitlab.example.com/fullchain.pem
+      key_file: /srv/certs/gitlab.example.com/privkey.pem
+    routes:
+    - server_name: registry.example.com
+      remote_addr: 10.0.1.10
+      remote_port: 443
+      passthrough: true
+    - server_name: '**.tenant.example.com'
+      remote_addr: 10.0.1.10
+      remote_port: 443
+      passthrough: true
+    - server_name: '*.apps.example.com'
+      remote_addr: 10.0.1.10
+      remote_port: 443
+      passthrough: true
+  http:
+    http3: true
+    routes:
+    - name: cdn-allowed
+      match: Host(`cdn.example.com`) && (PathPrefix(`/file/`) || PathPrefix(`/images/`) || PathPrefix(`/iso/`))
+      service: cdn
+      middlewares:
+      - crowdsec
+    - name: cdn-block
+      match: Host(`cdn.example.com`)
+      service: cdn
+      middlewares:
+      - block-all
+    - name: metrics
+      match: PathPrefix(`/metrics`)
+      service: metrics
+      middlewares:
+      - internal-only
+    - name: gitlab-login
+      match: Host(`gitlab.example.com`) && Method(`POST`) && Path(`/users/sign_in`)
+      service: gitlab
+      middlewares:
+      - crowdsec
+      - rate-limit-login
+    - name: gitlab-api
+      match: Host(`gitlab.example.com`) && PathPrefix(`/api/`)
+      service: gitlab
+      middlewares:
+      - crowdsec
+    - name: gitlab-assets
+      match: Host(`gitlab.example.com`) && (PathPrefix(`/assets/`) || PathPrefix(`/uploads/`))
+      service: gitlab
+      middlewares:
+      - crowdsec
+      - rate-limit-assets
+    - name: gitlab-internal
+      match: Host(`gitlab.example.com`) && ClientIP(`10.0.0.0/8`)
+      service: gitlab
+    - name: gitlab
+      match: Host(`gitlab.example.com`)
+      service: gitlab
+      middlewares:
+      - secure-headers
+      - crowdsec
+    services:
+      cdn:
+        servers:
+        - url: http://10.0.0.30:80
+      metrics:
+        servers:
+        - url: http://10.0.0.40:9100
+      gitlab:
+        servers:
+        - url: http://10.0.0.20:80
+    middlewares:
+      crowdsec:
+        crowdsec:
+          appsec: true
+          on_error: block
+      block-all:
+        ip_allow:
+          source_range:
+          - 127.0.0.1/32
+      internal-only:
+        ip_allow:
+          source_range:
+          - 10.0.0.0/8
+      rate-limit-login:
+        rate_limit:
+          average: 5
+          period: 1m
+          burst: 10
+      rate-limit-assets:
+        rate_limit:
+          average: 100
+          period: 1s
+          burst: 200
+      secure-headers:
+        headers:
+          response:
+            set:
+              X-Robots-Tag: noindex
+            remove:
+            - Server
+          hsts:
+            max_age: 31536000
+            include_subdomains: true
+            preload: false
+          frame_deny: true
+          content_type_nosniff: true
+          referrer_policy: same-origin

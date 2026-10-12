@@ -1,0 +1,32 @@
+# TCP routers that terminate TLS (with certResolver: rproxy's ACME or certbot's
+# files), a passthrough catch-all next to terminating routers, ClientIP, and two
+# UDP routers on one entry point
+[entryPoints.smtps]
+address = ":465"
+
+[entryPoints.mixed]
+address = ":8443"
+
+[entryPoints.games]
+address = "198.51.100.5:27015/udp"
+
+[entryPoints.tls13]
+address = ":993"
+
+[serversTransport]
+insecureSkipVerify = true
+
+[certificatesResolvers.le.acme]
+email = "hostmaster@example.net"
+storage = "/var/lib/traefik/acme.json"
+[certificatesResolvers.le.acme.dnsChallenge]
+provider = "rfc2136"
+resolvers = ["192.0.2.53:53", "192.0.2.54:53"]
+
+[certificatesResolvers.zone.acme]
+email = "hostmaster@example.net"
+[certificatesResolvers.zone.acme.dnsChallenge]
+provider = "acme-dns"
+
+[providers.file]
+filename = "dynamic.toml"

@@ -1,0 +1,1 @@
+source: synthetic: docker inspect output of three containers (labels, v2 rules with placeholders, a chain of middlewares). The password hash is a placeholder. capabilities.json is GET /capabilities of an older rproxy (no authentication middlewares, no sticky, no HTTP/3).

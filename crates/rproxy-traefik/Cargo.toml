@@ -1,0 +1,25 @@
+# Traefik configuration → rproxy settings (the rproxy-traefik-convert command, shipped
+# in the .deb). The library is also meant for ../rproxy-gateway (Traefik's CRDs):
+# rule translation and middleware conversion are public (src/lib.rs).
+# Its own value type keeps the input's key order (no serde_json preserve_order, which
+# would change rproxy-api's serde_json through feature unification); toml's own
+# preserve_order keeps TOML tables in file order, as Python's tomllib does.
+[package]
+name = "rproxy-traefik"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Converts a Traefik configuration into an rproxy-api settings file"
+
+[[bin]]
+name = "rproxy-traefik-convert"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+regex = "1.13.1"
+serde = "1.0.229"
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+toml = { version = "1.1.2", default-features = false, features = ["parse", "serde", "std", "preserve_order"] }

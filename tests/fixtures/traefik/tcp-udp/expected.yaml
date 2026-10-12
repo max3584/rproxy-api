@@ -1,0 +1,59 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+
+version: 1
+rules:
+- protocol: udp
+  listen_addr: 0.0.0.0
+  listen_port: 53
+  targets:
+  - addr: 10.0.1.53
+    port: 53
+  - addr: 10.0.1.54
+    port: 53
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 443
+  targets:
+  - addr: 10.0.1.11
+    port: 443
+    weight: 3
+  - addr: 10.0.1.12
+    port: 443
+  tls:
+    mode: sni
+    routes:
+    - server_names:
+      - app.example.com
+      - www.example.com
+      remote_addr: 10.0.1.10
+      remote_port: 443
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 993
+  remote_addr: 10.0.1.30
+  remote_port: 143
+  tls:
+    mode: terminate
+    certificates:
+    - cert_file: /etc/ssl/mail.pem
+      key_file: /etc/ssl/mail.key
+    options:
+      min_version: '1.3'
+      cipher_suites:
+      - TLS13_AES_256_GCM_SHA384
+      - TLS13_AES_128_GCM_SHA256
+    routes:
+    - server_name: mail.example.com
+      remote_addr: 10.0.1.30
+      remote_port: 143
+    unmatched: reject
+- protocol: tcp
+  listen_addr: 192.0.2.10
+  listen_port: 2222
+  targets:
+  - addr: 10.0.1.20
+    port: 22
+  - addr: 10.0.1.21
+    port: 22
+  source_ip: proxy_v2
