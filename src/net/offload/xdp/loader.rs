@@ -5,7 +5,7 @@
 use std::io;
 
 use aya::maps::{Array, HashMap as BpfHashMap, XskMap};
-use aya::programs::{Xdp, XdpFlags};
+use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 
 /// The XDP redirect object, built from `bpf/xdp-redirect` (see `bpf/README.md`).
@@ -23,10 +23,10 @@ pub enum Mode {
 }
 
 impl Mode {
-	fn flags(self) -> XdpFlags {
+	fn aya(self) -> XdpMode {
 		match self {
-			Mode::Driver => XdpFlags::DRV_MODE,
-			Mode::Generic => XdpFlags::SKB_MODE,
+			Mode::Driver => XdpMode::Driver,
+			Mode::Generic => XdpMode::Skb,
 		}
 	}
 }
@@ -49,7 +49,7 @@ impl Steer {
 		let mut ebpf = Ebpf::load(PROGRAM).map_err(err)?;
 		let program: &mut Xdp = ebpf.program_mut("xdp_redirect").ok_or_else(|| io::Error::other("xdp_redirect not in the object"))?.try_into().map_err(err)?;
 		program.load().map_err(err)?;
-		program.attach(iface, mode.flags()).map_err(err)?;
+		program.attach(iface, mode.aya()).map_err(err)?;
 		Ok(Steer { ebpf, iface: iface.to_string(), mode })
 	}
 

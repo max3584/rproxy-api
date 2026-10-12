@@ -12,6 +12,7 @@
     "dependencies"
   ],
   "prConcurrentLimit": 5,
+  "platformAutomerge": false,
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true,
