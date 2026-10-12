@@ -1,0 +1,6 @@
+certificatesResolvers.wildcard: eab: write the HMAC key (hmacEncoded) into /etc/rproxy/acme/wildcard-eab.key (not copied here)
+certificatesResolvers.wildcard: storage /letsencrypt/acme.json (acme.json) is not read: rproxy creates a new account and obtains the certificates again
+certificatesResolvers.wildcard: dnsChallenge pdns: set api_url and write the API key into /etc/rproxy/acme/wildcard-pdns.key
+certificatesResolvers.web: httpChallenge: rproxy's http rules on port 80 answer HTTP-01 before their routes (or set global.acme.http01_listen)
+certificatesResolvers.cloud: dnsChallenge route53: rproxy has no such provider; a generic REST template (type http) with placeholders is written: point it at the provider's API or a small relay (docs/en/ACME.md)
+global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)

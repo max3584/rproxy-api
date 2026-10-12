@@ -1,0 +1,100 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - serversTransport: insecureSkipVerify: applies to every https:// backend of the rule in rproxy
+# - router whoami: v2 host placeholders converted to HostRegexp
+# - middleware auth: basicAuth.users are not copied; put them in /etc/rproxy/auth/auth.htpasswd (htpasswd format)
+# - router errors: v2 path placeholders converted to PathRegexp
+# - entry point web: serversTransport settings (insecureSkipVerify, rootCAs) apply in rproxy only to rules that terminate TLS; https:// backends of this plain-HTTP rule are verified against the system roots
+# - entry point websecure: no certificate found; put one at /etc/rproxy/tls/websecure.pem
+# - needs features that GET /capabilities does not list yet (rules using them are refused as unsupported): basic_auth, forward_auth, sticky
+
+version: 1
+rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 8000
+  http:
+    routes:
+    - name: errors
+      match: Host(`errors.example.com`) && Query(`debug`, `1`) && PathRegexp(`^(?:/p/(?:[0-9]+))`)
+      service: error-pages
+    services:
+      error-pages:
+        servers:
+        - url: https://172.20.0.6:8080
+- protocol: tcp
+  listen_addr: '::'
+  listen_port: 8443
+  tls:
+    mode: terminate
+    certificates:
+    - cert_file: /etc/rproxy/tls/websecure.pem
+      key_file: /etc/rproxy/tls/websecure.key
+    upstream:
+      insecure_skip_verify: true
+  http:
+    routes:
+    - name: whoami
+      match: Host(`whoami.example.com`) && Header(`X-Env`, `prod`) || HostRegexp(`^(?:(?:[a-z]+)\.whoami\.example\.com)$`)
+      service: whoami
+      middlewares:
+      - compress
+      - strip
+      - auth
+      - forward
+      - retry
+      - breaker
+      - errors
+      - limit
+    services:
+      whoami:
+        servers:
+        - url: http://172.20.0.5:80
+        health_check:
+          path: /health
+          interval: 10s
+        sticky:
+          cookie: whoami_sticky
+      error-pages:
+        servers:
+        - url: https://172.20.0.6:8080
+    middlewares:
+      compress:
+        compress:
+          min_size: 1024
+      strip:
+        strip_prefix:
+          prefixes:
+          - /whoami
+          - /who
+      auth:
+        basic_auth:
+          users_file: /etc/rproxy/auth/auth.htpasswd
+          keep_authorization: true
+      forward:
+        forward_auth:
+          address: http://auth:9091/api/verify
+          response_headers:
+          - Remote-User
+          - Remote-Groups
+          trust_forward_header: true
+      retry:
+        retry:
+          attempts: 3
+          initial_interval: 100ms
+      breaker:
+        circuit_breaker:
+          failure_percent: 30
+          window: 10s
+          recovery: 10s
+      errors:
+        errors:
+          status:
+          - 500-599
+          service: error-pages
+          path: /{status}.html
+      limit:
+        buffering:
+          max_request_body: 10485760

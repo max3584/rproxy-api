@@ -1,0 +1,6 @@
+middleware crowdsec: the CrowdSec bouncer key is not copied; write it to /etc/rproxy/crowdsec.key (owner root, group rproxy, mode 640)
+router dashboard: service api@internal is Traefik's own; router left out
+certificates: get gitlab.example.com, cdn.example.com with certbot (or cert-manager, or rproxy's own ACME: global.acme, docs/en/ACME.md) into /etc/letsencrypt/live/gitlab.example.com/; rproxy re-reads renewed files by itself
+certificatesResolvers: letsencrypt: not converted (--certs certbot); use certbot / cert-manager and point cert_file / key_file at the files
+api: Traefik's dashboard has no equivalent; use the rproxy UI (TCP-UDP-rproxy-ui)
+accessLog: rproxy writes JSON Lines (event http.access); Traefik's format and filters are not converted

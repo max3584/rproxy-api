@@ -1,0 +1,2 @@
+default --static traefik.toml
+certbot --static traefik.toml --certs certbot

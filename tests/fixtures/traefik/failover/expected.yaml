@@ -1,0 +1,33 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - router app: failover service app: the servers of main then spare, balance: failover (the first server that is up; within main no round robin)
+
+version: 1
+rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 8080
+  http:
+    routes:
+    - name: app
+      match: Host(`app.example.com`)
+      service: app
+    - name: grpc
+      match: Host(`grpc.example.com`)
+      service: grpc
+    services:
+      app:
+        servers:
+        - url: http://10.0.2.1:80
+        - url: http://10.0.2.2:80
+        - url: http://10.0.3.1:80
+        health_check:
+          path: /health
+          interval: 5s
+        balance: failover
+      grpc:
+        servers:
+        - url: http://10.0.4.1:50051
+        protocol: h2c

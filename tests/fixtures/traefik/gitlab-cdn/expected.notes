@@ -1,0 +1,7 @@
+middleware crowdsec: the CrowdSec bouncer key is not copied; write it to /etc/rproxy/crowdsec.key (owner root, group rproxy, mode 640)
+router dashboard: service api@internal is Traefik's own; router left out
+router metrics: certResolver letsencrypt: no domain to name the certificate by; add it by hand
+certificatesResolvers.letsencrypt: storage /letsencrypt/acme.json (acme.json) is not read: rproxy creates a new account and obtains the certificates again
+global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)
+api: Traefik's dashboard has no equivalent; use the rproxy UI (TCP-UDP-rproxy-ui)
+accessLog: rproxy writes JSON Lines (event http.access); Traefik's format and filters are not converted

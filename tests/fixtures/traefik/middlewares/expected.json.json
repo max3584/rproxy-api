@@ -1,0 +1,409 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "protocol": "tcp",
+      "listen_addr": "0.0.0.0",
+      "listen_port": 80,
+      "http": {
+        "routes": [
+          {
+            "name": "redirect",
+            "match": "PathPrefix(`/`)",
+            "priority": 1000000,
+            "middlewares": [
+              "redirect"
+            ]
+          }
+        ],
+        "middlewares": {
+          "redirect": {
+            "redirect_scheme": {
+              "scheme": "https",
+              "permanent": false,
+              "port": 8443
+            }
+          }
+        }
+      }
+    },
+    {
+      "protocol": "tcp",
+      "listen_addr": "192.0.2.1",
+      "listen_port": 8443,
+      "tls": {
+        "mode": "terminate",
+        "certificates": [
+          {
+            "cert_file": "/etc/traefik/certs/wildcard.example.com.pem",
+            "key_file": "/etc/traefik/certs/wildcard.example.com.key"
+          }
+        ],
+        "options": {
+          "min_version": "1.2",
+          "cipher_suites": [
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+          ]
+        },
+        "client_auth": {
+          "mode": "required",
+          "ca_file": "/etc/traefik/ca/clients.pem"
+        },
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ],
+        "upstream": {
+          "ca_file": "/etc/traefik/ca/internal.pem",
+          "server_name": "cloud.internal.example.com"
+        }
+      },
+      "http": {
+        "routes": [
+          {
+            "name": "cloud",
+            "match": "Host(`cloud.example.com`)",
+            "priority": 10,
+            "service": "cloud",
+            "middlewares": [
+              "security",
+              "well-known",
+              "upload",
+              "retry-slow"
+            ]
+          },
+          {
+            "name": "api",
+            "match": "Host(`api.example.com`) && PathPrefix(`/api/v1`)",
+            "service": "api-split",
+            "middlewares": [
+              "security",
+              "api-v1",
+              "per-token",
+              "gzip",
+              "sso"
+            ]
+          },
+          {
+            "name": "legacy",
+            "match": "Host(`legacy.example.com`) && Path(`/old`)",
+            "service": "legacy",
+            "middlewares": [
+              "security",
+              "old-path",
+              "add-app",
+              "strip-slash",
+              "per-host"
+            ]
+          },
+          {
+            "name": "admin",
+            "match": "Host(`admin.example.com`) && ClientIP(`192.0.2.0/24`)",
+            "service": "shadowed",
+            "middlewares": [
+              "security",
+              "office",
+              "users",
+              "in-flight",
+              "breaker"
+            ]
+          },
+          {
+            "name": "to-dashboard",
+            "match": "Host(`traefik.example.com`)",
+            "middlewares": [
+              "security",
+              "to-https"
+            ]
+          },
+          {
+            "name": "templated",
+            "match": "HostRegexp(`^(?:(?:[a-z]+)\\.example\\.org|example\\.org)$`) || Method(`PURGE`)",
+            "service": "cloud",
+            "middlewares": [
+              "security"
+            ]
+          }
+        ],
+        "services": {
+          "cloud": {
+            "servers": [
+              {
+                "url": "https://192.0.2.10:443",
+                "weight": 2
+              },
+              {
+                "url": "https://192.0.2.11:443"
+              }
+            ],
+            "pass_host_header": false,
+            "health_check": {
+              "path": "/status.php",
+              "interval": "30s",
+              "timeout": "5s"
+            }
+          },
+          "api-split": {
+            "servers": [
+              {
+                "url": "http://192.0.2.20:8080",
+                "weight": 3
+              },
+              {
+                "url": "http://192.0.2.21:8080",
+                "weight": 2
+              }
+            ]
+          },
+          "legacy": {
+            "servers": [
+              {
+                "url": "http://[2001:db8::30]:8080"
+              }
+            ]
+          },
+          "shadowed": {
+            "servers": [
+              {
+                "url": "http://[2001:db8::30]:8080"
+              }
+            ]
+          }
+        },
+        "middlewares": {
+          "security": {
+            "headers": {
+              "request": {
+                "set": {
+                  "X-Forwarded-Proto": "https"
+                },
+                "remove": [
+                  "X-Remove-Me"
+                ]
+              },
+              "response": {
+                "set": {
+                  "X-Frame-Options": "SAMEORIGIN",
+                  "X-XSS-Protection": "1; mode=block",
+                  "Permissions-Policy": "camera=(), microphone=()"
+                },
+                "remove": [
+                  "X-Powered-By"
+                ]
+              },
+              "hsts": {
+                "max_age": 63072000,
+                "include_subdomains": false,
+                "preload": true
+              },
+              "csp": "default-src 'self'",
+              "cors": {
+                "allow_origins": [
+                  "https://app.example.com",
+                  "https://admin.example.com"
+                ],
+                "allow_methods": [
+                  "GET",
+                  "POST"
+                ],
+                "allow_headers": [
+                  "X-Token"
+                ],
+                "allow_credentials": true,
+                "max_age": 600
+              }
+            }
+          },
+          "well-known": {
+            "redirect_regex": {
+              "regex": "^https://(.*)/.well-known/(card|cal)dav",
+              "replacement": "https://${1}/remote.php/dav/",
+              "permanent": true
+            }
+          },
+          "upload": {
+            "buffering": {
+              "max_request_body": 2000000
+            }
+          },
+          "retry-slow": {
+            "retry": {
+              "attempts": 4,
+              "initial_interval": "250ms"
+            }
+          },
+          "api-v1": {
+            "replace_path_regex": {
+              "regex": "^/api/v1/(.*)",
+              "replacement": "/v1/$1"
+            }
+          },
+          "per-token": {
+            "rate_limit": {
+              "average": 50,
+              "period": "10s",
+              "source": "header:X-Token"
+            }
+          },
+          "gzip": {
+            "compress": {
+              "encodings": [
+                "zstd",
+                "gzip"
+              ]
+            }
+          },
+          "sso": {
+            "forward_auth": {
+              "address": "https://auth.example.com/verify",
+              "request_headers": [
+                "Accept",
+                "X-CustomHeader"
+              ]
+            }
+          },
+          "old-path": {
+            "replace_path": {
+              "path": "/new"
+            }
+          },
+          "add-app": {
+            "add_prefix": {
+              "prefix": "/app"
+            }
+          },
+          "strip-slash": {
+            "strip_prefix": {
+              "prefixes": [
+                "/static"
+              ]
+            }
+          },
+          "per-host": {
+            "rate_limit": {
+              "average": 10,
+              "period": "1s"
+            }
+          },
+          "office": {
+            "ip_allow": {
+              "source_range": [
+                "192.0.2.0/24",
+                "2001:db8::/32"
+              ]
+            }
+          },
+          "users": {
+            "basic_auth": {
+              "users_file": "/etc/traefik/users.htpasswd",
+              "realm": "Admin",
+              "user_header": "X-WebAuth-User"
+            }
+          },
+          "in-flight": {
+            "in_flight": {
+              "amount": 20
+            }
+          },
+          "breaker": {
+            "circuit_breaker": {
+              "failure_percent": 25,
+              "window": "10s",
+              "recovery": "90s"
+            }
+          },
+          "to-https": {
+            "redirect_scheme": {
+              "scheme": "https",
+              "permanent": false,
+              "port": 8443
+            }
+          }
+        }
+      }
+    },
+    {
+      "protocol": "tcp",
+      "listen_addr": "2001:db8::1",
+      "listen_port": 9443,
+      "tls": {
+        "mode": "terminate",
+        "certificates": [
+          {
+            "cert_file": "/etc/traefik/certs/wildcard.example.com.pem",
+            "key_file": "/etc/traefik/certs/wildcard.example.com.key"
+          }
+        ],
+        "options": {
+          "min_version": "1.2",
+          "cipher_suites": [
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+          ]
+        },
+        "client_auth": {
+          "mode": "required",
+          "ca_file": "/etc/traefik/ca/clients.pem"
+        },
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ]
+      },
+      "http": {
+        "routes": [
+          {
+            "name": "admin",
+            "match": "Host(`admin.example.com`) && ClientIP(`192.0.2.0/24`)",
+            "service": "shadowed",
+            "middlewares": [
+              "office",
+              "users",
+              "in-flight",
+              "breaker"
+            ]
+          }
+        ],
+        "services": {
+          "shadowed": {
+            "servers": [
+              {
+                "url": "http://[2001:db8::30]:8080"
+              }
+            ]
+          }
+        },
+        "middlewares": {
+          "office": {
+            "ip_allow": {
+              "source_range": [
+                "192.0.2.0/24",
+                "2001:db8::/32"
+              ]
+            }
+          },
+          "users": {
+            "basic_auth": {
+              "users_file": "/etc/traefik/users.htpasswd",
+              "realm": "Admin",
+              "user_header": "X-WebAuth-User"
+            }
+          },
+          "in-flight": {
+            "in_flight": {
+              "amount": 20
+            }
+          },
+          "breaker": {
+            "circuit_breaker": {
+              "failure_percent": 25,
+              "window": "10s",
+              "recovery": "90s"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

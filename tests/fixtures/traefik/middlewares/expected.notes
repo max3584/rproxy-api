@@ -1,0 +1,44 @@
+providers.docker: Docker labels are read only with --docker (docker inspect output)
+entryPoints.admin: forwardedHeaders.insecure: list the proxies in global.trusted_proxies instead
+entryPoints.admin: proxyProtocol (receiving PROXY headers) is not supported by rproxy
+middleware security: forceSTSHeader: rproxy sends HSTS only on HTTPS
+middleware security: headers.isDevelopment is not converted
+middleware upload: buffering.maxResponseBodyBytes is not converted
+middleware upload: buffering.retryExpression is not converted
+router cloud: healthCheck.hostname is not converted
+router cloud: several rootCAs: only the first is used (concatenate them into one file)
+router cloud: responseForwarding is not converted
+middleware gzip: compress.excludedContentTypes is not converted
+middleware sso: forwardAuth.tls is not converted
+middleware sso: forwardAuth.authResponseHeadersRegex is not converted
+router api: weighted service api-split: flattened into one service (weights multiplied)
+middleware strip-slash: stripPrefix.forceSlash is not converted
+middleware per-host: rateLimit by request host is not converted; limited per client IP
+middleware per-host: ipStrategy is not converted; rproxy uses global.trusted_proxies for the client IP
+middleware unlimited: rateLimit.average 0 means no limit; left out
+middleware no-limit-buffer: buffering without maxRequestBodyBytes is not converted
+middleware latency-only: circuitBreaker expression 'LatencyAtQuantileMS(50.0) > 100' cannot be converted (only NetworkErrorRatio / ResponseCodeRatio); left out
+middleware office: ipStrategy is not converted; rproxy uses global.trusted_proxies for the client IP
+middleware office: rejectStatusCode is not converted (rproxy answers 403)
+middleware in-flight: inFlightReq.sourceCriterion is not converted; counted per client IP
+middleware breaker: circuitBreaker expression 'ResponseCodeRatio(500, 600, 0, 600) > 0.25 || LatencyAtQuantileMS(50.0) > 100': only 'ResponseCodeRatio(500, 600, 0, 600) > 0.25' is used
+middleware breaker: circuitBreaker ResponseCodeRatio: rproxy counts 5xx and connection failures as failures
+middleware digest: middleware type digestAuth has no rproxy equivalent; left out
+middleware geoblock: plugin geoblock has no rproxy equivalent; left out
+middleware two-kinds: not one middleware type; left out
+router admin: middleware missing is not defined (or not from the file provider); left out
+router admin: mirroring service shadowed: only its main service legacy is used (add a mirror middleware to the routes by hand to copy requests)
+tls.options.strict: cipher suite TLS_RSA_WITH_AES_128_CBC_SHA is not available in rproxy; left out
+tls.options.strict: maxVersion / curvePreferences / sniStrict are not converted
+router plain-http: healthCheck.hostname is not converted
+router plain-http: several rootCAs: only the first is used (concatenate them into one file)
+router plain-http: responseForwarding is not converted
+router templated: v2 host placeholders converted to HostRegexp
+router templated: healthCheck.hostname is not converted
+router templated: several rootCAs: only the first is used (concatenate them into one file)
+router templated: responseForwarding is not converted
+router unknown-matcher: matcher Foo has no rproxy equivalent; router left out
+router on-web: on entry point web, which redirects everything; left out there
+metrics: rproxy serves Prometheus metrics at GET /metrics of its control API
+entry point websecure: routers without TLS on a TLS entry point are left out: plain-http
+accessLog: Traefik logs to stdout; rproxy writes http.access lines to its own log unless global.access_log is set

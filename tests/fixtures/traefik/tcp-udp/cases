@@ -1,0 +1,3 @@
+default --static traefik.toml
+listen-addr --static traefik.toml --listen-addr 192.0.2.99
+dynamic-only --dynamic dynamic.toml

@@ -1,0 +1,2 @@
+default --static traefik.yml
+json --static traefik.yml --json

@@ -1,0 +1,130 @@
+# Converted from the Traefik configuration by rproxy-traefik-convert.
+# Check it before use; see docs/MIGRATING-FROM-TRAEFIK.md.
+#
+# Not converted / to check:
+# - serversTransport: insecureSkipVerify: applies to every https:// backend of the rule in rproxy
+# - tcp router submission: combined rule: only its HostSNI part is used
+# - tcp router submission-alt: backend address 'not-an-address' not understood; left out
+# - tcp router submission-alt: service postfix-pool: healthCheck is not converted (rproxy checks L4 targets with a TCP connection: health_check)
+# - tcp router weird: HostSNIRegexp `^(smtp|mail)\.example\.org$` is not a plain suffix; not converted (rproxy takes names, *.suffix for one label and **.suffix for any depth)
+# - tcp router weird: ALPN is not converted (rproxy L4 routes by SNI only)
+# - tls.options.modern: maxVersion / curvePreferences / sniStrict are not converted
+# - tcp router imap2: entry point tls13: routers use different TLS options; rproxy has one set per rule
+# - udp router game-copy: entry point games already has a UDP router; left out
+# - udp router nowhere: service missing is not defined
+# - udp router nowhere: service missing has no servers; left out
+# - certificatesResolvers.le: storage /var/lib/traefik/acme.json (acme.json) is not read: rproxy creates a new account and obtains the certificates again
+# - certificatesResolvers.le: dnsChallenge rfc2136: set server and tsig_key_name, and write the TSIG secret into /etc/rproxy/acme/le-tsig.key
+# - certificatesResolvers.zone: dnsChallenge acme-dns: set api_url; existing lego accounts (ACME_DNS_STORAGE_PATH) can be used as credentials_file
+# - global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)
+# - entry point smtps: ClientIP of TCP routers applies to the whole rule (allow_from)
+# - entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule (the first is used)
+# - entry point tls13: no certificate found; put one at /etc/rproxy/tls/tls13.pem
+# - entry point mixed: a HostSNI(`*`) passthrough router cannot share a port with terminating routers; terminating routers left out: term
+
+version: 1
+global:
+  acme:
+    accounts:
+      le:
+        contact:
+        - mailto:hostmaster@example.net
+        allowed_names:
+        - mail.example.net
+      zone:
+        contact:
+        - mailto:hostmaster@example.net
+        allowed_names:
+        - '*.mx.example.net'
+    resolvers:
+      le:
+        account: le
+        challenge: dns-01
+        dns_provider: le-dns
+      zone:
+        account: zone
+        challenge: dns-01
+        dns_provider: zone-dns
+    dns_servers:
+    - 192.0.2.53:53
+    - 192.0.2.54:53
+    dns_providers:
+      le-dns:
+        type: rfc2136
+        server: 127.0.0.1:53
+        tsig_key_name: CHANGE-ME
+        tsig_secret_file: /etc/rproxy/acme/le-tsig.key
+        allowed_names:
+        - mail.example.net
+      zone-dns:
+        type: acme_dns
+        api_url: https://CHANGE-ME.invalid
+        credentials_file: /var/lib/rproxy/acme/acme-dns.json
+        allowed_names:
+        - '*.mx.example.net'
+rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 465
+  remote_addr: 192.0.2.25
+  remote_port: 25
+  allow_from:
+  - 192.0.2.0/24
+  - 2001:db8::/32
+  tls:
+    mode: terminate
+    certificates:
+    - acme: le
+      domains:
+      - mail.example.net
+    - acme: zone
+      domains:
+      - '*.mx.example.net'
+    routes:
+    - server_name: mail.example.net
+      remote_addr: 192.0.2.25
+      remote_port: 25
+    - server_name: '*.mx.example.net'
+      remote_addr: 192.0.2.26
+      remote_port: 25
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 993
+  remote_addr: 192.0.2.43
+  remote_port: 143
+  source_ip: proxy_v1
+  tls:
+    mode: terminate
+    certificates:
+    - cert_file: /etc/rproxy/tls/tls13.pem
+      key_file: /etc/rproxy/tls/tls13.key
+    options:
+      min_version: '1.3'
+    routes:
+    - server_name: imap.example.net
+      remote_addr: 192.0.2.43
+      remote_port: 143
+    - server_name: imap2.example.net
+      remote_addr: 192.0.2.44
+      remote_port: 143
+    unmatched: reject
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 8443
+  remote_addr: 2001:db8::40
+  remote_port: 443
+  tls:
+    mode: sni
+    routes:
+    - server_name: term.example.net
+      remote_addr: 192.0.2.41
+      remote_port: 8080
+- protocol: udp
+  listen_addr: 198.51.100.5
+  listen_port: 27015
+  targets:
+  - addr: 192.0.2.60
+    port: 27015
+    weight: 6
+  - addr: 192.0.2.61
+    port: 27015

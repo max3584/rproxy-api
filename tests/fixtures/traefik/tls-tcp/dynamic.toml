@@ -1,0 +1,113 @@
+[tcp.routers.submission]
+entryPoints = ["smtps"]
+rule = "HostSNI(`mail.example.net`) && ClientIP(`192.0.2.0/24`, `2001:db8::/32`)"
+service = "postfix"
+[tcp.routers.submission.tls]
+certResolver = "le"
+
+[tcp.routers.submission-alt]
+entryPoints = ["smtps"]
+rule = "HostSNIRegexp(`^[a-z0-9-]+\\.mx\\.example\\.net$`)"
+service = "postfix-pool"
+[tcp.routers.submission-alt.tls]
+certResolver = "zone"
+
+[tcp.routers.weird]
+entryPoints = ["smtps"]
+rule = "HostSNIRegexp(`^(smtp|mail)\\.example\\.org$`) || ALPN(`smtp`)"
+service = "postfix"
+
+[tcp.routers.catch]
+entryPoints = ["mixed"]
+rule = "HostSNI(`*`)"
+service = "backend-pt"
+[tcp.routers.catch.tls]
+passthrough = true
+
+[tcp.routers.term]
+entryPoints = ["mixed"]
+rule = "HostSNI(`term.example.net`)"
+service = "backend-term"
+[tcp.routers.term.tls]
+options = "modern"
+
+[tcp.routers.imap]
+entryPoints = ["tls13"]
+rule = "HostSNI(`imap.example.net`)"
+service = "dovecot-v1"
+[tcp.routers.imap.tls]
+options = "modern"
+[[tcp.routers.imap.tls.domains]]
+main = "imap.example.net"
+sans = ["mail.example.net"]
+
+[tcp.routers.imap2]
+entryPoints = ["tls13"]
+rule = "HostSNI(`imap2.example.net`)"
+service = "dovecot-v2"
+[tcp.routers.imap2.tls]
+options = "other"
+
+[tcp.services.postfix.loadBalancer]
+[[tcp.services.postfix.loadBalancer.servers]]
+address = "192.0.2.25:25"
+
+[tcp.services.postfix-pool.loadBalancer]
+[[tcp.services.postfix-pool.loadBalancer.servers]]
+address = "192.0.2.26:25"
+[[tcp.services.postfix-pool.loadBalancer.servers]]
+address = "not-an-address"
+[tcp.services.postfix-pool.loadBalancer.healthCheck]
+interval = "10s"
+
+[tcp.services.backend-pt.loadBalancer]
+[[tcp.services.backend-pt.loadBalancer.servers]]
+address = "[2001:db8::40]:443"
+
+[tcp.services.backend-term.loadBalancer]
+[[tcp.services.backend-term.loadBalancer.servers]]
+address = "192.0.2.41:8080"
+
+[tcp.services.dovecot-v1.loadBalancer]
+proxyProtocol = { version = 1 }
+[[tcp.services.dovecot-v1.loadBalancer.servers]]
+address = "192.0.2.43:143"
+
+[tcp.services.dovecot-v2.loadBalancer]
+proxyProtocol = { version = 2 }
+[[tcp.services.dovecot-v2.loadBalancer.servers]]
+address = "192.0.2.44:143"
+
+[udp.routers.game]
+entryPoints = ["games"]
+service = "game"
+
+[udp.routers.game-copy]
+entryPoints = ["games"]
+service = "game"
+
+[udp.routers.nowhere]
+entryPoints = ["games"]
+service = "missing"
+
+[[udp.services.game.weighted.services]]
+name = "game-a"
+weight = 2
+[[udp.services.game.weighted.services]]
+name = "game-b"
+
+[udp.services.game-a.loadBalancer]
+[[udp.services.game-a.loadBalancer.servers]]
+address = "192.0.2.60:27015"
+weight = 3
+
+[udp.services.game-b.loadBalancer]
+[[udp.services.game-b.loadBalancer.servers]]
+address = "192.0.2.61:27015"
+
+[tls.options.modern]
+minVersion = "VersionTLS13"
+curvePreferences = ["X25519"]
+
+[tls.options.other]
+minVersion = "VersionTLS12"

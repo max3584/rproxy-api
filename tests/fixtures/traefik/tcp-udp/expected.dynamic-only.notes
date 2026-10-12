@@ -1,0 +1,1 @@
+static: no entryPoints; using web (:80) and websecure (:443)

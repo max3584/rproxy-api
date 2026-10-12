@@ -27,12 +27,11 @@ jobs:
     container: alpine:3.24
     steps:
       # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring と zstd-sys
-      # tests/traefik_convert.rs runs contrib/traefik2rproxy.py (python3, py3-yaml)
       # tests/acme.rs obtains certificates from Pebble (the ACME test CA) with PowerDNS (pdns-doc has its schema)
       # tests/self_update.rs checks signatures made by the minisign tool
       - name: packages
         run: |
-          apk add --no-cache bash git tar zstd curl gcc musl-dev python3 py3-yaml mariadb mariadb-client \
+          apk add --no-cache bash git tar zstd curl gcc musl-dev mariadb mariadb-client \
             pebble pdns pdns-backend-sqlite3 pdns-doc sqlite minisign
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +39,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -p rproxy-api -p rproxy-traefik -- -D warnings
       # the optional mimalloc allocator (off by default, #185) still builds
       - name: clippy (alloc-mimalloc)
         run: cargo clippy --locked --bin rproxy-api --features alloc-mimalloc -- -D warnings
@@ -66,14 +65,14 @@ jobs:
       - name: unit + integration tests
         env:
           RPROXY_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/rproxy_test
-          RPROXY_TEST_REQUIRE_PYTHON: "1"
           RPROXY_TEST_PEBBLE: /usr/bin/pebble
           RPROXY_TEST_PDNS: /usr/sbin/pdns_server
           RPROXY_TEST_PDNS_SCHEMA: /usr/share/doc/pdns/schema.sqlite3.sql
           RPROXY_TEST_SQLITE3: /usr/bin/sqlite3
           RPROXY_TEST_REQUIRE_ACME: "1"
           RPROXY_TEST_REQUIRE_MINISIGN: "1"
-        run: cargo test --locked --all-targets
+        # crates/rproxy-traefik: the Traefik converter's own tests (the expected outputs in tests/fixtures/traefik)
+        run: cargo test --locked --all-targets -p rproxy-api -p rproxy-traefik
 
   transparent:
     name: transparent mode (network namespaces)
@@ -153,7 +152,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # cargo-deb publishes only a glibc build (a .deb): build it (cached by rust-cache with ~/.cargo/bin)
       - run: cargo install --locked cargo-deb
-      - run: cargo build --locked --release
+      # the server and the Traefik converter (the .deb has both)
+      - run: cargo build --locked --release -p rproxy-api -p rproxy-traefik
       - run: cargo deb --no-build --output target/debian/
       - uses: actions/upload-artifact@v4
         with:

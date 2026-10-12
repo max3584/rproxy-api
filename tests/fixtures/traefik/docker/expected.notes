@@ -1,0 +1,6 @@
+serversTransport: insecureSkipVerify: applies to every https:// backend of the rule in rproxy
+router whoami: v2 host placeholders converted to HostRegexp
+middleware auth: basicAuth.users are not copied; put them in /etc/rproxy/auth/auth.htpasswd (htpasswd format)
+router errors: v2 path placeholders converted to PathRegexp
+entry point web: serversTransport settings (insecureSkipVerify, rootCAs) apply in rproxy only to rules that terminate TLS; https:// backends of this plain-HTTP rule are verified against the system roots
+entry point websecure: no certificate found; put one at /etc/rproxy/tls/websecure.pem

@@ -418,7 +418,8 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/backend_tls.rs` | A service's `tls` (#236): its CA and SNI name, `subject_alt_names` (DNS names and URIs), a client certificate towards the backend, `https://` backends from a plain-HTTP rule, mistakes in shape and files |
 | `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec) |
 | `tests/acme.rs` | ACME (#208): the API's guards (always run) and obtaining real certificates with Pebble and PowerDNS (table above) |
-| `tests/traefik_convert.rs` | `contrib/traefik2rproxy.py` converts `tests/fixtures/traefik/` and rproxy accepts the result. Skipped without python3 and PyYAML (CI sets `RPROXY_TEST_REQUIRE_PYTHON=1`) |
+| `tests/traefik_convert.rs` | The Traefik converter (`crates/rproxy-traefik`): rproxy reads and accepts the output of every case (`cases`) in `tests/fixtures/traefik/`; some are checked in detail. The middlewares the converter knows (`KNOWN_MIDDLEWARES`) are in `Features::CURRENT` |
+| The tests of `crates/rproxy-traefik` (`cargo test -p rproxy-traefik`) | The output is byte for byte `tests/fixtures/traefik/*/expected*` (written by the Python version, `contrib/traefik2rproxy.py`; how to add one: `tests/fixtures/traefik/README.md`), exit codes and `-o`, unit tests of the YAML writer (as PyYAML writes), rules, middlewares and durations. It reads local files the administrator gives it, so there is no fuzz target (nothing read from the Internet) |
 
 ## Restoring from the DB (`tests/db_restore.rs`)
 

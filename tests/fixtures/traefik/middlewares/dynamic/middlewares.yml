@@ -1,0 +1,126 @@
+http:
+  middlewares:
+    security:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: https
+          X-Remove-Me: ""
+        customResponseHeaders:
+          X-Powered-By: ""
+        customFrameOptionsValue: SAMEORIGIN
+        browserXssFilter: true
+        permissionsPolicy: "camera=(), microphone=()"
+        contentSecurityPolicy: "default-src 'self'"
+        stsSeconds: 63072000
+        stsPreload: true
+        forceSTSHeader: true
+        accessControlAllowOriginList: ["https://app.example.com", "https://admin.example.com"]
+        accessControlAllowMethods: "GET,POST"
+        accessControlAllowHeaders: ["X-Token"]
+        accessControlAllowCredentials: true
+        accessControlMaxAge: 600
+        addVaryHeader: true
+        isDevelopment: false
+    well-known:
+      redirectRegex:
+        regex: "^https://(.*)/.well-known/(card|cal)dav"
+        replacement: "https://${1}/remote.php/dav/"
+        permanent: true
+    to-https:
+      redirectScheme:
+        scheme: https
+        port: "8443"
+    old-path:
+      replacePath:
+        path: /new
+    api-v1:
+      replacePathRegex:
+        regex: "^/api/v1/(.*)"
+        replacement: "/v1/$1"
+    add-app:
+      addPrefix:
+        prefix: /app
+    strip-slash:
+      stripPrefix:
+        prefixes: ["/static"]
+        forceSlash: true
+    per-token:
+      rateLimit:
+        average: 50
+        period: 10s
+        sourceCriterion:
+          requestHeaderName: X-Token
+    per-host:
+      rateLimit:
+        average: 10
+        sourceCriterion:
+          requestHost: true
+          ipStrategy:
+            depth: 1
+    unlimited:
+      rateLimit:
+        average: 0
+    in-flight:
+      inFlightReq:
+        amount: 20
+        sourceCriterion:
+          ipStrategy:
+            depth: 2
+    office:
+      ipWhiteList:
+        sourceRange: "192.0.2.0/24, 2001:db8::/32"
+        ipStrategy:
+          excludedIPs: ["198.51.100.7"]
+        rejectStatusCode: 404
+    users:
+      basicAuth:
+        usersFile: /etc/traefik/users.htpasswd
+        realm: Admin
+        removeHeader: true
+        headerField: X-WebAuth-User
+    sso:
+      forwardAuth:
+        address: https://auth.example.com/verify
+        authRequestHeaders: ["Accept", "X-CustomHeader"]
+        authResponseHeadersRegex: "^X-"
+        tls:
+          insecureSkipVerify: true
+    gzip:
+      compress:
+        encodings: ["zstd", "gzip"]
+        excludedContentTypes: ["text/event-stream"]
+    upload:
+      buffering:
+        maxRequestBodyBytes: 2000000
+        maxResponseBodyBytes: 2000000
+        retryExpression: "IsNetworkError() && Attempts() < 2"
+    no-limit-buffer:
+      buffering:
+        memRequestBodyBytes: 1000
+    breaker:
+      circuitBreaker:
+        expression: "ResponseCodeRatio(500, 600, 0, 600) > 0.25 || LatencyAtQuantileMS(50.0) > 100"
+        fallbackDuration: 1m30s
+    latency-only:
+      circuitBreaker:
+        expression: "LatencyAtQuantileMS(50.0) > 100"
+    retry-slow:
+      retry:
+        attempts: 4
+        initialInterval: 0.25
+    digest:
+      digestAuth:
+        users: ["test:traefik:a2688e031edb4be6a3797f3882655c05"]
+    geoblock:
+      plugin:
+        geoblock:
+          allowedCountries: ["JP"]
+    protected:
+      chain:
+        middlewares: [office, users, inner@file]
+    inner:
+      chain:
+        middlewares: [in-flight, breaker]
+    two-kinds:
+      headers: {}
+      compress: {}
