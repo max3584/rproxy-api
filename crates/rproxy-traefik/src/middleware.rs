@@ -527,7 +527,7 @@ mod tests {
 	}
 
 	fn conv(yaml: &str) -> (Converted, Vec<String>) {
-		let spec: Value = serde_yaml_ng::from_str(yaml).unwrap();
+		let spec: Value = crate::load::yaml_from_slice(yaml.as_bytes()).unwrap();
 		let mut env = Env::default();
 		let out = convert_middleware("m", &spec, "middleware m", &mut env);
 		(out, env.notes.items)

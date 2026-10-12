@@ -663,7 +663,7 @@ mod tests {
 
 	#[test]
 	fn merge_keys() {
-		let mut v: Value = serde_yaml_ng::from_str("base: &b {a: 1, b: 2}\nx:\n  <<: *b\n  b: 3\n  c: 4\n").unwrap();
+		let mut v: Value = crate::load::yaml_from_slice(b"base: &b {a: 1, b: 2}\nx:\n  <<: *b\n  b: 3\n  c: 4\n").unwrap();
 		apply_yaml_merge(&mut v);
 		let x = g(&v, &["x"]).unwrap().as_map().unwrap();
 		assert_eq!(x.keys().collect::<Vec<_>>(), ["a", "b", "c"]);

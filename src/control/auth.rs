@@ -190,7 +190,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 	let text = std::fs::read_to_string(path)?;
 	let structured = text.lines().any(|l| l.trim_start().starts_with("tokens:"));
 	let tokens = if structured {
-		let value: serde_json::Value = serde_yaml_ng::from_str(&text).map_err(|e| invalid(path, e))?;
+		let value: serde_json::Value = crate::config::yaml(&text).map_err(|e| invalid(path, e))?;
 		let doc: TokenDoc = serde_json::from_value(value).map_err(|e| invalid(path, e))?;
 		let mut tokens = Vec::new();
 		for e in doc.tokens {

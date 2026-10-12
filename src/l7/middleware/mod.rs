@@ -707,7 +707,7 @@ mod tests {
 	use super::*;
 
 	fn mw(yaml: &str) -> Middleware {
-		let spec: MiddlewareSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
+		let spec: MiddlewareSpec = serde_json::from_value(crate::config::yaml::<serde_json::Value>(yaml).unwrap()).unwrap();
 		Middleware::compile("t", &spec).unwrap()
 	}
 

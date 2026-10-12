@@ -739,7 +739,7 @@ mod tests {
 	use super::*;
 
 	fn service(yaml: &str) -> Service {
-		let spec: ServiceSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
+		let spec: ServiceSpec = serde_json::from_value(crate::config::yaml::<serde_json::Value>(yaml).unwrap()).unwrap();
 		Service::compile("s", &spec, &BTreeMap::new()).unwrap()
 	}
 

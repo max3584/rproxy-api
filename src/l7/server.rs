@@ -1930,7 +1930,7 @@ mod tests {
 	use super::*;
 
 	fn router(yaml: &str) -> Router {
-		let spec: HttpSpec = serde_json::from_value(serde_yaml_ng::from_str::<serde_json::Value>(yaml).unwrap()).unwrap();
+		let spec: HttpSpec = serde_json::from_value(crate::config::yaml::<serde_json::Value>(yaml).unwrap()).unwrap();
 		spec.validate().unwrap();
 		Router::compile(&spec, &Upstream::default(), crate::core::resolve::system_lookup()).unwrap()
 	}

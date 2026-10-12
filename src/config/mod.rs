@@ -10,10 +10,19 @@ pub mod reload;
 
 use serde::de::DeserializeOwned;
 
+/// Reads YAML as YAML 1.2 (serde-saphyr): `yes` / `on` stay strings, duplicate keys are refused, merge keys
+/// (`<<`) are expanded, alias expansion is bounded. Errors are one line (no source snippet).
+pub fn yaml<T: DeserializeOwned>(text: &str) -> Result<T, String> {
+	let mut options = serde_saphyr::Options::default();
+	options.strict_booleans = true;
+	options.with_snippet = false;
+	serde_saphyr::from_str_with_options(text, options).map_err(|e| e.to_string())
+}
+
 /// Reads YAML through a JSON value, so YAML and JSON mean exactly the same
 /// (`{kind: {...}}` maps select an enum variant, as in the API).
 pub fn from_yaml<T: DeserializeOwned>(text: &str) -> Result<T, String> {
-	let value: serde_json::Value = serde_yaml_ng::from_str(text).map_err(|e| e.to_string())?;
+	let value: serde_json::Value = yaml(text)?;
 	serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
@@ -169,7 +178,7 @@ impl ConfigDoc {
 	/// Parses one file; also says whether it had a `global` section.
 	fn parse_unchecked(path: &Path, text: &str) -> Result<(ConfigDoc, bool), String> {
 		let value: serde_json::Value = match path.extension().and_then(|e| e.to_str()) {
-			Some("yaml" | "yml") => serde_yaml_ng::from_str(text).map_err(|e| e.to_string())?,
+			Some("yaml" | "yml") => yaml(text)?,
 			_ => serde_json::from_str(text).map_err(|e| e.to_string())?,
 		};
 		let has_global = value.get("global").is_some();
@@ -338,6 +347,26 @@ impl ConfigDoc {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// serde-saphyr (#279): YAML 1.2 as before, plus merge keys, bounded aliases and one-line errors
+	#[test]
+	fn yaml_reading() {
+		let v: serde_json::Value = yaml("a: yes\nb: on\nc: true\nd: 10\ne: '010'\n").unwrap();
+		assert_eq!(v, serde_json::json!({"a": "yes", "b": "on", "c": true, "d": 10, "e": "010"}));
+		let e = yaml::<serde_json::Value>("a: 1\na: 2\n").unwrap_err();
+		assert!(e.contains("duplicate") && !e.contains('\n'), "{e}");
+		let v: serde_json::Value = yaml("base: &b {x: 1, y: 2}\nr:\n  <<: *b\n  y: 3\n").unwrap();
+		assert_eq!(v["r"], serde_json::json!({"x": 1, "y": 3}));
+		// a billion laughs stops at the alias budget instead of eating memory
+		let mut bomb = String::from("a: &a [x, x, x, x, x, x, x, x, x, x]\n");
+		for (i, c) in ('b'..='k').enumerate() {
+			let p = (b'a' + i as u8) as char;
+			bomb.push_str(&format!("{c}: &{c} [*{p}, *{p}, *{p}, *{p}, *{p}, *{p}, *{p}, *{p}, *{p}, *{p}]\n"));
+		}
+		assert!(yaml::<serde_json::Value>(&bomb).is_err());
+		let e = yaml::<serde_json::Value>("a: [1, 2\n").unwrap_err();
+		assert!(!e.contains('\n'), "{e}");
+	}
 
 	#[test]
 	fn reads_the_0_2_array_and_the_v0_3_document_in_yaml_and_json() {
