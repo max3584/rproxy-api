@@ -929,7 +929,8 @@ mod tests {
 		let mut c = cfg(&dir);
 		c.pubkey = Some(dir.join("key.pub"));
 		let key = c.key().unwrap();
-		let v = Version(0, 4, 9);
+		// a version that is never this build's own (the test promotes the own version below)
+		let v = Version(99, 0, 0);
 		let binary = b"#!/bin/true\n".to_vec();
 		let name = asset_name(v);
 		let manifest = serde_json::to_vec(&Manifest {
@@ -972,19 +973,19 @@ mod tests {
 
 		// state: bad versions and promotion
 		mark_bad(&c, v, "test");
-		assert_eq!(c.load_state().bad, ["0.4.9"]);
+		assert_eq!(c.load_state().bad, ["99.0.0"]);
 		// marks can be taken off (security review M1)
-		mark_bad(&c, Version::parse("0.4.8").unwrap(), "test");
-		assert_eq!(clear_bad(&c, Version::parse("0.4.8")).unwrap(), ["0.4.8"]);
-		assert_eq!(c.load_state().bad, ["0.4.9"]);
-		assert_eq!(clear_bad(&c, None).unwrap(), ["0.4.9"]);
+		mark_bad(&c, Version::parse("98.0.0").unwrap(), "test");
+		assert_eq!(clear_bad(&c, Version::parse("98.0.0")).unwrap(), ["98.0.0"]);
+		assert_eq!(c.load_state().bad, ["99.0.0"]);
+		assert_eq!(clear_bad(&c, None).unwrap(), ["99.0.0"]);
 		assert!(c.load_state().bad.is_empty());
 		mark_bad(&c, v, "test");
 		c.update_state(|s| s.trial = Some(Trial { version: Version::own().to_string(), started_at: 1, interrupted: 0 })).unwrap();
 		promote(&c);
 		let s = c.load_state();
 		assert_eq!((s.trial, s.good), (None, Some(Version::own().to_string())));
-		assert!(c.cached_versions().is_empty(), "pruned: 0.4.9 is neither good nor previous");
+		assert!(c.cached_versions().is_empty(), "pruned: 99.0.0 is neither good nor previous");
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }
