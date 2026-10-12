@@ -2,7 +2,7 @@ English: [MIGRATING-FROM-TRAEFIK.md](en/MIGRATING-FROM-TRAEFIK.md)
 
 # Traefik から移る
 
-`contrib/traefik2rproxy.py`（.deb では `/usr/bin/rproxy-traefik-convert`）は、Traefik の設定を rproxy の設定ファイル（`RPROXY_CONFIG`。`version: 1`・`global`・`rules`）に変換します。変換できなかった設定は、出力の先頭のコメントと標準エラーに一覧されます。出力はそのまま使わず、一覧を確かめてから置いてください。
+`rproxy-traefik-convert`（.deb では `/usr/bin/rproxy-traefik-convert`。ソースは `crates/rproxy-traefik`）は、Traefik の設定を rproxy の設定ファイル（`RPROXY_CONFIG`。`version: 1`・`global`・`rules`）に変換します。変換できなかった設定は、出力の先頭のコメントと標準エラーに一覧されます。出力はそのまま使わず、一覧を確かめてから置いてください。
 
 ## 使い方
 
@@ -22,7 +22,9 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/capabilities > caps
 rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.yaml
 ```
 
-- 必要なもの：Python 3.8 以上。YAML の読み書きには PyYAML（`apt install python3-yaml`）、TOML の読み込みには Python 3.11 以上。PyYAML がないときは JSON で出力する（rproxy は JSON の設定ファイルも読める。`--json` でも JSON になる）。
+- 1 つのバイナリで、ほかに要るものはない（v0.4.7 までは Python の `contrib/traefik2rproxy.py` だった。同じ引数で、同じ出力を書く）。入力は YAML・TOML・JSON（拡張子で決める）、出力は YAML（`--json` で JSON。rproxy は JSON の設定ファイルも読める）。
+- .deb を使わないときは、リポジトリから `cargo build --release -p rproxy-traefik` でビルドする（`target/release/rproxy-traefik-convert`）。
+- YAML は YAML 1.2 として読む（Traefik と同じ。Python の版の PyYAML と違い、引用符のない `yes`・`on` は真偽値ではなく文字列）。
 - 終了コードは、入力が読めないときだけ 2。変換できない設定があっても 0 で、一覧に出す。
 - `:443` のようにアドレスを省いたエントリポイントは `--listen-addr`（既定 `0.0.0.0`）で待ち受ける。
 - 変換した結果は `rproxy-api` の起動（または `RPROXY_CONFIG` の自動の読み直し）で検証される。誤りがあれば起動しない（読み直しでは反映しない）ので、置く前に手元の rproxy で試すと確実。

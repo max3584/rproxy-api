@@ -418,7 +418,8 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/backend_tls.rs` | サービスの `tls`（#236）：サービスの CA・SNI の名前、`subject_alt_names`（DNS 名・URI）、転送先へのクライアント証明書、平文の HTTP のルールからの `https://` の転送先、形とファイルの誤り |
 | `tests/crowdsec.rs` | `crowdsec` ミドルウェア（偽の LAPI と AppSec） |
 | `tests/acme.rs` | ACME（#208）：API の守り（いつも動く）と、Pebble・PowerDNS で実際に証明書を取る（上の表） |
-| `tests/traefik_convert.rs` | `contrib/traefik2rproxy.py` が `tests/fixtures/traefik/` を変換し、rproxy が受け付ける。python3 と PyYAML がなければスキップ（CI は `RPROXY_TEST_REQUIRE_PYTHON=1`） |
+| `tests/traefik_convert.rs` | Traefik の設定の変換（`crates/rproxy-traefik`）：`tests/fixtures/traefik/` のすべての場合（`cases`）の出力を rproxy が読んで受け付ける。いくつかは中身も確かめる。変換が知っているミドルウェア（`KNOWN_MIDDLEWARES`）が `Features::CURRENT` にある |
+| `crates/rproxy-traefik` のテスト（`cargo test -p rproxy-traefik`） | 出力が `tests/fixtures/traefik/*/expected*` とバイト単位で同じ（期待する出力は Python の版 `contrib/traefik2rproxy.py` が書いたもの。足し方は `tests/fixtures/traefik/README.md`）、終了コード・`-o`、YAML の書き方（PyYAML と同じ）・ルール・ミドルウェア・期間などの単体テスト。読むのは管理者が渡す手元のファイルなので、ファジングのターゲットは置かない（インターネットから読むものではない） |
 
 ## DB からの復元（`tests/db_restore.rs`）
 

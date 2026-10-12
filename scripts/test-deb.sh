@@ -58,6 +58,14 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" 
 getent passwd rproxy-acme >/dev/null || fail "no rproxy-acme user"
 [ -f /lib/systemd/system/rproxy-acme-helper.service ] || [ -f /usr/lib/systemd/system/rproxy-acme-helper.service ] || fail "no rproxy-acme-helper.service"
 ! systemctl is-enabled --quiet rproxy-acme-helper || fail "the ACME helper is enabled by default"
+# the Traefik converter is the Rust binary (crates/rproxy-traefik), and rproxy accepts what it writes
+[ "$(head -c4 /usr/bin/rproxy-traefik-convert | tail -c3)" = ELF ] || fail "rproxy-traefik-convert is not a binary"
+printf 'entryPoints:\n  web:\n    address: "127.0.0.1:18080"\n' >"$work/traefik.yml"
+printf 'http:\n  routers:\n    app:\n      rule: Host(\"app.example.com\")\n      service: app\n  services:\n    app:\n      loadBalancer:\n        servers: [{url: "http://127.0.0.1:18081"}]\n' >"$work/dynamic.yml"
+rproxy-traefik-convert --static "$work/traefik.yml" --dynamic "$work/dynamic.yml" -o "$work/converted.yaml" ||
+	fail "rproxy-traefik-convert failed"
+grep -q 'match: .*app.example.com' "$work/converted.yaml" || fail "the converted settings lack the router"
+/usr/bin/rproxy-api --check-config "$work/converted.yaml" >/dev/null || fail "--check-config refused the converted settings"
 # the default configuration logs to /var/log/rproxy (JSON Lines, rotated by rproxy itself)
 sudo sh -c 'head -n1 /var/log/rproxy/rproxy.*.log' | grep -q '"event"' || fail "no JSON log in /var/log/rproxy"
 curl -s -H "Authorization: Bearer $token" "http://127.0.0.1:$PORT/capabilities" | grep -q '"transparent":true' ||

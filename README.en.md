@@ -199,7 +199,7 @@ Example ([contrib/rproxy.example.yaml](contrib/rproxy.example.yaml)): accept onl
 
 Clients can claim any SNI or server name. Routing by name alone is not access control, so combine it with `allow_from`, mTLS (`client_auth`), and the Web UI login.
 
-When migrating from Traefik, `rproxy-traefik-convert` ([contrib/traefik2rproxy.py](contrib/traefik2rproxy.py), included in the .deb) can convert Traefik configuration (static and dynamic configuration, Docker labels) into this configuration file. Settings that could not be converted are listed at the top of the output and on stderr ([docs/en/MIGRATING-FROM-TRAEFIK.md](docs/en/MIGRATING-FROM-TRAEFIK.md)).
+When migrating from Traefik, `rproxy-traefik-convert` ([crates/rproxy-traefik](crates/rproxy-traefik), included in the .deb) can convert Traefik configuration (static and dynamic configuration, Docker labels) into this configuration file. Settings that could not be converted are listed at the top of the output and on stderr ([docs/en/MIGRATING-FROM-TRAEFIK.md](docs/en/MIGRATING-FROM-TRAEFIK.md)).
 
 An example for running under systemd is in [contrib/rproxy-api.service](contrib/rproxy-api.service) (it adds `CAP_NET_BIND_SERVICE` for ports such as 80 / 443).
 

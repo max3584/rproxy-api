@@ -2,7 +2,7 @@
 
 # Migrating from Traefik
 
-`contrib/traefik2rproxy.py` (`/usr/bin/rproxy-traefik-convert` in the .deb) converts a Traefik configuration into an rproxy configuration file (`RPROXY_CONFIG`: `version: 1`, `global`, `rules`). Settings that could not be converted are listed in a comment at the top of the output and on standard error. Do not use the output as-is; review the list before deploying it.
+`rproxy-traefik-convert` (`/usr/bin/rproxy-traefik-convert` in the .deb; source in `crates/rproxy-traefik`) converts a Traefik configuration into an rproxy configuration file (`RPROXY_CONFIG`: `version: 1`, `global`, `rules`). Settings that could not be converted are listed in a comment at the top of the output and on standard error. Do not use the output as-is; review the list before deploying it.
 
 ## Usage
 
@@ -22,7 +22,9 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/capabilities > caps
 rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.yaml
 ```
 
-- Requirements: Python 3.8 or later. PyYAML (`apt install python3-yaml`) for reading and writing YAML, and Python 3.11 or later for reading TOML. Without PyYAML, the output is JSON (rproxy can also read JSON configuration files; `--json` also produces JSON).
+- It is a single binary and needs nothing else (up to v0.4.7 it was the Python script `contrib/traefik2rproxy.py`; same arguments, same output). Input is YAML, TOML or JSON (by file extension); output is YAML (`--json` for JSON; rproxy can also read JSON configuration files).
+- Without the .deb, build it from the repository with `cargo build --release -p rproxy-traefik` (`target/release/rproxy-traefik-convert`).
+- YAML is read as YAML 1.2 (as Traefik does; unlike PyYAML in the Python version, unquoted `yes` / `on` are strings, not booleans).
 - The exit code is 2 only when the input cannot be read. Even if some settings cannot be converted, it exits with 0 and lists them.
 - Entry points that omit the address, such as `:443`, listen on `--listen-addr` (default `0.0.0.0`).
 - The converted result is validated when `rproxy-api` starts (or when `RPROXY_CONFIG` is automatically reloaded). If there are errors, it does not start (a reload does not apply the change), so testing with a local rproxy before deploying is the safe approach.
