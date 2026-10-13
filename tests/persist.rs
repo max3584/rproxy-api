@@ -189,6 +189,16 @@ impl Rproxy {
 		fs::read_to_string(&self.out).unwrap_or_default()
 	}
 
+	/// Until the log has `needle`: rproxy writes its log from another thread (tracing's non_blocking), so a
+	/// line can land after the API has answered.
+	async fn wait_log(&self, needle: &str) {
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !self.log().contains(needle) {
+			assert!(Instant::now() < deadline, "no {needle} in the log:\n{}", self.log());
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}
+
 	async fn wait(&self, port: u16) {
 		let deadline = Instant::now() + Duration::from_secs(20);
 		loop {
@@ -277,7 +287,7 @@ async fn rules_survive_a_restart_with_mariadb() {
 	{
 		let rp = Rproxy::start(&dir, api_port, &url, "first");
 		rp.wait(api_port).await;
-		assert!(rp.log().contains("restore.conflict"), "{}", rp.log());
+		rp.wait_log("restore.conflict").await;
 		let r = client.post(format!("{base}/rules")).bearer_auth("ci").json(&rule("tcp", stored, backend)).send().await.unwrap();
 		assert_eq!(r.status(), StatusCode::CREATED);
 		let v: Value = r.json().await.unwrap();
