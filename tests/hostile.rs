@@ -1417,18 +1417,22 @@ async fn dtls_echo(pki: &Pki, port: u16, name: &str, msg: &[u8]) -> Result<Vec<u
 		extended_master_secret: ExtendedMasterSecretType::Require,
 		..Default::default()
 	};
-	let c = tokio::time::timeout(Duration::from_secs(5), DTLSConn::new(conn, config, true, None))
+	// UDP under the flood loses datagrams; a lost flight costs a retransmission
+	let c = tokio::time::timeout(Duration::from_secs(10), DTLSConn::new(conn, config, true, None))
 		.await
-		.map_err(|_| "DTLS handshake timed out".to_string())?
-		.map_err(err("DTLS handshake"))?;
-	c.write(msg, None).await.map_err(err("DTLS write"))?;
+		.map_err(|_| format!("DTLS handshake for {name} timed out"))?
+		.map_err(|e| format!("DTLS handshake for {name}: {e}"))?;
+	// application data is not retransmitted by DTLS: resend until the echo comes back
 	let mut buf = vec![0u8; 1500];
-	let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf, None))
-		.await
-		.map_err(|_| "no DTLS reply".to_string())?
-		.map_err(err("DTLS read"))?;
-	let _ = c.close().await;
-	Ok(buf[..n].to_vec())
+	for _ in 0..5 {
+		c.write(msg, None).await.map_err(err("DTLS write"))?;
+		if let Ok(got) = tokio::time::timeout(Duration::from_secs(1), c.read(&mut buf, None)).await {
+			let n = got.map_err(err("DTLS read"))?;
+			let _ = c.close().await;
+			return Ok(buf[..n].to_vec());
+		}
+	}
+	Err(format!("no DTLS reply from {name}"))
 }
 
 /// The first datagram a real QUIC client sends (its Initial with the ClientHello).
