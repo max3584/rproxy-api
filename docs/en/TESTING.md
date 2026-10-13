@@ -32,7 +32,7 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 
 Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc targets; see "Fuzzing" below).
 
-To find a flaky test or check that it is fixed, run it many times in the manual Repeat workflow instead of on a developer's machine (`gh workflow run repeat.yml -f test=udp_sni -f times=100`, also `--ref <branch>` and `-f filter=<test name>`). It stops at the first failing run and prints its output and how many runs passed before it. No database, Pebble or PowerDNS is set up (tests that need them skip themselves).
+To find a flaky test or check that it is fixed, run it many times in the manual Repeat workflow instead of on a developer's machine (`gh workflow run repeat.yml -f test=udp_sni -f times=100`, also `--ref <branch>` and `-f filter=<test name>`). It stops at the first failing run and prints its output and how many runs passed before it. `-f mariadb=true` starts MariaDB as the CI's test job does (Pebble and PowerDNS are not set up, so tests that need them skip themselves).
 
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
