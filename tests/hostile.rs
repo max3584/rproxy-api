@@ -20,6 +20,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -37,7 +38,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use webrtc_util::conn::{Conn, Listener};
+use webrtc_util::conn::Conn;
 
 use common::pki::{Issued, Pki};
 use common::*;
@@ -1383,28 +1384,95 @@ const FROM_QUIC: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 const FROM_DTLS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const FROM_HOSTILE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 4);
 
-/// A DTLS echo server: `tag` + each datagram.
+/// A DTLS echo server: `tag` + each datagram. Not `dtls::listener`: it never
+/// forgets a peer address, and rproxy's upstream ports come round again under
+/// the load, so a new session would land in a finished connection.
 async fn dtls_backend(issued: &Issued, tag: &'static str) -> SocketAddr {
-	let listener = dtls::listener::listen(
-		"127.0.0.1:0",
-		DtlsConfig { certificates: vec![issued.dtls()], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() },
-	)
-	.await
-	.unwrap();
-	let addr = listener.addr().await.unwrap();
+	let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+	let addr = sock.local_addr().unwrap();
+	let config =
+		DtlsConfig { certificates: vec![issued.dtls()], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() };
 	tokio::spawn(async move {
-		while let Ok((conn, _)) = listener.accept().await {
-			tokio::spawn(async move {
-				let mut buf = vec![0u8; 1500];
-				while let Ok(n) = conn.recv(&mut buf).await {
-					if conn.send(&[tag.as_bytes(), &buf[..n]].concat()).await.is_err() {
-						break;
+		let mut peers: HashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
+		let mut buf = vec![0u8; 65536];
+		while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+			// a peer whose connection ended starts a new one
+			let tx = peers.entry(peer).or_insert_with(|| tokio::sync::mpsc::channel(1).0);
+			if tx.is_closed() {
+				let (new_tx, rx) = tokio::sync::mpsc::channel(64);
+				*tx = new_tx;
+				let pc = Arc::new(PeerConn { sock: sock.clone(), peer, rx: tokio::sync::Mutex::new(rx) });
+				let config = config.clone();
+				tokio::spawn(async move {
+					let conn: Arc<dyn Conn + Send + Sync> = pc.clone();
+					if let Ok(Ok(c)) = tokio::time::timeout(Duration::from_secs(15), DTLSConn::new(conn, config, false, None)).await {
+						let mut buf = vec![0u8; 1500];
+						while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf, None)).await {
+							if c.write(&[tag.as_bytes(), &buf[..n]].concat(), None).await.is_err() {
+								break;
+							}
+						}
+						let _ = c.close().await;
 					}
-				}
-			});
+					// done with this peer either way
+					let _ = pc.close().await;
+				});
+			}
+			let _ = tx.try_send(buf[..n].to_vec());
 		}
 	});
 	addr
+}
+
+/// One peer of `dtls_backend`'s socket.
+struct PeerConn {
+	sock: Arc<UdpSocket>,
+	peer: SocketAddr,
+	rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl Conn for PeerConn {
+	async fn connect(&self, _: SocketAddr) -> webrtc_util::Result<()> {
+		Ok(())
+	}
+
+	async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
+		let closed = || webrtc_util::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
+		let d = self.rx.lock().await.recv().await.ok_or_else(closed)?;
+		let n = d.len().min(buf.len());
+		buf[..n].copy_from_slice(&d[..n]);
+		Ok(n)
+	}
+
+	async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+		Ok((self.recv(buf).await?, self.peer))
+	}
+
+	async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+		Ok(self.sock.send_to(buf, self.peer).await?)
+	}
+
+	async fn send_to(&self, buf: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
+		self.send(buf).await
+	}
+
+	fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+		Ok(self.sock.local_addr()?)
+	}
+
+	fn remote_addr(&self) -> Option<SocketAddr> {
+		Some(self.peer)
+	}
+
+	async fn close(&self) -> webrtc_util::Result<()> {
+		self.rx.lock().await.close();
+		Ok(())
+	}
+
+	fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+		self
+	}
 }
 
 async fn dtls_echo(pki: &Pki, port: u16, name: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
