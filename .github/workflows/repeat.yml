@@ -4,8 +4,9 @@ name: Repeat
 # without spending the developer's machine on it, e.g.
 #   gh workflow run repeat.yml -f test=udp_sni -f times=100
 #   gh workflow run repeat.yml --ref <branch> -f test=udp_sni -f filter=quic_client_hello -f times=200
-# Needs no database: tests that need MariaDB, Pebble or PowerDNS skip themselves here. Fails on the first
-# failing run and prints its output (and how many runs passed before it).
+# With -f mariadb=true it starts MariaDB as the CI's test job does (RPROXY_TEST_DATABASE_URL), for the tests
+# that use it; Pebble and PowerDNS are not set up (those tests skip themselves). Fails on the first failing
+# run and prints its output (and how many runs passed before it).
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +21,11 @@ on:
         description: "how many runs"
         required: false
         default: "100"
+      mariadb:
+        description: "start MariaDB for tests that use it (RPROXY_TEST_DATABASE_URL)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -32,10 +38,24 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: packages
-        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+        run: |
+          apk add --no-cache bash git tar zstd curl gcc musl-dev
+          if [ "${{ inputs.mariadb }}" = true ]; then apk add --no-cache mariadb mariadb-client; fi
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # as the CI's test job
+      - name: MariaDB
+        if: ${{ inputs.mariadb }}
+        run: |
+          mkdir -p /run/mysqld && chown mysql:mysql /run/mysqld
+          mariadb-install-db --user=mysql --datadir=/var/lib/mysql --skip-test-db > /dev/null
+          nohup mariadbd --user=mysql --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 --port=3306 \
+            > /tmp/mariadb.log 2>&1 &
+          for _ in $(seq 60); do mariadb-admin ping --silent 2>/dev/null && break; sleep 1; done
+          mariadb-admin ping --silent || { cat /tmp/mariadb.log; exit 1; }
+          mariadb -e "CREATE DATABASE rproxy_test; ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password USING PASSWORD('root');"
+          echo "RPROXY_TEST_DATABASE_URL=mysql://root:root@127.0.0.1:3306/rproxy_test" >> "$GITHUB_ENV"
       - name: build
         shell: bash
         env:

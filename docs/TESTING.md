@@ -32,7 +32,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。
 
-時々落ちる試験を探す・直ったことを確かめるときは、手元で何十回も回さず、手動の Repeat ワークフローで 1 つの試験を続けて回す（`gh workflow run repeat.yml -f test=udp_sni -f times=100`、`--ref <ブランチ>`・`-f filter=<試験の名前>` も）。最初に落ちた回で止まり、その出力と、それまでに通った回数を出す。DB・Pebble・PowerDNS は用意しない（それが要る試験は自分で飛ばす）。
+時々落ちる試験を探す・直ったことを確かめるときは、手元で何十回も回さず、手動の Repeat ワークフローで 1 つの試験を続けて回す（`gh workflow run repeat.yml -f test=udp_sni -f times=100`、`--ref <ブランチ>`・`-f filter=<試験の名前>` も）。最初に落ちた回で止まり、その出力と、それまでに通った回数を出す。`-f mariadb=true` で CI の試験と同じく MariaDB を用意する（Pebble・PowerDNS は用意しないので、それが要る試験は自分で飛ばす）。
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
