@@ -7,7 +7,7 @@ rproxy は CrowdSec と 2 つの向きで連携します。
 | 向き | 何をするか | 設定 |
 |---|---|---|
 | 止める（bouncer） | LAPI の判定（ban）に入っている IP を止める。L7 は `crowdsec` ミドルウェア（403、AppSec も）、L4 はルールの `crowdsec: true`（TLS より前に切る） | rproxy の `global.crowdsec`（docs/API.md） |
-| 見つける（ログ） | CrowdSec のエージェントが rproxy のログを読み、攻撃を見つけて ban する | このページのパーサー・シナリオ・acquis |
+| 見つける（ログ） | CrowdSec のエージェントが rproxy のログ（と、あれば Suricata などの IDS のアラート）を読み、攻撃を見つけて ban する | このページのパーサー・シナリオ・acquis |
 
 両方を入れると、「rproxy を通るアクセスから CrowdSec が見つけて ban → rproxy がその IP を止める」が一周します。CI（`scripts/interop/crowdsec.sh`、interop の `crowdsec` ジョブ）で、本物の CrowdSec を使ってこの一周を確かめています。
 
@@ -114,15 +114,45 @@ rules:
 
 国の情報は CrowdSec の側でも `crowdsecurity/geoip-enrich`（同じ GeoLite2 を使う）で付けられる。rproxy の `global.geoip.log_country: true` は `conn.open`・`http.access` に `country`・`asn` を足すので、CrowdSec を通さずに SIEM などで rproxy のログを見るとき向け。どちらも同じデータベースのファイルを `geoipupdate` で更新すればよい（rproxy は変わったファイルを `check_interval` ごとに読み直す）。
 
+### 外部の解析ツールと組み合わせる（Suricata）
+
+rproxy は L4 のルールの中身を調べずに中継する。通信の中身から攻撃を見つけるのは外部の IDS に任せ、その結果を CrowdSec に集めて rproxy で止める、という分け方ができる。
+
+```
+クライアント ──▶ rproxy（crowdsec: true）──▶ 転送先
+       │
+       └─（同じ NIC を受け身で見る）─▶ Suricata ─ eve.json ─▶ CrowdSec ─ ban ─▶ rproxy
+```
+
+- Suricata は IDS（受け身）で、rproxy と同じ機械の NIC（`af-packet`）か、スイッチのミラーポート・TAP の先で動かす。通信の経路に入らないので、Suricata が止まっても通信は止まらない。
+- CrowdSec に Suricata のパーサーとシナリオを入れ、`eve.json` を読ませる。
+
+  ```bash
+  sudo cscli collections install crowdsecurity/suricata
+  sudo tee /etc/crowdsec/acquis.d/suricata.yaml >/dev/null <<'EOF'
+  filenames:
+    - /var/log/suricata/eve.json
+  labels:
+    type: suricata-evelogs
+  EOF
+  sudo systemctl restart crowdsec
+  ```
+
+  `crowdsecurity/suricata-major-severity` は TCP の severity 1 のアラート 1 件で ban し、`crowdsecurity/suricata-high-medium-severity` は severity 2 のアラートが 20 秒ほどの間に違うシグネチャで 3 件そろうと ban する。
+- rproxy の側は 3 節と同じ（L4 はルールの `crowdsec: true`、L7 は `crowdsec` ミドルウェア）。ban は `update_interval` ごとに反映され、その IP からの新しい接続（UDP は新しいセッション）から止める。
+- `tls.mode: terminate` のルールでは、暗号化された中身は Suricata から見えない（見えるのは ClientHello まで）。中身は rproxy の L7 の AppSec（`crowdsec: {appsec: true}`）で見る。HTTP のリクエストを解析の仕組みに写したいときは、ルートの `mirror` ミドルウェアも使える。
+- ほかの IDS も、CrowdSec のハブにパーサーとシナリオがあれば同じ形でつなげる。
+
 ## 4. CI での確かめ方
 
-`scripts/interop/crowdsec.sh` は、GitHub の Ubuntu のランナーで CrowdSec（LAPI・エージェント・AppSec）を公式のパッケージから入れ、ネットワーク名前空間のクライアントから rproxy を通して、次を確かめます。
+`scripts/interop/crowdsec.sh` は、CrowdSec の公式のイメージ（`crowdsecurity/crowdsec`、Alpine）のコンテナで CrowdSec（LAPI・エージェント・AppSec）と Suricata を動かし、ネットワーク名前空間のクライアントから rproxy を通して、次を確かめます。
 
 1. `cscli explain`：見本のログ（`scripts/interop/crowdsec-samples.log`）の 7 行すべてをパーサーが読み、HTTP の行が `crowdsecurity/http-logs` とシナリオ（`http-sensitive-files`・`http-probing` など）へ、L4 の行が `max3584/rproxy-conn-denied`・`max3584/rproxy-conn-limited` へ届く
 2. 検知：global なクライアントが存在しないパスを探索する → CrowdSec が rproxy のログから見つけて ban → そのクライアントは rproxy に 403 で止められ、ほかのクライアントは通る（IPv4 と IPv6）
 3. L4：`allow_from` で断られる接続を繰り返したクライアントが `max3584/rproxy-conn-denied` で ban され、`crowdsec: true` の L4 のルールで接続を切られる
-4. AppSec：`GET /.env`（`crowdsecurity/vpatch-env-access`）を 403 で止め、ふつうのリクエストは通す
-5. `cscli decisions delete` で ban を外すと、また通る
-6. 私用アドレス（10.99.0.10）のクライアントは、同じ探索をしても ban されない
+4. 外部の解析：Suricata をホスト側の veth で受け身に動かし、無害な目印の文字列に当たる試験用のルール（priority 1）を置く。目印を送ったクライアントが `crowdsecurity/suricata-major-severity` で ban され、`crowdsec: true` の L4 のルールで接続を切られる。ほかのクライアントは通る
+5. AppSec：`GET /.env`（`crowdsecurity/vpatch-env-access`）を 403 で止め、ふつうのリクエストは通す
+6. `cscli decisions delete` で ban を外すと、また通る
+7. 私用アドレス（10.99.0.10）のクライアントは、同じ探索をしても ban されない
 
 クライアントの「global な」アドレスには、文書用のアドレスを使っています。IPv4 は RFC 5737（192.0.2.0/24・198.51.100.0/24・203.0.113.0/24）、IPv6 は RFC 3849（2001:db8::/32）です。インターネットでは経路がないので名前空間の中なら安全で、CrowdSec の既定の whitelist（`crowdsecurity/whitelists`：RFC 1918・ループバックなど）にも入りません。CrowdSec は私用アドレスを ban しないので、`127.0.0.1` からの試験では検知も ban も起きません。

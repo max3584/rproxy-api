@@ -77,7 +77,7 @@ jobs:
       - run: scripts/interop/media.sh
 
   crowdsec:
-    name: crowdsec (LAPI, AppSec, detection from rproxy logs, global IPs)
+    name: crowdsec (LAPI, AppSec, detection from rproxy logs and Suricata, global IPs)
     needs: build
     runs-on: ubuntu-latest
     container:
@@ -87,7 +87,7 @@ jobs:
       options: --privileged
     steps:
       - name: packages
-        run: apk add --no-cache bash coreutils curl python3 iproute2
+        run: apk add --no-cache bash coreutils curl python3 iproute2 suricata
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
