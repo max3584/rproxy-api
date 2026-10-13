@@ -246,6 +246,40 @@ pub mod quic {
 		d.get(6..6 + len).map(<[u8]>::to_vec)
 	}
 
+	/// Whether the first packet of `d` is an Initial that opens with the keys of its own Destination Connection
+	/// ID: the first flight of a new connection. A client keeps protecting its Initials with the keys of the ID
+	/// it started with, but changes the ID in them to the server's after the server's first Initial (RFC 9000
+	/// §7.2): those later Initials of the same connection (ACKs, the rest of a large ClientHello) do not open.
+	pub fn opens_with_own_id(d: &[u8]) -> bool {
+		(|| {
+			let mut r = d;
+			let first = *take(&mut r, 1)?.first()?;
+			let raw = take(&mut r, 4)?;
+			let version = Version::of(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))?;
+			if (first >> 4) & 0b11 != version.initial_type() {
+				return None;
+			}
+			let dcid_len = *take(&mut r, 1)?.first()?;
+			if dcid_len > 20 {
+				return None;
+			}
+			let dcid = take(&mut r, u64::from(dcid_len))?;
+			let scid_len = *take(&mut r, 1)?.first()?;
+			if scid_len > 20 {
+				return None;
+			}
+			take(&mut r, u64::from(scid_len))?;
+			let token = varint(&mut r)?;
+			take(&mut r, token)?;
+			let length = varint(&mut r)?;
+			let pn_offset = d.len() - r.len();
+			take(&mut r, length)?;
+			let packet = &d[..d.len() - r.len()];
+			unprotect(version, dcid, packet, pn_offset)
+		})()
+		.is_some()
+	}
+
 	/// Client Initial packet protection keys (RFC 9001 §5.2, RFC 9369 §3.3).
 	#[derive(Debug, PartialEq, Eq)]
 	pub struct Keys {
@@ -608,7 +642,13 @@ mod tests {
 
 	/// A protected client Initial carrying `frames` (padded to at least 1200 bytes).
 	fn initial(version: Version, dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
-		let keys = client_initial_keys(version, dcid);
+		initial_keyed(version, dcid, dcid, pn, frames, token)
+	}
+
+	/// An Initial whose header says `dcid` but is protected with the keys of `keys_dcid` (a later Initial of a
+	/// connection, after the client took the server's connection ID).
+	fn initial_keyed(version: Version, dcid: &[u8], keys_dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
+		let keys = client_initial_keys(version, keys_dcid);
 		let mut payload = frames.to_vec();
 		// enough for the header protection sample, and the 1200-byte minimum
 		let min = 1200usize.saturating_sub(64).max(20);
@@ -916,5 +956,17 @@ mod tests {
 			let _ = s.push(&d);
 			let _ = s.push(&d);
 		}
+	}
+
+	// a later Initial of the same connection (the client took the server's connection ID, the keys stay those of
+	// the first ID) is not mistaken for a new connection; the first flight is
+	#[test]
+	fn later_initials_of_a_connection_do_not_open_with_their_own_id() {
+		let first = initial(Version::V1, &[1; 8], 0, &crypto_frame(0, b"x"), b"");
+		assert!(super::quic::opens_with_own_id(&first));
+		let later = initial_keyed(Version::V1, &[9; 8], &[1; 8], 1, &[0x02, 0, 0, 0, 0], b"");
+		assert!(!super::quic::opens_with_own_id(&later));
+		assert!(super::quic::initial_dcid(&later).is_some(), "it still looks like an Initial");
+		assert!(!super::quic::opens_with_own_id(b"not quic"));
 	}
 }
