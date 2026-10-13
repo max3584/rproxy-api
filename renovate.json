@@ -13,6 +13,7 @@
   ],
   "prConcurrentLimit": 5,
   "platformAutomerge": false,
+  "rebaseWhen": "behind-base-branch",
   "lockFileMaintenance": {
     "enabled": true,
     "automerge": true,
