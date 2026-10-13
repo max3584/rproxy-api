@@ -323,6 +323,20 @@ An HTTPS mirror (a small server in the test; binaries are answered with a redire
 | `a_trial_killed_three_times_is_bad` | A version on trial stopped by SIGKILL: the whole container (the launcher too), and the server alone (the OOM killer of the container's memory limit picks the largest process, the server). Both count as `update.interrupted` (for the server alone the launcher starts it again at once); the third makes the version bad and the image's version starts (security review M1) |
 | `signatures_of_the_minisign_tool_verify` | Keys and signatures made by the minisign tool (the default prehashed form and the legacy one) verify |
 
+## Integration tests: hostile traffic (`tests/hostile.rs`)
+
+Runs the real binary in its own process group with 16 hostile senders and 2 legitimate clients at once (`RPROXY_TEST_HOSTILE_SECS` seconds per round, default 2; two rounds). The random seed is printed; `RPROXY_TEST_HOSTILE_SEED` repeats the same input and `RPROXY_TEST_HOSTILE_ONLY=name,...` narrows the kinds of input. Each round checks: legitimate exchanges match byte for byte; the process is alive, `GET /rules` answers and every rule is running; after the load stops, connections go back to 0 and the `/proc/<pid>/fd` and thread counts return to the baseline within a margin; RSS does not keep growing from round to round; no panicked, fatal or `rule.failed` in the log. Run it longer in CI's Repeat workflow ("CI environment" above).
+
+| Test | What it sends |
+|---|---|
+| `tcp_survives_hostile_traffic` | random bytes, immediate close, connecting without sending, sending slowly, one huge write |
+| `tls_survives_hostile_traffic` | broken, truncated and fragmented ClientHellos and bad SNI to sni, terminate and terminate with passthrough routes |
+| `http_survives_hostile_traffic` | invalid methods, no Host, oversized and too many headers, broken chunked, Content-Length / Transfer-Encoding conflicts (a request sent behind must not reach the backend), headers with CR / LF, pipelined garbage, HTTP/2 preface garbage |
+| `starttls_survives_hostile_traffic` | garbage before or instead of STARTTLS on smtp, imap and pop3, commands slipped in before TLS (they must not reach the mail server) |
+| `udp_survives_hostile_traffic` | random and oversized datagrams, many source ports, garbage posing as DTLS or QUIC, to plain, QUIC and DTLS sni and DTLS terminate rules |
+
+PROXY protocol is out of scope: rproxy only sends it. A case sending broken DTLS ClientHellos is not in yet (#287).
+
 ## Integration tests: abnormal termination (`tests/crash.rs`)
 
 The real binary is stopped with SIGKILL (as by the OOM killer or `kill -9`) and started again on the same files (as systemd or the launcher restarts it). Kill times are random; each test runs `RPROXY_TEST_CRASH_ROUNDS` rounds (default 3). Many more rounds: the manual Crash workflow (`gh workflow run crash.yml -f rounds=50`). The process runs in a process group of its own, so a handoff's new process is stopped with it (as with systemd's `KillMode=control-group` or the end of a container).

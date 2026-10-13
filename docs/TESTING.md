@@ -323,6 +323,20 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_trial_killed_three_times_is_bad` | 試している版が SIGKILL で止まる：コンテナごと（起動役も）と、サーバだけ（コンテナのメモリの上限の OOM killer はいちばん大きいサーバを選ぶ）。どちらも `update.interrupted` で数え（サーバだけのときは起動役がその場で起動し直す）、3 回目で悪い版にしてイメージの版を起動する（セキュリティレビュー M1） |
 | `signatures_of_the_minisign_tool_verify` | minisign の道具で作った鍵と署名（既定の事前ハッシュの形と古い形）を確かめられる |
 
+## 結合テスト：壊れたもの・攻撃的なものを流す（`tests/hostile.rs`）
+
+本物のバイナリを自分のプロセスグループで起動し、不正な入力を送る 16 本と正規のクライアント 2 本を同時に動かす（1 回 `RPROXY_TEST_HOSTILE_SECS` 秒、既定 2。2 回繰り返す）。乱数のシードを表示し、`RPROXY_TEST_HOSTILE_SEED` で同じ入力を再現でき、`RPROXY_TEST_HOSTILE_ONLY=名前,…` で入力の種類を絞れる。毎回確かめること：正規のやり取りがバイト単位で一致する、プロセスが生きていて `GET /rules` が答えすべてのルールが running、負荷を止めた後に接続数が 0 に戻り `/proc/<pid>/fd` の数とスレッドの数が基準から余裕の範囲に戻る、RSS が回を重ねても増え続けない、ログに panicked・fatal・`rule.failed` がない。長く回すときは CI の Repeat ワークフローで（上の「CI の実行環境」）。
+
+| テスト | 流すもの |
+|---|---|
+| `tcp_survives_hostile_traffic` | でたらめなバイト列、すぐ閉じる、つなぐだけで送らない、ゆっくり送る、大きな 1 回の書き込み |
+| `tls_survives_hostile_traffic` | sni・terminate・passthrough の route 付きの terminate に、壊れた・途中で切れた・細切れの ClientHello、不正な SNI |
+| `http_survives_hostile_traffic` | 不正なメソッド・Host なし・大きすぎる・多すぎるヘッダ・壊れた chunked、Content-Length と Transfer-Encoding の食い違い（後ろに続けた要求が転送先に届かないこと）、CR / LF を混ぜたヘッダ、続けて送るゴミ、HTTP/2 の前置きのゴミ |
+| `starttls_survives_hostile_traffic` | smtp・imap・pop3 に、STARTTLS の前・代わりのゴミ、TLS の前に混ぜたコマンド（メールサーバに届かないこと） |
+| `udp_survives_hostile_traffic` | 平文・QUIC と DTLS の sni・DTLS の terminate に、でたらめな・大きすぎるデータグラム、多くの送信元ポートから、DTLS・QUIC のふりをしたゴミ |
+
+PROXY protocol は rproxy が送るだけで受け取らないので対象外。壊れた DTLS の ClientHello を送るケースはまだ入れていない（#287）。
+
 ## 結合テスト：異常終了（`tests/crash.rs`）
 
 本物のバイナリを SIGKILL（OOM killer・`kill -9` と同じ）で止め、同じファイルで起動し直す（systemd・起動役の再起動と同じ）。kill の時刻はでたらめに変え、各試験を `RPROXY_TEST_CRASH_ROUNDS` 回（既定 3）繰り返す。多く回すのは手動の Crash ワークフロー（`gh workflow run crash.yml -f rounds=50`）。プロセスは自分のプロセスグループで動かし、引き継ぎの新しいプロセスもまとめて止める（systemd の `KillMode=control-group`・コンテナの終わりと同じ）。
