@@ -1,0 +1,63 @@
+name: Repeat
+
+# Runs one integration test target (or test filter) many times in a row, to find or rule out a flaky test
+# without spending the developer's machine on it, e.g.
+#   gh workflow run repeat.yml -f test=udp_sni -f times=100
+#   gh workflow run repeat.yml --ref <branch> -f test=udp_sni -f filter=quic_client_hello -f times=200
+# Needs no database: tests that need MariaDB, Pebble or PowerDNS skip themselves here. Fails on the first
+# failing run and prints its output (and how many runs passed before it).
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "integration test target (a file in tests/, without .rs), or lib for the unit tests"
+        required: true
+      filter:
+        description: "test name filter (cargo test <filter>); empty: every test of the target"
+        required: false
+        default: ""
+      times:
+        description: "how many runs"
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: repeat ${{ inputs.test }} ${{ inputs.filter }} × ${{ inputs.times }}
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    timeout-minutes: 240
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        shell: bash
+        env:
+          TEST: ${{ inputs.test }}
+        run: |
+          if [ "$TEST" = lib ]; then cargo test --locked --lib --no-run; else cargo test --locked --test "$TEST" --no-run; fi
+      - name: run
+        shell: bash
+        env:
+          TEST: ${{ inputs.test }}
+          FILTER: ${{ inputs.filter }}
+          TIMES: ${{ inputs.times }}
+        run: |
+          case "$TIMES" in ''|*[!0-9]*) echo "times must be a number"; exit 1;; esac
+          target=(--test "$TEST")
+          [ "$TEST" = lib ] && target=(--lib)
+          for i in $(seq "$TIMES"); do
+            if ! out=$(cargo test --locked -q "${target[@]}" ${FILTER:+"$FILTER"} 2>&1); then
+              echo "$out"
+              echo "::error::run $i of $TIMES failed ($((i - 1)) passed before it)"
+              echo "## $TEST ${FILTER}: run $i of $TIMES failed ($((i - 1)) passed before it)" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          echo "## $TEST ${FILTER}: $TIMES of $TIMES runs passed" | tee -a "$GITHUB_STEP_SUMMARY"

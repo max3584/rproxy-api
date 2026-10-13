@@ -32,6 +32,8 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。
 
+時々落ちる試験を探す・直ったことを確かめるときは、手元で何十回も回さず、手動の Repeat ワークフローで 1 つの試験を続けて回す（`gh workflow run repeat.yml -f test=udp_sni -f times=100`、`--ref <ブランチ>`・`-f filter=<試験の名前>` も）。最初に落ちた回で止まり、その出力と、それまでに通った回数を出す。DB・Pebble・PowerDNS は用意しない（それが要る試験は自分で飛ばす）。
+
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
 SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`token.expiring` / `token.expired`（`tests/api_hardening.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。

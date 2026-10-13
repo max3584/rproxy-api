@@ -32,6 +32,8 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 
 Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc targets; see "Fuzzing" below).
 
+To find a flaky test or check that it is fixed, run it many times in the manual Repeat workflow instead of on a developer's machine (`gh workflow run repeat.yml -f test=udp_sni -f times=100`, also `--ref <branch>` and `-f filter=<test name>`). It stops at the first failing run and prints its output and how many runs passed before it. No database, Pebble or PowerDNS is set up (tests that need them skip themselves).
+
 Integration tests open real sockets on loopback. The control API, the echo server used as the target, and the clients are all real; only name resolution is replaced (`tests/common/mod.rs`).
 
 Log lines that SIEMs and CrowdSec read are collected inside the test process in the same JSON form as the binary writes and checked (`tests/common/logs.rs`: `logs::capture()`, then `logs::wait_for` picking the test's own lines by rule or path): UDP `conn.denied` and its thinning out (`tests/access.rs`), `conn.denied` of the L4 `crowdsec` and `refused_by` in `http.access` (`tests/crowdsec.rs`), 401 / 403 and change `audit` lines of the control API (`tests/api.rs`), `token.expiring` / `token.expired` (`tests/api_hardening.rs`), `refused_by`, `user` and `auth_error` in `http.access` (`tests/http.rs`, `tests/http_auth.rs`).

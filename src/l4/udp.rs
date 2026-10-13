@@ -450,7 +450,9 @@ fn renamed(probe: &mut Option<Probe>, quic_dcid: &mut Option<Vec<u8>>, name: Opt
 	use crate::tls::udp_sni::Sniff;
 	if probe.is_none() {
 		match crate::tls::udp_sni::quic::initial_dcid(&data) {
-			Some(dcid) if quic_dcid.as_deref() != Some(dcid.as_slice()) => {
+			// a new connection's first flight; not a later Initial of this one with the server's connection ID,
+			// which would be held until SNI_WAIT and stall the handshake
+			Some(dcid) if quic_dcid.as_deref() != Some(dcid.as_slice()) && crate::tls::udp_sni::quic::opens_with_own_id(&data) => {
 				*probe = Some(Probe {
 					dcid,
 					sniffer: crate::tls::udp_sni::Sniffer::default(),
