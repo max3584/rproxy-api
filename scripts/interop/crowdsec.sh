@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 実際の CrowdSec（LAPI・エージェント・AppSec）を動かし、rproxy のログから検知 → ban → rproxy で止める、
-# までを一周確かめる（issue #129）。CI の CrowdSec の公式のイメージ（crowdsecurity/crowdsec、Alpine）のコンテナ用
+# までを一周確かめる（issue #129）。外部の解析ツール（Suricata）のアラートから ban → rproxy の L4 で切る、も確かめる。CI の CrowdSec の公式のイメージ（crowdsecurity/crowdsec、Alpine）のコンテナ用
 # （特権つき、root で動かす。ネットワーク名前空間を作る。足りないものはワークフローが apk で入れる：bash coreutils curl
-# python3 iproute2）。systemd はないので、CrowdSec はこのスクリプトが設定して起動する。
+# python3 iproute2 suricata）。systemd はないので、CrowdSec はこのスクリプトが設定して起動する。
 #
 #   cargo build && scripts/interop/crowdsec.sh
 #
@@ -26,6 +26,7 @@ GLOBAL_A=192.0.2.10      # HTTP probing -> banned
 GLOBAL_B=198.51.100.10   # does nothing wrong -> always let through
 GLOBAL_C=203.0.113.10    # AppSec
 GLOBAL_F=192.0.2.20      # L4: refused by allow_from repeatedly -> banned
+GLOBAL_S=192.0.2.30      # sends what the Suricata test rule looks for -> banned from Suricata's alert
 GLOBAL_V6=2001:db8::10   # HTTP probing over IPv6 -> banned
 PRIVATE=10.99.0.10       # the same probing from a private address -> whitelisted by CrowdSec
 HOST4=192.0.2.1
@@ -36,6 +37,8 @@ dump() {
 	tail -n 80 "$WORK"/logs/*.log >&2 || true
 	echo "---- crowdsec" >&2
 	tail -n 80 /var/log/crowdsec.log /var/log/crowdsec.out >&2 || true
+	echo "---- suricata" >&2
+	tail -n 40 "$WORK"/suricata/suricata.log "$WORK"/suricata/eve.json >&2 || true
 	cscli alerts list >&2 || true
 	cscli decisions list >&2 || true
 	cscli metrics show acquisition parsers scenarios >&2 || true
@@ -73,7 +76,7 @@ sed -i 's/^\(  *log_media:\).*/\1 file/' /etc/crowdsec/config.yaml
 cscli machines add localhost --auto --force >/dev/null
 cscli hub update >/dev/null
 cscli collections install crowdsecurity/base-http-scenarios crowdsecurity/http-cve \
-	crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules >/dev/null
+	crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules crowdsecurity/suricata >/dev/null
 cscli parsers install crowdsecurity/http-logs crowdsecurity/whitelists >/dev/null 2>&1 || true
 install -m 644 "$ROOT/contrib/crowdsec/parsers/s01-parse/rproxy-logs.yaml" /etc/crowdsec/parsers/s01-parse/
 install -m 644 "$ROOT"/contrib/crowdsec/scenarios/*.yaml /etc/crowdsec/scenarios/
@@ -81,6 +84,13 @@ mkdir -p /etc/crowdsec/acquis.d
 install -m 644 "$ROOT/contrib/crowdsec/acquis.d/appsec.yaml" /etc/crowdsec/acquis.d/appsec.yaml
 sed "s#/var/log/rproxy/\*\.log#$WORK/logs/*.log#" "$ROOT/contrib/crowdsec/acquis.d/rproxy.yaml" \
 	> /etc/crowdsec/acquis.d/rproxy.yaml
+mkdir -p "$WORK/suricata"
+cat > /etc/crowdsec/acquis.d/suricata.yaml <<EOF
+filenames:
+  - $WORK/suricata/eve.json
+labels:
+  type: suricata-evelogs
+EOF
 cscli version 2>&1 | head -3
 start_crowdsec
 
@@ -101,12 +111,24 @@ ip link set rpcs-cli netns "$NS"
 for a in "$HOST4/24" 198.51.100.1/24 203.0.113.1/24 10.99.0.1/24; do ip addr add "$a" dev rpcs-host; done
 ip -6 addr add "$HOST6/64" dev rpcs-host nodad
 ip link set rpcs-host up
-for a in "$GLOBAL_A/24" "$GLOBAL_F/24" "$GLOBAL_B/24" "$GLOBAL_C/24" "$PRIVATE/24"; do
+for a in "$GLOBAL_A/24" "$GLOBAL_F/24" "$GLOBAL_S/24" "$GLOBAL_B/24" "$GLOBAL_C/24" "$PRIVATE/24"; do
 	ip netns exec "$NS" ip addr add "$a" dev rpcs-cli
 done
 ip netns exec "$NS" ip -6 addr add "$GLOBAL_V6/64" dev rpcs-cli nodad
 ip netns exec "$NS" ip link set rpcs-cli up
 ip netns exec "$NS" ip link set lo up
+
+echo "== Suricata on the host side of the veth (IDS: it only looks)"
+# a test rule that matches a harmless marker, at priority 1 (crowdsecurity/suricata-major-severity bans on one alert)
+cat > "$WORK/suricata/rproxy-test.rules" <<'EOF'
+alert tcp any any -> any 8089 (msg:"rproxy interop test marker"; flow:to_server,established; content:"RPROXY-IDS-TEST-MARKER"; classtype:misc-attack; priority:1; sid:9000001; rev:1;)
+EOF
+# -k none: the veth leaves checksums to offload, which Suricata would take as bad packets
+suricata -i rpcs-host -k none -S "$WORK/suricata/rproxy-test.rules" -l "$WORK/suricata" > "$WORK/suricata/suricata.out" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 60); do grep -qi 'engine started' "$WORK/suricata/suricata.log" 2>/dev/null && break; sleep 1; done
+grep -qi 'engine started' "$WORK/suricata/suricata.log" 2>/dev/null || fail "Suricata did not start: $(tail -n 20 "$WORK/suricata/suricata.out")"
+suricata -V
 
 echo "== backend and rproxy"
 mkdir -p "$WORK/www" "$WORK/logs"
@@ -226,6 +248,17 @@ wait_banned "$GLOBAL_F"
 wait_code "$GLOBAL_F" "http://$HOST4:8089/" 000
 [ "$(req "$GLOBAL_B" "http://$HOST4:8089/")" = 200 ] || fail "$GLOBAL_B was cut by the L4 rule too"
 echo "banned and cut before relaying: $GLOBAL_F"
+
+echo "== external analysis: $GLOBAL_S trips the Suricata rule -> banned from the alert -> cut by the crowdsec: true rule"
+[ "$(req "$GLOBAL_S" "http://$HOST4:8089/")" = 200 ] || fail "$GLOBAL_S could not reach the L4 rule"
+req "$GLOBAL_S" "http://$HOST4:8089/" -H 'X-Test: RPROXY-IDS-TEST-MARKER' >/dev/null
+for _ in $(seq 30); do grep -q '"signature_id":9000001' "$WORK/suricata/eve.json" 2>/dev/null && break; sleep 1; done
+grep -q '"signature_id":9000001' "$WORK/suricata/eve.json" 2>/dev/null || fail "Suricata raised no alert for the marker"
+wait_banned "$GLOBAL_S"
+cscli decisions list -i "$GLOBAL_S" -o json | grep -q 'suricata' || fail "$GLOBAL_S was banned, but not by a Suricata scenario"
+wait_code "$GLOBAL_S" "http://$HOST4:8089/" 000
+[ "$(req "$GLOBAL_B" "http://$HOST4:8089/")" = 200 ] || fail "$GLOBAL_B was cut by the L4 rule too"
+echo "banned from Suricata's alert and cut before relaying: $GLOBAL_S"
 
 echo "== AppSec: $GLOBAL_C"
 [ "$(req "$GLOBAL_C" "$SITE4/" -H 'Host: appsec.test')" = 200 ] || fail "a normal request through AppSec was refused"

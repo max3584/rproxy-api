@@ -7,7 +7,7 @@ rproxy integrates with CrowdSec in two directions.
 | Direction | What it does | Configuration |
 |---|---|---|
 | Block (bouncer) | Blocks IPs that are in the LAPI decisions (ban). For L7, the `crowdsec` middleware (403, AppSec as well); for L4, `crowdsec: true` on the rule (cut before TLS) | rproxy's `global.crowdsec` (docs/API.md) |
-| Detect (logs) | The CrowdSec agent reads rproxy's logs, detects attacks, and bans them | The parsers, scenarios, and acquis on this page |
+| Detect (logs) | The CrowdSec agent reads rproxy's logs (and, if present, the alerts of an IDS such as Suricata), detects attacks, and bans them | The parsers, scenarios, and acquis on this page |
 
 With both in place, the loop "CrowdSec detects from traffic passing through rproxy and bans → rproxy blocks that IP" is closed. CI (`scripts/interop/crowdsec.sh`, the `crowdsec` job in interop) verifies this loop with a real CrowdSec.
 
@@ -114,15 +114,45 @@ What should never get in by country or ASN can be dropped by rproxy's `geoip` (a
 
 CrowdSec can add the country itself with `crowdsecurity/geoip-enrich` (using the same GeoLite2). rproxy's `global.geoip.log_country: true` adds `country` and `asn` to `conn.open` and `http.access`, for reading rproxy's logs without CrowdSec, e.g. in a SIEM. Both can use the same database files updated by `geoipupdate` (rproxy reads a changed file again every `check_interval`).
 
+### Pairing with an external analyzer (Suricata)
+
+rproxy relays L4 rules without looking into their contents. Finding attacks in the traffic itself can be left to an external IDS, with CrowdSec collecting its results and rproxy doing the blocking.
+
+```
+client ──▶ rproxy (crowdsec: true) ──▶ backend
+   │
+   └─(the same NIC, watched passively)─▶ Suricata ─ eve.json ─▶ CrowdSec ─ ban ─▶ rproxy
+```
+
+- Run Suricata as an IDS (passive), on the NIC of the machine running rproxy (`af-packet`) or behind a switch mirror port or TAP. It is not in the traffic path, so traffic keeps flowing if Suricata stops.
+- Install Suricata's parser and scenarios in CrowdSec and have it read `eve.json`:
+
+  ```bash
+  sudo cscli collections install crowdsecurity/suricata
+  sudo tee /etc/crowdsec/acquis.d/suricata.yaml >/dev/null <<'EOF'
+  filenames:
+    - /var/log/suricata/eve.json
+  labels:
+    type: suricata-evelogs
+  EOF
+  sudo systemctl restart crowdsec
+  ```
+
+  `crowdsecurity/suricata-major-severity` bans on a single TCP alert of severity 1; `crowdsecurity/suricata-high-medium-severity` bans when severity 2 alerts with 3 different signatures come within about 20 seconds.
+- On the rproxy side it is the same as section 3 (`crowdsec: true` on L4 rules, the `crowdsec` middleware on L7). Bans are picked up every `update_interval`, and new connections (new sessions for UDP) from that IP are refused.
+- On `tls.mode: terminate` rules Suricata cannot see the encrypted contents (only up to the ClientHello). Inspect those with rproxy's L7 AppSec (`crowdsec: {appsec: true}`). To copy HTTP requests to an analyzer, the route's `mirror` middleware can be used as well.
+- Other IDSes connect the same way, given a parser and scenarios for them on the CrowdSec hub.
+
 ## 4. How CI verifies it
 
-`scripts/interop/crowdsec.sh` installs CrowdSec (LAPI, agent, AppSec) from the official packages on a GitHub Ubuntu runner and, from clients in network namespaces going through rproxy, verifies the following:
+`scripts/interop/crowdsec.sh` runs CrowdSec (LAPI, agent, AppSec) and Suricata in a container of CrowdSec's official image (`crowdsecurity/crowdsec`, Alpine) and, from clients in network namespaces going through rproxy, verifies the following:
 
 1. `cscli explain`: the parser reads all 7 lines of the sample log (`scripts/interop/crowdsec-samples.log`); the HTTP lines reach `crowdsecurity/http-logs` and the scenarios (`http-sensitive-files`, `http-probing`, etc.), and the L4 lines reach `max3584/rproxy-conn-denied` and `max3584/rproxy-conn-limited`
 2. Detection: a global client probes nonexistent paths → CrowdSec detects it from rproxy's logs and bans it → that client is blocked by rproxy with 403, while other clients pass (IPv4 and IPv6)
 3. L4: a client that repeatedly makes connections refused by `allow_from` is banned by `max3584/rproxy-conn-denied`, and its connections are cut by an L4 rule with `crowdsec: true`
-4. AppSec: `GET /.env` (`crowdsecurity/vpatch-env-access`) is blocked with 403, while normal requests pass
-5. After removing the ban with `cscli decisions delete`, the client passes again
-6. A client with a private address (10.99.0.10) is not banned even when it performs the same probing
+4. External analysis: Suricata runs passively on the host side of the veth with a test rule (priority 1) that matches a harmless marker string. The client that sends the marker is banned by `crowdsecurity/suricata-major-severity` and its connections are cut by an L4 rule with `crowdsec: true`, while other clients pass
+5. AppSec: `GET /.env` (`crowdsecurity/vpatch-env-access`) is blocked with 403, while normal requests pass
+6. After removing the ban with `cscli decisions delete`, the client passes again
+7. A client with a private address (10.99.0.10) is not banned even when it performs the same probing
 
 Documentation addresses are used for the clients' "global" addresses: RFC 5737 (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) for IPv4 and RFC 3849 (2001:db8::/32) for IPv6. They have no routes on the internet, so they are safe inside a namespace, and they are not in CrowdSec's default whitelist (`crowdsecurity/whitelists`: RFC 1918, loopback, etc.). CrowdSec does not ban private addresses, so tests from `127.0.0.1` trigger neither detection nor bans.
