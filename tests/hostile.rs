@@ -1596,7 +1596,7 @@ async fn udp_survives_hostile_traffic() {
 	};
 
 	let initials = Arc::new(vec![captured_quic_initial(&pki, "q.test").await, captured_quic_initial(&pki, "x.test").await]);
-	let hellos = Arc::new(vec![captured_dtls_hello(&pki, "d.test").await]);
+	let hellos = Arc::new(vec![captured_dtls_hello(&pki, "d.test").await, captured_dtls_hello(&pki, "t.test").await]);
 	let ports = Arc::new([plain, sni, term]);
 	let mut hostile: Vec<(&'static str, Job)> = vec![];
 	macro_rules! attack {
@@ -1653,6 +1653,17 @@ async fn udp_survives_hostile_traffic() {
 			1 => mutate(initial, &mut r),
 			// the same Initial again and again (replayed)
 			_ => initial,
+		};
+		let n = r.range(1, 20);
+		burst(port, vec![d; n], &mut r).await
+	});
+	attack!("dtls_hello_mutated", |r, port, _i, hellos| {
+		let hello = r.pick(&hellos[..]).clone();
+		let d = match r.range(0, 3) {
+			0 => hello[..r.range(1, hello.len())].to_vec(),
+			1 => mutate(hello, &mut r),
+			// the same ClientHello again and again (replayed)
+			_ => hello,
 		};
 		let n = r.range(1, 20);
 		burst(port, vec![d; n], &mut r).await
