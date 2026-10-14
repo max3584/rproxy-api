@@ -266,7 +266,9 @@ impl Server {
 	/// No panic, no fatal error, no rule failed.
 	fn check_log(&self, case: &str) {
 		let log = fs::read_to_string(self.dir.join("rproxy.log")).unwrap_or_default();
-		assert!(!log.contains("panicked"), "{case}: rproxy panicked\n{}", self.log());
+		// the panic itself, which the tail of the log may have left behind
+		let panics: Vec<&str> = log.lines().filter(|l| l.contains("panicked") || l.contains("\"panic\"")).take(5).collect();
+		assert!(panics.is_empty(), "{case}: rproxy panicked:\n{}\n{}", panics.join("\n"), self.log());
 		for line in log.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
 			assert!(!["fatal", "rule.failed"].contains(&line["event"].as_str().unwrap_or("")), "{case}: {line}");
 		}
@@ -1596,7 +1598,7 @@ async fn udp_survives_hostile_traffic() {
 	};
 
 	let initials = Arc::new(vec![captured_quic_initial(&pki, "q.test").await, captured_quic_initial(&pki, "x.test").await]);
-	let hellos = Arc::new(vec![captured_dtls_hello(&pki, "d.test").await]);
+	let hellos = Arc::new(vec![captured_dtls_hello(&pki, "d.test").await, captured_dtls_hello(&pki, "t.test").await]);
 	let ports = Arc::new([plain, sni, term]);
 	let mut hostile: Vec<(&'static str, Job)> = vec![];
 	macro_rules! attack {
@@ -1653,6 +1655,17 @@ async fn udp_survives_hostile_traffic() {
 			1 => mutate(initial, &mut r),
 			// the same Initial again and again (replayed)
 			_ => initial,
+		};
+		let n = r.range(1, 20);
+		burst(port, vec![d; n], &mut r).await
+	});
+	attack!("dtls_hello_mutated", |r, port, _i, hellos| {
+		let hello = r.pick(&hellos[..]).clone();
+		let d = match r.range(0, 3) {
+			0 => hello[..r.range(1, hello.len())].to_vec(),
+			1 => mutate(hello, &mut r),
+			// the same ClientHello again and again (replayed)
+			_ => hello,
 		};
 		let n = r.range(1, 20);
 		burst(port, vec![d; n], &mut r).await

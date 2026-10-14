@@ -333,9 +333,9 @@ Runs the real binary in its own process group with 16 hostile senders and 2 legi
 | `tls_survives_hostile_traffic` | broken, truncated and fragmented ClientHellos and bad SNI to sni, terminate and terminate with passthrough routes |
 | `http_survives_hostile_traffic` | invalid methods, no Host, oversized and too many headers, broken chunked, Content-Length / Transfer-Encoding conflicts (a request sent behind must not reach the backend), headers with CR / LF, pipelined garbage, HTTP/2 preface garbage |
 | `starttls_survives_hostile_traffic` | garbage before or instead of STARTTLS on smtp, imap and pop3, commands slipped in before TLS (they must not reach the mail server) |
-| `udp_survives_hostile_traffic` | random and oversized datagrams, many source ports, garbage posing as DTLS or QUIC, to plain, QUIC and DTLS sni and DTLS terminate rules |
+| `udp_survives_hostile_traffic` | random and oversized datagrams, many source ports, garbage posing as DTLS or QUIC, truncated, mutated and replayed QUIC Initials and DTLS ClientHellos, to plain, QUIC and DTLS sni and DTLS terminate rules |
 
-PROXY protocol is out of scope: rproxy only sends it. A case sending broken DTLS ClientHellos is not in yet (#287).
+PROXY protocol is out of scope: rproxy only sends it.
 
 ## Integration tests: abnormal termination (`tests/crash.rs`)
 

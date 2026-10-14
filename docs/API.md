@@ -213,6 +213,8 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
 
 `tls.client_auth.mode: optional_no_verify` は、クライアント証明書を求めるが、送られなくても、検証に通らなくても接続を受ける（Gateway API の `AllowInsecureFallback`）。`tcp` の `terminate`（`http` のルールと HTTP/3 を含む）と `udp` の DTLS の終端で使える。`GET /capabilities` の `features.client_auth_modes` に `optional_no_verify` があれば使える。
 
+`udp` の DTLS の終端は、ClientHello を断片に分けずに 1 つのレコードで送るクライアントを受ける（v0.4.11 から）。断片に分かれた ClientHello と、拡張の欄が途中で切れた ClientHello は捨てる（`debug` の `udp.drop`）。rproxy が使う DTLS のライブラリ（`dtls` 0.17.2）は、拡張が途中で切れた ClientHello を読むとそのセッションの処理が panic で止まるため（#287）。DTLS 1.2 の ClientHello はふつう 1 つのデータグラムに収まる。名前で振り分ける `sni` は rproxy の自前の読み取りなので、断片に分かれていても扱える。
+
 ```json
 "client_auth": {"mode": "optional_no_verify", "ca_file": "/etc/rproxy/clients-root.pem"}
 ```

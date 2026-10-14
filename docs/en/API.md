@@ -213,6 +213,8 @@ When a UDP rule listens on `0.0.0.0` / `::`, rproxy remembers the destination ad
 
 `tls.client_auth.mode: optional_no_verify` asks for a client certificate but accepts the connection without one, or with one that does not verify (the Gateway API's `AllowInsecureFallback`). It works for `tcp` `terminate` (`http` rules and HTTP/3 included) and DTLS termination on `udp`. Available when `features.client_auth_modes` of `GET /capabilities` lists `optional_no_verify`.
 
+DTLS termination on `udp` accepts clients that send their ClientHello whole, in one record (from v0.4.11). A fragmented ClientHello, or one whose extensions are cut short, is dropped (`udp.drop` at `debug`): the DTLS library rproxy uses (`dtls` 0.17.2) panics in that session when it reads a ClientHello with truncated extensions (#287). A DTLS 1.2 ClientHello normally fits in one datagram. `sni` routing reads names with rproxy's own parser, so it still handles fragmented ClientHellos.
+
 ```json
 "client_auth": {"mode": "optional_no_verify", "ca_file": "/etc/rproxy/clients-root.pem"}
 ```

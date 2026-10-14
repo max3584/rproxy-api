@@ -333,9 +333,9 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `tls_survives_hostile_traffic` | sni・terminate・passthrough の route 付きの terminate に、壊れた・途中で切れた・細切れの ClientHello、不正な SNI |
 | `http_survives_hostile_traffic` | 不正なメソッド・Host なし・大きすぎる・多すぎるヘッダ・壊れた chunked、Content-Length と Transfer-Encoding の食い違い（後ろに続けた要求が転送先に届かないこと）、CR / LF を混ぜたヘッダ、続けて送るゴミ、HTTP/2 の前置きのゴミ |
 | `starttls_survives_hostile_traffic` | smtp・imap・pop3 に、STARTTLS の前・代わりのゴミ、TLS の前に混ぜたコマンド（メールサーバに届かないこと） |
-| `udp_survives_hostile_traffic` | 平文・QUIC と DTLS の sni・DTLS の terminate に、でたらめな・大きすぎるデータグラム、多くの送信元ポートから、DTLS・QUIC のふりをしたゴミ |
+| `udp_survives_hostile_traffic` | 平文・QUIC と DTLS の sni・DTLS の terminate に、でたらめな・大きすぎるデータグラム、多くの送信元ポートから、DTLS・QUIC のふりをしたゴミ、途中で切れた・壊れた・繰り返し送る QUIC の Initial と DTLS の ClientHello |
 
-PROXY protocol は rproxy が送るだけで受け取らないので対象外。壊れた DTLS の ClientHello を送るケースはまだ入れていない（#287）。
+PROXY protocol は rproxy が送るだけで受け取らないので対象外。
 
 ## 結合テスト：異常終了（`tests/crash.rs`）
 
