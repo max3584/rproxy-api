@@ -581,6 +581,26 @@ Description: L4 TCP/UDP forwarder managed through an HTTP API
 
 Package: rproxy-api
 Architecture: arm64
+Version: 0.4.11-1
+Priority: optional
+Section: net
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 27647
+Depends: passwd
+Filename: pool/main/r/rproxy-api/rproxy-api_0.4.11-1_arm64.deb
+Size: 7734044
+MD5sum: 04b6c7e23def5f0f8cd30ffd17e1356a
+SHA1: cd7fbf5a6b0858d444675647b607a39aad8c45e9
+SHA256: 063046e90a88432e6b506d57558911e726e45c0d1ca7372b7b03187d5f9303b5
+SHA512: 34221c0244436a6638f06e378ef9d87cae29c85a8ae4f512a69712ba029d48e75cc3a6f3248167c01204c029f9b0feefb44640b451c4b76b93f3298232b7fc49
+Homepage: https://github.com/max3584/rproxy-api
+Description: L4 TCP/UDP forwarder managed through an HTTP API
+ Layer 4 TCP/UDP forwarder whose rules are added, changed and removed at run
+ time through an HTTP API. Supports TLS SNI routing and termination, mTLS, DTLS
+ termination, STARTTLS for SMTP/IMAP/POP3, port ranges and PROXY protocol.
+
+Package: rproxy-api
+Architecture: arm64
 Version: 0.4.2-1
 Priority: optional
 Section: net
