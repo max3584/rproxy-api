@@ -266,7 +266,9 @@ impl Server {
 	/// No panic, no fatal error, no rule failed.
 	fn check_log(&self, case: &str) {
 		let log = fs::read_to_string(self.dir.join("rproxy.log")).unwrap_or_default();
-		assert!(!log.contains("panicked"), "{case}: rproxy panicked\n{}", self.log());
+		// the panic itself, which the tail of the log may have left behind
+		let panics: Vec<&str> = log.lines().filter(|l| l.contains("panicked") || l.contains("\"panic\"")).take(5).collect();
+		assert!(panics.is_empty(), "{case}: rproxy panicked:\n{}\n{}", panics.join("\n"), self.log());
 		for line in log.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
 			assert!(!["fatal", "rule.failed"].contains(&line["event"].as_str().unwrap_or("")), "{case}: {line}");
 		}
