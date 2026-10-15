@@ -41,6 +41,8 @@ pub struct Ctx {
 	pub host: String,
 	/// `Origin` of the request as received (CORS).
 	pub origin: Option<HeaderValue>,
+	/// The request carries credentials (`Cookie` or `Authorization`; CORS).
+	pub credentials: bool,
 	/// Places taken by `in_flight`; kept until the response has been sent.
 	pub holds: Mutex<Vec<Hold>>,
 }
@@ -465,7 +467,7 @@ impl Middleware {
 	/// Runs the response side (also on answers of later middlewares).
 	pub fn on_response(&self, headers: &mut HeaderMap, ctx: &Ctx) {
 		if let Middleware::Cors(c) = self {
-			c.on_response(headers, ctx.origin.as_ref());
+			c.on_response(headers, ctx.origin.as_ref(), ctx.credentials);
 			return;
 		}
 		let Middleware::Headers(h) = self else { return };
@@ -720,7 +722,7 @@ mod tests {
 	}
 
 	fn ctx(https: bool) -> Ctx {
-		Ctx { client: "10.0.0.5".parse().unwrap(), https, host: "a.example".into(), origin: None, holds: Default::default() }
+		Ctx { client: "10.0.0.5".parse().unwrap(), https, host: "a.example".into(), origin: None, credentials: false, holds: Default::default() }
 	}
 
 	fn location(r: &Response<Body>) -> &str {

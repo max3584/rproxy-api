@@ -674,6 +674,7 @@ impl Conn {
 			https: self.https,
 			host: host.clone(),
 			origin: req.headers().get(header::ORIGIN).cloned(),
+			credentials: req.headers().contains_key(header::COOKIE) || req.headers().contains_key(header::AUTHORIZATION),
 			holds: Default::default(),
 		};
 		let mut sent = Sent {
