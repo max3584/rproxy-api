@@ -1,6 +1,6 @@
 name: Interop
 
-# 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX、CrowdSec）を rproxy と組み合わせて通す（scripts/interop/）。
+# 実際のサーバ（Postfix / Dovecot、coturn、MediaMTX、CrowdSec）とブラウザ（ヘッドレスの Chromium）を rproxy と組み合わせて通す（scripts/interop/）。
 # 時間がかかるので必須のチェックにはしない。データプレーンや試験を変えた PR、毎週、手動で動かす。
 # どれも Alpine のコンテナで動かす（#191）。rproxy は build ジョブで 1 回だけビルドし（musl の静的リンク）、
 # 各ジョブはそのバイナリを使う。CrowdSec は Alpine のパッケージがないので、CrowdSec の公式のイメージ（Alpine）を使う。
@@ -75,6 +75,22 @@ jobs:
           path: target/debug
       - run: chmod +x target/debug/rproxy-api
       - run: scripts/interop/media.sh
+
+  webrtc:
+    name: webrtc (headless Chromium, MediaMTX WHIP/WHEP, TURN relay)
+    needs: build
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash coreutils curl tar iproute2 coturn chromium nodejs
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rproxy-api
+          path: target/debug
+      - run: chmod +x target/debug/rproxy-api
+      - run: scripts/interop/webrtc.sh
 
   crowdsec:
     name: crowdsec (LAPI, AppSec, detection from rproxy logs and Suricata, global IPs)

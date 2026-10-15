@@ -492,12 +492,12 @@ TLS を有効にした制御 API と、SIGHUP によるトークン・証明書�
 |---|---|---|
 | `scripts/interop/mail.sh` | Postfix / Dovecot | STARTTLS の終端 + PROXY v2 で、Submission・SMTP（STARTTLS 任意）・IMAP・IMAPS・POP3 が通る。STARTTLS 前の送信・ログインを拒否する |
 | `scripts/interop/media.sh` | coturn / MediaMTX | TURN の UDP・TCP の素通し、TLS の終端、DTLS の終端で、割り当てと中継ができる（中継アドレスは範囲ルール越し）。RTSP（TCP interleaved）と RTSPS の終端で映像を受け取れる。10000 ポートの UDP の範囲ルールを作って消す時間・ファイル数・メモリ |
-
+| `scripts/interop/webrtc.sh` | ヘッドレスの Chromium / MediaMTX / coturn | ブラウザの WebRTC（WHIP で送り WHEP で受ける。映像は canvas）が、rproxy 越しに映像を受け取れる（#44）。直接：メディアの UDP が範囲ルール（passthrough）を通り、選ばれた候補の相手が rproxy のアドレス。TURN：`iceTransportPolicy: relay` で rproxy 越しの coturn だけでつながる。どちらも 30 フレーム以上をデコードする |
 | `scripts/interop/crowdsec.sh` | CrowdSec（LAPI・エージェント・AppSec） | rproxy のログから CrowdSec が検知して ban し、rproxy（L7 の `crowdsec`・L4 の `crowdsec: true`・AppSec）が止める。文書用アドレスのクライアント（IPv4・IPv6）は ban され、私用アドレスは whitelist で ban されない |
 
 10000 ポートの範囲ルール（UDP）の結果（GitHub の Ubuntu ランナー、2026-09）: 作成 約 0.2 秒、ファイル記述子 +10000（削除で元に戻る）、RSS 約 +94 MiB。
 
-どれも使い捨てのコンテナ（mail・media は `alpine:3.24`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
+どれも使い捨てのコンテナ（mail・media・webrtc は `alpine:3.24`、crowdsec は CrowdSec の公式のイメージ）の中で root で動かし、サーバをスクリプトが設定して起動する。手元の機械では実行しない。
 
 ## 長時間の負荷テスト（Soak ワークフロー）
 

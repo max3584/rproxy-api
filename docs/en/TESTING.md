@@ -492,12 +492,12 @@ The control API with TLS enabled and reloading tokens and certificates via SIGHU
 |---|---|---|
 | `scripts/interop/mail.sh` | Postfix / Dovecot | With STARTTLS termination + PROXY v2, Submission, SMTP (STARTTLS optional), IMAP, IMAPS, and POP3 work. Sending and logging in before STARTTLS are refused |
 | `scripts/interop/media.sh` | coturn / MediaMTX | Allocation and relaying work with TURN UDP and TCP passthrough, TLS termination, and DTLS termination (the relay addresses go through a range rule). Video can be received via RTSP (TCP interleaved) and RTSPS termination. Time, file count, and memory to create and delete a 10000-port UDP range rule |
-
+| `scripts/interop/webrtc.sh` | headless Chromium / MediaMTX / coturn | A browser's WebRTC (published over WHIP, read over WHEP; the video is a canvas) receives video through rproxy (#44). Direct: the media UDP goes through a range rule (passthrough) and the selected candidate's peer is rproxy's address. TURN: with `iceTransportPolicy: relay` it connects only through coturn behind rproxy. Both decode at least 30 frames |
 | `scripts/interop/crowdsec.sh` | CrowdSec (LAPI, agent, AppSec) | CrowdSec detects and bans from rproxy's logs, and rproxy (L7 `crowdsec`, L4 `crowdsec: true`, AppSec) blocks. Clients with documentation addresses (IPv4 and IPv6) are banned; a private address is whitelisted and never banned |
 
 Results for a 10000-port range rule (UDP) (GitHub Ubuntu runner, 2026-09): creation about 0.2 seconds, file descriptors +10000 (back to the original after deletion), RSS about +94 MiB.
 
-They all run as root inside a throwaway container (`alpine:3.24` for mail and media, CrowdSec's official image for crowdsec), and the scripts configure and start the servers themselves. Do not run them on your own machine.
+They all run as root inside a throwaway container (`alpine:3.24` for mail, media and webrtc, CrowdSec's official image for crowdsec), and the scripts configure and start the servers themselves. Do not run them on your own machine.
 
 ## Long-running load test (Soak workflow)
 
