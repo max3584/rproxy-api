@@ -324,6 +324,34 @@ async fn cors_answers_preflights_and_marks_responses() {
 	assert!(!headers.contains_key("access-control-allow-origin"));
 }
 
+/// `allow_origins: ["*"]` without credentials: `*`, except for a request with
+/// credentials, which gets its origin back (Gateway API v1.5's conformance; v1.6
+/// takes either), never with allow-credentials.
+#[tokio::test]
+async fn cors_wildcard_echoes_the_origin_of_requests_with_credentials() {
+	let h = harness().await;
+	let (b, _) = backend("b").await;
+	let port = rule(
+		&h,
+		json!({
+			"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": format!("http://{b}"), "middlewares": ["cors"]}],
+			"middlewares": {"cors": {"cors": {"allow_origins": ["*"], "allow_methods": ["*"], "allow_headers": ["*"], "allow_credentials": false}}},
+		}),
+	)
+	.await;
+	let url = format!("http://127.0.0.1:{port}/unauth");
+	let get = || client().get(&url).header("origin", "https://other.foo.com");
+	let (status, headers, _) = send(get()).await;
+	assert_eq!(status, 200);
+	assert_eq!(headers["access-control-allow-origin"], "*");
+	for (name, value) in [("cookie", "foo=bar"), ("authorization", "Basic dTpw")] {
+		let (_, headers, _) = send(get().header(name, value)).await;
+		assert_eq!(headers["access-control-allow-origin"], "https://other.foo.com", "{name}");
+		assert!(!headers.contains_key("access-control-allow-credentials"), "{name}");
+		assert!(headers.get_all("vary").iter().any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("origin")), "{name}");
+	}
+}
+
 #[tokio::test]
 async fn retry_on_the_statuses_given() {
 	let h = harness().await;

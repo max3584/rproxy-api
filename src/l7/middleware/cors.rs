@@ -84,11 +84,14 @@ impl Cors {
 	}
 
 	/// The `Access-Control-Allow-Origin` for this `Origin`; None when not allowed.
-	fn allow_origin(&self, origin: Option<&HeaderValue>) -> Option<HeaderValue> {
+	/// With `*`, a request with credentials gets its origin back rather than `*`
+	/// (as Gateway API v1.5's conformance expects; v1.6 takes either). Without
+	/// `allow_credentials` the browser still refuses the response to it.
+	fn allow_origin(&self, origin: Option<&HeaderValue>, credentials: bool) -> Option<HeaderValue> {
 		let origin = origin?;
 		let o = origin.to_str().ok()?;
 		if self.any_origin {
-			return Some(if self.spec.allow_credentials { origin.clone() } else { HeaderValue::from_static("*") });
+			return Some(if self.spec.allow_credentials || credentials { origin.clone() } else { HeaderValue::from_static("*") });
 		}
 		self.spec.allow_origins.iter().any(|p| origin_matches(p, o)).then(|| origin.clone())
 	}
@@ -118,7 +121,8 @@ impl Cors {
 		let requested = parts.headers.get(header::ACCESS_CONTROL_REQUEST_METHOD)?;
 		let mut resp = Response::new(Full::new(Bytes::new()).map_err(|never| match never {}).boxed());
 		*resp.status_mut() = StatusCode::NO_CONTENT;
-		let Some(allow) = self.allow_origin(origin) else {
+		// a preflight carries no credentials
+		let Some(allow) = self.allow_origin(origin, false) else {
 			resp.headers_mut().insert(header::VARY, HeaderValue::from_static("Origin"));
 			return Some(resp);
 		};
@@ -149,12 +153,12 @@ impl Cors {
 	}
 
 	/// Other requests from an allowed origin: the CORS headers on the response.
-	pub fn on_response(&self, headers: &mut HeaderMap, origin: Option<&HeaderValue>) {
+	pub fn on_response(&self, headers: &mut HeaderMap, origin: Option<&HeaderValue>, credentials: bool) {
 		// a preflight answered above has them already
 		if headers.contains_key(header::ACCESS_CONTROL_ALLOW_METHODS) && headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
 			return;
 		}
-		if let Some(allow) = self.allow_origin(origin) {
+		if let Some(allow) = self.allow_origin(origin, credentials) {
 			self.common(headers, allow);
 		}
 	}
@@ -227,9 +231,9 @@ mod tests {
 		no_origin.headers.remove("origin");
 		assert!(c.on_request(&no_origin, None).is_none(), "OPTIONS without Origin is not a CORS preflight");
 		let mut resp = HeaderMap::new();
-		c.on_response(&mut resp, Some(&hv("https://foobar.com")));
+		c.on_response(&mut resp, Some(&hv("https://foobar.com")), false);
 		assert!(resp.is_empty());
-		c.on_response(&mut resp, Some(&hv("https://www.foo.com")));
+		c.on_response(&mut resp, Some(&hv("https://www.foo.com")), false);
 		assert_eq!(resp["access-control-allow-origin"], "https://www.foo.com");
 		assert_eq!(resp["vary"], "Origin");
 
@@ -246,9 +250,15 @@ mod tests {
 		assert!(!r.headers().contains_key("access-control-allow-credentials"));
 		let mut resp = HeaderMap::new();
 		resp.insert("access-control-allow-credentials", hv("true"));
-		star(false).on_response(&mut resp, Some(&hv("https://foobar.com:12345")));
+		star(false).on_response(&mut resp, Some(&hv("https://foobar.com:12345")), false);
 		assert_eq!(resp["access-control-allow-origin"], "*");
 		assert!(!resp.contains_key("access-control-allow-credentials"), "the backend's is replaced");
+		// a request with credentials gets its origin back, still without allow-credentials
+		let mut resp = HeaderMap::new();
+		star(false).on_response(&mut resp, Some(&hv("https://other.foo.com")), true);
+		assert_eq!(resp["access-control-allow-origin"], "https://other.foo.com");
+		assert!(!resp.contains_key("access-control-allow-credentials"));
+		assert_eq!(resp["vary"], "Origin");
 	}
 
 	#[test]
