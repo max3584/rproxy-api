@@ -13,8 +13,9 @@
 #   - TURN：受け取る側を iceTransportPolicy: relay にして、rproxy 越しの coturn（127.0.0.1:23478）だけでつなぐ。
 #     coturn の relay のアドレスは 127.0.0.2 として告知し、rproxy の範囲ルールで coturn へ。
 #
-# 確かめること：受け取ったフレームが 30 以上、直接は選ばれた候補の相手が 127.0.0.2:18189（rproxy）、TURN は
-# 自分の候補が relay、rproxy のルールにバイトが流れた。使い捨てのコンテナの外では実行しない。
+# 確かめること：受け取ったフレームが 30 以上、直接は選ばれた候補の相手が 127.0.0.2:18189（rproxy）で範囲ルールに
+# バイトが流れた、TURN は受け取った映像のバイト数以上が rproxy の TURN のルールを（coturn からブラウザへ）通った。
+# 使い捨てのコンテナの外では実行しない。
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -92,8 +93,8 @@ for _ in $(seq 50); do curl -sf http://127.0.0.1:19222/json/version >/dev/null &
 curl -sf http://127.0.0.1:19222/json/version >/dev/null || fail "Chromium did not start"
 
 field() { node -e "const v=JSON.parse(process.argv[1]); console.log(String(process.argv[2].split('.').reduce((o,k)=>o?.[k], v) ?? ''))" "$1" "$2"; }
-stat() { # stat <listen addr> <port> -> the udp rule's rx_bytes
-	field "$(curl -s "$API/rules/udp/$1/$2")" stats.rx_bytes
+stat() { # stat <listen addr> <port> [rx_bytes | tx_bytes] -> that count of the udp rule
+	field "$(curl -s "$API/rules/udp/$1/$2")" "stats.${3:-rx_bytes}"
 }
 page=http://127.0.0.2:28889/
 check() { # check <name> <mode> [turn url] -> JSON of what getStats saw
@@ -113,11 +114,14 @@ echo "range rule 127.0.0.2:18180-18199: rx_bytes $media_before -> $media_after"
 [ "$media_after" -gt "$media_before" ] || fail "direct: no bytes through rproxy's range rule"
 
 echo "== TURN: the reader only through coturn behind rproxy (iceTransportPolicy: relay)"
-turn_before=$(stat 127.0.0.1 23478)
+# with iceTransportPolicy: relay the browser has no other way than TURN; Chromium may still name the
+# selected local candidate prflx (learned from the binding response through the relay), so what
+# counts is that the video it received came down through rproxy's TURN rule
+turn_before=$(stat 127.0.0.1 23478 tx_bytes)
 out=$(check relay relay 'turn:127.0.0.1:23478?transport=udp')
 [ "$(field "$out" framesDecoded)" -ge 30 ] || fail "relay: too few frames decoded: $out"
-[ "$(field "$out" local.type)" = relay ] || fail "relay: the selected candidate is not a relayed one: $out"
-turn_after=$(stat 127.0.0.1 23478)
-echo "TURN rule 127.0.0.1:23478: rx_bytes $turn_before -> $turn_after"
-[ "$turn_after" -gt "$turn_before" ] || fail "relay: no bytes through rproxy's TURN rule"
+received=$(field "$out" bytesReceived)
+turn_after=$(stat 127.0.0.1 23478 tx_bytes)
+echo "TURN rule 127.0.0.1:23478: tx_bytes $turn_before -> $turn_after (the browser received $received bytes of video)"
+[ $((turn_after - turn_before)) -ge "$received" ] || fail "relay: the video did not come through rproxy's TURN rule: $out"
 echo "OK"
