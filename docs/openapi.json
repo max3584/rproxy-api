@@ -126,6 +126,15 @@
           "upstream": {
             "type": "object",
             "description": "terminate (tcp) routes that are not passthrough: how to reach this route's backends instead of the rule's tls.upstream (same fields: tls, server_name, ca_file, insecure_skip_verify, cert_file, chain_file, key_file); features.tls_route_upstream"
+          },
+          "source_ip": {
+            "type": "string",
+            "enum": [
+              "proxy",
+              "proxy_v1",
+              "proxy_v2"
+            ],
+            "description": "routes relayed at L4 (passthrough routes of terminate, routes of sni) only: how the client's address is passed to this route's backends, instead of the rule's source_ip (v0.4.13, #297; features.route_source_ip). Left out: the rule's. transparent is per rule; proxy_v1 is tcp only"
           }
         },
         "additionalProperties": false
@@ -2093,6 +2102,10 @@
               "proxy_protocol_in": {
                 "type": "boolean",
                 "description": "proxy_protocol of a tcp rule: PROXY v1 / v2 headers read from trusted front ends (v0.4.13, #296)"
+              },
+              "route_source_ip": {
+                "type": "boolean",
+                "description": "source_ip of tls.routes[] relayed at L4: passthrough routes of terminate, routes of sni (v0.4.13, #297)"
               }
             }
           },

@@ -228,6 +228,18 @@ Every connection comes from 127.0.0.1, so `from: ["127.0.0.1/32"]` makes the tes
 | `per_source_limits_count_the_client_of_the_header` | Per-source `limits` count per client of the header (another client behind the same front end gets through) |
 | `http_rules_forward_the_client_of_the_header` | `X-Forwarded-For` / `X-Real-IP` of an `http` rule and `client` of `http.access` are the header's client, `proxy_peer` the front end |
 
+## Integration tests: `source_ip` per route (`tests/route_source_ip.rs`, #297)
+
+The backends are sockets that only record what they receive: whether a PROXY header comes, what it says, and that the ClientHello (QUIC: the Initial) follows.
+
+| Test | What it checks |
+|---|---|
+| `a_passthrough_route_of_an_http_rule_sends_proxy_v2_and_l7_does_not` | On one port's `http` rule, the backend of a passthrough route with `source_ip: proxy_v2` gets a v2 header with the client's address; the HTTP to the L7 service gets none |
+| `a_passthrough_route_passes_on_the_client_of_an_incoming_proxy_header` | On connections received with `proxy_protocol` (#296), a route's `proxy_v1` header names the header's client |
+| `routes_of_an_sni_rule_override_the_rules_source_ip` | On an `sni` rule (the rule has `proxy_v2`): a route's `proxy` (no header) and `proxy_v1`; routes without one and unmatched names use the rule's. A PATCH of a route's value is `in_place` (dry run) and applies from the next connection |
+| `a_udp_sni_route_sends_proxy_v2_datagrams` | On a `udp` `sni` rule (QUIC), only the datagrams of the `proxy_v2` route carry the DGRAM header |
+| `route_source_ip_is_validated_and_advertised` | `features.route_source_ip`. A terminated route, `transparent` on a route and `proxy_v1` on a `udp` route are `unsupported`; an unknown value is a 4xx |
+
 ## Integration tests: v0.4 shapes (`tests/v04_shapes.rs`, #215)
 
 Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v0.4.0 every item runs (all `features` flags are true), so what remains here is the `features` list, the scopes of the new endpoints, the validation by `--check-config` and of the startup flags, and that a 0.3 settings file still passes. That each feature works is checked by its own tests (`tests/api_hardening.rs`, `rulesets.rs`, `limits.rs`, `geoip.rs`, `outlier.rs`, `plan.rs`, `persist.rs`, `handoff.rs`, `self_update.rs`, `performance.rs`).

@@ -18,7 +18,7 @@
 # - certificatesResolvers.zone: dnsChallenge acme-dns: set api_url; existing lego accounts (ACME_DNS_STORAGE_PATH) can be used as credentials_file
 # - global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)
 # - entry point smtps: ClientIP of TCP routers applies to the whole rule (allow_from)
-# - entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule (the first is used)
+# - entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule for terminated routes and the default (the first is used)
 # - entry point tls13: no certificate found; put one at /etc/rproxy/tls/tls13.pem
 # - entry point mixed: a HostSNI(`*`) passthrough router cannot share a port with terminating routers; terminating routers left out: term
 
@@ -30,6 +30,7 @@ global:
         contact:
         - mailto:hostmaster@example.net
         allowed_names:
+        - www.example.net
         - mail.example.net
       zone:
         contact:
@@ -55,6 +56,7 @@ global:
         tsig_key_name: CHANGE-ME
         tsig_secret_file: /etc/rproxy/acme/le-tsig.key
         allowed_names:
+        - www.example.net
         - mail.example.net
       zone-dns:
         type: acme_dns
@@ -63,6 +65,30 @@ global:
         allowed_names:
         - '*.mx.example.net'
 rules:
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 443
+  tls:
+    mode: terminate
+    certificates:
+    - acme: le
+      domains:
+      - www.example.net
+    routes:
+    - server_name: '**.tenant.example.net'
+      remote_addr: 192.0.2.45
+      remote_port: 443
+      passthrough: true
+      source_ip: proxy_v2
+  http:
+    routes:
+    - name: site
+      match: Host(`www.example.net`)
+      service: site
+    services:
+      site:
+        servers:
+        - url: http://192.0.2.80:8080
 - protocol: tcp
   listen_addr: 0.0.0.0
   listen_port: 465
@@ -119,6 +145,23 @@ rules:
     - server_name: term.example.net
       remote_addr: 192.0.2.41
       remote_port: 8080
+- protocol: tcp
+  listen_addr: 0.0.0.0
+  listen_port: 9443
+  remote_addr: 192.0.2.45
+  remote_port: 443
+  source_ip: proxy_v2
+  tls:
+    mode: sni
+    routes:
+    - server_name: a.edge.example.net
+      remote_addr: 192.0.2.45
+      remote_port: 443
+    - server_name: b.edge.example.net
+      remote_addr: 2001:db8::40
+      remote_port: 443
+      source_ip: proxy
+    unmatched: reject
 - protocol: udp
   listen_addr: 198.51.100.5
   listen_port: 27015

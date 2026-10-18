@@ -258,7 +258,7 @@ Besides blocking based on CrowdSec decisions (the L7 `crowdsec` middleware, `cro
 
 ## Passing the source IP
 
-Choose with `source_ip` per rule. What PROXY protocol is, which option to choose, and configuration examples for targets (Postfix, Dovecot, nginx, ingress-nginx, etc.) are in [docs/en/SOURCE-IP.md](docs/en/SOURCE-IP.md).
+Choose with `source_ip` per rule (`tls.routes[]` that are not terminated can also choose `proxy`, `proxy_v1` or `proxy_v2` per route; v0.4.13). What PROXY protocol is, which option to choose, and configuration examples for targets (Postfix, Dovecot, nginx, ingress-nginx, etc.) are in [docs/en/SOURCE-IP.md](docs/en/SOURCE-IP.md).
 
 | Value | Behavior | Requirements |
 |---|---|---|

@@ -258,7 +258,7 @@ CrowdSec の判定で止める（L7 の `crowdsec` ミドルウェア、L4 の�
 
 ## 送信元 IP の引き渡し
 
-ルールごとに `source_ip` で選ぶ。PROXY protocol とは何か、どれを選ぶか、転送先（Postfix・Dovecot・nginx・ingress-nginx など）の設定の例は [docs/SOURCE-IP.md](docs/SOURCE-IP.md)。
+ルールごとに `source_ip` で選ぶ（TLS を終端しない `tls.routes[]` は route ごとにも `proxy`・`proxy_v1`・`proxy_v2` を選べる。v0.4.13）。PROXY protocol とは何か、どれを選ぶか、転送先（Postfix・Dovecot・nginx・ingress-nginx など）の設定の例は [docs/SOURCE-IP.md](docs/SOURCE-IP.md)。
 
 | 値 | 動作 | 前提 |
 |---|---|---|

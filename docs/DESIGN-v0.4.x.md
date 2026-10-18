@@ -225,3 +225,19 @@ rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かっ
 - PATCH でその場で変わる（次の接続から）。組の PUT・設定ファイルの再読み込みも `in_place`。引き継ぎ・保存：ルールの形に足すだけ。DB の `options` にも同じ形で書ける。
 - 対象外（後の段階）：UDP の PROXY v2（データグラムごとのヘッダ）。HTTP/3 の QUIC にはヘッダがない。
 - 試験：単体（`net::proxy_in`：解析・上限・細切れ・時間切れ・検証）、`tests/proxy_protocol.rs`（`allow_from`・`limits`・`X-Forwarded-For` とアクセスログ・PROXY v2 で受けて PROXY v2 で送る・`LOCAL`・`required`・外からのヘッダ・形と PATCH）、ファジングの `proxy_header_in`。
+
+## 10. `tls.routes[]` ごとの `source_ip`（v0.4.13、#297）
+
+1 つのポートの `terminate`（`http` のルールを含む）のルールで、L7 の部分（PROXY のヘッダを受けない転送先）と、そのまま流す名前（Kubernetes など、PROXY v2 でクライアントを受けたい転送先）とで送信元の渡し方を分ける。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| route ごとの送信元の渡し方 | `tls.routes[].source_ip`（`proxy`・`proxy_v1`・`proxy_v2`） | `route_source_ip` | なし（ルールの `source_ip`） |
+
+- 書ける route：L4 で転送先へつなぐもの（`terminate` の `passthrough: true` の route、`sni` のルールの route。`tcp`・`udp`）。PROXY のヘッダはクライアントのバイト（ClientHello）の前に置くので、終端せずに流す接続でだけ意味がはっきりする。rproxy が終端する route は `unsupported`（issue の「まずルールのもの、要るなら後で」）。
+- `transparent` は route ごとには選べない（`unsupported`）：`IP_TRANSPARENT` のソケット・ポリシールーティング・転送先からの戻りの経路の準備がルールの単位で、名前ごとに変えると戻りの経路が合わない。`udp` の route の `proxy_v1` もルールと同じく `unsupported`。
+- `transparent` のルールの route に `proxy*` を書いたとき：その route の転送先へは rproxy のアドレスからつなぐ（route の値をそのまま使う。ルールの `transparent` を残して PROXY ヘッダを足す形にはしない）。
+- 実行時は route の `RouteTarget.source_ip` → `Target.source_ip`、`Runtime::source_ip_for` / `bind_as_for`（`tcp.rs` の `relay_hello`・`connect`、`udp.rs` の `session`）。PATCH・組の PUT・再読み込みは route の差し替え（`install_routes`）なので `in_place`（ルールの `source_ip` は今までどおり作り直し）。
+- `proxy_protocol`（#296）で受けた接続では、ヘッダのクライアントを書く（ルールの `source_ip` と同じ）。
+- 引き継ぎ・保存：ルールの形（`tls.routes[]`）に足すだけ。DB の `options.tls` にも同じ形で書ける。Traefik の変換は、ルーターごとに違う `proxyProtocol.version` を route の `source_ip` にする（終端しないルーターだけ）。
+- 試験：単体（`tls::config` の検証、`config::plan` の round trip と `in_place`）、`tests/route_source_ip.rs`。

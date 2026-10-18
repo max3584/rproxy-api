@@ -50,7 +50,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `HostSNIRegexp` の単純な接尾辞（`^.+\.example\.com$` / `^[^.]+\.example\.com$`） | `**.example.com`（何階層でも）/ `*.example.com`（1 階層） |
 | HTTP のルーターと同じエントリポイントの TCP の passthrough のルーター | 同じルールの `tls.routes` に `passthrough: true` で入れる（その名前だけ終端せずに流す） |
 | TCP のルーター（TLS を終端する） | `tls.mode: terminate` の `tls.routes` |
-| TCP のサービスの `proxyProtocol.version` | `source_ip: proxy_v1` / `proxy_v2` |
+| TCP のサービスの `proxyProtocol.version` | `source_ip: proxy_v1` / `proxy_v2`。同じエントリポイントでルーターごとに版が違えば、TLS を終端しないルーター（passthrough・`sni`）は route の `source_ip`（v0.4.13）、ほかは最初のルーターのもの（メモに出す）。HTTP のルーターの隣の passthrough のルーターも route の `source_ip` |
 | UDP のルーター | `protocol: udp` のルール |
 
 ### サービス

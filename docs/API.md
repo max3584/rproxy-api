@@ -137,7 +137,7 @@ tokens:
 | `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
 | `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くと今までどおり（ほかに宛先があれば 5 秒、なければ OS の既定（Linux は約 2 分））。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
-| `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md |
+| `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md。TLS を終端しない `tls.routes[]` には route ごとの `source_ip` も書ける（下の「`tls.routes[]` の `source_ip`」） |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
@@ -203,7 +203,7 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
 | フィールド | 説明 |
 |---|---|
 | `mode` | `passthrough`（既定。暗号化されたまま流す）、`sni`（ClientHello のサーバ名で転送先を選び、復号しない。tcp は TLS、udp は DTLS と QUIC（HTTP/3 など）。下の「UDP のサーバ名での振り分け」）、`terminate`（rproxy で復号する。tcp は TLS、udp は DTLS） |
-| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）：`{"server_name" または "server_names", "remote_addr", "remote_port", "passthrough"?}`。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。一致しない名前はルールの `remote_addr` / `remote_port`（`targets`）へ。ポート範囲では、ここの `remote_port` も同じだけずれる。<br>名前の書き方：`mail.example.com`（完全一致）、`*.example.com`（1 階層だけ）、`**.example.com`（1 階層以上、何階層でも。`example.com` 自体には一致しない）。`server_names` で 1 つの route に名前を複数書ける（`server_name` とどちらか一方）。複数の route に一致するときは、完全一致 → `*.` → `**.`（接尾辞が長い方）→ 書いた順。<br>`passthrough: true`（`terminate` だけ）：その名前の接続は終端せず、ClientHello ごと転送先へそのまま流す（`sni` と同じ。証明書は転送先が持つ）。`allow_from`・ルールの `crowdsec`・`source_ip`・統計は効く。`starttls` とは組み合わせられない。HTTP/3（QUIC）では扱わない（その名前の QUIC の接続は閉じる） |
+| `routes` | サーバ名ごとの転送先（`sni` と `terminate`）：`{"server_name" または "server_names", "remote_addr", "remote_port", "passthrough"?, "source_ip"?}`。範囲ルールでは、`remote_port` に範囲の長さを足して 65535 を超えないこと。一致しない名前はルールの `remote_addr` / `remote_port`（`targets`）へ。ポート範囲では、ここの `remote_port` も同じだけずれる。<br>名前の書き方：`mail.example.com`（完全一致）、`*.example.com`（1 階層だけ）、`**.example.com`（1 階層以上、何階層でも。`example.com` 自体には一致しない）。`server_names` で 1 つの route に名前を複数書ける（`server_name` とどちらか一方）。複数の route に一致するときは、完全一致 → `*.` → `**.`（接尾辞が長い方）→ 書いた順。<br>`passthrough: true`（`terminate` だけ）：その名前の接続は終端せず、ClientHello ごと転送先へそのまま流す（`sni` と同じ。証明書は転送先が持つ）。`allow_from`・ルールの `crowdsec`・`source_ip`・統計は効く（`source_ip` は route ごとにも書ける。v0.4.13、下の「`tls.routes[]` の `source_ip`」）。`starttls` とは組み合わせられない。HTTP/3（QUIC）では扱わない（その名前の QUIC の接続は閉じる） |
 | `unmatched` | `default`（既定。どの `routes` にも一致しない名前・SNI なしは、ルールの `remote_addr` / `remote_port` へ）または `reject`（切断する。`terminate` ではハンドシェイクを完了せずに切る）。`sni`（tcp・udp）と tcp の `terminate` で、`routes` があるときだけ指定できる |
 | `certificates` | `terminate` で必須。`cert_file` はサーバ証明書、`chain_file` は中間 CA の証明書（サーバ証明書を発行した CA から、ルートへ向かう順。ルートは入れなくてよい）、`key_file` は秘密鍵。`cert_file` にチェーンを連結しても使える。読み込むときに、チェーンの順番と、鍵がサーバ証明書と対になっていることを確かめる。複数あれば SNI で選び、どれにも一致しなければ先頭を使う。DTLS の鍵は PKCS#8（`-----BEGIN PRIVATE KEY-----`）に限る |
 | `client_auth` | クライアント証明書の検証（mTLS）。`mode` は `none`（既定）/ `optional`（送られてきたら検証する）/ `required` / `optional_no_verify`（#238。下の「証明書を確かめない `optional_no_verify`」）。`optional` と `required` では `ca_file` が必須。`ca_file` はルート CA（信頼の起点）。`chain_file` はクライアント証明書の中間 CA で、中間 CA を送ってこないクライアントのために、検証の途中経路を補う（信頼の起点にはしない）。TLS と DTLS で同じ規則で検証する |
@@ -483,7 +483,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
     - 転送先へは `X-Forwarded-User`（`preferred_username`、なければ `email`、なければ `sub`）・`X-Forwarded-Sub`・`X-Forwarded-Email`・`X-Forwarded-Groups`（`groups_claim`（既定 `groups`、ドット区切りで `realm_access.roles` なども）の値をカンマ区切り）を付ける。クライアントが送った同名のヘッダと、rproxy のクッキーは取り除く。Keycloak ではクライアントに「Group Membership」のマッパーを足すと `groups` が入る。
     - サインイン・ログアウト・失敗は `event: "oidc.login"` / `"oidc.error"` / `"oidc.refresh"`。
   - 秘密のファイル（`users_file`・`client_secret_file`・`cookie_secret_file`）がない・中身が誤っていれば `invalid`（設定ファイルなら起動しない）。読めない（権限）なら起動は続け、そのミドルウェアを通るリクエストに 503 を返す。ファイルは変わったら（数秒以内に）読み直し、SIGHUP でも読み直す。読み直しに失敗したら今の中身を使い続ける（`reload.secret` の警告）。所有者とモードは docs/PERMISSIONS.md。
-- `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。`tls.routes` も使えない（`tls_config`。`Host(...)` で振り分ける）。
+- `source_ip` は `proxy` か `transparent`（転送先への接続の送信元をクライアントにする）。`proxy_v1` / `proxy_v2` は使えない（`invalid`。クライアントの IP は `X-Forwarded-For` で渡す）。ただし passthrough の route には route ごとの `source_ip`（`proxy_v1` / `proxy_v2`）を書ける（v0.4.13、#297）。passthrough でない `tls.routes` は使えない（`tls_config`。`Host(...)` で振り分ける）。
 - 接続の統計（`stats`）はクライアントとの接続単位で、`rx_bytes` はクライアントから、`tx_bytes` はクライアントへのバイト数。
 - DB の `options` 列の JSON にも `http` を保存できる（`{"tls", "starttls", "starttls_required", "allow_from", "http", "crowdsec", "targets", "balance", "health_check"}`。`crowdsec` は v0.3.2、`targets` / `balance` / `health_check` は v0.3.3 から）。`targets` が空でなければ `dist_addr` / `dist_port` は読まない（UI は `''` / `0` を入れる）。
 
@@ -632,6 +632,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
 | サービスごとの転送先の TLS（#236） | `http.services.<名前>.tls` | `server_name`・`ca_file`・`subject_alt_names`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify` | `services` の `tls` |
 | 名前ごとの複数の宛先（#234） | `tls.routes[]` | `targets: [{addr, port, weight, backup}]`・`balance`（`remote_addr` / `remote_port` の代わり） | `tls_route_targets` |
 | 名前ごとの転送先への TLS（v0.4.7、TLSRoute の終端の BackendTLSPolicy） | `tls.routes[].upstream` | ルールの `tls.upstream` と同じ項目（`tls`・`server_name`・`ca_file`・`cert_file`・`key_file`・`chain_file`・`insecure_skip_verify`）。tcp の `terminate` の passthrough でない route だけ。あればその route ではルールの `tls.upstream` の代わりに使う（`tls: false` なら平文）。ファイルはルールの作成・変更のときに読む | `tls_route_upstream` |
+| 名前ごとの送信元 IP の渡し方（v0.4.13、#297） | `tls.routes[].source_ip` | `proxy`・`proxy_v1`・`proxy_v2`。TLS を終端しない route（`terminate` の `passthrough` の route、`sni` のルールの route）だけ。省けばルールの `source_ip`（下の「`tls.routes[]` の `source_ip`」） | `route_source_ip` |
 | クライアント証明書を確かめない（#238、`AllowInsecureFallback`） | `tls.client_auth.mode` | `optional_no_verify`（上の「証明書を確かめない `optional_no_verify`」） | `client_auth_modes` |
 | 固定の状態コードの転送先（#235） | `http.services.<名前>.servers[]` | `{"status": 500, "weight": 1}`（`url` の代わり） | `http_options` の `server_status` |
 | 421 Misdirected Request（v0.4.3） | `tls.misdirected` | `{"groups": [["*"], ["b.example"], ["**.w.example"]]}` | `http_options` の `misdirected` |
@@ -937,6 +938,27 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - `required: false` のルールに、サーバから先に送るプロトコル（SMTP・MySQL など）でヘッダなしの接続が来ると、ヘッダを待つ 5 秒の後に通す。前段が必ずヘッダを付けるなら `required: true` のままにする。
 - HTTP/3（`http.http3`、UDP）にはヘッダがなく、QUIC の接続は接続元のアドレスで扱う。UDP の PROXY v2（データグラムごとのヘッダ）は後の段階（今は `udp` のルールに付けると `unsupported`）。
 - PATCH で変えると次の接続から効く（接続は切らない）。組の PUT・設定ファイルの再読み込みでもその場で変わる（`change: in_place`）。
+
+### `tls.routes[]` の `source_ip`（v0.4.13、#297、`features.route_source_ip`）
+
+1 つのポートで、名前ごとに転送先へのクライアントのアドレスの渡し方を変える。例：`:443` の `http` のルールはそのまま L7 で扱い、Kubernetes へそのまま流す名前だけ PROXY v2 を付ける。
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "tls": {"mode": "terminate", "certificates": [{"cert_file": "/etc/rproxy/tls/www.pem", "key_file": "/etc/rproxy/tls/www.key"}],
+  "routes": [{"server_names": ["**.tenant.example.com"], "passthrough": true,
+   "remote_addr": "10.2.255.131", "remote_port": 443, "source_ip": "proxy_v2"}]},
+ "http": {"routes": [{"name": "www", "match": "Host(`www.example.com`)", "service": "www"}],
+  "services": {"www": {"servers": [{"url": "http://10.0.0.80:8080"}]}}}}
+```
+
+- route の `source_ip` は、ルールの `source_ip` より先に使う。省けばルールのもの（今までどおり）。一覧・`GET /rules` には書いたときだけ出る。
+- 書ける route：TLS を終端せずに L4 で転送先へつなぐもの。`terminate` のルール（`http` のルールを含む）の `passthrough: true` の route と、`sni` のルール（`tcp`・`udp`）の route。rproxy が終端する route（`passthrough` でない `terminate` の route）に書くと `400 unsupported`（ルールの `source_ip` を使う）。
+- 値：`proxy`（ヘッダなし）・`proxy_v1`・`proxy_v2`。`udp` の `sni` のルールの route では `proxy_v1` は `unsupported`（ルールと同じ。`proxy_v2` はデータグラムごとの DGRAM のヘッダ）。
+- `transparent` は route ごとには選べない（`400 unsupported`）。`IP_TRANSPARENT` のソケット・ポリシールーティング・転送先からの戻りの経路の準備はルールの単位で、名前ごとに変えると戻りの経路が合わなくなるため。`transparent` のルールの route に `proxy`・`proxy_v1`・`proxy_v2` を書くと、その route の転送先へは rproxy のアドレスからつなぐ。
+- `http` のルールそのものは `X-Forwarded-For` で渡す（ルールの `proxy_v1` / `proxy_v2` は今までどおり `invalid`）が、その passthrough の route には付けられる。
+- ヘッダの中身はルールの `source_ip` と同じ：送信元はクライアント（`proxy_protocol` で受けた接続ではヘッダのクライアント）、宛先は rproxy が受けたアドレス。終端していないので PROXY v2 の TLS の TLV は付けない。
+- PATCH（`tls` を送る）・組の PUT・設定ファイルの再読み込みで、接続を切らずに変わる（`change: in_place`、次の接続から）。ルールの `source_ip` は今までどおり変えられない（作り直し）。
 
 ## エンドポイント
 

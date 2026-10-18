@@ -50,7 +50,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | Simple-suffix `HostSNIRegexp` (`^.+\.example\.com$` / `^[^.]+\.example\.com$`) | `**.example.com` (any depth) / `*.example.com` (one level) |
 | TCP passthrough router on the same entry point as HTTP routers | Placed in the same rule's `tls.routes` with `passthrough: true` (only those names are passed through without termination) |
 | TCP router (terminating TLS) | `tls.routes` with `tls.mode: terminate` |
-| TCP service `proxyProtocol.version` | `source_ip: proxy_v1` / `proxy_v2` |
+| TCP service `proxyProtocol.version` | `source_ip: proxy_v1` / `proxy_v2`. When routers on one entry point use different versions, routers that do not terminate TLS (passthrough, `sni`) get a route `source_ip` (v0.4.13), the others the first router's (a note). Passthrough routers next to HTTP routers get a route `source_ip` too |
 | UDP router | A rule with `protocol: udp` |
 
 ### Services

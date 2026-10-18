@@ -48,6 +48,43 @@ service = "dovecot-v2"
 [tcp.routers.imap2.tls]
 options = "other"
 
+[tcp.routers.edge-a]
+entryPoints = ["edge"]
+rule = "HostSNI(`a.edge.example.net`)"
+service = "edge-v2"
+[tcp.routers.edge-a.tls]
+passthrough = true
+
+[tcp.routers.edge-b]
+entryPoints = ["edge"]
+rule = "HostSNI(`b.edge.example.net`)"
+service = "backend-pt"
+[tcp.routers.edge-b.tls]
+passthrough = true
+
+[tcp.routers.k8s]
+entryPoints = ["websecure"]
+rule = "HostSNIRegexp(`^.+\\.tenant\\.example\\.net$`)"
+service = "edge-v2"
+[tcp.routers.k8s.tls]
+passthrough = true
+
+[http.routers.site]
+entryPoints = ["websecure"]
+rule = "Host(`www.example.net`)"
+service = "site"
+[http.routers.site.tls]
+certResolver = "le"
+
+[http.services.site.loadBalancer]
+[[http.services.site.loadBalancer.servers]]
+url = "http://192.0.2.80:8080"
+
+[tcp.services.edge-v2.loadBalancer]
+proxyProtocol = { version = 2 }
+[[tcp.services.edge-v2.loadBalancer.servers]]
+address = "192.0.2.45:443"
+
 [tcp.services.postfix.loadBalancer]
 [[tcp.services.postfix.loadBalancer.servers]]
 address = "192.0.2.25:25"

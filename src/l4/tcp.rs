@@ -68,7 +68,7 @@ struct Connected {
 /// a target that refuses is marked down for a while and the next one is tried.
 async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Result<Connected> {
 	let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no resolved target");
-	let bind_as = rt.bind_as(client);
+	let bind_as = rt.bind_as_for(target, client);
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
@@ -76,7 +76,7 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	for c in target.candidates.iter().filter(usable) {
 		let lease = c.lease();
 		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
-			let attempt = source::connect_tcp(*addr, rt.bind_as(client));
+			let attempt = source::connect_tcp(*addr, bind_as);
 			// the rule's connect_timeout (v0.4.3); without it, 5 s when another target can be tried
 			let limit = rt.connect_timeout().or(fallback.then_some(FAILOVER_CONNECT_TIMEOUT));
 			let result = if let Some(limit) = limit {
@@ -106,14 +106,16 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	Err(last_err)
 }
 
+/// The PROXY header (if any) in front of what goes to the backend. `source_ip` is
+/// the rule's, or a route's own (#297, `Runtime::source_ip_for`).
 async fn send_proxy_header(
-	rt: &Runtime,
+	source_ip: SourceIp,
 	out: &mut TcpStream,
 	client: SocketAddr,
 	local: SocketAddr,
 	tls: Option<&TlsInfo>,
 ) -> io::Result<()> {
-	match rt.source_ip {
+	match source_ip {
 		SourceIp::ProxyV1 => out.write_all(&source::proxy_v1_header(client, local)).await,
 		SourceIp::ProxyV2 => out.write_all(&source::proxy_v2_header_with(client, local, tls)).await,
 		SourceIp::Proxy | SourceIp::Transparent => Ok(()),
@@ -349,7 +351,7 @@ async fn run(
 			detail.connected = Some(Instant::now());
 			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, country = detail.country(), asn = detail.asn(),
 				proxy_peer = peer_field());
-			send_proxy_header(rt, &mut out, client, local, None).await?;
+			send_proxy_header(rt.source_ip, &mut out, client, local, None).await?;
 			finish_plain(rt, client, inbound, &mut out, detail).await
 		}
 		TlsMode::Sni => {
@@ -382,7 +384,7 @@ async fn relay_hello(
 	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough,
 		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
-	send_proxy_header(rt, &mut out, client, local, None).await?;
+	send_proxy_header(rt.source_ip_for(target), &mut out, client, local, None).await?;
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
@@ -627,7 +629,7 @@ async fn terminate(
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
 		client_cn = info.client_cn.as_deref().unwrap_or(""), client_verify = info.client_verify(), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
 		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
-	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
+	send_proxy_header(rt.source_ip, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);
 
 	let backend = out.as_raw_fd();
@@ -677,7 +679,7 @@ async fn plain_smtp(
 	detail.connected = Some(Instant::now());
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, starttls = "smtp", tls = "none",
 		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
-	send_proxy_header(rt, &mut out, client, local, None).await?;
+	send_proxy_header(rt.source_ip, &mut out, client, local, None).await?;
 	let extra = starttls::skip_greeting(StartTls::Smtp, &mut out).await?;
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;
 	inbound.write_all(&extra).await?;

@@ -737,7 +737,12 @@ impl Registry {
 			}
 			let events = Arc::new(watch::channel(0).0);
 			let pool = Pool::new(pool_members, route.balance, events, false).with_outlier(crate::core::outlier::L4Outlier::new(None));
-			targets.push(RouteTarget { patterns: route.patterns(), passthrough: route.passthrough, pool: Arc::new(pool) });
+			targets.push(RouteTarget {
+				patterns: route.patterns(),
+				passthrough: route.passthrough,
+				source_ip: route.source_ip,
+				pool: Arc::new(pool),
+			});
 		}
 		(Arc::new(targets), resolvers)
 	}

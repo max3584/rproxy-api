@@ -70,6 +70,11 @@ pub struct Route {
 	/// is created or changed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub upstream: Option<Upstream>,
+	/// Routes relayed at L4 (`passthrough` routes of `terminate`, routes of `sni`) only: how the
+	/// client's address is passed to this route's backends, instead of the rule's `source_ip`
+	/// (#297). `proxy`, `proxy_v1` or `proxy_v2`; `transparent` is per rule (socket and routing).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub source_ip: Option<crate::core::rule::SourceIp>,
 }
 
 fn is_zero(n: &u16) -> bool {
@@ -319,6 +324,27 @@ fn tls_error(message: impl Into<String>) -> ApiError {
 	ApiError::tls_config(message)
 }
 
+/// `tls.routes[].source_ip` (#297): only where the route's backend is reached at
+/// L4 with the client's bytes as they are (the PROXY header goes in front of them).
+fn check_route_source_ip(protocol: Protocol, mode: TlsMode, route: &Route, source_ip: crate::core::rule::SourceIp) -> Result<(), ApiError> {
+	use crate::core::rule::SourceIp;
+	let label = route.label();
+	if mode == TlsMode::Terminate && !route.passthrough {
+		return Err(ApiError::unsupported(format!(
+			"route {label}: source_ip is for routes relayed without terminating (passthrough routes, or mode sni); a terminated route uses the rule's source_ip"
+		)));
+	}
+	match (protocol, source_ip) {
+		(_, SourceIp::Transparent) => Err(ApiError::unsupported(format!(
+			"route {label}: source_ip transparent is set on the rule only (the sockets and the policy routing are prepared per rule); a route takes proxy, proxy_v1 or proxy_v2"
+		))),
+		(Protocol::Udp, SourceIp::ProxyV1) => {
+			Err(ApiError::unsupported(format!("route {label}: PROXY protocol v1 is text over tcp; use proxy_v2 for udp")))
+		}
+		_ => Ok(()),
+	}
+}
+
 /// Checks the combination of fields; files are read later by `build`.
 /// `port_count` is the size of the rule's port range (1 for a single port).
 pub fn validate(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartTls>) -> Result<(), ApiError> {
@@ -428,6 +454,9 @@ pub fn validate_range(protocol: Protocol, tls: &TlsSpec, starttls: Option<StartT
 		}
 		if route.passthrough && starttls.is_some() {
 			return Err(tls_error("passthrough routes cannot be combined with starttls (TLS starts after the plain-text dialogue)"));
+		}
+		if let Some(source_ip) = route.source_ip {
+			check_route_source_ip(protocol, tls.mode, route, source_ip)?;
 		}
 		if let Some(up) = &route.upstream {
 			if protocol != Protocol::Tcp || tls.mode != TlsMode::Terminate || route.passthrough {
@@ -1469,6 +1498,7 @@ mod tests {
 			targets: vec![],
 			balance: Default::default(),
 			upstream: None,
+			source_ip: None,
 		}
 	}
 
@@ -1516,6 +1546,38 @@ mod tests {
 		assert!(check(&spec(vec![bad], TlsMode::Terminate), None).unwrap_err().contains("invalid server_name"));
 		assert!(check(&spec(vec![names.clone()], TlsMode::Sni), None).unwrap_err().contains("mode terminate"));
 		assert!(check(&spec(vec![names], TlsMode::Terminate), Some(StartTls::Smtp)).unwrap_err().contains("starttls"));
+	}
+
+	#[test]
+	fn route_source_ip_only_on_routes_relayed_at_l4() {
+		use crate::core::rule::SourceIp;
+		let cert = CertFiles { cert_file: "c".into(), key_file: "k".into(), ..Default::default() };
+		let spec = |route: Route, mode| TlsSpec {
+			mode,
+			routes: vec![route],
+			certificates: if mode == TlsMode::Terminate { vec![cert.clone()] } else { vec![] },
+			..Default::default()
+		};
+		let code = |protocol, s: &TlsSpec| validate_range(protocol, s, None, 1).map_err(|e| e.code);
+		let named = |source_ip, passthrough| Route { server_name: "a.test".into(), passthrough, source_ip: Some(source_ip), ..route() };
+		for s in [SourceIp::Proxy, SourceIp::ProxyV1, SourceIp::ProxyV2] {
+			assert_eq!(code(Protocol::Tcp, &spec(named(s, true), TlsMode::Terminate)), Ok(()), "passthrough route {s:?}");
+			assert_eq!(code(Protocol::Tcp, &spec(named(s, false), TlsMode::Sni)), Ok(()), "sni route {s:?}");
+			// a terminated route keeps the rule's
+			assert_eq!(code(Protocol::Tcp, &spec(named(s, false), TlsMode::Terminate)), Err("unsupported"), "terminated route {s:?}");
+		}
+		// transparent is prepared per rule
+		assert_eq!(code(Protocol::Tcp, &spec(named(SourceIp::Transparent, true), TlsMode::Terminate)), Err("unsupported"));
+		assert_eq!(code(Protocol::Tcp, &spec(named(SourceIp::Transparent, false), TlsMode::Sni)), Err("unsupported"));
+		// udp sni: v2 (DGRAM) only, as for the rule
+		assert_eq!(code(Protocol::Udp, &spec(named(SourceIp::ProxyV2, false), TlsMode::Sni)), Ok(()));
+		assert_eq!(code(Protocol::Udp, &spec(named(SourceIp::ProxyV1, false), TlsMode::Sni)), Err("unsupported"));
+		// round trip: left out stays out
+		let json = serde_json::to_value(named(SourceIp::ProxyV2, true)).unwrap();
+		assert_eq!(json["source_ip"], "proxy_v2");
+		assert!(serde_json::to_value(route()).unwrap().get("source_ip").is_none());
+		let back: Route = serde_json::from_value(json).unwrap();
+		assert_eq!(back.source_ip, Some(SourceIp::ProxyV2));
 	}
 
 	#[test]

@@ -59,10 +59,27 @@ PROXY TCP4 203.0.113.9 198.51.100.10 51234 443\r\n
 
 ## ほかの設定との関係
 
-- **L7（`http`）のルール：** `proxy`（または `transparent`）だけが使えます。クライアントの IP は `X-Forwarded-For` / `X-Real-IP` で渡ります（前段の CDN などを信じるには `global.trusted_proxies`）。同じルールの passthrough の route（`tls.routes[].passthrough`）にも PROXY protocol は付きません。
+- **L7（`http`）のルール：** `proxy`（または `transparent`）だけが使えます。クライアントの IP は `X-Forwarded-For` / `X-Real-IP` で渡ります（前段の CDN などを信じるには `global.trusted_proxies`）。同じルールの passthrough の route（`tls.routes[].passthrough`）には、route ごとの `source_ip` で PROXY protocol を付けられます（下の「名前ごとに変える」）。
 - **TLS を rproxy で終端するルール（`terminate`）：** `proxy_v2` なら、TLS の情報（SNI・ALPN・TLS のバージョン・クライアント証明書の CN）も TLV で渡ります。
-- **`source_ip` は作成後に変えられません**（作り直す）。転送先の設定と同時に切り替える必要があるためです。
+- **ルールの `source_ip` は作成後に変えられません**（作り直す）。転送先の設定と同時に切り替える必要があるためです（route ごとの `source_ip` は PATCH で変えられます）。
 - 設定の書き方・制約は [API.md](API.md) のルールの項目 `source_ip`。
+
+## 名前ごとに変える（`tls.routes[].source_ip`、v0.4.13）
+
+1 つのポートで、名前によって転送先が PROXY protocol を受けるかどうかが違うことがあります。たとえば VM の `:443` は L7（`http`）のルールのまま、Kubernetes へそのまま流す名前だけ PROXY v2 を付けてクライアントの IP を渡したいとき。TLS を終端せずに転送先へつなぐ route（`terminate` のルールの `passthrough: true` の route と、`sni` のルールの route）には、route ごとに `source_ip` を書けます。
+
+```json
+"tls": {"mode": "terminate", "certificates": [...], "routes": [
+  {"server_names": ["**.tenant.example.com"], "passthrough": true,
+   "remote_addr": "10.2.255.131", "remote_port": 443, "source_ip": "proxy_v2"}
+]}
+```
+
+- route の `source_ip` はルールのものより先に使います。省けばルールのもの。
+- 書けるのは `proxy`・`proxy_v1`・`proxy_v2`（`udp` の `sni` のルールでは `proxy`・`proxy_v2`）。
+- **`transparent` は route ごとには選べません。** `IP_TRANSPARENT` のソケット・ポリシールーティング・転送先からの戻りの経路の準備がルールの単位だからです（[TRANSPARENT.md](TRANSPARENT.md)）。`transparent` のルールの route に `proxy*` を書くと、その転送先へは rproxy のアドレスからつなぎます。
+- rproxy が TLS を終端する route には書けません（ルールの `source_ip` を使います）。
+- 細かい動きは [API.md](API.md) の「`tls.routes[]` の `source_ip`」。
 
 ## rproxy が PROXY protocol を受け取る（`proxy_protocol`、v0.4.13）
 
