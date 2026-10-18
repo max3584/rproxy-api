@@ -65,6 +65,8 @@ struct Options {
 	bandwidth: Option<crate::core::bandwidth::BandwidthSpec>,
 	geoip: Option<crate::net::geoip::GeoipSpec>,
 	outlier_detection: Option<crate::core::outlier::L4OutlierSpec>,
+	/// PROXY headers read from trusted front ends (#296).
+	proxy_protocol: Option<crate::net::proxy_in::ProxyProtocolSpec>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -95,6 +97,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		starttls: None,
 		starttls_required: None,
 		allow_from: vec![],
+		proxy_protocol: None,
 		http: None,
 		crowdsec: false,
 		labels: Default::default(),
@@ -139,6 +142,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		req.bandwidth = options.bandwidth;
 		req.geoip = options.geoip;
 		req.outlier_detection = options.outlier_detection;
+		req.proxy_protocol = options.proxy_protocol;
 	}
 	Ok(Some(req))
 }

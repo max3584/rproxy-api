@@ -506,7 +506,8 @@ impl Limits {
 pub fn refused(rt: &crate::core::proxy::Runtime, client: SocketAddr, reason: Reason, transport: &'static str) {
 	rt.stats.limited(reason);
 	match rt.limited_log.check(&client.ip()) {
-		Some(suppressed) => info!(event = "conn.limited", rule = %rt.key, client = %client, reason = reason.as_str(), transport, suppressed),
+		Some(suppressed) => info!(event = "conn.limited", rule = %rt.key, client = %client, reason = reason.as_str(), transport, suppressed,
+			proxy_peer = crate::net::proxy_in::peer_field()),
 		None => debug!(event = "conn.limited", rule = %rt.key, client = %client, reason = reason.as_str(), transport, throttled = true),
 	}
 }

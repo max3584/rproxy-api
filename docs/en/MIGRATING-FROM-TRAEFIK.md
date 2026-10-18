@@ -44,6 +44,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `entryPoints.<name>.http.tls`, router `tls` | The rule's `tls.mode: terminate` |
 | `entryPoints.<name>.http3` | `http.http3: true` |
 | `entryPoints.<name>.forwardedHeaders.trustedIPs` | `global.trusted_proxies` |
+| `entryPoints.<name>.proxyProtocol.trustedIPs` (receiving PROXY protocol) | `proxy_protocol: {from: <trustedIPs>, required: false}` on that entry point's rules (v0.4.13; as in Traefik, a header is used when present). Without `trustedIPs`, and `insecure: true`, it is not converted (a note). rproxy refuses headers from outside `from` |
 | `accessLog.filePath` | `global.access_log` (format is rproxy's JSON Lines; Traefik's format and filters are not converted) |
 | TCP router (`HostSNI`, `tls.passthrough: true`) | `tls.routes` with `tls.mode: sni` (one per router; `server_names` if there are multiple names). `HostSNI(`*`)` becomes the rule's forwarding target (if absent, `unmatched: reject`) |
 | Simple-suffix `HostSNIRegexp` (`^.+\.example\.com$` / `^[^.]+\.example\.com$`) | `**.example.com` (any depth) / `*.example.com` (one level) |
@@ -124,7 +125,6 @@ With rproxy's ACME, HTTP-01 is answered by the `http` rule on port 80 itself, be
 
 - Traefik's own services (the `api@internal` dashboard, `ping@internal`, etc.): the routers are removed entirely. For management, use the rproxy UI (TCP-UDP-rproxy-ui)
 - `metrics`: rproxy returns Prometheus format from the control API's `GET /metrics`
-- Incoming PROXY protocol (`entryPoints.<name>.proxyProtocol`): rproxy does not read it (`X-Forwarded-For` added by the front end can be trusted via `global.trusted_proxies`)
 - When HTTP and TCP routers share an entry point: passthrough routers with specified names are merged. Other TCP routers (TLS-terminating TCP routers, `HostSNI(`*`)`) are removed
 - When a `HostSNI(`*`)` passthrough and a TLS-terminating router share an entry point: the terminating one is removed
 - `HostSNIRegexp` that is not a simple suffix, `ALPN()`, label-only `defaultRule`, Kubernetes IngressRoute (CRD)

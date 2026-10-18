@@ -1,6 +1,5 @@
 providers.docker: Docker labels are read only with --docker (docker inspect output)
 entryPoints.admin: forwardedHeaders.insecure: list the proxies in global.trusted_proxies instead
-entryPoints.admin: proxyProtocol (receiving PROXY headers) is not supported by rproxy
 middleware security: forceSTSHeader: rproxy sends HSTS only on HTTPS
 middleware security: headers.isDevelopment is not converted
 middleware upload: buffering.maxResponseBodyBytes is not converted

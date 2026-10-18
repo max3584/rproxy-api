@@ -12,6 +12,7 @@ use crate::core::outlier::L4OutlierSpec;
 use crate::core::ruleset::Labels;
 use crate::net::geoip::GeoipSpec;
 use crate::net::cidr::{self, Cidr};
+use crate::net::proxy_in::{ProxyProtocol, ProxyProtocolSpec};
 use crate::error::ApiError;
 use crate::l7::HttpSpec;
 use crate::tls::config::{self as tlsconf, StartTls, TlsMode, TlsSpec};
@@ -204,6 +205,8 @@ pub struct Features {
 	pub listen_freebind: bool,
 	/// `connect_timeout` of an L4 tcp rule: how long a connection to a target may take (v0.4.3)
 	pub connect_timeout: bool,
+	/// `proxy_protocol` of a tcp rule: PROXY v1 / v2 headers read from trusted front ends (#296)
+	pub proxy_protocol_in: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -262,6 +265,7 @@ impl Features {
 		tokens_reload: true,
 		listen_freebind: crate::net::listen::FREEBIND,
 		connect_timeout: true,
+		proxy_protocol_in: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -306,6 +310,7 @@ impl Features {
 		tokens_reload: true,
 		listen_freebind: true,
 		connect_timeout: true,
+		proxy_protocol_in: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -370,6 +375,7 @@ impl Features {
 		for (what, used, available) in [
 			("listen_freebind (IP_FREEBIND: Linux)", spec.listen_freebind, self.listen_freebind),
 			("connect_timeout", spec.connect_timeout.is_some(), self.connect_timeout),
+			("proxy_protocol", spec.proxy_protocol.is_some(), self.proxy_protocol_in),
 			("labels", !spec.labels.is_empty(), self.labels),
 			("limits", spec.limits.is_some(), self.limits),
 			("bandwidth", spec.bandwidth.is_some(), self.bandwidth),
@@ -468,6 +474,9 @@ pub struct RuleRequest {
 	/// Client addresses allowed to connect (CIDR or single IP); empty means everyone.
 	#[serde(default)]
 	pub allow_from: Vec<String>,
+	/// PROXY v1 / v2 headers to read from the front ends in `from` (tcp; #296).
+	#[serde(default)]
+	pub proxy_protocol: Option<ProxyProtocolSpec>,
 	/// L7 routing (v0.3): routes, services and middlewares.
 	#[serde(default)]
 	pub http: Option<HttpSpec>,
@@ -530,6 +539,8 @@ pub struct RuleSpec {
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
 	pub allow_from: Vec<Cidr>,
+	/// `proxy_protocol` (tcp): whose PROXY headers are read.
+	pub proxy_protocol: Option<ProxyProtocol>,
 	pub http: Option<HttpSpec>,
 	pub crowdsec: bool,
 	pub labels: Labels,
@@ -783,6 +794,7 @@ impl RuleRequest {
 		}
 		let connect_timeout = validate_connect_timeout(self.connect_timeout.as_deref(), self.protocol, self.http.is_some())?;
 		let allow_from = cidr::parse_list(&self.allow_from)?;
+		let proxy_protocol = crate::net::proxy_in::validate(self.proxy_protocol, self.protocol)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
 		if tls.misdirected.is_some() && self.http.is_none() {
@@ -853,6 +865,7 @@ impl RuleRequest {
 			// only SMTP may continue without TLS
 			starttls_required: self.starttls != Some(StartTls::Smtp) || self.starttls_required.unwrap_or(true),
 			allow_from,
+			proxy_protocol,
 			http: self.http,
 			crowdsec: self.crowdsec,
 			labels: self.labels,
@@ -898,6 +911,8 @@ pub struct UpdateRequest {
 	pub listen_port_end: Option<u16>,
 	/// Replaces the allowed client addresses when present.
 	pub allow_from: Option<Vec<String>>,
+	/// Replaces `proxy_protocol` when present (`{}` removes it).
+	pub proxy_protocol: Option<ProxyProtocolSpec>,
 	/// Replaces the L7 routing when present (v0.3).
 	pub http: Option<HttpSpec>,
 	/// Turns the CrowdSec check at accept time on or off when present.
@@ -974,6 +989,8 @@ pub struct RuleView {
 	pub starttls_required: bool,
 	pub allow_from: Vec<String>,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub proxy_protocol: Option<ProxyProtocolSpec>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<HttpSpec>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub crowdsec: bool,
@@ -1043,6 +1060,7 @@ impl RuleView {
 			starttls: spec.starttls,
 			starttls_required: spec.starttls_required,
 			allow_from: spec.allow_from.iter().map(|c| c.to_string()).collect(),
+			proxy_protocol: spec.proxy_protocol.as_ref().map(|p| p.view()),
 			http: spec.http.clone(),
 			crowdsec: spec.crowdsec,
 			labels: spec.labels.clone(),
@@ -1094,6 +1112,7 @@ mod tests {
 			starttls: None,
 			starttls_required: None,
 			allow_from: vec![],
+			proxy_protocol: None,
 			http: None,
 			crowdsec: false,
 			labels: Default::default(),

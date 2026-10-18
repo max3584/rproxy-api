@@ -205,3 +205,23 @@ The rproxy-api part of two gaps found after rproxy-gateway v0.4.4 (fleet pods ho
 - `connect_timeout` changes in place by PATCH (from the next connection). `listen_freebind` cannot change (the sockets are opened again: re-created).
 - Handoff and storage: only added to the rule's shape (in the `GET /rules` shape and `rproxy_rules.spec`; an older patch ignores the unknown key).
 - Tests: `scripts/test-freebind.sh` (real path in network namespaces; CI's transparent job), `tests/listen.rs`, `tests/targets.rs` (a target that drops SYNs).
+
+## 9. Receiving PROXY protocol (v0.4.13, #296)
+
+Read the PROXY protocol v1 / v2 header a front end (a load balancer, another rproxy, a Kubernetes Gateway) sends, and use it as the real client's address. Until now `net::source` only wrote them.
+
+| Item | Shape | `features` | Default |
+|---|---|---|---|
+| Receive PROXY headers | `proxy_protocol: {"from": [<CIDR>, ...], "required"?: bool}` of a `tcp` rule | `proxy_protocol_in` | none (as before, no header is read) |
+
+- Whom to believe: `from` is matched against the TCP peer (the hop right in front), never the address in the header. `from` is required, cannot be empty, and `/0` is refused (no setting believes headers from just anyone). `required` defaults to `true`.
+- A connection from outside `from` that starts like a header (the v2 signature, `PROXY `): **refused** (the open question of the issue). A misconfigured front end shows up, and its header does not reach the backend as data where a backend that believes headers would take a spoofed address. `conn.denied` with `reason: proxy_protocol_untrusted`. Other connections are as before.
+- Waiting for the first bytes: rules where the client speaks first (TLS `sni` / `terminate`, `http`) wait for them, also from outside (rproxy reads them first anyway). Plain TCP and STARTTLS may have the server speak first, so they do not wait: only bytes already there when the connection is accepted (and, for plain TCP, once the backend is connected) are looked at, so connections from outside are not delayed; a late header can slip through there.
+- Limits: 107 bytes for v1 (the spec). v2's length field could say 65535; the part after the 16 fixed bytes is capped at 4096 (addresses take at most 216 bytes (AF_UNIX); AWS's VPC endpoint id, GCP's PSC id, HAProxy's SSL TLVs and unique ids are all far smaller). The time limit is 5 s from the accept (not configurable; below the TLS handshake's 10 s, and front ends send the header right after connecting).
+- Reading: look with `peek`, decide, then read exactly the header (nothing after it is read too early, so what follows (reading the ClientHello, splice, STARTTLS) is unchanged). A header arriving in pieces is waited for.
+- TLVs are skipped (towards the backend rproxy writes what it saw itself). `LOCAL`, `UNKNOWN`, `AF_UNSPEC` and `AF_UNIX` keep the peer's address. `DGRAM` on a TCP connection is refused.
+- Where the real client is used: `allow_from`, `geoip`, `crowdsec`, `limits`, `bandwidth`, the logs' `client`, `X-Forwarded-For` / `X-Real-IP` (and the `global.trusted_proxies` decision), `source_ip` towards the backend (`proxy_v1` / `proxy_v2` / `transparent`). The front end is the logs' `proxy_peer` (L4: the task-local `net::proxy_in::PROXY_PEER`; `http`: `Conn.proxy_peer`). The destination in a header towards the backend is still the address rproxy received the connection on.
+- Order: from a front end in `from`, the header is read before `allow_from` and the rest (the earlier "`allow_from` before the PROXY header" now holds for rules without `proxy_protocol` and connections from outside `from`).
+- A PATCH changes it in place (from the next connection); rule set PUTs and settings file reloads are `in_place` too. Handoff and storage: only added to the rule's shape. The database's `options` take the same shape.
+- Not covered (later): PROXY v2 over UDP (a header per datagram). HTTP/3's QUIC carries no header.
+- Tests: unit (`net::proxy_in`: parsing, limits, pieces, timeouts, validation), `tests/proxy_protocol.rs` (`allow_from`, `limits`, `X-Forwarded-For` and the access log, PROXY v2 in and out, `LOCAL`, `required`, headers from outside, the shape and PATCH), the fuzz target `proxy_header_in`.

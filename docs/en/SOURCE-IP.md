@@ -63,3 +63,20 @@ Recommended combinations per use case are in [PROFILES.md](PROFILES.md).
 - **Rules where rproxy terminates TLS (`terminate`):** with `proxy_v2`, TLS information (SNI, ALPN, TLS version, client certificate CN) is also passed in TLVs.
 - **`source_ip` cannot be changed after creation** (recreate the rule). This is because it must be switched at the same time as the target's configuration.
 - For syntax and constraints, see the rule field `source_ip` in [API.md](API.md).
+
+## rproxy receiving PROXY protocol (`proxy_protocol`, v0.4.13)
+
+Everything above is about rproxy **sending** to the target. When there is a load balancer in front of rproxy too (a cloud NLB, HAProxy, another rproxy, a Kubernetes Gateway) and it sends PROXY protocol, `proxy_protocol` of a `tcp` rule **receives** the header and treats the address in it as the real client.
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25,
+ "remote_addr": "10.0.0.25", "remote_port": 25, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}}
+```
+
+- **`from` (required): the front ends whose headers are believed.** As in "Things to watch out for" above, only the front end is trusted. It is matched against the TCP peer (the hop right in front), cannot be empty, and `0.0.0.0/0` is not accepted.
+- **`required` (default `true`):** a connection from `from` without a header is refused. If the front end's health checks come without one, use `false` (no header: the peer's address). A `LOCAL` header (v2's form for health checks) passes even with `true`, with the peer's address.
+- **Connections from outside `from`** are ordinary connections (no header is read), but one that starts with a header is refused (`conn.denied` with `reason: proxy_protocol_untrusted`); a front end missing from `from` shows up there.
+- The header's client is used by `allow_from`, `geoip`, `crowdsec`, `limits`, `bandwidth`, the logs' `client`, `X-Forwarded-For` / `X-Real-IP` and `source_ip` towards the target. The front end's address stays in the logs' `proxy_peer`.
+- PROXY v2 in and PROXY v2 out (the example) carries the real client's IP from the front end to the target. v2 TLVs are skipped; towards the target rproxy writes the TLS details it saw itself.
+- The details (size limits of 107 bytes for v1 and 4096 for v2, the 5 s time limit, HTTP/3 and UDP not covered) are in "Receiving PROXY protocol" in [API.md](API.md).

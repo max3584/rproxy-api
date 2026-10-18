@@ -157,7 +157,8 @@ impl HttpGlobal {
 				user = %entry.user, auth_error = %entry.auth_error,
 				client_cn = (!entry.client_cn.is_empty()).then_some(entry.client_cn.as_str()),
 				client_verify = (!entry.client_verify.is_empty()).then_some(entry.client_verify.as_str()),
-				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn),
+				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn,
+				proxy_peer = (!entry.proxy_peer.is_empty()).then_some(entry.proxy_peer.as_str())),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
 				line.push(b'\n');
@@ -236,6 +237,10 @@ pub struct AccessEntry {
 	pub country: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub asn: Option<u32>,
+	/// The front end that sent the connection's PROXY header (`proxy_protocol`, #296), whose
+	/// client is `client`; left out without one.
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub proxy_peer: String,
 }
 
 #[derive(Serialize)]

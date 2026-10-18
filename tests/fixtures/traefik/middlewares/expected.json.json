@@ -327,6 +327,12 @@
       "protocol": "tcp",
       "listen_addr": "2001:db8::1",
       "listen_port": 9443,
+      "proxy_protocol": {
+        "from": [
+          "198.51.100.0/24"
+        ],
+        "required": false
+      },
       "tls": {
         "mode": "terminate",
         "certificates": [

@@ -530,6 +530,8 @@ mod tests {
 				"remote_port": 6000, "udp_idle_secs": 90, "extra_listen_addrs": ["0.0.0.0"], "source_ip": "proxy_v2"}),
 			json!({"protocol": "tcp", "listen_addr": "192.0.2.10", "listen_port": 443, "listen_freebind": true, "remote_addr": "10.0.0.1",
 				"remote_port": 443, "connect_timeout": "1500ms"}),
+			json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25, "remote_addr": "10.0.0.25", "remote_port": 25,
+				"proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19"], "required": false}}),
 			json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": 5432, "targets": [{"addr": "db1", "port": 5432, "weight": 2},
 				{"addr": "db2", "port": 5432, "backup": true}], "balance": "failover", "health_check": {"interval": "5s"},
 				"allow_from": ["10.0.0.0/8", "fd00::1"], "labels": {"tenant": "a"}}),
@@ -563,6 +565,10 @@ mod tests {
 		c.outlier_detection = Some(serde_json::from_value(json!({"consecutive_failures": 3})).unwrap());
 		assert!(in_place(&a, &c) && in_place(&c, &a));
 		assert_eq!(change_of(&a, true, &c), (Action::Update, Change::InPlace));
+		// proxy_protocol (#296) too
+		let mut d = a.clone();
+		d.proxy_protocol = crate::net::proxy_in::validate(Some(serde_json::from_value(json!({"from": ["10.0.0.1"]})).unwrap()), d.key.protocol).unwrap();
+		assert_eq!(change_of(&a, true, &d), (Action::Update, Change::InPlace));
 		b.source_ip = crate::core::rule::SourceIp::ProxyV2;
 		assert_eq!(change_of(&a, true, &b), (Action::Update, Change::Recreate), "PATCH cannot change source_ip");
 		let wide = spec(json!({"protocol": "tcp", "listen_addr": "::", "listen_port": 80, "remote_addr": "a", "remote_port": 1}));

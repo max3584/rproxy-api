@@ -63,3 +63,20 @@ PROXY TCP4 203.0.113.9 198.51.100.10 51234 443\r\n
 - **TLS を rproxy で終端するルール（`terminate`）：** `proxy_v2` なら、TLS の情報（SNI・ALPN・TLS のバージョン・クライアント証明書の CN）も TLV で渡ります。
 - **`source_ip` は作成後に変えられません**（作り直す）。転送先の設定と同時に切り替える必要があるためです。
 - 設定の書き方・制約は [API.md](API.md) のルールの項目 `source_ip`。
+
+## rproxy が PROXY protocol を受け取る（`proxy_protocol`、v0.4.13）
+
+ここまでは rproxy が転送先へ **送る** 話です。rproxy の前にもロードバランサ（クラウドの NLB・HAProxy・別の rproxy・Kubernetes の Gateway など）がいて、それが PROXY protocol を付けて送ってくるときは、`tcp` のルールの `proxy_protocol` でヘッダを **受け取り**、そこに書かれたアドレスを本当のクライアントとして扱えます。
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25,
+ "remote_addr": "10.0.0.25", "remote_port": 25, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}}
+```
+
+- **`from`（必須）：ヘッダを信じる前段のアドレス。** 上の「気をつけること」と同じく、ヘッダを信じる相手を前段だけに絞ります。判定するのは TCP の接続元（すぐ前の段）で、空にはできず、`0.0.0.0/0` も使えません。
+- **`required`（既定 `true`）：** `from` からの接続がヘッダを付けてこなければ断ります。前段のヘルスチェックなどがヘッダなしで来るなら `false`（ヘッダがなければ接続元のアドレスのまま）。前段の `LOCAL`（v2 のヘルスチェックの形）は `true` でも通り、接続元のアドレスで扱います。
+- **`from` の外からの接続** はヘッダを読まずにふつうの接続として扱いますが、ヘッダで始まる接続は断ります（`conn.denied` の `reason: proxy_protocol_untrusted`）。前段のアドレスを `from` に書き漏らすとここで分かります。
+- ヘッダのクライアントは、`allow_from`・`geoip`・`crowdsec`・`limits`・`bandwidth`・ログの `client`・`X-Forwarded-For` / `X-Real-IP`・転送先への `source_ip` のすべてで使います。前段のアドレスはログの `proxy_peer` に残ります。
+- PROXY v2 で受けて PROXY v2 で送る（上の例）と、前段から転送先まで本当のクライアントの IP が届きます。v2 の TLV は読み飛ばし、転送先には rproxy 自身が見た TLS の情報を書きます。
+- 細かい動き（大きさの上限 v1 107 バイト・v2 4096 バイト、5 秒の時間の上限、HTTP/3・UDP は対象外など）は [API.md](API.md) の「PROXY protocol を受け取る」。

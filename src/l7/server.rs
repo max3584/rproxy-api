@@ -314,6 +314,9 @@ pub(super) struct Conn {
 	tls: Option<TlsInfo>,
 	/// Over QUIC (HTTP/3); others get `Alt-Svc` when the rule answers HTTP/3.
 	h3: bool,
+	/// The front end that sent the connection's PROXY header (`proxy_protocol`, #296);
+	/// `client` is then the address it named. For the access log.
+	proxy_peer: Option<SocketAddr>,
 }
 
 const X_FORWARDED_CLIENT_CERT: &str = "x-forwarded-client-cert";
@@ -403,7 +406,7 @@ impl Conn {
 	}
 
 	pub(super) fn new(rt: Arc<Runtime>, client: SocketAddr, local: SocketAddr, tls: Option<TlsInfo>, h3: bool) -> Self {
-		Conn { rt, client, local, https: tls.is_some(), tls, h3 }
+		Conn { rt, client, local, https: tls.is_some(), tls, h3, proxy_peer: crate::net::proxy_in::current_peer() }
 	}
 }
 
@@ -658,6 +661,7 @@ impl Conn {
 				tls_version: self.tls.as_ref().and_then(|t| t.version.clone()).unwrap_or_default(),
 				client_cn: self.tls.as_ref().filter(|_| self.client_auth()).and_then(|t| t.client_cn.clone()).unwrap_or_default(),
 				client_verify: self.tls.as_ref().filter(|_| self.client_auth()).map(|t| t.client_verify().to_string()).unwrap_or_default(),
+				proxy_peer: self.proxy_peer.map(|p| p.to_string()).unwrap_or_default(),
 				..Default::default()
 			}
 		} else {
@@ -1449,7 +1453,15 @@ impl Conn {
 
 	/// A copy of the request for `mirror` (#232), sent on its own; its answer is dropped.
 	fn mirror(&self, router: Arc<Router>, copy: mirror::Copy, body: Body) {
-		let conn = Conn { rt: self.rt.clone(), client: self.client, local: self.local, https: self.https, tls: self.tls.clone(), h3: self.h3 };
+		let conn = Conn {
+			rt: self.rt.clone(),
+			client: self.client,
+			local: self.local,
+			https: self.https,
+			tls: self.tls.clone(),
+			h3: self.h3,
+			proxy_peer: self.proxy_peer,
+		};
 		self.rt.tracker.spawn(async move {
 			let kill = conn.rt.kill.clone();
 			tokio::select! {

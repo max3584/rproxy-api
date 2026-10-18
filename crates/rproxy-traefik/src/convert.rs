@@ -129,6 +129,8 @@ struct Rule {
 	redirect: Option<Value>,
 	default_middlewares: Vec<String>,
 	default_tls: Option<Value>,
+	/// `proxy_protocol` from the entry point's `proxyProtocol.trustedIPs` (tcp).
+	proxy_protocol: Option<Value>,
 }
 
 /// The names of one certificate, in order and as a set.
@@ -369,8 +371,21 @@ impl Converter<'_> {
 			if as_bool(g(ep, &["forwardedHeaders", "insecure"]), false) {
 				self.note(&where_, "forwardedHeaders.insecure: list the proxies in global.trusted_proxies instead");
 			}
-			if g(ep, &["proxyProtocol"]).is_some() {
-				self.note(&where_, "proxyProtocol (receiving PROXY headers) is not supported by rproxy");
+			// receiving PROXY headers: rproxy believes them only from listed front ends; as in
+			// Traefik, the header is optional from them (required: false)
+			let mut proxy_protocol = None;
+			if let Some(pp) = g(ep, &["proxyProtocol"]) {
+				let trusted = as_list(g(pp, &["trustedIPs"]));
+				if proto != "tcp" {
+					self.note(&where_, "proxyProtocol is read on tcp entry points only");
+				} else if trusted.is_empty() {
+					self.note(&where_, "proxyProtocol without trustedIPs: list the front ends in proxy_protocol.from");
+				} else {
+					proxy_protocol = Some(Value::Map(map([("from", trusted.into()), ("required", false.into())])));
+				}
+				if as_bool(g(pp, &["insecure"]), false) {
+					self.note(&where_, "proxyProtocol.insecure: rproxy believes PROXY headers only from proxy_protocol.from");
+				}
 			}
 			let rule = Rule {
 				ep: name.clone(),
@@ -390,6 +405,7 @@ impl Converter<'_> {
 				redirect,
 				default_middlewares,
 				default_tls,
+				proxy_protocol,
 			};
 			match self.rule_index(name) {
 				Some(i) => self.rules[i] = rule,
@@ -1056,7 +1072,11 @@ impl Converter<'_> {
 
 	fn base(&self, rule: usize) -> Map {
 		let r = &self.rules[rule];
-		map([("protocol", r.protocol.as_str().into()), ("listen_addr", r.addr.as_str().into()), ("listen_port", r.port.into())])
+		let mut m = map([("protocol", r.protocol.as_str().into()), ("listen_addr", r.addr.as_str().into()), ("listen_port", r.port.into())]);
+		if let Some(pp) = &r.proxy_protocol {
+			m.insert("proxy_protocol", pp.clone());
+		}
+		m
 	}
 
 	fn tls_spec(&mut self, rule: usize, mode: &str, where_: &str) -> Map {
