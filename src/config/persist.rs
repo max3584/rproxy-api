@@ -7,6 +7,13 @@
 //! written on every change to it (whichever token makes it) and deleted with
 //! it, before the answer. A write that fails leaves the rule running
 //! (`persisted: false`, `event = "degraded"`, `part = "db"`).
+//!
+//! A process killed while a write is on its way leaves that statement to
+//! MariaDB, which carries it out (and may commit it) after the client is gone.
+//! So that a restart reads the rows only after it is done, the one connection
+//! that writes holds this node's lock (`GET_LOCK`), which MariaDB lets go only
+//! once it has finished with that connection; the startup waits for it
+//! (`load`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -48,6 +55,11 @@ pub struct StoredSet {
 
 /// Longest a write may hold up the answer.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the startup waits for an earlier process's connection to let go of
+/// this node's lock before it ends that connection (`KILL`), and after that.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+const KILLED_WAIT: Duration = Duration::from_secs(10);
 
 /// One row of `rproxy_rules`.
 #[derive(Clone, Debug, Deserialize)]
@@ -126,9 +138,10 @@ impl Store {
 	/// `url`: `RPROXY_DATABASE_URL`; the pool connects when first used.
 	pub fn new(node: String, url: Option<&str>) -> Result<Store, String> {
 		let backend = match url {
+			// one connection: it holds this node's lock and makes every write (`write`)
 			Some(url) => Backend::Db(
 				MySqlPoolOptions::new()
-					.max_connections(2)
+					.max_connections(1)
 					.acquire_timeout(WRITE_TIMEOUT)
 					.connect_lazy(url)
 					.map_err(|e| format!("database: {e}"))?,
@@ -206,22 +219,31 @@ impl Store {
 		}
 	}
 
-	/// This node's rows (startup). Rows written by a newer rproxy (`spec_version`)
-	/// or that do not read are skipped with `restore.skip`.
+	/// This node's rows (startup, not after a live upgrade), once the writes an
+	/// earlier process of this node sent are done (`wait_for_earlier_writes`).
+	/// Rows written by a newer rproxy (`spec_version`) or that do not read are
+	/// skipped with `restore.skip`.
 	pub async fn load(&self) -> Result<Vec<StoredRule>, String> {
 		let rows = match &self.backend {
 			Backend::None => return Ok(vec![]),
 			Backend::Memory { rows, .. } => return Ok(rows.lock().unwrap().values().filter(|r| r.node == self.node).cloned().collect()),
-			Backend::Db(pool) => sqlx::query(
-				"SELECT CAST(spec AS CHAR) AS spec, CAST(spec_version AS SIGNED) AS spec_version, created_by, \
-				 CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) AS created_at, updated_by, \
-				 CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) AS updated_at \
-				 FROM rproxy_rules WHERE node = ? ORDER BY protocol, listen_addr, listen_port",
-			)
-			.bind(&self.node)
-			.fetch_all(pool)
-			.await
-			.map_err(|e| e.to_string())?,
+			Backend::Db(pool) => {
+				let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
+				if let Err(e) = self.wait_for_earlier_writes(&mut conn).await {
+					warn!(event = "degraded", part = "db", table = TABLE, error = %e,
+						"the stored rules are read without waiting for an earlier process's writes (one may land afterwards)");
+				}
+				sqlx::query(
+					"SELECT CAST(spec AS CHAR) AS spec, CAST(spec_version AS SIGNED) AS spec_version, created_by, \
+					 CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) AS created_at, updated_by, \
+					 CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) AS updated_at \
+					 FROM rproxy_rules WHERE node = ? ORDER BY protocol, listen_addr, listen_port",
+				)
+				.bind(&self.node)
+				.fetch_all(&mut *conn)
+				.await
+				.map_err(|e| e.to_string())?
+			}
 		};
 		let mut out = vec![];
 		for row in rows {
@@ -231,6 +253,82 @@ impl Store {
 			}
 		}
 		Ok(out)
+	}
+
+	/// The name of this node's lock (`GET_LOCK` names are at most 64 characters;
+	/// node names up to 255).
+	fn lock_name(&self) -> String {
+		use sha2::Digest;
+		let hash = sha2::Sha256::digest(self.node.as_bytes());
+		format!("rproxy-node-{}", hash.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>())
+	}
+
+	/// Takes this node's lock on `conn`, waiting until an earlier process's
+	/// connection lets go of it: MariaDB does that only after it has finished
+	/// the statements that connection sent, so the rows read afterwards include
+	/// a write sent just before that process was killed. A connection that
+	/// still holds it after `LOCK_WAIT` (its host went away and MariaDB has not
+	/// noticed, or its statement waits for a row lock) is ended with `KILL`,
+	/// which also ends what it was doing (a user may end its own connections).
+	async fn wait_for_earlier_writes(&self, conn: &mut sqlx::MySqlConnection) -> Result<(), String> {
+		let name = self.lock_name();
+		for wait in [LOCK_WAIT, KILLED_WAIT] {
+			let got: Option<i64> = sqlx::query_scalar("SELECT CAST(GET_LOCK(?, ?) AS SIGNED)")
+				.bind(&name)
+				.bind(wait.as_secs())
+				.fetch_one(&mut *conn)
+				.await
+				.map_err(|e| e.to_string())?;
+			if got == Some(1) {
+				return Ok(());
+			}
+			if wait == KILLED_WAIT {
+				break;
+			}
+			let holder: Option<i64> = sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS SIGNED)")
+				.bind(&name)
+				.fetch_one(&mut *conn)
+				.await
+				.map_err(|e| e.to_string())?;
+			if let Some(id) = holder {
+				warn!(event = "restore.wait", connection = id, waited_secs = LOCK_WAIT.as_secs(),
+					"a connection of an earlier process of this node is still open; it is ended (KILL) before the stored rules are read");
+				sqlx::raw_sql(sqlx::AssertSqlSafe(format!("KILL CONNECTION {id}")))
+					.execute(&mut *conn)
+					.await
+					.map_err(|e| format!("KILL CONNECTION {id}: {e}"))?;
+			}
+		}
+		Err(format!("another connection still holds this node's lock ({name})"))
+	}
+
+	/// Runs a write on the pool's one connection, which holds this node's lock
+	/// (taken again without waiting when the connection is new; held by another
+	/// connection, the write goes ahead without it).
+	async fn write(&self, pool: &MySqlPool, query: sqlx::query::Query<'_, sqlx::MySql, sqlx::mysql::MySqlArguments>) -> Result<(), String> {
+		let name = self.lock_name();
+		let run = async {
+			let mut conn = pool.acquire().await?;
+			sqlx::query("SELECT IF(IS_USED_LOCK(?) <=> CONNECTION_ID(), 1, GET_LOCK(?, 0))")
+				.bind(&name)
+				.bind(&name)
+				.execute(&mut *conn)
+				.await?;
+			query.execute(&mut *conn).await.map(|_| ())
+		};
+		match tokio::time::timeout(WRITE_TIMEOUT, run).await {
+			Ok(r) => r.map_err(|e: sqlx::Error| e.to_string()),
+			Err(_) => Err("timed out".into()),
+		}
+	}
+
+	/// The old process after a live upgrade handed over: it writes no more, and
+	/// its connection lets go of this node's lock for the new process.
+	pub async fn release(&self) {
+		let _write = self.writes.lock().await;
+		if let Backend::Db(pool) = &self.backend {
+			pool.close().await;
+		}
 	}
 
 	fn read_row(&self, row: &sqlx::mysql::MySqlRow) -> Result<StoredRule, String> {
@@ -322,10 +420,7 @@ impl Store {
 				.bind(created_at.saturating_mul(1000))
 				.bind(by)
 				.bind(now);
-				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
-					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
-					Err(_) => Err("timed out".into()),
-				}
+				self.write(pool, query).await
 			}
 		};
 		let persisted = result.is_ok();
@@ -363,10 +458,7 @@ impl Store {
 				.bind(key.protocol.to_string())
 				.bind(key.listen.ip().to_string())
 				.bind(u32::from(key.listen.port()));
-				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
-					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
-					Err(_) => Err("timed out".into()),
-				}
+				self.write(pool, query).await
 			}
 		};
 		match result {
@@ -525,10 +617,7 @@ impl Store {
 				.bind(SPEC_VERSION)
 				.bind(row.by)
 				.bind(now);
-				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
-					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
-					Err(_) => Err("timed out".into()),
-				}
+				self.write(pool, query).await
 			}
 		};
 		let persisted = result.is_ok();
@@ -558,10 +647,7 @@ impl Store {
 			}
 			Backend::Db(pool) => {
 				let query = sqlx::query("DELETE FROM rproxy_rule_sets WHERE node = ? AND name = ?").bind(&self.node).bind(name);
-				match tokio::time::timeout(WRITE_TIMEOUT, query.execute(pool)).await {
-					Ok(r) => r.map(|_| ()).map_err(|e| e.to_string()),
-					Err(_) => Err("timed out".into()),
-				}
+				self.write(pool, query).await
 			}
 		};
 		match result {

@@ -1146,6 +1146,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	match &handed {
 		Some(h) => {
 			handoff::set_draining();
+			// the new process writes the rows now (it takes this node's lock)
+			if let Some(store) = registry.persist() {
+				store.release().await;
+			}
 			info!(event = "handoff.drain", pid = h.pid, drain_secs = upgrader.config().drain.as_secs());
 		}
 		None if graceful.immediate() => info!(event = "shutdown"),

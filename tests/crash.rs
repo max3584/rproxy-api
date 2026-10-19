@@ -831,6 +831,181 @@ async fn stored_rules_survive_kills_with_mariadb() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
+/// Whether a statement starting with `prefix` has been running for a while
+/// (the other tests' writes take a few milliseconds).
+async fn held_up(pool: &sqlx::MySqlPool, prefix: &str) -> bool {
+	let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE CONCAT(?, '%') AND TIME_MS > 300")
+		.bind(prefix)
+		.fetch_one(pool)
+		.await
+		.unwrap();
+	n > 0
+}
+
+/// Whether a process waits for a node's lock (`config::persist`).
+async fn waiting_for_a_node_lock(pool: &sqlx::MySqlPool) -> bool {
+	let n: i64 = sqlx::query_scalar(
+		"SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE 'SELECT CAST(GET_LOCK(%' AND STATE = 'User lock'",
+	)
+	.fetch_one(pool)
+	.await
+	.unwrap();
+	n > 0
+}
+
+/// A write the killed process sent is still running in MariaDB (here: waiting
+/// for a row lock the test holds; in CI a slow commit) when the process starts
+/// again. The new process reads the table only once that write is done, so
+/// what runs is what is stored: the created rule, and no deleted one. A write
+/// that does not finish within a while is ended (`KILL`) before the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_still_running_at_the_kill_is_read_after_it_is_done() {
+	use sqlx::{Connection, Executor};
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-late-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let dir = workdir("db-late");
+	token_file(&dir);
+	let backend = tcp_backend("L:").await;
+	let port = free_port();
+	let env = [("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())];
+	let api = free_port();
+	let mut s = Server::start(&dir, "first", api, &env);
+	s.ready().await;
+	// create, delete (both let through once the new process waits), create (held until it gives up and ends it)
+	for (round, statement) in ["INSERT INTO rproxy_rules", "DELETE FROM rproxy_rules", "INSERT INTO rproxy_rules"].into_iter().enumerate() {
+		// the rule's row is locked (to create: a row of the test's own, rolled back later; no gap
+		// lock, which would hold up the other tests' rows too): the write waits
+		let mut blocker = sqlx::MySqlConnection::connect(&url).await.unwrap();
+		blocker.execute("BEGIN").await.unwrap();
+		let lock = match round {
+			1 => "SELECT listen_port FROM rproxy_rules WHERE node = ? AND protocol = 'tcp' AND listen_addr = '127.0.0.1' AND listen_port = ? FOR UPDATE",
+			_ => "INSERT INTO rproxy_rules (node, protocol, listen_addr, listen_port, spec, created_by, created_at, updated_by, updated_at) \
+				  VALUES (?, 'tcp', '127.0.0.1', ?, '{}', 'test', NOW(), 'test', NOW())",
+		};
+		sqlx::query(lock).bind(&node).bind(u32::from(port)).execute(&mut blocker).await.unwrap();
+		let path = format!("http://127.0.0.1:{api}/rules/tcp/127.0.0.1/{port}");
+		let req = match round {
+			0 | 2 => reqwest::Client::new().post(format!("http://127.0.0.1:{api}/rules")).json(&rule("tcp", port, backend)),
+			_ => reqwest::Client::new().delete(&path),
+		};
+		let sent = tokio::spawn(req.bearer_auth("ci").timeout(Duration::from_secs(30)).send());
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !held_up(&pool, statement).await {
+			assert!(Instant::now() < deadline, "{statement} did not start:\n{}", s.log());
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		s.kill9();
+		assert!(sent.await.unwrap().is_err(), "the answer came before the kill");
+		drop(s);
+		// MariaDB still runs the write of the killed process
+		assert!(held_up(&pool, statement).await, "{statement} of the killed process");
+
+		s = Server::start(&dir, &format!("after{round}"), api, &env);
+		// the new process waits for the write before it reads (or is ready already)
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let client = reqwest::Client::new();
+		loop {
+			if waiting_for_a_node_lock(&pool).await {
+				break;
+			}
+			let r = client.get(format!("http://127.0.0.1:{api}/readyz")).timeout(Duration::from_secs(1)).send().await;
+			if r.is_ok_and(|r| r.status() == StatusCode::OK) {
+				break;
+			}
+			assert!(Instant::now() < deadline, "the new process neither waits nor is ready:\n{}", s.log());
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		if round == 2 {
+			s.ready().await;
+			assert!(s.log().contains("\"restore.wait\""), "{}", s.log());
+		}
+		// the write goes through now (round 2: it was ended)
+		blocker.execute("ROLLBACK").await.unwrap();
+		drop(blocker);
+		s.ready().await;
+		s.assert_clean_start();
+		let rows: Vec<(u32,)> =
+			sqlx::query_as("SELECT listen_port FROM rproxy_rules WHERE node = ?").bind(&node).fetch_all(&pool).await.unwrap();
+		let (status, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+		match round {
+			0 => {
+				assert_eq!(rows, [(u32::from(port),)], "the row of the created rule");
+				assert_eq!(status, StatusCode::OK, "the stored rule runs: {v}\n{}", s.log());
+				assert_eq!((&v["origin"], &v["persisted"], &v["state"]), (&json!("api"), &json!(true), &json!("running")), "{v}");
+			}
+			_ => {
+				assert!(rows.is_empty(), "no row: {rows:?}");
+				assert_eq!(status, StatusCode::NOT_FOUND, "no rule: {v}\n{}", s.log());
+			}
+		}
+	}
+	drop(s);
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let _ = fs::remove_dir_all(&dir);
+}
+
+/// A live upgrade: the old process, draining, lets go of the node's lock, and
+/// the new process's writes take it (so a restart after it is killed waits for
+/// them too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_live_upgrade_the_new_process_holds_the_node_lock() {
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-upgrade-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let dir = workdir("db-upgrade");
+	token_file(&dir);
+	let backend = tcp_backend("U:").await;
+	let env = [
+		("RPROXY_DATABASE_URL", url.clone()),
+		("RPROXY_NODE_NAME", node.clone()),
+		("RPROXY_HANDOFF_TIMEOUT", "10s".into()),
+		("RPROXY_HANDOFF_DRAIN", "30s".into()),
+	];
+	let api = free_port();
+	let s = Server::start(&dir, "old", api, &env);
+	s.ready().await;
+	// config::persist's name of the node's lock
+	let lock = format!("rproxy-node-{}", &sha(&node)[..32]);
+	let holder = async || -> Option<i64> {
+		sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS SIGNED)").bind(&lock).fetch_one(&pool).await.unwrap()
+	};
+	let old_conn = holder().await;
+	assert!(old_conn.is_some(), "the old process holds the node's lock");
+	let port = free_port();
+	let (status, v) = s.call(Method::POST, "/rules", Some(rule("tcp", port, backend))).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
+	// a connection the old process holds: it drains
+	let held = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let old = s.pid();
+	signal(old, libc::SIGUSR2);
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while !s.log().contains("\"handoff.drain\"") {
+		assert!(!s.log().contains("\"handoff.failed\""), "{}", s.log());
+		assert!(Instant::now() < deadline, "no handoff:\n{}", s.log());
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let (status, v) = s.call(Method::POST, "/rules", Some(rule("tcp", free_port(), backend))).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
+	assert!(alive(old), "the old process still drains");
+	let new_conn = holder().await;
+	assert!(
+		new_conn.is_some() && new_conn != old_conn,
+		"the new process's writes hold the lock: {new_conn:?} (old {old_conn:?})\n{}",
+		s.log()
+	);
+	drop(held);
+	drop(s);
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let _ = fs::remove_dir_all(&dir);
+}
+
 /// A rule set of a `persist: true` token is `PUT` with growing generations
 /// while the process is killed: after the restart it has the last answered
 /// generation (or the one sent at the kill), with exactly that generation's

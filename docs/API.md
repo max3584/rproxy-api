@@ -594,6 +594,7 @@ global:
 - 書くのは作成・変更・削除の応答の前。`api` のルールは、どのトークンで変えても・消しても行を書き直す・消す（行がルールと食い違わないように）。`persist: true` のトークンでも、`dynamic` のルール（UI・保存しないトークンのもの）を変えたときは保存しない。
 - 表示：`origin: "api"` のルールに `persisted`（行が最新か）・`created_by`（作ったトークンの名前）・`created_at`（Unix 秒）。書けなかったとき（DB に届かない、テーブルがない）はルールを動かしたまま `persisted: false`、ログに `event = "degraded"`（`part: "db"`）。`RPROXY_DATABASE_URL` がなければ保存しない（`persisted: false`）。保存したら `rule.persist`（`action: save` / `delete`、`token`）。
 - 起動時は UI の `forward_rules` を復元してから、`rproxy_rules` の自分の `node`（`--node-name` / `RPROXY_NODE_NAME`、既定はホスト名）の行を `origin: "api"` で復元する。同じキーが両方にあれば UI の行を使い、`restore.conflict`（warn）を出す。テーブルが読めなければ `degraded`（`part: "db"`）を出して、UI のルールだけで起動する。`spec_version` がこの版より新しい行は `restore.skip` で読み飛ばす。
+- 異常終了（`kill -9`・OOM killer・ホストの停止）のすぐ後の起動：止まったプロセスが送っていた書き込みは、MariaDB が送り主がいなくなった後に実行して確定させることがある。起動し直したプロセスがその前に行を読むと、行はあるのにルールは動いていない、が次の起動まで続く（削除なら、行はないのにルールが動く）。これを防ぐため、書き込みは 1 本の接続でし、その接続がノードごとのロック（`GET_LOCK`。名前は `rproxy-node-` と `node` の SHA-256 の先頭 32 桁）を持つ。MariaDB はその接続の文を終えるまでロックを放さないので、起動時はロックを取ってから行を読む。2 秒たっても放されなければ（ホストが止まり MariaDB が気づいていない、文が行のロックを待っている）、持っている接続を `KILL CONNECTION` で終わらせ（同じユーザーの接続なので追加の権限は要らない。その書き込みは取り消されるか確定する）、`restore.wait`（warn、`connection`）を出す。さらに 10 秒たっても取れなければ `degraded`（`part: "db"`）を出して、そのまま読む。引き継ぎ（SIGUSR2）では、古いプロセスが drain に入るときに接続を閉じてロックを放し、新しいプロセスが次の書き込みで取る。同じ `node` で 2 つのプロセスを同時に動かさないこと（後から起動した方が先の方の接続を終わらせる）。
 - テーブルの定義と GRANT は UI リポジトリの `db/` の migration に置く。rproxy が使う定義：
 
 ```sql

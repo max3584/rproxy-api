@@ -378,6 +378,8 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_kill_under_traffic_comes_back_with_the_same_rules` | TCP・UDP・HTTP を流している間に kill。起動し直すと `/readyz` が最初に 200 を返したときにはルールがすべてそろっていて（`GET /rules` が kill の前と同じ。数・`started_at` を除く）、流れ、数は 0 から（`counters_since` が起動の時刻） |
 | `kills_during_a_live_upgrade_leave_a_service_that_starts_again` | 引き継ぎ（SIGUSR2）の途中（すぐ・`handoff.start`・`handoff.received`・`handoff.sent`・`restore.start`・`handoff.ready` の直後）に古いプロセス・新しいプロセス・両方を kill。準備の前に新しいプロセスが死んだら古いプロセスが変更も含めて動き続け、古いプロセスだけが死んだら新しいプロセスは引き継ぐか自分で終わる（止まったままにならない）。どの場合も起動し直すと、ルール・制御 API（TCP と Unix ソケット）が戻る |
 | `stored_rules_survive_kills_with_mariadb` | `persist: true` のトークンでルールの作成・変更・削除を 6 本で続けている間に kill。起動し直すと、各ルールは最後に答えた変更のとおりか、kill のときに送っていた変更のとおり（`origin: api`・`persisted: true`）で、`rproxy_rules` の行とも一致する |
+| `a_write_still_running_at_the_kill_is_read_after_it_is_done` | kill のときに送っていた書き込み（作成・削除）が MariaDB でまだ動いている（テストが行のロックで止める。CI では遅い確定で起きた）。起動し直したプロセスは、その書き込みが終わってから行を読む（ノードのロックを待つ）ので、作ったルールは動き、消したルールは戻らない（行とルールが食い違わない）。終わらない書き込みは 2 秒で `KILL` して（`restore.wait`）から読む |
+| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | 引き継ぎ（SIGUSR2）の後、drain している古いプロセスはノードのロックを放し、新しいプロセスの書き込みがロックを持つ |
 | `stored_rule_sets_survive_kills_with_mariadb` | `persist: true` のトークンでルールの組を世代を上げながら `PUT` し続けている間に kill。起動し直すと、組は最後に答えた世代か kill のときに送っていた世代で、その世代のルールがちょうどそろう |
 
 ## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
