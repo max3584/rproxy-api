@@ -104,7 +104,8 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | `RPROXY_API_LOCKOUT_FAILURES` / `_WINDOW` / `_DURATION` | `--api-lockout-failures` / `-window` / `-duration` | `20` / `1m` / `5m` | TCP の制御 API で認証の失敗（401）が続いた送信元を `429 locked_out` で止める（既定で有効。`0` で止めない。Unix ソケットは対象外）（#167） |
 | `RPROXY_API_LOCKOUT_EXEMPT` | `--api-lockout-exempt` | なし | 一時停止しない送信元（カンマ区切りの CIDR）。検証済みのクライアント証明書（mTLS）の接続も止めない（v0.4） |
 | `RPROXY_FILES_TRUSTED_DIRS` | `--files-trusted-dirs` | なし | ルールが指すファイルを root のものでも使うディレクトリ（`:` か `,` 区切りの絶対パス。Kubernetes の Secret のボリューム）。設定ファイルの `global.files.trusted_dirs` があればそちら（v0.4、docs/PERMISSIONS.md） |
-| `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する（#144、docs/API.md の「API で作ったルールの保存」） |
+| `RPROXY_NODE_NAME` | `--node-name` | ホスト名 | `rproxy_rules` での名前。起動時はこの名前の行だけを復元する。ノードごとに違う名前にする（同じ名前のプロセスが 2 つあると、後の方は保存しない。#144、docs/API.md の「API で作ったルールの保存」） |
+| `RPROXY_PERSIST_CHECK_SECS` | `--persist-check-secs` | `60` | 自分の `node` の `rproxy_rules` の行と、API で作った動いているルールを照らす間隔（秒）。書けなかったものを書き直し、行に合わせる。0 で起動時にロックが取れなかったときだけ（v0.4.14） |
 | `RPROXY_HANDOFF_SOCKET` / `_TIMEOUT` / `_DRAIN` | `--handoff-socket` / `-timeout` / `-drain` | `/run/rproxy/handoff.sock` / `30s` / `5m` | 再起動なしの更新（#174）：SIGUSR2 か `POST /admin/upgrade` で、ディスクの上のバイナリに待ち受けのソケットを渡す。引き継ぎ用のソケット、新しいプロセスを待つ時間、古いプロセスが今の接続を待つ時間。docs/UPGRADE.md |
 | `RPROXY_SHUTDOWN_DELAY` / `RPROXY_SHUTDOWN_DRAIN` | `--shutdown-delay` / `--shutdown-drain` | `0s` / `0s` | SIGTERM での終わり方（v0.4.1）。既定はすぐ止める（今までと同じ）。`DELAY` の間は `/readyz` を 503 `draining` にしたまま受け付け（前のロードバランサから外れるのを待つ）、続けて待ち受けを閉じて今の接続の終わりを `DRAIN` まで待つ。その間、制御 API の読むだけの要求は答え、変更は `503 shutting_down`。2 回目の SIGTERM ですぐ止まる。それぞれ 1 時間まで。systemd での推奨値は下の「SIGTERM での終わり方」 |
 | `RPROXY_UPDATE` | `--update` | `off` | 自動更新（コンテナ。#174）：`off`・`check`・`auto`。`RPROXY_UPDATE_PIN`・`_SOURCE`・`_CACHE`・`_INTERVAL`・`_PUBKEY`・`_HEALTHY` も。イメージの入口は `rproxy-api launch`。docs/UPGRADE.md |
@@ -355,8 +356,9 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `conn.retarget` | UDP セッションの転送先の切り替え（名前解決の変化、または宛先が down になった：`reason: target down`） |
 | `target.down` / `target.up` | 複数の宛先（`targets`）・`health_check` のあるルールで、宛先が down / up になった（`reason: health_check` / `outlier`。`outlier` は実際の通信の失敗で外した・戻した：`cause`、`ejection_secs`）。`http` のサービスの `outlier_detection` でも（`service`、`server`） |
 | `dns.change` / `dns.stale` | 転送先の名前解決結果の変化 / 解決失敗（前回の結果を使い続ける） |
-| `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数。`restore.conflict` は `rproxy_rules` と UI の `forward_rules` に同じキーがあり UI の行を使った、#144） |
+| `restore.*` | 起動時の DB からの復元（`restore.paused` は UI で一時停止していて作らなかったルールの数。`restore.conflict` は `rproxy_rules` と UI の `forward_rules` に同じキーがあり UI の行を使った、#144。`restore.wait` はノードのロックを 8 秒で取れず、読める行で復元した（docs/API.md の「API で作ったルールの保存」）） |
 | `rule.persist` | `persist: true` のトークンの API のルール（`origin: "api"`）を `rproxy_rules` に書いた・消した（`action: save` / `delete`、`token`。#144） |
+| `persist.reconcile` / `persist.duplicate_node` / `persist.lock` | 定期の照合で書き直した・行に合わせてルールを作った・置き換えた・消した（`action`）、ノードのロックをほかの生きている接続が持ち続けている（error。同じ `node` の名前のプロセスがほかにある見込み、`connection`・`host`）、ロックをまた持った（docs/API.md の「API で作ったルールの保存」） |
 | `ruleset.persist` / `ruleset.restore` / `restore.rulesets` | `persist: true` のトークンのルールの組を `rproxy_rule_sets` に書いた・消した（`action: save` / `delete`、`token`。v0.4.2、#241）/ 起動時に組を 1 つ戻した（`ruleset`・`generation`・`etag`）/ 戻した組の数 |
 | `acme.order` / `acme.issue` / `acme.renew` / `acme.revoke` / `acme.ari` / `acme.error` / `acme.rate_limited` | ACME の注文を始めた / 証明書を取った / 更新した / 失敗した（`retry_at`）/ 発行の上限で後に回した（docs/ACME.md） |
 | `acme.account` / `acme.dns` / `acme.challenge` / `acme.answer` / `acme.listening` | ACME のアカウントを作った・無効にした / DNS-01 の TXT を書いた・消した / challenge を用意した・答えた / `http01_listen` で待ち受けを始めた。秘密は出さない |

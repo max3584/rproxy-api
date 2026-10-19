@@ -378,6 +378,13 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_kill_under_traffic_comes_back_with_the_same_rules` | TCP・UDP・HTTP を流している間に kill。起動し直すと `/readyz` が最初に 200 を返したときにはルールがすべてそろっていて（`GET /rules` が kill の前と同じ。数・`started_at` を除く）、流れ、数は 0 から（`counters_since` が起動の時刻） |
 | `kills_during_a_live_upgrade_leave_a_service_that_starts_again` | 引き継ぎ（SIGUSR2）の途中（すぐ・`handoff.start`・`handoff.received`・`handoff.sent`・`restore.start`・`handoff.ready` の直後）に古いプロセス・新しいプロセス・両方を kill。準備の前に新しいプロセスが死んだら古いプロセスが変更も含めて動き続け、古いプロセスだけが死んだら新しいプロセスは引き継ぐか自分で終わる（止まったままにならない）。どの場合も起動し直すと、ルール・制御 API（TCP と Unix ソケット）が戻る |
 | `stored_rules_survive_kills_with_mariadb` | `persist: true` のトークンでルールの作成・変更・削除を 6 本で続けている間に kill。起動し直すと、各ルールは最後に答えた変更のとおりか、kill のときに送っていた変更のとおり（`origin: api`・`persisted: true`）で、`rproxy_rules` の行とも一致する |
+| `a_write_still_running_at_the_kill_is_read_after_it_is_done` | kill のときに送っていた書き込み（作成・削除）が MariaDB でまだ動いている（テストが行のロックで止める。CI では遅い確定で起きた）。起動し直したプロセスはノードのロックを待ってから行を読む（その間は ready にならない）。確定していない書き込みは接続と一緒に取り消されるので、作成は行もルールもなく、削除は両方残る（行とルールが食い違わない）。書き込みの時間を超えて止めた削除は、ロック待ちの時間切れで取り消され、新しいプロセスはロックを取れる（`restore.wait` なし） |
+| `a_held_node_lock_holds_up_the_start_only_for_its_bound` | ノードのロックをほかの接続が持ったまま：起動は `STARTUP_WAIT`（8 秒）だけ待ち、`restore.wait`（持ち主の `host`）を出して、読める行を復元する |
+| `the_periodic_check_makes_the_running_rules_what_the_rows_say` | 定期の照合（`RPROXY_PERSIST_CHECK_SECS=1`）：DB に直接足した行のルールが動き、書き換えた行でルールが置き換わり、消した行のルールが消える（`persist.reconcile`） |
+| `the_periodic_check_does_not_undo_a_change_under_way` | 書き込みが行のロックで止まっている PATCH（失敗して `persisted: false`）：その間に照合は古い行へ戻さず、終わった後に照合が動いているルールを書き直す |
+| `a_second_process_with_the_same_node_name_does_not_take_the_lock` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、書き込みはすぐに `persisted: false`、`persist.duplicate_node` を出す。1 つ目はロックを持ったまま書ける |
+| `without_the_database_a_change_answers_at_once` | DB に届かない：変更はすぐに `persisted: false` で答える |
+| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | 引き継ぎ（SIGUSR2）の後、drain している古いプロセスはノードのロックを放し、新しいプロセスの書き込みがロックを持つ |
 | `stored_rule_sets_survive_kills_with_mariadb` | `persist: true` のトークンでルールの組を世代を上げながら `PUT` し続けている間に kill。起動し直すと、組は最後に答えた世代か kill のときに送っていた世代で、その世代のルールがちょうどそろう |
 
 ## 結合テスト：変更前の差分（`tests/plan.rs`、#169）

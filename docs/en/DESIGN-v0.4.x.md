@@ -241,3 +241,14 @@ On one port's `terminate` rule (`http` rules included), pass the source differen
 - On connections received with `proxy_protocol` (#296) the header's client is written (as with the rule's `source_ip`).
 - Handoff and storage: only added to the rule's shape (`tls.routes[]`). The database's `options.tls` takes the same shape. The Traefik converter turns `proxyProtocol.version`s that differ between routers into route `source_ip`s (for routers that do not terminate).
 - Tests: unit (validation in `tls::config`, round trip and `in_place` in `config::plan`), `tests/route_source_ip.rs`.
+
+## 11. The write queue of API storage (v0.4.14, #303)
+
+A process restarted right after kill -9 read `rproxy_rules` before the stopped process's write had committed: a row was there but its rule did not run (`stored_rules_survive_kills_with_mariadb` in CI). The fix (the owner's decision):
+
+- Every database job goes through one queue, run in order by one worker that holds the one connection and the node's lock (`GET_LOCK`) (`config::persist::queue`). API calls queue their write and wait for its commit. Reads (startup, the check) go through the same queue, so nothing stale is read inside the process.
+- Writes are transactions with a time limit (`max_statement_time` and `innodb_lock_wait_timeout` 3 seconds, `wait_timeout` 30 seconds with pings). A stopped process's write also ends within the limit, so the startup waits for the lock only that long (8 seconds) and then reads. No `KILL CONNECTION`. Without the lock it starts from what it can read and checks again once it has the lock.
+- The periodic check (default 60 seconds), when the queue is empty, no API change is under way and the lock can be had without waiting: writes again what did not go through, then fixes only `origin: api` rules to match the rows. Otherwise it waits for the next round.
+- A process with the same `node` name does not have the lock taken from it; the other's writes answer `persisted: false` and it logs `persist.duplicate_node`.
+- The queue is behind a trait (`PersistQueue`); the only implementation now is in-process (no new dependency). An external queue (Redis or the like) can replace it without changing the callers.
+- Rule sets (`rproxy_rule_sets`) are written through the same queue. The check only writes again sets that did not go through; it does not change running sets to match their rows (that needs the owner and generation rules).

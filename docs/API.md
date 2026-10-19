@@ -594,6 +594,13 @@ global:
 - 書くのは作成・変更・削除の応答の前。`api` のルールは、どのトークンで変えても・消しても行を書き直す・消す（行がルールと食い違わないように）。`persist: true` のトークンでも、`dynamic` のルール（UI・保存しないトークンのもの）を変えたときは保存しない。
 - 表示：`origin: "api"` のルールに `persisted`（行が最新か）・`created_by`（作ったトークンの名前）・`created_at`（Unix 秒）。書けなかったとき（DB に届かない、テーブルがない）はルールを動かしたまま `persisted: false`、ログに `event = "degraded"`（`part: "db"`）。`RPROXY_DATABASE_URL` がなければ保存しない（`persisted: false`）。保存したら `rule.persist`（`action: save` / `delete`、`token`）。
 - 起動時は UI の `forward_rules` を復元してから、`rproxy_rules` の自分の `node`（`--node-name` / `RPROXY_NODE_NAME`、既定はホスト名）の行を `origin: "api"` で復元する。同じキーが両方にあれば UI の行を使い、`restore.conflict`（warn）を出す。テーブルが読めなければ `degraded`（`part: "db"`）を出して、UI のルールだけで起動する。`spec_version` がこの版より新しい行は `restore.skip` で読み飛ばす。
+- 書き込みの道（v0.4.14）：DB への仕事（ルール・組の書き込み、起動時と定期の読み込み、ノードのロック）はすべて 1 本の列に並び、1 つの係が 1 本の接続で順に実行する。API の変更は列に入れて確定（COMMIT）を待ってから答える（`persisted: true` は DB で確定したこと）。列がいっぱい（256 件）・DB に届かないときはすぐに `persisted: false` で答え、待ち続けない。
+  - 書き込みは 1 件ずつのトランザクションで、接続のセッションは 1 つの文を 3 秒で終わらせる（`max_statement_time`・`innodb_lock_wait_timeout`）。止まったプロセスが送っていた書き込みも、6 秒（文と COMMIT）のうちに確定か取り消しで終わる（確定する前に接続が切れたものは MariaDB が取り消す）。
+  - 接続はノードごとのロック（`GET_LOCK`。名前は `rproxy-node-` と `node` の SHA-256 の先頭 32 桁）を持つ。MariaDB はその接続の文を終えるまでロックを放さないので、起動時はロックを最大 8 秒待ってから行を読む（`kill -9`・OOM killer の直後の起動で、確定の途中だった書き込みより先に読まない）。取れなければ読める行で復元して `restore.wait`（warn、持っている接続の `connection`・`host`）を出し、5 秒ごとにロックを試し、取れたら行と照らし直す。セッションの `wait_timeout` は 30 秒で（空いている接続は 10 秒ごとに ping）、ホストごと止まって閉じられなかった接続も MariaDB がそのうちに切る。
+  - 定期の照合（`RPROXY_PERSIST_CHECK_SECS`、既定 60 秒、0 で起動時にロックが取れなかったときだけ）：列が空で API の変更が途中でないときだけ、ロックを待たずに取れたら、まず書けなかったもの（`persisted: false` のルール・組、消せなかった行）を書き直し、次に自分の `node` の行に合わせて `origin: "api"` のルール（組のものを除く）を作る・置き換える・消す（行が正：再起動で動くのは行のほう。`persist.reconcile`）。UI・固定・組のルールには触らない（そのキーの行は `restore.conflict` を 1 回出して残す）。組（`rproxy_rule_sets`）は書き直すだけで、動いている組は変えない。取れなければ次の回に回す。
+  - `node` の名前はノードごとに違うこと（既定はホスト名）。同じ名前のプロセスがほかに動いていると、後から起動した方はロックを取らず（取り上げない）、その書き込みは `persisted: false` になり、ロックが 46 秒（`wait_timeout` と書き込みの時間より長く）取れないままなら `persist.duplicate_node`（error、相手の `connection`・`host`）を出す。
+  - 引き継ぎ（SIGUSR2）では、古いプロセスが drain に入るときに途中の変更と列を終えてから接続を閉じてロックを放し、新しいプロセスが取る。
+  - 列は trait（`config::persist::queue::PersistQueue`）の後ろにあり、今はプロセスの中の実装（上限つきの channel と 1 つのタスク）だけ。外の列（Redis など）に替えても呼び出し側は変わらない。
 - テーブルの定義と GRANT は UI リポジトリの `db/` の migration に置く。rproxy が使う定義：
 
 ```sql
