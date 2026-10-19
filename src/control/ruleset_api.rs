@@ -80,6 +80,11 @@ pub async fn put(
 	let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 	let admin = principal.has(crate::control::auth::Scope::Admin);
 	let opts = PutOptions { if_match: if_match(&headers)?, dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
+	// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
+	let _change = match state.registry.persist().filter(|_| !dry_run) {
+		Some(store) => Some(store.changing().await),
+		None => None,
+	};
 	let result = state.registry.put_ruleset(&name, req, opts).await;
 	if !dry_run {
 		audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
@@ -128,6 +133,10 @@ pub async fn delete(
 	let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 	let admin = principal.has(crate::control::auth::Scope::Admin);
 	let store = set_store(&state, &principal, &name);
+	let _change = match state.registry.persist() {
+		Some(store) => Some(store.changing().await),
+		None => None,
+	};
 	let result = state.registry.delete_ruleset(&name, if_match(&headers)?, drain, &may_use_ports, (&principal.name, admin)).await;
 	audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
 	result?;

@@ -171,6 +171,11 @@ struct Options {
 	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
+	/// Seconds between checks of this node's rows in rproxy_rules against the running
+	/// rules made through the API (writes that did not go through are written again,
+	/// the rows win); 0: only after a start that found the node's lock held
+	#[arg(long, env = "RPROXY_PERSIST_CHECK_SECS", default_value_t = 60)]
+	persist_check_secs: u64,
 	/// Unix socket for live upgrades [default: /run/rproxy/handoff.sock] (v0.4, #174)
 	#[arg(long, env = "RPROXY_HANDOFF_SOCKET")]
 	handoff_socket: Option<PathBuf>,
@@ -1007,6 +1012,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 				vec![]
 			}
 		};
+		// a write an earlier process of this node left behind is done first
+		if let Some(store) = registry.persist() {
+			store.wait_for_earlier_writes().await;
+		}
 		let stored = match registry.persist() {
 			Some(store) => match store.load().await {
 				Ok(rows) => rproxy_api::config::persist::without_conflicts(&ui, rows),
@@ -1040,6 +1049,11 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 					"stored rule sets are not restored"),
 			}
 		}
+	}
+
+	// pings, the node's lock while another connection holds it, the periodic check
+	if let Some(store) = registry.persist() {
+		store.spawn_background(&registry, (opts.persist_check_secs > 0).then(|| Duration::from_secs(opts.persist_check_secs)));
 	}
 
 	// GET /readyz (#28): the restore is done

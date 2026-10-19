@@ -408,6 +408,7 @@ async fn create(
 	// #144: rules of a persist: true token are stored in rproxy_rules
 	let store = state.registry.persist().filter(|_| principal.persist && Features::CURRENT.persistence).cloned();
 	let origin = if store.is_some() { Origin::Api } else { Origin::Dynamic };
+	let _change = changing(&state).await;
 	let result = async {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
 		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
@@ -417,6 +418,16 @@ async fn create(
 	audit(&principal, &client, "create", &rule, &result);
 	let view = persisted(&state, store.as_deref(), result?, &principal).await;
 	Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// Held by a change to rules from before it changes the registry until the row
+/// is written: the periodic check of the stored rules waits for none of them
+/// (`persist::Store::reconcile`).
+async fn changing(state: &AppState) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+	match state.registry.persist() {
+		Some(store) => Some(store.changing().await),
+		None => None,
+	}
 }
 
 /// Writes an `api` rule's row after a change and answers its view with `persisted`.
@@ -452,6 +463,7 @@ async fn update(
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
+	let _change = changing(&state).await;
 	let result = async {
 		check_rule_ports(&state, &principal, &key).await?;
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
@@ -482,6 +494,7 @@ async fn delete(
 		}
 		None => None,
 	};
+	let _change = changing(&state).await;
 	// #144: the row of an api rule goes with it
 	let stored = match state.registry.persist() {
 		Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),

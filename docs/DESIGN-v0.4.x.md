@@ -241,3 +241,14 @@ rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かっ
 - `proxy_protocol`（#296）で受けた接続では、ヘッダのクライアントを書く（ルールの `source_ip` と同じ）。
 - 引き継ぎ・保存：ルールの形（`tls.routes[]`）に足すだけ。DB の `options.tls` にも同じ形で書ける。Traefik の変換は、ルーターごとに違う `proxyProtocol.version` を route の `source_ip` にする（終端しないルーターだけ）。
 - 試験：単体（`tls::config` の検証、`config::plan` の round trip と `in_place`）、`tests/route_source_ip.rs`。
+
+## 11. API の保存の書き込みの列（v0.4.14、#303）
+
+kill -9 の直後に起動し直したプロセスが、止まったプロセスの書き込みの確定より先に `rproxy_rules` を読み、行はあるのにルールが動かない、が起きた（CI の `stored_rules_survive_kills_with_mariadb`）。直し方（オーナーの決定）：
+
+- DB への仕事はすべて 1 本の列を通り、1 つの係が 1 本の接続とノードのロック（`GET_LOCK`）を持って順に実行する（`config::persist::queue`）。API は入れて確定を待つ。読み込み（起動時・照合）も同じ列を通るので、プロセスの中で古いものを読まない。
+- 書き込みは時間に上限のあるトランザクション（`max_statement_time`・`innodb_lock_wait_timeout` 3 秒、`wait_timeout` 30 秒と ping）。止まったプロセスの書き込みも上限のうちに終わるので、起動はロックをその間（8 秒）だけ待って読む。`KILL CONNECTION` は使わない。取れなければ読めるもので始め、取れたら照らし直す。
+- 定期の照合（既定 60 秒）は、列が空で API の変更が途中でないときに、ロックを待たずに取れたら：書けなかったものを書き直し、行に合わせて `origin: api` のルールだけを直す。取れなければ次の回へ。
+- 同じ `node` の名前のプロセスからはロックを取り上げず、書き込みを `persisted: false` にして `persist.duplicate_node` を出す。
+- 列は trait（`PersistQueue`）の後ろに置き、今はプロセスの中の実装だけ（依存を足さない）。外の列（Redis など）に替えても呼び出し側は変わらない。
+- 組（`rproxy_rule_sets`）も同じ列で書く。照合は書けなかった組を書き直すだけで、動いている組を行に合わせて変えることはしない（持ち主・世代の扱いが要るため）。
