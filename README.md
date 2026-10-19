@@ -129,7 +129,7 @@ v0.4 で足した項目（どれも動く。ルールに付ける設定と `glob
 | 固定ルールのファイルが読めない（権限） | 固定ルールなしで起動する（`part: static_rules`） |
 | `global.access_log` のディレクトリに書き込めない | アクセスログをメインのログに出す（`part: global.access_log`） |
 | DB に接続できない | DB のルールなしで起動する（`restore.error`） |
-| 同じ `RPROXY_NODE_NAME` の生きているプロセスが DB のノードのロックを持っている（例外：起動しない） | 約 40 秒待ってから `persist.duplicate_node`（error）と `fatal` を出して終わる（終了コード 1。systemd はこの誤りを出しながら再起動を繰り返す）。名前をノードごとに変える。kill の後に残った接続や引き継ぎ（SIGUSR2）では止まらない（docs/API.md の「API で作ったルールの保存」） |
+| 同じ `RPROXY_NODE_NAME` の生きているプロセスが DB のノードのロックを持っている（例外：起動しない） | 約 40 秒待ってから `persist.duplicate_node`（error）と `fatal` を出して終わる（終了コード 1。systemd はこの誤りを出しながら再起動を繰り返す）。待ち受けを開く前に確かめる。名前をノードごとに変える（新旧が重なる入れ替え（blue/green、Kubernetes の `maxSurge`）では古い方を先に止めるか、名前を分ける）。kill の後に残った接続や引き継ぎ（SIGUSR2）では止まらない（docs/API.md の「API で作ったルールの保存」） |
 | `rproxy_rules` を読めない・書けない（テーブルがない、権限、DB が落ちている） | 起動時は UI のルールだけを復元する。API のルールは動かしたまま `persisted: false`（`part: db`、#144） |
 | `global.geoip` のデータベースが読めない（権限）・新しい版が壊れている | 読めるまで国・ASN は「分からない」（`unknown` の扱い）、読み直しでは今のものを使い続ける（`part: geoip`） |
 | `global.performance` の `busy_poll_usecs` を設定できない・`cpu_affinity` に存在しない CPU | `SO_BUSY_POLL` なしで動く / その CPU を除く（`part: global.performance.*`） |

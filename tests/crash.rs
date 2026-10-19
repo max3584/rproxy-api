@@ -1181,8 +1181,16 @@ async fn a_second_process_with_the_same_node_name_does_not_start() {
 	};
 	let first = holder().await;
 	assert!(first.is_some());
+	// a static rule of the second process: it never listens (the check comes before any listener)
+	let static_port = free_port();
+	fs::write(
+		dir_b.join("rproxy.yaml"),
+		format!("version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {static_port}, remote_addr: 127.0.0.1, remote_port: {}}}\n", backend.port()),
+	)
+	.unwrap();
+	let env_b = [env[0].clone(), env[1].clone(), ("RPROXY_CONFIG", dir_b.join("rproxy.yaml").display().to_string())];
 	let started = Instant::now();
-	let mut b = Server::start(&dir_b, "b", api_b, &env);
+	let mut b = Server::start(&dir_b, "b", api_b, &env_b);
 	let deadline = started + rproxy_api::config::persist::DUPLICATE_STARTUP_WAIT + Duration::from_secs(20);
 	let status = loop {
 		if let Some(status) = b.child.try_wait().unwrap() {
@@ -1190,6 +1198,7 @@ async fn a_second_process_with_the_same_node_name_does_not_start() {
 		}
 		let ready = reqwest::Client::new().get(format!("http://127.0.0.1:{api_b}/readyz")).timeout(Duration::from_secs(1)).send().await;
 		assert!(!ready.is_ok_and(|r| r.status() == StatusCode::OK), "the second process became ready:\n{}", b.log());
+		assert!(TcpStream::connect(("127.0.0.1", static_port)).await.is_err(), "the second process listens:\n{}", b.log());
 		assert!(Instant::now() < deadline, "the second process still runs:\n{}", b.log());
 		tokio::time::sleep(Duration::from_millis(500)).await;
 	};

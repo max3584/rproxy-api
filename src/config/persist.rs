@@ -936,9 +936,19 @@ impl Store {
 				}
 			}
 		}
-		// 2. the rows, after every write queued so far
-		let queued_before = self.seq.load(Ordering::Acquire);
-		let rows = self.load().await?;
+		// 2. the rows, after every write queued so far (the count and the read taken
+		// together under `order`, where writes are counted and queued)
+		let (queued_before, read) = {
+			let _order = self.order.lock().await;
+			(self.seq.load(Ordering::Acquire), self.enqueue(Job::ReadRules))
+		};
+		let result = read.await;
+		self.note_lock(&result, false);
+		let rows = match result {
+			Ok(Done::Rules(rows)) => rows,
+			Ok(other) => return Err(format!("unexpected answer {other:?}")),
+			Err(e) => return Err(e.to_string()),
+		};
 		// 3. compared and applied alone: no change is half way through, and none
 		// queued a write after the read (the rows would not show it)
 		let Ok(_alone) = self.changes.clone().try_write_owned() else { return Ok(Reconciled { skipped: Some("changes"), ..out }) };

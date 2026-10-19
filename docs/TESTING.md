@@ -309,6 +309,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | テスト | 確かめること |
 |---|---|
 | `persist_tokens_store_their_sets` | `persist: true` のトークンの組は 1 行（`generation`・`etag`・持ち主・ルール）で保存され、応答・`GET /rulesets`・`GET /rulesets/{name}` に `persisted`。dry run と `persist` のないトークンの組は書かない。保存した組は `admin` が変えても行が変わる（持ち主はそのまま）。書けなければ `persisted: false`。`DELETE` で行が消える。`features.ruleset_persistence` |
+| `a_set_draining_holds_up_neither_other_sets_nor_the_release` | `DELETE /rulesets/a?drain_secs` の drain の間：ほかの組の `PUT` は待たずに `persisted: true` で書かれ、引き継ぎの `release` もすぐ終わる |
 | `stored_sets_are_restored` | 保存した組が `generation`・`etag`・持ち主ごと戻る。先に戻したルールとキーが重なるルールだけ外して、残りを当てる。持ち主が戻るので、ほかのトークンは変えられない |
 | `sets_survive_a_restart_with_mariadb` | 本物のバイナリと MariaDB（`RPROXY_TEST_DATABASE_URL`）：テーブルがなくても起動し `persisted: false`。保存 → 再起動で戻る。ほかのノードの行は戻さない。新しい `generation` の行を古い `PUT` で書き換えない。`DELETE` で行が消える |
 
@@ -391,7 +392,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_held_node_lock_holds_up_the_start_only_for_its_bound` | ノードのロックを、生きている rproxy より長く何もしていない接続が持ったまま：起動は `STARTUP_WAIT`（8 秒）だけ待ち、`restore.wait`（持ち主の `host`）を出して、読める行を復元する |
 | `the_periodic_check_makes_the_running_rules_what_the_rows_say` | 定期の照合（`RPROXY_PERSIST_CHECK_SECS=1`）：DB に直接足した行のルールが動き、書き換えた行でルールが置き換わり、消した行のルールが消える（`persist.reconcile`） |
 | `the_periodic_check_does_not_undo_a_change_under_way` | 書き込みが行のロックで止まっている PATCH（失敗して `persisted: false`）：その間に照合は古い行へ戻さず、終わった後に照合が動いているルールを書き直す |
-| `a_second_process_with_the_same_node_name_does_not_start` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、`DUPLICATE_STARTUP_WAIT`（40 秒）まで待って、持ち主が文を送り続けている（生きている）ので `persist.duplicate_node`（error、`phase: startup`、持ち主の `host`）と `fatal`（`--node-name`・`RPROXY_NODE_NAME`）を出して 0 以外で終わる（ready にならない）。1 つ目はロックを持ったまま書ける |
+| `a_second_process_with_the_same_node_name_does_not_start` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、`DUPLICATE_STARTUP_WAIT`（40 秒）まで待って、持ち主が文を送り続けている（生きている）ので `persist.duplicate_node`（error、`phase: startup`、持ち主の `host`）と `fatal`（`--node-name`・`RPROXY_NODE_NAME`）を出して 0 以外で終わる（ready にならず、固定ルールの待ち受けも開かない）。1 つ目はロックを持ったまま書ける |
 | `a_duplicate_started_while_the_database_was_down_does_not_take_the_lock` | DB に届かないあいだに起動した同じ名前の 2 つ目のプロセス（テストの中継を後から開く）：ロックを取り上げず、書き込みはすぐに `persisted: false`、`DUPLICATE_AFTER` の後に `persist.duplicate_node` を出す。1 つ目はロックを持ったまま書ける |
 | `a_connection_opened_again_takes_the_lock_again` | 接続が切れた（MariaDB で KILL）後、ping が開き直した接続でロックを取り直す（書き込みを待たない） |
 | `a_live_upgrade_carries_what_was_not_written` | 古いプロセスで書けなかった変更（行のロックで止めた PATCH、`persisted: false`）のまま引き継ぐ：新しいプロセスはルールを変えたまま動かし、照合で古い行に戻さず、行を書き直す |
