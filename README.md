@@ -266,6 +266,14 @@ CrowdSec の判定で止める（L7 の `crowdsec` ミドルウェア、L4 の�
 | `proxy_v1` / `proxy_v2` | TCP は接続の先頭に、UDP（`proxy_v2` のみ）はデータグラムごとに PROXY protocol ヘッダを付ける | 転送先が PROXY protocol に対応していること。UDP は dnsdist・PowerDNS・Unbound と同じく、毎回のデータグラムにヘッダを付け、応答にはヘッダを付けない |
 | `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT` / `IPV6_TRANSPARENT`） | Linux、`CAP_NET_ADMIN`。IPv4 と IPv6。転送先からの戻りパケットが rproxy のホストを通ること（[docs/TRANSPARENT.md](docs/TRANSPARENT.md)） |
 
+rproxy の前にロードバランサなどがいて PROXY protocol を付けて送ってくるときは、ルールの `proxy_protocol` でヘッダを受け取る（v0.4.13。`tcp` のルール）。信じるのは `from` に書いた前段からのヘッダだけで、`allow_from`・`limits`・ログ・`X-Forwarded-For`・上の `source_ip` などはヘッダのクライアントで動く。前段のアドレスはログの `proxy_peer`。
+
+```json
+"proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}
+```
+
+`required`（既定 `true`）は `from` からの接続がヘッダを付けてこなければ断る。`from` の外からヘッダで始まる接続も断る。詳しくは [docs/SOURCE-IP.md](docs/SOURCE-IP.md) と [docs/API.md](docs/API.md) の「PROXY protocol を受け取る」。
+
 `transparent` を使うには、rproxy に `CAP_NET_ADMIN` を与え、転送先からの戻りパケットを rproxy のホスト自身で受け取るポリシールーティングを設定する。
 apt・install.sh で入れた場合は、ユニットが `CAP_NET_ADMIN` を与えているので権限の設定は要らない。ポリシールーティング（下の 1）は install.sh でまとめて入れられる（起動時に毎回設定する `rproxy-transparent-routing.service` を作る）。
 
@@ -332,8 +340,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP でトークン・制御 API の証明書・ルールの証明書・CrowdSec の鍵を読み直した（読めなければ今のものを使い続ける）。`reload.tokens` はトークンファイルが変わったときにも出る（`reason: "file changed"`、数の `tokens` だけ。誤りのある版の警告は版ごとに 1 回） |
 | `geoip.reload` | `global.geoip` のデータベースを読んだ・読み直した（`db`：`country` / `asn`、`path`、`build_epoch`）。読めないときは `degraded`（`part: geoip`）で今のものを使い続ける |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |
-| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn` |
-| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`。`client`（`IP:ポート`）、`sni`。UDP は送信元ごとに間引く（`suppressed`：その前に省いた行の数）。HTTP/3 は `transport: quic` |
+| `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn`。ルールの `proxy_protocol` でヘッダを受けた接続は、`client` がヘッダのクライアント、`proxy_peer` が前段（`conn.denied`・`conn.limited`・`conn.error`・`http.access` も同じ） |
+| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`・`proxy_protocol`（`from` の前段のヘッダがない・壊れている、`error`）・`proxy_protocol_untrusted`（`from` の外からのヘッダ、`version`）。`client`（`IP:ポート`）、`sni`。UDP は送信元ごとに間引く（`suppressed`：その前に省いた行の数）。HTTP/3 は `transport: quic` |
 | `conn.limited` | ルールの `limits`（#165）で断った接続（UDP はデータグラム）：`reason` は `max_connections`・`source_connections`・`new_connections`・`packets`、`transport` は `tcp`・`udp`、`client`。送信元ごとに間引く（`suppressed`） |
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗 |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |

@@ -1422,6 +1422,9 @@
             "type": "string",
             "description": "How long a connection to a target may take before the next target is tried (tcp without http; 100ms-10m; v0.4.3, features.connect_timeout). Left out: 5s with other targets to fall back on, else the OS's."
           },
+          "proxy_protocol": {
+            "$ref": "#/components/schemas/ProxyProtocolIn"
+          },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
           },
@@ -1504,6 +1507,14 @@
           "connect_timeout": {
             "type": "string",
             "description": "Replaces connect_timeout when present (0s removes it; left out keeps it)."
+          },
+          "proxy_protocol": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProxyProtocolIn"
+              }
+            ],
+            "description": "Replaces proxy_protocol when present ({} removes it; left out keeps it). Takes effect from the next connection."
           },
           "udp_idle_secs": {
             "type": "integer",
@@ -1763,6 +1774,14 @@
           "connect_timeout": {
             "type": "string",
             "description": "Left out when not set."
+          },
+          "proxy_protocol": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProxyProtocolIn"
+              }
+            ],
+            "description": "Left out when not set; required is always shown."
           },
           "source_ip": {
             "$ref": "#/components/schemas/SourceIp"
@@ -2070,6 +2089,10 @@
               "connect_timeout": {
                 "type": "boolean",
                 "description": "connect_timeout of an L4 tcp rule (v0.4.3)"
+              },
+              "proxy_protocol_in": {
+                "type": "boolean",
+                "description": "proxy_protocol of a tcp rule: PROXY v1 / v2 headers read from trusted front ends (v0.4.13, #296)"
               }
             }
           },
@@ -2268,6 +2291,27 @@
           "port"
         ],
         "additionalProperties": false
+      },
+      "ProxyProtocolIn": {
+        "type": "object",
+        "description": "PROXY protocol v1 / v2 headers read from the front ends in from (tcp rules; v0.4.13, features.proxy_protocol_in, #296). The client of the header is used for allow_from, geoip, crowdsec, limits, bandwidth, logs, X-Forwarded-For and source_ip. A peer outside from that starts with a header is refused. {} means none.",
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 64,
+            "description": "The TCP peers (CIDR or single IP) whose headers are believed. Required and not empty; /0 is refused."
+          },
+          "required": {
+            "type": "boolean",
+            "default": true,
+            "description": "Refuse a connection from a peer in from that sends no header. false: without a header the peer's address is used."
+          }
+        }
       },
       "L4HealthCheck": {
         "type": "object",

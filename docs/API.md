@@ -143,8 +143,9 @@ tokens:
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
 | `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
-| `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS や PROXY ヘッダより前に切断する。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない）。断った数は `stats.denied`（UDP はデータグラムごと）、ログは `conn.denied`（`reason: allow_from`。UDP は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行。送信元を偽った大量のデータグラムに備えて、全体でも続けて 200 行、その後は 1 秒に 50 行まで。`suppressed` はその前に省いた行の数。v0.3.20 から。それより前の UDP は `debug` でだけ出ていた） |
-| `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS や PROXY ヘッダより前）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`。UDP は `allow_from` と同じく間引く） |
+| `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS より前に切断する（`proxy_protocol` のルールでは、`from` の前段からの接続はヘッダを読んでから、ヘッダのクライアントで判定する）。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない）。断った数は `stats.denied`（UDP はデータグラムごと）、ログは `conn.denied`（`reason: allow_from`。UDP は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行。送信元を偽った大量のデータグラムに備えて、全体でも続けて 200 行、その後は 1 秒に 50 行まで。`suppressed` はその前に省いた行の数。v0.3.20 から。それより前の UDP は `debug` でだけ出ていた） |
+| `proxy_protocol` | object | | 前段（ロードバランサ・別の rproxy・Kubernetes の Gateway など）が付ける PROXY protocol v1 / v2 のヘッダを読み、そのクライアントのアドレスを使う（v0.4.13、#296、`features.proxy_protocol_in`）。`{"from": [<CIDR>, ...], "required"?: bool}`：`from`（必須、空にできない。最大 64 件、`/0` は `invalid`）はヘッダを信じる TCP の接続元、`required`（既定 `true`）は `from` からの接続がヘッダを付けてこなければ断る。`from` の外からヘッダで始まる接続は断る。`tcp` のルールだけ（`udp` は `unsupported`）。一覧では `required` も出す。PATCH で付けると置き換え（`{}` で外す、省けば今のまま）、次の接続から効く。下の「PROXY protocol を受け取る」 |
+| `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで判定）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`。UDP は `allow_from` と同じく間引く） |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
 
@@ -760,7 +761,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 `features.limits`・`features.bandwidth` は true（形は上の表と docs/DESIGN-v0.4.md の 4・5）。
 
-- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS・PROXY ヘッダより前）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
+- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
 - 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールだけ。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
 - 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら、接続の残っていない古いものから忘れる。接続の残っている送信元は忘れない（数え直しで制限をすり抜けられないように。セキュリティレビュー L8）。表がそういう送信元でいっぱいのあいだ、新しい送信元は `limits` では断り（`reason: source_connections`）、`bandwidth` では 1 つの共有のバケツを使う）。`max_sources` は 1,000,000 まで。
 - `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
@@ -787,7 +788,7 @@ rules:
 
 - データベースは同梱しない。MaxMind の GeoLite2（アカウントを作って `geoipupdate` で取る）か、同じ項目（`country.iso_code`、なければ `registered_country.iso_code`、`autonomous_system_number`）を持つ mmdb を使う。ファイルはメモリに読み込み（mmap はしない）、`check_interval` ごとと SIGHUP で変わっていれば読み直す（`event: "geoip.reload"`）。読み直せない（書きかけ・壊れている・権限）ときは今のものを使い続ける（`event: "degraded"`、`part: "geoip"`。同じ問題は 1 回だけ）。起動時（と `--check-config`）は、ファイルがない・mmdb でないなら設定のエラーで起動しない。権限で読めないなら `degraded` を出して起動し、読めるまでそのデータベースの判定はすべて「分からない」になる。
 - 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（分かっている国か ASN が、そのリストに当たらなければ拒否。もう一方が分からなくても拒否する。セキュリティレビュー L18）。リストが要る国・ASN がどれも分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。**データベースが読めないときも `unknown` になる**ので、拒否に倒したいときは `unknown: deny` にする。データベースは 1 GiB まで（それより大きいファイルは読まない）。
-- L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS・PROXY ヘッダより前）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
+- L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
 - L7（ミドルウェアの `geoip`）：`global.trusted_proxies` で決めたクライアントの IP で判定し、拒否は `403`（`ip_allow` と同じ）。`http.access` の `refused_by: "geoip"`・`middleware`、`country`・`asn`。
 - `log_country: true` で、`conn.open`（TCP・UDP）と `http.access` に `country`（と `asn`）が付く（分からないときは付かない）。
 - 国のリストは `country_db`、ASN のリストは `asn_db` がないと `400 invalid`（設定ファイルは検証の誤り）。`PATCH` で `geoip` を付けると丸ごと置き換え、`{}` で外す（接続は切らない。次の接続・データグラムから）。
@@ -915,6 +916,28 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
 - `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
 
+### PROXY protocol を受け取る（v0.4.13、#296、`features.proxy_protocol_in`）
+
+前段（ロードバランサ・別の rproxy・Kubernetes の Gateway など）が PROXY protocol v1 / v2 のヘッダを付けて送ってくるとき、`tcp` のルールの `proxy_protocol` でヘッダを読み、そこに書かれたアドレスを本当のクライアントとして扱う。PROXY v2 で受けて PROXY v2 で送る（`source_ip: proxy_v2`）こともできる。
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25,
+ "remote_addr": "10.0.0.25", "remote_port": 25, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}}
+```
+
+- 信じるのは `from` の接続元（TCP の相手のアドレス、すぐ前の段）が送るヘッダだけ。ヘッダの中のアドレスでは判定しない。`from` は空にできず、`0.0.0.0/0`・`::/0` も `invalid`（誰のヘッダでも信じる設定は作れない）。
+- `from` の接続元からは、接続の最初にヘッダを読む（v1 か v2 かは先頭のバイトで見分ける）。`required: true`（既定）なら、ヘッダがなければ断る。`false` なら、ヘッダがなければ接続元のアドレスのまま。壊れた・長すぎる・届き終わらないヘッダはどちらでも断る。
+- `from` の外からの接続：ヘッダは読まず、ふつうの接続として扱う。ただし、ヘッダらしきもの（v2 の署名 `\r\n\r\n\0\r\nQUIT\n` か `PROXY `）で始まる接続は断る（`from` に前段を書き漏らしたことに気づけるように。そのヘッダがデータとして転送先に届くこともない）。クライアントから先に送るルール（TLS の `sni`・`terminate`、`http`）では最初のバイトを待って確かめる。サーバから先に送ることのある平文の TCP と STARTTLS では待たず、受け付けたときと転送先につながったとき（平文の TCP）にもう届いているバイトだけを見る。
+- 大きさの上限：v1 は 107 バイト（仕様の上限）、v2 は固定の 16 バイトの後が 4096 バイトまで（アドレスと TLV を合わせて。前段が付ける TLV はずっと小さい）。ヘッダは受け付けてから 5 秒以内に届き終わること（ゆっくり送る相手に接続を持たせ続けない。変えられない）。
+- v2 の TLV（ALPN・SNI・TLS の情報など）は読み飛ばす（転送先へは rproxy 自身が見たものを書く）。v2 の `LOCAL`（前段のヘルスチェック）、v1 の `UNKNOWN`、v2 の `AF_UNSPEC`・`AF_UNIX` は接続元のアドレスのまま。TCP の接続に UDP（`DGRAM`）のヘッダが来たら断る。
+- ヘッダのクライアントを使うところ：`allow_from`・`geoip`・`crowdsec`・`limits`（送信元ごと）・`bandwidth`（送信元ごと）、ログの `client`（`conn.open`・`conn.close`・`conn.error`・`conn.denied`・`conn.limited`・`http.access`）、`http` のルールの `X-Forwarded-For`・`X-Real-IP`（`global.trusted_proxies` で信じるかもこのアドレスで決める）、転送先への `source_ip`（`proxy_v1` / `proxy_v2` はヘッダのクライアントを書き、`transparent` はヘッダのクライアントを送信元にする。戻りの経路の前提は今までと同じ、docs/TRANSPARENT.md）。転送先へのヘッダの宛先のアドレスは、今までどおり rproxy が受けたアドレス。
+- 前段（ヘッダを送ってきた接続元）のアドレスとポートは、ログの `proxy_peer` に残す（ヘッダのない接続では省く）。
+- 断った接続は `stats.denied` に数え、`conn.denied` を `warn` で出す：`reason: proxy_protocol`（`from` の前段からのヘッダがない・壊れている・遅い。`client` は前段、`error` に理由）、`reason: proxy_protocol_untrusted`（`from` の外からのヘッダ。`version` に `v1` / `v2`）。
+- `required: false` のルールに、サーバから先に送るプロトコル（SMTP・MySQL など）でヘッダなしの接続が来ると、ヘッダを待つ 5 秒の後に通す。前段が必ずヘッダを付けるなら `required: true` のままにする。
+- HTTP/3（`http.http3`、UDP）にはヘッダがなく、QUIC の接続は接続元のアドレスで扱う。UDP の PROXY v2（データグラムごとのヘッダ）は後の段階（今は `udp` のルールに付けると `unsupported`）。
+- PATCH で変えると次の接続から効く（接続は切らない）。組の PUT・設定ファイルの再読み込みでもその場で変わる（`change: in_place`）。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -928,7 +951,7 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
-| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている接続はそのまま）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
+| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている接続はそのまま）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
 | `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |
@@ -1007,4 +1030,4 @@ v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自
 `forward_rules` のノードでの振り分けは UI 側でする（`target` 列、UI PR #103。ノードごとの DB のビューがその rproxy の行だけを見せる）ので、rproxy は `forward_rules` を絞り込まない。`rproxy_rules` は rproxy が自分の `node` の行だけを読む。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
-`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
+`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。

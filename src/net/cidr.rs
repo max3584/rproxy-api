@@ -38,6 +38,11 @@ fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
 }
 
 impl Cidr {
+	/// The prefix length (0 for a range holding every address of its family).
+	pub fn prefix(&self) -> u8 {
+		self.prefix
+	}
+
 	pub fn contains(&self, ip: IpAddr) -> bool {
 		let ip = canonical(ip);
 		ip.is_ipv4() == self.net.is_ipv4() && mask(ip, self.prefix) == self.net

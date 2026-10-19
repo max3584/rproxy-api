@@ -44,6 +44,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `entryPoints.<名前>.http.tls`、ルーターの `tls` | ルールの `tls.mode: terminate` |
 | `entryPoints.<名前>.http3` | `http.http3: true` |
 | `entryPoints.<名前>.forwardedHeaders.trustedIPs` | `global.trusted_proxies` |
+| `entryPoints.<名前>.proxyProtocol.trustedIPs`（受け取る PROXY protocol） | そのエントリポイントのルールの `proxy_protocol: {from: <trustedIPs>, required: false}`（v0.4.13。Traefik と同じく、ヘッダは付いていれば使う。`trustedIPs` のない形と `insecure: true` は変換せず、メモに出す。rproxy は `from` の外からのヘッダを断る） |
 | `accessLog.filePath` | `global.access_log`（書式は rproxy の JSON Lines。Traefik の書式やフィルタは変換しない） |
 | TCP のルーター（`HostSNI`、`tls.passthrough: true`） | `tls.mode: sni` の `tls.routes`（ルーターごとに 1 つ。名前が複数なら `server_names`）。`HostSNI(`*`)` がルールの転送先（なければ `unmatched: reject`） |
 | `HostSNIRegexp` の単純な接尾辞（`^.+\.example\.com$` / `^[^.]+\.example\.com$`） | `**.example.com`（何階層でも）/ `*.example.com`（1 階層） |
@@ -124,7 +125,6 @@ rproxy の ACME の HTTP-01 は、80 番の `http` のルールがリダイレ�
 
 - Traefik 自身のサービス（`api@internal` のダッシュボード、`ping@internal` など）：ルーターごと外す。管理画面は rproxy の UI（TCP-UDP-rproxy-ui）を使う
 - `metrics`：rproxy は制御 API の `GET /metrics` で Prometheus の形式を返す
-- 受け取る PROXY protocol（`entryPoints.<名前>.proxyProtocol`）：rproxy は読まない（前段が付ける `X-Forwarded-For` は `global.trusted_proxies` で信用できる）
 - HTTP と TCP のルーターが同じエントリポイントにあるとき：名前を指定した passthrough のルーターはまとめる。それ以外の TCP のルーター（TLS を終端する TCP のルーター、`HostSNI(`*`)`）は外す
 - `HostSNI(`*`)` の passthrough と、TLS を終端するルーターが同じエントリポイントにあるとき：終端する方を外す
 - 単純な接尾辞でない `HostSNIRegexp`、`ALPN()`、ラベルだけの `defaultRule`、Kubernetes の IngressRoute（CRD）

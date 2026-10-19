@@ -1,8 +1,8 @@
-//! PROXY protocol v1 / v2 headers (`net::source`). rproxy only writes them (it
-//! never reads PROXY headers from its clients), so this target checks the
-//! writer: for any addresses and TLS details, the header is well formed and
+//! PROXY protocol v1 / v2 headers (`net::source`), as rproxy writes them towards
+//! backends: for any addresses and TLS details, the header is well formed and
 //! reads back to what was put in (decoded here independently, after the spec at
-//! haproxy.org/download/2.9/doc/proxy-protocol.txt).
+//! haproxy.org/download/2.9/doc/proxy-protocol.txt). Reading the headers front ends
+//! send (`net::proxy_in`, #296) is the `proxy_header_in` target.
 #![no_main]
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};

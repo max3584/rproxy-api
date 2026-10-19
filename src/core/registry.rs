@@ -758,6 +758,7 @@ impl Registry {
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
+			proxy_protocol: RwLock::new(spec.proxy_protocol.clone().map(Arc::new)),
 			crowdsec: spec.crowdsec.into(),
 			geoip: RwLock::new(spec.geoip.as_ref().map(|g| Arc::new(crate::net::geoip::Policy::new(g)))),
 			http: RwLock::new(prepared.http),
@@ -905,6 +906,9 @@ impl Registry {
 		}
 		if let Some(on) = req.crowdsec {
 			spec.crowdsec = on;
+		}
+		if let Some(pp) = req.proxy_protocol {
+			spec.proxy_protocol = crate::net::proxy_in::validate(Some(pp), key.protocol)?;
 		}
 		if let Some(list) = &req.extra_listen_addrs {
 			spec.extra_listen = validate_extra_listen(key.listen.ip(), list)?;
@@ -1076,6 +1080,7 @@ impl Registry {
 					|| r.spec.health_check != spec.health_check;
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
+				*r.rt.proxy_protocol.write().unwrap_or_else(|e| e.into_inner()) = spec.proxy_protocol.clone().map(Arc::new);
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				r.rt.set_connect_timeout(spec.connect_timeout);
 				// from the next connection / read on; what the limits count is kept

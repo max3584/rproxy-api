@@ -65,6 +65,10 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | | `ehlo_reply_loses_starttls` | `STARTTLS` is removed from the EHLO reply after TLS |
 | | `ehlo_reply_with_non_utf8_bytes_does_not_panic` | Non-UTF-8 bytes or multi-byte characters in the mail server's EHLO reply do not cause a panic (an input found by fuzzing, #162) |
 | `net/source.rs` | `v2_header_carries_tls_tlvs` | PROXY v2 TLVs (AUTHORITY, SSL, CN) and their lengths |
+| `net/proxy_in.rs` | `reads_back_what_rproxy_writes` / `every_prefix_asks_for_more` / `other_protocols_are_not_headers` | Received PROXY headers (#296): the v1 / v2 headers rproxy writes (with TLVs) read back, a partial one waits for more, other protocols are not headers |
+| | `v1_unknown_and_bad_lines` / `v2_local_unspec_and_limits` | v1 `UNKNOWN`, broken lines and the 107-byte limit; v2 `LOCAL`, `AF_UNSPEC`, `AF_UNIX`, `DGRAM` and the 4096-byte limit (refused before the bytes arrive) |
+| | `read_consumes_just_the_header` / `read_without_a_header` / `read_gives_up_on_a_slow_header` / `untrusted_headers_are_seen` | A header in pieces is waited for and exactly it is read; with and without `required`; timeouts; headers from outside `from` are seen (waiting and not) |
+| | `validation` | `from` is required, empty or `/0` is `invalid`, `udp` is `unsupported`, `required` defaults to true |
 | `core/registry.rs` | `a_panicking_listener_marks_only_its_rule_failed` | When a listener panics, only that rule becomes `failed` |
 | | `a_stale_supervisor_does_not_touch_a_recreated_rule` | A supervisor task from an old generation does not touch a recreated rule |
 | `core/ruleset.rs` | `etags_follow_the_rules_and_the_generation` | The etag does not depend on the order of the rules and changes with the rules or the generation. How `If-Match` may be written (quoted, `W/`, a list, `*`) |
@@ -210,6 +214,20 @@ Streams tens of MiB of pseudo-random data (slices of a 1 MiB block at positions 
 | `http_rules_are_shaped` | Responses of an `http` rule are shaped by the download limit |
 | `udp_bandwidth_drops_over_the_rate` | UDP datagrams over the download limit are dropped and counted in `stats.dropped` and `rproxy_rule_bandwidth_dropped_total` (the upload is untouched) |
 
+## Integration tests: receiving PROXY protocol (`tests/proxy_protocol.rs`, #296)
+
+Every connection comes from 127.0.0.1, so `from: ["127.0.0.1/32"]` makes the test the front end, and another range makes it a peer outside `from`.
+
+| Test | What it checks |
+|---|---|
+| `the_shape_validation_and_capabilities` | `features.proxy_protocol_in`; the listed shape (with `required`); PATCH replaces, keeps when left out, `{}` removes; an empty or missing `from`, `/0` and a broken address are `invalid`; `udp` is `unsupported` |
+| `allow_from_judges_the_client_in_the_header` | `allow_from` judges the header's client (v1 and v2). The header does not reach the backend |
+| `required_refuses_a_connection_without_a_header` | With `required` (the default) a connection without a header is refused; with `false` it goes on with the peer's address. A broken header is refused either way |
+| `a_header_from_outside_from_is_refused` | Headers (v1, v2) from outside `from` are refused (`conn.denied` with `reason: proxy_protocol_untrusted`); connections without one go through. On a TLS `sni` rule a header arriving late is waited for and found |
+| `proxy_v2_out_carries_the_client_of_the_header` | `source_ip: proxy_v2` writes the header's client to the backend (v1 in, v2 out); `client` and `proxy_peer` of `conn.open`; `LOCAL` keeps the peer's address |
+| `per_source_limits_count_the_client_of_the_header` | Per-source `limits` count per client of the header (another client behind the same front end gets through) |
+| `http_rules_forward_the_client_of_the_header` | `X-Forwarded-For` / `X-Real-IP` of an `http` rule and `client` of `http.access` are the header's client, `proxy_peer` the front end |
+
 ## Integration tests: v0.4 shapes (`tests/v04_shapes.rs`, #215)
 
 Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v0.4.0 every item runs (all `features` flags are true), so what remains here is the `features` list, the scopes of the new endpoints, the validation by `--check-config` and of the startup flags, and that a 0.3 settings file still passes. That each feature works is checked by its own tests (`tests/api_hardening.rs`, `rulesets.rs`, `limits.rs`, `geoip.rs`, `outlier.rs`, `plan.rs`, `persist.rs`, `handoff.rs`, `self_update.rs`, `performance.rs`).
@@ -335,7 +353,7 @@ Runs the real binary in its own process group with 16 hostile senders and 2 legi
 | `starttls_survives_hostile_traffic` | garbage before or instead of STARTTLS on smtp, imap and pop3, commands slipped in before TLS (they must not reach the mail server) |
 | `udp_survives_hostile_traffic` | random and oversized datagrams, many source ports, garbage posing as DTLS or QUIC, truncated, mutated and replayed QUIC Initials and DTLS ClientHellos, to plain, QUIC and DTLS sni and DTLS terminate rules |
 
-PROXY protocol is out of scope: rproxy only sends it.
+Received PROXY protocol (#296) is not sent here (the header parser is the fuzz target `proxy_header_in`, the behavior `tests/proxy_protocol.rs`).
 
 ## Integration tests: abnormal termination (`tests/crash.rs`)
 
@@ -618,7 +636,8 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `tls_client_hello` | `tls::sni`: the TLS ClientHello (records, handshake, body) | Raw bytes |
 | `udp_sni` | The `Sniffer` of `tls::udp_sni`: DTLS ClientHello fragments and QUIC v1 / v2 Initial packets | Datagrams, each prefixed with a 16-bit length |
 | `quic_initial` | QUIC again, with frames chosen by the fuzzer encrypted with the Initial keys (so the frame parser behind the AEAD and the CRYPTO reassembly are reached) | Flags (v2), DCID, then (packet number, frames) packets |
-| `proxy_header` | `net::source`: PROXY protocol v1 / v2 headers. rproxy only writes them, so the target checks that for any addresses and TLS details the header is well formed and reads back to the same values | `arbitrary` |
+| `proxy_header` | `net::source`: the PROXY protocol v1 / v2 headers written towards backends. For any addresses and TLS details the header is well formed and reads back to the same values | `arbitrary` |
+| `proxy_header_in` | `net::proxy_in::parse`: PROXY headers received from front ends (#296). No panic on any bytes; a header is never longer than the limits (v1 107, v2 16 + 4096 bytes) or the input; the header's own bytes give the same answer and shorter prefixes ask for more; agreement with `classify`; the addresses read, written again by rproxy, read back the same | raw bytes |
 | `matcher` | `l7::matcher`: parsing and evaluating `match` expressions | The expression, then one per line: host, path, query, method, header, client IP |
 | `starttls` | `l4::starttls`: the dialogue with the client before STARTTLS, the mail server's greeting and EHLO reply, the plain-text hand-over | A first byte (protocol, STARTTLS required, bytes per read), then what the peer sends |
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |

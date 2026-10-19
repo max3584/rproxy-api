@@ -205,3 +205,23 @@ rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かっ
 - `connect_timeout` は PATCH でその場で変えられる（次の接続から）。`listen_freebind` は変えられない（ソケットを開き直すので作り直し）。
 - 引き継ぎ・保存：ルールの形に足すだけ（`GET /rules` の形・`rproxy_rules.spec` に入る。古いパッチは知らない項目を無視して読む）。
 - 試験：`scripts/test-freebind.sh`（名前空間の実経路。CI の transparent のジョブ）、`tests/listen.rs`、`tests/targets.rs`（SYN を捨てる宛先）。
+
+## 9. PROXY protocol を受け取る（v0.4.13、#296）
+
+前段（ロードバランサ・別の rproxy・Kubernetes の Gateway）が付けた PROXY protocol v1 / v2 のヘッダを読み、本当のクライアントのアドレスとして使う。今までの `net::source` は書くだけだった。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| PROXY ヘッダを受け取る | `tcp` のルールの `proxy_protocol: {"from": [<CIDR>, ...], "required"?: bool}` | `proxy_protocol_in` | なし（今までどおり、ヘッダは読まない） |
+
+- 信じる相手：`from` は TCP の接続元（すぐ前の段）で判定し、ヘッダの中のアドレスでは判定しない。`from` は必須で空にできず、`/0` も断る（誰のヘッダでも信じる設定を作らせない）。`required` は既定 `true`。
+- `from` の外からヘッダらしきもの（v2 の署名・`PROXY `）で始まる接続：**断る**（issue の「決めること」。前段の設定ミスに気づけ、ヘッダがデータとして転送先に流れて、ヘッダを信じる転送先にアドレスを偽られることもない）。`conn.denied` の `reason: proxy_protocol_untrusted`。ほかの接続は今までどおり。
+- 最初のバイトの待ち方：クライアントから先に送るルール（TLS の `sni`・`terminate`、`http`）は、外からの接続でも最初のバイトを待つ（どのみち rproxy が最初に読む）。平文の TCP と STARTTLS はサーバから先に送ることがあるので待たず、受け付けたとき（と平文の TCP では転送先につながったとき）に届いているバイトだけを見る（外からの接続を遅らせないため。取りこぼしはありうる）。
+- 上限：v1 は 107 バイト（仕様）。v2 は長さの欄が 16 ビット（65535）まで言えるが、固定の 16 バイトの後を 4096 バイトまでにした（アドレスは最大 216 バイト（AF_UNIX）、AWS の VPC エンドポイント ID・GCP の PSC の ID・HAProxy の SSL の TLV・unique ID はどれもずっと小さい）。時間の上限は受け付けてから 5 秒（変えられない。TLS のハンドシェイクの 10 秒より短く、前段は接続の直後に送るので足りる）。
+- 読み方：`peek` で見て判断してから、ヘッダの分だけを読む（ヘッダの後のバイトを読みすぎないので、後の処理（ClientHello の読み取り・splice・STARTTLS）はそのまま）。細切れに届くときは届くのを待つ。
+- TLV は読み飛ばす（転送先へは rproxy 自身が見たものを書く）。`LOCAL`・`UNKNOWN`・`AF_UNSPEC`・`AF_UNIX` は接続元のアドレスのまま。TCP の接続の `DGRAM` は断る。
+- 本当のクライアントを使うところ：`allow_from`・`geoip`・`crowdsec`・`limits`・`bandwidth`、ログの `client`、`X-Forwarded-For`・`X-Real-IP`（`global.trusted_proxies` の判定も）、転送先への `source_ip`（`proxy_v1` / `proxy_v2` / `transparent`）。前段はログの `proxy_peer`（L4 はタスクローカル `net::proxy_in::PROXY_PEER`、`http` は `Conn.proxy_peer`）。転送先へのヘッダの宛先は今までどおり rproxy が受けたアドレス。
+- 順序：`from` の前段からはヘッダを読んでから `allow_from` などを確かめる（それまでの「`allow_from` は PROXY ヘッダより前」は、`proxy_protocol` のないルールと `from` の外の接続でだけ成り立つ）。
+- PATCH でその場で変わる（次の接続から）。組の PUT・設定ファイルの再読み込みも `in_place`。引き継ぎ・保存：ルールの形に足すだけ。DB の `options` にも同じ形で書ける。
+- 対象外（後の段階）：UDP の PROXY v2（データグラムごとのヘッダ）。HTTP/3 の QUIC にはヘッダがない。
+- 試験：単体（`net::proxy_in`：解析・上限・細切れ・時間切れ・検証）、`tests/proxy_protocol.rs`（`allow_from`・`limits`・`X-Forwarded-For` とアクセスログ・PROXY v2 で受けて PROXY v2 で送る・`LOCAL`・`required`・外からのヘッダ・形と PATCH）、ファジングの `proxy_header_in`。

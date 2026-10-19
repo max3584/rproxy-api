@@ -132,6 +132,8 @@ def main():
     put("proxy_header", "v4", bytes([0, 192, 0, 2, 1, 0, 198, 51, 100, 1, 0x13, 0x88, 0, 80, 0]))
     put("proxy_header", "v6-tls", bytes([1]) + bytes(range(32)) + b"\x01\xbb\x00\x50\x01" + b"h2\x00mail.example\x00TLSv1.3\x00cn\x00")
 
+    proxy_in_seeds()
+
     # matcher: an expression, then (one per line) host, path, query, method, header, client IP
     request = "\nApi.Example.com:8443\n/api/v1\ndebug=1&x\nPOST\nx-requested-with: XMLHttpRequest\n10.1.2.3"
     for i, expr in enumerate(
@@ -267,6 +269,35 @@ def dpdk_seeds():
     put("dpdk_packet", "arp-then-udp", framed([req, reply, first, first, answer]))
     put("dpdk_packet", "no-checksum", framed([reply, odd, odd]))
     put("dpdk_packet", "ping-fragment", framed([ping, frag]))
+
+
+
+def proxy_in_seeds():
+    """proxy_header_in: PROXY headers as a front end sends them (bytes as they are), and the data after them."""
+    sig = b"\r\n\r\n\x00\r\nQUIT\n"
+
+    def v2(cmd, fam, body):
+        return sig + bytes([cmd, fam]) + struct.pack(">H", len(body)) + body
+
+    v4 = bytes([192, 0, 2, 7, 198, 51, 100, 1]) + struct.pack(">HH", 4000, 443)
+    v6 = bytes.fromhex("20010db8000000000000000000000001") + bytes.fromhex("20010db8000000000000000000000002") + struct.pack(">HH", 1, 2)
+    # TLVs as front ends add them: ALPN, AUTHORITY, an SSL block with a version and a CN, AWS's VPC endpoint id (0xea)
+    ssl = b"\x01" + struct.pack(">I", 0) + b"\x21" + struct.pack(">H", 7) + b"TLSv1.3" + b"\x22" + struct.pack(">H", 5) + b"alice"
+    tlvs = b"\x01\x00\x02h2" + b"\x02" + struct.pack(">H", 12) + b"mail.example" + b"\x20" + struct.pack(">H", len(ssl)) + ssl
+    vpce = b"\x01vpce-0123456789abcdef"
+    tlvs += b"\xea" + struct.pack(">H", len(vpce)) + vpce
+    put("proxy_header_in", "v1-tcp4", b"PROXY TCP4 192.0.2.7 198.51.100.1 4000 443\r\nGET / HTTP/1.1\r\n")
+    put("proxy_header_in", "v1-tcp6", b"PROXY TCP6 2001:db8::1 ::ffff:192.0.2.9 1 65535\r\n\x16\x03\x01")
+    put("proxy_header_in", "v1-unknown", b"PROXY UNKNOWN\r\n")
+    put("proxy_header_in", "v1-longest", b"PROXY UNKNOWN " + b" ".join([b"ffff:" * 7 + b"ffff"] * 2) + b" 65535 65535\r\n")
+    put("proxy_header_in", "v1-no-crlf", b"PROXY TCP4 192.0.2.7 198.51.100.1 4000 443" + b" " * 70)
+    put("proxy_header_in", "v2-tcp4", v2(0x21, 0x11, v4) + b"hello")
+    put("proxy_header_in", "v2-tcp6-tlvs", v2(0x21, 0x21, v6 + tlvs))
+    put("proxy_header_in", "v2-local", v2(0x20, 0x00, b""))
+    put("proxy_header_in", "v2-unix", v2(0x21, 0x31, b"/run/a".ljust(108, b"\x00") + b"/run/b".ljust(108, b"\x00")))
+    put("proxy_header_in", "v2-dgram", v2(0x21, 0x12, v4))
+    put("proxy_header_in", "v2-too-long", sig + b"\x21\x11\xff\xff" + v4)
+    put("proxy_header_in", "plain-tls", b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
 
 
 if __name__ == "__main__":

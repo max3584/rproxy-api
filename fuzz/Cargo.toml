@@ -55,6 +55,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "proxy_header_in"
+path = "fuzz_targets/proxy_header_in.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "matcher"
 path = "fuzz_targets/matcher.rs"
 test = false

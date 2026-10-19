@@ -17,6 +17,7 @@ use crate::core::balance::Lease;
 use crate::l7::server::{self as http, Metered};
 use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
+use crate::net::proxy_in::{self, peer_field};
 use crate::net::source::{self, TlsInfo};
 use crate::l4::relay;
 use crate::l4::starttls::{self, Outcome};
@@ -135,6 +136,9 @@ struct Detail {
 	connected: Option<Instant>,
 	/// Which side ended first; only with `outlier_detection.short_lived`.
 	first: Option<Arc<crate::core::outlier::FirstEnd>>,
+	/// From a peer outside `proxy_protocol.from` on a rule with `proxy_protocol`, where the
+	/// server may speak first: looked at again for a PROXY header once the backend answers.
+	untrusted: bool,
 }
 
 impl Detail {
@@ -150,15 +154,66 @@ impl Detail {
 /// Refusal that is not an error: allow_from or `unmatched: reject`.
 fn denied(rt: &Runtime, client: SocketAddr, why: &str, sni: Option<&str>) -> io::Error {
 	rt.stats.denied();
-	info!(event = "conn.denied", rule = %rt.key, client = %client, reason = why, sni = sni.unwrap_or(""));
+	info!(event = "conn.denied", rule = %rt.key, client = %client, reason = why, sni = sni.unwrap_or(""), proxy_peer = peer_field());
 	io::Error::new(io::ErrorKind::PermissionDenied, "denied")
+}
+
+/// A connection from a front end in `proxy_protocol.from` without a usable PROXY header
+/// (none while `required`, a broken or too long one, or too slow).
+fn header_refused(rt: &Runtime, peer: SocketAddr, why: &io::Error) {
+	rt.stats.denied();
+	warn!(event = "conn.denied", rule = %rt.key, client = %peer, reason = "proxy_protocol", error = %why);
+}
+
+/// A connection from outside `proxy_protocol.from` that starts like a PROXY header: a
+/// front end missing from `from`, or someone claiming another address.
+fn untrusted_header(rt: &Runtime, client: SocketAddr, version: proxy_in::Version) -> io::Error {
+	rt.stats.denied();
+	warn!(event = "conn.denied", rule = %rt.key, client = %client, reason = "proxy_protocol_untrusted", version = version.as_str(),
+		"a PROXY header from a peer outside proxy_protocol.from");
+	io::Error::new(io::ErrorKind::PermissionDenied, "denied")
+}
+
+/// Whether the client sends first on this rule (TLS, HTTP), so its first bytes can be
+/// waited for; plain TCP and STARTTLS may have the server speak first.
+fn client_speaks_first(rt: &Runtime, tls: &TlsRuntime) -> bool {
+	rt.http_router().is_some()
+		|| match tls.mode() {
+			TlsMode::Sni => true,
+			TlsMode::Terminate => tls.starttls.is_none(),
+			TlsMode::Passthrough => false,
+		}
 }
 
 fn is_denied(e: &io::Error) -> bool {
 	e.kind() == io::ErrorKind::PermissionDenied && e.to_string() == "denied"
 }
 
-async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+/// A connection as accepted from `peer`. With `proxy_protocol` (#296), a front end in
+/// `from` sends a PROXY header first and the client is who it names: everything after
+/// this (allow_from, geoip, crowdsec, limits, bandwidth, logs, the address passed on to
+/// the backend) uses that client, and the front end is the logs' `proxy_peer`.
+async fn handle(mut inbound: TcpStream, peer: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+	let (client, via, untrusted) = match rt.proxy_protocol() {
+		None => (peer, None, false),
+		Some(pp) if pp.trusts(peer.ip()) => match tokio::select! {
+			_ = rt.kill.cancelled() => return,
+			r = proxy_in::read(&mut inbound, pp.required) => r,
+		} {
+			Ok(Some(client)) => (client, Some(peer), false),
+			// LOCAL (the front end's health check), UNKNOWN, or no header while not required
+			Ok(None) => (peer, None, false),
+			Err(e) => {
+				header_refused(&rt, peer, &e);
+				return;
+			}
+		},
+		Some(_) => (peer, None, true),
+	};
+	proxy_in::with_peer(via, handle_client(inbound, client, rt, offset, untrusted)).await
+}
+
+async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16, untrusted: bool) {
 	if !rt.allowed(client.ip()) {
 		denied(&rt, client, "allow_from", None);
 		return;
@@ -185,6 +240,18 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		}
 	};
 	let tls = rt.tls();
+	// `proxy_protocol`: a peer outside `from` must not send a header (#296)
+	let speaks_first = client_speaks_first(&rt, &tls);
+	if untrusted {
+		let start = tokio::select! {
+			_ = rt.kill.cancelled() => return,
+			s = proxy_in::untrusted_start(&inbound, speaks_first) => s,
+		};
+		if let Some(version) = start {
+			untrusted_header(&rt, client, version);
+			return;
+		}
+	}
 	// a `terminate` rule with passthrough routes reads the ClientHello first:
 	// passthrough names are relayed as they are, the others are terminated
 	// from the bytes already read
@@ -199,7 +266,7 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 			},
 			Err(e) => {
 				rt.stats.tls_failed();
-				warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, "reading the ClientHello");
+				warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field(), "reading the ClientHello");
 				return;
 			}
 		}
@@ -210,8 +277,12 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 	let started = Instant::now();
 	rt.stats.opened();
 	let short_lived = !rt.pool().outlier().short_lived.is_zero();
-	let mut detail =
-		Detail { geo: rt.geo_for_log(client.ip(), geo), first: short_lived.then(Arc::default), ..Default::default() };
+	let mut detail = Detail {
+		geo: rt.geo_for_log(client.ip(), geo),
+		first: short_lived.then(Arc::default),
+		untrusted: untrusted && !speaks_first,
+		..Default::default()
+	};
 
 	let serving = async {
 		match pass {
@@ -247,9 +318,9 @@ async fn handle(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, of
 		Err(e) if is_denied(&e) => {}
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
-			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or("")),
+			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 		Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, target = %target,
-			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or("")),
+			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 	}
 }
 
@@ -267,10 +338,17 @@ async fn run(
 		TlsMode::Passthrough => {
 			let target = rt.select(None, offset).ok_or_else(|| denied(rt, client, "unmatched", None))?;
 			let Connected { stream: mut out, addr, lease, .. } = connect(rt, client, &target).await?;
+			// by now (a round trip to the backend) a front end's header would have arrived
+			if detail.untrusted {
+				if let Some(version) = proxy_in::untrusted_start(inbound, false).await {
+					return Err(untrusted_header(rt, client, version));
+				}
+			}
 			detail.target = Some(addr);
 			detail.lease = lease;
-	detail.connected = Some(Instant::now());
-			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, country = detail.country(), asn = detail.asn());
+			detail.connected = Some(Instant::now());
+			info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, country = detail.country(), asn = detail.asn(),
+				proxy_peer = peer_field());
 			send_proxy_header(rt, &mut out, client, local, None).await?;
 			finish_plain(rt, client, inbound, &mut out, detail).await
 		}
@@ -303,7 +381,7 @@ async fn relay_hello(
 	detail.connected = Some(Instant::now());
 	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough,
-		country = detail.country(), asn = detail.asn());
+		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
@@ -437,7 +515,8 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 		if let Some(acme) = crate::acme::challenge::tls_alpn_config(&start.client_hello()) {
 			let mut session = start.into_stream(acme).await?;
 			let _ = tokio::io::AsyncWriteExt::shutdown(&mut session).await;
-			info!(event = "acme.answer", challenge = "tls-alpn-01", rule = %rt.key, client = %client, sni = name.as_deref().unwrap_or(""));
+			info!(event = "acme.answer", challenge = "tls-alpn-01", rule = %rt.key, client = %client, sni = name.as_deref().unwrap_or(""),
+				proxy_peer = peer_field());
 			return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
 		}
 		if rt.select(name.as_deref(), offset).is_none() {
@@ -502,9 +581,9 @@ async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt
 		Err(e) if is_denied(&e) => {}
 		Ok(reason) => info!(event = "conn.close", rule = %rt.key, client = %client, target = "http",
 			rx_bytes = rx.load(Ordering::Relaxed), tx_bytes = tx.load(Ordering::Relaxed), duration_ms = elapsed_ms, reason,
-			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or("")),
+			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 		Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, target = "http",
-			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or("")),
+			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 	}
 }
 
@@ -547,7 +626,7 @@ async fn terminate(
 		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
 		client_cn = info.client_cn.as_deref().unwrap_or(""), client_verify = info.client_verify(), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
-		country = detail.country(), asn = detail.asn());
+		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
 	send_proxy_header(rt, &mut out, client, local, Some(&info)).await?;
 	detail.tls = Some(info);
 
@@ -597,7 +676,7 @@ async fn plain_smtp(
 	detail.lease = lease;
 	detail.connected = Some(Instant::now());
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, starttls = "smtp", tls = "none",
-		country = detail.country(), asn = detail.asn());
+		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
 	send_proxy_header(rt, &mut out, client, local, None).await?;
 	let extra = starttls::skip_greeting(StartTls::Smtp, &mut out).await?;
 	let after = starttls::replay_plain(&mut out, ehlo.as_deref(), &pending).await?;

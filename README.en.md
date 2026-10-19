@@ -266,6 +266,14 @@ Choose with `source_ip` per rule. What PROXY protocol is, which option to choose
 | `proxy_v1` / `proxy_v2` | Adds a PROXY protocol header at the start of the connection for TCP, and to each datagram for UDP (`proxy_v2` only) | The target supports PROXY protocol. For UDP, as with dnsdist, PowerDNS, and Unbound, the header is added to every datagram and not to responses |
 | `transparent` | Connects using the client's IP (`IP_TRANSPARENT` / `IPV6_TRANSPARENT`) | Linux, `CAP_NET_ADMIN`. IPv4 and IPv6. Return packets from the target must pass through the rproxy host ([docs/en/TRANSPARENT.md](docs/en/TRANSPARENT.md)) |
 
+When a load balancer or another proxy in front of rproxy sends PROXY protocol, the rule's `proxy_protocol` receives the header (v0.4.13, `tcp` rules). Only headers from the front ends in `from` are believed; `allow_from`, `limits`, the logs, `X-Forwarded-For`, `source_ip` above and the rest then work on the header's client. The front end's address is the logs' `proxy_peer`.
+
+```json
+"proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}
+```
+
+`required` (default `true`) refuses a connection from `from` without a header. A connection from outside `from` that starts with a header is refused too. Details: [docs/en/SOURCE-IP.md](docs/en/SOURCE-IP.md) and "Receiving PROXY protocol" in [docs/en/API.md](docs/en/API.md).
+
 To use `transparent`, give rproxy `CAP_NET_ADMIN` and set up policy routing so that the rproxy host itself receives the return packets from the target.
 If installed with apt or install.sh, the unit grants `CAP_NET_ADMIN`, so no permission setup is needed. The policy routing (1 below) can be installed in one go with install.sh (it creates `rproxy-transparent-routing.service`, which sets it up on every boot).
 
@@ -332,8 +340,8 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `reload.tokens` / `reload.tls` / `reload.rules_tls` / `reload.crowdsec` | SIGHUP re-read the tokens, the control API's certificate, the rules' certificates, the CrowdSec key (the current ones stay if a file cannot be read). `reload.tokens` also appears when the token file changes (`reason: "file changed"`, only the count `tokens`; a version with a mistake is warned about once) |
 | `geoip.reload` | A `global.geoip` database was read or read again (`db`: `country` / `asn`, `path`, `build_epoch`). One that cannot be read logs `degraded` (`part: geoip`) and the current one stays |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | Static rules were loaded / a rule's listen addresses changed / a rule with the same key was skipped |
-| `conn.open` / `conn.close` | Start and end of a connection (session for UDP). `client`, `target`, `rx_bytes`, `tx_bytes`, `duration_ms`, `reason`. When TLS is terminated, `tls_version`, `tls_cipher`, etc. HTTP/3 QUIC connections have `transport: quic`. With `global.geoip.log_country`, `country` and `asn` |
-| `conn.denied` | A refused connection (for UDP, datagram): `reason` is `allow_from`, `geoip` (`country`, `asn`), `crowdsec` or `unmatched`; `client` (`IP:port`), `sni`. For UDP thinned out per source (`suppressed`: lines left out before it). HTTP/3 has `transport: quic` |
+| `conn.open` / `conn.close` | Start and end of a connection (session for UDP). `client`, `target`, `rx_bytes`, `tx_bytes`, `duration_ms`, `reason`. When TLS is terminated, `tls_version`, `tls_cipher`, etc. HTTP/3 QUIC connections have `transport: quic`. With `global.geoip.log_country`, `country` and `asn`. On connections whose PROXY header was received (the rule's `proxy_protocol`), `client` is the header's client and `proxy_peer` the front end (also in `conn.denied`, `conn.limited`, `conn.error` and `http.access`) |
+| `conn.denied` | A refused connection (for UDP, datagram): `reason` is `allow_from`, `geoip` (`country`, `asn`), `crowdsec`, `unmatched`, `proxy_protocol` (no or a broken header from a front end in `from`; `error`) or `proxy_protocol_untrusted` (a header from outside `from`; `version`); `client` (`IP:port`), `sni`. For UDP thinned out per source (`suppressed`: lines left out before it). HTTP/3 has `transport: quic` |
 | `conn.limited` | A connection (for UDP, datagram) refused by the rule's `limits` (#165): `reason` is `max_connections`, `source_connections`, `new_connections` or `packets`; `transport` is `tcp` or `udp`; `client`. Thinned out per source (`suppressed`) |
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | A failed connection (the target cannot be reached, the ClientHello cannot be read, …) / a failed TLS or DTLS handshake / accepting or receiving failed |
 | `http3.listening` / `http3.error` | An `http.http3` rule started accepting HTTP/3 over UDP / the QUIC certificates cannot be rebuilt |
