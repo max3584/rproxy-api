@@ -14,6 +14,6 @@ certificatesResolvers.le: dnsChallenge rfc2136: set server and tsig_key_name, an
 certificatesResolvers.zone: dnsChallenge acme-dns: set api_url; existing lego accounts (ACME_DNS_STORAGE_PATH) can be used as credentials_file
 global.acme: check the accounts' allowed_names (the names found in the routers) and fill in every CHANGE-ME and secret file; then rproxy-api --check-config (docs/en/ACME.md)
 entry point smtps: ClientIP of TCP routers applies to the whole rule (allow_from)
-entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule (the first is used)
+entry point tls13: routers use different PROXY protocol versions; rproxy has one per rule for terminated routes and the default (the first is used)
 entry point tls13: no certificate found; put one at /etc/rproxy/tls/tls13.pem
 entry point mixed: a HostSNI(`*`) passthrough router cannot share a port with terminating routers; terminating routers left out: term

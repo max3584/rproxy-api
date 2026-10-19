@@ -206,7 +206,9 @@ async fn session(
 	let mut events = rt.pool_events.subscribe();
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
-	let bind_as = rt.bind_as(client);
+	let mut bind_as = rt.bind_as(client);
+	// the rule's, or the `tls.routes` route's own (#297)
+	let mut source_ip = rt.source_ip;
 	// `tls.mode: sni` (#130): hold the first datagrams until the server name is read
 	let by_name = tls.mode() == TlsMode::Sni;
 	let (sni, first) = if by_name {
@@ -230,13 +232,16 @@ async fn session(
 				return None;
 			}
 			// a `tls.routes` backend: its addresses as resolved now
-			Some(t) if t.from_route => t
-				.candidates
-				.iter()
-				.flat_map(|c| c.addrs.iter())
-				.copied()
-				.find(|a| source::usable(*a, bind_as))
-				.map(|addr| Picked { lease: None, addrs: None, addr }),
+			Some(t) if t.from_route => {
+				source_ip = rt.source_ip_for(&t);
+				bind_as = rt.bind_as_for(&t, client);
+				t.candidates
+					.iter()
+					.flat_map(|c| c.addrs.iter())
+					.copied()
+					.find(|a| source::usable(*a, bind_as))
+					.map(|addr| Picked { lease: None, addrs: None, addr })
+			}
 			Some(_) => pick(rt, offset, bind_as),
 		}
 	} else {
@@ -249,7 +254,7 @@ async fn session(
 	};
 	let mut target = Some(addr);
 
-	let upstream = match source::udp_upstream(addr, rt.bind_as(client)).await {
+	let upstream = match source::udp_upstream(addr, bind_as).await {
 		Ok(s) => s,
 		Err(e) => {
 			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e);
@@ -264,7 +269,7 @@ async fn session(
 		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn));
 	// `bandwidth` (#166): datagrams over the rate are dropped
 	let (mut up, mut down) = (Gate::new(client.ip(), Dir::Up), Gate::new(client.ip(), Dir::Down));
-	let header = proxy_header(rt, client, listener.local_for(local));
+	let header = proxy_header(source_ip, client, listener.local_for(local));
 	// sni: the QUIC connection this session was routed for, and a new one being read
 	let mut quic_dcid = first.iter().find_map(|d| crate::tls::udp_sni::quic::initial_dcid(d));
 	let mut probe: Option<Probe> = None;
@@ -562,11 +567,11 @@ async fn drain(rt: &Runtime, from_client: &mut mpsc::Receiver<Vec<u8>>, idle: Du
 	}
 }
 
-/// `source_ip: proxy_v2`: the PROXY v2 (DGRAM) header sent in front of every
+/// `source_ip: proxy_v2` (the rule's, or a route's own, #297): the PROXY v2 (DGRAM) header sent in front of every
 /// datagram to the backend. The destination is the address the client sent to
 /// (learnt on a wildcard listener).
-fn proxy_header(rt: &Runtime, client: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
-	(rt.source_ip == SourceIp::ProxyV2).then(|| source::proxy_v2_dgram_header(client, local))
+fn proxy_header(source_ip: SourceIp, client: SocketAddr, local: SocketAddr) -> Option<Vec<u8>> {
+	(source_ip == SourceIp::ProxyV2).then(|| source::proxy_v2_dgram_header(client, local))
 }
 
 /// Sends a client's datagrams on to its backend (those over the `bandwidth`
@@ -700,7 +705,7 @@ async fn dtls_session(
 	let started = Instant::now();
 	// before `listener` moves into the DTLS connection
 	let listen = listener.local_for(local);
-	let header = proxy_header(&rt, client, listen);
+	let header = proxy_header(rt.source_ip, client, listen);
 	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, client, local));
 	let handshake = tokio::select! {
 		_ = rt.kill.cancelled() => { remove(&sessions, peer, id); return; }

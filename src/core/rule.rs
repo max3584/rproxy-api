@@ -207,6 +207,8 @@ pub struct Features {
 	pub connect_timeout: bool,
 	/// `proxy_protocol` of a tcp rule: PROXY v1 / v2 headers read from trusted front ends (#296)
 	pub proxy_protocol_in: bool,
+	/// `source_ip` of `tls.routes[]` relayed at L4 (passthrough routes, routes of `sni`; #297)
+	pub route_source_ip: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -266,6 +268,7 @@ impl Features {
 		listen_freebind: crate::net::listen::FREEBIND,
 		connect_timeout: true,
 		proxy_protocol_in: true,
+		route_source_ip: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -311,6 +314,7 @@ impl Features {
 		listen_freebind: true,
 		connect_timeout: true,
 		proxy_protocol_in: true,
+		route_source_ip: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -362,6 +366,9 @@ impl Features {
 		}
 		if !self.tls_route_upstream && tls.routes.iter().any(|r| r.upstream.is_some()) {
 			return missing("upstream of tls.routes");
+		}
+		if !self.route_source_ip && tls.routes.iter().any(|r| r.source_ip.is_some()) {
+			return missing("source_ip of tls.routes");
 		}
 		let mode = serde_json::to_value(tls.client_auth.mode).ok();
 		if let Some(m) = mode.as_ref().and_then(|v| v.as_str()).filter(|m| !self.client_auth_modes.contains(m)) {

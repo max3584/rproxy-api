@@ -87,6 +87,8 @@ pub struct RouteTarget {
 	pub patterns: Vec<String>,
 	/// Relay without terminating TLS (`passthrough: true` in a `terminate` rule).
 	pub passthrough: bool,
+	/// Its own `source_ip` (#297), instead of the rule's.
+	pub source_ip: Option<SourceIp>,
 	/// Its targets (`remote_addr` / `remote_port` as one, or `targets`, #234).
 	pub pool: Arc<Pool>,
 }
@@ -118,6 +120,8 @@ pub struct Target {
 	pub from_route: bool,
 	/// That route's place in `tls.routes` (its own `upstream`, `TlsRuntime::upstream_for`).
 	pub route: Option<usize>,
+	/// That route's own `source_ip` (#297); `None` uses the rule's.
+	pub source_ip: Option<SourceIp>,
 }
 
 /// Everything a listener and its connections need at run time.
@@ -195,6 +199,17 @@ impl Runtime {
 
 	pub fn bind_as(&self, client: SocketAddr) -> Option<SocketAddr> {
 		(self.source_ip == SourceIp::Transparent).then_some(client)
+	}
+
+	/// How the client's address is passed on to `target`'s backends: its route's
+	/// `source_ip` (#297), else the rule's.
+	pub fn source_ip_for(&self, target: &Target) -> SourceIp {
+		target.source_ip.unwrap_or(self.source_ip)
+	}
+
+	/// `bind_as` for `target`: a route with its own `source_ip` connects from rproxy's address.
+	pub fn bind_as_for(&self, target: &Target, client: SocketAddr) -> Option<SocketAddr> {
+		(self.source_ip_for(target) == SourceIp::Transparent).then_some(client)
 	}
 
 	pub fn http_router(&self) -> Option<Arc<crate::l7::server::Router>> {
@@ -280,7 +295,8 @@ impl Runtime {
 					.into_iter()
 					.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 					.collect();
-				return Some(Target { candidates, pool: Some(route.pool.clone()), passthrough: route.passthrough, from_route: true, route: Some(i) });
+				return Some(Target { candidates, pool: Some(route.pool.clone()), passthrough: route.passthrough, from_route: true, route: Some(i),
+					source_ip: route.source_ip });
 			}
 		}
 		if !routes.is_empty() && self.tls().spec.unmatched == Unmatched::Reject {
@@ -292,7 +308,7 @@ impl Runtime {
 			.into_iter()
 			.map(|m| Candidate { addrs: m.addrs(offset), host: m.spec.addr.clone(), member: Some(m) })
 			.collect();
-		Some(Target { candidates, pool: Some(pool), passthrough: false, from_route: false, route: None })
+		Some(Target { candidates, pool: Some(pool), passthrough: false, from_route: false, route: None, source_ip: None })
 	}
 }
 

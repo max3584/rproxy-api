@@ -1,6 +1,7 @@
 # TCP routers that terminate TLS (with certResolver: rproxy's ACME or certbot's
 # files), a passthrough catch-all next to terminating routers, ClientIP, and two
-# UDP routers on one entry point
+# UDP routers on one entry point; PROXY protocol towards some passthrough
+# backends only (per route, next to HTTP routers too)
 [entryPoints.smtps]
 address = ":465"
 
@@ -12,6 +13,12 @@ address = "198.51.100.5:27015/udp"
 
 [entryPoints.tls13]
 address = ":993"
+
+[entryPoints.edge]
+address = ":9443"
+
+[entryPoints.websecure]
+address = ":443"
 
 [serversTransport]
 insecureSkipVerify = true

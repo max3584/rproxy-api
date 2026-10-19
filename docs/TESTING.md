@@ -228,6 +228,18 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `per_source_limits_count_the_client_of_the_header` | 送信元ごとの `limits` はヘッダのクライアントごとに数える（同じ前段の後ろの別のクライアントは通る） |
 | `http_rules_forward_the_client_of_the_header` | `http` のルールの `X-Forwarded-For`・`X-Real-IP` と `http.access` の `client` がヘッダのクライアント、`proxy_peer` が前段 |
 
+## 結合テスト：route ごとの `source_ip`（`tests/route_source_ip.rs`、#297）
+
+転送先は受けたバイトを覚えるだけのソケットで、PROXY ヘッダの有無と中身、その後に ClientHello（QUIC は Initial）が続くことを見る。
+
+| テスト | 確かめること |
+|---|---|
+| `a_passthrough_route_of_an_http_rule_sends_proxy_v2_and_l7_does_not` | 1 つのポートの `http` のルールで、`source_ip: proxy_v2` の passthrough の route の転送先にはクライアントのアドレスの v2 ヘッダが付き、L7 のサービスへの HTTP には付かない |
+| `a_passthrough_route_passes_on_the_client_of_an_incoming_proxy_header` | `proxy_protocol`（#296）で受けた接続では、route の `proxy_v1` のヘッダがヘッダのクライアントを書く |
+| `routes_of_an_sni_rule_override_the_rules_source_ip` | `sni` のルール（ルールは `proxy_v2`）で、route の `proxy`（ヘッダなし）・`proxy_v1`、書かない route と一致しない名前はルールのもの。PATCH で route の値を変えるのは `in_place`（dry run）で、次の接続から効く |
+| `a_udp_sni_route_sends_proxy_v2_datagrams` | `udp` の `sni`（QUIC）で、`proxy_v2` の route のデータグラムにだけ DGRAM のヘッダが付く |
+| `route_source_ip_is_validated_and_advertised` | `features.route_source_ip`。終端する route・route の `transparent`・`udp` の route の `proxy_v1` は `unsupported`、知らない値は 4xx |
+
 ## 結合テスト：v0.4 の形（`tests/v04_shapes.rs`、#215）
 
 v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.0 ではすべての項目が動く（`features` はすべて true）ので、ここに残っているのは `features` の一覧・新しいエンドポイントのスコープ・`--check-config` と起動時の引数の検証・0.3 の設定ファイルがそのまま通ることだけ。各機能が動くことは、機能ごとのテスト（`tests/api_hardening.rs`・`rulesets.rs`・`limits.rs`・`geoip.rs`・`outlier.rs`・`plan.rs`・`persist.rs`・`handoff.rs`・`self_update.rs`・`performance.rs`）で確かめる。

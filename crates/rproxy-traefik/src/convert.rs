@@ -1264,19 +1264,22 @@ impl Converter<'_> {
 				tls.insert("upstream", upstream);
 			}
 			if !passthrough.is_empty() {
-				let routes: Vec<Value> = passthrough.iter().map(|t| self.sni_route(ri, *t, where_, true)).collect();
+				let routes: Vec<Value> = passthrough
+					.iter()
+					.map(|t| {
+						let mut route = self.sni_route(ri, *t, where_, true);
+						// PROXY protocol towards this passthrough backend only (#297)
+						let own = source_name(self.rules[ri].tcp_routes[*t].proxy);
+						if let (Value::Map(m), true) = (&mut route, own != "proxy") {
+							m.insert("source_ip", own);
+						}
+						route
+					})
+					.collect();
 				tls.insert("routes", routes);
 				for t in passthrough {
 					let route = &self.rules[ri].tcp_routes[*t];
-					let (name, proxy, client_ip) = (route.name.clone(), route.proxy, !route.client_ip.is_empty());
-					if matches!(proxy, Some(1 | 2)) {
-						self.note(
-							where_,
-							&format!(
-								"router {name}: PROXY protocol towards a passthrough backend next to HTTP routers is not available in rproxy; left out of the conversion"
-							),
-						);
-					}
+					let (name, client_ip) = (route.name.clone(), !route.client_ip.is_empty());
 					if client_ip {
 						self.note(where_, &format!("router {name}: ClientIP is not converted for passthrough routes"));
 					}
@@ -1330,8 +1333,15 @@ impl Converter<'_> {
 		let default = catch_all.first().copied().unwrap_or(routes[0]);
 		let backend = backends(&routes_all[default].servers);
 		let proxy = routes_all[routes[0]].proxy;
-		if proxies.len() > 1 {
-			self.note(where_, "routers use different PROXY protocol versions; rproxy has one per rule (the first is used)");
+		// routes relayed at L4 (mode sni, passthrough) carry their own source_ip (#297);
+		// terminated routes and the default take the rule's
+		let sni_mode = terminate.is_empty();
+		let conflict = routes.iter().any(|i| {
+			let r = &routes_all[*i];
+			source_name(r.proxy) != source_name(proxy) && !(named.contains(i) && (sni_mode || r.passthrough()))
+		});
+		if proxies.len() > 1 && conflict {
+			self.note(where_, "routers use different PROXY protocol versions; rproxy has one per rule for terminated routes and the default (the first is used)");
 		}
 		let mut result = self.base(ri);
 		for (k, v) in backend {
@@ -1356,7 +1366,14 @@ impl Converter<'_> {
 			.iter()
 			.map(|t| {
 				let pass = mode == "terminate" && self.rules[ri].tcp_routes[*t].passthrough();
-				self.sni_route(ri, *t, where_, pass)
+				let own = source_name(self.rules[ri].tcp_routes[*t].proxy);
+				let mut route = self.sni_route(ri, *t, where_, pass);
+				if (mode == "sni" || pass) && own != source_name(proxy) {
+					if let Value::Map(m) = &mut route {
+						m.insert("source_ip", own);
+					}
+				}
+				route
 			})
 			.collect();
 		tls.insert("routes", routes);
@@ -1431,6 +1448,15 @@ impl Converter<'_> {
 		}
 		doc.insert("rules", rules);
 		Ok(Value::Map(doc))
+	}
+}
+
+/// `source_ip` for a Traefik service's `proxyProtocol.version`.
+fn source_name(version: Option<i64>) -> &'static str {
+	match version {
+		Some(1) => "proxy_v1",
+		Some(2) => "proxy_v2",
+		_ => "proxy",
 	}
 }
 

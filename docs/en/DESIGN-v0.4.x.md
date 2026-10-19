@@ -225,3 +225,19 @@ Read the PROXY protocol v1 / v2 header a front end (a load balancer, another rpr
 - A PATCH changes it in place (from the next connection); rule set PUTs and settings file reloads are `in_place` too. Handoff and storage: only added to the rule's shape. The database's `options` take the same shape.
 - Not covered (later): PROXY v2 over UDP (a header per datagram). HTTP/3's QUIC carries no header.
 - Tests: unit (`net::proxy_in`: parsing, limits, pieces, timeouts, validation), `tests/proxy_protocol.rs` (`allow_from`, `limits`, `X-Forwarded-For` and the access log, PROXY v2 in and out, `LOCAL`, `required`, headers from outside, the shape and PATCH), the fuzz target `proxy_header_in`.
+
+## 10. `source_ip` per `tls.routes[]` (v0.4.13, #297)
+
+On one port's `terminate` rule (`http` rules included), pass the source differently to the L7 part (backends that take no PROXY header) and to names passed straight through (Kubernetes and the like, which want the client in PROXY v2).
+
+| Item | Shape | `features` | Default |
+|---|---|---|---|
+| How a route passes the source | `tls.routes[].source_ip` (`proxy`, `proxy_v1`, `proxy_v2`) | `route_source_ip` | none (the rule's `source_ip`) |
+
+- Routes that take it: those that reach the backend at L4 (`passthrough: true` routes of `terminate`, routes of `sni` rules; `tcp` and `udp`). The PROXY header goes in front of the client's bytes (the ClientHello), which is well defined only on connections passed through untouched. Routes rproxy terminates are `unsupported` (the issue's "the rule's first, later if needed").
+- `transparent` cannot be chosen per route (`unsupported`): the `IP_TRANSPARENT` sockets, the policy routing and the return path from the backends are prepared per rule, and changing it per name would break the return path. `proxy_v1` on a `udp` route is `unsupported` as on the rule.
+- A route with `proxy*` on a `transparent` rule: its backends are reached from rproxy's address (the route's value is used as it is; the rule's `transparent` is not kept with a PROXY header added).
+- At run time: the route's `RouteTarget.source_ip` → `Target.source_ip`, `Runtime::source_ip_for` / `bind_as_for` (`relay_hello` and `connect` in `tcp.rs`, `session` in `udp.rs`). PATCH, rule set PUTs and reloads replace the routes (`install_routes`), so it is `in_place` (the rule's `source_ip` still re-creates the rule).
+- On connections received with `proxy_protocol` (#296) the header's client is written (as with the rule's `source_ip`).
+- Handoff and storage: only added to the rule's shape (`tls.routes[]`). The database's `options.tls` takes the same shape. The Traefik converter turns `proxyProtocol.version`s that differ between routers into route `source_ip`s (for routers that do not terminate).
+- Tests: unit (validation in `tls::config`, round trip and `in_place` in `config::plan`), `tests/route_source_ip.rs`.

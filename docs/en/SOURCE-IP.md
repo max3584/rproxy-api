@@ -59,10 +59,27 @@ Recommended combinations per use case are in [PROFILES.md](PROFILES.md).
 
 ## Relationship with other settings
 
-- **L7 (`http`) rules:** only `proxy` (or `transparent`) can be used. The client IP is passed in `X-Forwarded-For` / `X-Real-IP` (use `global.trusted_proxies` to trust an upstream CDN, etc.). Passthrough routes in the same rule (`tls.routes[].passthrough`) do not get PROXY protocol either.
+- **L7 (`http`) rules:** only `proxy` (or `transparent`) can be used. The client IP is passed in `X-Forwarded-For` / `X-Real-IP` (use `global.trusted_proxies` to trust an upstream CDN, etc.). Passthrough routes in the same rule (`tls.routes[].passthrough`) can get PROXY protocol with their own `source_ip` ("Per name" below).
 - **Rules where rproxy terminates TLS (`terminate`):** with `proxy_v2`, TLS information (SNI, ALPN, TLS version, client certificate CN) is also passed in TLVs.
-- **`source_ip` cannot be changed after creation** (recreate the rule). This is because it must be switched at the same time as the target's configuration.
+- **The rule's `source_ip` cannot be changed after creation** (recreate the rule). This is because it must be switched at the same time as the target's configuration (a route's own `source_ip` can be changed with PATCH).
 - For syntax and constraints, see the rule field `source_ip` in [API.md](API.md).
+
+## Per name (`tls.routes[].source_ip`, v0.4.13)
+
+On one port, whether the backend takes PROXY protocol can depend on the name. For example, the VM's `:443` stays an L7 (`http`) rule, and only the names passed straight through to Kubernetes should get PROXY v2 with the client's IP. Routes that reach the backend without terminating TLS (`passthrough: true` routes of `terminate` rules, and routes of `sni` rules) can have their own `source_ip`.
+
+```json
+"tls": {"mode": "terminate", "certificates": [...], "routes": [
+  {"server_names": ["**.tenant.example.com"], "passthrough": true,
+   "remote_addr": "10.2.255.131", "remote_port": 443, "source_ip": "proxy_v2"}
+]}
+```
+
+- A route's `source_ip` is used before the rule's. Left out: the rule's.
+- It takes `proxy`, `proxy_v1` and `proxy_v2` (`proxy` and `proxy_v2` on `udp` `sni` rules).
+- **`transparent` cannot be chosen per route.** The `IP_TRANSPARENT` sockets, the policy routing and the return path from the backends are prepared per rule ([TRANSPARENT.md](TRANSPARENT.md)). A route of a `transparent` rule with `proxy*` connects to its backend from rproxy's address.
+- Routes where rproxy terminates TLS cannot have one (they use the rule's `source_ip`).
+- The details are in "`source_ip` of `tls.routes[]`" in [API.md](API.md).
 
 ## rproxy receiving PROXY protocol (`proxy_protocol`, v0.4.13)
 
