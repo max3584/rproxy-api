@@ -168,12 +168,13 @@ struct Options {
 	/// volumes), separated by ':' or ','; global.files.trusted_dirs wins (v0.4)
 	#[arg(long, env = "RPROXY_FILES_TRUSTED_DIRS")]
 	files_trusted_dirs: Option<String>,
-	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
+	/// This rproxy's name in rproxy_rules (default: the host name); unique per node: with
+	/// a database, a start while another live process has the name stops (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
 	/// Seconds between checks of this node's rows in rproxy_rules against the running
 	/// rules made through the API (writes that did not go through are written again,
-	/// the rows win); 0: only after a start that found the node's lock held
+	/// the rows win); 0: only while the node's lock is not held
 	#[arg(long, env = "RPROXY_PERSIST_CHECK_SECS", default_value_t = 60)]
 	persist_check_secs: u64,
 	/// Unix socket for live upgrades [default: /run/rproxy/handoff.sock] (v0.4, #174)
@@ -1012,9 +1013,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 				vec![]
 			}
 		};
-		// a write an earlier process of this node left behind is done first
+		// a write an earlier process of this node left behind is done first; another
+		// live process with this node name stops the startup (node names must be unique)
 		if let Some(store) = registry.persist() {
-			store.wait_for_earlier_writes().await;
+			store.wait_for_earlier_writes().await?;
 		}
 		let stored = match registry.persist() {
 			Some(store) => match store.load().await {

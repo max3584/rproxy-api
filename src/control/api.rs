@@ -408,16 +408,31 @@ async fn create(
 	// #144: rules of a persist: true token are stored in rproxy_rules
 	let store = state.registry.persist().filter(|_| principal.persist && Features::CURRENT.persistence).cloned();
 	let origin = if store.is_some() { Origin::Api } else { Origin::Dynamic };
-	let _change = changing(&state).await;
-	let result = async {
-		check_ports(&principal, req.listen_port, req.listen_port_end)?;
-		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
-		state.registry.create_as(req, origin).await
-	}
-	.await;
-	audit(&principal, &client, "create", &rule, &result);
-	let view = persisted(&state, store.as_deref(), result?, &principal).await;
-	Ok((StatusCode::CREATED, Json(view)).into_response())
+	to_the_end(async move {
+		let _change = changing(&state).await;
+		let result = async {
+			check_ports(&principal, req.listen_port, req.listen_port_end)?;
+			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
+			state.registry.create_as(req, origin).await
+		}
+		.await;
+		audit(&principal, &client, "create", &rule, &result);
+		let view = persisted(&state, store.as_deref(), result?, &principal).await;
+		Ok((StatusCode::CREATED, Json(view)).into_response())
+	})
+	.await
+}
+
+/// Runs a change to its end in a task of its own: a client that goes away (or
+/// a front's timeout) drops the handler's future, but never a change half way
+/// through (a rule changed and its row not written, nor recorded as not
+/// written, #144).
+pub(crate) async fn to_the_end<T, E>(change: impl std::future::Future<Output = Result<T, E>> + Send + 'static) -> Result<T, E>
+where
+	T: Send + 'static,
+	E: From<ApiError> + Send + 'static,
+{
+	tokio::spawn(change).await.unwrap_or_else(|e| Err(ApiError::internal(format!("the change did not finish: {e}")).into()))
 }
 
 /// Held by a change to rules from before it changes the registry until the row
@@ -463,16 +478,19 @@ async fn update(
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
-	let _change = changing(&state).await;
-	let result = async {
-		check_rule_ports(&state, &principal, &key).await?;
-		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
-		state.registry.update(&key, req).await
-	}
-	.await;
-	audit(&principal, &client, "update", &key.to_string(), &result);
-	let store = state.registry.persist().filter(|_| Features::CURRENT.persistence).cloned();
-	Ok(Json(persisted(&state, store.as_deref(), result?, &principal).await).into_response())
+	to_the_end(async move {
+		let _change = changing(&state).await;
+		let result = async {
+			check_rule_ports(&state, &principal, &key).await?;
+			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+			state.registry.update(&key, req).await
+		}
+		.await;
+		audit(&principal, &client, "update", &key.to_string(), &result);
+		let store = state.registry.persist().filter(|_| Features::CURRENT.persistence).cloned();
+		Ok(Json(persisted(&state, store.as_deref(), result?, &principal).await).into_response())
+	})
+	.await
 }
 
 async fn delete(
@@ -494,23 +512,34 @@ async fn delete(
 		}
 		None => None,
 	};
-	let _change = changing(&state).await;
-	// #144: the row of an api rule goes with it
-	let stored = match state.registry.persist() {
-		Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),
-		_ => None,
-	};
-	let result = async {
-		check_rule_ports(&state, &principal, &key).await?;
-		state.registry.delete(&key, drain).await
-	}
-	.await;
-	audit(&principal, &client, "delete", &key.to_string(), &result);
-	result?;
-	if let Some(store) = stored {
-		store.remove(&key, &principal.name).await;
-	}
-	Ok(StatusCode::NO_CONTENT.into_response())
+	to_the_end(async move {
+		let change = changing(&state).await;
+		// #144: the row of an api rule goes with it
+		let stored = match state.registry.persist() {
+			Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),
+			_ => None,
+		};
+		let result = async {
+			check_rule_ports(&state, &principal, &key).await?;
+			state.registry.take(&key).await
+		}
+		.await;
+		audit(&principal, &client, "delete", &key.to_string(), &result);
+		let taken = result?;
+		// the row's deletion is queued now, before a new rule with the key can queue its row
+		let queued = match &stored {
+			Some(store) => store.begin_remove(&state.registry, &key, &principal.name).await,
+			None => None,
+		};
+		// the drain holds up no other change (nor the end of a live upgrade)
+		drop(change);
+		state.registry.stop_taken(taken, drain).await;
+		if let (Some(store), Some(queued)) = (stored, queued) {
+			store.finish_remove(queued).await;
+		}
+		Ok(StatusCode::NO_CONTENT.into_response())
+	})
+	.await
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -115,6 +115,131 @@ async fn persist_tokens_store_their_rules() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
+/// A client that goes away before the answer (or a front's timeout) does not
+/// cut a change short: the row is still written, and the periodic check never
+/// takes the rule for one without a row meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_whose_client_went_away_is_still_written() {
+	let dir = workdir("gone");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("n1"));
+	h.registry.set_persist(store.clone());
+	let backend = tcp_backend("G:").await;
+	let port = free_port();
+	store.delay_writes(Duration::from_millis(800));
+	let sent = h
+		.http
+		.post(format!("{}/rules", h.base))
+		.bearer_auth("ci")
+		.json(&rule("tcp", port, backend))
+		.timeout(Duration::from_millis(300))
+		.send()
+		.await;
+	assert!(sent.is_err(), "the answer came before the write: {sent:?}");
+	// the write is on its way: the check leaves the rule alone
+	let r = store.reconcile(&h.registry).await.unwrap();
+	assert_eq!(r.deleted, 0, "{r:?}");
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while store.memory_rows().is_empty() {
+		assert!(Instant::now() < deadline, "the row was not written");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let (_, v) = call(&h, reqwest::Method::GET, &format!("/rules/tcp/127.0.0.1/{port}"), "ci", None).await;
+	assert_eq!((&v["origin"], &v["persisted"], &v["state"]), (&json!("api"), &json!(true), &json!("running")), "{v}");
+	store.delay_writes(Duration::ZERO);
+	let r = store.reconcile(&h.registry).await.unwrap();
+	assert_eq!((r.deleted, r.replaced, r.created), (0, 0, 0), "{r:?}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// `DELETE ?drain_secs` while a `POST` makes a new rule with the same key: the
+/// old rule's row is deleted before the new one is written, so the new rule
+/// keeps its row (and `persisted: true`); the drain does not hold up the `POST`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_with_drain_spares_a_new_rule_with_the_key() {
+	let dir = workdir("drain");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("n1"));
+	h.registry.set_persist(store.clone());
+	let backend = tcp_backend("D:").await;
+	let port = free_port();
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let (status, v) = call(&h, reqwest::Method::POST, "/rules", "ci", Some(rule("tcp", port, backend))).await;
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
+	// a connection the old rule drains
+	let mut held = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	tokio::io::AsyncWriteExt::write_all(&mut held, b"x").await.unwrap();
+	let mut buf = [0u8; 8];
+	let _ = tokio::io::AsyncReadExt::read(&mut held, &mut buf).await;
+	let delete = tokio::spawn({
+		let (http, url) = (h.http.clone(), format!("{}{path}?drain_secs=20", h.base));
+		async move { http.delete(url).bearer_auth("ci").send().await.unwrap().status() }
+	});
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while call(&h, reqwest::Method::GET, &path, "ci", None).await.0 != StatusCode::NOT_FOUND {
+		assert!(Instant::now() < deadline, "the rule is not taken out");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	// the new rule, while the old one drains (its listener closes right away)
+	let mut body = rule("tcp", port, backend);
+	body["udp_idle_secs"] = json!(4242);
+	let started = Instant::now();
+	let created = loop {
+		let (status, v) = call(&h, reqwest::Method::POST, "/rules", "ci", Some(body.clone())).await;
+		if status == StatusCode::CREATED {
+			break v;
+		}
+		assert!(Instant::now() < deadline, "{status}: {v}");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	};
+	assert!(started.elapsed() < Duration::from_secs(3), "the POST waited for the drain: {:?}", started.elapsed());
+	assert_eq!(created["persisted"], true, "{created}");
+	assert!(!delete.is_finished(), "the drain is over already");
+	drop(held);
+	assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+	let rows = store.memory_rows();
+	assert_eq!(rows.iter().map(|r| r.spec.udp_idle_secs).collect::<Vec<_>>(), [Some(4242)], "the new rule's row stays");
+	let (_, v) = call(&h, reqwest::Method::GET, &path, "ci", None).await;
+	assert_eq!((&v["persisted"], &v["udp_idle_secs"]), (&json!(true), &json!(4242)), "{v}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// A live upgrade's old process lets go of the node's lock while a deletion
+/// still drains (it used to wait for the drain, so the new process could not
+/// write and said it was a duplicate node).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_does_not_wait_for_a_drain() {
+	let dir = workdir("release");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("n1"));
+	h.registry.set_persist(store.clone());
+	let backend = tcp_backend("R:").await;
+	let port = free_port();
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	assert_eq!(call(&h, reqwest::Method::POST, "/rules", "ci", Some(rule("tcp", port, backend))).await.0, StatusCode::CREATED);
+	let mut held = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	tokio::io::AsyncWriteExt::write_all(&mut held, b"x").await.unwrap();
+	let mut buf = [0u8; 8];
+	let _ = tokio::io::AsyncReadExt::read(&mut held, &mut buf).await;
+	let delete = tokio::spawn({
+		let (http, url) = (h.http.clone(), format!("{}{path}?drain_secs=30", h.base));
+		async move { http.delete(url).bearer_auth("ci").send().await.unwrap().status() }
+	});
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while call(&h, reqwest::Method::GET, &path, "ci", None).await.0 != StatusCode::NOT_FOUND {
+		assert!(Instant::now() < deadline, "the rule is not taken out");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	let started = Instant::now();
+	tokio::time::timeout(Duration::from_secs(3), store.release()).await.expect("release waited for the drain");
+	assert!(started.elapsed() < Duration::from_secs(3));
+	// the row was deleted before the drain
+	assert!(store.memory_rows().is_empty());
+	drop(held);
+	assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+	fs::remove_dir_all(dir).unwrap();
+}
+
 /// Without RPROXY_DATABASE_URL a persist token's rules are `api` but not stored.
 #[tokio::test]
 async fn without_a_database_nothing_is_stored() {

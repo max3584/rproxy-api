@@ -77,23 +77,29 @@ pub async fn put(
 			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })?;
 	}
 	principal.may_use_ruleset(&name)?;
-	let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
-	let admin = principal.has(crate::control::auth::Scope::Admin);
-	let opts = PutOptions { if_match: if_match(&headers)?, dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
-	// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
-	let _change = match state.registry.persist().filter(|_| !dry_run) {
-		Some(store) => Some(store.changing().await),
-		None => None,
-	};
-	let result = state.registry.put_ruleset(&name, req, opts).await;
-	if !dry_run {
-		audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
-	}
-	let mut applied = result?;
-	if !dry_run {
-		applied.persisted = persist_set(&state, &principal, &name).await;
-	}
-	Ok((etag_header(&applied.etag), Json(applied)).into_response())
+	let if_match = if_match(&headers)?.map(str::to_owned);
+	// a change runs to its end even if the client goes away (#144)
+	super::api::to_the_end(async move {
+		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
+		let admin = principal.has(crate::control::auth::Scope::Admin);
+		let opts =
+			PutOptions { if_match: if_match.as_deref(), dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
+		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
+		let _change = match state.registry.persist().filter(|_| !dry_run) {
+			Some(store) => Some(store.changing().await),
+			None => None,
+		};
+		let result = state.registry.put_ruleset(&name, req, opts).await;
+		if !dry_run {
+			audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
+		}
+		let mut applied = result?;
+		if !dry_run {
+			applied.persisted = persist_set(&state, &principal, &name).await;
+		}
+		Ok((etag_header(&applied.etag), Json(applied)).into_response())
+	})
+	.await
 }
 
 /// The store for a change to rule set `name` (#241): a `persist: true` token's
@@ -130,18 +136,30 @@ pub async fn delete(
 		None => None,
 	};
 	principal.may_use_ruleset(&name)?;
-	let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
-	let admin = principal.has(crate::control::auth::Scope::Admin);
-	let store = set_store(&state, &principal, &name);
-	let _change = match state.registry.persist() {
-		Some(store) => Some(store.changing().await),
-		None => None,
-	};
-	let result = state.registry.delete_ruleset(&name, if_match(&headers)?, drain, &may_use_ports, (&principal.name, admin)).await;
-	audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
-	result?;
-	if let Some(store) = store {
-		store.remove_set(&name, &principal.name).await;
-	}
-	Ok(StatusCode::NO_CONTENT)
+	let if_match = if_match(&headers)?.map(str::to_owned);
+	// a change runs to its end even if the client goes away (#144)
+	super::api::to_the_end(async move {
+		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
+		let admin = principal.has(crate::control::auth::Scope::Admin);
+		let store = set_store(&state, &principal, &name);
+		let change = match state.registry.persist() {
+			Some(store) => Some(store.changing().await),
+			None => None,
+		};
+		let result = state.registry.take_ruleset(&name, if_match.as_deref(), &may_use_ports, (&principal.name, admin)).await;
+		audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
+		let taken = result?;
+		// the row's deletion is queued now; the drain holds up no other change (nor the end of a live upgrade)
+		let queued = match &store {
+			Some(store) => store.begin_remove_set(&state.registry, &name, &principal.name).await,
+			None => None,
+		};
+		drop(change);
+		state.registry.stop_ruleset(taken, drain).await;
+		if let (Some(store), Some(queued)) = (store, queued) {
+			store.finish_remove_set(queued).await;
+		}
+		Ok(StatusCode::NO_CONTENT)
+	})
+	.await
 }

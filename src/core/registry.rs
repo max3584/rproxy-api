@@ -150,6 +150,12 @@ impl Failed {
 	}
 }
 
+/// A rule taken out of the table, still to be stopped (`Registry::take`, `stop_taken`).
+pub struct Taken {
+	key: Key,
+	entry: Entry,
+}
+
 pub(super) enum Entry {
 	Running(Running),
 	Failed(Failed),
@@ -1312,6 +1318,14 @@ impl Registry {
 
 	/// Stops a rule. Returns once the listener is closed and every connection has ended.
 	pub async fn delete(&self, key: &Key, drain: Option<Duration>) -> Result<(), ApiError> {
+		let taken = self.take(key).await?;
+		self.stop_taken(taken, drain).await;
+		Ok(())
+	}
+
+	/// The first half of `delete`: takes the rule out of the table (it is gone
+	/// from the list and its key is free); `stop_taken` stops it.
+	pub async fn take(&self, key: &Key) -> Result<Taken, ApiError> {
 		let entry = {
 			let mut rules = self.rules.lock().await;
 			match rules.get(key) {
@@ -1325,10 +1339,15 @@ impl Registry {
 				Some(_) => rules.remove(key).expect("checked above"),
 			}
 		};
-		self.stop_entry(key, entry, drain).await;
+		Ok(Taken { key: *key, entry })
+	}
+
+	/// The second half of `delete`: stops the rule `take` took out, after `drain`.
+	pub async fn stop_taken(&self, taken: Taken, drain: Option<Duration>) {
+		let Taken { key, entry } = taken;
+		self.stop_entry(&key, entry, drain).await;
 		self.gc_certs().await;
 		info!(event = "rule.delete", rule = %key, drain_secs = drain.map(|d| d.as_secs()));
-		Ok(())
 	}
 
 	/// Stops a rule already taken out of the table.
