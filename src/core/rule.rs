@@ -209,6 +209,8 @@ pub struct Features {
 	pub proxy_protocol_in: bool,
 	/// `source_ip` of `tls.routes[]` relayed at L4 (passthrough routes, routes of `sni`; #297)
 	pub route_source_ip: bool,
+	/// `proxy_protocol` of a udp rule: PROXY v2 (DGRAM) headers in front of each datagram from trusted front ends (#312)
+	pub proxy_protocol_in_udp: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -269,6 +271,7 @@ impl Features {
 		connect_timeout: true,
 		proxy_protocol_in: true,
 		route_source_ip: true,
+		proxy_protocol_in_udp: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -315,6 +318,7 @@ impl Features {
 		connect_timeout: true,
 		proxy_protocol_in: true,
 		route_source_ip: true,
+		proxy_protocol_in_udp: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -383,6 +387,7 @@ impl Features {
 			("listen_freebind (IP_FREEBIND: Linux)", spec.listen_freebind, self.listen_freebind),
 			("connect_timeout", spec.connect_timeout.is_some(), self.connect_timeout),
 			("proxy_protocol", spec.proxy_protocol.is_some(), self.proxy_protocol_in),
+			("proxy_protocol of a udp rule", spec.proxy_protocol.is_some() && spec.key.protocol == Protocol::Udp, self.proxy_protocol_in_udp),
 			("labels", !spec.labels.is_empty(), self.labels),
 			("limits", spec.limits.is_some(), self.limits),
 			("bandwidth", spec.bandwidth.is_some(), self.bandwidth),
@@ -546,7 +551,7 @@ pub struct RuleSpec {
 	pub starttls: Option<StartTls>,
 	pub starttls_required: bool,
 	pub allow_from: Vec<Cidr>,
-	/// `proxy_protocol` (tcp): whose PROXY headers are read.
+	/// `proxy_protocol` (tcp, udp): whose PROXY headers are read.
 	pub proxy_protocol: Option<ProxyProtocol>,
 	pub http: Option<HttpSpec>,
 	pub crowdsec: bool,
@@ -801,7 +806,7 @@ impl RuleRequest {
 		}
 		let connect_timeout = validate_connect_timeout(self.connect_timeout.as_deref(), self.protocol, self.http.is_some())?;
 		let allow_from = cidr::parse_list(&self.allow_from)?;
-		let proxy_protocol = crate::net::proxy_in::validate(self.proxy_protocol, self.protocol)?;
+		let proxy_protocol = crate::net::proxy_in::validate(self.proxy_protocol)?;
 		let tls = self.tls.unwrap_or_default();
 		tlsconf::validate_range(self.protocol, &tls, self.starttls, port_count)?;
 		if tls.misdirected.is_some() && self.http.is_none() {

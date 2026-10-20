@@ -79,8 +79,9 @@ async fn the_shape_validation_and_capabilities() {
 		let (status, v) = h.patch(&path, with_pp(target.clone(), pp.clone())).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "PATCH {pp}: {v}");
 	}
+	// udp too since #312 (tests/proxy_protocol_udp.rs)
 	let (status, v) = h.post(with_pp(rule("udp", free_udp_port(), backend), trusted())).await;
-	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
+	assert_eq!(status, StatusCode::CREATED, "{v}");
 }
 
 /// The header's client is who `allow_from` judges; v1 and v2 both.

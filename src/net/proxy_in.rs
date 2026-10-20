@@ -13,17 +13,23 @@
 //! reads at most `V1_MAX` bytes of a v1 header and `V2_MAX` of a v2 one (TLVs
 //! included); TLVs are skipped (towards a backend rproxy writes what it saw itself).
 //! The header must arrive within `HEADER_TIMEOUT`.
+//!
+//! On `udp` rules (#312) every datagram from a peer in `from` carries its own header
+//! in front (what rproxy's `source_ip: proxy_v2` writes, `net::source`): only a v2
+//! header of the DGRAM transport is accepted (`parse_dgram`; v1 has no UDP, a STREAM
+//! header or one longer than the datagram is refused), and `datagram` says who the
+//! client is and how many bytes to strip. The same bounds apply.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-use crate::core::rule::Protocol;
 use crate::error::ApiError;
 use crate::net::cidr::{Cidr, MAX_ALLOW_FROM};
 
@@ -81,13 +87,10 @@ impl ProxyProtocol {
 	}
 }
 
-/// `proxy_protocol` of a rule: tcp only (PROXY v2 over UDP is for later), `from`
-/// not empty and no `/0` (rproxy never believes headers from just anyone).
-pub fn validate(spec: Option<ProxyProtocolSpec>, protocol: Protocol) -> Result<Option<ProxyProtocol>, ApiError> {
+/// `proxy_protocol` of a rule (tcp, and udp since #312): `from` not empty and no
+/// `/0` (rproxy never believes headers from just anyone).
+pub fn validate(spec: Option<ProxyProtocolSpec>) -> Result<Option<ProxyProtocol>, ApiError> {
 	let Some(spec) = spec.filter(|s| !s.is_empty()) else { return Ok(None) };
-	if protocol != Protocol::Tcp {
-		return Err(ApiError::unsupported("proxy_protocol is for tcp rules (PROXY headers over udp are not read)"));
-	}
 	let list = spec.from.unwrap_or_default();
 	if list.is_empty() {
 		return Err(ApiError::invalid(
@@ -185,7 +188,56 @@ pub fn parse(buf: &[u8]) -> Parsed {
 		Start::More => Parsed::More,
 		Start::Plain => Parsed::NotHeader,
 		Start::Header(Version::V1) => parse_v1(buf),
-		Start::Header(Version::V2) => parse_v2(buf),
+		Start::Header(Version::V2) => parse_v2(buf, false),
+	}
+}
+
+/// Reads the PROXY header at the start of a whole datagram (`udp` rules, #312): only
+/// v2 of the DGRAM transport (or LOCAL / UNSPEC, which leave the peer's address); the
+/// header must end within the datagram. A datagram too short to tell is not a header.
+pub fn parse_dgram(datagram: &[u8]) -> Parsed {
+	match classify(datagram) {
+		Start::More | Start::Plain => Parsed::NotHeader,
+		Start::Header(Version::V1) => Parsed::Invalid("PROXY v1 header in a datagram (v1 has no UDP)"),
+		Start::Header(Version::V2) => match parse_v2(datagram, true) {
+			Parsed::More => Parsed::Invalid("v2 header longer than the datagram"),
+			parsed => parsed,
+		},
+	}
+}
+
+/// Why a datagram was refused on a `udp` rule with `proxy_protocol`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+	/// `proxy_protocol` (a peer in `from`: no header while `required`, or a bad one) or
+	/// `proxy_protocol_untrusted` (a header from outside `from`), as on TCP.
+	pub reason: &'static str,
+	pub why: &'static str,
+	/// The header's version, for `proxy_protocol_untrusted`.
+	pub version: Option<Version>,
+}
+
+/// A datagram from `peer` on a `udp` rule with `proxy_protocol` (#312): Ok with the
+/// client named by its header (None: the peer's address stands) and the length of the
+/// header to strip before it goes on; Err when it is dropped.
+pub fn datagram(pp: &ProxyProtocol, peer: IpAddr, data: &[u8]) -> Result<(Option<SocketAddr>, usize), Refusal> {
+	if !pp.trusts(peer) {
+		return match classify(data) {
+			Start::Header(v) => Err(Refusal {
+				reason: "proxy_protocol_untrusted",
+				why: "a PROXY header from a peer outside proxy_protocol.from",
+				version: Some(v),
+			}),
+			_ => Ok((None, 0)),
+		};
+	}
+	let refused = |why| Err(Refusal { reason: "proxy_protocol", why, version: None });
+	match parse_dgram(data) {
+		Parsed::Header(h) => Ok((h.addrs.map(|(src, _)| src), h.len)),
+		Parsed::NotHeader if !pp.required => Ok((None, 0)),
+		Parsed::NotHeader => refused("no PROXY header (proxy_protocol.required)"),
+		Parsed::Invalid(why) => refused(why),
+		Parsed::More => refused("incomplete PROXY header"),
 	}
 }
 
@@ -228,7 +280,9 @@ fn port(s: &str) -> Option<u16> {
 	s.parse().ok()
 }
 
-fn parse_v2(buf: &[u8]) -> Parsed {
+/// A v2 header; `dgram`: at the start of a datagram, where only the DGRAM transport
+/// (or an unspecified one) is accepted, and on a stream only STREAM.
+fn parse_v2(buf: &[u8], dgram: bool) -> Parsed {
 	if buf.len() < 16 {
 		return Parsed::More;
 	}
@@ -258,8 +312,11 @@ fn parse_v2(buf: &[u8]) -> Parsed {
 	if local {
 		return header(None);
 	}
-	if transport == 2 {
+	if transport == 2 && !dgram {
 		return Parsed::Invalid("v2 header of a datagram (UDP) on a TCP connection");
+	}
+	if transport == 1 && dgram {
+		return Parsed::Invalid("v2 header of a stream (TCP) in a datagram");
 	}
 	match family {
 		// AF_UNSPEC, AF_UNIX, or an unspecified transport: nothing rproxy can use
@@ -395,6 +452,12 @@ pub fn with_peer<F: std::future::Future>(peer: Option<SocketAddr>, f: F) -> impl
 	PROXY_PEER.scope(peer, f)
 }
 
+/// Runs `f` (a datagram's checks on a `udp` rule) with `peer` as the `proxy_peer` of
+/// its log lines.
+pub fn sync_with_peer<R>(peer: Option<SocketAddr>, f: impl FnOnce() -> R) -> R {
+	PROXY_PEER.sync_scope(peer, f)
+}
+
 /// The front end that sent the current connection's PROXY header, if any.
 pub fn current_peer() -> Option<SocketAddr> {
 	PROXY_PEER.try_with(|p| *p).ok().flatten()
@@ -407,6 +470,41 @@ pub fn peer_field() -> Option<tracing::field::DisplayValue<SocketAddr>> {
 
 /// Shared form kept in `Runtime` (PATCH replaces it for the next connection).
 pub type Shared = Option<Arc<ProxyProtocol>>;
+
+/// `Runtime.proxy_protocol`: None after one relaxed load when the rule has none (a
+/// `udp` rule looks at it for every batch of datagrams).
+#[derive(Debug, Default)]
+pub struct Slot {
+	on: AtomicBool,
+	current: RwLock<Shared>,
+}
+
+impl Slot {
+	pub fn new(pp: Option<ProxyProtocol>) -> Self {
+		let slot = Slot::default();
+		slot.set(pp);
+		slot
+	}
+
+	pub fn get(&self) -> Shared {
+		if !self.on.load(Ordering::Relaxed) {
+			return None;
+		}
+		self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// Whether the rule has one (for the DPDK path, which refuses it).
+	pub fn is_on(&self) -> bool {
+		self.on.load(Ordering::Relaxed)
+	}
+
+	/// Puts `pp` into effect for the next connections and datagrams (PATCH).
+	pub fn set(&self, pp: Option<ProxyProtocol>) {
+		let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
+		self.on.store(pp.is_some(), Ordering::Relaxed);
+		*current = pp.map(Arc::new);
+	}
+}
 
 #[cfg(test)]
 mod tests {
@@ -537,15 +635,95 @@ mod tests {
 	}
 
 	#[test]
+	fn datagram_headers() {
+		use crate::net::source::proxy_v2_dgram_header;
+		for (src, dst) in [("192.0.2.1:5000", "198.51.100.1:53"), ("[2001:db8::1]:1", "[2001:db8::2]:65535")] {
+			let (src, dst) = (sa(src), sa(dst));
+			let h = proxy_v2_dgram_header(src, dst);
+			let with = [h.as_slice(), b"payload"].concat();
+			match parse_dgram(&with) {
+				Parsed::Header(got) => assert_eq!((got.version, got.len, got.addrs), (Version::V2, h.len(), Some((src, dst)))),
+				other => panic!("{other:?}"),
+			}
+			// the stream parser refuses it, and the datagram one a header cut short
+			assert!(matches!(parse(&with), Parsed::Invalid(_)));
+			assert!(matches!(parse_dgram(&h[..h.len() - 1]), Parsed::Invalid(_)));
+			assert!(matches!(parse_dgram(&h[..13]), Parsed::Invalid(_)), "the signature and part of the rest");
+		}
+		// LOCAL, UNSPEC and AF_UNIX leave the peer's address; TLVs are skipped
+		assert_eq!(header_dgram(&v2(0x20, 0x00, &[])).addrs, None);
+		assert_eq!(header_dgram(&v2(0x21, 0x00, &[])).addrs, None);
+		assert_eq!(header_dgram(&v2(0x21, 0x32, &[0; 216])).addrs, None);
+		let mut body = vec![192, 0, 2, 7, 192, 0, 2, 8, 0x13, 0x88, 0, 53];
+		body.extend_from_slice(&[0x05, 0, 3, 1, 2, 3]);
+		let h = header_dgram(&[v2(0x21, 0x12, &body), b"x".to_vec()].concat());
+		assert_eq!((h.len, h.addrs), (16 + body.len(), Some((sa("192.0.2.7:5000"), sa("192.0.2.8:53")))));
+		for (bad, why) in [
+			(v2(0x21, 0x11, &[0; 12]), "STREAM in a datagram"),
+			(v2(0x21, 0x21, &[0; 36]), "STREAM over IPv6"),
+			(b"PROXY UNKNOWN\r\n".to_vec(), "v1"),
+			(v2(0x21, 0x12, &[0; 11]), "short IPv4"),
+			(v2(0x21, 0x13, &[0; 12]), "transport 3"),
+		] {
+			assert!(matches!(parse_dgram(&bad), Parsed::Invalid(_)), "{why}");
+		}
+		let mut long = v2(0x21, 0x12, &[0; 12]);
+		long[14..16].copy_from_slice(&((V2_MAX_PAYLOAD + 1) as u16).to_be_bytes());
+		long.resize(16 + V2_MAX_PAYLOAD + 1, 0);
+		assert!(matches!(parse_dgram(&long), Parsed::Invalid(_)), "bounded as on TCP");
+		for plain in [&b""[..], b"\r\n", b"\x16\xfe\xfd", b"PROX"] {
+			assert_eq!(parse_dgram(plain), Parsed::NotHeader, "{plain:?}");
+		}
+	}
+
+	fn header_dgram(buf: &[u8]) -> Header {
+		match parse_dgram(buf) {
+			Parsed::Header(h) => h,
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[test]
+	fn what_a_datagram_comes_to() {
+		use crate::net::source::proxy_v2_dgram_header;
+		let pp = |required| ProxyProtocol { from: vec!["10.0.0.0/8".parse().unwrap()], required };
+		let (front, other) = ("10.1.2.3".parse().unwrap(), "192.0.2.50".parse().unwrap());
+		let h = proxy_v2_dgram_header(sa("192.0.2.7:4000"), sa("10.9.9.9:53"));
+		let with = [h.as_slice(), b"q"].concat();
+		assert_eq!(datagram(&pp(true), front, &with), Ok((Some(sa("192.0.2.7:4000")), h.len())));
+		assert_eq!(datagram(&pp(true), front, b"q").unwrap_err().reason, "proxy_protocol", "required");
+		assert_eq!(datagram(&pp(false), front, b"q"), Ok((None, 0)));
+		assert_eq!(datagram(&pp(false), front, b"PROXY UDP4\r\nq").unwrap_err().reason, "proxy_protocol", "v1: refused anyway");
+		let local = v2(0x20, 0x00, &[]);
+		assert_eq!(datagram(&pp(true), front, &local), Ok((None, 16)), "LOCAL: the peer's address");
+		// from outside `from`
+		let r = datagram(&pp(true), other, &with).unwrap_err();
+		assert_eq!((r.reason, r.version), ("proxy_protocol_untrusted", Some(Version::V2)));
+		assert_eq!(datagram(&pp(true), other, b"PROXY TCP4 x").unwrap_err().version, Some(Version::V1));
+		assert_eq!(datagram(&pp(true), other, b"q"), Ok((None, 0)));
+		assert_eq!(datagram(&pp(true), other, &with[..5]), Ok((None, 0)), "too short to be one");
+	}
+
+	#[test]
+	fn the_slot() {
+		let slot = Slot::default();
+		assert!(slot.get().is_none() && !slot.is_on());
+		slot.set(Some(ProxyProtocol { from: vec!["10.0.0.0/8".parse().unwrap()], required: true }));
+		assert!(slot.is_on() && slot.get().unwrap().required);
+		slot.set(None);
+		assert!(slot.get().is_none() && !slot.is_on());
+	}
+
+	#[test]
 	fn validation() {
 		let spec = |v: serde_json::Value| serde_json::from_value::<ProxyProtocolSpec>(v).unwrap();
-		let ok = validate(Some(spec(serde_json::json!({"from": ["10.2.0.0/16", "172.16.10.19/32"]}))), Protocol::Tcp).unwrap().unwrap();
+		let ok = validate(Some(spec(serde_json::json!({"from": ["10.2.0.0/16", "172.16.10.19/32"]})))).unwrap().unwrap();
 		assert!(ok.required, "required by default");
 		assert!(ok.trusts("10.2.3.4".parse().unwrap()) && ok.trusts("::ffff:172.16.10.19".parse().unwrap()));
 		assert!(!ok.trusts("172.16.10.20".parse().unwrap()));
 		assert_eq!(ok.view(), spec(serde_json::json!({"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true})));
-		assert_eq!(validate(Some(spec(serde_json::json!({}))), Protocol::Tcp).unwrap(), None, "{{}} is none");
-		assert_eq!(validate(None, Protocol::Udp).unwrap(), None);
+		assert_eq!(validate(Some(spec(serde_json::json!({})))).unwrap(), None, "{{}} is none");
+		assert_eq!(validate(None).unwrap(), None);
 		for (v, code) in [
 			(serde_json::json!({"from": []}), "invalid"),
 			(serde_json::json!({"required": false}), "invalid"),
@@ -553,9 +731,8 @@ mod tests {
 			(serde_json::json!({"from": ["0.0.0.0/0"]}), "invalid"),
 			(serde_json::json!({"from": ["::/0"]}), "invalid"),
 		] {
-			assert_eq!(validate(Some(spec(v.clone())), Protocol::Tcp).unwrap_err().code, code, "{v}");
+			assert_eq!(validate(Some(spec(v.clone()))).unwrap_err().code, code, "{v}");
 		}
-		assert_eq!(validate(Some(spec(serde_json::json!({"from": ["10.0.0.1"]}))), Protocol::Udp).unwrap_err().code, "unsupported");
 		assert!(serde_json::from_value::<ProxyProtocolSpec>(serde_json::json!({"from": ["10.0.0.1"], "trust": true})).is_err());
 	}
 

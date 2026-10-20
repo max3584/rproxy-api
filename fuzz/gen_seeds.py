@@ -298,6 +298,11 @@ def proxy_in_seeds():
     put("proxy_header_in", "v2-dgram", v2(0x21, 0x12, v4))
     put("proxy_header_in", "v2-too-long", sig + b"\x21\x11\xff\xff" + v4)
     put("proxy_header_in", "plain-tls", b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
+    # udp rules (#312): one header in front of each datagram, as rproxy's source_ip: proxy_v2 writes it
+    put("proxy_header_in", "v2-dgram-quic", v2(0x21, 0x12, v4) + b"\xc3\x00\x00\x00\x01\x08" + bytes(range(8)) + b"\x00\x00")
+    put("proxy_header_in", "v2-dgram6-tlvs-dns", v2(0x21, 0x22, v6 + tlvs) + bytes.fromhex("12340100000100000000000003777777076578616d706c6500000100 01".replace(" ", "")))
+    put("proxy_header_in", "v2-dgram-local-dtls", v2(0x20, 0x12, b"") + b"\x16\xfe\xfd\x00\x00")
+    put("proxy_header_in", "v2-dgram-short", sig + b"\x21\x12\x00\x0c" + v4[:6])
 
 
 if __name__ == "__main__":

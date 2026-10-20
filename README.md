@@ -268,7 +268,7 @@ CrowdSec の判定で止める（L7 の `crowdsec` ミドルウェア、L4 の�
 | `proxy_v1` / `proxy_v2` | TCP は接続の先頭に、UDP（`proxy_v2` のみ）はデータグラムごとに PROXY protocol ヘッダを付ける | 転送先が PROXY protocol に対応していること。UDP は dnsdist・PowerDNS・Unbound と同じく、毎回のデータグラムにヘッダを付け、応答にはヘッダを付けない |
 | `transparent` | クライアントの IP を名乗って接続する（`IP_TRANSPARENT` / `IPV6_TRANSPARENT`） | Linux、`CAP_NET_ADMIN`。IPv4 と IPv6。転送先からの戻りパケットが rproxy のホストを通ること（[docs/TRANSPARENT.md](docs/TRANSPARENT.md)） |
 
-rproxy の前にロードバランサなどがいて PROXY protocol を付けて送ってくるときは、ルールの `proxy_protocol` でヘッダを受け取る（v0.4.13。`tcp` のルール）。信じるのは `from` に書いた前段からのヘッダだけで、`allow_from`・`limits`・ログ・`X-Forwarded-For`・上の `source_ip` などはヘッダのクライアントで動く。前段のアドレスはログの `proxy_peer`。
+rproxy の前にロードバランサなどがいて PROXY protocol を付けて送ってくるときは、ルールの `proxy_protocol` でヘッダを受け取る（v0.4.13。`tcp` のルール、v0.4.16 から `udp` のルールも：データグラムごとの PROXY v2）。信じるのは `from` に書いた前段からのヘッダだけで、`allow_from`・`limits`・ログ・`X-Forwarded-For`・上の `source_ip` などはヘッダのクライアントで動く。前段のアドレスはログの `proxy_peer`。
 
 ```json
 "proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}

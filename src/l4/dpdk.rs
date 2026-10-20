@@ -347,6 +347,9 @@ pub fn claim(spec: &RuleSpec, ip: IpAddr) -> Option<Result<Claim, ApiError>> {
 		Some("tls (DTLS / sni)".to_string())
 	} else if spec.http.is_some() {
 		Some("http".to_string())
+	} else if spec.proxy_protocol.is_some() {
+		// PROXY headers in front of datagrams (#312) are read on the kernel path only
+		Some("proxy_protocol".to_string())
 	} else {
 		None
 	};
@@ -467,6 +470,12 @@ impl Rule for RtRule {
 		if rt.tls().mode() != TlsMode::Passthrough {
 			rt.stats.dropped();
 			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "tls is not supported on the DPDK path");
+			return None;
+		}
+		// PATCH may have added proxy_protocol (#312): its headers are not read here
+		if rt.proxy_protocol.is_on() {
+			rt.stats.dropped();
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "proxy_protocol is not supported on the DPDK path");
 			return None;
 		}
 		let permit = match rt.limits.get().map(|l| l.admit(ip)) {

@@ -23,6 +23,7 @@ use crate::core::limits::{self, Permit, Reason};
 use crate::tls::dtls::SessionConn;
 use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
+use crate::net::proxy_in::{self, peer_field};
 use crate::net::source;
 use crate::tls::config::{TlsMode, TlsRuntime};
 use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
@@ -41,7 +42,44 @@ const SNI_MAX_PENDING: usize = 4096;
 /// A session is one client (address and port) talking to one local address:
 /// on a wildcard socket the same client may reach the rule at several addresses
 /// (IPv4 and IPv6, or several IPv6 addresses), and each is answered from its own.
-type Peer = (SocketAddr, Option<Local>);
+/// With `proxy_protocol` (#312), datagrams from a front end in `from` carry the
+/// client in a PROXY v2 header: the session is (front end's address and port, local
+/// address, the header's client), and replies go back to the front end's address and
+/// port, without a header. A header naming another client from the same front end
+/// port is another session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Peer {
+	/// Where the datagrams come from, and replies go.
+	from: SocketAddr,
+	local: Option<Local>,
+	/// The client named by a PROXY header; None: `from` is the client.
+	named: Option<SocketAddr>,
+}
+
+impl Peer {
+	/// The client: who `allow_from`, `limits`, the logs and the backend see.
+	fn client(&self) -> SocketAddr {
+		self.named.unwrap_or(self.from)
+	}
+
+	/// The front end that sent the PROXY header (`proxy_peer` of the logs).
+	fn via(&self) -> Option<SocketAddr> {
+		self.named.map(|_| self.from)
+	}
+}
+
+// Without a header the key hashes as the (address, local) pair it was before #312:
+// nothing more is hashed for every datagram of a rule without `proxy_protocol`.
+impl std::hash::Hash for Peer {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.from.hash(state);
+		self.local.hash(state);
+		if let Some(named) = self.named {
+			named.hash(state);
+		}
+	}
+}
+
 type Sessions = Arc<Mutex<HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>>>;
 
 /// What the shards of one port share: how many sessions are reading their
@@ -88,34 +126,36 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 			_ = rt.kill.cancelled(), if draining => break,
 			received = socket.recv_batch(&mut batch) => match received {
 				Ok(_) => {
-					// `limits` (#165): None after one relaxed load when the rule has none
+					// `limits` (#165) and `proxy_protocol` (#312): None after one relaxed load when the rule has none
 					let limiter = rt.limits.get();
+					let pp = rt.proxy_protocol.get();
 					let mut map = sessions.lock().unwrap();
-					for (data, Meta { from: client, local, .. }) in batch.iter() {
+					let mut one = |peer: Peer, data: &[u8]| {
+						let client = peer.client();
 						if !rt.allowed(client.ip()) {
 							denied(&rt, client, "allow_from");
-							continue;
+							return;
 						}
 						// also datagrams of sessions that were open before the rule's geoip changed
 						if let Err(info) = rt.geoip_check(client.ip()) {
 							rt.geoip_denied(client, &info, None, true);
-							continue;
+							return;
 						}
 						// also datagrams of sessions that were open before the ban
 						if rt.crowdsec_blocks(client.ip()) {
 							denied(&rt, client, "crowdsec");
-							continue;
+							return;
 						}
 						if limiter.as_ref().is_some_and(|l| !l.packet(client.ip())) {
 							limits::refused(&rt, client, Reason::Packets, "udp");
-							continue;
+							return;
 						}
-						let tx = match map.get(&(client, local)) {
+						let tx = match map.get(&peer) {
 							Some((_, tx)) if !tx.is_closed() => tx.clone(),
 							_ if draining => {
 								// shutting down: no new sessions
 								rt.stats.dropped();
-								continue;
+								return;
 							}
 							_ => {
 								// a new session: within the limits, or the datagram is dropped
@@ -124,19 +164,35 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 									Some(Ok(p)) => Some(p),
 									Some(Err(reason)) => {
 										limits::refused(&rt, client, reason, "udp");
-										continue;
+										return;
 									}
 								};
 								let id = next_id.fetch_add(1, Ordering::Relaxed);
 								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
-								map.insert((client, local), (id, tx.clone()));
-								rt.tracker.spawn(run_session(id, (client, local), rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), permit));
+								map.insert(peer, (id, tx.clone()));
+								let session = run_session(id, peer, rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), permit);
+								rt.tracker.spawn(proxy_in::with_peer(peer.via(), session));
 								tx
 							}
 						};
 						if tx.try_send(data.to_vec()).is_err() {
 							rt.stats.dropped();
 							debug!(event = "udp.drop", rule = %rt.key, client = %client);
+						}
+					};
+					for (data, Meta { from, local, .. }) in batch.iter() {
+						let Some(pp) = pp.as_deref() else {
+							one(Peer { from, local, named: None }, data);
+							continue;
+						};
+						// the PROXY header is read and stripped; the checks and logs are of the client it names
+						match proxy_in::datagram(pp, from.ip(), data) {
+							Ok((None, skip)) => one(Peer { from, local, named: None }, &data[skip..]),
+							Ok((named, skip)) => {
+								let peer = Peer { from, local, named };
+								proxy_in::sync_with_peer(peer.via(), || one(peer, &data[skip..]));
+							}
+							Err(refusal) => header_denied(&rt, from, refusal),
 						}
 					}
 				}
@@ -154,8 +210,20 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 fn denied(rt: &Runtime, client: SocketAddr, reason: &'static str) {
 	rt.stats.denied();
 	match rt.denied_log.check(&client.ip()) {
-		Some(suppressed) => info!(event = "conn.denied", rule = %rt.key, client = %client, reason, sni = "", suppressed),
+		Some(suppressed) => info!(event = "conn.denied", rule = %rt.key, client = %client, reason, sni = "", suppressed, proxy_peer = peer_field()),
 		None => debug!(event = "conn.denied", rule = %rt.key, client = %client, reason, throttled = true),
+	}
+}
+
+/// A datagram refused for its PROXY header (`proxy_protocol`, #312): from a front end
+/// in `from`, none while `required` or a bad one; from outside `from`, one at all.
+/// Counted and logged as TCP's refusals, at most `Throttle`'s rate per peer.
+fn header_denied(rt: &Runtime, peer: SocketAddr, refusal: proxy_in::Refusal) {
+	rt.stats.denied();
+	let (reason, version) = (refusal.reason, refusal.version.map(|v| v.as_str()));
+	match rt.denied_log.check(&peer.ip()) {
+		Some(suppressed) => warn!(event = "conn.denied", rule = %rt.key, client = %peer, reason, error = refusal.why, version, sni = "", suppressed),
+		None => debug!(event = "conn.denied", rule = %rt.key, client = %peer, reason, error = refusal.why, throttled = true),
 	}
 }
 
@@ -200,7 +268,7 @@ async fn session(
 	sniffing: &AtomicUsize,
 	carry: Vec<Vec<u8>>,
 ) -> Option<Vec<Vec<u8>>> {
-	let (client, local) = peer;
+	let (client, reply_to, local) = (peer.client(), peer.from, peer.local);
 	let tls = rt.tls();
 	let started = Instant::now();
 	let mut events = rt.pool_events.subscribe();
@@ -224,7 +292,8 @@ async fn session(
 		match rt.select(sni.as_deref(), offset) {
 			None => {
 				rt.stats.denied();
-				info!(event = "conn.denied", rule = %rt.key, client = %client, reason = "unmatched", sni = sni.as_deref().unwrap_or(""));
+				info!(event = "conn.denied", rule = %rt.key, client = %client, reason = "unmatched", sni = sni.as_deref().unwrap_or(""),
+					proxy_peer = peer_field());
 				// swallow the rest of this client's datagrams until it goes quiet,
 				// rather than reading every one of them again as a new session
 				drain(rt, from_client, idle).await;
@@ -248,7 +317,8 @@ async fn session(
 		pick(rt, offset, bind_as)
 	};
 	let Some(Picked { mut lease, addrs: mut target_rx, addr }) = picked else {
-		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", sni = sni.as_deref().unwrap_or(""));
+		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", sni = sni.as_deref().unwrap_or(""),
+			proxy_peer = peer_field());
 		remove(sessions, peer, id);
 		return None;
 	};
@@ -257,7 +327,7 @@ async fn session(
 	let upstream = match source::udp_upstream(addr, bind_as).await {
 		Ok(s) => s,
 		Err(e) => {
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e);
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field());
 			remove(sessions, peer, id);
 			return None;
 		}
@@ -266,7 +336,7 @@ async fn session(
 	rt.stats.opened();
 	let geo = rt.geo_for_log(client.ip(), None);
 	info!(event = "conn.open", rule = %rt.key, listen = %listener.local_for(local), client = %client, target = %addr_or_empty(target),
-		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn));
+		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn), proxy_peer = peer_field());
 	// `bandwidth` (#166): datagrams over the rate are dropped
 	let (mut up, mut down) = (Gate::new(client.ip(), Dir::Up), Gate::new(client.ip(), Dir::Down));
 	let header = proxy_header(source_ip, client, listener.local_for(local));
@@ -332,7 +402,7 @@ async fn session(
 					continue;
 				}
 				for _ in 0..BATCH {
-					let n = match reply(&upstream, listener, client, local, &mut down, &rt.bandwidth) {
+					let n = match reply(&upstream, listener, reply_to, local, &mut down, &rt.bandwidth) {
 						Reply::Empty => break,
 						Reply::OverBandwidth => {
 							rt.stats.bandwidth_dropped();
@@ -347,7 +417,7 @@ async fn session(
 						}
 						// the client side's send buffer is full: wait with a copy, not the shared buffer
 						Reply::Blocked(data) => {
-							if let Err(e) = listener.send_to(&data, client, local).await {
+							if let Err(e) = listener.send_to(&data, reply_to, local).await {
 								rt.stats.dropped();
 								debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
 							}
@@ -424,7 +494,7 @@ async fn session(
 	drop(lease);
 	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
-		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
+		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason, proxy_peer = peer_field());
 	restart
 }
 
@@ -701,12 +771,12 @@ async fn dtls_session(
 	offset: u16,
 	tls: Arc<TlsRuntime>,
 ) {
-	let (client, local) = peer;
+	let (client, local) = (peer.client(), peer.local);
 	let started = Instant::now();
 	// before `listener` moves into the DTLS connection
 	let listen = listener.local_for(local);
 	let header = proxy_header(rt.source_ip, client, listen);
-	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, client, local));
+	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, peer.from, local));
 	let handshake = tokio::select! {
 		_ = rt.kill.cancelled() => { remove(&sessions, peer, id); return; }
 		r = tokio::time::timeout(HANDSHAKE_TIMEOUT, DTLSConn::new(conn, tls.dtls_server_config(), false, None)) => r,
@@ -774,7 +844,7 @@ async fn dtls_session(
 
 	rt.stats.opened();
 	info!(event = "conn.open", rule = %rt.key, listen = %listen, client = %client, target = %addr, dtls = true,
-		client_cn = client_cn.as_deref().unwrap_or(""), client_verify, upstream_dtls = tls.spec.upstream.tls);
+		client_cn = client_cn.as_deref().unwrap_or(""), client_verify, upstream_dtls = tls.spec.upstream.tls, proxy_peer = peer_field());
 
 	let mut idle_rx = rt.udp_idle.clone();
 	let mut idle = *idle_rx.borrow_and_update();
@@ -834,7 +904,7 @@ async fn dtls_session(
 	remove(&sessions, peer, id);
 	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr, dtls = true,
-		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason);
+		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason, proxy_peer = peer_field());
 }
 
 fn addr_or_empty(target: Option<SocketAddr>) -> String {

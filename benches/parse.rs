@@ -1,5 +1,6 @@
 //! CPU-only benchmarks (no sockets): the `match` expressions of L7 routes, the
-//! TLS ClientHello walk of `sni` rules and the QUIC Initial of UDP `sni` rules.
+//! TLS ClientHello walk of `sni` rules, the QUIC Initial of UDP `sni` rules and the
+//! PROXY v2 header in front of each datagram of a UDP rule with `proxy_protocol`.
 //! Run with `cargo bench --bench parse`; CI compares a PR with its merge base
 //! (.github/workflows/bench.yml, docs/TESTING.md).
 
@@ -10,6 +11,8 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 use rproxy_api::l7::matcher::{Matcher, RequestInfo};
+use rproxy_api::net::proxy_in::{datagram, ProxyProtocol};
+use rproxy_api::net::source::proxy_v2_dgram_header;
 use rproxy_api::tls::sni::{parse_client_hello, Parse};
 use rproxy_api::tls::udp_sni::{Sniff, Sniffer};
 
@@ -105,6 +108,31 @@ fn quic(c: &mut Criterion) {
 	g.finish();
 }
 
+/// `proxy_protocol` of a udp rule (#312): what `l4::udp::serve` does for each datagram
+/// from a front end before the usual checks: is the peer in `from`, read the v2 DGRAM
+/// header, and the offset of the payload (nothing is copied or allocated).
+fn proxy_dgram(c: &mut Criterion) {
+	let mut g = c.benchmark_group("proxy_dgram");
+	let pp = ProxyProtocol { from: vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()], required: true };
+	let front: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+	for (name, src, dst) in [("v4", "192.0.2.7:4000", "10.9.9.9:443"), ("v6", "[2001:db8::7]:4000", "[fd00::9]:443")] {
+		let d = [proxy_v2_dgram_header(src.parse().unwrap(), dst.parse().unwrap()), vec![0xc3; 1200]].concat();
+		assert!(matches!(datagram(&pp, front, &d), Ok((Some(_), _))));
+		g.throughput(Throughput::Elements(1));
+		g.bench_function(name, |b| {
+			b.iter(|| {
+				let (client, skip) = datagram(black_box(&pp), black_box(front), black_box(&d)).unwrap();
+				(client, black_box(&d[skip..]).len())
+			})
+		});
+	}
+	// a datagram from outside `from`: only its first bytes are looked at
+	let plain = vec![0xc3; 1200];
+	let outside: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+	g.bench_function("untrusted_plain", |b| b.iter(|| datagram(black_box(&pp), black_box(outside), black_box(&plain))));
+	g.finish();
+}
+
 fn config() -> Criterion {
 	Criterion::default().warm_up_time(Duration::from_secs(1)).measurement_time(Duration::from_secs(3))
 }
@@ -112,6 +140,6 @@ fn config() -> Criterion {
 criterion_group! {
 	name = benches;
 	config = config();
-	targets = matcher, clienthello, quic
+	targets = matcher, clienthello, quic, proxy_dgram
 }
 criterion_main!(benches);
