@@ -1263,6 +1263,135 @@ impl Gate {
 	}
 }
 
+/// A TCP forwarder to the database that holds up the answer to the read of
+/// the UI's rules (`forward_rules`, at the start of the restore) until `go`:
+/// a restore that takes as long as the test wants. Everything else (the
+/// node's connection, its lock and pings) goes through.
+struct Stall {
+	addr: std::net::SocketAddr,
+	go: Arc<AtomicBool>,
+}
+
+impl Stall {
+	async fn to(url: &str) -> Stall {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let target = url.split('@').nth(1).and_then(|r| r.split('/').next()).unwrap().to_string();
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let go = Arc::new(AtomicBool::new(false));
+		let released = go.clone();
+		tokio::spawn(async move {
+			loop {
+				let Ok((client, _)) = listener.accept().await else { return };
+				let (target, released) = (target.clone(), released.clone());
+				tokio::spawn(async move {
+					let Ok(server) = TcpStream::connect(&target).await else { return };
+					let (mut client_rx, mut client_tx) = client.into_split();
+					let (mut server_rx, mut server_tx) = server.into_split();
+					// whether this connection asked for the UI's rules
+					let held = Arc::new(AtomicBool::new(false));
+					let asked = held.clone();
+					tokio::spawn(async move {
+						let mut buf = vec![0u8; 16 * 1024];
+						loop {
+							let Ok(got) = client_rx.read(&mut buf).await else { return };
+							if got == 0 {
+								return;
+							}
+							if buf[..got].windows(13).any(|w| w == b"forward_rules") {
+								asked.store(true, Ordering::Relaxed);
+							}
+							if server_tx.write_all(&buf[..got]).await.is_err() {
+								return;
+							}
+						}
+					});
+					let mut buf = vec![0u8; 16 * 1024];
+					loop {
+						let Ok(got) = server_rx.read(&mut buf).await else { return };
+						if got == 0 {
+							return;
+						}
+						while held.load(Ordering::Relaxed) && !released.load(Ordering::Relaxed) {
+							tokio::time::sleep(Duration::from_millis(50)).await;
+						}
+						if client_tx.write_all(&buf[..got]).await.is_err() {
+							return;
+						}
+					}
+				});
+			}
+		});
+		Stall { addr, go }
+	}
+
+	/// `url` with this forwarder in place of the database's address.
+	fn url(&self, url: &str) -> String {
+		let (head, rest) = url.split_once('@').unwrap();
+		let path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
+		format!("{head}@{}/{path}", self.addr)
+	}
+}
+
+/// A process with the same node name that has just taken the lock and
+/// restores for longer than `LIVE_IDLE` (here: its read of the UI's rules is
+/// held up) is live, and a second process sees it so (#307): the first pings
+/// from the moment it has the lock, not only once its restore is done (the
+/// second used to take it for a connection left behind and start).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_with_the_same_node_name_that_restores_for_long_is_seen_live() {
+	use rproxy_api::config::persist::{DUPLICATE_LOOK_AGAIN, DUPLICATE_STARTUP_WAIT, LIVE_IDLE};
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-slow-restore-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let (dir_a, dir_b) = (workdir("db-slow-a"), workdir("db-slow-b"));
+	token_file(&dir_a);
+	token_file(&dir_b);
+	let (api_a, api_b) = (free_port(), free_port());
+	let stall = Stall::to(&url).await;
+	let a = Server::start(&dir_a, "a", api_a, &[("RPROXY_DATABASE_URL", stall.url(&url)), ("RPROXY_NODE_NAME", node.clone())]);
+	let lock = format!("rproxy-node-{}", &sha(&node)[..32]);
+	let holder = async || -> Option<i64> {
+		sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS SIGNED)").bind(&lock).fetch_one(&pool).await.unwrap()
+	};
+	let deadline = Instant::now() + Duration::from_secs(20);
+	let first = loop {
+		if let Some(c) = holder().await {
+			break c;
+		}
+		assert!(Instant::now() < deadline, "the first process does not take the lock:\n{}", a.log());
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	};
+	let started = Instant::now();
+	let mut b = Server::start(&dir_b, "b", api_b, &[("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())]);
+	let deadline = started + DUPLICATE_STARTUP_WAIT + DUPLICATE_LOOK_AGAIN + Duration::from_secs(20);
+	let status = loop {
+		if let Some(status) = b.child.try_wait().unwrap() {
+			break status;
+		}
+		let ready = reqwest::Client::new().get(format!("http://127.0.0.1:{api_b}/readyz")).timeout(Duration::from_secs(1)).send().await;
+		assert!(!ready.is_ok_and(|r| r.status() == StatusCode::OK), "the second process became ready:\n{}", b.log());
+		assert!(Instant::now() < deadline, "the second process still runs:\n{}", b.log());
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	};
+	assert!(!status.success(), "{status}\n{}", b.log());
+	assert!(b.log().contains("\"persist.duplicate_node\""), "{}", b.log());
+	// the first process was restoring all along, for longer than a live one is ever idle
+	let ready = reqwest::Client::new().get(format!("http://127.0.0.1:{api_a}/readyz")).timeout(Duration::from_secs(1)).send().await;
+	assert!(!ready.is_ok_and(|r| r.status() == StatusCode::OK), "the restore was not held up:\n{}", a.log());
+	assert!(started.elapsed() > LIVE_IDLE);
+	stall.go.store(true, Ordering::Relaxed);
+	a.ready().await;
+	assert_eq!(holder().await, Some(first), "the first process keeps the lock");
+	drop(b);
+	drop(a);
+	let _ = fs::remove_dir_all(&dir_a);
+	let _ = fs::remove_dir_all(&dir_b);
+}
+
 /// A second process with the same node name that started while the database
 /// was down (so it could not tell at its start): it does not take the lock from
 /// the first once the database is back, its writes answer `persisted: false` at

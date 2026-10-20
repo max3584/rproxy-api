@@ -237,7 +237,14 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
 pub fn active() -> bool {
-	ACTIVE.load(Ordering::Relaxed)
+	ACTIVE.load(Ordering::Acquire)
+}
+
+/// Marks a handoff as in progress or not (tests of `prepare`; `Upgrader::start`
+/// does it otherwise).
+#[doc(hidden)]
+pub fn set_active(on: bool) {
+	ACTIVE.store(on, Ordering::Release);
 }
 
 pub fn draining() -> bool {
@@ -326,7 +333,11 @@ impl Upgrader {
 			}
 		};
 		info!(event = "handoff.start", exe = %exe.display(), reason, socket = %self.cfg.socket.display());
-		let state = snapshot(&self.registry).await;
+		let state = match prepare(&self.registry, crate::config::persist::FREEZE_WAIT).await {
+			Ok(state) => state,
+			// not the binary's fault: the self-update does not mark it bad
+			Err(why) => return self.failed(None, why),
+		};
 		let cfg = self.cfg.clone();
 		let exe2 = exe.clone();
 		let result = tokio::task::spawn_blocking(move || hand_over(&cfg, &exe2, &state))
@@ -344,6 +355,7 @@ impl Upgrader {
 				OUTCOMES.refused.fetch_add(1, Ordering::Relaxed);
 				warn!(event = "handoff.refused", reason = "version", error = %why, "restart rproxy-api to change the minor version");
 				ACTIVE.store(false, Ordering::Release);
+				thaw(&self.registry);
 			}
 			Err(Failure::Failed(why)) => self.failed(explicit.then_some(exe.as_path()), why),
 		}
@@ -355,7 +367,9 @@ impl Upgrader {
 		if let (Some(exe), Some(f)) = (exe, self.on_failure.lock().unwrap_or_else(|e| e.into_inner()).as_ref()) {
 			f(exe, &why);
 		}
+		// the changes that waited go on here (no longer refused)
 		ACTIVE.store(false, Ordering::Release);
+		thaw(&self.registry);
 	}
 
 	/// Waits until a handoff has succeeded.
@@ -388,6 +402,34 @@ impl Upgrader {
 /// Marks this process as draining (after `handed_off`).
 pub fn set_draining() {
 	DRAINING.store(true, Ordering::Release);
+}
+
+/// The old process's state for the new one, taken once no change is under way
+/// (#305): the API's changes to rules and rule sets (and the periodic check's)
+/// are waited for up to `wait` and then held off (`persist::Store::freeze`)
+/// until the store's `release` after the handoff, or `thaw` if it fails. A
+/// change that gets its turn meanwhile is refused (`503 upgrading`,
+/// `control::api::changing`), so none is made in the old process only. Err:
+/// changes were still under way after `wait`; the handoff must not happen
+/// (the old process keeps running and keeps them).
+#[doc(hidden)]
+pub async fn prepare(registry: &Registry, wait: Duration) -> Result<State, String> {
+	if let Some(store) = registry.persist() {
+		if !store.freeze(wait).await {
+			return Err(format!(
+				"changes to rules or rule sets were still under way after {}s; the live upgrade did not start (send it again)",
+				wait.as_secs()
+			));
+		}
+	}
+	Ok(snapshot(registry).await)
+}
+
+/// The handoff did not happen after `prepare`: changes run again.
+fn thaw(registry: &Registry) {
+	if let Some(store) = registry.persist() {
+		store.thaw();
+	}
 }
 
 /// The rules made through the API (and from the database) and the counters.
@@ -562,8 +604,41 @@ pub struct Adopted {
 impl Received {
 	/// The rules made through the API, with their origin as they were.
 	pub fn rules(&self) -> Vec<(RuleRequest, &serde_json::Value)> {
-		self.state
-			.rules
+		self.state.rules()
+	}
+
+	/// Starts the old process's rules (`State::restore_rules`).
+	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
+		self.state.restore_rules(registry).await
+	}
+
+	/// Applies the rule sets of the old process again (`State::restore_rulesets`).
+	pub async fn restore_rulesets(&self, registry: &Arc<Registry>) {
+		self.state.restore_rulesets(registry).await
+	}
+
+	/// Adds the old counters to the rules now running and tells the old process
+	/// this one is ready.
+	pub async fn ready(self, registry: &Registry) -> Result<Adopted, String> {
+		add_counters(registry, &self.state.counters, |c| c.clone()).await;
+		let channel = self.channel;
+		let channel = tokio::task::spawn_blocking(move || channel.send(READY, b"", &[]).map(|_| channel))
+			.await
+			.map_err(|e| e.to_string())?
+			.map_err(|e| format!("handoff: {e}"))?;
+		Ok(Adopted { channel, snapshot: self.state.counters })
+	}
+
+	/// The sockets, for `inherit::adopt`.
+	pub fn take_fds(&mut self) -> Vec<std::os::fd::OwnedFd> {
+		std::mem::take(&mut self.fds)
+	}
+}
+
+impl State {
+	/// The rules made through the API, with their origin as they were.
+	pub fn rules(&self) -> Vec<(RuleRequest, &serde_json::Value)> {
+		self.rules
 			.iter()
 			.filter_map(|v| match serde_json::from_value::<RuleRequest>(v.clone()) {
 				Ok(r) => Some((r, v)),
@@ -598,20 +673,20 @@ impl Received {
 				dynamic.push(req);
 			}
 		}
-		info!(event = "restore.start", rules = dynamic.len(), api_rules = api.len(), rulesets = self.state.rulesets.len(), from = "handoff");
+		info!(event = "restore.start", rules = dynamic.len(), api_rules = api.len(), rulesets = self.rulesets.len(), from = "handoff");
 		registry.restore(dynamic).await;
 		if !api.is_empty() {
 			registry.restore_as(api, Origin::Api).await;
 		}
 		self.restore_rulesets(registry).await;
 		if let Some(store) = registry.persist() {
-			store.adopt_pending(self.state.persist_pending.clone());
+			store.adopt_pending(self.persist_pending.clone());
 		}
 	}
 
 	/// Applies the rule sets of the old process again (#28), as they were.
 	pub async fn restore_rulesets(&self, registry: &Arc<Registry>) {
-		for set in &self.state.rulesets {
+		for set in &self.rulesets {
 			let rules: Result<Vec<RuleRequest>, _> = set.rules.iter().map(|v| serde_json::from_value(v.clone())).collect();
 			let rules = match rules {
 				Ok(r) => r,
@@ -634,23 +709,6 @@ impl Received {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
 			}
 		}
-	}
-
-	/// Adds the old counters to the rules now running and tells the old process
-	/// this one is ready.
-	pub async fn ready(self, registry: &Registry) -> Result<Adopted, String> {
-		add_counters(registry, &self.state.counters, |c| c.clone()).await;
-		let channel = self.channel;
-		let channel = tokio::task::spawn_blocking(move || channel.send(READY, b"", &[]).map(|_| channel))
-			.await
-			.map_err(|e| e.to_string())?
-			.map_err(|e| format!("handoff: {e}"))?;
-		Ok(Adopted { channel, snapshot: self.state.counters })
-	}
-
-	/// The sockets, for `inherit::adopt`.
-	pub fn take_fds(&mut self) -> Vec<std::os::fd::OwnedFd> {
-		std::mem::take(&mut self.fds)
 	}
 }
 

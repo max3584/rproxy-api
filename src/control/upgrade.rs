@@ -263,7 +263,7 @@ pub async fn guard(req: Request, next: Next) -> Response {
 	next.run(req).await
 }
 
-fn upgrading(message: &str) -> ApiError {
+pub(crate) fn upgrading(message: &str) -> ApiError {
 	ApiError { status: StatusCode::SERVICE_UNAVAILABLE, code: "upgrading", message: message.into() }
 }
 

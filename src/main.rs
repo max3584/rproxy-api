@@ -979,6 +979,9 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if received.is_none() && opts.database_url.is_some() {
 		if let Some(store) = registry.persist() {
 			store.wait_for_earlier_writes().await?;
+			// pinged from now on, also while the restore below runs: another process
+			// with this node name sees this one live (#307)
+			store.spawn_keepalive();
 		}
 	}
 	if let Some((path, d)) = &doc {

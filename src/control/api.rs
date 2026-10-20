@@ -409,7 +409,7 @@ async fn create(
 	let store = state.registry.persist().filter(|_| principal.persist && Features::CURRENT.persistence).cloned();
 	let origin = if store.is_some() { Origin::Api } else { Origin::Dynamic };
 	to_the_end(async move {
-		let _change = changing(&state).await;
+		let _change = changing(&state).await?;
 		let result = async {
 			check_ports(&principal, req.listen_port, req.listen_port_end)?;
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
@@ -435,14 +435,26 @@ where
 	tokio::spawn(change).await.unwrap_or_else(|e| Err(ApiError::internal(format!("the change did not finish: {e}")).into()))
 }
 
-/// Held by a change to rules from before it changes the registry until the row
-/// is written: the periodic check of the stored rules waits for none of them
-/// (`persist::Store::reconcile`).
-async fn changing(state: &AppState) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
-	match state.registry.persist() {
+/// Held by a change to rules or rule sets from before it changes the registry
+/// until the row is written: the periodic check of the stored rules waits for
+/// none of them (`persist::Store::reconcile`), and a live upgrade takes its
+/// snapshot only once they are done (`persist::Store::freeze`).
+///
+/// A change that gets it after a live upgrade started is refused with `503
+/// upgrading` before it changes anything (#305): it passed `upgrade::guard`
+/// before the upgrade started, and made now it would run only in this
+/// process, after the snapshot the new process starts from.
+pub(crate) async fn changing(state: &AppState) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, ApiError> {
+	let guard = match state.registry.persist() {
 		Some(store) => Some(store.changing().await),
 		None => None,
+	};
+	if super::upgrade::handoff::active() {
+		return Err(super::upgrade::upgrading(
+			"a live upgrade started while this change waited; it was not made: send it again in a moment",
+		));
 	}
+	Ok(guard)
 }
 
 /// Writes an `api` rule's row after a change and answers its view with `persisted`.
@@ -479,7 +491,7 @@ async fn update(
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
 	to_the_end(async move {
-		let _change = changing(&state).await;
+		let _change = changing(&state).await?;
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
 			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
@@ -513,7 +525,7 @@ async fn delete(
 		None => None,
 	};
 	to_the_end(async move {
-		let change = changing(&state).await;
+		let change = changing(&state).await?;
 		// #144: the row of an api rule goes with it
 		let stored = match state.registry.persist() {
 			Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),
