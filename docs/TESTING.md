@@ -87,6 +87,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | | `the_startup_refuses_only_a_holder_shown_live` | 起動時にロックの持ち主を見た結果の次の手（`after_looks`、#307）：1 回目に `LIVE_IDLE` より長く何もしていなければ続ける、間に ping した持ち主（復元の途中でも）は断る、ずっと何もしていなければ続ける。MySQL で長い書き込みが間に終わった（文の途中 → 短く何もしていない）ときは断らずに `DUPLICATE_LOOK_AGAIN` 待ってもう 1 回見て、何もしていなければ続け・ping していれば断り、まだ決められなければ断らない |
 | `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | ロックの持ち主を 2 回見て、その間に文を送った（`TIME` が戻った、文が始まった）・ほかの接続になった・見えないときは生きている、ずっと何もしていない・1 つの文のままなら生きていない |
 | | `a_statement_that_ended_in_between_is_no_proof_of_life` | 1 回目は文の途中、2 回目は短く何もしていない（MySQL で落ちたホストの長い書き込みが終わった、#307）：生きているとはみなさず `Unsure`（`LIVE_IDLE` 以上何もしていなければ生きていない）。3 回目で何もしていなければ生きていない、ping していれば生きている |
+| `control/upgrade/update.rs` | `cached_releases_are_verified_again` | （ほかに）引き継ぎをしなかった版の試しは `end_trial` で取り下げ、悪い版にはしない。ほかの版の試しには触らない |
 
 ## 結合テスト：制御 API（`tests/api.rs`）
 
@@ -294,6 +295,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `changes_around_the_snapshot_are_in_it_or_refused` | 書き込みの途中の変更があるうちに引き継ぎが始まり、同じルールへの変更が写しの前後に来る：写し（`handoff::prepare`）は途中の変更を待ち、その後の変更（ルールと組）は何も変えずに `503 upgrading`。古いプロセスは写しの後に変わらず、新しいプロセスは最後に答えた変更で動き、行も同じ（`persisted: true`）。前は写しの後の変更が古いプロセスでだけ動いていた |
 | `a_change_that_does_not_end_in_time_stops_the_handoff` | 待ちの上限のうちに終わらない変更（遅い書き込み）：引き継ぎをしない（`prepare` が誤り）、変更は古いプロセスで最後まで動いて `persisted: true`（前は `release` が上限で諦め、変更は古いプロセスにだけあって書けなかった） |
 | `after_a_failed_handoff_the_waiting_changes_go_on` | 写しの後に引き継ぎが失敗した：止めていた間に順番を待った変更は断らずに続き、書かれる |
+| `a_handoff_that_panics_lets_the_changes_go_on` | 引き継ぎのタスクが写しの後に panic した：`handoff::Running` の drop が引き継ぎの印を外して鍵を放すので、待っていた変更は止まったままにならず（503 にもならず）続いて書かれ、自動更新には引き継ぎをしなかったことが伝わる（`set_on_abort`。試しを取り下げる） |
 
 ## 結合テスト：SIGTERM での終わり方（`tests/shutdown.rs`、v0.4.1）
 

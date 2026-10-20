@@ -294,11 +294,20 @@ pub struct Upgrader {
 	wake: Notify,
 	/// The self-update marks a release that failed as bad.
 	on_failure: Mutex<Option<OnFailure>>,
+	/// The self-update takes back its trial of a release that was not handed over to.
+	on_abort: Mutex<Option<OnFailure>>,
 }
 
 impl Upgrader {
 	pub fn new(cfg: Config, registry: Arc<Registry>) -> Arc<Upgrader> {
-		Arc::new(Upgrader { cfg, registry, handed: Mutex::default(), wake: Notify::new(), on_failure: Mutex::default() })
+		Arc::new(Upgrader {
+			cfg,
+			registry,
+			handed: Mutex::default(),
+			wake: Notify::new(),
+			on_failure: Mutex::default(),
+			on_abort: Mutex::default(),
+		})
 	}
 
 	pub fn config(&self) -> &Config {
@@ -307,6 +316,13 @@ impl Upgrader {
 
 	pub fn set_on_failure(&self, f: OnFailure) {
 		*self.on_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+	}
+
+	/// Called with the binary when a handoff to it did not happen, for whatever
+	/// reason (also after `OnFailure`): the self-update takes back its trial of
+	/// that version (a version that never ran is not on trial).
+	pub fn set_on_abort(&self, f: OnFailure) {
+		*self.on_abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
 	}
 
 	/// Starts a handoff to `exe` (default: the binary on disk) in the background.
@@ -324,6 +340,9 @@ impl Upgrader {
 	}
 
 	async fn run(self: Arc<Self>, exe: Option<PathBuf>, reason: &'static str) {
+		// every way out but a handoff that happened (an error, a refusal, a panic)
+		// lets the changes run again and rolls back the self-update's trial
+		let mut running = Running::new(self.clone(), None);
 		let explicit = exe.is_some();
 		let exe = match exe.map(Ok).unwrap_or_else(binary_on_disk) {
 			Ok(exe) => exe,
@@ -332,10 +351,12 @@ impl Upgrader {
 				return;
 			}
 		};
+		running.exe = Some(exe.clone());
 		info!(event = "handoff.start", exe = %exe.display(), reason, socket = %self.cfg.socket.display());
 		let state = match prepare(&self.registry, crate::config::persist::FREEZE_WAIT).await {
 			Ok(state) => state,
-			// not the binary's fault: the self-update does not mark it bad
+			// not the binary's fault: the self-update does not mark it bad (`Running`
+			// takes its trial back)
 			Err(why) => return self.failed(None, why),
 		};
 		let cfg = self.cfg.clone();
@@ -345,6 +366,7 @@ impl Upgrader {
 			.unwrap_or_else(|e| Err(Failure::Failed(format!("handoff task: {e}"))));
 		match result {
 			Ok(handed) => {
+				running.handed_over();
 				info!(event = "handoff.ready", pid = handed.pid, exe = %exe.display());
 				// systemd (Type=notify, NotifyAccess=all) and `rproxy-api launch` follow the new process
 				super::notify::notify(&format!("MAINPID={}", handed.pid));
@@ -354,8 +376,6 @@ impl Upgrader {
 			Err(Failure::Refused(why)) => {
 				OUTCOMES.refused.fetch_add(1, Ordering::Relaxed);
 				warn!(event = "handoff.refused", reason = "version", error = %why, "restart rproxy-api to change the minor version");
-				ACTIVE.store(false, Ordering::Release);
-				thaw(&self.registry);
 			}
 			Err(Failure::Failed(why)) => self.failed(explicit.then_some(exe.as_path()), why),
 		}
@@ -367,9 +387,6 @@ impl Upgrader {
 		if let (Some(exe), Some(f)) = (exe, self.on_failure.lock().unwrap_or_else(|e| e.into_inner()).as_ref()) {
 			f(exe, &why);
 		}
-		// the changes that waited go on here (no longer refused)
-		ACTIVE.store(false, Ordering::Release);
-		thaw(&self.registry);
 	}
 
 	/// Waits until a handoff has succeeded.
@@ -396,6 +413,44 @@ impl Upgrader {
 		}
 		OUTCOMES.done.fetch_add(1, Ordering::Relaxed);
 		info!(event = "handoff.done", pid);
+	}
+}
+
+/// A handoff under way (`Upgrader::run`): unless it ends with the new process
+/// taking over (`handed_over`), dropping it, on every way out (an error, a
+/// refusal, a panic), ends the handoff: changes run again (`active()` false,
+/// the store thawed: the changes that waited go on, not refused) and the
+/// self-update takes back its trial of `exe` (`Upgrader::set_on_abort`).
+#[doc(hidden)]
+pub struct Running {
+	upgrader: Arc<Upgrader>,
+	pub exe: Option<PathBuf>,
+	done: bool,
+}
+
+impl Running {
+	pub fn new(upgrader: Arc<Upgrader>, exe: Option<PathBuf>) -> Running {
+		Running { upgrader, exe, done: false }
+	}
+
+	/// The new process took over: nothing to undo.
+	pub fn handed_over(&mut self) {
+		self.done = true;
+	}
+}
+
+impl Drop for Running {
+	fn drop(&mut self) {
+		if self.done {
+			return;
+		}
+		ACTIVE.store(false, Ordering::Release);
+		thaw(&self.upgrader.registry);
+		if let (Some(exe), Ok(f)) = (&self.exe, self.upgrader.on_abort.lock()) {
+			if let Some(f) = f.as_ref() {
+				f(exe, "the live upgrade did not happen");
+			}
+		}
 	}
 }
 

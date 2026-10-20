@@ -87,6 +87,7 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | | `the_startup_refuses_only_a_holder_shown_live` | The startup's next step after looking at the lock's holder (`after_looks`, #307): a holder idle for longer than `LIVE_IDLE` at the first look lets it go on, a holder that pinged in between (also while it restores) is refused, one idle all along lets it go on. When a long write ended in between on MySQL (a statement, then briefly idle) it is not refused: it waits `DUPLICATE_LOOK_AGAIN` and looks again, going on if the holder stayed idle, refusing if it pinged, and not refusing if it still cannot tell |
 | `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | Two looks at the lock's holder: it is live when it sent a statement in between (its `TIME` went back, or a statement started), when another connection holds the lock now or when it cannot be seen; not live when it stayed idle or ran one statement all along |
 | | `a_statement_that_ended_in_between_is_no_proof_of_life` | A statement at the first look and briefly idle at the second (a dead host's long write ending on MySQL, #307): not taken for live but `Unsure` (idle for `LIVE_IDLE` or longer: not live). At a third look it is not live if it stayed idle, live if it pinged |
+| `control/upgrade/update.rs` | `cached_releases_are_verified_again` | (among others) the trial of a version that was not handed over to is taken back by `end_trial`, not marked bad; another version's trial is left alone |
 
 ## Integration tests: control API (`tests/api.rs`)
 
@@ -294,6 +295,7 @@ In-process, with a memory store and two registries (the old process, and the new
 | `changes_around_the_snapshot_are_in_it_or_refused` | A live upgrade starts while a change's write is under way, and more changes to the same rule come right around the snapshot and after it: the snapshot (`handoff::prepare`) waits for the change under way, later changes (rules and rule sets) get `503 upgrading` without changing anything. The old process does not change after the snapshot; the new process runs the last answered change, and its row matches (`persisted: true`). Changes after the snapshot used to run in the old process only |
 | `a_change_that_does_not_end_in_time_stops_the_handoff` | A change that does not end within the wait (a slow write): the handoff does not happen (`prepare` fails) and the change runs to its end in the old process with `persisted: true` (`release` used to give up at its bound, and the change was in the old process only and not written) |
 | `after_a_failed_handoff_the_waiting_changes_go_on` | The handoff failed after the snapshot: changes that waited meanwhile go on (not refused) and are written |
+| `a_handoff_that_panics_lets_the_changes_go_on` | The handoff task panics after the snapshot: dropping `handoff::Running` clears the handoff mark and lets go of the lock, so the change that waited does not hang (nor get 503) but goes on and is written, and the self-update is told the handoff did not happen (`set_on_abort`: it takes back its trial) |
 
 ## Integration tests: shutting down on SIGTERM (`tests/shutdown.rs`, v0.4.1)
 

@@ -158,7 +158,9 @@ async fn changes_around_the_snapshot_are_in_it_or_refused() {
 	state.restore_rules(&new.registry).await;
 	old_store.release().await;
 
+	// every change answered while the handoff is still marked (they are woken together)
 	let (first, second, third) = (first.await.unwrap(), second.await.unwrap(), third.await.unwrap());
+	let set_after = set_after.await.unwrap();
 	handoff::set_active(false);
 	assert_eq!((first.0, &first.1["persisted"]), (StatusCode::OK, &json!(true)), "the change under way: {}", first.1);
 	let mut answered = Some(111);
@@ -173,7 +175,7 @@ async fn changes_around_the_snapshot_are_in_it_or_refused() {
 		}
 	}
 	assert_eq!(third.0, StatusCode::SERVICE_UNAVAILABLE, "a change after the snapshot was made in the old process: {}", third.1);
-	assert_eq!(set_after.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE, "a rule set changed after the snapshot");
+	assert_eq!(set_after, StatusCode::SERVICE_UNAVAILABLE, "a rule set changed after the snapshot");
 	// the old process did not change after the snapshot
 	assert_eq!(snapshot_idle, answered);
 	assert_eq!(idle_of(&old, port).await, answered, "the old process changed after the snapshot");
@@ -245,5 +247,49 @@ async fn after_a_failed_handoff_the_waiting_changes_go_on() {
 	let (status, v) = waiting.await.unwrap();
 	assert_eq!((status, &v["persisted"], &v["udp_idle_secs"]), (StatusCode::OK, &json!(true), &json!(111)), "{v}");
 	assert_eq!(row_idle(&store, port), Some(111));
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// A handoff whose task ends without handing over, here by a panic after the
+/// snapshot: the changes that waited go on (neither left waiting for ever nor
+/// refused), and the self-update is told the handoff to that binary did not
+/// happen (`Upgrader::set_on_abort`: it takes back its trial).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handoff_that_panics_lets_the_changes_go_on() {
+	let _one = ONE_AT_A_TIME.lock().await;
+	let dir = workdir("panic");
+	let h = harness_with(tokens(&dir)).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	let port = stored_rule(&h).await;
+	let config = handoff::Config { socket: dir.join("handoff.sock"), timeout: Duration::from_secs(1), drain: Duration::from_secs(1) };
+	let upgrader = handoff::Upgrader::new(config, h.registry.clone());
+	let aborted: Arc<std::sync::Mutex<Vec<PathBuf>>> = Arc::default();
+	upgrader.set_on_abort(Box::new({
+		let aborted = aborted.clone();
+		move |exe, _| aborted.lock().unwrap().push(exe.to_path_buf())
+	}));
+	handoff::set_active(true);
+	let (frozen, is_frozen) = tokio::sync::oneshot::channel();
+	let (go, panic_now) = tokio::sync::oneshot::channel::<()>();
+	let task = tokio::spawn({
+		let (upgrader, registry) = (upgrader.clone(), h.registry.clone());
+		async move {
+			let _running = handoff::Running::new(upgrader, Some(PathBuf::from("/opt/rproxy/rproxy-api-v99.0.0")));
+			let _state = handoff::prepare(&registry, Duration::from_secs(5)).await.unwrap();
+			let _ = frozen.send(());
+			let _ = panic_now.await;
+			panic!("the handoff task panicked (test)");
+		}
+	});
+	is_frozen.await.unwrap();
+	let waiting = patch(&h, port, 111);
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	go.send(()).unwrap();
+	assert!(task.await.is_err(), "the task panicked");
+	assert!(!handoff::active(), "the handoff stays marked");
+	let (status, v) = tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("the waiting change hangs").unwrap();
+	assert_eq!((status, &v["persisted"], &v["udp_idle_secs"]), (StatusCode::OK, &json!(true), &json!(111)), "{v}");
+	assert_eq!(*aborted.lock().unwrap(), [PathBuf::from("/opt/rproxy/rproxy-api-v99.0.0")]);
 	fs::remove_dir_all(dir).unwrap();
 }

@@ -748,6 +748,14 @@ impl Updater {
 					mark_bad(&cfg, v, why);
 				}
 			}));
+			// a handoff that did not happen (changes still under way, another minor):
+			// the version never ran, so it is not on trial (nor bad)
+			let cfg = self.cfg.clone();
+			u.set_on_abort(Box::new(move |exe, _| {
+				if let Some(v) = cfg.cached_version_of(exe) {
+					end_trial(&cfg, v);
+				}
+			}));
 			let _ = self.upgrader.set(u);
 		}
 		if self.cfg.mode == UpdateMode::Off {
@@ -818,6 +826,16 @@ impl Updater {
 		}
 		Ok(fetched)
 	}
+}
+
+/// Takes back the trial of `v` (a handoff to it did not happen; `v` is not bad).
+pub fn end_trial(cfg: &UpdateConfig, v: Version) {
+	let _ = cfg.update_state(|s| {
+		if s.trial.as_ref().is_some_and(|t| t.version == v.to_string()) {
+			info!(event = "update.trial", version = %v, "the live upgrade to this version did not happen; it is not on trial");
+			s.trial = None;
+		}
+	});
 }
 
 /// Marks `v` as bad (it failed to start or did not stay up).
@@ -980,6 +998,14 @@ mod tests {
 		assert_eq!(c.load_state().bad, ["99.0.0"]);
 		assert_eq!(clear_bad(&c, None).unwrap(), ["99.0.0"]);
 		assert!(c.load_state().bad.is_empty());
+		// a handoff that did not happen takes back only its own version's trial, and marks nothing bad
+		let other = Version::parse("97.0.0").unwrap();
+		c.update_state(|s| s.trial = Some(Trial { version: v.to_string(), started_at: 1, interrupted: 0 })).unwrap();
+		end_trial(&c, other);
+		assert_eq!(c.load_state().trial.map(|t| t.version), Some(v.to_string()));
+		end_trial(&c, v);
+		let s = c.load_state();
+		assert!(s.trial.is_none() && s.bad.is_empty(), "{:?} {:?}", s.trial, s.bad);
 		mark_bad(&c, v, "test");
 		c.update_state(|s| s.trial = Some(Trial { version: Version::own().to_string(), started_at: 1, interrupted: 0 })).unwrap();
 		promote(&c);
