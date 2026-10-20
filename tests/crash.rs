@@ -1135,17 +1135,19 @@ async fn the_periodic_check_does_not_undo_a_change_under_way() {
 	blocker.execute("ROLLBACK").await.unwrap();
 	drop(blocker);
 	// the running rule stays as changed, and its row follows it
+	// (`persisted` turns true just after the row is committed, so wait for both)
 	let deadline = Instant::now() + Duration::from_secs(30);
 	loop {
 		assert_eq!(rule_idle(&s, port).await, Some(777), "the change was undone:\n{}", s.log());
 		if row_idle(&pool, &node, port).await == Some(777) {
-			break;
+			let (_, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+			if v["persisted"] == true {
+				break;
+			}
 		}
 		assert!(Instant::now() < deadline, "the row stays {before:?}:\n{}", s.log());
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
-	let (_, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
-	assert_eq!(v["persisted"], true, "{v}");
 	drop(s);
 	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
 	let _ = fs::remove_dir_all(&dir);
@@ -1404,17 +1406,19 @@ async fn a_live_upgrade_carries_what_was_not_written() {
 	blocker.execute("ROLLBACK").await.unwrap();
 	drop(blocker);
 	// the new process: the rule stays as changed, and its row follows it
+	// (`persisted` turns true just after the row is committed, so wait for both)
 	let deadline = Instant::now() + Duration::from_secs(40);
 	loop {
 		assert_eq!(rule_idle(&s, port).await, Some(777), "the change was undone:\n{}", s.log());
 		if row_idle(&pool, &node, port).await == Some(777) {
-			break;
+			let (_, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+			if v["persisted"] == true {
+				break;
+			}
 		}
 		assert!(Instant::now() < deadline, "the row was not written:\n{}", s.log());
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
-	let (_, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
-	assert_eq!(v["persisted"], true, "{v}");
 	assert!(!s.log().contains("\"persist.duplicate_node\""), "{}", s.log());
 	drop(s);
 	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
