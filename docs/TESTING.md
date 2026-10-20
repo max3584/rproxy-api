@@ -76,6 +76,15 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | | `conditions_from_the_view` | 状態・誤りの `code` から 4 つの `conditions` の status と reason |
 | | `label_metrics_lines` | `rproxy_rule_labels` の行（名前の置き換え、同じ名前になるキー、値のエスケープ） |
 | | `readiness_states` | `starting` → ready → `draining`（ready に戻らない） |
+| `config/persist.rs` | `reconcile_leaves_rules_whose_row_is_not_up_to_date` | 引き継ぎで `persisted: false` のまま受け取ったルール（行がない・古い）と、消せなかった行：照合は消さない・行に戻さない・作らず、DB が戻ったら書き直す。その後は行が正 |
+| | `reconcile_does_not_hold_up_changes_while_it_writes_again` | 照合が書き直している（遅い書き込み）間も、API の変更はすぐに `changing` を取れる |
+| | `reconcile_counts_an_invalid_row_once` | ルールにならない行は毎回 `created` に数えず、行が直ったら作る |
+| | `a_late_removal_spares_a_newer_rule_with_the_key` | 古いルールの遅れた行の削除は、同じキーの新しい `api` のルールの行と `persisted` を消さない |
+| | `a_write_on_its_way_is_not_undone` | 書き込みの途中（書きかけとして覚えている）のルールを照合が消さない |
+| | `a_write_that_went_through_ends_a_busy_episode` | 書き込みが通るとロックを持つとみなし、`busy_since` を戻す（後の `persist.duplicate_node` が早まらない） |
+| | `release_does_not_wait_for_ever` | `release` は途中の変更を上限まで待ってからロックを放す |
+| | `pending_writes_read_back` | 引き継ぎで渡す書けていないもの（`Pending`）が読み戻せる。古いプロセスからの空のものも読める |
+| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | ロックの持ち主を 2 回見て、その間に文を送った（`TIME` が戻った）・ほかの接続になった・見えないときは生きている、ずっと何もしていない・1 つの文のままなら生きていない |
 
 ## 結合テスト：制御 API（`tests/api.rs`）
 
@@ -300,6 +309,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | テスト | 確かめること |
 |---|---|
 | `persist_tokens_store_their_sets` | `persist: true` のトークンの組は 1 行（`generation`・`etag`・持ち主・ルール）で保存され、応答・`GET /rulesets`・`GET /rulesets/{name}` に `persisted`。dry run と `persist` のないトークンの組は書かない。保存した組は `admin` が変えても行が変わる（持ち主はそのまま）。書けなければ `persisted: false`。`DELETE` で行が消える。`features.ruleset_persistence` |
+| `a_set_draining_holds_up_neither_other_sets_nor_the_release` | `DELETE /rulesets/a?drain_secs` の drain の間：ほかの組の `PUT` は待たずに `persisted: true` で書かれ、引き継ぎの `release` もすぐ終わる |
 | `stored_sets_are_restored` | 保存した組が `generation`・`etag`・持ち主ごと戻る。先に戻したルールとキーが重なるルールだけ外して、残りを当てる。持ち主が戻るので、ほかのトークンは変えられない |
 | `sets_survive_a_restart_with_mariadb` | 本物のバイナリと MariaDB（`RPROXY_TEST_DATABASE_URL`）：テーブルがなくても起動し `persisted: false`。保存 → 再起動で戻る。ほかのノードの行は戻さない。新しい `generation` の行を古い `PUT` で書き換えない。`DELETE` で行が消える |
 
@@ -379,12 +389,15 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `kills_during_a_live_upgrade_leave_a_service_that_starts_again` | 引き継ぎ（SIGUSR2）の途中（すぐ・`handoff.start`・`handoff.received`・`handoff.sent`・`restore.start`・`handoff.ready` の直後）に古いプロセス・新しいプロセス・両方を kill。準備の前に新しいプロセスが死んだら古いプロセスが変更も含めて動き続け、古いプロセスだけが死んだら新しいプロセスは引き継ぐか自分で終わる（止まったままにならない）。どの場合も起動し直すと、ルール・制御 API（TCP と Unix ソケット）が戻る |
 | `stored_rules_survive_kills_with_mariadb` | `persist: true` のトークンでルールの作成・変更・削除を 6 本で続けている間に kill。起動し直すと、各ルールは最後に答えた変更のとおりか、kill のときに送っていた変更のとおり（`origin: api`・`persisted: true`）で、`rproxy_rules` の行とも一致する |
 | `a_write_still_running_at_the_kill_is_read_after_it_is_done` | kill のときに送っていた書き込み（作成・削除）が MariaDB でまだ動いている（テストが行のロックで止める。CI では遅い確定で起きた）。起動し直したプロセスはノードのロックを待ってから行を読む（その間は ready にならない）。確定していない書き込みは接続と一緒に取り消されるので、作成は行もルールもなく、削除は両方残る（行とルールが食い違わない）。書き込みの時間を超えて止めた削除は、ロック待ちの時間切れで取り消され、新しいプロセスはロックを取れる（`restore.wait` なし） |
-| `a_held_node_lock_holds_up_the_start_only_for_its_bound` | ノードのロックをほかの接続が持ったまま：起動は `STARTUP_WAIT`（8 秒）だけ待ち、`restore.wait`（持ち主の `host`）を出して、読める行を復元する |
+| `a_held_node_lock_holds_up_the_start_only_for_its_bound` | ノードのロックを、生きている rproxy より長く何もしていない接続が持ったまま：起動は `STARTUP_WAIT`（8 秒）だけ待ち、`restore.wait`（持ち主の `host`）を出して、読める行を復元する |
 | `the_periodic_check_makes_the_running_rules_what_the_rows_say` | 定期の照合（`RPROXY_PERSIST_CHECK_SECS=1`）：DB に直接足した行のルールが動き、書き換えた行でルールが置き換わり、消した行のルールが消える（`persist.reconcile`） |
 | `the_periodic_check_does_not_undo_a_change_under_way` | 書き込みが行のロックで止まっている PATCH（失敗して `persisted: false`）：その間に照合は古い行へ戻さず、終わった後に照合が動いているルールを書き直す |
-| `a_second_process_with_the_same_node_name_does_not_take_the_lock` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、書き込みはすぐに `persisted: false`、`persist.duplicate_node` を出す。1 つ目はロックを持ったまま書ける |
+| `a_second_process_with_the_same_node_name_does_not_start` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、`DUPLICATE_STARTUP_WAIT`（40 秒）まで待って、持ち主が文を送り続けている（生きている）ので `persist.duplicate_node`（error、`phase: startup`、持ち主の `host`）と `fatal`（`--node-name`・`RPROXY_NODE_NAME`）を出して 0 以外で終わる（ready にならず、固定ルールの待ち受けも開かない）。1 つ目はロックを持ったまま書ける |
+| `a_duplicate_started_while_the_database_was_down_does_not_take_the_lock` | DB に届かないあいだに起動した同じ名前の 2 つ目のプロセス（テストの中継を後から開く）：ロックを取り上げず、書き込みはすぐに `persisted: false`、`DUPLICATE_AFTER` の後に `persist.duplicate_node` を出す。1 つ目はロックを持ったまま書ける |
+| `a_connection_opened_again_takes_the_lock_again` | 接続が切れた（MariaDB で KILL）後、ping が開き直した接続でロックを取り直す（書き込みを待たない） |
+| `a_live_upgrade_carries_what_was_not_written` | 古いプロセスで書けなかった変更（行のロックで止めた PATCH、`persisted: false`）のまま引き継ぐ：新しいプロセスはルールを変えたまま動かし、照合で古い行に戻さず、行を書き直す |
 | `without_the_database_a_change_answers_at_once` | DB に届かない：変更はすぐに `persisted: false` で答える |
-| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | 引き継ぎ（SIGUSR2）の後、drain している古いプロセスはノードのロックを放し、新しいプロセスの書き込みがロックを持つ |
+| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | 引き継ぎ（SIGUSR2）の後、drain している古いプロセスはノードのロックを放し、新しいプロセスの書き込みがロックを持つ。新しいプロセスは同じ名前のプロセスとみなさない（`persist.duplicate_node`・`fatal` なし） |
 | `stored_rule_sets_survive_kills_with_mariadb` | `persist: true` のトークンでルールの組を世代を上げながら `PUT` し続けている間に kill。起動し直すと、組は最後に答えた世代か kill のときに送っていた世代で、その世代のルールがちょうどそろう |
 
 ## 結合テスト：変更前の差分（`tests/plan.rs`、#169）
@@ -405,6 +418,9 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `persist_tokens_store_their_rules` | `persist: true` のトークンのルールは `origin: "api"`・`persisted`・`created_by`・`created_at` で行が書かれる（メモリのストア）。保存しないトークンのルールは `dynamic` のまま。`api` のルールの変更はどのトークンでも書き、作った人は残る。書けなければ `persisted: false` で動き続ける。削除で行も消える。dry run は書かない |
 | `without_a_database_nothing_is_stored` | `RPROXY_DATABASE_URL` がなければ `api` だが `persisted: false` |
 | `restored_rows_are_api_rules` | 復元した行は `api` のルール（`persisted: true`、保存した `created_at`）。同じキーは UI の行が先 |
+| `a_change_whose_client_went_away_is_still_written` | 応答の前にクライアントが切れた `POST`（書き込みを遅くしたメモリのストア）：変更は最後まで進み、行が書かれて `persisted: true`。書き込みの途中の照合はルールを消さない |
+| `a_delete_with_drain_spares_a_new_rule_with_the_key` | `DELETE ?drain_secs` の drain の間に同じキーの `POST`：`POST` は drain を待たず、古いルールの行の削除が先なので、新しいルールの行と `persisted: true` が残る |
+| `release_does_not_wait_for_a_drain` | drain を待つ削除の途中でも、引き継ぎの `release` はすぐにロックを放す（行の削除は drain の前に済む） |
 | `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
 | `a_blank_node_name_stops_the_startup` | 空白だけの `RPROXY_NODE_NAME` は設定のエラー |
 ## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）

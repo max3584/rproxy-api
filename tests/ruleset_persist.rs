@@ -63,6 +63,47 @@ fn set(generation: u64, rules: Vec<Value>) -> Value {
 	json!({"generation": generation, "rules": rules})
 }
 
+/// `DELETE /rulesets/a?drain_secs` drains: a `PUT` of another set meanwhile
+/// is neither held up by the drain nor holds up a live upgrade's `release`, and
+/// its row is written (it used to wait for the drain holding the changes'
+/// shared lock, so `release` gave up and the change was written nowhere).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_draining_holds_up_neither_other_sets_nor_the_release() {
+	let dir = workdir("drain");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	let backend = tcp_backend("D:").await;
+	let (a, b) = (free_port(), free_port());
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![rule("tcp", a, backend)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	// a connection the set's rule drains
+	let mut held = tokio::net::TcpStream::connect(("127.0.0.1", a)).await.unwrap();
+	tokio::io::AsyncWriteExt::write_all(&mut held, b"x").await.unwrap();
+	let mut buf = [0u8; 8];
+	let _ = tokio::io::AsyncReadExt::read(&mut held, &mut buf).await;
+	let delete = tokio::spawn({
+		let (http, url) = (h.http.clone(), format!("{}/rulesets/ci/a?drain_secs=60", h.base));
+		async move { http.delete(url).bearer_auth("ci").send().await.unwrap().status() }
+	});
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while call(&h, Method::GET, "/rulesets/ci/a", "ci", None).await.0 != StatusCode::NOT_FOUND {
+		assert!(Instant::now() < deadline, "the set is not taken out");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	let started = Instant::now();
+	let r = call(&h, Method::PUT, "/rulesets/ci/b", "ci", Some(set(1, vec![rule("tcp", b, backend)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	assert!(started.elapsed() < Duration::from_secs(3), "the PUT waited for the drain: {:?}", started.elapsed());
+	tokio::time::timeout(Duration::from_secs(3), store.release()).await.expect("release waited for the drain");
+	assert!(!delete.is_finished(), "the drain is over already");
+	let names: Vec<String> = store.memory_sets().into_iter().map(|s| s.name).collect();
+	assert_eq!(names, ["ci/b"], "a's row is gone, b's written");
+	drop(held);
+	assert_eq!(delete.await.unwrap(), StatusCode::NO_CONTENT);
+	fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn persist_tokens_store_their_sets() {
 	let dir = workdir("api");

@@ -960,9 +960,9 @@ async fn a_write_still_running_at_the_kill_is_read_after_it_is_done() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
-/// This node's lock held by another connection (a host that went away and
-/// MariaDB has not dropped yet, another process with the same node name): the
-/// startup waits only its bound, says so (`restore.wait`, with the holder's
+/// This node's lock held by another connection that is idle for longer than a
+/// live rproxy ever is (a host that went away and MariaDB has not dropped yet):
+/// the startup waits only its bound, says so (`restore.wait`, with the holder's
 /// host) and restores the rows that are there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_node_lock_holds_up_the_start_only_for_its_bound() {
@@ -993,6 +993,9 @@ async fn a_held_node_lock_holds_up_the_start_only_for_its_bound() {
 	let mut holder = sqlx::MySqlConnection::connect(&url).await.unwrap();
 	let got: Option<i64> = sqlx::query_scalar("SELECT CAST(GET_LOCK(?, 0) AS SIGNED)").bind(&lock).fetch_one(&mut holder).await.unwrap();
 	assert_eq!(got, Some(1));
+	// idle (no statement, no ping) for longer than a live rproxy by the end of STARTUP_WAIT
+	use rproxy_api::config::persist::{LIVE_IDLE, STARTUP_WAIT};
+	tokio::time::sleep(LIVE_IDLE.saturating_sub(STARTUP_WAIT) + Duration::from_secs(2)).await;
 	let env = [("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())];
 	let api = free_port();
 	let started = Instant::now();
@@ -1148,11 +1151,14 @@ async fn the_periodic_check_does_not_undo_a_change_under_way() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
-/// Another live process with the same node name: the second one does not take
-/// the lock from the first, its writes answer `persisted: false` at once, and
-/// it says it is probably a duplicate node name (`persist.duplicate_node`).
+/// Another live process with the same node name: the second one does not
+/// start. It waits for the lock up to `DUPLICATE_STARTUP_WAIT` (a dead
+/// process's connection would be gone by then), sees the holder run statements
+/// (pings) meanwhile, says so (`persist.duplicate_node` with the holder's host
+/// and what to set) and exits with an error. The first keeps the lock and its
+/// writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_second_process_with_the_same_node_name_does_not_take_the_lock() {
+async fn a_second_process_with_the_same_node_name_does_not_start() {
 	let Some((url, pool)) = database().await else {
 		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
 		return;
@@ -1175,13 +1181,121 @@ async fn a_second_process_with_the_same_node_name_does_not_take_the_lock() {
 	};
 	let first = holder().await;
 	assert!(first.is_some());
-	let b = Server::start(&dir_b, "b", api_b, &env);
+	// a static rule of the second process: it never listens (the check comes before any listener)
+	let static_port = free_port();
+	fs::write(
+		dir_b.join("rproxy.yaml"),
+		format!("version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {static_port}, remote_addr: 127.0.0.1, remote_port: {}}}\n", backend.port()),
+	)
+	.unwrap();
+	let env_b = [env[0].clone(), env[1].clone(), ("RPROXY_CONFIG", dir_b.join("rproxy.yaml").display().to_string())];
+	let started = Instant::now();
+	let mut b = Server::start(&dir_b, "b", api_b, &env_b);
+	let deadline = started + rproxy_api::config::persist::DUPLICATE_STARTUP_WAIT + Duration::from_secs(20);
+	let status = loop {
+		if let Some(status) = b.child.try_wait().unwrap() {
+			break status;
+		}
+		let ready = reqwest::Client::new().get(format!("http://127.0.0.1:{api_b}/readyz")).timeout(Duration::from_secs(1)).send().await;
+		assert!(!ready.is_ok_and(|r| r.status() == StatusCode::OK), "the second process became ready:\n{}", b.log());
+		assert!(TcpStream::connect(("127.0.0.1", static_port)).await.is_err(), "the second process listens:\n{}", b.log());
+		assert!(Instant::now() < deadline, "the second process still runs:\n{}", b.log());
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	};
+	let took = started.elapsed();
+	assert!(!status.success(), "{status}\n{}", b.log());
+	assert!(took >= rproxy_api::config::persist::STARTUP_WAIT, "gave up after {took:?}");
+	let log = b.log();
+	let line = log.lines().find(|l| l.contains("\"persist.duplicate_node\"")).unwrap_or_else(|| panic!("no persist.duplicate_node:\n{log}"));
+	let line: Value = serde_json::from_str(line).unwrap();
+	assert_eq!((&line["level"], &line["phase"]), (&json!("ERROR"), &json!("startup")), "{line}");
+	assert!(line["host"].as_str().is_some_and(|h| !h.is_empty() && h != "?"), "the holder's host: {line}");
+	let fatal = log.lines().find(|l| l.contains("\"fatal\"")).unwrap_or_else(|| panic!("no fatal:\n{log}"));
+	assert!(fatal.contains("RPROXY_NODE_NAME") && fatal.contains("--node-name"), "{fatal}");
+	assert_eq!(holder().await, first, "the first process keeps the lock");
+	let (status, v) = a.call(Method::POST, "/rules", Some(rule("tcp", free_port(), backend))).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}\n{}", a.log());
+	drop(b);
+	drop(a);
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let _ = fs::remove_dir_all(&dir_a);
+	let _ = fs::remove_dir_all(&dir_b);
+}
+
+/// A TCP forwarder to the database that the test opens and closes (a database
+/// that is down, then back).
+struct Gate {
+	addr: std::net::SocketAddr,
+	open: Arc<AtomicBool>,
+}
+
+impl Gate {
+	async fn to(url: &str) -> Gate {
+		let target = url.split('@').nth(1).and_then(|r| r.split('/').next()).unwrap().to_string();
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let open = Arc::new(AtomicBool::new(false));
+		let on = open.clone();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut client, _)) = listener.accept().await else { return };
+				if !on.load(Ordering::Relaxed) {
+					continue;
+				}
+				let target = target.clone();
+				tokio::spawn(async move {
+					if let Ok(mut server) = TcpStream::connect(&target).await {
+						let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+					}
+				});
+			}
+		});
+		Gate { addr, open }
+	}
+
+	/// `url` with this forwarder in place of the database's address.
+	fn url(&self, url: &str) -> String {
+		let (head, rest) = url.split_once('@').unwrap();
+		let path = rest.split_once('/').map(|(_, p)| p).unwrap_or("");
+		format!("{head}@{}/{path}", self.addr)
+	}
+}
+
+/// A second process with the same node name that started while the database
+/// was down (so it could not tell at its start): it does not take the lock from
+/// the first once the database is back, its writes answer `persisted: false` at
+/// once, and it says it is probably a duplicate node name
+/// (`persist.duplicate_node`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_started_while_the_database_was_down_does_not_take_the_lock() {
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-twice-late-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let (dir_a, dir_b) = (workdir("db-late-a"), workdir("db-late-b"));
+	token_file(&dir_a);
+	token_file(&dir_b);
+	let backend = tcp_backend("W:").await;
+	let env = [("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())];
+	let (api_a, api_b) = (free_port(), free_port());
+	let a = Server::start(&dir_a, "a", api_a, &env);
+	a.ready().await;
+	let lock = format!("rproxy-node-{}", &sha(&node)[..32]);
+	let holder = async || -> Option<i64> {
+		sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS SIGNED)").bind(&lock).fetch_one(&pool).await.unwrap()
+	};
+	let first = holder().await;
+	assert!(first.is_some());
+	let gate = Gate::to(&url).await;
+	let b = Server::start(&dir_b, "b", api_b, &[("RPROXY_DATABASE_URL", gate.url(&url)), ("RPROXY_NODE_NAME", node.clone())]);
 	b.ready().await;
-	assert!(b.log().contains("\"restore.wait\""), "{}", b.log());
+	gate.open.store(true, Ordering::Relaxed);
 	let started = Instant::now();
 	let (status, v) = b.call(Method::POST, "/rules", Some(rule("tcp", free_port(), backend))).await.unwrap();
 	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(false)), "{v}\n{}", b.log());
-	assert!(started.elapsed() < Duration::from_secs(3), "the write was not refused at once: {:?}", started.elapsed());
+	assert!(started.elapsed() < Duration::from_secs(4), "the write was not refused at once: {:?}", started.elapsed());
 	let deadline = Instant::now() + rproxy_api::config::persist::DUPLICATE_AFTER + Duration::from_secs(20);
 	while !b.log().contains("\"persist.duplicate_node\"") {
 		assert!(Instant::now() < deadline, "no persist.duplicate_node:\n{}", b.log());
@@ -1195,6 +1309,116 @@ async fn a_second_process_with_the_same_node_name_does_not_take_the_lock() {
 	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
 	let _ = fs::remove_dir_all(&dir_a);
 	let _ = fs::remove_dir_all(&dir_b);
+}
+
+/// The connection broke (here: killed in MariaDB) and the pool opened another
+/// one: the lock is taken again on it, without waiting for a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_opened_again_takes_the_lock_again() {
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-reconnect-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let dir = workdir("db-reconnect");
+	token_file(&dir);
+	let backend = tcp_backend("K:").await;
+	let env = [("RPROXY_DATABASE_URL", url.clone()), ("RPROXY_NODE_NAME", node.clone())];
+	let api = free_port();
+	let s = Server::start(&dir, "reconnect", api, &env);
+	s.ready().await;
+	let lock = format!("rproxy-node-{}", &sha(&node)[..32]);
+	let holder = async || -> Option<i64> {
+		sqlx::query_scalar("SELECT CAST(IS_USED_LOCK(?) AS SIGNED)").bind(&lock).fetch_one(&pool).await.unwrap()
+	};
+	let old = holder().await.expect("the process holds the node's lock");
+	sqlx::query(sqlx::AssertSqlSafe(format!("KILL {old}"))).execute(&pool).await.unwrap();
+	// the next ping finds the connection gone, the one after opens another and takes the lock on it
+	let deadline = Instant::now() + Duration::from_secs(3 * rproxy_api::config::persist::IDLE_SECS / 3 + 10);
+	let new = loop {
+		if let Some(new) = holder().await.filter(|c| *c != old) {
+			break new;
+		}
+		assert!(Instant::now() < deadline, "the lock was not taken again:\n{}", s.log());
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	};
+	let (status, v) = s.call(Method::POST, "/rules", Some(rule("tcp", free_port(), backend))).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}\n{}", s.log());
+	assert_eq!(holder().await, Some(new));
+	drop(s);
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let _ = fs::remove_dir_all(&dir);
+}
+
+/// A rule whose write failed in the old process of a live upgrade
+/// (`persisted: false`) runs on in the new process as it was changed: the new
+/// process writes its row, and its periodic check never puts the older row back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_upgrade_carries_what_was_not_written() {
+	use sqlx::{Connection, Executor};
+	let Some((url, pool)) = database().await else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let node = format!("crash-carry-{}", std::process::id());
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let dir = workdir("db-carry");
+	token_file(&dir);
+	let backend = tcp_backend("Y:").await;
+	let env = [
+		("RPROXY_DATABASE_URL", url.clone()),
+		("RPROXY_NODE_NAME", node.clone()),
+		("RPROXY_HANDOFF_TIMEOUT", "10s".into()),
+		("RPROXY_HANDOFF_DRAIN", "1s".into()),
+		// the old process does not check (and so does not write it again) before the upgrade
+		("RPROXY_PERSIST_CHECK_SECS", "0".into()),
+	];
+	let api = free_port();
+	let s = Server::start(&dir, "carry", api, &env);
+	s.ready().await;
+	let port = free_port();
+	let (status, v) = s.call(Method::POST, "/rules", Some(rule("tcp", port, backend))).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
+	// the row is locked past the write's bound: the PATCH runs, its write fails
+	let mut blocker = sqlx::MySqlConnection::connect(&url).await.unwrap();
+	blocker.execute("BEGIN").await.unwrap();
+	sqlx::query("SELECT listen_port FROM rproxy_rules WHERE node = ? AND listen_port = ? FOR UPDATE")
+		.bind(&node)
+		.bind(u32::from(port))
+		.fetch_all(&mut blocker)
+		.await
+		.unwrap();
+	let patch = json!({"remote_addr": "127.0.0.1", "remote_port": backend.port(), "udp_idle_secs": 777});
+	let (status, v) = s.call(Method::PATCH, &format!("/rules/tcp/127.0.0.1/{port}"), Some(patch)).await.unwrap();
+	assert_eq!((status, &v["persisted"]), (StatusCode::OK, &json!(false)), "{v}\n{}", s.log());
+	// the upgrade while the row is still locked (the old process cannot write it again meanwhile)
+	signal(s.pid(), libc::SIGUSR2);
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while !s.log().contains("\"handoff.drain\"") {
+		assert!(!s.log().contains("\"handoff.failed\""), "{}", s.log());
+		assert!(Instant::now() < deadline, "no handoff:\n{}", s.log());
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert_ne!(row_idle(&pool, &node, port).await, Some(777));
+	blocker.execute("ROLLBACK").await.unwrap();
+	drop(blocker);
+	// the new process: the rule stays as changed, and its row follows it
+	let deadline = Instant::now() + Duration::from_secs(40);
+	loop {
+		assert_eq!(rule_idle(&s, port).await, Some(777), "the change was undone:\n{}", s.log());
+		if row_idle(&pool, &node, port).await == Some(777) {
+			break;
+		}
+		assert!(Instant::now() < deadline, "the row was not written:\n{}", s.log());
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	let (_, v) = s.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(v["persisted"], true, "{v}");
+	assert!(!s.log().contains("\"persist.duplicate_node\""), "{}", s.log());
+	drop(s);
+	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();
+	let _ = fs::remove_dir_all(&dir);
 }
 
 /// The database is not there: a change answers `persisted: false` at once.
@@ -1269,6 +1493,10 @@ async fn after_a_live_upgrade_the_new_process_holds_the_node_lock() {
 		"the new process's writes hold the lock: {new_conn:?} (old {old_conn:?})\n{}",
 		s.log()
 	);
+	// the new process knows it is a live upgrade: no duplicate node name
+	for event in ["\"persist.duplicate_node\"", "\"fatal\""] {
+		assert!(!s.log().contains(event), "{event}:\n{}", s.log());
+	}
 	drop(held);
 	drop(s);
 	sqlx::query("DELETE FROM rproxy_rules WHERE node = ?").bind(&node).execute(&pool).await.unwrap();

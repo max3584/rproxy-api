@@ -157,6 +157,11 @@ pub struct State {
 	/// Rule sets (#28) with their rules, applied again as they were.
 	#[serde(default)]
 	pub rulesets: Vec<SetSnapshot>,
+	/// Writes of `api` rules and stored rule sets (#144, #241) that are on their
+	/// way or did not go through: the new process writes them again, and its
+	/// periodic check does not take the rows over them.
+	#[serde(default)]
+	pub persist_pending: crate::config::persist::Pending,
 }
 
 /// A rule set (`PUT /rulesets/{name}`, #28) as handed over.
@@ -408,7 +413,15 @@ async fn snapshot(registry: &Registry) -> State {
 		}
 	}
 	let counters = registry.runtimes().await.iter().map(|(k, rt, since)| Counters::of(k, rt, Some(*since))).collect();
-	State { version: env!("CARGO_PKG_VERSION").into(), process_start_time: super::process_start_time().to_string(), rules, counters, rulesets }
+	let persist_pending = registry.persist().map(|s| s.pending()).unwrap_or_default();
+	State {
+		version: env!("CARGO_PKG_VERSION").into(),
+		process_start_time: super::process_start_time().to_string(),
+		rules,
+		counters,
+		rulesets,
+		persist_pending,
+	}
 }
 
 /// Every listening socket of this process, duplicated (so a socket closed
@@ -591,6 +604,9 @@ impl Received {
 			registry.restore_as(api, Origin::Api).await;
 		}
 		self.restore_rulesets(registry).await;
+		if let Some(store) = registry.persist() {
+			store.adopt_pending(self.state.persist_pending.clone());
+		}
 	}
 
 	/// Applies the rule sets of the old process again (#28), as they were.

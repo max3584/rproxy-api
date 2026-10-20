@@ -42,6 +42,13 @@ pub enum Job {
 	Release,
 }
 
+impl Job {
+	/// Whether the job writes a row (and so goes through only under the lock).
+	pub fn writes(&self) -> bool {
+		matches!(self, Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_))
+	}
+}
+
 /// A row of `rproxy_rules` to write.
 #[derive(Clone, Debug)]
 pub struct RuleRow {
@@ -85,6 +92,37 @@ pub struct Holder {
 	pub connection: Option<i64>,
 	/// `information_schema.PROCESSLIST.HOST` (a user sees its own connections).
 	pub host: Option<String>,
+	/// `PROCESSLIST.COMMAND`: `Sleep` between statements.
+	pub command: Option<String>,
+	/// `PROCESSLIST.TIME`: seconds in that command (idle, for `Sleep`).
+	pub idle_secs: Option<u64>,
+}
+
+/// Seconds the idle times of two looks at a connection may differ by beyond
+/// the time between them (they are whole seconds).
+const SLACK: Duration = Duration::from_secs(2);
+
+impl Holder {
+	/// How long the connection has been idle (None: running a statement, or not seen).
+	pub fn idle(&self) -> Option<Duration> {
+		(self.command.as_deref() == Some("Sleep")).then(|| Duration::from_secs(self.idle_secs.unwrap_or(0)))
+	}
+
+	/// Whether the holder is live, from this look `elapsed` after `earlier`: it
+	/// ran a statement in between (its idle time started again), or another
+	/// connection took the lock meanwhile, or it cannot be seen (another user's:
+	/// a dead connection would have been dropped by then). One that stayed idle
+	/// all the time, or runs one statement all the time, is not live.
+	pub fn live_since(&self, earlier: &Holder, elapsed: Duration) -> bool {
+		if self.connection != earlier.connection || self.command.is_none() {
+			return true;
+		}
+		match (earlier.idle(), self.idle()) {
+			(Some(before), Some(now)) => now + SLACK < before + elapsed,
+			(None, Some(_)) => true,
+			(_, None) => false,
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -240,6 +278,29 @@ mod tests {
 		let q = LocalQueue::start(4, Gate(gate.clone()));
 		assert!(matches!(q.submit(Job::Ping, Duration::from_millis(50)).await, Err(JobError::TimedOut)));
 		gate.add_permits(1);
+	}
+
+	fn holder(connection: i64, command: &str, idle_secs: u64) -> Holder {
+		Holder { connection: Some(connection), host: Some("h:1".into()), command: Some(command.into()), idle_secs: Some(idle_secs) }
+	}
+
+	/// Two looks at the holder of a lock, 32 seconds apart.
+	#[test]
+	fn a_holder_is_live_when_it_ran_statements_in_between() {
+		let apart = Duration::from_secs(32);
+		// pinged in between: its idle time started again
+		assert!(holder(7, "Sleep", 4).live_since(&holder(7, "Sleep", 8), apart));
+		// idle all along (a connection left behind)
+		assert!(!holder(7, "Sleep", 40).live_since(&holder(7, "Sleep", 8), apart));
+		assert!(!holder(7, "Sleep", 39).live_since(&holder(7, "Sleep", 8), apart));
+		// one statement all along (not ours)
+		assert!(!holder(7, "Query", 40).live_since(&holder(7, "Query", 8), apart));
+		// another connection took the lock meanwhile, or the holder cannot be seen
+		assert!(holder(9, "Sleep", 30).live_since(&holder(7, "Sleep", 8), apart));
+		let unseen = Holder { connection: Some(7), ..Default::default() };
+		assert!(unseen.live_since(&unseen, apart));
+		assert_eq!(holder(7, "Sleep", 20).idle(), Some(Duration::from_secs(20)));
+		assert_eq!(holder(7, "Query", 20).idle(), None);
 	}
 
 	#[tokio::test]

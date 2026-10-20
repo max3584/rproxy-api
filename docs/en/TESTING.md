@@ -76,6 +76,15 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | | `conditions_from_the_view` | The status and reason of the four `conditions` from the state and the error's `code` |
 | | `label_metrics_lines` | `rproxy_rule_labels` lines (names, keys that end up the same, escaped values) |
 | | `readiness_states` | `starting` → ready → `draining` (never ready again) |
+| `config/persist.rs` | `reconcile_leaves_rules_whose_row_is_not_up_to_date` | Rules taken over from a live upgrade with `persisted: false` (no row, an older row) and a row that could not be deleted: the check neither deletes, puts the row back nor creates, and writes them once the database is back. From then on the rows win |
+| | `reconcile_does_not_hold_up_changes_while_it_writes_again` | While the check writes again (slow writes), an API change gets `changing` at once |
+| | `reconcile_counts_an_invalid_row_once` | A row that does not make a rule is not counted as `created` every round; once the row is right the rule starts |
+| | `a_late_removal_spares_a_newer_rule_with_the_key` | A late deletion of an older rule's row spares the row and `persisted` of a newer `api` rule with the same key |
+| | `a_write_on_its_way_is_not_undone` | The check does not delete a rule whose write is under way (recorded as such) |
+| | `a_write_that_went_through_ends_a_busy_episode` | A write that went through counts as holding the lock and resets `busy_since` (a later `persist.duplicate_node` does not come early) |
+| | `release_does_not_wait_for_ever` | `release` waits for a change under way only up to its bound before it lets go of the lock |
+| | `pending_writes_read_back` | What a live upgrade hands over of the writes not done (`Pending`) reads back; an empty one from an older process reads too |
+| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | Two looks at the lock's holder: live when it sent a statement in between (its `TIME` went back), another connection took it, or it cannot be seen; not live when idle all along or in one statement all along |
 
 ## Integration tests: control API (`tests/api.rs`)
 
@@ -300,6 +309,7 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | Test | What it checks |
 |---|---|
 | `persist_tokens_store_their_sets` | A set of a `persist: true` token is stored as one row (`generation`, `etag`, owner, rules), and the answer, `GET /rulesets` and `GET /rulesets/{name}` show `persisted`. Dry runs and sets of tokens without `persist` are not written. A stored set changed by an `admin` updates its row (the owner stays). A failing write gives `persisted: false`. `DELETE` removes the row. `features.ruleset_persistence` |
+| `a_set_draining_holds_up_neither_other_sets_nor_the_release` | While `DELETE /rulesets/a?drain_secs` drains, a `PUT` of another set does not wait and is written (`persisted: true`), and a live upgrade's `release` ends at once |
 | `stored_sets_are_restored` | A stored set comes back with its `generation`, `etag` and owner. Only a rule whose key overlaps a rule restored before is left out; the rest applies. The owner is restored, so other tokens may not change it |
 | `sets_survive_a_restart_with_mariadb` | The real binary with MariaDB (`RPROXY_TEST_DATABASE_URL`): it starts without the table and answers `persisted: false`; stored, restarted, restored; other nodes' rows stay out; an older `PUT` does not overwrite a row with a newer `generation`; `DELETE` removes the row |
 
@@ -379,12 +389,15 @@ The real binary is stopped with SIGKILL (as by the OOM killer or `kill -9`) and 
 | `kills_during_a_live_upgrade_leave_a_service_that_starts_again` | The old process, the new one, or both killed during a handoff (SIGUSR2): at once, or right after `handoff.start`, `handoff.received`, `handoff.sent`, `restore.start`, `handoff.ready`. A new process killed before it is ready leaves the old one running, changes included; a new process whose old one died takes over or ends by itself (it does not hang). In every case a restart brings back the rules and the control API (TCP and Unix socket) |
 | `stored_rules_survive_kills_with_mariadb` | Killed while 6 writers create, change and delete rules with a `persist: true` token. After the restart each rule is as the last answered change left it or as the change sent at the kill (`origin: api`, `persisted: true`), and matches its row in `rproxy_rules` |
 | `a_write_still_running_at_the_kill_is_read_after_it_is_done` | A write (create, delete) sent at the kill is still running in MariaDB (held up by a row lock of the test; in CI it was a slow commit). The restarted process waits for the node's lock before it reads the rows (not ready meanwhile). A write that had not committed is undone with its connection, so a create leaves neither row nor rule and a delete leaves both (rows and rules agree). A delete held past the write's bound is undone by the lock wait timeout, and the new process gets the lock (no `restore.wait`) |
-| `a_held_node_lock_holds_up_the_start_only_for_its_bound` | The node's lock is held by another connection: the startup waits only `STARTUP_WAIT` (8 seconds), logs `restore.wait` (with the holder's `host`) and restores the readable rows |
+| `a_held_node_lock_holds_up_the_start_only_for_its_bound` | The node's lock is held by a connection that has done nothing for longer than a live rproxy ever does: the startup waits only `STARTUP_WAIT` (8 seconds), logs `restore.wait` (with the holder's `host`) and restores the readable rows |
 | `the_periodic_check_makes_the_running_rules_what_the_rows_say` | The periodic check (`RPROXY_PERSIST_CHECK_SECS=1`): a row added straight to the database starts its rule, a changed row replaces it, a deleted row deletes it (`persist.reconcile`) |
 | `the_periodic_check_does_not_undo_a_change_under_way` | A PATCH whose write is held up by a row lock (and fails, `persisted: false`): the check does not put the older row back meanwhile, and afterwards writes the running rule again |
-| `a_second_process_with_the_same_node_name_does_not_take_the_lock` | A second process with the same `node` name does not take the lock; its writes answer `persisted: false` at once and it logs `persist.duplicate_node`. The first keeps the lock and its writes |
+| `a_second_process_with_the_same_node_name_does_not_start` | A second process with the same `node` name does not take the lock; it waits up to `DUPLICATE_STARTUP_WAIT` (40 seconds), sees the holder keep sending statements (live), logs `persist.duplicate_node` (error, `phase: startup`, the holder's `host`) and `fatal` (`--node-name`, `RPROXY_NODE_NAME`), and exits non-zero (never ready, its static rule never listens). The first keeps the lock and its writes |
+| `a_duplicate_started_while_the_database_was_down_does_not_take_the_lock` | A second process with the same name started while the database could not be reached (the test's forwarder opens later): it does not take the lock, its writes answer `persisted: false` at once, and after `DUPLICATE_AFTER` it logs `persist.duplicate_node`. The first keeps the lock and its writes |
+| `a_connection_opened_again_takes_the_lock_again` | After the connection broke (KILL in MariaDB), the ping takes the lock again on the connection opened again (without waiting for a write) |
+| `a_live_upgrade_carries_what_was_not_written` | A live upgrade with a change the old process could not write (a PATCH held up by a row lock, `persisted: false`): the new process runs the rule as changed, its check does not put the older row back, and it writes the row |
 | `without_the_database_a_change_answers_at_once` | The database cannot be reached: a change answers `persisted: false` at once |
-| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | After a live upgrade (SIGUSR2) the old process, draining, lets go of the node's lock and the new process's writes hold it |
+| `after_a_live_upgrade_the_new_process_holds_the_node_lock` | After a live upgrade (SIGUSR2) the old process, draining, lets go of the node's lock and the new process's writes hold it. The new process is not taken for a duplicate node name (no `persist.duplicate_node`, no `fatal`) |
 | `stored_rule_sets_survive_kills_with_mariadb` | Killed while a rule set is `PUT` with growing generations by a `persist: true` token. After the restart the set has the last answered generation or the one sent at the kill, with exactly that generation's rules |
 
 ## Integration tests: diff before change (`tests/plan.rs`, #169)
@@ -405,6 +418,9 @@ The real binary is stopped with SIGKILL (as by the OOM killer or `kill -9`) and 
 | `persist_tokens_store_their_rules` | Rules of a `persist: true` token are `origin: "api"` with `persisted`, `created_by` and `created_at`, and get a row (memory store). Rules of other tokens stay `dynamic`. Changes to an `api` rule are written whichever token makes them, keeping the creator. A failed write leaves the rule running with `persisted: false`. Deleting removes the row. Dry runs write nothing |
 | `without_a_database_nothing_is_stored` | Without `RPROXY_DATABASE_URL`: `api`, but `persisted: false` |
 | `restored_rows_are_api_rules` | Restored rows are `api` rules (`persisted: true`, the stored `created_at`). The UI's row wins on the same key |
+| `a_change_whose_client_went_away_is_still_written` | A `POST` whose client went away before the answer (a memory store with slow writes): the change runs to its end, the row is written and `persisted: true`. A check while the write is under way does not delete the rule |
+| `a_delete_with_drain_spares_a_new_rule_with_the_key` | A `POST` with the same key while `DELETE ?drain_secs` drains: the `POST` does not wait for the drain, and the old rule's row is deleted first, so the new rule keeps its row and `persisted: true` |
+| `release_does_not_wait_for_a_drain` | While a delete drains, a live upgrade's `release` lets go of the lock at once (the row was deleted before the drain) |
 | `rules_survive_a_restart_with_mariadb` | MariaDB (`RPROXY_TEST_DATABASE_URL`) and the real binary: a created (and changed) rule is written to `rproxy_rules` and comes back as `api` after a restart. On the UI's key the UI's rule is used (`restore.conflict`); other nodes' rows stay out. Deleting removes the row |
 | `a_blank_node_name_stops_the_startup` | A blank `RPROXY_NODE_NAME` is a configuration error |
 ## Integration tests: rule sets, labels, conditions, readiness (`tests/rulesets.rs`, #28)

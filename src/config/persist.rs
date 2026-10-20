@@ -25,24 +25,35 @@
 //!   within it) lets MariaDB drop the connection of a host that went away
 //!   without closing it.
 //!
-//! Another live process with the same node name keeps the lock: writes then
-//! fail (`persisted: false`) instead of racing it, and after `DUPLICATE_AFTER`
-//! `persist.duplicate_node` (error) says so.
+//! Node names must be unique. At startup (not after a live upgrade, where the
+//! new process knows the old one holds the lock until it lets go) a lock still
+//! held by a live connection after `DUPLICATE_STARTUP_WAIT` (longer than a dead
+//! one's write and `IDLE_SECS`) is another process with the same node name:
+//! the startup stops with `persist.duplicate_node` (`wait_for_earlier_writes`).
+//! A process that started while the database was down and finds the lock held
+//! later does not take it: writes then fail (`persisted: false`) instead of
+//! racing the other, and after `DUPLICATE_AFTER` `persist.duplicate_node`
+//! (error) says so.
+//!
+//! What a write is about to change is recorded (`Unwritten`) before it is
+//! queued and cleared once it went through, so `reconcile` never takes a row
+//! for the truth while a write of it is on its way or failed: rows win only
+//! over running rules whose row is known to be up to date.
 
 pub mod queue;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use sqlx::Row;
 use tracing::{debug, error, info, warn};
 
 use crate::core::registry::Registry;
-use crate::core::rule::{parse_listen, Key, Origin, RuleRequest, RuleView};
+use crate::core::rule::{parse_listen, Key, Origin, Protocol, RuleRequest, RuleView};
 use queue::{Done, Holder, Job, JobError, JobFuture, JobResult, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
 
 /// rproxy's own table (definition and GRANT: the UI repository's `db/` migrations;
@@ -87,6 +98,26 @@ pub const DUPLICATE_AFTER: Duration = Duration::from_secs(IDLE_SECS + 2 * STATEM
 
 /// Jobs that may wait in the queue; more are refused at once (`persisted: false`).
 const QUEUE_CAPACITY: usize = 256;
+
+/// How long the startup waits in all for this node's lock while another
+/// connection holds it: a dead process's connection is gone by then (its write
+/// within `WRITE_BOUND`, an idle one within `IDLE_SECS`), so a holder still
+/// there that runs statements is a live process with the same node name.
+pub const DUPLICATE_STARTUP_WAIT: Duration = Duration::from_secs(IDLE_SECS + 10);
+
+/// A live rproxy runs a statement on its connection at least every `PING`: a
+/// holder idle for longer than this is not one.
+pub const LIVE_IDLE: Duration = Duration::from_secs(IDLE_SECS / 3 + 5);
+
+/// How long `release` waits for the changes under way (each writes within
+/// `WRITE_TIMEOUT`) before it lets go of the lock anyway.
+pub const RELEASE_WAIT: Duration = Duration::from_secs(WRITE_TIMEOUT.as_secs() + 3);
+
+/// Writes `reconcile` tries again per round (the rest waits for the next).
+const RETRIES_PER_ROUND: usize = 32;
+
+/// Rules `reconcile` creates, replaces or deletes per round.
+const APPLIED_PER_ROUND: usize = 64;
 
 /// One row of `rproxy_rule_sets`.
 #[derive(Clone, Debug)]
@@ -141,6 +172,10 @@ struct Memory {
 	sets: Mutex<HashMap<String, StoredSet>>,
 	/// Makes the writes fail.
 	fail: AtomicBool,
+	/// Another connection holds the lock: the lock and the writes answer `Busy`.
+	busy: AtomicBool,
+	/// How long each write takes (milliseconds).
+	delay_ms: AtomicU64,
 }
 
 /// Whether this process holds the node's lock, and since when not.
@@ -153,13 +188,65 @@ struct LockWatch {
 	reported: bool,
 }
 
-/// Writes that did not go through, written again by `reconcile`: by whom.
+/// Writes that are on their way or did not go through (written again by
+/// `reconcile`): by whom. Recorded before the write is queued, cleared once it
+/// went through (by the last write queued for the key: `latest`).
 #[derive(Default)]
 struct Unwritten {
 	rules: HashMap<Key, String>,
 	removed_rules: HashMap<Key, String>,
 	sets: HashMap<String, String>,
 	removed_sets: HashMap<String, String>,
+	/// The last write queued for a rule or set (`Store::seq`).
+	latest: HashMap<Key, u64>,
+	latest_sets: HashMap<String, u64>,
+}
+
+/// What a live upgrade hands over of the writes that are not done (#174): the
+/// new process writes them again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+	/// Rules whose row is not up to date.
+	#[serde(default)]
+	pub rules: Vec<PendingRule>,
+	/// Deleted rules whose row stayed.
+	#[serde(default)]
+	pub removed_rules: Vec<PendingRule>,
+	/// Rule sets whose row is not up to date.
+	#[serde(default)]
+	pub sets: Vec<PendingSet>,
+	/// Deleted rule sets whose row stayed.
+	#[serde(default)]
+	pub removed_sets: Vec<PendingSet>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRule {
+	pub protocol: Protocol,
+	pub listen: std::net::SocketAddr,
+	pub by: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSet {
+	pub name: String,
+	pub by: String,
+}
+
+/// A write queued with its intent recorded; `Store::finish_remove` waits for it.
+pub struct Queued {
+	key: Key,
+	by: String,
+	seq: u64,
+	job: JobFuture<'static>,
+}
+
+/// A rule set's removal queued; `Store::finish_remove_set` waits for it.
+pub struct QueuedSet {
+	name: String,
+	by: String,
+	seq: u64,
+	job: JobFuture<'static>,
 }
 
 /// What a `reconcile` did.
@@ -191,9 +278,14 @@ pub struct Store {
 	lock: Mutex<LockWatch>,
 	/// Keys `restore.conflict` was said for by `reconcile` (once each).
 	conflicts: Mutex<std::collections::HashSet<Key>>,
+	/// Rows `reconcile` could not start a rule from, as they were (said once each).
+	invalid: Mutex<HashMap<Key, String>>,
 	/// Reading a rule and queueing its row happen together, so rows are queued
 	/// in the order of the changes.
 	order: tokio::sync::Mutex<()>,
+	/// Writes queued so far (under `order`): `reconcile` compares the rows it
+	/// read only if no write was queued after the read.
+	seq: AtomicU64,
 }
 
 /// The host name (`RPROXY_NODE_NAME`'s default).
@@ -237,7 +329,9 @@ impl Store {
 			changes: Default::default(),
 			lock: Default::default(),
 			conflicts: Default::default(),
+			invalid: Default::default(),
 			order: Default::default(),
+			seq: AtomicU64::new(0),
 		}
 	}
 
@@ -247,6 +341,8 @@ impl Store {
 		let Some(url) = url else { return Ok(Store::with(node, None, None)) };
 		let statement_limit = Arc::new(AtomicBool::new(false));
 		let limit = statement_limit.clone();
+		let lock = lock_name(&node);
+		let lock_on_connect = lock.clone();
 		// one connection: it holds this node's lock and runs every job; kept open
 		// (pinged, `spawn_background`) so that it keeps the lock
 		let pool = MySqlPoolOptions::new()
@@ -256,23 +352,31 @@ impl Store {
 			.max_lifetime(None)
 			.after_connect(move |conn, _| {
 				let limit = limit.clone();
+				let lock = lock_on_connect.clone();
 				Box::pin(async move {
 					use sqlx::Executor;
+					// row locks (InnoDB) and metadata locks (DDL of the table) are waited
+					// for STATEMENT_SECS at most, on MariaDB and MySQL
 					conn.execute(sqlx::AssertSqlSafe(format!(
-						"SET SESSION innodb_lock_wait_timeout = {STATEMENT_SECS}, wait_timeout = {IDLE_SECS}"
+						"SET SESSION innodb_lock_wait_timeout = {STATEMENT_SECS}, lock_wait_timeout = {STATEMENT_SECS}, \
+						 wait_timeout = {IDLE_SECS}"
 					)))
 					.await?;
-					// MariaDB's; MySQL has no such limit for writes
+					// MariaDB's; MySQL has no such limit for writes (max_execution_time is for SELECT only)
 					match conn.execute(sqlx::AssertSqlSafe(format!("SET SESSION max_statement_time = {STATEMENT_SECS}"))).await {
 						Ok(_) => limit.store(true, Ordering::Relaxed),
-						Err(e) => warn!(event = "degraded", part = "db", error = %e, "writes to rproxy_rules are bounded only by the lock wait"),
+						Err(e) => warn!(event = "degraded", part = "db", error = %e,
+							"writes to rproxy_rules are bounded only by the lock waits (MySQL): a write of a killed process may still run after the restart has read the rows"),
 					}
+					// a new connection (also after the old one broke) takes the lock at once
+					// if it is free, so the lock is held all the time
+					let _ = sqlx::query("SELECT GET_LOCK(?, 0)").bind(&lock).execute(&mut *conn).await;
 					Ok(())
 				})
 			})
 			.connect_lazy(url)
 			.map_err(|e| format!("database: {e}"))?;
-		let worker = DbWorker { pool, node: node.clone(), lock: lock_name(&node), statement_limit };
+		let worker = DbWorker { pool, node: node.clone(), lock, statement_limit };
 		Ok(Store::with(node, Some(Arc::new(LocalQueue::start(QUEUE_CAPACITY, worker))), None))
 	}
 
@@ -290,6 +394,37 @@ impl Store {
 		if let Some(m) = &self.memory {
 			m.fail.store(fail, Ordering::Relaxed);
 		}
+	}
+
+	/// Makes a memory store's lock held by another connection (tests).
+	#[doc(hidden)]
+	pub fn memory_busy(&self, busy: bool) {
+		if let Some(m) = &self.memory {
+			m.busy.store(busy, Ordering::Relaxed);
+		}
+	}
+
+	/// Makes each write of a memory store take this long (tests).
+	#[doc(hidden)]
+	pub fn delay_writes(&self, delay: Duration) {
+		if let Some(m) = &self.memory {
+			m.delay_ms.store(delay.as_millis() as u64, Ordering::Relaxed);
+		}
+	}
+
+	/// Puts a rule row into a memory store as if another writer did (tests).
+	#[doc(hidden)]
+	pub fn memory_put_row(&self, row: StoredRule) {
+		if let (Some(m), Some(key)) = (&self.memory, row.key()) {
+			m.rows.lock().unwrap().insert(key, row);
+		}
+	}
+
+	/// Whether `reconcile` would write the rule's row again or leaves it alone (tests).
+	#[doc(hidden)]
+	pub fn is_unwritten(&self, key: &Key) -> bool {
+		let u = self.unwritten.lock().unwrap();
+		u.rules.contains_key(key) || u.removed_rules.contains_key(key)
 	}
 
 	/// The rows of a memory store (tests).
@@ -341,21 +476,34 @@ impl Store {
 	}
 
 	async fn submit(&self, job: Job) -> JobResult {
+		let writes = job.writes();
 		let result = self.enqueue(job).await;
-		self.note_lock(&result);
+		self.note_lock(&result, writes);
 		result
 	}
 
-	/// Follows who holds the node's lock from the jobs' results.
-	fn note_lock(&self, result: &JobResult) {
+	/// Records what a write is about to change (under `order`, before it is
+	/// queued); its number in the order of the writes.
+	fn intend(&self, record: impl FnOnce(&mut Unwritten, u64)) -> u64 {
+		let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+		if self.queue.is_some() {
+			record(&mut self.unwritten.lock().unwrap_or_else(|e| e.into_inner()), seq);
+		}
+		seq
+	}
+
+	/// Follows who holds the node's lock from the jobs' results (`wrote`: the
+	/// job was a write, which goes through only under the lock).
+	fn note_lock(&self, result: &JobResult, wrote: bool) {
 		let mut w = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-		match result {
-			Ok(Done::Locked) => {
-				if w.reported {
-					info!(event = "persist.lock", node = %self.node, "this process holds the node's lock again");
-				}
-				*w = LockWatch { held: true, busy_since: None, reported: false };
+		if matches!(result, Ok(Done::Locked)) || (wrote && result.is_ok()) {
+			if w.reported {
+				info!(event = "persist.lock", node = %self.node, "this process holds the node's lock again");
 			}
+			*w = LockWatch { held: true, busy_since: None, reported: false };
+			return;
+		}
+		match result {
 			Err(JobError::Busy(holder)) => {
 				w.held = false;
 				let since = *w.busy_since.get_or_insert_with(Instant::now);
@@ -394,21 +542,55 @@ impl Store {
 	/// `STARTUP_WAIT` for an earlier process's connection to let go of it: MariaDB
 	/// does that only after it has finished the statements that connection sent
 	/// (each within `WRITE_BOUND`), so the rows read afterwards include a write
-	/// sent just before that process was killed. Still held after that (a host
-	/// that went away, until MariaDB drops its connection; another process with
-	/// this node's name): `restore.wait`, the rows are read anyway, and the
-	/// periodic check compares them again once it has the lock.
-	pub async fn wait_for_earlier_writes(&self) {
-		match self.submit(Job::Lock { wait: STARTUP_WAIT }).await {
-			Err(JobError::Busy(h)) => {
-				warn!(event = "restore.wait", node = %self.node, lock = %lock_name(&self.node), connection = h.connection.map(|c| c.to_string()).unwrap_or_default(),
-					host = h.host.as_deref().unwrap_or(""), waited_secs = STARTUP_WAIT.as_secs(),
-					"another connection still holds this node's lock; the stored rules are read anyway and checked again once the lock is free");
-			}
+	/// sent just before that process was killed.
+	///
+	/// Still held after that: a holder idle for longer than a live rproxy ever is
+	/// (`LIVE_IDLE`) is a connection left behind (`restore.wait`, the rows are
+	/// read anyway, and the periodic check compares them again once it has the
+	/// lock). Otherwise the wait goes on up to `DUPLICATE_STARTUP_WAIT` (a host
+	/// that went away without closing its connection: MariaDB drops it within
+	/// `IDLE_SECS`). A holder that is still there and ran statements meanwhile
+	/// (its idle time started again: it pings) is a live process with the same
+	/// node name: `persist.duplicate_node` and an error, which stops the startup.
+	pub async fn wait_for_earlier_writes(&self) -> Result<(), String> {
+		let first = match self.submit(Job::Lock { wait: STARTUP_WAIT }).await {
+			Ok(_) => return Ok(()),
+			Err(JobError::Busy(h)) => h,
 			// the database is not there: the reads say so
-			Err(e) => debug!(event = "persist.lock", error = %e),
-			Ok(_) => {}
-		}
+			Err(e) => {
+				debug!(event = "persist.lock", error = %e);
+				return Ok(());
+			}
+		};
+		let since = Instant::now();
+		let holder = if first.idle().is_some_and(|i| i >= LIVE_IDLE) {
+			first
+		} else {
+			match self.submit(Job::Lock { wait: DUPLICATE_STARTUP_WAIT.saturating_sub(STARTUP_WAIT) }).await {
+				Ok(_) => return Ok(()),
+				Err(JobError::Busy(second)) if second.live_since(&first, since.elapsed()) => {
+					let connection = second.connection.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+					let host = second.host.clone().unwrap_or_else(|| "?".into());
+					error!(event = "persist.duplicate_node", phase = "startup", node = %self.node, lock = %lock_name(&self.node),
+						connection = %connection, host = %host, waited_secs = DUPLICATE_STARTUP_WAIT.as_secs(),
+						"another live process with the same node name holds this node's lock: node names must be unique; give this process a name of its own with --node-name or RPROXY_NODE_NAME (default the host name)");
+					return Err(format!(
+						"another live process uses the node name {:?} (its database connection {connection} from {host} holds the node's lock): \
+						 node names must be unique; set --node-name or RPROXY_NODE_NAME (default the host name) to a name of its own",
+						self.node
+					));
+				}
+				Err(JobError::Busy(second)) => second,
+				Err(e) => {
+					debug!(event = "persist.lock", error = %e);
+					return Ok(());
+				}
+			}
+		};
+		warn!(event = "restore.wait", node = %self.node, lock = %lock_name(&self.node), connection = holder.connection.map(|c| c.to_string()).unwrap_or_default(),
+			host = holder.host.as_deref().unwrap_or(""), idle_secs = holder.idle_secs.unwrap_or(0), waited_secs = (since.elapsed() + STARTUP_WAIT).as_secs(),
+			"a connection that does not look live still holds this node's lock; the stored rules are read anyway and checked again once the lock is free");
+		Ok(())
 	}
 
 	/// This node's rows (startup). Rows written by a newer rproxy (`spec_version`)
@@ -424,9 +606,49 @@ impl Store {
 		}
 	}
 
-	/// Takes over what the old process knew of an `api` rule (a live upgrade, #174).
+	/// Takes over what the old process knew of an `api` rule (a live upgrade,
+	/// #174): a row that was not up to date there is written again here.
 	pub fn adopt(&self, key: Key, meta: Meta) {
+		if !meta.persisted && self.enabled() {
+			self.unwritten.lock().unwrap_or_else(|e| e.into_inner()).rules.entry(key).or_insert_with(|| meta.created_by.clone());
+		}
 		self.meta.lock().unwrap_or_else(|e| e.into_inner()).insert(key, meta);
+	}
+
+	/// The writes that are on their way or did not go through, for the new
+	/// process of a live upgrade (#174).
+	pub fn pending(&self) -> Pending {
+		let u = self.unwritten.lock().unwrap_or_else(|e| e.into_inner());
+		let rules = |m: &HashMap<Key, String>| -> Vec<PendingRule> {
+			m.iter().map(|(k, by)| PendingRule { protocol: k.protocol, listen: k.listen, by: by.clone() }).collect()
+		};
+		let sets = |m: &HashMap<String, String>| -> Vec<PendingSet> {
+			m.iter().map(|(name, by)| PendingSet { name: name.clone(), by: by.clone() }).collect()
+		};
+		Pending { rules: rules(&u.rules), removed_rules: rules(&u.removed_rules), sets: sets(&u.sets), removed_sets: sets(&u.removed_sets) }
+	}
+
+	/// Takes over the old process's writes that are not done (a live upgrade,
+	/// #174): the periodic check writes them, and rows never win over them.
+	pub fn adopt_pending(&self, pending: Pending) {
+		if !self.enabled() {
+			return;
+		}
+		let mut u = self.unwritten.lock().unwrap_or_else(|e| e.into_inner());
+		for r in pending.rules {
+			u.rules.insert(Key { protocol: r.protocol, listen: r.listen }, r.by);
+		}
+		for r in pending.removed_rules {
+			u.removed_rules.insert(Key { protocol: r.protocol, listen: r.listen }, r.by);
+		}
+		let mut sets = self.sets.lock().unwrap_or_else(|e| e.into_inner());
+		for s in pending.sets {
+			sets.insert(s.name.clone(), false);
+			u.sets.insert(s.name, s.by);
+		}
+		for s in pending.removed_sets {
+			u.removed_sets.insert(s.name, s.by);
+		}
 	}
 
 	/// Remembers the rules restored from the table (as stored).
@@ -443,13 +665,22 @@ impl Store {
 	/// changed by `by`); does nothing for other rules. Returns whether the row is
 	/// up to date.
 	pub async fn save(&self, registry: &Registry, key: &Key, by: &str) -> bool {
+		self.save_rule(registry, key, by).await == Some(true)
+	}
+
+	/// `save`; None: not an `api` rule (nothing to write).
+	async fn save_rule(&self, registry: &Registry, key: &Key, by: &str) -> Option<bool> {
 		// the rule as it is now goes into the queue before any later change's row
-		let (pending, created_by, created_at) = {
+		let (seq, pending, created_by, created_at) = {
 			let _order = self.order.lock().await;
-			let Some((spec, _, _)) = registry.current(key).await else { return false };
-			if spec.origin != Origin::Api || spec.ruleset.is_some() {
-				return false;
-			}
+			let spec = match registry.current(key).await {
+				Some((spec, _, _)) if spec.origin == Origin::Api && spec.ruleset.is_none() => spec,
+				_ => {
+					// gone, or not stored any more: nothing to write again
+					self.unwritten.lock().unwrap().rules.remove(key);
+					return None;
+				}
+			};
 			let now = unix_millis();
 			let (created_by, created_at) = {
 				let meta = self.meta.lock().unwrap();
@@ -457,20 +688,16 @@ impl Store {
 			};
 			let spec = crate::config::plan::shape(&spec);
 			let row = RuleRow { key: *key, spec, created_by: created_by.clone(), created_at, by: by.into(), now };
-			(self.enqueue(Job::SaveRule(row)), created_by, created_at)
+			let seq = self.intend(|u, seq| {
+				u.rules.insert(*key, by.into());
+				u.removed_rules.remove(key);
+				u.latest.insert(*key, seq);
+			});
+			(seq, self.enqueue(Job::SaveRule(row)), created_by, created_at)
 		};
 		let result = pending.await;
-		self.note_lock(&result);
+		self.note_lock(&result, true);
 		let persisted = result.is_ok();
-		{
-			let mut u = self.unwritten.lock().unwrap();
-			u.removed_rules.remove(key);
-			if persisted {
-				u.rules.remove(key);
-			} else {
-				u.rules.insert(*key, by.into());
-			}
-		}
 		match result {
 			Ok(_) => info!(event = "rule.persist", rule = %key, action = "save", token = by),
 			// without a database nothing is stored, as documented; not a degradation
@@ -478,30 +705,65 @@ impl Store {
 			Err(e) => warn!(event = "degraded", part = "db", rule = %key, error = %e,
 				"the rule runs but is not stored in rproxy_rules yet (it is written again by the next check; until then it is lost on restart)"),
 		}
-		let mut meta = self.meta.lock().unwrap();
-		meta.insert(*key, Meta { created_by, created_at, persisted });
-		persisted
+		// the last write queued for the rule says whether its row is up to date
+		let latest = {
+			let mut u = self.unwritten.lock().unwrap();
+			let latest = u.latest.get(key) == Some(&seq);
+			if latest && persisted {
+				u.rules.remove(key);
+				u.latest.remove(key);
+			}
+			latest || !self.enabled()
+		};
+		if latest {
+			self.meta.lock().unwrap().insert(*key, Meta { created_by, created_at, persisted });
+		}
+		Some(persisted)
 	}
 
-	/// Deletes the row of a deleted `api` rule.
-	pub async fn remove(&self, key: &Key, by: &str) -> bool {
-		self.meta.lock().unwrap().remove(key);
-		if self.queue.is_none() {
-			return false;
+	/// Deletes the row of a deleted `api` rule (`begin_remove`, then waits for it).
+	pub async fn remove(&self, registry: &Registry, key: &Key, by: &str) -> bool {
+		match self.begin_remove(registry, key, by).await {
+			Some(queued) => self.finish_remove(queued).await,
+			None => false,
 		}
-		let pending = {
-			let _order = self.order.lock().await;
-			self.enqueue(Job::RemoveRule(*key))
-		};
-		let result = pending.await;
-		self.note_lock(&result);
-		{
-			let mut u = self.unwritten.lock().unwrap();
+	}
+
+	/// Queues the deletion of the row of an `api` rule that is out of the
+	/// registry now (with the change under `changing`). None: nothing to delete
+	/// (no database; or a newer `api` rule has the key, and its own change writes
+	/// its row: deleting would lose it).
+	pub async fn begin_remove(&self, registry: &Registry, key: &Key, by: &str) -> Option<Queued> {
+		if self.queue.is_none() {
+			self.meta.lock().unwrap().remove(key);
+			return None;
+		}
+		let _order = self.order.lock().await;
+		if let Some((spec, _, _)) = registry.current(key).await {
+			if spec.origin == Origin::Api && spec.ruleset.is_none() {
+				self.unwritten.lock().unwrap().removed_rules.remove(key);
+				return None;
+			}
+		}
+		self.meta.lock().unwrap().remove(key);
+		let seq = self.intend(|u, seq| {
+			u.removed_rules.insert(*key, by.into());
 			u.rules.remove(key);
-			if result.is_ok() {
-				u.removed_rules.remove(key);
-			} else {
-				u.removed_rules.insert(*key, by.into());
+			u.latest.insert(*key, seq);
+		});
+		Some(Queued { key: *key, by: by.into(), seq, job: self.enqueue(Job::RemoveRule(*key)) })
+	}
+
+	/// Waits for a deletion `begin_remove` queued; whether the row is gone.
+	pub async fn finish_remove(&self, queued: Queued) -> bool {
+		let Queued { key, by, seq, job } = queued;
+		let result = job.await;
+		self.note_lock(&result, true);
+		if result.is_ok() {
+			let mut u = self.unwritten.lock().unwrap();
+			if u.latest.get(&key) == Some(&seq) {
+				u.removed_rules.remove(&key);
+				u.latest.remove(&key);
 			}
 		}
 		match result {
@@ -518,29 +780,44 @@ impl Store {
 	}
 
 	/// The old process after a live upgrade handed over: the changes under way
-	/// and the queued jobs finish, then the connection closes and lets go of
-	/// this node's lock for the new process. Nothing is written after that.
+	/// (up to `RELEASE_WAIT`) and the queued jobs finish, then the connection
+	/// closes and lets go of this node's lock for the new process. Nothing is
+	/// written after that.
 	pub async fn release(&self) {
-		let _all = self.changes.clone().write_owned().await;
+		self.release_within(RELEASE_WAIT).await
+	}
+
+	/// `release`, waiting up to `wait` for the changes under way (tests).
+	#[doc(hidden)]
+	pub async fn release_within(&self, wait: Duration) {
+		let all = tokio::time::timeout(wait, self.changes.clone().write_owned()).await;
+		if all.is_err() {
+			warn!(event = "persist.release", node = %self.node, waited_secs = wait.as_secs(),
+				"changes are still under way; this process lets go of the node's lock anyway (what they write after that fails, persisted: false)");
+		}
 		if self.queue.is_some() {
 			let _ = self.submit(Job::Release).await;
 		}
 	}
 
-	/// The background of a store with a database: pings the idle connection
-	/// (`PING`), tries the lock again every `RETRY` while another connection
-	/// holds it, and checks this node's rows against the running rules every
-	/// `every` (`reconcile`; None: only while the lock is not held).
+	/// The background of a store with a database: keeps the connection open and
+	/// the node's lock held (`PING`: a connection opened again takes it again),
+	/// tries the lock again every `RETRY` while it is not held, and checks this
+	/// node's rows against the running rules every `every` (`reconcile`; None:
+	/// only while the lock is not held).
 	pub fn spawn_background(self: &Arc<Self>, registry: &Arc<Registry>, every: Option<Duration>) {
-		let Some(q) = self.queue.clone() else { return };
+		if self.queue.is_none() {
+			return;
+		}
 		let me = Arc::downgrade(self);
 		tokio::spawn(async move {
 			loop {
 				tokio::time::sleep(PING).await;
-				if Weak::strong_count(&me) == 0 {
-					return;
+				let Some(store) = me.upgrade() else { return };
+				if !store.queue.as_ref().is_some_and(|q| q.idle()) {
+					continue;
 				}
-				if q.idle() && matches!(q.submit(Job::Ping, WRITE_TIMEOUT).await, Err(JobError::Closed)) {
+				if matches!(store.submit(Job::Ping).await, Err(JobError::Closed)) {
 					return;
 				}
 			}
@@ -562,9 +839,9 @@ impl Store {
 						if r.skipped.is_none() {
 							last = Instant::now();
 						}
-						if r != Reconciled::default() && r.skipped.is_none() {
+						if r.written + r.created + r.replaced + r.deleted > 0 {
 							info!(event = "persist.reconcile", written = r.written, created = r.created, replaced = r.replaced,
-								deleted = r.deleted);
+								deleted = r.deleted, skipped = r.skipped.unwrap_or(""));
 						}
 					}
 					Err(e) => debug!(event = "persist.reconcile", error = %e),
@@ -574,20 +851,24 @@ impl Store {
 	}
 
 	/// Compares this node's rows with the running `api` rules, under the node's
-	/// lock and with no API change half way through: first writes again what did
-	/// not go through (rules and sets with `persisted: false`, deleted ones whose
-	/// row stayed), then makes the running `api` rules what the rows say (rows
-	/// win: they are what a restart would run). Only `api` rules (not of a rule
-	/// set) are touched; a row whose key another rule has is left alone
-	/// (`restore.conflict`, once). Skipped when the queue is not idle, an API
-	/// change is under way or another connection holds the lock.
+	/// lock: first writes again what did not go through (rules and sets with
+	/// `persisted: false`, deleted ones whose row stayed; like API changes, at
+	/// most `RETRIES_PER_ROUND`, holding no change up), then reads the rows and,
+	/// with no API change half way through and no write queued since the read,
+	/// makes the running `api` rules what the rows say (rows win: they are what a
+	/// restart would run; at most `APPLIED_PER_ROUND`). Rules whose row is not
+	/// known to be up to date (a write on its way or failed, `persisted: false`)
+	/// are left alone, and so are rules not of the API or of a rule set; a row
+	/// whose key another rule has is left alone (`restore.conflict`, once), and
+	/// so is a row that does not make a rule (`restore.skip`, once until it
+	/// changes). Skipped when the queue is not idle, an API change is under way
+	/// or another connection holds the lock.
 	pub async fn reconcile(&self, registry: &Arc<Registry>) -> Result<Reconciled, String> {
 		let skip = |why| Ok(Reconciled { skipped: Some(why), ..Default::default() });
 		let Some(q) = &self.queue else { return skip("off") };
 		if !q.idle() {
 			return skip("queue");
 		}
-		let Ok(_alone) = self.changes.clone().try_write_owned() else { return skip("changes") };
 		match self.submit(Job::Lock { wait: Duration::ZERO }).await {
 			Ok(_) => {}
 			Err(JobError::Busy(_)) => return skip("lock"),
@@ -595,72 +876,137 @@ impl Store {
 			Err(e) => return Err(e.to_string()),
 		}
 		let mut out = Reconciled::default();
-		let unwritten = std::mem::take(&mut *self.unwritten.lock().unwrap());
-		let api_rules = |specs: Vec<(crate::core::rule::RuleSpec, bool)>| -> HashMap<Key, crate::core::rule::RuleSpec> {
-			specs.into_iter().filter(|(s, _)| s.origin == Origin::Api && s.ruleset.is_none()).map(|(s, _)| (s.key, s)).collect()
+		// 1. what did not go through, written again (the first failure ends it: the database is in trouble)
+		let (rules, removed_rules, sets, removed_sets) = {
+			let u = self.unwritten.lock().unwrap();
+			let take = |m: &HashMap<Key, String>| m.iter().map(|(k, by)| (*k, by.clone())).collect::<Vec<_>>();
+			let take_sets = |m: &HashMap<String, String>| m.iter().map(|(n, by)| (n.clone(), by.clone())).collect::<Vec<_>>();
+			(take(&u.rules), take(&u.removed_rules), take_sets(&u.sets), take_sets(&u.removed_sets))
 		};
-		let running = api_rules(registry.specs().await);
-		// 1. what did not go through
-		for (key, by) in unwritten.rules {
-			if running.contains_key(&key) && self.save(registry, &key, &by).await {
+		let mut budget = RETRIES_PER_ROUND;
+		'retry: {
+			for (key, by) in rules {
+				if budget == 0 {
+					break 'retry;
+				}
+				budget -= 1;
+				match self.save_rule(registry, &key, &by).await {
+					Some(true) => out.written += 1,
+					Some(false) => break 'retry,
+					None => {}
+				}
+			}
+			for (key, by) in removed_rules {
+				if budget == 0 {
+					break 'retry;
+				}
+				budget -= 1;
+				if let Some(queued) = self.begin_remove(registry, &key, &by).await {
+					if !self.finish_remove(queued).await {
+						break 'retry;
+					}
+					out.written += 1;
+				}
+			}
+			for (name, by) in sets {
+				if budget == 0 {
+					break 'retry;
+				}
+				budget -= 1;
+				let Some((generation, etag, owner, rules)) = registry.ruleset_row(&name).await else {
+					// gone: nothing to write again
+					self.unwritten.lock().unwrap().sets.remove(&name);
+					continue;
+				};
+				if !self.save_set(SetRow { name: &name, generation, etag: &etag, owner: &owner, rules, by: &by }).await {
+					break 'retry;
+				}
 				out.written += 1;
 			}
-		}
-		for (key, by) in unwritten.removed_rules {
-			if !running.contains_key(&key) && self.remove(&key, &by).await {
-				out.written += 1;
-			}
-		}
-		for (name, by) in unwritten.sets {
-			if let Some((generation, etag, owner, rules)) = registry.ruleset_row(&name).await {
-				if self.save_set(SetRow { name: &name, generation, etag: &etag, owner: &owner, rules, by: &by }).await {
+			for (name, by) in removed_sets {
+				if budget == 0 {
+					break 'retry;
+				}
+				budget -= 1;
+				if let Some(queued) = self.begin_remove_set(registry, &name, &by).await {
+					if !self.finish_remove_set(queued).await {
+						break 'retry;
+					}
 					out.written += 1;
 				}
 			}
 		}
-		for (name, by) in unwritten.removed_sets {
-			if registry.ruleset_row(&name).await.is_none() && self.remove_set(&name, &by).await {
-				out.written += 1;
-			}
+		// 2. the rows, after every write queued so far (the count and the read taken
+		// together under `order`, where writes are counted and queued)
+		let (queued_before, read) = {
+			let _order = self.order.lock().await;
+			(self.seq.load(Ordering::Acquire), self.enqueue(Job::ReadRules))
+		};
+		let result = read.await;
+		self.note_lock(&result, false);
+		let rows = match result {
+			Ok(Done::Rules(rows)) => rows,
+			Ok(other) => return Err(format!("unexpected answer {other:?}")),
+			Err(e) => return Err(e.to_string()),
+		};
+		// 3. compared and applied alone: no change is half way through, and none
+		// queued a write after the read (the rows would not show it)
+		let Ok(_alone) = self.changes.clone().try_write_owned() else { return Ok(Reconciled { skipped: Some("changes"), ..out }) };
+		if self.seq.load(Ordering::Acquire) != queued_before {
+			return Ok(Reconciled { skipped: Some("changes"), ..out });
 		}
-		// 2. the rows win over the running api rules that are stored
-		let rows = self.load().await?;
-		let still_unwritten: std::collections::HashSet<Key> = {
+		let mut leave: std::collections::HashSet<Key> = {
 			let u = self.unwritten.lock().unwrap();
 			u.rules.keys().chain(u.removed_rules.keys()).copied().collect()
 		};
+		leave.extend(self.meta.lock().unwrap().iter().filter(|(_, m)| !m.persisted).map(|(k, _)| *k));
+		let running: HashMap<Key, crate::core::rule::RuleSpec> = registry
+			.specs()
+			.await
+			.into_iter()
+			.filter(|(s, _)| s.origin == Origin::Api && s.ruleset.is_none())
+			.map(|(s, _)| (s.key, s))
+			.collect();
 		let mut by_key: HashMap<Key, StoredRule> = HashMap::new();
 		for row in rows {
 			if let Some(key) = row.key() {
 				by_key.insert(key, row);
 			}
 		}
+		let mut budget = APPLIED_PER_ROUND;
 		for (key, spec) in &running {
-			if still_unwritten.contains(key) {
+			if leave.contains(key) {
 				continue;
+			}
+			if budget == 0 {
+				return Ok(out);
 			}
 			match by_key.get(key) {
 				None => {
+					budget -= 1;
 					if registry.delete(key, None).await.is_ok() {
 						self.meta.lock().unwrap().remove(key);
 						info!(event = "persist.reconcile", rule = %key, action = "delete", "the rule's row is gone from rproxy_rules");
 						out.deleted += 1;
 					}
 				}
-				Some(row) => {
-					let want = registry.validate_at_startup(row.spec.clone()).map(|(s, _)| crate::config::plan::shape(&s));
-					if want.as_ref().is_ok_and(|w| *w != crate::config::plan::shape(spec)) {
+				Some(row) => match registry.validate_at_startup(row.spec.clone()) {
+					Ok((want, _)) if crate::config::plan::shape(&want) != crate::config::plan::shape(spec) => {
+						budget -= 1;
 						let _ = registry.delete(key, None).await;
 						registry.restore_as(vec![row.spec.clone()], Origin::Api).await;
 						self.restored(std::slice::from_ref(row));
 						info!(event = "persist.reconcile", rule = %key, action = "replace", "the rule is replaced by its row");
 						out.replaced += 1;
 					}
-				}
+					Ok(_) => {}
+					// the running rule stays
+					Err(e) => self.invalid_row(key, row, &e.message),
+				},
 			}
 		}
 		for (key, row) in by_key {
-			if running.contains_key(&key) || still_unwritten.contains(&key) {
+			if running.contains_key(&key) || leave.contains(&key) {
 				continue;
 			}
 			if registry.get(&key).await.is_ok() {
@@ -670,12 +1016,38 @@ impl Store {
 				}
 				continue;
 			}
+			// a row that did not make a rule is tried again once it changed
+			if self.invalid.lock().unwrap().get(&key) == Some(&format!("{:?}", row.spec)) {
+				continue;
+			}
+			if budget == 0 {
+				return Ok(out);
+			}
+			budget -= 1;
+			if let Err(e) = registry.validate_at_startup(row.spec.clone()) {
+				self.invalid_row(&key, &row, &e.message);
+				continue;
+			}
 			registry.restore_as(vec![row.spec.clone()], Origin::Api).await;
+			if registry.get(&key).await.is_err() {
+				self.invalid_row(&key, &row, "it could not be started (rule.failed says why)");
+				continue;
+			}
+			self.invalid.lock().unwrap().remove(&key);
 			self.restored(std::slice::from_ref(&row));
 			info!(event = "persist.reconcile", rule = %key, action = "create", "the rule of a row in rproxy_rules was not running");
 			out.created += 1;
 		}
 		Ok(out)
+	}
+
+	/// A row that does not make a rule: said once until the row changes.
+	fn invalid_row(&self, key: &Key, row: &StoredRule, error: &str) {
+		let seen = format!("{:?}", row.spec);
+		if self.invalid.lock().unwrap().insert(*key, seen.clone()).as_ref() != Some(&seen) {
+			warn!(event = "restore.skip", table = TABLE, rule = %key, error = %error,
+				"a row of rproxy_rules does not make a rule; it is left alone until it changes");
+		}
 	}
 }
 
@@ -710,11 +1082,12 @@ impl Store {
 		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).copied()
 	}
 
-	/// Remembers sets that have rows (startup, a live upgrade).
+	/// Remembers sets that have rows (startup, a live upgrade; a set the old
+	/// process could not write stays `persisted: false`).
 	pub fn sets_restored(&self, names: impl IntoIterator<Item = String>) {
 		let mut sets = self.sets.lock().unwrap_or_else(|e| e.into_inner());
 		for n in names {
-			sets.insert(n, true);
+			sets.entry(n).or_insert(true);
 		}
 	}
 
@@ -744,50 +1117,87 @@ impl Store {
 			by: row.by.into(),
 			now: unix_millis(),
 		};
-		let result = self.submit(Job::SaveSet(record)).await;
-		let persisted = result.is_ok();
-		{
-			let mut u = self.unwritten.lock().unwrap();
-			u.removed_sets.remove(row.name);
-			if persisted {
-				u.sets.remove(row.name);
-			} else {
+		let (seq, job) = {
+			let _order = self.order.lock().await;
+			let seq = self.intend(|u, seq| {
 				u.sets.insert(row.name.into(), row.by.into());
+				u.removed_sets.remove(row.name);
+				u.latest_sets.insert(row.name.into(), seq);
+			});
+			(seq, self.enqueue(Job::SaveSet(record)))
+		};
+		let result = job.await;
+		self.note_lock(&result, true);
+		let persisted = result.is_ok();
+		let latest = {
+			let mut u = self.unwritten.lock().unwrap();
+			let latest = u.latest_sets.get(row.name) == Some(&seq);
+			if latest && persisted {
+				u.sets.remove(row.name);
+				u.latest_sets.remove(row.name);
 			}
-		}
+			latest || !self.enabled()
+		};
 		match result {
 			Ok(_) => info!(event = "ruleset.persist", ruleset = row.name, generation = row.generation, action = "save", token = row.by),
 			Err(_) if !self.enabled() => {}
 			Err(e) => warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = row.name, error = %e,
 				"the rule set runs but is not stored in rproxy_rule_sets yet (it is written again by the next check)"),
 		}
-		self.sets.lock().unwrap_or_else(|e| e.into_inner()).insert(row.name.to_string(), persisted);
+		if latest {
+			self.sets.lock().unwrap_or_else(|e| e.into_inner()).insert(row.name.to_string(), persisted);
+		}
 		persisted
 	}
 
-	/// Deletes the row of a deleted set.
-	pub async fn remove_set(&self, name: &str, by: &str) -> bool {
-		self.sets.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
-		if self.queue.is_none() {
-			return false;
+	/// Deletes the row of a deleted set (`begin_remove_set`, then waits for it).
+	pub async fn remove_set(&self, registry: &Registry, name: &str, by: &str) -> bool {
+		match self.begin_remove_set(registry, name, by).await {
+			Some(queued) => self.finish_remove_set(queued).await,
+			None => false,
 		}
-		let result = self.submit(Job::RemoveSet(name.into())).await;
-		{
-			let mut u = self.unwritten.lock().unwrap();
+	}
+
+	/// Queues the deletion of the row of a set that is out of the registry now.
+	/// None: nothing to delete (no database; a newer set has the name).
+	pub async fn begin_remove_set(&self, registry: &Registry, name: &str, by: &str) -> Option<QueuedSet> {
+		if self.queue.is_none() {
+			self.sets.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+			return None;
+		}
+		let _order = self.order.lock().await;
+		if registry.ruleset_row(name).await.is_some() {
+			self.unwritten.lock().unwrap().removed_sets.remove(name);
+			return None;
+		}
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+		let seq = self.intend(|u, seq| {
+			u.removed_sets.insert(name.into(), by.into());
 			u.sets.remove(name);
-			if result.is_ok() {
-				u.removed_sets.remove(name);
-			} else {
-				u.removed_sets.insert(name.into(), by.into());
+			u.latest_sets.insert(name.into(), seq);
+		});
+		Some(QueuedSet { name: name.into(), by: by.into(), seq, job: self.enqueue(Job::RemoveSet(name.into())) })
+	}
+
+	/// Waits for a deletion `begin_remove_set` queued; whether the row is gone.
+	pub async fn finish_remove_set(&self, queued: QueuedSet) -> bool {
+		let QueuedSet { name, by, seq, job } = queued;
+		let result = job.await;
+		self.note_lock(&result, true);
+		if result.is_ok() {
+			let mut u = self.unwritten.lock().unwrap();
+			if u.latest_sets.get(&name) == Some(&seq) {
+				u.removed_sets.remove(&name);
+				u.latest_sets.remove(&name);
 			}
 		}
 		match result {
 			Ok(_) => {
-				info!(event = "ruleset.persist", ruleset = name, action = "delete", token = by);
+				info!(event = "ruleset.persist", ruleset = %name, action = "delete", token = %by);
 				true
 			}
 			Err(e) => {
-				warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = name, error = %e,
+				warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = %name, error = %e,
 					"the row of the deleted rule set stays in rproxy_rule_sets for now (it is deleted again by the next check)");
 				false
 			}
@@ -814,17 +1224,21 @@ impl DbWorker {
 		self.pool.acquire().await.map_err(failed)
 	}
 
-	/// Who holds the lock (nothing known when it cannot be read).
+	/// Who holds the lock, and what its connection does (nothing known when it
+	/// cannot be read; a user sees only its own connections).
 	async fn holder(&self, conn: &mut sqlx::MySqlConnection) -> Holder {
-		let row: Result<Option<(Option<i64>, Option<String>)>, _> = sqlx::query_as(
-			"SELECT CAST(IS_USED_LOCK(?) AS SIGNED), (SELECT HOST FROM information_schema.PROCESSLIST WHERE ID = IS_USED_LOCK(?))",
+		type Row = (Option<i64>, Option<String>, Option<String>, Option<i64>);
+		let row: Result<Option<Row>, _> = sqlx::query_as(
+			"SELECT CAST(h.id AS SIGNED), p.HOST, p.COMMAND, CAST(p.TIME AS SIGNED) \
+			 FROM (SELECT IS_USED_LOCK(?) AS id) h LEFT JOIN information_schema.PROCESSLIST p ON p.ID = h.id",
 		)
-		.bind(&self.lock)
 		.bind(&self.lock)
 		.fetch_optional(&mut *conn)
 		.await;
 		match row {
-			Ok(Some((connection, host))) => Holder { connection, host },
+			Ok(Some((connection, host, command, time))) => {
+				Holder { connection, host, command, idle_secs: time.map(|t| t.max(0) as u64) }
+			}
 			_ => Holder::default(),
 		}
 	}
@@ -986,12 +1400,16 @@ impl DbWorker {
 				self.write(query).await
 			}
 			Job::Ping => {
-				// only an open connection (a database that is down is not dialled every time)
-				if self.pool.num_idle() > 0 {
-					use sqlx::Connection;
-					self.conn().await?.ping().await.map_err(failed)?;
+				// only an open connection (a database that is down is not dialled every
+				// time; the lock is tried again by `reconcile` meanwhile)
+				if self.pool.size() == 0 {
+					return Err(JobError::Failed("no open connection".into()));
 				}
-				Ok(Done::Ok)
+				// a statement, which keeps the connection open and shows it live (its
+				// idle time starts again); a connection opened again meanwhile (the
+				// old one broke) takes the lock again here
+				let mut conn = self.conn().await?;
+				self.take_lock(&mut conn, Duration::ZERO).await.map(|()| Done::Locked)
 			}
 			Job::Release => {
 				self.pool.close().await;
@@ -1044,12 +1462,14 @@ struct MemoryWorker {
 impl MemoryWorker {
 	fn job(&self, job: Job) -> JobResult {
 		let m = &self.memory;
-		let writing = matches!(job, Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_));
-		if writing && m.fail.load(Ordering::Relaxed) {
+		if m.busy.load(Ordering::Relaxed) && (job.writes() || matches!(job, Job::Lock { .. } | Job::Ping)) {
+			return Err(JobError::Busy(Holder { connection: Some(1), host: Some("other:1".into()), ..Default::default() }));
+		}
+		if job.writes() && m.fail.load(Ordering::Relaxed) {
 			return Err(JobError::Failed("writes fail (test)".into()));
 		}
 		match job {
-			Job::Lock { .. } => Ok(Done::Locked),
+			Job::Lock { .. } | Job::Ping => Ok(Done::Locked),
 			Job::ReadRules => Ok(Done::Rules(m.rows.lock().unwrap().values().filter(|r| r.node == self.node).cloned().collect())),
 			Job::ReadSets => Ok(Done::Sets(m.sets.lock().unwrap().values().cloned().collect())),
 			Job::SaveRule(r) => {
@@ -1092,15 +1512,21 @@ impl MemoryWorker {
 				m.sets.lock().unwrap().remove(&name);
 				Ok(Done::Ok)
 			}
-			Job::Ping | Job::Release => Ok(Done::Ok),
+			Job::Release => Ok(Done::Ok),
 		}
 	}
 }
 
 impl Worker for MemoryWorker {
 	fn run(&mut self, job: Job) -> JobFuture<'_> {
-		let result = self.job(job);
-		Box::pin(async move { result })
+		let delay = Duration::from_millis(self.memory.delay_ms.load(Ordering::Relaxed));
+		let wait = job.writes() && !delay.is_zero();
+		Box::pin(async move {
+			if wait {
+				tokio::time::sleep(delay).await;
+			}
+			self.job(job)
+		})
 	}
 }
 
@@ -1155,5 +1581,217 @@ mod tests {
 	#[test]
 	fn host_name_is_never_empty() {
 		assert!(!host_name().is_empty());
+	}
+
+	fn registry(store: &Arc<Store>) -> Arc<Registry> {
+		let r = Registry::new(crate::core::registry::Config {
+			dns_interval: Duration::from_secs(30),
+			lookup: crate::core::resolve::system_lookup(),
+			transparent: false,
+			transparent_ipv6: false,
+			max_range_ports: crate::core::rule::DEFAULT_MAX_RANGE_PORTS,
+			reserved: vec![],
+			http: Default::default(),
+		});
+		r.set_persist(store.clone());
+		r
+	}
+
+	fn free_port() -> u16 {
+		std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+	}
+
+	fn local(port: u16, remote_port: u16) -> RuleRequest {
+		serde_json::from_value(serde_json::json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"remote_addr": "127.0.0.1", "remote_port": remote_port}))
+		.unwrap()
+	}
+
+	fn key(port: u16) -> Key {
+		Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{port}").parse().unwrap() }
+	}
+
+	fn row(port: u16, remote_port: u16) -> StoredRule {
+		StoredRule { spec: local(port, remote_port), ..stored(port) }
+	}
+
+	async fn remote_port(registry: &Registry, port: u16) -> Option<u16> {
+		registry.get(&key(port)).await.ok().map(|v| v.remote_port)
+	}
+
+	/// A rule whose row was not up to date in the old process of a live upgrade
+	/// (`persisted: false`, adopted with no row or an older one) is written again
+	/// by the check, never deleted or put back to the row; a deletion the old
+	/// process could not write never brings the rule back.
+	#[tokio::test]
+	async fn reconcile_leaves_rules_whose_row_is_not_up_to_date() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		let (gone, stale, removed) = (free_port(), free_port(), free_port());
+		// what the old process ran: `gone` has no row, `stale` an older one; `removed` was deleted, its row stayed
+		for port in [gone, stale] {
+			registry.create_as(local(port, 81), Origin::Api).await.unwrap();
+			store.adopt(key(port), Meta { created_by: "ci".into(), created_at: 1, persisted: false });
+		}
+		store.memory_put_row(row(stale, 80));
+		store.memory_put_row(row(removed, 80));
+		store.adopt_pending(Pending {
+			removed_rules: vec![PendingRule { protocol: Protocol::Tcp, listen: key(removed).listen, by: "ci".into() }],
+			..Default::default()
+		});
+		// the database is out: nothing is written, and nothing is undone
+		store.fail_writes(true);
+		let r = store.reconcile(&registry).await.unwrap();
+		assert_eq!((r.created, r.replaced, r.deleted, r.written), (0, 0, 0, 0), "{r:?}");
+		assert_eq!((remote_port(&registry, gone).await, remote_port(&registry, stale).await), (Some(81), Some(81)));
+		assert_eq!(remote_port(&registry, removed).await, None);
+		// back: the rows follow the running rules
+		store.fail_writes(false);
+		let r = store.reconcile(&registry).await.unwrap();
+		assert_eq!((r.created, r.replaced, r.deleted, r.written), (0, 0, 0, 3), "{r:?}");
+		let mut rows: Vec<(u16, u16)> = store.memory_rows().iter().map(|r| (r.spec.listen_port, r.spec.remote_port)).collect();
+		rows.sort();
+		let mut want = vec![(gone, 81), (stale, 81)];
+		want.sort();
+		assert_eq!(rows, want);
+		assert_eq!(registry.get(&key(gone)).await.unwrap().persisted, Some(true));
+		// and from now on the rows win
+		store.memory_put_row(row(stale, 82));
+		let r = store.reconcile(&registry).await.unwrap();
+		assert_eq!(r.replaced, 1, "{r:?}");
+		assert_eq!(remote_port(&registry, stale).await, Some(82));
+	}
+
+	/// The check writes again what did not go through without holding up the
+	/// API's changes meanwhile.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn reconcile_does_not_hold_up_changes_while_it_writes_again() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		store.fail_writes(true);
+		let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+		for &port in &ports {
+			registry.create_as(local(port, 81), Origin::Api).await.unwrap();
+			assert!(!store.save(&registry, &key(port), "ci").await);
+		}
+		store.fail_writes(false);
+		store.delay_writes(Duration::from_millis(400));
+		let check = tokio::spawn({
+			let (store, registry) = (store.clone(), registry.clone());
+			async move { store.reconcile(&registry).await }
+		});
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		let started = Instant::now();
+		let change = store.changing().await;
+		assert!(started.elapsed() < Duration::from_millis(100), "a change waited {:?}", started.elapsed());
+		drop(change);
+		let r = check.await.unwrap().unwrap();
+		assert_eq!(r.written, 3, "{r:?}");
+		assert_eq!(store.memory_rows().len(), 3);
+	}
+
+	/// A row that does not make a rule is said once and not counted as created
+	/// again every round.
+	#[tokio::test]
+	async fn reconcile_counts_an_invalid_row_once() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		let port = free_port();
+		store.memory_put_row(row(port, 0));
+		for _ in 0..3 {
+			let r = store.reconcile(&registry).await.unwrap();
+			assert_eq!((r.created, r.skipped), (0, None), "{r:?}");
+		}
+		assert!(registry.get(&key(port)).await.is_err());
+		// once the row is right, the rule starts
+		store.memory_put_row(row(port, 80));
+		assert_eq!(store.reconcile(&registry).await.unwrap().created, 1);
+		assert_eq!(remote_port(&registry, port).await, Some(80));
+	}
+
+	/// The deletion of an older rule's row (a drain, then the write) does not
+	/// delete the row of the newer rule with the same key, nor its `persisted`.
+	#[tokio::test]
+	async fn a_late_removal_spares_a_newer_rule_with_the_key() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		let port = free_port();
+		registry.create_as(local(port, 81), Origin::Api).await.unwrap();
+		assert!(store.save(&registry, &key(port), "ci").await);
+		let taken = registry.take(&key(port)).await.unwrap();
+		registry.stop_taken(taken, None).await;
+		registry.create_as(local(port, 82), Origin::Api).await.unwrap();
+		assert!(store.save(&registry, &key(port), "ci").await);
+		// the removal of the first rule, late
+		assert!(!store.remove(&registry, &key(port), "ci").await);
+		assert_eq!(store.memory_rows().iter().map(|r| r.spec.remote_port).collect::<Vec<_>>(), [82]);
+		assert_eq!(registry.get(&key(port)).await.unwrap().persisted, Some(true));
+		// without the newer rule the row goes
+		registry.delete(&key(port), None).await.unwrap();
+		assert!(store.remove(&registry, &key(port), "ci").await);
+		assert!(store.memory_rows().is_empty());
+	}
+
+	/// A write that is on its way is never taken for missing: the check leaves
+	/// its rule alone until it is done.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_write_on_its_way_is_not_undone() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		let port = free_port();
+		registry.create_as(local(port, 81), Origin::Api).await.unwrap();
+		store.delay_writes(Duration::from_millis(500));
+		let save = tokio::spawn({
+			let (store, registry) = (store.clone(), registry.clone());
+			async move { store.save(&registry, &key(port), "ci").await }
+		});
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert!(store.is_unwritten(&key(port)));
+		let r = store.reconcile(&registry).await.unwrap();
+		assert_eq!(r.deleted, 0, "{r:?}");
+		assert!(save.await.unwrap());
+		assert!(!store.is_unwritten(&key(port)));
+		assert_eq!(remote_port(&registry, port).await, Some(81));
+	}
+
+	/// Lock tracking: a write that went through shows the lock held and ends a
+	/// busy episode (a later one starts its own `DUPLICATE_AFTER`).
+	#[tokio::test]
+	async fn a_write_that_went_through_ends_a_busy_episode() {
+		let store = Arc::new(Store::memory("n1"));
+		let registry = registry(&store);
+		let port = free_port();
+		registry.create_as(local(port, 81), Origin::Api).await.unwrap();
+		store.memory_busy(true);
+		assert!(!store.save(&registry, &key(port), "ci").await);
+		assert!(!store.holds_lock());
+		assert!(store.lock.lock().unwrap().busy_since.is_some());
+		store.memory_busy(false);
+		assert!(store.save(&registry, &key(port), "ci").await);
+		assert!(store.holds_lock());
+		assert!(store.lock.lock().unwrap().busy_since.is_none());
+	}
+
+	/// `release` waits for a change under way only so long.
+	#[tokio::test]
+	async fn release_does_not_wait_for_ever() {
+		let store = Arc::new(Store::memory("n1"));
+		let _change = store.changing().await;
+		let started = Instant::now();
+		store.release_within(Duration::from_millis(200)).await;
+		assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+		assert_eq!(store.reconcile(&registry(&store)).await.unwrap().skipped, Some("released"));
+	}
+
+	/// What a live upgrade hands over reads back.
+	#[test]
+	fn pending_writes_read_back() {
+		let p = Pending {
+			rules: vec![PendingRule { protocol: Protocol::Udp, listen: "[::]:53".parse().unwrap(), by: "ci".into() }],
+			removed_sets: vec![PendingSet { name: "a/b".into(), by: "ui".into() }],
+			..Default::default()
+		};
+		assert_eq!(serde_json::from_value::<Pending>(serde_json::to_value(&p).unwrap()).unwrap(), p);
+		assert_eq!(serde_json::from_str::<Pending>("{}").unwrap(), Pending::default());
 	}
 }

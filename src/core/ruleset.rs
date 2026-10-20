@@ -204,6 +204,22 @@ pub struct RulesetSummary {
 	pub persisted: Option<bool>,
 }
 
+/// A rule set taken out by `Registry::take_ruleset`, its rules still to be
+/// stopped (`stop_ruleset`). Dropped without that (a panic in between), it
+/// stops them at once.
+pub struct TakenSet {
+	name: String,
+	entries: Vec<(Key, Entry)>,
+}
+
+impl Drop for TakenSet {
+	fn drop(&mut self) {
+		for (_, entry) in &mut self.entries {
+			entry.abandon();
+		}
+	}
+}
+
 /// A refused `PUT /rulesets/{name}`: the first problem as `code` / `error`,
 /// every problem in `errors`.
 #[derive(Debug)]
@@ -611,10 +627,25 @@ impl Registry {
 		if_match_header: Option<&str>,
 		drain: Option<Duration>,
 		may_use_ports: &(dyn Fn(u16, u16) -> bool + Send + Sync),
-		(by, admin): (&str, bool),
+		who: (&str, bool),
 	) -> Result<usize, ApiError> {
+		let taken = self.take_ruleset(name, if_match_header, may_use_ports, who).await?;
+		Ok(self.stop_ruleset(taken, drain).await)
+	}
+
+	/// The first half of `delete_ruleset`: checks, forgets the set and takes its
+	/// rules out of the table, their listeners closing (the ports are free);
+	/// `stop_ruleset` drains and stops them. Other changes to rule sets wait only
+	/// for this half, not for the drain.
+	pub async fn take_ruleset(
+		&self,
+		name: &str,
+		if_match_header: Option<&str>,
+		may_use_ports: &(dyn Fn(u16, u16) -> bool + Send + Sync),
+		(by, admin): (&str, bool),
+	) -> Result<TakenSet, ApiError> {
 		validate_name(name)?;
-		let _write = self.rulesets.write.lock().await;
+		let write = self.rulesets.write.lock().await;
 		let current = self.rulesets.get(name).ok_or_else(|| ApiError::not_found(format!("no rule set {name:?}")))?;
 		check_owner(name, Some(&current), by, admin)?;
 		check_if_match(if_match_header, Some(&current))?;
@@ -630,7 +661,19 @@ impl Registry {
 			}
 			keys.into_iter().filter_map(|k| rules.remove(&k).map(|e| (k, e))).collect()
 		};
+		for (_, entry) in &entries {
+			entry.stop_accepting();
+		}
 		self.rulesets.set(name, None);
+		drop(write);
+		Ok(TakenSet { name: name.to_string(), entries })
+	}
+
+	/// The second half of `delete_ruleset`: stops the rules `take_ruleset` took
+	/// out (all at once, each after `drain`); how many.
+	pub async fn stop_ruleset(&self, mut taken: TakenSet, drain: Option<Duration>) -> usize {
+		let entries = std::mem::take(&mut taken.entries);
+		let name = taken.name.as_str();
 		let count = entries.len();
 		futures_util::future::join_all(entries.into_iter().map(|(key, entry)| async move {
 			self.stop_entry(&key, entry, drain).await;
@@ -639,7 +682,7 @@ impl Registry {
 		.await;
 		self.gc_certs().await;
 		info!(event = "ruleset.delete", ruleset = name, rules = count);
-		Ok(count)
+		count
 	}
 
 	/// `PUT /rulesets/{name}`: makes the set's rules exactly `req.rules`.

@@ -168,12 +168,13 @@ struct Options {
 	/// volumes), separated by ':' or ','; global.files.trusted_dirs wins (v0.4)
 	#[arg(long, env = "RPROXY_FILES_TRUSTED_DIRS")]
 	files_trusted_dirs: Option<String>,
-	/// This rproxy's name in rproxy_rules (default: the host name) (v0.4, #144)
+	/// This rproxy's name in rproxy_rules (default: the host name); unique per node: with
+	/// a database, a start while another live process has the name stops (v0.4, #144)
 	#[arg(long, env = "RPROXY_NODE_NAME")]
 	node_name: Option<String>,
 	/// Seconds between checks of this node's rows in rproxy_rules against the running
 	/// rules made through the API (writes that did not go through are written again,
-	/// the rows win); 0: only after a start that found the node's lock held
+	/// the rows win); 0: only while the node's lock is not held
 	#[arg(long, env = "RPROXY_PERSIST_CHECK_SECS", default_value_t = 60)]
 	persist_check_secs: u64,
 	/// Unix socket for live upgrades [default: /run/rproxy/handoff.sock] (v0.4, #174)
@@ -963,6 +964,23 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
 
+	// #144: rules of persist: true tokens, in rproxy_rules
+	if rproxy_api::core::rule::Features::CURRENT.persistence {
+		let node = opts.node_name.clone().unwrap_or_else(rproxy_api::config::persist::host_name);
+		match rproxy_api::config::persist::Store::new(node, opts.database_url.as_deref()) {
+			Ok(store) => registry.set_persist(Arc::new(store)),
+			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
+		}
+	}
+	// before anything listens (not after a live upgrade, whose old process holds the
+	// lock until it lets go): a write an earlier process of this node left behind is
+	// done first, and another live process with this node name stops the startup
+	// (node names must be unique)
+	if received.is_none() && opts.database_url.is_some() {
+		if let Some(store) = registry.persist() {
+			store.wait_for_earlier_writes().await?;
+		}
+	}
 	if let Some((path, d)) = &doc {
 		let rules = registry.load_static_labeled(d.labeled_rules()).await.map_err(|e| format!("{}: {e}", path.display()))?;
 		registry.set_config_status(ConfigStatus {
@@ -983,14 +1001,6 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		}
 	}
 
-	// #144: rules of persist: true tokens, in rproxy_rules
-	if rproxy_api::core::rule::Features::CURRENT.persistence {
-		let node = opts.node_name.clone().unwrap_or_else(rproxy_api::config::persist::host_name);
-		match rproxy_api::config::persist::Store::new(node, opts.database_url.as_deref()) {
-			Ok(store) => registry.set_persist(Arc::new(store)),
-			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
-		}
-	}
 	let set_store = registry.persist().filter(|_| rproxy_api::core::rule::Features::CURRENT.ruleset_persistence).cloned();
 	if let Some(r) = &received {
 		// the old process's rules, as they were (not the database's, read at its start)
@@ -1012,10 +1022,6 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 				vec![]
 			}
 		};
-		// a write an earlier process of this node left behind is done first
-		if let Some(store) = registry.persist() {
-			store.wait_for_earlier_writes().await;
-		}
 		let stored = match registry.persist() {
 			Some(store) => match store.load().await {
 				Ok(rows) => rproxy_api::config::persist::without_conflicts(&ui, rows),

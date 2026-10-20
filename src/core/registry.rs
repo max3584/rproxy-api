@@ -150,12 +150,55 @@ impl Failed {
 	}
 }
 
+/// A rule taken out of the table, still to be stopped (`Registry::take`,
+/// `stop_taken`). Dropped without that (a panic in between), it stops the rule
+/// at once, so no listener runs outside the table.
+pub struct Taken {
+	key: Key,
+	entry: Option<Entry>,
+}
+
+impl Drop for Taken {
+	fn drop(&mut self) {
+		if let Some(entry) = &mut self.entry {
+			entry.abandon();
+		}
+	}
+}
+
 pub(super) enum Entry {
 	Running(Running),
 	Failed(Failed),
 }
 
 impl Entry {
+	/// Stops accepting (the listeners close, the port is free); the
+	/// connections go on until `kill`.
+	pub(super) fn stop_accepting(&self) {
+		if let Entry::Running(r) = self {
+			r.rt.stop.cancel();
+		}
+	}
+
+	/// Stops everything at once without waiting (an entry out of the table that
+	/// is not stopped the usual way).
+	pub(super) fn abandon(&mut self) {
+		match self {
+			Entry::Running(r) => {
+				r.rt.stop.cancel();
+				r.rt.tracker.close();
+				r.rt.kill.cancel();
+				drop(r.stop_resolver());
+				r.stop_route_resolvers();
+			}
+			Entry::Failed(f) => {
+				if let Some(retry) = f.retry.take() {
+					retry.abort();
+				}
+			}
+		}
+	}
+
 	pub(super) fn spec(&self) -> &RuleSpec {
 		match self {
 			Entry::Running(r) => &r.spec,
@@ -1312,6 +1355,14 @@ impl Registry {
 
 	/// Stops a rule. Returns once the listener is closed and every connection has ended.
 	pub async fn delete(&self, key: &Key, drain: Option<Duration>) -> Result<(), ApiError> {
+		let taken = self.take(key).await?;
+		self.stop_taken(taken, drain).await;
+		Ok(())
+	}
+
+	/// The first half of `delete`: takes the rule out of the table (it is gone
+	/// from the list and its key is free); `stop_taken` stops it.
+	pub async fn take(&self, key: &Key) -> Result<Taken, ApiError> {
 		let entry = {
 			let mut rules = self.rules.lock().await;
 			match rules.get(key) {
@@ -1325,10 +1376,17 @@ impl Registry {
 				Some(_) => rules.remove(key).expect("checked above"),
 			}
 		};
-		self.stop_entry(key, entry, drain).await;
+		entry.stop_accepting();
+		Ok(Taken { key: *key, entry: Some(entry) })
+	}
+
+	/// The second half of `delete`: stops the rule `take` took out, after `drain`.
+	pub async fn stop_taken(&self, mut taken: Taken, drain: Option<Duration>) {
+		let key = taken.key;
+		let Some(entry) = taken.entry.take() else { return };
+		self.stop_entry(&key, entry, drain).await;
 		self.gc_certs().await;
 		info!(event = "rule.delete", rule = %key, drain_secs = drain.map(|d| d.as_secs()));
-		Ok(())
 	}
 
 	/// Stops a rule already taken out of the table.
