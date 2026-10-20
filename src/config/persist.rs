@@ -54,7 +54,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::core::registry::Registry;
 use crate::core::rule::{parse_listen, Key, Origin, Protocol, RuleRequest, RuleView};
-use queue::{Done, Holder, Job, JobError, JobFuture, JobResult, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
+use queue::{Done, Holder, Job, JobError, JobFuture, JobResult, Liveness, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
 
 /// rproxy's own table (definition and GRANT: the UI repository's `db/` migrations;
 /// the DDL is in docs/API.md).
@@ -105,13 +105,56 @@ const QUEUE_CAPACITY: usize = 256;
 /// there that runs statements is a live process with the same node name.
 pub const DUPLICATE_STARTUP_WAIT: Duration = Duration::from_secs(IDLE_SECS + 10);
 
-/// A live rproxy runs a statement on its connection at least every `PING`: a
-/// holder idle for longer than this is not one.
+/// A live rproxy runs a statement on its connection at least every `PING`
+/// (from the moment it has the lock, also while it restores, #307): a holder
+/// idle for longer than this is not one.
 pub const LIVE_IDLE: Duration = Duration::from_secs(IDLE_SECS / 3 + 5);
 
-/// How long `release` waits for the changes under way (each writes within
-/// `WRITE_TIMEOUT`) before it lets go of the lock anyway.
-pub const RELEASE_WAIT: Duration = Duration::from_secs(WRITE_TIMEOUT.as_secs() + 3);
+/// How long the startup waits for a third look at the holder of this node's
+/// lock when the second could not tell (`Liveness::Unsure`, #307): a live
+/// rproxy pings in that time, a dead one's connection stays idle (or MariaDB
+/// drops it and the lock comes free).
+pub const DUPLICATE_LOOK_AGAIN: Duration = Duration::from_secs(LIVE_IDLE.as_secs() + 5);
+
+/// What the startup does after its looks at the holder of this node's lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Startup {
+	/// Another live process has the node name: the startup stops.
+	Refuse,
+	/// The holder does not look live: the rows are read anyway (`restore.wait`).
+	Proceed,
+	/// Wait this long more for the lock, then look again.
+	LookAgain(Duration),
+}
+
+/// The startup's next step after `looks` at the holder of this node's lock
+/// (each with when it was taken, from the start of the wait): see
+/// `Store::wait_for_earlier_writes`.
+pub fn after_looks(looks: &[(Holder, Duration)]) -> Startup {
+	match looks {
+		[] => Startup::Proceed,
+		[(first, _)] if first.idle().is_some_and(|i| i >= LIVE_IDLE) => Startup::Proceed,
+		[_] => Startup::LookAgain(DUPLICATE_STARTUP_WAIT.saturating_sub(STARTUP_WAIT)),
+		[.., (earlier, then), (last, now)] => match last.liveness_since(earlier, now.saturating_sub(*then)) {
+			Liveness::Live => Startup::Refuse,
+			Liveness::NotLive => Startup::Proceed,
+			Liveness::Unsure if looks.len() == 2 => Startup::LookAgain(DUPLICATE_LOOK_AGAIN),
+			// still unsure: a duplicate is not proven, and one would not take the
+			// lock from the other (its writes fail and `persist.duplicate_node` says so)
+			Liveness::Unsure => Startup::Proceed,
+		},
+	}
+}
+
+/// How long a live upgrade waits for the API changes under way before it
+/// takes its snapshot (`freeze`; each writes within `WRITE_TIMEOUT`): longer,
+/// and the handoff does not happen (the old process keeps running, nothing is
+/// lost), #305.
+pub const FREEZE_WAIT: Duration = Duration::from_secs(WRITE_TIMEOUT.as_secs() + 3);
+
+/// How long `release` waits for the changes under way when the store was not
+/// frozen (it always is after a handoff) before it lets go of the lock anyway.
+pub const RELEASE_WAIT: Duration = FREEZE_WAIT;
 
 /// Writes `reconcile` tries again per round (the rest waits for the next).
 const RETRIES_PER_ROUND: usize = 32;
@@ -286,6 +329,13 @@ pub struct Store {
 	/// Writes queued so far (under `order`): `reconcile` compares the rows it
 	/// read only if no write was queued after the read.
 	seq: AtomicU64,
+	/// `changes` held alone from a live upgrade's snapshot until `release` (or
+	/// `thaw`, when the handoff did not happen): no change runs in between.
+	frozen: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+	/// Makes the next `save_set` wait before it reads the set (tests).
+	set_pause: Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// The keepalive (`PING`) runs.
+	keepalive: AtomicBool,
 }
 
 /// The host name (`RPROXY_NODE_NAME`'s default).
@@ -332,6 +382,9 @@ impl Store {
 			invalid: Default::default(),
 			order: Default::default(),
 			seq: AtomicU64::new(0),
+			frozen: Default::default(),
+			set_pause: Default::default(),
+			keepalive: AtomicBool::new(false),
 		}
 	}
 
@@ -388,6 +441,15 @@ impl Store {
 		Store::with(node.into(), Some(Arc::new(LocalQueue::start(QUEUE_CAPACITY, worker))), Some(memory))
 	}
 
+	/// Another memory store on the same rows (tests): the new process of a live
+	/// upgrade.
+	#[doc(hidden)]
+	pub fn memory_after_upgrade(&self) -> Store {
+		let memory = self.memory.clone().expect("a memory store");
+		let worker = MemoryWorker { node: self.node.clone(), memory: memory.clone() };
+		Store::with(self.node.clone(), Some(Arc::new(LocalQueue::start(QUEUE_CAPACITY, worker))), Some(memory))
+	}
+
 	/// Makes the writes of a memory store fail (tests).
 	#[doc(hidden)]
 	pub fn fail_writes(&self, fail: bool) {
@@ -437,6 +499,15 @@ impl Store {
 	#[doc(hidden)]
 	pub fn memory_sets(&self) -> Vec<StoredSet> {
 		self.memory.as_ref().map(|m| m.sets.lock().unwrap().values().cloned().collect()).unwrap_or_default()
+	}
+
+	/// Makes the next `save_set` wait before it reads the set (tests): it adds a
+	/// permit to the first semaphore once there, then waits for one of the second.
+	#[doc(hidden)]
+	pub fn pause_next_set_write(&self) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let pause = (Arc::new(tokio::sync::Semaphore::new(0)), Arc::new(tokio::sync::Semaphore::new(0)));
+		*self.set_pause.lock().unwrap() = Some(pause.clone());
+		pause
 	}
 
 	/// Puts a set row into a memory store as if another process wrote it (tests).
@@ -544,35 +615,42 @@ impl Store {
 	/// (each within `WRITE_BOUND`), so the rows read afterwards include a write
 	/// sent just before that process was killed.
 	///
-	/// Still held after that: a holder idle for longer than a live rproxy ever is
-	/// (`LIVE_IDLE`) is a connection left behind (`restore.wait`, the rows are
-	/// read anyway, and the periodic check compares them again once it has the
-	/// lock). Otherwise the wait goes on up to `DUPLICATE_STARTUP_WAIT` (a host
-	/// that went away without closing its connection: MariaDB drops it within
-	/// `IDLE_SECS`). A holder that is still there and ran statements meanwhile
-	/// (its idle time started again: it pings) is a live process with the same
-	/// node name: `persist.duplicate_node` and an error, which stops the startup.
+	/// Still held after that (`after_looks`): a holder idle for longer than a
+	/// live rproxy ever is (`LIVE_IDLE`) is a connection left behind
+	/// (`restore.wait`, the rows are read anyway, and the periodic check compares
+	/// them again once it has the lock). Otherwise the wait goes on up to
+	/// `DUPLICATE_STARTUP_WAIT` (a host that went away without closing its
+	/// connection: MariaDB drops it within `IDLE_SECS`). A holder that is still
+	/// there and ran statements meanwhile (its idle time started again: it
+	/// pings, from the moment it took the lock, `spawn_keepalive`) is a live
+	/// process with the same node name: `persist.duplicate_node` and an error,
+	/// which stops the startup. When the second look cannot tell (the statement
+	/// of the first ended in between, `Liveness::Unsure`: a dead host's long
+	/// write on MySQL looks so, #307) a third look after `DUPLICATE_LOOK_AGAIN`
+	/// does; still unsure, the startup goes on with `restore.wait`.
 	pub async fn wait_for_earlier_writes(&self) -> Result<(), String> {
-		let first = match self.submit(Job::Lock { wait: STARTUP_WAIT }).await {
-			Ok(_) => return Ok(()),
-			Err(JobError::Busy(h)) => h,
-			// the database is not there: the reads say so
-			Err(e) => {
-				debug!(event = "persist.lock", error = %e);
-				return Ok(());
-			}
-		};
-		let since = Instant::now();
-		let holder = if first.idle().is_some_and(|i| i >= LIVE_IDLE) {
-			first
-		} else {
-			match self.submit(Job::Lock { wait: DUPLICATE_STARTUP_WAIT.saturating_sub(STARTUP_WAIT) }).await {
+		let started = Instant::now();
+		let mut looks: Vec<(Holder, Duration)> = vec![];
+		let mut wait = STARTUP_WAIT;
+		loop {
+			match self.submit(Job::Lock { wait }).await {
 				Ok(_) => return Ok(()),
-				Err(JobError::Busy(second)) if second.live_since(&first, since.elapsed()) => {
-					let connection = second.connection.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
-					let host = second.host.clone().unwrap_or_else(|| "?".into());
+				Err(JobError::Busy(h)) => looks.push((h, started.elapsed())),
+				// the database is not there: the reads say so
+				Err(e) => {
+					debug!(event = "persist.lock", error = %e);
+					return Ok(());
+				}
+			}
+			match after_looks(&looks) {
+				Startup::LookAgain(more) => wait = more,
+				Startup::Proceed => break,
+				Startup::Refuse => {
+					let holder = &looks[looks.len() - 1].0;
+					let connection = holder.connection.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+					let host = holder.host.clone().unwrap_or_else(|| "?".into());
 					error!(event = "persist.duplicate_node", phase = "startup", node = %self.node, lock = %lock_name(&self.node),
-						connection = %connection, host = %host, waited_secs = DUPLICATE_STARTUP_WAIT.as_secs(),
+						connection = %connection, host = %host, waited_secs = started.elapsed().as_secs(),
 						"another live process with the same node name holds this node's lock: node names must be unique; give this process a name of its own with --node-name or RPROXY_NODE_NAME (default the host name)");
 					return Err(format!(
 						"another live process uses the node name {:?} (its database connection {connection} from {host} holds the node's lock): \
@@ -580,15 +658,11 @@ impl Store {
 						self.node
 					));
 				}
-				Err(JobError::Busy(second)) => second,
-				Err(e) => {
-					debug!(event = "persist.lock", error = %e);
-					return Ok(());
-				}
 			}
-		};
+		}
+		let holder = &looks[looks.len() - 1].0;
 		warn!(event = "restore.wait", node = %self.node, lock = %lock_name(&self.node), connection = holder.connection.map(|c| c.to_string()).unwrap_or_default(),
-			host = holder.host.as_deref().unwrap_or(""), idle_secs = holder.idle_secs.unwrap_or(0), waited_secs = (since.elapsed() + STARTUP_WAIT).as_secs(),
+			host = holder.host.as_deref().unwrap_or(""), idle_secs = holder.idle_secs.unwrap_or(0), waited_secs = started.elapsed().as_secs(), looks = looks.len(),
 			"a connection that does not look live still holds this node's lock; the stored rules are read anyway and checked again once the lock is free");
 		Ok(())
 	}
@@ -779,34 +853,67 @@ impl Store {
 		}
 	}
 
-	/// The old process after a live upgrade handed over: the changes under way
-	/// (up to `RELEASE_WAIT`) and the queued jobs finish, then the connection
-	/// closes and lets go of this node's lock for the new process. Nothing is
-	/// written after that.
+	/// A live upgrade's snapshot is about to be taken (#305): waits up to `wait`
+	/// for the API changes under way (and a `reconcile` applying rows) to end,
+	/// then holds `changes` alone until `release` (the handoff happened) or
+	/// `thaw` (it did not). So the snapshot is the last state of this process:
+	/// no change runs between the snapshot and `release`, and one that waits
+	/// for `changing` meanwhile is refused once it gets it (`503 upgrading`,
+	/// `control::api`), never made here only. False: changes were still under
+	/// way after `wait` (the handoff must not happen).
+	pub async fn freeze(&self, wait: Duration) -> bool {
+		match tokio::time::timeout(wait, self.changes.clone().write_owned()).await {
+			Ok(alone) => {
+				*self.frozen.lock().unwrap_or_else(|e| e.into_inner()) = Some(alone);
+				true
+			}
+			Err(_) => false,
+		}
+	}
+
+	/// The handoff did not happen after `freeze`: changes run again.
+	pub fn thaw(&self) {
+		drop(self.frozen.lock().unwrap_or_else(|e| e.into_inner()).take());
+	}
+
+	/// The old process after a live upgrade handed over: the queued jobs finish
+	/// (writes queued before the snapshot, also those whose rows are in its
+	/// `pending`), then the connection closes and lets go of this node's lock
+	/// for the new process. No change ran since the snapshot (`freeze`), and
+	/// nothing is written after this; the changes that waited meanwhile go on
+	/// once it returns and are refused (`503 upgrading`).
 	pub async fn release(&self) {
 		self.release_within(RELEASE_WAIT).await
 	}
 
-	/// `release`, waiting up to `wait` for the changes under way (tests).
+	/// `release`, waiting up to `wait` for the changes under way when the store
+	/// is not frozen (tests).
 	#[doc(hidden)]
 	pub async fn release_within(&self, wait: Duration) {
-		let all = tokio::time::timeout(wait, self.changes.clone().write_owned()).await;
-		if all.is_err() {
-			warn!(event = "persist.release", node = %self.node, waited_secs = wait.as_secs(),
-				"changes are still under way; this process lets go of the node's lock anyway (what they write after that fails, persisted: false)");
-		}
+		let frozen = self.frozen.lock().unwrap_or_else(|e| e.into_inner()).take();
+		let _alone = match frozen {
+			Some(alone) => Some(alone),
+			None => {
+				let all = tokio::time::timeout(wait, self.changes.clone().write_owned()).await.ok();
+				if all.is_none() {
+					warn!(event = "persist.release", node = %self.node, waited_secs = wait.as_secs(),
+						"changes are still under way; this process lets go of the node's lock anyway (what they write after that fails, persisted: false)");
+				}
+				all
+			}
+		};
 		if self.queue.is_some() {
 			let _ = self.submit(Job::Release).await;
 		}
 	}
 
-	/// The background of a store with a database: keeps the connection open and
-	/// the node's lock held (`PING`: a connection opened again takes it again),
-	/// tries the lock again every `RETRY` while it is not held, and checks this
-	/// node's rows against the running rules every `every` (`reconcile`; None:
-	/// only while the lock is not held).
-	pub fn spawn_background(self: &Arc<Self>, registry: &Arc<Registry>, every: Option<Duration>) {
-		if self.queue.is_none() {
+	/// Keeps the connection open and the node's lock held: a statement every
+	/// `PING` while the queue is idle (a connection opened again takes the lock
+	/// again). The startup starts it as soon as it has the lock, before the
+	/// restore (which may take long): so the process looks live to another
+	/// process with the same node name from then on (#307). Once only.
+	pub fn spawn_keepalive(self: &Arc<Self>) {
+		if self.queue.is_none() || self.keepalive.swap(true, Ordering::AcqRel) {
 			return;
 		}
 		let me = Arc::downgrade(self);
@@ -822,6 +929,18 @@ impl Store {
 				}
 			}
 		});
+	}
+
+	/// The background of a store with a database: keeps the connection open and
+	/// the node's lock held (`PING`: a connection opened again takes it again),
+	/// tries the lock again every `RETRY` while it is not held, and checks this
+	/// node's rows against the running rules every `every` (`reconcile`; None:
+	/// only while the lock is not held).
+	pub fn spawn_background(self: &Arc<Self>, registry: &Arc<Registry>, every: Option<Duration>) {
+		if self.queue.is_none() {
+			return;
+		}
+		self.spawn_keepalive();
 		let me = Arc::downgrade(self);
 		let registry = Arc::downgrade(registry);
 		tokio::spawn(async move {
@@ -913,15 +1032,12 @@ impl Store {
 					break 'retry;
 				}
 				budget -= 1;
-				let Some((generation, etag, owner, rules)) = registry.ruleset_row(&name).await else {
-					// gone: nothing to write again
-					self.unwritten.lock().unwrap().sets.remove(&name);
-					continue;
-				};
-				if !self.save_set(SetRow { name: &name, generation, etag: &etag, owner: &owner, rules, by: &by }).await {
-					break 'retry;
+				// read as it runs when its row is queued (gone: nothing to write again)
+				match self.save_set(registry, &name, &by).await {
+					Some(true) => out.written += 1,
+					Some(false) => break 'retry,
+					None => {}
 				}
-				out.written += 1;
 			}
 			for (name, by) in removed_sets {
 				if budget == 0 {
@@ -1056,17 +1172,6 @@ fn missing_table(e: &sqlx::Error) -> bool {
 	e.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42S02") || d.message().contains("doesn't exist"))
 }
 
-/// What a `PUT /rulesets/{name}` left, to be written as one row.
-pub struct SetRow<'a> {
-	pub name: &'a str,
-	pub generation: u64,
-	pub etag: &'a str,
-	pub owner: &'a str,
-	/// The set's rules, each as `config::plan::shape`.
-	pub rules: serde_json::Value,
-	pub by: &'a str,
-}
-
 /// Rule sets (#241, v0.4.2): a set changed by a `persist: true` token gets a
 /// row in `rproxy_rule_sets`; from then on every change to it is written,
 /// whichever token makes it, and its deletion deletes the row. `reconcile`
@@ -1105,49 +1210,61 @@ impl Store {
 		}
 	}
 
-	/// Writes a set's row after a `PUT` (a row with a newer `generation` is
-	/// kept). Returns whether the row is up to date.
-	pub async fn save_set(&self, row: SetRow<'_>) -> bool {
-		let record = SetRecord {
-			name: row.name.into(),
-			generation: row.generation,
-			etag: row.etag.into(),
-			owner: row.owner.into(),
-			rules: row.rules,
-			by: row.by.into(),
-			now: unix_millis(),
-		};
-		let (seq, job) = {
+	/// Writes the row of a set as it runs now (after a `PUT`, or again by
+	/// `reconcile`; a row with a newer `generation` is kept). The set is read
+	/// under `order`, where its row is queued (#306): of two changes, the one
+	/// queued last read the set last, so an older version never lands after a
+	/// newer one (the same `generation` overwrites the row). None: the set is
+	/// gone (nothing to write); otherwise whether the row is up to date.
+	pub async fn save_set(&self, registry: &Registry, name: &str, by: &str) -> Option<bool> {
+		self.paused_set_write().await;
+		let (seq, generation, job) = {
 			let _order = self.order.lock().await;
+			let Some((generation, etag, owner, rules)) = registry.ruleset_row(name).await else {
+				self.unwritten.lock().unwrap().sets.remove(name);
+				return None;
+			};
+			let record = SetRecord { name: name.into(), generation, etag, owner, rules, by: by.into(), now: unix_millis() };
 			let seq = self.intend(|u, seq| {
-				u.sets.insert(row.name.into(), row.by.into());
-				u.removed_sets.remove(row.name);
-				u.latest_sets.insert(row.name.into(), seq);
+				u.sets.insert(name.into(), by.into());
+				u.removed_sets.remove(name);
+				u.latest_sets.insert(name.into(), seq);
 			});
-			(seq, self.enqueue(Job::SaveSet(record)))
+			(seq, generation, self.enqueue(Job::SaveSet(record)))
 		};
 		let result = job.await;
 		self.note_lock(&result, true);
 		let persisted = result.is_ok();
 		let latest = {
 			let mut u = self.unwritten.lock().unwrap();
-			let latest = u.latest_sets.get(row.name) == Some(&seq);
+			let latest = u.latest_sets.get(name) == Some(&seq);
 			if latest && persisted {
-				u.sets.remove(row.name);
-				u.latest_sets.remove(row.name);
+				u.sets.remove(name);
+				u.latest_sets.remove(name);
 			}
 			latest || !self.enabled()
 		};
 		match result {
-			Ok(_) => info!(event = "ruleset.persist", ruleset = row.name, generation = row.generation, action = "save", token = row.by),
+			Ok(_) => info!(event = "ruleset.persist", ruleset = name, generation, action = "save", token = by),
 			Err(_) if !self.enabled() => {}
-			Err(e) => warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = row.name, error = %e,
+			Err(e) => warn!(event = "degraded", part = "db", table = SETS_TABLE, ruleset = name, error = %e,
 				"the rule set runs but is not stored in rproxy_rule_sets yet (it is written again by the next check)"),
 		}
 		if latest {
-			self.sets.lock().unwrap_or_else(|e| e.into_inner()).insert(row.name.to_string(), persisted);
+			self.sets.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), persisted);
 		}
-		persisted
+		Some(persisted)
+	}
+
+	/// `pause_next_set_write` (tests).
+	async fn paused_set_write(&self) {
+		let pause = self.set_pause.lock().unwrap_or_else(|e| e.into_inner()).take();
+		if let Some((arrived, go)) = pause {
+			arrived.add_permits(1);
+			if let Ok(permit) = go.acquire().await {
+				permit.forget();
+			}
+		}
 	}
 
 	/// Deletes the row of a deleted set (`begin_remove_set`, then waits for it).
@@ -1781,6 +1898,42 @@ mod tests {
 		store.release_within(Duration::from_millis(200)).await;
 		assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
 		assert_eq!(store.reconcile(&registry(&store)).await.unwrap().skipped, Some("released"));
+	}
+
+	fn looked(command: &str, idle_secs: u64, at_secs: u64) -> (Holder, Duration) {
+		let h = Holder { connection: Some(7), host: Some("h:1".into()), command: Some(command.into()), idle_secs: Some(idle_secs) };
+		(h, Duration::from_secs(at_secs))
+	}
+
+	/// The startup's steps while another connection holds this node's lock
+	/// (#307): a holder that pings is refused, also one that took the lock just
+	/// before and restores for long (it pings from the lock on); on MySQL a long
+	/// statement that ended between the looks is not taken for a live one
+	/// (unsure: a third look), and a holder still unsure after it is not
+	/// refused.
+	#[test]
+	fn the_startup_refuses_only_a_holder_shown_live() {
+		let second = DUPLICATE_STARTUP_WAIT.saturating_sub(STARTUP_WAIT);
+		let first_at = STARTUP_WAIT.as_secs();
+		let second_at = DUPLICATE_STARTUP_WAIT.as_secs();
+		// idle for longer than a live rproxy at the first look: left behind
+		assert_eq!(after_looks(&[looked("Sleep", LIVE_IDLE.as_secs(), first_at)]), Startup::Proceed);
+		assert_eq!(after_looks(&[looked("Sleep", 3, first_at)]), Startup::LookAgain(second));
+		assert_eq!(after_looks(&[looked("Query", 3, first_at)]), Startup::LookAgain(second));
+		// it pinged in between (a live process, restoring or not)
+		assert_eq!(after_looks(&[looked("Sleep", 3, first_at), looked("Sleep", 5, second_at)]), Startup::Refuse);
+		// idle all along
+		assert_eq!(after_looks(&[looked("Sleep", 3, first_at), looked("Sleep", 35, second_at)]), Startup::Proceed);
+		// MySQL, a dead host's long write that ended in between: look again
+		let ended = [looked("Query", 20, first_at), looked("Sleep", 3, second_at)];
+		assert_eq!(after_looks(&ended), Startup::LookAgain(DUPLICATE_LOOK_AGAIN));
+		let third_at = second_at + DUPLICATE_LOOK_AGAIN.as_secs();
+		// stayed idle: not live, the startup goes on
+		assert_eq!(after_looks(&[ended[0].clone(), ended[1].clone(), looked("Sleep", 3 + DUPLICATE_LOOK_AGAIN.as_secs(), third_at)]), Startup::Proceed);
+		// pinged meanwhile: live
+		assert_eq!(after_looks(&[ended[0].clone(), ended[1].clone(), looked("Sleep", 4, third_at)]), Startup::Refuse);
+		// still unsure at the third look: not refused
+		assert_eq!(after_looks(&[ended[0].clone(), ended[1].clone(), looked("Query", 30, third_at), looked("Sleep", 1, third_at + 20)]), Startup::Proceed);
 	}
 
 	/// What a live upgrade hands over reads back.

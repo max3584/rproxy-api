@@ -82,9 +82,12 @@ Log lines that SIEMs and CrowdSec read are collected inside the test process in 
 | | `a_late_removal_spares_a_newer_rule_with_the_key` | A late deletion of an older rule's row spares the row and `persisted` of a newer `api` rule with the same key |
 | | `a_write_on_its_way_is_not_undone` | The check does not delete a rule whose write is under way (recorded as such) |
 | | `a_write_that_went_through_ends_a_busy_episode` | A write that went through counts as holding the lock and resets `busy_since` (a later `persist.duplicate_node` does not come early) |
-| | `release_does_not_wait_for_ever` | `release` waits for a change under way only up to its bound before it lets go of the lock |
+| | `release_does_not_wait_for_ever` | `release` of a store that was not frozen (after a live upgrade it always is, #305) waits for a change under way only up to its bound before it lets go of the lock |
 | | `pending_writes_read_back` | What a live upgrade hands over of the writes not done (`Pending`) reads back; an empty one from an older process reads too |
-| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | Two looks at the lock's holder: live when it sent a statement in between (its `TIME` went back), another connection took it, or it cannot be seen; not live when idle all along or in one statement all along |
+| | `the_startup_refuses_only_a_holder_shown_live` | The startup's next step after looking at the lock's holder (`after_looks`, #307): a holder idle for longer than `LIVE_IDLE` at the first look lets it go on, a holder that pinged in between (also while it restores) is refused, one idle all along lets it go on. When a long write ended in between on MySQL (a statement, then briefly idle) it is not refused: it waits `DUPLICATE_LOOK_AGAIN` and looks again, going on if the holder stayed idle, refusing if it pinged, and not refusing if it still cannot tell |
+| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | Two looks at the lock's holder: it is live when it sent a statement in between (its `TIME` went back, or a statement started), when another connection holds the lock now or when it cannot be seen; not live when it stayed idle or ran one statement all along |
+| | `a_statement_that_ended_in_between_is_no_proof_of_life` | A statement at the first look and briefly idle at the second (a dead host's long write ending on MySQL, #307): not taken for live but `Unsure` (idle for `LIVE_IDLE` or longer: not live). At a third look it is not live if it stayed idle, live if it pinged |
+| `control/upgrade/update.rs` | `cached_releases_are_verified_again` | (among others) the trial of a version that was not handed over to is taken back by `end_trial`, not marked bad; another version's trial is left alone |
 
 ## Integration tests: control API (`tests/api.rs`)
 
@@ -283,6 +286,17 @@ Starts the real binary and hands over with SIGUSR2 and `POST /admin/upgrade` (do
 | `api_rules_and_http_counters_carry_over` | Rules of a `persist: true` token come back as `origin: "api"` with `created_by`, `created_at` and `persisted`, without reading the database. `stats.http` by route carries over and keeps counting |
 | `a_failed_handoff_keeps_the_old_process` | When the new process cannot connect (the handoff socket's directory is missing): `handoff.failed`, and the old process keeps running. `rproxy_handoffs_total{outcome="failed"}`, `rproxy_build_info`. `POST /admin/upgrade` over TCP is 403 by default |
 
+## Integration tests: the snapshot of a live upgrade and changes (`tests/handoff_freeze.rs`, #305, v0.4.15)
+
+In-process, with a memory store and two registries (the old process, and the new one started from the snapshot; both see the same rows). A handoff in progress (`handoff::set_active`) is process-wide, so the tests of this file run one at a time.
+
+| Test | What it checks |
+|---|---|
+| `changes_around_the_snapshot_are_in_it_or_refused` | A live upgrade starts while a change's write is under way, and more changes to the same rule come right around the snapshot and after it: the snapshot (`handoff::prepare`) waits for the change under way, later changes (rules and rule sets) get `503 upgrading` without changing anything. The old process does not change after the snapshot; the new process runs the last answered change, and its row matches (`persisted: true`). Changes after the snapshot used to run in the old process only |
+| `a_change_that_does_not_end_in_time_stops_the_handoff` | A change that does not end within the wait (a slow write): the handoff does not happen (`prepare` fails) and the change runs to its end in the old process with `persisted: true` (`release` used to give up at its bound, and the change was in the old process only and not written) |
+| `after_a_failed_handoff_the_waiting_changes_go_on` | The handoff failed after the snapshot: changes that waited meanwhile go on (not refused) and are written |
+| `a_handoff_that_panics_lets_the_changes_go_on` | The handoff task panics after the snapshot: dropping `handoff::Running` clears the handoff mark and lets go of the lock, so the change that waited does not hang (nor get 503) but goes on and is written, and the self-update is told the handoff did not happen (`set_on_abort`: it takes back its trial) |
+
 ## Integration tests: shutting down on SIGTERM (`tests/shutdown.rs`, v0.4.1)
 
 Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY_SHUTDOWN_DELAY` / `_DRAIN`).
@@ -311,6 +325,8 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `persist_tokens_store_their_sets` | A set of a `persist: true` token is stored as one row (`generation`, `etag`, owner, rules), and the answer, `GET /rulesets` and `GET /rulesets/{name}` show `persisted`. Dry runs and sets of tokens without `persist` are not written. A stored set changed by an `admin` updates its row (the owner stays). A failing write gives `persisted: false`. `DELETE` removes the row. `features.ruleset_persistence` |
 | `a_set_draining_holds_up_neither_other_sets_nor_the_release` | While `DELETE /rulesets/a?drain_secs` drains, a `PUT` of another set does not wait and is written (`persisted: true`), and a live upgrade's `release` ends at once |
 | `stored_sets_are_restored` | A stored set comes back with its `generation`, `etag` and owner. Only a rule whose key overlaps a rule restored before is left out; the rest applies. The owner is restored, so other tokens may not change it |
+| `two_puts_of_the_same_generation_leave_the_row_of_the_set_that_runs` | Two `PUT`s of the same `generation` at once (the one that changed the set first stops before it queues its row while the other runs to its end, #306): the row is the running set (the later one) and says `persisted: true`. The set is read under the same `order` its row is queued under |
+| `the_check_writing_a_set_again_does_not_undo_a_put` | The check writes again a set that did not go through while a `PUT` of the same `generation` runs to its end (#306): the check writes the set as it is when it queues it, so the row stays the `PUT`'s, with `persisted: true` |
 | `sets_survive_a_restart_with_mariadb` | The real binary with MariaDB (`RPROXY_TEST_DATABASE_URL`): it starts without the table and answers `persisted: false`; stored, restarted, restored; other nodes' rows stay out; an older `PUT` does not overwrite a row with a newer `generation`; `DELETE` removes the row |
 
 ## Integration tests: performance (`tests/performance.rs`, #194, #184)
@@ -394,6 +410,7 @@ The real binary is stopped with SIGKILL (as by the OOM killer or `kill -9`) and 
 | `the_periodic_check_does_not_undo_a_change_under_way` | A PATCH whose write is held up by a row lock (and fails, `persisted: false`): the check does not put the older row back meanwhile, and afterwards writes the running rule again |
 | `a_second_process_with_the_same_node_name_does_not_start` | A second process with the same `node` name does not take the lock; it waits up to `DUPLICATE_STARTUP_WAIT` (40 seconds), sees the holder keep sending statements (live), logs `persist.duplicate_node` (error, `phase: startup`, the holder's `host`) and `fatal` (`--node-name`, `RPROXY_NODE_NAME`), and exits non-zero (never ready, its static rule never listens). The first keeps the lock and its writes |
 | `a_duplicate_started_while_the_database_was_down_does_not_take_the_lock` | A second process with the same name started while the database could not be reached (the test's forwarder opens later): it does not take the lock, its writes answer `persisted: false` at once, and after `DUPLICATE_AFTER` it logs `persist.duplicate_node`. The first keeps the lock and its writes |
+| `a_process_with_the_same_node_name_that_restores_for_long_is_seen_live` | The first process with a name takes the lock and then restores for longer than `LIVE_IDLE` (the test's forwarder holds up its read of the UI's rules, #307): it pings from the moment it has the lock, so the second one sees it live and stops with `persist.duplicate_node` (it used to take it for a connection left behind and start, and the first one's connection was dropped by `wait_timeout`). The first finishes its restore and keeps the lock |
 | `a_connection_opened_again_takes_the_lock_again` | After the connection broke (KILL in MariaDB), the ping takes the lock again on the connection opened again (without waiting for a write) |
 | `a_live_upgrade_carries_what_was_not_written` | A live upgrade with a change the old process could not write (a PATCH held up by a row lock, `persisted: false`): the new process runs the rule as changed, its check does not put the older row back, and it writes the row |
 | `without_the_database_a_change_answers_at_once` | The database cannot be reached: a change answers `persisted: false` at once |

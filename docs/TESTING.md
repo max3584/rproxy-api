@@ -82,9 +82,12 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | | `a_late_removal_spares_a_newer_rule_with_the_key` | 古いルールの遅れた行の削除は、同じキーの新しい `api` のルールの行と `persisted` を消さない |
 | | `a_write_on_its_way_is_not_undone` | 書き込みの途中（書きかけとして覚えている）のルールを照合が消さない |
 | | `a_write_that_went_through_ends_a_busy_episode` | 書き込みが通るとロックを持つとみなし、`busy_since` を戻す（後の `persist.duplicate_node` が早まらない） |
-| | `release_does_not_wait_for_ever` | `release` は途中の変更を上限まで待ってからロックを放す |
+| | `release_does_not_wait_for_ever` | 止めていない（引き継ぎでは必ず止めている、#305）ストアの `release` は途中の変更を上限まで待ってからロックを放す |
 | | `pending_writes_read_back` | 引き継ぎで渡す書けていないもの（`Pending`）が読み戻せる。古いプロセスからの空のものも読める |
-| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | ロックの持ち主を 2 回見て、その間に文を送った（`TIME` が戻った）・ほかの接続になった・見えないときは生きている、ずっと何もしていない・1 つの文のままなら生きていない |
+| | `the_startup_refuses_only_a_holder_shown_live` | 起動時にロックの持ち主を見た結果の次の手（`after_looks`、#307）：1 回目に `LIVE_IDLE` より長く何もしていなければ続ける、間に ping した持ち主（復元の途中でも）は断る、ずっと何もしていなければ続ける。MySQL で長い書き込みが間に終わった（文の途中 → 短く何もしていない）ときは断らずに `DUPLICATE_LOOK_AGAIN` 待ってもう 1 回見て、何もしていなければ続け・ping していれば断り、まだ決められなければ断らない |
+| `config/persist/queue.rs` | `a_holder_is_live_when_it_ran_statements_in_between` | ロックの持ち主を 2 回見て、その間に文を送った（`TIME` が戻った、文が始まった）・ほかの接続になった・見えないときは生きている、ずっと何もしていない・1 つの文のままなら生きていない |
+| | `a_statement_that_ended_in_between_is_no_proof_of_life` | 1 回目は文の途中、2 回目は短く何もしていない（MySQL で落ちたホストの長い書き込みが終わった、#307）：生きているとはみなさず `Unsure`（`LIVE_IDLE` 以上何もしていなければ生きていない）。3 回目で何もしていなければ生きていない、ping していれば生きている |
+| `control/upgrade/update.rs` | `cached_releases_are_verified_again` | （ほかに）引き継ぎをしなかった版の試しは `end_trial` で取り下げ、悪い版にはしない。ほかの版の試しには触らない |
 
 ## 結合テスト：制御 API（`tests/api.rs`）
 
@@ -283,6 +286,17 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `api_rules_and_http_counters_carry_over` | `persist: true` のトークンのルールが DB を読み直さずに `origin: "api"`・`created_by`・`created_at`・`persisted` のまま戻る。`stats.http` のルートごとの数が引き継がれて、その後も増える |
 | `a_failed_handoff_keeps_the_old_process` | 新しいプロセスにつなげない（引き継ぎ用のソケットのディレクトリがない）と `handoff.failed` で、古いプロセスが動き続ける。`rproxy_handoffs_total{outcome="failed"}`・`rproxy_build_info`。TCP からの `POST /admin/upgrade` は既定で 403 |
 
+## 結合テスト：引き継ぎの写しと変更（`tests/handoff_freeze.rs`、#305、v0.4.15）
+
+プロセスの中で、メモリのストアと 2 つのレジストリ（古いプロセスと、写しから始める新しいプロセス。同じ行を見る）で確かめる。引き継ぎの途中（`handoff::set_active`）はプロセス全体のものなので、このファイルのテストは 1 つずつ動く。
+
+| テスト | 確かめること |
+|---|---|
+| `changes_around_the_snapshot_are_in_it_or_refused` | 書き込みの途中の変更があるうちに引き継ぎが始まり、同じルールへの変更が写しの前後に来る：写し（`handoff::prepare`）は途中の変更を待ち、その後の変更（ルールと組）は何も変えずに `503 upgrading`。古いプロセスは写しの後に変わらず、新しいプロセスは最後に答えた変更で動き、行も同じ（`persisted: true`）。前は写しの後の変更が古いプロセスでだけ動いていた |
+| `a_change_that_does_not_end_in_time_stops_the_handoff` | 待ちの上限のうちに終わらない変更（遅い書き込み）：引き継ぎをしない（`prepare` が誤り）、変更は古いプロセスで最後まで動いて `persisted: true`（前は `release` が上限で諦め、変更は古いプロセスにだけあって書けなかった） |
+| `after_a_failed_handoff_the_waiting_changes_go_on` | 写しの後に引き継ぎが失敗した：止めていた間に順番を待った変更は断らずに続き、書かれる |
+| `a_handoff_that_panics_lets_the_changes_go_on` | 引き継ぎのタスクが写しの後に panic した：`handoff::Running` の drop が引き継ぎの印を外して鍵を放すので、待っていた変更は止まったままにならず（503 にもならず）続いて書かれ、自動更新には引き継ぎをしなかったことが伝わる（`set_on_abort`。試しを取り下げる） |
+
 ## 結合テスト：SIGTERM での終わり方（`tests/shutdown.rs`、v0.4.1）
 
 本物のバイナリに SIGTERM を送る（docs/DESIGN-v0.4.x.md の 2.、`RPROXY_SHUTDOWN_DELAY` / `_DRAIN`）。
@@ -311,6 +325,8 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `persist_tokens_store_their_sets` | `persist: true` のトークンの組は 1 行（`generation`・`etag`・持ち主・ルール）で保存され、応答・`GET /rulesets`・`GET /rulesets/{name}` に `persisted`。dry run と `persist` のないトークンの組は書かない。保存した組は `admin` が変えても行が変わる（持ち主はそのまま）。書けなければ `persisted: false`。`DELETE` で行が消える。`features.ruleset_persistence` |
 | `a_set_draining_holds_up_neither_other_sets_nor_the_release` | `DELETE /rulesets/a?drain_secs` の drain の間：ほかの組の `PUT` は待たずに `persisted: true` で書かれ、引き継ぎの `release` もすぐ終わる |
 | `stored_sets_are_restored` | 保存した組が `generation`・`etag`・持ち主ごと戻る。先に戻したルールとキーが重なるルールだけ外して、残りを当てる。持ち主が戻るので、ほかのトークンは変えられない |
+| `two_puts_of_the_same_generation_leave_the_row_of_the_set_that_runs` | 同じ `generation` の `PUT` が 2 つ重なる（先に組を変えた方が行を列に入れる前に止まり、その間に後の方が最後まで動く、#306）：行は動いている組（後の方）と同じで `persisted: true`。組の中身は行を列に入れるのと同じ `order` の中で読む |
+| `the_check_writing_a_set_again_does_not_undo_a_put` | 書けなかった組を照合が書き直す途中で、同じ `generation` の `PUT` が最後まで動く（#306）：照合は列に入れるときの組を書くので、行は `PUT` の中身のまま、`persisted: true` |
 | `sets_survive_a_restart_with_mariadb` | 本物のバイナリと MariaDB（`RPROXY_TEST_DATABASE_URL`）：テーブルがなくても起動し `persisted: false`。保存 → 再起動で戻る。ほかのノードの行は戻さない。新しい `generation` の行を古い `PUT` で書き換えない。`DELETE` で行が消える |
 
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
@@ -394,6 +410,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `the_periodic_check_does_not_undo_a_change_under_way` | 書き込みが行のロックで止まっている PATCH（失敗して `persisted: false`）：その間に照合は古い行へ戻さず、終わった後に照合が動いているルールを書き直す |
 | `a_second_process_with_the_same_node_name_does_not_start` | 同じ `node` の名前の 2 つ目のプロセス：ロックを取り上げず、`DUPLICATE_STARTUP_WAIT`（40 秒）まで待って、持ち主が文を送り続けている（生きている）ので `persist.duplicate_node`（error、`phase: startup`、持ち主の `host`）と `fatal`（`--node-name`・`RPROXY_NODE_NAME`）を出して 0 以外で終わる（ready にならず、固定ルールの待ち受けも開かない）。1 つ目はロックを持ったまま書ける |
 | `a_duplicate_started_while_the_database_was_down_does_not_take_the_lock` | DB に届かないあいだに起動した同じ名前の 2 つ目のプロセス（テストの中継を後から開く）：ロックを取り上げず、書き込みはすぐに `persisted: false`、`DUPLICATE_AFTER` の後に `persist.duplicate_node` を出す。1 つ目はロックを持ったまま書ける |
+| `a_process_with_the_same_node_name_that_restores_for_long_is_seen_live` | 同じ名前の 1 つ目のプロセスがロックを取った後、復元（UI のルールの読み込みをテストの中継で止める）に `LIVE_IDLE` より長くかかる（#307）：ロックを取った直後から ping するので、2 つ目は生きているとみて `persist.duplicate_node` で起動をやめる（前は残った接続とみなして起動し、1 つ目の接続は `wait_timeout` で切られていた）。1 つ目は復元を終えてロックを持ち続ける |
 | `a_connection_opened_again_takes_the_lock_again` | 接続が切れた（MariaDB で KILL）後、ping が開き直した接続でロックを取り直す（書き込みを待たない） |
 | `a_live_upgrade_carries_what_was_not_written` | 古いプロセスで書けなかった変更（行のロックで止めた PATCH、`persisted: false`）のまま引き継ぐ：新しいプロセスはルールを変えたまま動かし、照合で古い行に戻さず、行を書き直す |
 | `without_the_database_a_change_answers_at_once` | DB に届かない：変更はすぐに `persisted: false` で答える |

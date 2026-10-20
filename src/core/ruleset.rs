@@ -928,8 +928,11 @@ impl Registry {
 	}
 
 	/// What a set's row in `rproxy_rule_sets` holds (#241): (generation, etag,
-	/// owner, the rules as `config::plan::shape` in key order).
+	/// owner, the rules as `config::plan::shape` in key order). Read under the
+	/// sets' write lock, which a `PUT` holds until it has set the new generation
+	/// and etag: never an etag of one version with the rules of another.
 	pub async fn ruleset_row(&self, name: &str) -> Option<(u64, String, String, serde_json::Value)> {
+		let _write = self.rulesets.write.lock().await;
 		let s = self.rulesets.get(name)?;
 		let rules = self.rules.lock().await;
 		let mut specs: Vec<&RuleSpec> = rules.values().map(|e| e.spec()).filter(|s| s.ruleset.as_deref() == Some(name)).collect();

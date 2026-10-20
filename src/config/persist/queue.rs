@@ -102,25 +102,53 @@ pub struct Holder {
 /// the time between them (they are whole seconds).
 const SLACK: Duration = Duration::from_secs(2);
 
+/// What two looks at the holder of a lock say of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+	/// It sent a statement in between (or cannot be seen, or another connection holds the lock now).
+	Live,
+	/// Idle all the time, or running one statement all the time.
+	NotLive,
+	/// The statement of the earlier look ended in between and it has been idle
+	/// since, for less than `LIVE_IDLE`: a live client's statement, or a dead
+	/// one's long statement that MariaDB finished on its own (MySQL has no
+	/// limit for statements, #307). Only a later look tells.
+	Unsure,
+}
+
 impl Holder {
 	/// How long the connection has been idle (None: running a statement, or not seen).
 	pub fn idle(&self) -> Option<Duration> {
 		(self.command.as_deref() == Some("Sleep")).then(|| Duration::from_secs(self.idle_secs.unwrap_or(0)))
 	}
 
-	/// Whether the holder is live, from this look `elapsed` after `earlier`: it
-	/// ran a statement in between (its idle time started again), or another
-	/// connection took the lock meanwhile, or it cannot be seen (another user's:
-	/// a dead connection would have been dropped by then). One that stayed idle
-	/// all the time, or runs one statement all the time, is not live.
-	pub fn live_since(&self, earlier: &Holder, elapsed: Duration) -> bool {
-		if self.connection != earlier.connection || self.command.is_none() {
-			return true;
+	/// Whether the holder is live, from this look `elapsed` after `earlier`.
+	/// `PROCESSLIST.TIME` starts again when a statement starts and when it ends:
+	/// - another connection took the lock meanwhile, or it cannot be seen
+	///   (another user's: a dead connection would have been dropped by then):
+	///   live;
+	/// - the same command at both looks (idle, or running a statement): live
+	///   if its time started again in between (a statement was sent: only a
+	///   live client sends one), otherwise not live (idle all the time, or one
+	///   statement all the time);
+	/// - idle, then running a statement: a statement was sent, live;
+	/// - running a statement, then idle: the statement ended, which a dead
+	///   client's statement also does (on MySQL it may run long, #307). Idle
+	///   for `LIVE_IDLE` or longer it is not live (a live rproxy runs a
+	///   statement more often); otherwise unsure, and a later look tells.
+	pub fn liveness_since(&self, earlier: &Holder, elapsed: Duration) -> Liveness {
+		let (Some(now), true) = (self.command.as_deref(), self.connection == earlier.connection) else {
+			return Liveness::Live;
+		};
+		let Some(before) = earlier.command.as_deref() else { return Liveness::Unsure };
+		let secs = |h: &Holder| Duration::from_secs(h.idle_secs.unwrap_or(0));
+		if before == now {
+			return if secs(self) + SLACK < secs(earlier) + elapsed { Liveness::Live } else { Liveness::NotLive };
 		}
-		match (earlier.idle(), self.idle()) {
-			(Some(before), Some(now)) => now + SLACK < before + elapsed,
-			(None, Some(_)) => true,
-			(_, None) => false,
+		match (before == "Sleep", now == "Sleep") {
+			(true, _) => Liveness::Live,
+			(false, true) if secs(self) >= super::LIVE_IDLE => Liveness::NotLive,
+			_ => Liveness::Unsure,
 		}
 	}
 }
@@ -287,20 +315,45 @@ mod tests {
 	/// Two looks at the holder of a lock, 32 seconds apart.
 	#[test]
 	fn a_holder_is_live_when_it_ran_statements_in_between() {
+		use Liveness::*;
 		let apart = Duration::from_secs(32);
 		// pinged in between: its idle time started again
-		assert!(holder(7, "Sleep", 4).live_since(&holder(7, "Sleep", 8), apart));
+		assert_eq!(holder(7, "Sleep", 4).liveness_since(&holder(7, "Sleep", 8), apart), Live);
 		// idle all along (a connection left behind)
-		assert!(!holder(7, "Sleep", 40).live_since(&holder(7, "Sleep", 8), apart));
-		assert!(!holder(7, "Sleep", 39).live_since(&holder(7, "Sleep", 8), apart));
+		assert_eq!(holder(7, "Sleep", 40).liveness_since(&holder(7, "Sleep", 8), apart), NotLive);
+		assert_eq!(holder(7, "Sleep", 39).liveness_since(&holder(7, "Sleep", 8), apart), NotLive);
 		// one statement all along (not ours)
-		assert!(!holder(7, "Query", 40).live_since(&holder(7, "Query", 8), apart));
+		assert_eq!(holder(7, "Query", 40).liveness_since(&holder(7, "Query", 8), apart), NotLive);
+		// a statement started in between (only a live client sends one)
+		assert_eq!(holder(7, "Query", 1).liveness_since(&holder(7, "Sleep", 8), apart), Live);
+		assert_eq!(holder(7, "Query", 1).liveness_since(&holder(7, "Query", 8), apart), Live);
 		// another connection took the lock meanwhile, or the holder cannot be seen
-		assert!(holder(9, "Sleep", 30).live_since(&holder(7, "Sleep", 8), apart));
+		assert_eq!(holder(9, "Sleep", 30).liveness_since(&holder(7, "Sleep", 8), apart), Live);
 		let unseen = Holder { connection: Some(7), ..Default::default() };
-		assert!(unseen.live_since(&unseen, apart));
+		assert_eq!(unseen.liveness_since(&unseen, apart), Live);
 		assert_eq!(holder(7, "Sleep", 20).idle(), Some(Duration::from_secs(20)));
 		assert_eq!(holder(7, "Query", 20).idle(), None);
+	}
+
+	/// MySQL (no limit for statements), a host that went away during a long
+	/// write (#307): the first look sees the statement, the second the
+	/// connection idle since it ended. That is no proof of a live client
+	/// (it used to refuse the startup): unsure, and a third look tells (a live
+	/// rproxy has pinged meanwhile, a dead one's connection stayed idle).
+	#[test]
+	fn a_statement_that_ended_in_between_is_no_proof_of_life() {
+		use Liveness::*;
+		let apart = Duration::from_secs(32);
+		assert_eq!(holder(7, "Sleep", 3).liveness_since(&holder(7, "Query", 20), apart), Unsure);
+		// idle for longer than a live rproxy ever is
+		assert_eq!(holder(7, "Sleep", 16).liveness_since(&holder(7, "Query", 20), apart), NotLive);
+		// the third look, 20 seconds later
+		let later = Duration::from_secs(20);
+		assert_eq!(holder(7, "Sleep", 23).liveness_since(&holder(7, "Sleep", 3), later), NotLive);
+		assert_eq!(holder(7, "Sleep", 6).liveness_since(&holder(7, "Sleep", 3), later), Live);
+		// not seen at the first look
+		let unseen = Holder { connection: Some(7), host: Some("h:1".into()), ..Default::default() };
+		assert_eq!(holder(7, "Sleep", 3).liveness_since(&unseen, apart), Unsure);
 	}
 
 	#[tokio::test]

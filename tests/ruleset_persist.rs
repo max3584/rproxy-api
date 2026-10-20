@@ -287,6 +287,101 @@ const RPROXY_RULE_SETS: &str = "CREATE TABLE rproxy_rule_sets (
 	PRIMARY KEY (node, name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
 
+/// A rule that sends `port` to 127.0.0.1:`remote` (the remote tells the versions of a set apart).
+fn to(port: u16, remote: u16) -> Value {
+	rule("tcp", port, std::net::SocketAddr::from(([127, 0, 0, 1], remote)))
+}
+
+/// Waits until the set's row has the running set's rules and the set says
+/// `persisted: true` (and fails if it never does).
+async fn row_follows_the_set(h: &Harness, store: &Store, name: &str) {
+	let deadline = Instant::now() + Duration::from_secs(5);
+	loop {
+		let (_, view) = call(h, Method::GET, &format!("/rulesets/{name}"), "ci", None).await;
+		let running: Vec<u64> = view["rules"].as_array().unwrap().iter().map(|r| r["remote_port"].as_u64().unwrap()).collect();
+		let row: Option<Vec<u64>> =
+			store.memory_sets().into_iter().find(|s| s.name == name).map(|s| s.rules.iter().map(|r| u64::from(r.remote_port)).collect());
+		if row.as_ref() == Some(&running) && view["persisted"] == true {
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"the row {row:?} and the running set {running:?} (persisted: {}) do not agree",
+			view["persisted"]
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+}
+
+/// Two `PUT`s of the same generation at once (#306): the one that read the set
+/// first queues its row last. The row is read with the queueing (under the
+/// store's order), so the row ends up as the set that runs, and `persisted`
+/// says so (it used to keep the older rules while saying `persisted: true`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_puts_of_the_same_generation_leave_the_row_of_the_set_that_runs() {
+	let dir = workdir("same-gen");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	let a = free_port();
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![to(a, 1001)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	// the first PUT has changed the set and waits before it writes the row
+	let (arrived, go) = store.pause_next_set_write();
+	let first = tokio::spawn({
+		let (base, http) = (h.base.clone(), h.http.clone());
+		async move {
+			let r = http.put(format!("{base}/rulesets/ci/a")).bearer_auth("ci").json(&set(1, vec![to(a, 1002)])).send().await.unwrap();
+			(r.status(), r.json::<Value>().await.unwrap())
+		}
+	});
+	arrived.acquire().await.unwrap().forget();
+	// the second, of the same generation, runs to its end meanwhile
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![to(a, 1003)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	go.add_permits(1);
+	let r = first.await.unwrap();
+	assert_eq!(r.0, StatusCode::OK, "{}", r.1);
+	row_follows_the_set(&h, &store, "ci/a").await;
+	let (_, view) = call(&h, Method::GET, "/rulesets/ci/a", "ci", None).await;
+	assert_eq!(view["rules"][0]["remote_port"], 1003, "{view}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// The periodic check writes again a set whose row did not go through while a
+/// `PUT` of the same generation changes it (#306): the check reads the set
+/// when it queues the row, so it never writes the older rules over the
+/// `PUT`'s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_check_writing_a_set_again_does_not_undo_a_put() {
+	let dir = workdir("check-put");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	let a = free_port();
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![to(a, 1001)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	store.fail_writes(true);
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![to(a, 1002)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(false)), "{}", r.1);
+	store.fail_writes(false);
+	// the check writes the set again, and waits before it reads it
+	let (arrived, go) = store.pause_next_set_write();
+	let check = tokio::spawn({
+		let (store, registry) = (store.clone(), h.registry.clone());
+		async move { store.reconcile(&registry).await }
+	});
+	arrived.acquire().await.unwrap().forget();
+	let r = call(&h, Method::PUT, "/rulesets/ci/a", "ci", Some(set(1, vec![to(a, 1003)]))).await;
+	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
+	go.add_permits(1);
+	check.await.unwrap().unwrap();
+	row_follows_the_set(&h, &store, "ci/a").await;
+	let (_, view) = call(&h, Method::GET, "/rulesets/ci/a", "ci", None).await;
+	assert_eq!(view["rules"][0]["remote_port"], 1003, "{view}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
 /// The real binary with MariaDB: a set PUT by a persist token survives a
 /// restart (generation, etag, owner); a row with a newer generation is not
 /// overwritten; other nodes' rows stay out; DELETE removes the row. Without

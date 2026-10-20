@@ -85,10 +85,8 @@ pub async fn put(
 		let opts =
 			PutOptions { if_match: if_match.as_deref(), dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
 		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
-		let _change = match state.registry.persist().filter(|_| !dry_run) {
-			Some(store) => Some(store.changing().await),
-			None => None,
-		};
+		// refused if a live upgrade started meanwhile (#305)
+		let _change = if dry_run { None } else { super::api::changing(&state).await? };
 		let result = state.registry.put_ruleset(&name, req, opts).await;
 		if !dry_run {
 			audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
@@ -114,10 +112,8 @@ fn set_store(state: &AppState, principal: &Principal, name: &str) -> Option<Arc<
 
 /// Writes the set's row after a `PUT`; `persisted` of the answer.
 async fn persist_set(state: &AppState, principal: &Principal, name: &str) -> Option<bool> {
-	let store = set_store(state, principal, name)?;
-	let (generation, etag, owner, rules) = state.registry.ruleset_row(name).await?;
-	let row = crate::config::persist::SetRow { name, generation, etag: &etag, owner: &owner, rules, by: &principal.name };
-	Some(store.save_set(row).await)
+	// the set is read as it runs when its row is queued (#306)
+	set_store(state, principal, name)?.save_set(&state.registry, name, &principal.name).await
 }
 
 pub async fn delete(
@@ -142,10 +138,8 @@ pub async fn delete(
 		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 		let admin = principal.has(crate::control::auth::Scope::Admin);
 		let store = set_store(&state, &principal, &name);
-		let change = match state.registry.persist() {
-			Some(store) => Some(store.changing().await),
-			None => None,
-		};
+		// refused if a live upgrade started meanwhile (#305)
+		let change = super::api::changing(&state).await?;
 		let result = state.registry.take_ruleset(&name, if_match.as_deref(), &may_use_ports, (&principal.name, admin)).await;
 		audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
 		let taken = result?;
