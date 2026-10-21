@@ -82,9 +82,10 @@ jobs:
           if [ -d "$CRITERION_HOME" ]; then
             find "$CRITERION_HOME" -type d \( -name new -o -name change \) -prune -exec rm -rf {} +
           fi
-          # CPU とメモリの比べる相手（PR の側の cargo clean で消えるので外へ写す）
-          if cargo build --locked --release --bin rproxy-api; then
-            cp target/release/rproxy-api "$RUNNER_TEMP/rproxy-base"
+          # CPU とメモリの比べる相手（PR の側の cargo clean で消えるので外へ写す）。--benches を付けて
+          # dev-dependencies の features をベンチマークと揃え、依存を作り直さない
+          if cargo build --locked --release --bin rproxy-api --benches; then
+            cp "$CARGO_TARGET_DIR/release/rproxy-api" "$RUNNER_TEMP/rproxy-base" || echo "::warning title=Resource usage::no rproxy-api of the merge base"
           else
             echo "::warning title=Resource usage::rproxy-api did not build at the merge base; no comparison"
           fi
