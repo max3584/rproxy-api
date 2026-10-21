@@ -5,11 +5,15 @@ name: Benchmarks
 # 閾値（THRESHOLD %）より遅くなり、95 % の信頼区間がすべて遅い側にあるものだけを警告にする。
 # 失敗にはしない（必須のチェックにもしない）。結果はジョブのサマリーと PR のコメント（1 件を更新する）に出す。
 # Alpine（musl）のコンテナで測る（#191。リリースのバイナリ・.deb と同じ libc と malloc）。
+# CPU とメモリ：マージベースと PR の release のバイナリを別のプロセスとして交互に動かし、loopback で決まった量の
+# UDP（平文・proxy_protocol）と TCP を流して /proc から CPU 時間と RSS を読む（examples/resource_probe.rs）。
+# 5 回の中央値を比べ、CPU は THRESHOLD %、メモリは MEM_THRESHOLD % より悪いものを警告にする（これも失敗にはしない）。
 on:
   pull_request:
     paths:
       - src/**
       - benches/**
+      - examples/resource_probe.rs
       - tests/common/**
       - Cargo.toml
       - Cargo.lock
@@ -29,6 +33,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   THRESHOLD: "15"
+  MEM_THRESHOLD: "15"
 
 jobs:
   bench:
@@ -77,6 +82,13 @@ jobs:
           if [ -d "$CRITERION_HOME" ]; then
             find "$CRITERION_HOME" -type d \( -name new -o -name change \) -prune -exec rm -rf {} +
           fi
+          # CPU とメモリの比べる相手（PR の側の cargo clean で消えるので外へ写す）。--benches を付けて
+          # dev-dependencies の features をベンチマークと揃え、依存を作り直さない
+          if cargo build --locked --release --bin rproxy-api --benches; then
+            cp "$CARGO_TARGET_DIR/release/rproxy-api" "$RUNNER_TEMP/rproxy-base" || echo "::warning title=Resource usage::no rproxy-api of the merge base"
+          else
+            echo "::warning title=Resource usage::rproxy-api did not build at the merge base; no comparison"
+          fi
       # 1 回の繰り返しが 30 秒進まなければ、ベンチマーク自身が状態を出して panic する（benches/dataplane.rs の STALL）
       - name: benchmarks of the PR
         timeout-minutes: 20
@@ -87,11 +99,36 @@ jobs:
           # このクレートの分だけ消して、PR のソースから作り直させる（依存はそのまま使う）
           cargo clean --release -p rproxy-api
           cargo bench --locked --bench '*' -- --baseline-lenient base
+      # CPU 時間とメモリ（examples/resource_probe.rs）：マージベースと PR のバイナリを交互に 5 回。ふだんは 2〜3 分
+      - name: resource usage (merge base vs. PR)
+        timeout-minutes: 12
+        run: |
+          ulimit -n "$(ulimit -Hn)" || true
+          cargo build --locked --release --bin rproxy-api --example resource_probe
+          # the steps run with sh (no bash arrays)
+          set -- --rproxy pr=target/release/rproxy-api
+          if [ -x "$RUNNER_TEMP/rproxy-base" ]; then set -- --rproxy "base=$RUNNER_TEMP/rproxy-base" "$@"; fi
+          mkdir -p resource-usage
+          target/release/examples/resource_probe "$@" --rounds 5 \
+            --cpu-threshold "$THRESHOLD" --mem-threshold "$MEM_THRESHOLD" \
+            --markdown resource-usage/resources.md --json resource-usage/resources.json \
+            || echo "::warning title=Resource usage::the resource probe failed (see this step's log)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: resource-usage
+          # relative to the workspace (runner.temp is the runner's path, not the container's)
+          path: resource-usage/
+          if-no-files-found: ignore
       - name: summary
         run: |
           {
             python3 scripts/bench-summary.py "$CRITERION_HOME" "$THRESHOLD" base
             echo
+            if [ -f resource-usage/resources.md ]; then
+              cat resource-usage/resources.md
+              echo
+            fi
             echo "merge base ${{ steps.base.outputs.sha }} · [job]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
           } > "$RUNNER_TEMP/summary.md"
           cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
