@@ -252,6 +252,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `a_header_from_outside_from_is_dropped` | `from` の外からのヘッダ（v1・v2）は捨て（`reason: proxy_protocol_untrusted`、`client` は前段）、ヘッダのないものは通す |
 | `per_source_limits_count_the_client_of_the_header` | 送信元ごとの `limits` はヘッダのクライアントで数える。同じ前段のソケットで別のクライアントのヘッダは別のセッション |
 | `sni_reads_the_name_past_the_header` | 外側の rproxy の後ろの `tls.mode: sni` のルールが、ヘッダを外して QUIC の名前を読む（本物の quinn）。同じソケットから別の名前の接続で作り直す。route の `source_ip: proxy_v2` はヘッダのクライアントと内側のアドレスを書く |
+| `dtls_is_terminated_past_the_header` | `tls.mode: terminate`（DTLS）のルールで、データグラムごとにヘッダを付けるクライアントとのハンドシェイクとデータが通り、返事にはヘッダがなく、転送先（`source_ip: proxy_v2`）と `conn.open` の `client` はヘッダのクライアント、`proxy_peer` は前段 |
 
 ## 結合テスト：route ごとの `source_ip`（`tests/route_source_ip.rs`、#297）
 

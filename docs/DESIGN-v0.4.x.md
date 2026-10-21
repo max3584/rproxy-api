@@ -289,4 +289,4 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - DPDK の道（`Bound::Dpdk`、実験の機能 `dpdk`）：ヘッダを読まない。`dpdk::claim` が `proxy_protocol` のある `udp` のルールを `bind_failed` で断り、PATCH で付けるときも `Registry::update` が同じ誤りで断る（なお付いていれば、DPDK の道の新しいセッションは `conn.error` で作らない）。読めるようにするのは、実機の確かめと一緒に後で。
 - 対象外：`http` のルールの HTTP/3（quinn の UDP）は今までどおりヘッダを読まない。
 - PATCH・組の PUT・再読み込みは `in_place`（次のデータグラムのまとまりから）。引き継ぎ・保存はルールの形のまま（UDP のセッションは引き継ぎで作り直し）。
-- 試験：単体（`net::proxy_in` の `parse_dgram`・`datagram`・`Slot`、`config::plan` の round trip と `in_place`）、`tests/proxy_protocol_udp.rs`（2 段の rproxy・`allow_from`・`required`・外からのヘッダ・壊れたヘッダ・送信元ごとの `limits`・QUIC の `sni` と route の `source_ip`・PATCH での付け外し・検証）、ファジングの `proxy_header_in`（DGRAM の seeds）、ベンチマーク。
+- 試験：単体（`net::proxy_in` の `parse_dgram`・`datagram`・`Slot`、`config::plan` の round trip と `in_place`）、`tests/proxy_protocol_udp.rs`（2 段の rproxy・`allow_from`・`required`・外からのヘッダ・壊れたヘッダ・送信元ごとの `limits`・QUIC の `sni` と route の `source_ip`・DTLS の終端・PATCH での付け外し・検証）、ファジングの `proxy_header_in`（DGRAM の seeds）、ベンチマーク。

@@ -370,3 +370,101 @@ async fn sni_reads_the_name_past_the_header() {
 	assert_eq!(buf[expected.len()] & 0xc0, 0xc0, "then the QUIC Initial, without the outer header");
 	assert!(n > expected.len());
 }
+
+// ---- tls.mode: terminate (DTLS) behind a front end ----
+
+/// A client socket that puts a PROXY v2 (DGRAM) header in front of every datagram it
+/// sends, as a front end does; what comes back has none.
+struct Framed {
+	sock: UdpSocket,
+	header: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl webrtc_util::conn::Conn for Framed {
+	async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
+		Ok(self.sock.connect(addr).await?)
+	}
+
+	async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
+		Ok(self.sock.recv(buf).await?)
+	}
+
+	async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+		Ok(self.sock.recv_from(buf).await?)
+	}
+
+	async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+		self.sock.send(&[self.header.as_slice(), buf].concat()).await?;
+		Ok(buf.len())
+	}
+
+	async fn send_to(&self, buf: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
+		self.send(buf).await
+	}
+
+	fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+		Ok(self.sock.local_addr()?)
+	}
+
+	fn remote_addr(&self) -> Option<SocketAddr> {
+		self.sock.peer_addr().ok()
+	}
+
+	async fn close(&self) -> webrtc_util::Result<()> {
+		Ok(())
+	}
+
+	fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+		self
+	}
+}
+
+/// A `tls.mode: terminate` (DTLS) rule with `proxy_protocol`: the handshake and the data
+/// go through with a header in front of every datagram, replies come back without one,
+/// and the backend (`source_ip: proxy_v2`) and the logs see the client of the header.
+#[tokio::test]
+async fn dtls_is_terminated_past_the_header() {
+	logs::capture();
+	let pki = Pki::new("pp-udp-dtls");
+	let cert = pki.server("front", &["media.test"]);
+	let h = harness().await;
+	let port = free_udp_port();
+	let mut body = with_pp(rule("udp", port, reading_backend().await), trusted());
+	body["source_ip"] = json!("proxy_v2");
+	body["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]});
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	sock.connect(local(port)).await.unwrap();
+	let front = sock.local_addr().unwrap();
+	let conn: Arc<dyn webrtc_util::conn::Conn + Send + Sync> = Arc::new(Framed { sock, header: header("192.0.2.7:4000", port) });
+	let config = dtls::config::Config {
+		roots_cas: pki.roots(),
+		server_name: "media.test".into(),
+		extended_master_secret: dtls::config::ExtendedMasterSecretType::Require,
+		..Default::default()
+	};
+	let c = tokio::time::timeout(Duration::from_secs(5), dtls::conn::DTLSConn::new(conn, config, true, None))
+		.await
+		.expect("DTLS handshake timed out")
+		.expect("DTLS handshake");
+	for msg in ["a", "b"] {
+		c.write(msg.as_bytes(), None).await.unwrap();
+		let mut buf = vec![0u8; 1500];
+		let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf, None)).await.expect("no reply").unwrap();
+		assert_eq!(String::from_utf8_lossy(&buf[..n]), format!("192.0.2.7:4000|{msg}"), "the backend sees the client of the header");
+	}
+	let open =
+		logs::wait_for("conn.open", |l| l["event"] == "conn.open" && l["rule"] == format!("udp/127.0.0.1:{port}") && l["dtls"] == true)
+			.await;
+	assert_eq!(
+		(open["client"].as_str(), open["proxy_peer"].as_str()),
+		(Some("192.0.2.7:4000"), Some(front.to_string().as_str())),
+		"{open}"
+	);
+	let v = wait_for(&h, &format!("/rules/udp/127.0.0.1/{port}"), |v| v["connections"] == 1).await;
+	assert_eq!(v["stats"]["denied"], 0, "{v}");
+	let _ = c.close().await;
+}

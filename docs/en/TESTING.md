@@ -252,6 +252,7 @@ Every datagram comes from 127.0.0.1, so `from: ["127.0.0.1/32"]` makes the test 
 | `a_header_from_outside_from_is_dropped` | Headers (v1, v2) from outside `from` are dropped (`reason: proxy_protocol_untrusted`, `client` is the front end); datagrams without one pass |
 | `per_source_limits_count_the_client_of_the_header` | Per-source `limits` count the header's client; another client in the headers of the same front end socket is another session |
 | `sni_reads_the_name_past_the_header` | A `tls.mode: sni` rule behind an outer rproxy reads the QUIC server name past the header (real quinn), starts over for a connection to another name from the same socket, and a route's `source_ip: proxy_v2` writes the header's client and the inner rule's address |
+| `dtls_is_terminated_past_the_header` | On a `tls.mode: terminate` (DTLS) rule, the handshake and data go through with a client that puts a header in front of every datagram; replies carry none, and the backend (`source_ip: proxy_v2`) and `client` of `conn.open` see the header's client, `proxy_peer` the front end |
 
 ## Integration tests: `source_ip` per route (`tests/route_source_ip.rs`, #297)
 
