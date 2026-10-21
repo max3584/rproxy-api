@@ -105,11 +105,11 @@ jobs:
         run: |
           ulimit -n "$(ulimit -Hn)" || true
           cargo build --locked --release --bin rproxy-api --example resource_probe
-          builds=()
-          if [ -x "$RUNNER_TEMP/rproxy-base" ]; then builds+=(--rproxy "base=$RUNNER_TEMP/rproxy-base"); fi
-          builds+=(--rproxy "pr=target/release/rproxy-api")
+          # the steps run with sh (no bash arrays)
+          set -- --rproxy pr=target/release/rproxy-api
+          if [ -x "$RUNNER_TEMP/rproxy-base" ]; then set -- --rproxy "base=$RUNNER_TEMP/rproxy-base" "$@"; fi
           mkdir -p resource-usage
-          target/release/examples/resource_probe "${builds[@]}" --rounds 5 \
+          target/release/examples/resource_probe "$@" --rounds 5 \
             --cpu-threshold "$THRESHOLD" --mem-threshold "$MEM_THRESHOLD" \
             --markdown resource-usage/resources.md --json resource-usage/resources.json \
             || echo "::warning title=Resource usage::the resource probe failed (see this step's log)"
