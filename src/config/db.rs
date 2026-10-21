@@ -216,6 +216,10 @@ mod tests {
 		.unwrap();
 		assert_eq!(new.labels["tenant"], "act");
 		assert_eq!(new.limits.unwrap().max_connections, Some(10));
+		// proxy_protocol (#296), on udp rows too (#312): the API's shape
+		let pp: Options = serde_json::from_str(r#"{"proxy_protocol": {"from": ["10.2.0.0/16"], "required": false}}"#).unwrap();
+		let pp = crate::net::proxy_in::validate(pp.proxy_protocol).unwrap().unwrap();
+		assert!(!pp.required && pp.trusts("10.2.3.4".parse().unwrap()));
 		assert!(serde_json::from_str::<Options>(r#"{"limitz": {}}"#).is_err(), "unknown keys are still refused");
 	}
 }

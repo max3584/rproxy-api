@@ -31,7 +31,7 @@ use crate::core::balance::{Lease, Member};
 use crate::core::bandwidth::{Dir, Gate};
 use crate::core::limits::{self, Permit, Reason};
 use crate::core::proxy::Runtime;
-use crate::core::rule::{RuleSpec, SourceIp};
+use crate::core::rule::{Protocol, RuleSpec, SourceIp};
 use crate::error::ApiError;
 use crate::net::offload::probe::{Outcome, Test};
 use crate::tls::config::TlsMode;
@@ -347,15 +347,40 @@ pub fn claim(spec: &RuleSpec, ip: IpAddr) -> Option<Result<Claim, ApiError>> {
 		Some("tls (DTLS / sni)".to_string())
 	} else if spec.http.is_some() {
 		Some("http".to_string())
+	} else if spec.proxy_protocol.is_some() {
+		// PROXY headers in front of datagrams (#312) are read on the kernel path only
+		Some("proxy_protocol".to_string())
 	} else {
 		None
 	};
 	if let Some(what) = unsupported {
-		return Some(Err(ApiError::bind_failed(format!(
-			"{at}: the address belongs to a DPDK port (global.performance.dpdk), whose UDP path does not support {what}"
-		))));
+		return Some(Err(unsupported_here(at, &what)));
 	}
 	Some(Ok(Claim { ip: v4, port: spec.key.listen.port(), count: spec.port_count }))
+}
+
+fn unsupported_here(at: SocketAddr, what: &str) -> ApiError {
+	ApiError::bind_failed(format!("{at}: the address belongs to a DPDK port (global.performance.dpdk), whose UDP path does not support {what}"))
+}
+
+/// `proxy_protocol` of a udp rule listening on a DPDK port's address (#312): the DPDK
+/// path does not read PROXY headers, so it is refused on every path. Create and re-create
+/// refuse it in `claim`; PATCH (`Registry::updated_spec`) refuses it with this, and rule
+/// set PUTs and reloads re-create the rule instead of changing it in place
+/// (`config::plan::in_place`).
+pub fn proxy_protocol_refused(spec: &RuleSpec) -> Option<ApiError> {
+	let d = DATAPLANE.get()?;
+	proxy_protocol_refusal(spec, |ip| d.engine.owns(ip))
+}
+
+fn proxy_protocol_refusal(spec: &RuleSpec, owns: impl Fn(Ipv4Addr) -> bool) -> Option<ApiError> {
+	if spec.key.protocol != Protocol::Udp || spec.proxy_protocol.is_none() {
+		return None;
+	}
+	spec.listen_ips().into_iter().find_map(|ip| match ip {
+		IpAddr::V4(v4) if owns(v4) => Some(unsupported_here(SocketAddr::new(ip, spec.key.listen.port()), "proxy_protocol")),
+		_ => None,
+	})
 }
 
 /// The serving task of a claimed address: registers the rule with the
@@ -469,6 +494,16 @@ impl Rule for RtRule {
 			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "tls is not supported on the DPDK path");
 			return None;
 		}
+		// refused on every path (`proxy_protocol_refused`); should it be there anyway, its headers are not read here
+		if rt.proxy_protocol.is_on() {
+			rt.stats.dropped();
+			let error = "proxy_protocol is not supported on the DPDK path";
+			match rt.denied_log.check(&ip) {
+				Some(suppressed) => warn!(event = "conn.error", rule = %rt.key, client = %client, error, suppressed),
+				None => debug!(event = "conn.error", rule = %rt.key, client = %client, error, throttled = true),
+			}
+			return None;
+		}
 		let permit = match rt.limits.get().map(|l| l.admit(ip)) {
 			None => None,
 			Some(Ok(p)) => Some(p),
@@ -559,5 +594,39 @@ mod tests {
 			eal_args(&spec),
 			["rproxy-api", "-l", "2-3", "-a", "0000:3b:00.0", "--vdev", "net_tap0,iface=x", "--vdev", DPDK_CHECK_PORT, "--in-memory"]
 		);
+	}
+
+	fn rule(v: serde_json::Value) -> RuleSpec {
+		let caps = crate::core::rule::Caps { features: crate::core::rule::Features::ALL, ..Default::default() };
+		serde_json::from_value::<crate::core::rule::RuleRequest>(v).unwrap().validate(&caps).unwrap()
+	}
+
+	/// `proxy_protocol` of a udp rule on a DPDK port's address is refused (#312), also on
+	/// an extra address; elsewhere, without it, or on tcp it is not this check's business.
+	#[test]
+	fn dpdk_refuses_proxy_protocol_on_its_addresses() {
+		let port: Ipv4Addr = "10.0.0.2".parse().unwrap();
+		let owns = |ip: Ipv4Addr| ip == port;
+		let udp = |listen: &str, extra: serde_json::Value, pp: bool| {
+			let mut v = serde_json::json!({"protocol": "udp", "listen_addr": listen, "listen_port": 53, "remote_addr": "10.9.0.1",
+				"remote_port": 53, "extra_listen_addrs": extra});
+			if pp {
+				v["proxy_protocol"] = serde_json::json!({"from": ["10.1.0.0/16"]});
+			}
+			rule(v)
+		};
+		let refused = proxy_protocol_refusal(&udp("10.0.0.2", serde_json::json!([]), true), owns).expect("refused");
+		assert_eq!(refused.code, "bind_failed");
+		assert!(refused.message.contains("proxy_protocol"), "{}", refused.message);
+		assert!(proxy_protocol_refusal(&udp("10.5.0.1", serde_json::json!(["10.0.0.2"]), true), owns).is_some(), "an extra address");
+		assert!(proxy_protocol_refusal(&udp("10.5.0.1", serde_json::json!([]), true), owns).is_none(), "the kernel path");
+		assert!(proxy_protocol_refusal(&udp("10.0.0.2", serde_json::json!([]), false), owns).is_none(), "without proxy_protocol");
+		let tcp = rule(serde_json::json!({"protocol": "tcp", "listen_addr": "10.0.0.2", "listen_port": 53, "remote_addr": "10.9.0.1",
+			"remote_port": 53, "proxy_protocol": {"from": ["10.1.0.0/16"]}}));
+		assert!(proxy_protocol_refusal(&tcp, owns).is_none(), "tcp is not served by DPDK");
+		// without a running DPDK data plane (as here) nothing is refused, and changes stay in place
+		assert!(proxy_protocol_refused(&udp("10.0.0.2", serde_json::json!([]), true)).is_none());
+		let (before, after) = (udp("10.0.0.2", serde_json::json!([]), false), udp("10.0.0.2", serde_json::json!([]), true));
+		assert!(crate::config::plan::in_place(&before, &after));
 	}
 }

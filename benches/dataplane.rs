@@ -154,10 +154,15 @@ async fn echo<S: tokio::io::AsyncRead + tokio::io::AsyncWrite>(s: S, data: &[u8]
 
 /// Sends `data` and waits for the answer, sending again if a datagram was lost.
 async fn udp_ask(sock: &UdpSocket, data: &[u8], back: &mut [u8]) {
+	udp_ask_for(sock, data, data.len(), back).await
+}
+
+/// `udp_ask` for an answer of `len` bytes (a PROXY header sent in front is not echoed).
+async fn udp_ask_for(sock: &UdpSocket, data: &[u8], len: usize, back: &mut [u8]) {
 	for _ in 0..20 {
 		sock.send(data).await.unwrap();
 		if let Ok(n) = tokio::time::timeout(Duration::from_millis(250), sock.recv(back)).await {
-			assert_eq!(n.unwrap(), data.len());
+			assert_eq!(n.unwrap(), len);
 			return;
 		}
 	}
@@ -226,6 +231,14 @@ fn l4_udp(c: &mut Criterion) {
 		create(&h, body).await;
 		(h, port)
 	});
+	// the same with `proxy_protocol` (#312): every datagram carries a PROXY v2 header from a front end in `from`
+	let pp_port = rt.block_on(async {
+		let port = free_udp_port();
+		let mut body = rule("udp", port, udp_echo().await);
+		body["proxy_protocol"] = json!({"from": ["127.0.0.1/32"]});
+		create(&h, body).await;
+		port
+	});
 	let mut g = c.benchmark_group("l4_udp");
 	let data = vec![0x5au8; DATAGRAM];
 	let mut back = vec![0u8; 65536];
@@ -242,6 +255,24 @@ fn l4_udp(c: &mut Criterion) {
 				let start = Instant::now();
 				for _ in 0..iters {
 					guard(&h, "l4_udp/roundtrip_1KiB", udp_ask(&sock, &data, &mut back)).await;
+				}
+				start.elapsed()
+			})
+		})
+	});
+
+	let (pp_sock, framed) = rt.block_on(async {
+		let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		sock.connect(("127.0.0.1", pp_port)).await.unwrap();
+		let header = rproxy_api::net::source::proxy_v2_dgram_header("192.0.2.7:4000".parse().unwrap(), sock.peer_addr().unwrap());
+		(sock, [header, data.clone()].concat())
+	});
+	g.bench_function("roundtrip_1KiB_proxy_protocol", |b| {
+		b.iter_custom(|iters| {
+			rt.block_on(async {
+				let start = Instant::now();
+				for _ in 0..iters {
+					guard(&h, "l4_udp/roundtrip_1KiB_proxy_protocol", udp_ask_for(&pp_sock, &framed, DATAGRAM, &mut back)).await;
 				}
 				start.elapsed()
 			})

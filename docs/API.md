@@ -144,7 +144,7 @@ tokens:
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
 | `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
 | `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS より前に切断する（`proxy_protocol` のルールでは、`from` の前段からの接続はヘッダを読んでから、ヘッダのクライアントで判定する）。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない）。断った数は `stats.denied`（UDP はデータグラムごと）、ログは `conn.denied`（`reason: allow_from`。UDP は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行。送信元を偽った大量のデータグラムに備えて、全体でも続けて 200 行、その後は 1 秒に 50 行まで。`suppressed` はその前に省いた行の数。v0.3.20 から。それより前の UDP は `debug` でだけ出ていた） |
-| `proxy_protocol` | object | | 前段（ロードバランサ・別の rproxy・Kubernetes の Gateway など）が付ける PROXY protocol v1 / v2 のヘッダを読み、そのクライアントのアドレスを使う（v0.4.13、#296、`features.proxy_protocol_in`）。`{"from": [<CIDR>, ...], "required"?: bool}`：`from`（必須、空にできない。最大 64 件、`/0` は `invalid`）はヘッダを信じる TCP の接続元、`required`（既定 `true`）は `from` からの接続がヘッダを付けてこなければ断る。`from` の外からヘッダで始まる接続は断る。`tcp` のルールだけ（`udp` は `unsupported`）。一覧では `required` も出す。PATCH で付けると置き換え（`{}` で外す、省けば今のまま）、次の接続から効く。下の「PROXY protocol を受け取る」 |
+| `proxy_protocol` | object | | 前段（ロードバランサ・別の rproxy・Kubernetes の Gateway など）が付ける PROXY protocol v1 / v2 のヘッダを読み、そのクライアントのアドレスを使う（v0.4.13、#296、`features.proxy_protocol_in`）。`{"from": [<CIDR>, ...], "required"?: bool}`：`from`（必須、空にできない。最大 64 件、`/0` は `invalid`）はヘッダを信じる TCP の接続元、`required`（既定 `true`）は `from` からの接続がヘッダを付けてこなければ断る。`from` の外からヘッダで始まる接続は断る。`udp` のルールでは v2 の DGRAM のヘッダをデータグラムごとに読んで外す（v0.4.16、#312、`features.proxy_protocol_in_udp`）。一覧では `required` も出す。PATCH で付けると置き換え（`{}` で外す、省けば今のまま）、次の接続（`udp` は次のデータグラム）から効く。下の「PROXY protocol を受け取る」 |
 | `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで判定）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`。UDP は `allow_from` と同じく間引く） |
 
 範囲ルールのキーは `listen_port`（範囲の先頭）。同じプロトコルで待ち受けアドレスとポートが重なるルールは作れない（`already_exists`）。
@@ -947,8 +947,29 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - 前段（ヘッダを送ってきた接続元）のアドレスとポートは、ログの `proxy_peer` に残す（ヘッダのない接続では省く）。
 - 断った接続は `stats.denied` に数え、`conn.denied` を `warn` で出す：`reason: proxy_protocol`（`from` の前段からのヘッダがない・壊れている・遅い。`client` は前段、`error` に理由）、`reason: proxy_protocol_untrusted`（`from` の外からのヘッダ。`version` に `v1` / `v2`）。
 - `required: false` のルールに、サーバから先に送るプロトコル（SMTP・MySQL など）でヘッダなしの接続が来ると、ヘッダを待つ 5 秒の後に通す。前段が必ずヘッダを付けるなら `required: true` のままにする。
-- HTTP/3（`http.http3`、UDP）にはヘッダがなく、QUIC の接続は接続元のアドレスで扱う。UDP の PROXY v2（データグラムごとのヘッダ）は後の段階（今は `udp` のルールに付けると `unsupported`）。
+- HTTP/3（`http.http3`、UDP）にはヘッダがなく、QUIC の接続は接続元のアドレスで扱う。`udp` のルールのデータグラムごとのヘッダは下の「`udp` のルール」。
 - PATCH で変えると次の接続から効く（接続は切らない）。組の PUT・設定ファイルの再読み込みでもその場で変わる（`change: in_place`）。
+
+#### `udp` のルール（v0.4.16、#312、`features.proxy_protocol_in_udp`）
+
+多段の構成（外側の rproxy → 内側の rproxy → 転送先）で、UDP でもクライアントのアドレスを最後まで保つ。外側の `source_ip: proxy_v2` はデータグラムごとに PROXY v2（DGRAM）のヘッダを前に付けて送る。内側の `udp` のルールの `proxy_protocol` がそれを読み、外してから転送先へ送る。
+
+```json
+{"protocol": "udp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "remote_addr": "10.0.0.43", "remote_port": 443, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.0/16"]}}
+```
+
+- `from`・`required` の意味は TCP と同じ。違うのは、ヘッダが接続の最初に 1 回ではなく、`from` の前段からのデータグラムの 1 つ 1 つの前に付くこと（rproxy 自身の `source_ip: proxy_v2` が送る形）。
+- 受け付けるのは v2 の DGRAM（UDP over IPv4 / IPv6）だけ。v1（UDP の形がない）、STREAM（TCP）のヘッダ、壊れたヘッダ、データグラムの中で終わらないヘッダは捨てる。大きさの上限は TCP と同じ（固定の 16 バイトの後が 4096 バイトまで）。v2 の `LOCAL`・`AF_UNSPEC` は前段のアドレスのまま。TLV は読み飛ばす。
+- `required: true`（既定）なら、`from` からのヘッダのないデータグラムは捨てる。`from` の外からヘッダ（v2 の署名か `PROXY `）で始まるデータグラムも捨てる。捨てた数は `stats.denied`、ログは `conn.denied`（`warn`、`reason: proxy_protocol` / `proxy_protocol_untrusted`、`client` は前段）。ログは送信元ごとに間引く（ほかの UDP の拒否と同じ。省いた数は次の行の `suppressed`）。
+- セッションは（前段のアドレス・ポート, ヘッダのクライアント）ごと（ワイルドカードの待ち受けでは受けたアドレスごとにも分かれる）。返事は、データグラムが来た前段のアドレス・ポートへ、ヘッダを付けずに返す（外側の rproxy はセッションごとのソケットで受けて、クライアントへ返す）。同じ前段のポートからのヘッダが別のクライアントを書いてきたら、別のセッションになる（前のセッションは `udp_idle_secs` で終わる）。
+- ヘッダのクライアントを使うところは TCP と同じ：`allow_from`・`geoip`・`crowdsec`・`limits`（送信元ごとのセッションとデータグラム）・`bandwidth`（送信元ごと）、ログの `client`（前段は `proxy_peer`）、転送先への `source_ip`（`proxy_v2` はヘッダのクライアントを書き、`transparent` はヘッダのクライアントを送信元にする）と `tls.routes[]` の `source_ip`（#297）。
+- `tls.mode: sni`（DTLS・QUIC）は、ヘッダを外してから名前を読む。同じソケットからの別の名前の新しい QUIC の接続でセッションを作り直すのも同じ。`tls.mode: terminate`（DTLS の終端）も、ヘッダを外したデータグラムで DTLS を話す。
+- `proxy_protocol` のないルールの道筋は変わらない（データグラムのまとまりごとに 1 回、値を読むだけ）。
+- DPDK の道（`global.performance.dpdk`）はヘッダを読まない：DPDK のポートのアドレスで待ち受ける `udp` のルールに `proxy_protocol` を付けると、どの道でも断る：作成は `bind_failed`、PATCH（`dry_run` も）は同じ誤り、組の PUT と設定ファイルの再読み込みはその場で変えずに作り直すので、そのルールは同じ誤りで `failed` になる。
+- `http` のルールの HTTP/3（quinn の UDP）は範囲の外で、今までどおりヘッダを読まない（QUIC の接続は接続元のアドレス）。
+- PATCH で付ける・外すと、次のデータグラムのまとまりから効く（ルールは止めない、`change: in_place`）。
 
 ### `tls.routes[]` の `source_ip`（v0.4.13、#297、`features.route_source_ip`）
 

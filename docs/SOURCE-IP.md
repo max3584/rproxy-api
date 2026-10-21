@@ -96,4 +96,32 @@ PROXY TCP4 203.0.113.9 198.51.100.10 51234 443\r\n
 - **`from` の外からの接続** はヘッダを読まずにふつうの接続として扱いますが、ヘッダで始まる接続は断ります（`conn.denied` の `reason: proxy_protocol_untrusted`）。前段のアドレスを `from` に書き漏らすとここで分かります。
 - ヘッダのクライアントは、`allow_from`・`geoip`・`crowdsec`・`limits`・`bandwidth`・ログの `client`・`X-Forwarded-For` / `X-Real-IP`・転送先への `source_ip` のすべてで使います。前段のアドレスはログの `proxy_peer` に残ります。
 - PROXY v2 で受けて PROXY v2 で送る（上の例）と、前段から転送先まで本当のクライアントの IP が届きます。v2 の TLV は読み飛ばし、転送先には rproxy 自身が見た TLS の情報を書きます。
-- 細かい動き（大きさの上限 v1 107 バイト・v2 4096 バイト、5 秒の時間の上限、HTTP/3・UDP は対象外など）は [API.md](API.md) の「PROXY protocol を受け取る」。
+- 細かい動き（大きさの上限 v1 107 バイト・v2 4096 バイト、5 秒の時間の上限、HTTP/3 は対象外など）は [API.md](API.md) の「PROXY protocol を受け取る」。
+
+### UDP の多段（v0.4.16）
+
+`udp` のルールでも同じ `proxy_protocol` を使えます。UDP には接続がないので、外側の rproxy の `source_ip: proxy_v2` は **データグラムの 1 つ 1 つ** の前にヘッダ（PROXY v2 の DGRAM）を付けて送り、内側の rproxy がそれを読んで外してから転送先へ送ります。
+
+```
+クライアント 203.0.113.9:51234
+   │ UDP
+   ▼
+外側の rproxy（10.2.0.5） udp :443 → 10.2.0.10:443、source_ip: proxy_v2
+   │ ヘッダ（203.0.113.9:51234）+ データグラム
+   ▼
+内側の rproxy（10.2.0.10） udp :443 → 10.0.0.43:443、proxy_protocol.from: 10.2.0.5、source_ip: proxy_v2
+   │ ヘッダ（203.0.113.9:51234）+ データグラム
+   ▼
+転送先 10.0.0.43:443（PROXY v2 を受ける設定）
+```
+
+```json
+{"protocol": "udp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "remote_addr": "10.0.0.43", "remote_port": 443, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.5/32"]}}
+```
+
+- 内側の返事はヘッダを付けずに外側のソケットへ返り、外側がクライアントへ返します。
+- 内側で `transparent` にすれば、ヘッダのクライアントを名乗って転送先へ送ります（PROXY protocol に対応していない転送先）。
+- `tls.mode: sni`（QUIC・DTLS）の内側のルールは、ヘッダを外してから名前を読みます。
+- 受け付けるのは v2 の DGRAM だけ（v1 や TCP の形のヘッダのデータグラムは捨てる）。`http` のルールの HTTP/3 と DPDK の道は対象外です。細かい動きは [API.md](API.md) の「`udp` のルール」。

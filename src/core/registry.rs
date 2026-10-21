@@ -806,7 +806,7 @@ impl Registry {
 			routes: RwLock::new(routes),
 			tls: RwLock::new(prepared.tls),
 			allow_from: RwLock::new(Arc::new(spec.allow_from.clone())),
-			proxy_protocol: RwLock::new(spec.proxy_protocol.clone().map(Arc::new)),
+			proxy_protocol: crate::net::proxy_in::Slot::new(spec.proxy_protocol.clone()),
 			crowdsec: spec.crowdsec.into(),
 			geoip: RwLock::new(spec.geoip.as_ref().map(|g| Arc::new(crate::net::geoip::Policy::new(g)))),
 			http: RwLock::new(prepared.http),
@@ -956,7 +956,7 @@ impl Registry {
 			spec.crowdsec = on;
 		}
 		if let Some(pp) = req.proxy_protocol {
-			spec.proxy_protocol = crate::net::proxy_in::validate(Some(pp), key.protocol)?;
+			spec.proxy_protocol = crate::net::proxy_in::validate(Some(pp))?;
 		}
 		if let Some(list) = &req.extra_listen_addrs {
 			spec.extra_listen = validate_extra_listen(key.listen.ip(), list)?;
@@ -1040,6 +1040,12 @@ impl Registry {
 		self.caps().features.check_v04(&spec)?;
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), &self.caps())?;
+		}
+		// a udp address forwarded by DPDK does not read PROXY headers (#312): refused as when it is created
+		// (rule set PUTs and reloads re-create such a rule instead, `config::plan::in_place`)
+		#[cfg(feature = "dpdk")]
+		if let Some(e) = crate::l4::dpdk::proxy_protocol_refused(&spec) {
+			return Err(e);
 		}
 		Ok((current, spec, tls_changed, http_changed))
 	}
@@ -1128,7 +1134,7 @@ impl Registry {
 					|| r.spec.health_check != spec.health_check;
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
-				*r.rt.proxy_protocol.write().unwrap_or_else(|e| e.into_inner()) = spec.proxy_protocol.clone().map(Arc::new);
+				r.rt.proxy_protocol.set(spec.proxy_protocol.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				r.rt.set_connect_timeout(spec.connect_timeout);
 				// from the next connection / read on; what the limits count is kept

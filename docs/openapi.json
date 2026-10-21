@@ -2106,6 +2106,10 @@
               "route_source_ip": {
                 "type": "boolean",
                 "description": "source_ip of tls.routes[] relayed at L4: passthrough routes of terminate, routes of sni (v0.4.13, #297)"
+              },
+              "proxy_protocol_in_udp": {
+                "type": "boolean",
+                "description": "proxy_protocol of a udp rule: a PROXY v2 (DGRAM) header in front of each datagram from trusted front ends (v0.4.16, #312)"
               }
             }
           },
@@ -2307,7 +2311,7 @@
       },
       "ProxyProtocolIn": {
         "type": "object",
-        "description": "PROXY protocol v1 / v2 headers read from the front ends in from (tcp rules; v0.4.13, features.proxy_protocol_in, #296). The client of the header is used for allow_from, geoip, crowdsec, limits, bandwidth, logs, X-Forwarded-For and source_ip. A peer outside from that starts with a header is refused. {} means none.",
+        "description": "PROXY protocol headers read from the front ends in from. tcp rules: v1 / v2 before the stream (v0.4.13, features.proxy_protocol_in, #296). udp rules: a v2 header of the DGRAM transport in front of each datagram, stripped before it goes on; replies go back to the front end's address and port without a header (v0.4.16, features.proxy_protocol_in_udp, #312). The client of the header is used for allow_from, geoip, crowdsec, limits, bandwidth, logs, X-Forwarded-For and source_ip. A peer outside from that starts with a header is refused (udp: the datagram is dropped). {} means none.",
         "additionalProperties": false,
         "properties": {
           "from": {

@@ -232,13 +232,27 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 
 | テスト | 確かめること |
 |---|---|
-| `the_shape_validation_and_capabilities` | `features.proxy_protocol_in`、一覧の形（`required` も出す）、PATCH での置き換え・そのまま・`{}` で外す、空の `from`・`from` なし・`/0`・壊れたアドレスは `invalid`、`udp` は `unsupported` |
+| `the_shape_validation_and_capabilities` | `features.proxy_protocol_in`、一覧の形（`required` も出す）、PATCH での置き換え・そのまま・`{}` で外す、空の `from`・`from` なし・`/0`・壊れたアドレスは `invalid`、`udp` でも作れる（#312） |
 | `allow_from_judges_the_client_in_the_header` | `allow_from` はヘッダのクライアントで判定する（v1・v2）。ヘッダは転送先に流れない |
 | `required_refuses_a_connection_without_a_header` | `required`（既定）ではヘッダのない接続を断り、`false` なら接続元のアドレスで通す。壊れたヘッダはどちらでも断る |
 | `a_header_from_outside_from_is_refused` | `from` の外からのヘッダ（v1・v2）は断り（`conn.denied` の `reason: proxy_protocol_untrusted`）、ヘッダのない接続はそのまま通す。TLS の `sni` のルールでは遅れて届くヘッダも待って見つける |
 | `proxy_v2_out_carries_the_client_of_the_header` | `source_ip: proxy_v2` はヘッダのクライアントを転送先に書く（v1 で受けて v2 で送る）。`conn.open` の `client` と `proxy_peer`。`LOCAL` は接続元のアドレス |
 | `per_source_limits_count_the_client_of_the_header` | 送信元ごとの `limits` はヘッダのクライアントごとに数える（同じ前段の後ろの別のクライアントは通る） |
 | `http_rules_forward_the_client_of_the_header` | `http` のルールの `X-Forwarded-For`・`X-Real-IP` と `http.access` の `client` がヘッダのクライアント、`proxy_peer` が前段 |
+
+## 結合テスト：UDP で PROXY protocol を受け取る（`tests/proxy_protocol_udp.rs`、#312）
+
+データグラムはすべて 127.0.0.1 から来るので、`from: ["127.0.0.1/32"]` で試験（か外側の rproxy のルール）が前段になる。変えた直後に 1 回だけ読まず、返事と数を待つ。
+
+| テスト | 確かめること |
+|---|---|
+| `the_shape_validation_and_patch_in_place` | `features.proxy_protocol_in_udp`。PATCH で付けると同じソケットの次のデータグラムからヘッダを読んで外し（ルールは `running` のまま）、`required` でヘッダのないものを捨て、`{}` で外すとヘッダはまたデータ。空の `from`・`from` なし・`/0`・壊れたアドレスは `invalid`（作成・PATCH） |
+| `two_hops_keep_the_client` | 外側の rproxy（`source_ip: proxy_v2`）→ 内側の rproxy（`proxy_protocol`・`source_ip: proxy_v2`）→ ヘッダを読む転送先：転送先は元のクライアントを見て、返事はヘッダなしで 2 段を通ってクライアントに届く。クライアントごとのセッション、内側の `conn.open` の `client` と `proxy_peer` |
+| `allow_from_required_and_bad_headers` | `allow_from` はヘッダのクライアントで判定、`required` でヘッダのないものを捨てる（`reason: proxy_protocol`）。`required: false` でもヘッダなしは通り、v1・STREAM・途中で切れたヘッダは捨てる（`stats.denied`） |
+| `a_header_from_outside_from_is_dropped` | `from` の外からのヘッダ（v1・v2）は捨て（`reason: proxy_protocol_untrusted`、`client` は前段）、ヘッダのないものは通す |
+| `per_source_limits_count_the_client_of_the_header` | 送信元ごとの `limits` はヘッダのクライアントで数える。同じ前段のソケットで別のクライアントのヘッダは別のセッション |
+| `sni_reads_the_name_past_the_header` | 外側の rproxy の後ろの `tls.mode: sni` のルールが、ヘッダを外して QUIC の名前を読む（本物の quinn）。同じソケットから別の名前の接続で作り直す。route の `source_ip: proxy_v2` はヘッダのクライアントと内側のアドレスを書く |
+| `dtls_is_terminated_past_the_header` | `tls.mode: terminate`（DTLS）のルールで、データグラムごとにヘッダを付けるクライアントとのハンドシェイクとデータが通り、返事にはヘッダがなく、転送先（`source_ip: proxy_v2`）と `conn.open` の `client` はヘッダのクライアント、`proxy_peer` は前段 |
 
 ## 結合テスト：route ごとの `source_ip`（`tests/route_source_ip.rs`、#297）
 
@@ -391,7 +405,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `starttls_survives_hostile_traffic` | smtp・imap・pop3 に、STARTTLS の前・代わりのゴミ、TLS の前に混ぜたコマンド（メールサーバに届かないこと） |
 | `udp_survives_hostile_traffic` | 平文・QUIC と DTLS の sni・DTLS の terminate に、でたらめな・大きすぎるデータグラム、多くの送信元ポートから、DTLS・QUIC のふりをしたゴミ、途中で切れた・壊れた・繰り返し送る QUIC の Initial と DTLS の ClientHello |
 
-受け取る PROXY protocol（#296）はここでは流さない（ヘッダの解析はファジングの `proxy_header_in`、動きは `tests/proxy_protocol.rs`）。
+受け取る PROXY protocol（#296・#312）はここでは流さない（ヘッダの解析はファジングの `proxy_header_in`、動きは `tests/proxy_protocol.rs`・`tests/proxy_protocol_udp.rs`）。
 
 ## 結合テスト：異常終了（`tests/crash.rs`）
 
@@ -533,8 +547,9 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `benches/parse.rs` の `matcher/*` | L7 の `match` の評価（7 本のルートを順に見て最後に一致するリクエスト 1 件）と、7 本の式の解析（正規表現を含む） |
 | `clienthello/*` | rustls が作る ClientHello（約 250 バイトと 3 KiB）からサーバ名を読む（`sni::parse_client_hello`） |
 | `quic_initial/v1` / `v2` | RFC 9001 / 9369 の Initial（`tests/fixtures/quic`）から鍵を計算し、ヘッダの保護と AEAD を外してサーバ名を読む（`udp_sni::Sniffer`） |
+| `proxy_dgram/v4` / `v6` / `untrusted_plain` | `udp` のルールの `proxy_protocol`（#312）でデータグラムごとにする判断（`proxy_in::datagram`：信じる前段か、v2 の DGRAM のヘッダの解析、外す位置。割り当てなし）。`untrusted_plain` は `from` の外のヘッダのないデータグラム |
 | `benches/dataplane.rs` の `l4_tcp/*` | TCP の転送の 1 MiB の往復（スループット）と、新しい接続（接続 → 1 バイトの往復 → 切断） |
-| `l4_udp/*` | UDP の 1 KiB の往復と、新しいセッション（毎回新しい送信元ポート） |
+| `l4_udp/*` | UDP の 1 KiB の往復と、新しいセッション（毎回新しい送信元ポート）。`roundtrip_1KiB_proxy_protocol` は同じ往復を `proxy_protocol` のルールに PROXY v2 のヘッダを付けて（#312） |
 | `tls_terminate/*` | TLS の終端の新しい接続（再開なしの完全なハンドシェイク）と、終端した接続での 1 MiB の往復 |
 | `l7_http1/request` / `l7_http2/*` | `http` のルール（ルート 4 本、`headers`・`strip_prefix` のミドルウェア）への HTTP/1.1 の keep-alive のリクエスト、HTTP/2（h2c）の 1 件ずつと 32 件同時 |
 
@@ -689,7 +704,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 | `udp_sni` | `tls::udp_sni` の `Sniffer`：DTLS の ClientHello の断片と QUIC v1 / v2 の Initial | データグラムごとに 16 ビットの長さを前に付ける |
 | `quic_initial` | 同じく QUIC。ファザーが選んだフレームを Initial の鍵で暗号化して渡す（AEAD の内側のフレームの解析と CRYPTO のつなぎ合わせまで届くように） | フラグ（v2）、DCID、（パケット番号、フレーム）の並び |
 | `proxy_header` | `net::source`：転送先へ書く PROXY protocol v1 / v2 のヘッダ。どんなアドレス・TLS の情報でも正しい形で、読み戻すと同じになることを確かめる | `arbitrary` |
-| `proxy_header_in` | `net::proxy_in::parse`：前段から受け取る PROXY ヘッダ（#296）。どんなバイト列でも panic せず、ヘッダは上限（v1 107・v2 16 + 4096 バイト）と入力より長くならず、ヘッダのバイトだけでも同じ答え、短い部分は続きを待ち、`classify` と食い違わず、読んだアドレスを rproxy が書き直して読み戻すと同じ | バイト列そのまま |
+| `proxy_header_in` | `net::proxy_in::parse`：前段から受け取る PROXY ヘッダ（#296）。どんなバイト列でも panic せず、ヘッダは上限（v1 107・v2 16 + 4096 バイト）と入力より長くならず、ヘッダのバイトだけでも同じ答え、短い部分は続きを待ち、`classify` と食い違わず、読んだアドレスを rproxy が書き直して読み戻すと同じ。同じバイト列を `udp` のデータグラムとして（#312、`parse_dgram`・`datagram`）：続きを待つことはなく、受け付けるのは v2 の DGRAM（と `LOCAL`・`UNSPEC`）だけ、ヘッダはデータグラムの中で終わり、rproxy の DGRAM のヘッダは読み戻すと同じ | バイト列そのまま |
 | `matcher` | `l7::matcher`：`match` の式の解析と評価 | 式、続けて 1 行ずつホスト・パス・クエリ・メソッド・ヘッダ・クライアントの IP |
 | `starttls` | `l4::starttls`：STARTTLS 前のクライアントとのやり取り、メールサーバの挨拶と EHLO の応答、平文での引き継ぎ | 先頭のバイト（プロトコル・STARTTLS 必須・1 回に読む量）、続けて相手が送るもの |
 | `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |

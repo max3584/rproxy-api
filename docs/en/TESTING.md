@@ -232,13 +232,27 @@ Every connection comes from 127.0.0.1, so `from: ["127.0.0.1/32"]` makes the tes
 
 | Test | What it checks |
 |---|---|
-| `the_shape_validation_and_capabilities` | `features.proxy_protocol_in`; the listed shape (with `required`); PATCH replaces, keeps when left out, `{}` removes; an empty or missing `from`, `/0` and a broken address are `invalid`; `udp` is `unsupported` |
+| `the_shape_validation_and_capabilities` | `features.proxy_protocol_in`; the listed shape (with `required`); PATCH replaces, keeps when left out, `{}` removes; an empty or missing `from`, `/0` and a broken address are `invalid`; `udp` can be created too (#312) |
 | `allow_from_judges_the_client_in_the_header` | `allow_from` judges the header's client (v1 and v2). The header does not reach the backend |
 | `required_refuses_a_connection_without_a_header` | With `required` (the default) a connection without a header is refused; with `false` it goes on with the peer's address. A broken header is refused either way |
 | `a_header_from_outside_from_is_refused` | Headers (v1, v2) from outside `from` are refused (`conn.denied` with `reason: proxy_protocol_untrusted`); connections without one go through. On a TLS `sni` rule a header arriving late is waited for and found |
 | `proxy_v2_out_carries_the_client_of_the_header` | `source_ip: proxy_v2` writes the header's client to the backend (v1 in, v2 out); `client` and `proxy_peer` of `conn.open`; `LOCAL` keeps the peer's address |
 | `per_source_limits_count_the_client_of_the_header` | Per-source `limits` count per client of the header (another client behind the same front end gets through) |
 | `http_rules_forward_the_client_of_the_header` | `X-Forwarded-For` / `X-Real-IP` of an `http` rule and `client` of `http.access` are the header's client, `proxy_peer` the front end |
+
+## Integration tests: receiving PROXY protocol over UDP (`tests/proxy_protocol_udp.rs`, #312)
+
+Every datagram comes from 127.0.0.1, so `from: ["127.0.0.1/32"]` makes the test (or an outer rproxy rule) the front end. Nothing is read once right after a change: replies and counters are waited for.
+
+| Test | What it checks |
+|---|---|
+| `the_shape_validation_and_patch_in_place` | `features.proxy_protocol_in_udp`. Added with PATCH, the same socket's next datagrams have their header read and stripped (the rule stays `running`), `required` drops datagrams without one, and after `{}` headers are data again. An empty or missing `from`, `/0` and a broken address are `invalid` (create and PATCH) |
+| `two_hops_keep_the_client` | Outer rproxy (`source_ip: proxy_v2`), inner rproxy (`proxy_protocol`, `source_ip: proxy_v2`), a backend that reads the header: the backend sees the original client, and replies reach the client through both hops without headers. A session per client; `client` and `proxy_peer` of the inner `conn.open` |
+| `allow_from_required_and_bad_headers` | `allow_from` judges the header's client; `required` drops datagrams without one (`reason: proxy_protocol`). With `required: false` those pass, while v1, STREAM and cut-short headers are dropped (`stats.denied`) |
+| `a_header_from_outside_from_is_dropped` | Headers (v1, v2) from outside `from` are dropped (`reason: proxy_protocol_untrusted`, `client` is the front end); datagrams without one pass |
+| `per_source_limits_count_the_client_of_the_header` | Per-source `limits` count the header's client; another client in the headers of the same front end socket is another session |
+| `sni_reads_the_name_past_the_header` | A `tls.mode: sni` rule behind an outer rproxy reads the QUIC server name past the header (real quinn), starts over for a connection to another name from the same socket, and a route's `source_ip: proxy_v2` writes the header's client and the inner rule's address |
+| `dtls_is_terminated_past_the_header` | On a `tls.mode: terminate` (DTLS) rule, the handshake and data go through with a client that puts a header in front of every datagram; replies carry none, and the backend (`source_ip: proxy_v2`) and `client` of `conn.open` see the header's client, `proxy_peer` the front end |
 
 ## Integration tests: `source_ip` per route (`tests/route_source_ip.rs`, #297)
 
@@ -391,7 +405,7 @@ Runs the real binary in its own process group with 16 hostile senders and 2 legi
 | `starttls_survives_hostile_traffic` | garbage before or instead of STARTTLS on smtp, imap and pop3, commands slipped in before TLS (they must not reach the mail server) |
 | `udp_survives_hostile_traffic` | random and oversized datagrams, many source ports, garbage posing as DTLS or QUIC, truncated, mutated and replayed QUIC Initials and DTLS ClientHellos, to plain, QUIC and DTLS sni and DTLS terminate rules |
 
-Received PROXY protocol (#296) is not sent here (the header parser is the fuzz target `proxy_header_in`, the behavior `tests/proxy_protocol.rs`).
+Received PROXY protocol (#296, #312) is not sent here (the header parser is the fuzz target `proxy_header_in`, the behavior `tests/proxy_protocol.rs` and `tests/proxy_protocol_udp.rs`).
 
 ## Integration tests: abnormal termination (`tests/crash.rs`)
 
@@ -533,8 +547,9 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 | `matcher/*` in `benches/parse.rs` | Evaluating L7 `match` expressions (one request checked against 7 routes in turn, matching the last), and parsing the 7 expressions (regexes included) |
 | `clienthello/*` | Reading the server name from a ClientHello made by rustls (about 250 bytes and 3 KiB; `sni::parse_client_hello`) |
 | `quic_initial/v1` / `v2` | Deriving the keys, removing header protection and AEAD, and reading the server name from the RFC 9001 / 9369 Initial packets (`tests/fixtures/quic`, `udp_sni::Sniffer`) |
+| `proxy_dgram/v4` / `v6` / `untrusted_plain` | What `proxy_protocol` of a `udp` rule (#312) decides for each datagram (`proxy_in::datagram`: trusted peer or not, parsing the v2 DGRAM header, the offset to strip; no allocation). `untrusted_plain` is a datagram without a header from outside `from` |
 | `l4_tcp/*` in `benches/dataplane.rs` | A 1 MiB round trip through TCP forwarding (throughput), and new connections (connect → 1-byte round trip → close) |
-| `l4_udp/*` | A 1 KiB UDP round trip, and new sessions (a new source port every time) |
+| `l4_udp/*` | A 1 KiB UDP round trip, and new sessions (a new source port every time). `roundtrip_1KiB_proxy_protocol` is the same round trip with a PROXY v2 header to a rule with `proxy_protocol` (#312) |
 | `tls_terminate/*` | New connections with TLS termination (full handshakes, no resumption), and a 1 MiB round trip on a terminated connection |
 | `l7_http1/request` / `l7_http2/*` | Requests to an `http` rule (4 routes, `headers` and `strip_prefix` middlewares): HTTP/1.1 keep-alive, HTTP/2 (h2c) one at a time and 32 at once |
 
@@ -689,7 +704,7 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `udp_sni` | The `Sniffer` of `tls::udp_sni`: DTLS ClientHello fragments and QUIC v1 / v2 Initial packets | Datagrams, each prefixed with a 16-bit length |
 | `quic_initial` | QUIC again, with frames chosen by the fuzzer encrypted with the Initial keys (so the frame parser behind the AEAD and the CRYPTO reassembly are reached) | Flags (v2), DCID, then (packet number, frames) packets |
 | `proxy_header` | `net::source`: the PROXY protocol v1 / v2 headers written towards backends. For any addresses and TLS details the header is well formed and reads back to the same values | `arbitrary` |
-| `proxy_header_in` | `net::proxy_in::parse`: PROXY headers received from front ends (#296). No panic on any bytes; a header is never longer than the limits (v1 107, v2 16 + 4096 bytes) or the input; the header's own bytes give the same answer and shorter prefixes ask for more; agreement with `classify`; the addresses read, written again by rproxy, read back the same | raw bytes |
+| `proxy_header_in` | `net::proxy_in::parse`: PROXY headers received from front ends (#296). No panic on any bytes; a header is never longer than the limits (v1 107, v2 16 + 4096 bytes) or the input; the header's own bytes give the same answer and shorter prefixes ask for more; agreement with `classify`; the addresses read, written again by rproxy, read back the same. The same bytes as a `udp` datagram (#312, `parse_dgram`, `datagram`): never asks for more, only v2 DGRAM (and `LOCAL`, `UNSPEC`) accepted, the header ends within the datagram, and rproxy's own DGRAM header reads back the same | raw bytes |
 | `matcher` | `l7::matcher`: parsing and evaluating `match` expressions | The expression, then one per line: host, path, query, method, header, client IP |
 | `starttls` | `l4::starttls`: the dialogue with the client before STARTTLS, the mail server's greeting and EHLO reply, the plain-text hand-over | A first byte (protocol, STARTTLS required, bytes per read), then what the peer sends |
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |

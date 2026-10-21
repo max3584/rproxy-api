@@ -135,9 +135,9 @@ pub struct Runtime {
 	pub routes: RwLock<Arc<Vec<RouteTarget>>>,
 	pub tls: RwLock<Arc<TlsRuntime>>,
 	pub allow_from: RwLock<Arc<Vec<Cidr>>>,
-	/// The rule's `proxy_protocol` (#296): whose PROXY headers are read; PATCH replaces
-	/// it for the next connection.
-	pub proxy_protocol: RwLock<crate::net::proxy_in::Shared>,
+	/// The rule's `proxy_protocol` (#296, udp #312): whose PROXY headers are read; PATCH
+	/// replaces it for the next connection (udp: the next batch of datagrams).
+	pub proxy_protocol: crate::net::proxy_in::Slot,
 	/// The rule's `crowdsec`: refuse clients blocked by the CrowdSec decisions.
 	pub crowdsec: std::sync::atomic::AtomicBool,
 	/// The rule's `geoip` (#168): country / ASN lists checked right after `allow_from`.
@@ -226,7 +226,7 @@ impl Runtime {
 
 	/// The rule's `proxy_protocol`, if it has one.
 	pub fn proxy_protocol(&self) -> crate::net::proxy_in::Shared {
-		self.proxy_protocol.read().unwrap_or_else(|e| e.into_inner()).clone()
+		self.proxy_protocol.get()
 	}
 
 	/// Whether `allow_from` lets this client in.
@@ -263,7 +263,8 @@ impl Runtime {
 			return;
 		}
 		match self.denied_log.check(&client.ip()) {
-			Some(suppressed) => tracing::info!(event = "conn.denied", rule = %self.key, client = %client, reason = "geoip", country, asn, sni = "", suppressed),
+			Some(suppressed) => tracing::info!(event = "conn.denied", rule = %self.key, client = %client, reason = "geoip", country, asn, sni = "", suppressed,
+				proxy_peer = crate::net::proxy_in::peer_field()),
 			None => tracing::debug!(event = "conn.denied", rule = %self.key, client = %client, reason = "geoip", country, asn, throttled = true),
 		}
 	}

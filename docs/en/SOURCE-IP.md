@@ -96,4 +96,32 @@ Everything above is about rproxy **sending** to the target. When there is a load
 - **Connections from outside `from`** are ordinary connections (no header is read), but one that starts with a header is refused (`conn.denied` with `reason: proxy_protocol_untrusted`); a front end missing from `from` shows up there.
 - The header's client is used by `allow_from`, `geoip`, `crowdsec`, `limits`, `bandwidth`, the logs' `client`, `X-Forwarded-For` / `X-Real-IP` and `source_ip` towards the target. The front end's address stays in the logs' `proxy_peer`.
 - PROXY v2 in and PROXY v2 out (the example) carries the real client's IP from the front end to the target. v2 TLVs are skipped; towards the target rproxy writes the TLS details it saw itself.
-- The details (size limits of 107 bytes for v1 and 4096 for v2, the 5 s time limit, HTTP/3 and UDP not covered) are in "Receiving PROXY protocol" in [API.md](API.md).
+- The details (size limits of 107 bytes for v1 and 4096 for v2, the 5 s time limit, HTTP/3 not covered) are in "Receiving PROXY protocol" in [API.md](API.md).
+
+### Multi-hop over UDP (v0.4.16)
+
+`udp` rules take the same `proxy_protocol`. UDP has no connection, so the outer rproxy's `source_ip: proxy_v2` puts a header (PROXY v2, DGRAM) in front of **every datagram**, and the inner rproxy reads and strips it before the datagram goes on to the target.
+
+```
+client 203.0.113.9:51234
+   │ UDP
+   ▼
+outer rproxy (10.2.0.5)  udp :443 → 10.2.0.10:443, source_ip: proxy_v2
+   │ header (203.0.113.9:51234) + datagram
+   ▼
+inner rproxy (10.2.0.10) udp :443 → 10.0.0.43:443, proxy_protocol.from: 10.2.0.5, source_ip: proxy_v2
+   │ header (203.0.113.9:51234) + datagram
+   ▼
+target 10.0.0.43:443 (set up to receive PROXY v2)
+```
+
+```json
+{"protocol": "udp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "remote_addr": "10.0.0.43", "remote_port": 443, "source_ip": "proxy_v2",
+ "proxy_protocol": {"from": ["10.2.0.5/32"]}}
+```
+
+- The inner rule's replies go back to the outer rule's socket without a header, and the outer rule answers the client.
+- With `transparent` on the inner rule, it sends to the target as the header's client (for targets without PROXY protocol).
+- An inner rule with `tls.mode: sni` (QUIC, DTLS) reads the server name after stripping the header.
+- Only v2 DGRAM headers are accepted (datagrams with v1 or TCP-form headers are dropped). HTTP/3 of `http` rules and the DPDK path are not covered. The details are in "`udp` rules" in [API.md](API.md).

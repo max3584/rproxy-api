@@ -223,7 +223,7 @@ rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かっ
 - 本当のクライアントを使うところ：`allow_from`・`geoip`・`crowdsec`・`limits`・`bandwidth`、ログの `client`、`X-Forwarded-For`・`X-Real-IP`（`global.trusted_proxies` の判定も）、転送先への `source_ip`（`proxy_v1` / `proxy_v2` / `transparent`）。前段はログの `proxy_peer`（L4 はタスクローカル `net::proxy_in::PROXY_PEER`、`http` は `Conn.proxy_peer`）。転送先へのヘッダの宛先は今までどおり rproxy が受けたアドレス。
 - 順序：`from` の前段からはヘッダを読んでから `allow_from` などを確かめる（それまでの「`allow_from` は PROXY ヘッダより前」は、`proxy_protocol` のないルールと `from` の外の接続でだけ成り立つ）。
 - PATCH でその場で変わる（次の接続から）。組の PUT・設定ファイルの再読み込みも `in_place`。引き継ぎ・保存：ルールの形に足すだけ。DB の `options` にも同じ形で書ける。
-- 対象外（後の段階）：UDP の PROXY v2（データグラムごとのヘッダ）。HTTP/3 の QUIC にはヘッダがない。
+- 対象外（後の段階）：UDP の PROXY v2（データグラムごとのヘッダ。v0.4.16 で入れた、12.）。HTTP/3 の QUIC にはヘッダがない。
 - 試験：単体（`net::proxy_in`：解析・上限・細切れ・時間切れ・検証）、`tests/proxy_protocol.rs`（`allow_from`・`limits`・`X-Forwarded-For` とアクセスログ・PROXY v2 で受けて PROXY v2 で送る・`LOCAL`・`required`・外からのヘッダ・形と PATCH）、ファジングの `proxy_header_in`。
 
 ## 10. `tls.routes[]` ごとの `source_ip`（v0.4.13、#297）
@@ -270,3 +270,23 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
   - 起動時は、ロックを取った直後から（復元の前に）ping を始める（`Store::spawn_keepalive`）。復元に `LIVE_IDLE`（15 秒）より長くかかっても、もう 1 つのプロセスからは生きて見える（前は ping が復元の後の `spawn_background` からで、2 つ目が起動していた）。引き継ぎの新しいプロセスは、古いプロセスが放すまでロックを取れないので、今までどおり復元の後から（早く始めると `DUPLICATE_AFTER` を早く数え始めてしまう）。
   - 判定（`Holder::liveness_since`）は、`PROCESSLIST.TIME` が文の始まりと終わりで数え直されることを使う。同じ状態のまま `TIME` が戻った・何もしていない状態から文が始まった：生きている（死んだクライアントは文を送れない）。「1 回目は文の途中、2 回目は何もしていない（`LIVE_IDLE` より短い）」は決められない（`Unsure`）：MySQL（文に時間の上限がない）で、落ちたホストの長い文が間に終わったときにこう見える（前は生きているとみなして断っていた）。
   - 決められないときは、断らずに `DUPLICATE_LOOK_AGAIN`（20 秒）待ってもう 1 回見る（`after_looks`）。その間に、生きているものは ping し、死んだものは何もしないか `wait_timeout` で切られてロックが空く。3 回目でも決められなければ断らずに `restore.wait` で起動を続ける：重なっても、後のプロセスはロックを取り上げず、書き込みが `persisted: false` と `persist.duplicate_node`（`DUPLICATE_AFTER`）になるので、警告にとどめる方を選んだ。断るまでの時間は最長で約 60 秒（決められないときだけ。ふだんは今までどおり約 40 秒）。
+
+## 12. UDP で PROXY protocol v2 を受け取る（v0.4.16、#312）
+
+多段の構成（外側の rproxy → 内側の rproxy → 転送先）で、UDP でもクライアントのアドレスを保つ。外側の `source_ip: proxy_v2` はもともとデータグラムごとに PROXY v2（DGRAM）のヘッダを付けて送れたが、内側が読めなかった。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| UDP の PROXY ヘッダを受け取る | `udp` のルールの `proxy_protocol`（形は 9. と同じ） | `proxy_protocol_in_udp` | なし（今までどおり、ヘッダは読まない） |
+
+- 形と意味は TCP と同じ（`from` は必須・空と `/0` は不可、`required` は既定 `true`）。新しい設定の項目はない。
+- 解析：`net::proxy_in::parse_dgram`。v2 の DGRAM（`0x12`・`0x22`）、`LOCAL`、`AF_UNSPEC`（と転送の種類の指定なし、AF_UNIX）だけを受け付け、v1・STREAM・データグラムの中で終わらないヘッダは誤り。上限は TCP の解析と同じ（`V2_MAX_PAYLOAD` 4096 バイト）。TCP の `parse` と同じ `parse_v2` を使い、違いは転送の種類の判定だけ。データグラム 1 つの判断（信じる前段か・ヘッダのクライアント・外す長さ・捨てる理由）は純粋な関数 `datagram` で、ファジングの `proxy_header_in` も通す。
+- どこで読むか：`l4::udp::serve` の、データグラムを受けたところ（`allow_from` より前）。前段からのデータグラムは、ヘッダを外した残り（受信のまとまりのバッファの中の位置をずらすだけ。写しは今までどおりセッションの列に入れる 1 回だけ）をセッションに渡す。DTLS・QUIC の名前の読み取り（`sniff`・`renamed`）も、DTLS の終端もヘッダのないデータグラムを見る。
+- セッションの鍵：`Peer { from, local, named }`（前段のアドレス・ポート、受けたアドレス、ヘッダのクライアント）。返事は `from`（前段のソケット）へ、ヘッダなしで返す。外側の rproxy はセッションごとに転送先へのソケットを持つので、内側では前段のポートがクライアントごとに分かれる。同じ前段のポートのヘッダのクライアントが変わったら別のセッション（前のものは `udp_idle_secs` で終わる。決めたこと：ヘッダを付け替える前段はふつうないので、作り直さずに分ける方を単純にした）。
+- 速さ：`proxy_protocol` のないルールは、データグラムのまとまりごとに relaxed load 1 回（`proxy_in::Slot`、`limits` と同じ形）で、データグラムごとの処理は変わらない。`Peer` の `Hash` はヘッダのクライアントがないとき、今までの（アドレス, 受けたアドレス）の組と同じものだけを混ぜる。ヘッダを読む道は、信じる前段の判定・解析・外す位置だけで割り当てなし（`benches/parse.rs` の `proxy_dgram`：手元で 1 データグラムあたり約 40〜45 ns。`benches/dataplane.rs` の `l4_udp/roundtrip_1KiB_proxy_protocol` は loopback の往復のばらつきの中で、ヘッダなしの `roundtrip_1KiB` と区別できない）。
+- 拒否：`stats.denied` と `conn.denied`（`warn`、`reason: proxy_protocol` / `proxy_protocol_untrusted`、`error`、外からのものは `version`）。UDP のほかの拒否と同じく `Runtime.denied_log` で前段ごとに間引く（送信元を偽れる UDP で、ログをあふれさせない）。
+- ヘッダのクライアントを使うところ：`allow_from`・`geoip`・`crowdsec`・`limits`（データグラムとセッション）・`bandwidth`、ログの `client`（前段は `proxy_peer`。データグラムの判定は `proxy_in::sync_with_peer`、セッションのタスクは `with_peer`）、`source_ip`（`proxy_v2` はヘッダのクライアントを書き、`transparent` はヘッダのクライアントで bind する）、route の `source_ip`（#297）。
+- DPDK の道（`Bound::Dpdk`、実験の機能 `dpdk`）：ヘッダを読まない。どの道でも断る（`dpdk::proxy_protocol_refused`）：作成と作り直しは `dpdk::claim` が `bind_failed`、PATCH（と dry run）は `Registry::updated_spec` が同じ誤り、組の PUT と設定ファイルの再読み込みは `config::plan::in_place` が偽になって作り直し（`claim` で `failed`）。その場で変えて DPDK の道がヘッダを付けたままのデータグラムを流すことはない（なお付いていれば、DPDK の道の新しいセッションは作らず、`conn.error` は送信元ごとに間引く）。読めるようにするのは、実機の確かめと一緒に後で。
+- 対象外：`http` のルールの HTTP/3（quinn の UDP）は今までどおりヘッダを読まない。
+- PATCH・組の PUT・再読み込みは `in_place`（次のデータグラムのまとまりから）。引き継ぎ・保存はルールの形のまま（UDP のセッションは引き継ぎで作り直し）。
+- 試験：単体（`net::proxy_in` の `parse_dgram`・`datagram`・`Slot`、`config::plan` の round trip と `in_place`、`l4::dpdk` の `dpdk_refuses_proxy_protocol_on_its_addresses`（機能 `dpdk`、CI の `dpdk.yml`））、`tests/proxy_protocol_udp.rs`（2 段の rproxy・`allow_from`・`required`・外からのヘッダ・壊れたヘッダ・送信元ごとの `limits`・QUIC の `sni` と route の `source_ip`・DTLS の終端・PATCH での付け外し・検証）、ファジングの `proxy_header_in`（DGRAM の seeds）、ベンチマーク。

@@ -268,7 +268,7 @@ Choose with `source_ip` per rule (`tls.routes[]` that are not terminated can als
 | `proxy_v1` / `proxy_v2` | Adds a PROXY protocol header at the start of the connection for TCP, and to each datagram for UDP (`proxy_v2` only) | The target supports PROXY protocol. For UDP, as with dnsdist, PowerDNS, and Unbound, the header is added to every datagram and not to responses |
 | `transparent` | Connects using the client's IP (`IP_TRANSPARENT` / `IPV6_TRANSPARENT`) | Linux, `CAP_NET_ADMIN`. IPv4 and IPv6. Return packets from the target must pass through the rproxy host ([docs/en/TRANSPARENT.md](docs/en/TRANSPARENT.md)) |
 
-When a load balancer or another proxy in front of rproxy sends PROXY protocol, the rule's `proxy_protocol` receives the header (v0.4.13, `tcp` rules). Only headers from the front ends in `from` are believed; `allow_from`, `limits`, the logs, `X-Forwarded-For`, `source_ip` above and the rest then work on the header's client. The front end's address is the logs' `proxy_peer`.
+When a load balancer or another proxy in front of rproxy sends PROXY protocol, the rule's `proxy_protocol` receives the header (v0.4.13, `tcp` rules; from v0.4.16 `udp` rules too: PROXY v2 per datagram). Only headers from the front ends in `from` are believed; `allow_from`, `limits`, the logs, `X-Forwarded-For`, `source_ip` above and the rest then work on the header's client. The front end's address is the logs' `proxy_peer`.
 
 ```json
 "proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19/32"], "required": true}

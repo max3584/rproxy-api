@@ -131,6 +131,20 @@ pub fn in_place(old: &RuleSpec, new: &RuleSpec) -> bool {
 		&& old.listen_freebind == new.listen_freebind
 		&& old.http.is_some() == new.http.is_some()
 		&& !(is_dual_stack_wildcard(&old.key) && old.v6only() != new.v6only())
+		&& dpdk_serves(new)
+}
+
+/// Whether the DPDK path can take `new` as it is (#312): a udp rule with `proxy_protocol`
+/// on a DPDK port's address is re-created instead, which refuses it (`bind_failed`) as
+/// when it is created, on every path (PATCH refuses it earlier, `Registry::updated_spec`).
+#[cfg(feature = "dpdk")]
+fn dpdk_serves(new: &RuleSpec) -> bool {
+	crate::l4::dpdk::proxy_protocol_refused(new).is_none()
+}
+
+#[cfg(not(feature = "dpdk"))]
+fn dpdk_serves(_: &RuleSpec) -> bool {
+	true
 }
 
 /// How replacing `old` (running or not) with `new` takes effect.
@@ -532,6 +546,10 @@ mod tests {
 				"remote_port": 443, "connect_timeout": "1500ms"}),
 			json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25, "remote_addr": "10.0.0.25", "remote_port": 25,
 				"proxy_protocol": {"from": ["10.2.0.0/16", "172.16.10.19"], "required": false}}),
+			// proxy_protocol on udp (#312)
+			json!({"protocol": "udp", "listen_addr": "0.0.0.0", "listen_port": 443, "remote_addr": "10.0.0.1", "remote_port": 443,
+				"source_ip": "proxy_v2", "tls": {"mode": "sni", "routes": [{"server_name": "q.example", "remote_addr": "10.0.0.2", "remote_port": 443}]},
+				"proxy_protocol": {"from": ["10.2.0.0/16"]}}),
 			// tls.routes[].source_ip (#297)
 			json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443, "remote_addr": "10.0.0.1", "remote_port": 443,
 				"source_ip": "proxy_v1", "tls": {"mode": "sni", "routes": [
@@ -576,8 +594,14 @@ mod tests {
 		assert_eq!(change_of(&a, true, &c), (Action::Update, Change::InPlace));
 		// proxy_protocol (#296) too
 		let mut d = a.clone();
-		d.proxy_protocol = crate::net::proxy_in::validate(Some(serde_json::from_value(json!({"from": ["10.0.0.1"]})).unwrap()), d.key.protocol).unwrap();
+		d.proxy_protocol = crate::net::proxy_in::validate(Some(serde_json::from_value(json!({"from": ["10.0.0.1"]})).unwrap())).unwrap();
 		assert_eq!(change_of(&a, true, &d), (Action::Update, Change::InPlace));
+		// and on udp (#312)
+		let u = spec(json!({"protocol": "udp", "listen_addr": "0.0.0.0", "listen_port": 53, "remote_addr": "a", "remote_port": 53}));
+		let mut w = u.clone();
+		w.proxy_protocol = d.proxy_protocol.clone();
+		assert_eq!(change_of(&u, true, &w), (Action::Update, Change::InPlace));
+		assert_eq!(change_of(&w, true, &u), (Action::Update, Change::InPlace));
 		// a route's own source_ip (#297) is read per connection: in place, unlike the rule's
 		let sni = |route_source: Value| {
 			spec(json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443, "remote_addr": "a", "remote_port": 1,
