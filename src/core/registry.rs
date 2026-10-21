@@ -957,13 +957,6 @@ impl Registry {
 		}
 		if let Some(pp) = req.proxy_protocol {
 			spec.proxy_protocol = crate::net::proxy_in::validate(Some(pp))?;
-			// a udp address forwarded by DPDK does not read PROXY headers (#312): refused as when it is created
-			#[cfg(feature = "dpdk")]
-			if spec.proxy_protocol.is_some() && key.protocol == Protocol::Udp {
-				if let Some(Err(e)) = spec.listen_ips().into_iter().find_map(|ip| crate::l4::dpdk::claim(&spec, ip).filter(|c| c.is_err())) {
-					return Err(e);
-				}
-			}
 		}
 		if let Some(list) = &req.extra_listen_addrs {
 			spec.extra_listen = validate_extra_listen(key.listen.ip(), list)?;
@@ -1047,6 +1040,12 @@ impl Registry {
 		self.caps().features.check_v04(&spec)?;
 		if spec.source_ip == SourceIp::Transparent {
 			check_transparent_families(&spec.extra_listen, &spec.members(), &self.caps())?;
+		}
+		// a udp address forwarded by DPDK does not read PROXY headers (#312): refused as when it is created
+		// (rule set PUTs and reloads re-create such a rule instead, `config::plan::in_place`)
+		#[cfg(feature = "dpdk")]
+		if let Some(e) = crate::l4::dpdk::proxy_protocol_refused(&spec) {
+			return Err(e);
 		}
 		Ok((current, spec, tls_changed, http_changed))
 	}

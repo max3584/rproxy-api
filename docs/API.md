@@ -967,7 +967,7 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - ヘッダのクライアントを使うところは TCP と同じ：`allow_from`・`geoip`・`crowdsec`・`limits`（送信元ごとのセッションとデータグラム）・`bandwidth`（送信元ごと）、ログの `client`（前段は `proxy_peer`）、転送先への `source_ip`（`proxy_v2` はヘッダのクライアントを書き、`transparent` はヘッダのクライアントを送信元にする）と `tls.routes[]` の `source_ip`（#297）。
 - `tls.mode: sni`（DTLS・QUIC）は、ヘッダを外してから名前を読む。同じソケットからの別の名前の新しい QUIC の接続でセッションを作り直すのも同じ。`tls.mode: terminate`（DTLS の終端）も、ヘッダを外したデータグラムで DTLS を話す。
 - `proxy_protocol` のないルールの道筋は変わらない（データグラムのまとまりごとに 1 回、値を読むだけ）。
-- DPDK の道（`global.performance.dpdk`）はヘッダを読まない：DPDK のポートのアドレスで待ち受ける `udp` のルールに `proxy_protocol` を付けると、作成は `bind_failed`、PATCH は同じ誤りで断る。
+- DPDK の道（`global.performance.dpdk`）はヘッダを読まない：DPDK のポートのアドレスで待ち受ける `udp` のルールに `proxy_protocol` を付けると、どの道でも断る：作成は `bind_failed`、PATCH（`dry_run` も）は同じ誤り、組の PUT と設定ファイルの再読み込みはその場で変えずに作り直すので、そのルールは同じ誤りで `failed` になる。
 - `http` のルールの HTTP/3（quinn の UDP）は範囲の外で、今までどおりヘッダを読まない（QUIC の接続は接続元のアドレス）。
 - PATCH で付ける・外すと、次のデータグラムのまとまりから効く（ルールは止めない、`change: in_place`）。
 

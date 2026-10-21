@@ -968,7 +968,7 @@ In a multi-hop setup (outer rproxy, inner rproxy, backend) the client's address 
 - The header's client is used where TCP uses it: `allow_from`, `geoip`, `crowdsec`, `limits` (sessions and datagrams per source), `bandwidth` (per source), the logs' `client` (the front end is `proxy_peer`), `source_ip` towards the backend (`proxy_v2` writes the header's client, `transparent` uses it as the source) and `source_ip` of `tls.routes[]` (#297).
 - `tls.mode: sni` (DTLS, QUIC) reads the server name after the header is stripped, and starting a session over for a new QUIC connection to another name from the same socket works the same. `tls.mode: terminate` (DTLS) speaks DTLS on the datagrams without the header.
 - Rules without `proxy_protocol` take the same path as before (the setting is read once per batch of datagrams).
-- The DPDK path (`global.performance.dpdk`) does not read headers: a `udp` rule with `proxy_protocol` listening on a DPDK port's address is refused with `bind_failed` when created, and a PATCH adding it with the same error.
+- The DPDK path (`global.performance.dpdk`) does not read headers: a `udp` rule with `proxy_protocol` listening on a DPDK port's address is refused on every path: creating it is `bind_failed`, a PATCH (also with `dry_run`) gets the same error, and rule set PUTs and settings file reloads re-create the rule instead of changing it in place, so it becomes `failed` with the same error.
 - HTTP/3 of `http` rules (quinn's UDP) is out of scope and reads no header, as before (QUIC connections use the peer's address).
 - Adding or removing it with PATCH takes effect from the next batch of datagrams (the rule keeps running, `change: in_place`).
 

@@ -131,6 +131,20 @@ pub fn in_place(old: &RuleSpec, new: &RuleSpec) -> bool {
 		&& old.listen_freebind == new.listen_freebind
 		&& old.http.is_some() == new.http.is_some()
 		&& !(is_dual_stack_wildcard(&old.key) && old.v6only() != new.v6only())
+		&& dpdk_serves(new)
+}
+
+/// Whether the DPDK path can take `new` as it is (#312): a udp rule with `proxy_protocol`
+/// on a DPDK port's address is re-created instead, which refuses it (`bind_failed`) as
+/// when it is created, on every path (PATCH refuses it earlier, `Registry::updated_spec`).
+#[cfg(feature = "dpdk")]
+fn dpdk_serves(new: &RuleSpec) -> bool {
+	crate::l4::dpdk::proxy_protocol_refused(new).is_none()
+}
+
+#[cfg(not(feature = "dpdk"))]
+fn dpdk_serves(_: &RuleSpec) -> bool {
+	true
 }
 
 /// How replacing `old` (running or not) with `new` takes effect.
