@@ -51,7 +51,10 @@
               "shutting_down",
               "tls_required",
               "in_use",
-              "cert_store_unavailable"
+              "cert_store_unavailable",
+              "protected_file",
+              "file_not_allowed",
+              "secret_reuse"
             ]
           }
         },
@@ -2110,6 +2113,10 @@
               "proxy_protocol_in_udp": {
                 "type": "boolean",
                 "description": "proxy_protocol of a udp rule: a PROXY v2 (DGRAM) header in front of each datagram from trusted front ends (v0.4.16, #312)"
+              },
+              "protected_files": {
+                "type": "boolean",
+                "description": "Rules from the API may not name files of the certificate store, the ACME storage or the settings' secrets (403 protected_file); allow_certs tokens name no file (403 file_not_allowed); an OIDC client secret file keeps to one use (409 secret_reuse) (v0.4.17, #319)"
               }
             }
           },
@@ -3436,7 +3443,10 @@
               "precondition_failed",
               "stale_generation",
               "locked_out",
-              "shutting_down"
+              "shutting_down",
+              "protected_file",
+              "file_not_allowed",
+              "secret_reuse"
             ]
           },
           "errors": {

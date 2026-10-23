@@ -77,6 +77,7 @@ pub async fn put(
 			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })?;
 	}
 	principal.may_use_ruleset(&name)?;
+	super::rule_files::check_ruleset(&state.registry, &principal, &name, &req.rules).await?;
 	let if_match = if_match(&headers)?.map(str::to_owned);
 	// a change runs to its end even if the client goes away (#144)
 	super::api::to_the_end(async move {

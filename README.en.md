@@ -218,7 +218,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/
 ```
 
 - Errors: reasons are reported per file and per rule (such as `rproxy.yaml rule #2`). It does not stop at the first one; all are reported
-- Warnings: certificates close to expiry (`RPROXY_CERT_WARN_DAYS`), settings that cannot run with this version or these permissions (they become `failed` at startup), files the `rproxy` user may not be able to read (judged from owner and mode)
+- Warnings: certificates close to expiry (`RPROXY_CERT_WARN_DAYS`), settings that cannot run with this version or these permissions (they become `failed` at startup), files the `rproxy` user may not be able to read (judged from owner and mode), files a rule from the API could not name (the certificate store, the ACME storage, secret files, a reused OIDC client secret; v0.4.17, "Files rules from the API may name" in docs/en/API.md)
 - JSON: `{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - No name resolution is done (whether target names resolve is found out at startup)
 - If no configuration file is specified, there is nothing to check, so it exits 0

@@ -6,6 +6,7 @@ pub mod files;
 pub mod geoip;
 pub mod listen;
 pub mod offload;
+pub mod protected;
 pub mod proxy_in;
 pub mod source;
 pub mod udpsock;

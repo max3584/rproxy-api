@@ -258,6 +258,75 @@ async fn the_api_guards_acme() {
 	let _ = fs::remove_dir_all(&dir);
 }
 
+/// #319: rules from the API may not name files of the ACME storage nor the ACME
+/// secrets, with or without acme:write (`{"acme": ...}` is the way to its certificates).
+#[tokio::test]
+async fn rules_may_not_name_acme_files() {
+	let dir = workdir("files");
+	let tokens_file = dir.join("tokens.yaml");
+	fs::write(
+		&tokens_file,
+		format!(
+			"tokens:\n  - {{name: plain, sha256: {}, scopes: [rules:read, rules:write]}}\n  - {{name: acme, sha256: {}, scopes: [rules:read, rules:write, acme:write]}}\n",
+			hex("plain-token"),
+			hex("acme-token")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(tokens_file).unwrap()).await;
+	let yaml = acme_settings(&dir, "https://127.0.0.1:1/directory", "");
+	let global: rproxy_api::acme::config::AcmeGlobal = rproxy_api::config::from_yaml(&yaml).unwrap();
+	let acme = rproxy_api::acme::Acme::new(&global).unwrap();
+	h.registry.set_acme(acme.clone());
+	let certs = dir.join("acme/certs");
+	fs::create_dir_all(&certs).unwrap();
+	fs::write(certs.join("www.crt"), "c").unwrap();
+	fs::write(certs.join("www.key"), "k").unwrap();
+	fs::write(dir.join("users"), "alice:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n").unwrap();
+
+	let post = |token: &'static str, body: Value| {
+		let (http, base) = (h.http.clone(), h.base.clone());
+		async move {
+			let r = http.post(format!("{base}/rules")).bearer_auth(token).json(&body).send().await.unwrap();
+			let status = r.status();
+			(status, r.json::<Value>().await.unwrap_or(Value::Null))
+		}
+	};
+	let backend = tcp_backend("b:").await;
+	let with_files = |cert: String, key: String| {
+		let mut r = rule("tcp", free_port(), backend);
+		r["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]});
+		r
+	};
+	let users = |file: String| {
+		json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+			"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["auth"]}],
+			"middlewares": {"auth": {"basic_auth": {"users_file": file}}}}})
+	};
+	let oidc = |secret: String| {
+		json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+			"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["sso"]}],
+			"middlewares": {"sso": {"oidc": {"issuer": "https://idp.evil.example", "client_id": "x",
+				"client_secret_file": secret, "cookie_secret_file": dir.join("users")}}}}})
+	};
+	let p = |f: PathBuf| f.to_string_lossy().into_owned();
+	for (token, body, want) in [
+		("plain-token", with_files(p(certs.join("www.crt")), p(certs.join("www.key"))), "ACME storage"),
+		("acme-token", with_files(p(certs.join("www.crt")), p(certs.join("www.key"))), "ACME storage"),
+		("acme-token", users(p(dir.join("pdns.key"))), "global.acme"),
+		("acme-token", oidc(p(dir.join("relay.token"))), "global.acme"),
+	] {
+		let (status, v) = post(token, body).await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("protected_file")), "{want}: {v}");
+		assert!(v["error"].as_str().unwrap().contains(want), "{v}");
+		assert!(!v["error"].as_str().unwrap().contains(PDNS_KEY) && !v["error"].as_str().unwrap().contains(RELAY_SECRET), "{v}");
+	}
+	// a file of its own is fine
+	let (status, v) = post("plain-token", users(p(dir.join("users")))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let _ = fs::remove_dir_all(&dir);
+}
+
 /// The helper refuses peers it does not know, names outside the allowlist,
 /// values that are not DNS-01 values, and records it would not write there.
 #[tokio::test]

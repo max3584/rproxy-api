@@ -331,6 +331,7 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `bad_certificates_and_names_are_refused` | Unreadable PEM, a mismatching key, expired, no key, unknown fields and bad names are `400 invalid` (no key in the answer); a body above 1 MiB is 413; expiring soon gives `warnings`. A rule naming a certificate that is not stored is `400 tls_config`; `cert` with `cert_file` is a mistake |
 | `a_failed_rule_starts_once_its_certificate_is_stored` | A settings-file rule naming a certificate not stored is `failed`, and starts once the name is `PUT` |
 | `scopes_and_allow_certs` | The `certs:read` / `certs:write` scopes; names outside `allow_certs` are 403 for `PUT` and in rules; `GET /certs` lists only names within `allow_certs` |
+| `rule_files_may_not_reach_the_store` | #319: a rule from the API naming a file under the store (itself, through a symbolic link, through `..`, a name stored later) gets `403 protected_file` (dry runs, PATCH, a rule set PUT, a service's `ca_file` too), and the token file the same. Other places are fine. An `allow_certs` token names no file: `403 file_not_allowed` (`{"cert"}` is fine). A settings file rule runs with the store's files. `features.protected_files` |
 
 ## Integration tests: storing rule sets (`tests/ruleset_persist.rs`, #241, v0.4.2)
 
@@ -502,7 +503,7 @@ Test files not covered by the sections above (see the description at the top of 
 
 | File | What it checks |
 |---|---|
-| `tests/check_config.rs` | `rproxy-api --check-config` (#140; a key readable by others is an error, fine with `global.files.owner_check: off`): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON |
+| `tests/check_config.rs` | `rproxy-api --check-config` (#140; a key readable by others is an error, fine with `global.files.owner_check: off`): validates the settings file the way startup and reloads do, opens nothing, reports through its exit code, text and JSON. Files the API would refuse (#319) are warnings (`files_the_api_may_not_name_are_warnings`) |
 | `tests/startup.rs` | Starting the real binary: configuration mistakes stop it; problems in the environment (permissions, a busy port) leave it running in a restricted mode that recovers. TLS on the control API, reloads on SIGHUP, `GET /readyz` |
 | `tests/targets.rs` | Several destinations (#98): `targets`, `balance` (round_robin / least_conn / failover), `backup`, `health_check` (L4 and services of `http` rules). The default behaviour without `outlier_detection`. `connect_timeout` (v0.4.3; a target that drops SYNs) |
 | `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99); listening on addresses not on the host yet (`listen_freebind`, v0.4.3; the real path is `scripts/test-freebind.sh`) |
@@ -511,13 +512,13 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends |
 | `tests/http.rs` | L7 routing of `http` rules |
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
-| `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc` |
+| `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc`. Reusing an OIDC client secret file is `409 secret_reuse` (#319, `oidc_client_secrets_keep_to_one_use`) |
 | `tests/http_resilience.rs` | Health checks, `sticky`, `compress`, `buffering`, `retry`, `circuit_breaker`, `errors` and kept backend connections (#61, #63, #64, #65) |
 | `tests/http_semantics.rs` | The HTTP forwarding contract ("HTTP forwarding semantics" in docs/en/API.md): 504 when an HTTP/2 backend's streams are taken, and more connections (security review M6); client certificate headers dropped on an HTTPS rule without `client_auth` over HTTP/1.1, HTTP/2 and HTTP/3 (security review H1); cookies, repeated fields, hop-by-hop headers, bodies, large headers and timeouts with HTTP/1.1, HTTP/2 and HTTP/3 clients. HTTP/2 backends (#233): one multiplexed h2c connection, trailers both ways (including a gRPC trailers-only answer), `te: trailers`, h2 (TLS + ALPN) and `auto` (with backends picking `h2` or `http/1.1`), 502 when the backend does not pick `h2`, `protocol` against the URL scheme |
 | `tests/gateway_l7.rs` | L7 for the Gateway API (#224, #226-#232, #235): `add` of `headers`, redirect `status`, route `timeouts` (504, per attempt, cutting a body off), `replace_host`, per-server middlewares, `cors` (preflights, wildcard origins), `status` of `retry`, `mirror` (share, bodies, an unreachable mirror), `status` servers, `features`. Preflights from origins not allowed answered by rproxy, `retry` again with one server, `X-Client-Verify` and `X-Forwarded-Client-Cert` of client certificates (`optional_no_verify`, forged headers removed) (#238). Certificate headers cannot be forged on plain rules without `client_auth`, Upgrades, `forward_auth` or `mirror`, and the X-Forwarded-For of `mirror` copies (security review H1, M5) |
 | `tests/backend_tls.rs` | A service's `tls` (#236): its CA and SNI name, `subject_alt_names` (DNS names and URIs), a client certificate towards the backend, `https://` backends from a plain-HTTP rule, mistakes in shape and files |
-| `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec) |
-| `tests/acme.rs` | ACME (#208): the API's guards (always run) and obtaining real certificates with Pebble and PowerDNS (table above) |
+| `tests/crowdsec.rs` | The `crowdsec` middleware (a fake LAPI and AppSec). Rules from the API may not name the key file (#319, `rules_may_not_name_the_key_file`) |
+| `tests/acme.rs` | ACME (#208): the API's guards (always run; the storage and secret files of #319 in `rules_may_not_name_acme_files`) and obtaining real certificates with Pebble and PowerDNS (table above) |
 | `tests/traefik_convert.rs` | The Traefik converter (`crates/rproxy-traefik`): rproxy reads and accepts the output of every case (`cases`) in `tests/fixtures/traefik/`; some are checked in detail. The middlewares the converter knows (`KNOWN_MIDDLEWARES`) are in `Features::CURRENT` |
 | The tests of `crates/rproxy-traefik` (`cargo test -p rproxy-traefik`) | The output is byte for byte `tests/fixtures/traefik/*/expected*` (written by the Python version, `contrib/traefik2rproxy.py`; how to add one: `tests/fixtures/traefik/README.md`), exit codes and `-o`, unit tests of the YAML writer (as PyYAML writes), rules, middlewares and durations. It reads local files the administrator gives it, so there is no fuzz target (nothing read from the Internet) |
 

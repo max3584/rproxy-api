@@ -62,7 +62,8 @@ DPDK のデータプレーン（`global.performance.dpdk`、#261。`--features d
 - 満たさなければ API は `400 tls_config` / `invalid`（理由つき）、設定ファイルは設定の誤り（起動・再読み込みで止まる）。`--check-config` は、サービスのユーザーで動かせば誤り、ほかのユーザー（root）で動かせば rproxy-api について確かめた警告。確かめるのは開いたファイル（fstat）なので、確かめたものを読む。
 - certbot などが root のファイルを作るなら、deploy hook で rproxy-api のものに写す（例：`install -o rproxy-api -g rproxy -m 0640 privkey.pem /etc/rproxy/tls/a.key`）。どうしても root のファイルをそのまま使うなら `global.files.owner_check: off`（`rules:write` のトークンを持つ人が、rproxy の読めるどのファイルでも証明書・鍵として使えるようになる。起動時に `degraded` を出す）。
 - 信頼するディレクトリ（`global.files.trusted_dirs`、なければ環境変数 `RPROXY_FILES_TRUSTED_DIRS`。`:` か `,` 区切りの絶対パス、既定はなし）：開いたファイルの本当のパス（シンボリックリンクをすべてたどった先。`..` で外へは出られない）がその下にあれば、root のものも使う。Kubernetes の Secret のボリューム（root の持ち物、グループは fsGroup、0440、root の `..data` のリンク）のためで、rproxy-gateway は `RPROXY_FILES_TRUSTED_DIRS=/var/run/rproxy-gateway/certs` を渡す。ほかの確かめ（グループ・ほかの人が書けない、鍵はほかの人が読めない（0440 は通る）、リンクは rproxy か root のもの）はそのまま。root 以外のユーザーのファイルは、その下でも使わない。起動時に `files.trusted_dirs` のログに出す。`--check-config` も同じものを使う。そのディレクトリに root が置いたファイルは `rules:write` のトークンから鍵として使えるので、ほかの用途のファイルを置かない。
-- 制御 API の証明書・トークンのファイル（`RPROXY_TLS_*`、`RPROXY_TOKEN_FILE`）・GeoIP のデータベースは対象外（ルールからは指せない）。
+- 制御 API の証明書・トークンのファイル（`RPROXY_TLS_*`、`RPROXY_TOKEN_FILE`）・GeoIP のデータベースは対象外（rproxy 自身が読むもので、この確かめを通さない）。
+- 所有者の確かめに加えて、API のルール（v0.4.17、#319）は証明書のストア（`RPROXY_CERT_STORE`）・ACME の保存先の下と、設定・オプションの秘密のファイル（CrowdSec・ACME の秘密、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_KEY`）を指せない（`403 protected_file`）。`allow_certs` のあるトークンはファイルを指せない（`403 file_not_allowed`）。OIDC の client secret のファイルはほかの用途に使えない（`409 secret_reuse`）。設定ファイルのルールは今までどおりで、`--check-config` が警告する。詳しくは docs/API.md の「API のルールが指せるファイル」。
 
 ### ルールの宛先
 

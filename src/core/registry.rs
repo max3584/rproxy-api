@@ -1227,6 +1227,19 @@ impl Registry {
 	}
 
 	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
+	/// The files every rule names (#319), with its key and rule set.
+	pub async fn file_refs(&self) -> Vec<(Key, Option<String>, Vec<crate::net::protected::FileRef>)> {
+		let rules = self.rules.lock().await;
+		rules
+			.values()
+			.map(|e| {
+				let spec = e.spec();
+				(spec.key, spec.ruleset.clone(), crate::net::protected::refs(Some(&spec.tls), spec.http.as_ref()))
+			})
+			.filter(|(_, _, refs)| !refs.is_empty())
+			.collect()
+	}
+
 	pub async fn rules_using_cert(&self, name: &str) -> Vec<String> {
 		let mut keys: Vec<String> = self
 			.rules

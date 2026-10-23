@@ -993,6 +993,19 @@ Passes the client's address to the backend differently per name on one port. For
 - The header is the same as with the rule's `source_ip`: the source is the client (on connections received with `proxy_protocol`, the header's client), the destination the address rproxy received the connection on. Nothing is terminated, so PROXY v2 carries no TLS TLVs.
 - PATCH (sending `tls`), rule set PUTs and settings file reloads change it without closing connections (`change: in_place`, from the next connection). The rule's `source_ip` still cannot be changed (re-create the rule).
 
+### Files rules from the API may name (v0.4.17, #319, `features.protected_files`)
+
+The file fields of a rule (every `*_file` of `tls` and `http`: certificates, keys, chains and CAs (`client_auth`, `upstream`, `routes[].upstream`, a service's `tls`), `basic_auth.users_file`, `oidc.client_secret_file` / `cookie_secret_file` / `ca_file`) are limited as follows when they come from the API (`POST` / `PATCH /rules`, `PUT /rulesets/{name}`, dry runs too), so that a `rules:write` token cannot terminate TLS with a stored or ACME key, nor have a secret sent to an issuer of its own.
+
+- Nothing under the certificate store (`RPROXY_CERT_STORE`) or the ACME storage (`global.acme.storage`), and none of the secrets of the settings and the options (`global.crowdsec.api_key_file`; in `global.acme` the DNS providers' `api_key_file`, `secret_file`, `tsig_secret_file`, `credentials_file`, EAB `hmac_key_file` and the accounts' `key_file`; `RPROXY_TOKEN_FILE`; `RPROXY_TLS_KEY`): `403 protected_file`, whatever the token's scopes (`acme:write`, `admin`). Stored certificates are used with `{"cert": "<name>"}`, ACME ones with `{"acme": ...}` (`acme:write`).
+  - A path is judged where it really leads: the file is opened (without reading, `O_PATH`) and the real path (`/proc/self/fd`) and inode of the fd are compared, so symbolic links and `..` do not get around it (a hard link to a secret file is found by its inode). A path that does not exist yet (a certificate stored later) is followed up to the parent that exists.
+  - For secret files, the file itself only (the other files of its directory may be named: the default `/etc/rproxy` holds the token file next to rules' files).
+- A token with `allow_certs` (limited to some stored certificates) may not name files in rules: `403 file_not_allowed`. Its certificates are the `{"cert": "<name>"}` within `allow_certs`.
+- An OIDC client secret file (rproxy sends it to the issuer) may be used only as the client secret of the same `issuer` (without a trailing `/`) and `client_id`. When it is also, in any rule (settings file, API, rule sets), a cookie secret, the client secret of another issuer or client, a `users_file`, a key, ...: `409 secret_reuse` (one client in several rules is fine).
+- Rules of the settings file (`origin: static`) work as before (they are the host administrator's). `--check-config` warns about the same things (`... is under the certificate store ...; allowed in the settings file, but the same rule from the API is refused (403 protected_file)`, `409 secret_reuse`).
+- Rules created through the API by an earlier version (including those restored from the database or stored rule sets) keep running; the checks apply when they are changed next.
+- The `oidc` session cookie is bound to the `issuer` and `client_id` besides the cookie name (AES-256-GCM associated data): a cookie of another `oidc` middleware with the same cookie secret does not pass. After upgrading to this version, current sessions sign in again once.
+
 ## Endpoints
 
 | Method and path | Body | On success | Description |
@@ -1058,6 +1071,9 @@ On failure, responses take the following shape.
 | `tls_required` | 403 | v0.4.2: a `PUT /certs` (with a key) over plain TCP from elsewhere than loopback |
 | `in_use` | 409 | v0.4.2: rules use the stored certificate (`used_by`) |
 | `cert_store_unavailable` | 503 | v0.4.2: the certificate store cannot be written |
+| `protected_file` | 403 | v0.4.17 (#319): a rule from the API names a file under the certificate store or the ACME storage, or a secret file of the settings or the options |
+| `file_not_allowed` | 403 | v0.4.17 (#319): a token with `allow_certs` named a file in a rule |
+| `secret_reuse` | 409 | v0.4.17 (#319): an OIDC client secret file is used for something else than the client secret of the same issuer and client |
 | `internal` | 500 | Other |
 
 ## Relationship between the API, config file and UI (DB)

@@ -218,7 +218,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/
 ```
 
 - 誤り：ファイル・ルール（`rproxy.yaml rule #2` など）ごとに理由を出す。最初の 1 つで止めず、すべて出す
-- 警告：期限が近い証明書（`RPROXY_CERT_WARN_DAYS`）、この版や権限で動かせない設定（起動すると `failed` になる）、`rproxy` のユーザーが読めないかもしれないファイル（所有者とモードからの判断）
+- 警告：期限が近い証明書（`RPROXY_CERT_WARN_DAYS`）、この版や権限で動かせない設定（起動すると `failed` になる）、`rproxy` のユーザーが読めないかもしれないファイル（所有者とモードからの判断）、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密のファイル、OIDC の client secret の使い回し。v0.4.17、docs/API.md の「API のルールが指せるファイル」）
 - JSON：`{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - 名前解決はしない（転送先の名前が引けるかは、起動したときに分かる）
 - 設定ファイルが指定されていなければ、確かめるものがないので 0 で終わる

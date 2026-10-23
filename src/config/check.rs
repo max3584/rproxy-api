@@ -191,6 +191,28 @@ pub async fn check(input: &CheckInput) -> Report {
 	for (rule, message) in checked.warnings {
 		report.warning(rule, message);
 	}
+	// #319: files a rule from the API may not name; the settings file's rules may (they are the administrator's)
+	{
+		use crate::net::protected::{self, FileRef, Use};
+		let crowdsec_key = doc.global.crowdsec.as_ref().map(|c| Path::new(c.api_key_file.as_str()));
+		let entries = protected::current(registry.acme().map(|a| a.as_ref()), crowdsec_key);
+		let refs: Vec<(String, Vec<FileRef>)> =
+			doc.labeled_rules().into_iter().map(|(label, r)| (label, protected::refs(r.tls.as_ref(), r.http.as_ref()))).collect();
+		for (label, files) in &refs {
+			for f in files {
+				if let Some(e) = protected::protecting(&f.path, &entries) {
+					report.warning(
+						label.clone(),
+						format!("{}: {} is {}; allowed in the settings file, but the same rule from the API is refused (403 protected_file)", f.field, f.path, e.what),
+					);
+				}
+			}
+		}
+		let uses: Vec<Use<'_>> = refs.iter().flat_map(|(label, files)| files.iter().map(|f| Use { rule: label.clone(), file: f, new: true })).collect();
+		for conflict in protected::secret_conflicts(&uses) {
+			report.warning("", format!("{conflict} (the same rules from the API are refused: 409 secret_reuse)"));
+		}
+	}
 
 	// files rproxy reads while running: they must be readable by its user too
 	for r in &doc.rules {

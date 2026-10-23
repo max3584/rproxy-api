@@ -992,6 +992,19 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - ヘッダの中身はルールの `source_ip` と同じ：送信元はクライアント（`proxy_protocol` で受けた接続ではヘッダのクライアント）、宛先は rproxy が受けたアドレス。終端していないので PROXY v2 の TLS の TLV は付けない。
 - PATCH（`tls` を送る）・組の PUT・設定ファイルの再読み込みで、接続を切らずに変わる（`change: in_place`、次の接続から）。ルールの `source_ip` は今までどおり変えられない（作り直し）。
 
+### API のルールが指せるファイル（v0.4.17、#319、`features.protected_files`）
+
+ルールのファイルの項目（`tls` と `http` のすべての `*_file`：証明書・鍵・チェーン・CA（`client_auth`・`upstream`・`routes[].upstream`・サービスの `tls`）、`basic_auth.users_file`、`oidc.client_secret_file`・`cookie_secret_file`・`ca_file`）を、API（`POST` / `PATCH /rules`・`PUT /rulesets/{name}`、`dry_run` も）からは次のように制限する。`rules:write` のトークンが、保存した証明書や ACME の鍵で TLS を終端したり、秘密を自分の用意した issuer に送らせたりできないように。
+
+- 証明書のストア（`RPROXY_CERT_STORE`）と ACME の保存先（`global.acme.storage`）の下、設定とオプションの秘密のファイル（`global.crowdsec.api_key_file`、`global.acme` の DNS のプロバイダの `api_key_file`・`secret_file`・`tsig_secret_file`・`credentials_file`・EAB の `hmac_key_file`・アカウントの `key_file`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_KEY`）は指せない：`403 protected_file`。トークンのスコープ（`acme:write`・`admin`）に関係なく断る。保存した証明書は `{"cert": "<name>"}`、ACME の証明書は `{"acme": ...}`（`acme:write`）で使う。
+  - パスは実際に行き着く先で比べる：ファイルを開いて（読まずに、`O_PATH`）その fd の本当のパス（`/proc/self/fd`）と inode を見るので、シンボリックリンク・`..` では回り込めない（秘密のファイルはハードリンクも inode で見つける）。まだないパス（後で保存される証明書）は、ある親のディレクトリまでたどって比べる。
+  - 秘密のファイルはそのファイルだけ（同じディレクトリのほかのファイルは指せる。既定の `/etc/rproxy` にはトークンとルールのファイルが並ぶため）。
+- `allow_certs` のあるトークン（保存した証明書の一部に絞ったトークン）は、ルールにファイルのパスを書けない：`403 file_not_allowed`。証明書は `allow_certs` の内の `{"cert": "<name>"}` で使う。
+- OIDC の client secret のファイル（rproxy が issuer に送る）は、同じ `issuer`（末尾の `/` を除く）と `client_id` の client secret としてだけ使える。ほかのルール（設定ファイル・API・組）を含めて、cookie の秘密・別の issuer や client の client secret・`users_file`・鍵などにも使っていれば `409 secret_reuse`（同じ client を複数のルールで使うのはよい）。
+- 設定ファイルのルール（`origin: static`）は今までどおり（ホストの管理者のもの）。`--check-config` が同じものを警告にする（`... is under the certificate store ...; allowed in the settings file, but the same rule from the API is refused (403 protected_file)`、`409 secret_reuse`）。
+- 前の版で API から作ったルール（DB・組の保存から戻すものを含む）は、そのまま動く。次に変えるときに上の確かめを通る。
+- `oidc` のセッションの cookie は、cookie の名前に加えて `issuer` と `client_id` にも結びつける（AES-256-GCM の関連データ）。同じ cookie の秘密を使うほかの `oidc` のミドルウェアの cookie は通らない。この版に上げると、今のセッションは一度だけサインインし直しになる。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -1057,6 +1070,9 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `tls_required` | 403 | v0.4.2：鍵を含む `PUT /certs` を平文の TCP（loopback 以外）で送った |
 | `in_use` | 409 | v0.4.2：保存した証明書をルールが使っている（`used_by`） |
 | `cert_store_unavailable` | 503 | v0.4.2：証明書の保存先に書けない |
+| `protected_file` | 403 | v0.4.17（#319）：API のルールが、証明書のストア・ACME の保存先の下か、設定・オプションの秘密のファイルを指している |
+| `file_not_allowed` | 403 | v0.4.17（#319）：`allow_certs` のあるトークンがルールにファイルのパスを書いた |
+| `secret_reuse` | 409 | v0.4.17（#319）：OIDC の client secret のファイルを、同じ issuer・client の client secret のほかにも使っている |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係
