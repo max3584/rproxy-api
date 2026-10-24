@@ -951,6 +951,9 @@ impl Registry {
 		let everything = |_: u16, _: u16| true;
 		for set in sets {
 			let mut rules: Vec<(usize, RuleRequest)> = set.rules.into_iter().enumerate().collect();
+			for (i, r) in &rules {
+				self.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "restore");
+			}
 			let mut outcome = Err(String::new());
 			// each round leaves out the rules the last one refused
 			for _ in 0..4 {

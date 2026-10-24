@@ -319,3 +319,23 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
   - 上限で閉じるとき、処理中のリクエストがあれば終わるまで待つ（`Activity::in_progress`。なければ 1 秒）。
   - アクセスログに `raw_path`（正規化でパスが変わったときだけ、送られたままのパス。検知のルールが `../` を見られるように）。
 - 試験：単体（`l7::normalize`・`l7::timeouts`・`config` の `global.http`）、`tests/path_normalize.rs`（`/%61dmin`・`//admin`・`/x/../admin`・`/admin/.` などと末尾のドットの Host を HTTP/1.1・HTTP/2・HTTP/3 で、転送先が受け取るパス、400、`raw_path`、認証のないルートでの身元のヘッダ、何も送らない接続・slowloris・HTTP/2 の前置きだけ、HTTP/2 のアイドル、遅いアップロードが通ることと止まった本文）、`tests/http_semantics.rs`（転送先へのパスとクエリ）、ベンチマーク `path_normalize`。
+
+## 14. API のルールが指せるファイル（v0.4.17、#319）
+
+脆弱性の点検（2026-10-23）の高 A・中 M2・M3：`rules:write` のトークンは、ルールのファイルの項目に rproxy が読めるどのファイルでも書けた（所有者の確認 `net::files` は rproxy のものなら通す）。証明書のストアや ACME の保存先の鍵で TLS を終端でき（`allow_certs`・`acme:write` の回り込み）、`oidc.client_secret_file` に別の秘密（ほかのルールの cookie の秘密、CrowdSec のキー）を書くと、issuer を自由に書けるので自分の token endpoint に送らせられた。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| API のルールのファイルの制限 | 新しい設定はない。誤りの `code`：`403 protected_file`・`403 file_not_allowed`・`409 secret_reuse` | `protected_files` | いつも（設定ファイルのルールは今までどおり） |
+
+- どこで：`control::rule_files::check`（`POST` / `PATCH /rules`・`PUT /rulesets/{name}`、`dry_run` も。`acme_api::check_rule_scope` の後）。ファイルの一覧は `net::protected::refs`：`tls` と `http` を JSON にして、`*_file` の項目をすべて拾う（項目を足しても名前が `_file` で終われば入る。終わらない名前でファイルを指す項目を足すときはここを直す）。
+- 守るもの（`net::protected::current`）：証明書のストア（`tls::named::dir`、木）、ACME の保存先（木）と `Acme::protected_files`（DNS のプロバイダの秘密・EAB・`storage` の外のアカウントの鍵。CA のファイルは除く：ルールの CA と同じものを使ってよい）、CrowdSec のキー（`Bouncer::key_file`）、オプションの `RPROXY_TOKEN_FILE`・`RPROXY_TLS_KEY`（`set_process`、`main` が `--check-config` の前にも入れる）。
+  - 決めたこと：秘密のファイルはディレクトリではなくそのファイルだけ。既定の `/etc/rproxy` にトークンのファイルと `users_file`・証明書が並び、ディレクトリで断ると今の使い方が動かなくなる。
+- 比べ方（`resolve`）：`O_PATH` で開く（読む権限は要らない、FIFO で止まらない）→ `/proc/self/fd` の本当のパスと（デバイス, inode）。木は本当のパスの前方一致（要素ごと）、ファイルは inode（開けなければパス）。開けないパスは、ある親までの本当のパスに残りを `..` を除いて足したもの（後で保存される `<store>/<name>/current/tls.key` も今断る）。ファイルを読む時（`net::files::read`）には比べない：API は文字列しか渡せず、リンクを作れないので、確かめた後に行き先が変わるのは管理者がディスクを変えたときだけ。
+- `allow_certs` のあるトークンはファイルを書けない（`Principal::limited_to_stored_certs`）：ストアの外の鍵でも、名前の制限を回り込む道になるため。
+- OIDC（M2）：`net::protected::secret_conflicts`。client secret のファイルは、同じ（issuer, client_id）の client secret としてだけ使える。比べる相手は動いているすべてのルール（`Registry::file_refs`。PATCH は置き換える部分（`tls` / `http`）、組の PUT はその組のルールを除く）と、同じ変更の中のルール。今あるルールどうしの重なりは、その変更の誤りにしない。
+- M4（cookie の秘密を使い回したときに別のルールのセッションが通る）：セッションと state の cookie の AES-256-GCM の関連データを cookie の名前・issuer・client_id にした（`oidc::Oidc::aad`）。今のセッションは上げたときに一度だけ無効になる（受け入れた：古い形を受け付けると回り込みが残る）。
+- 設定ファイルのルール：断らない（ホストの管理者のもの）。`--check-config` が同じ判定を警告にする（`check.rs`）。DB・組の保存から戻すルール、引き継ぎで渡すルールも断らない（前の版で受け付けたもの。次の変更で確かめる）。
+- 試験：単体（`net::protected`：木・ファイル・リンク・`..`・ハードリンク・まだないパス、項目の拾い方、client secret の使い道。`oidc`：別の issuer・client の cookie は開かない）、`tests/cert_api.rs`（`rule_files_may_not_reach_the_store`：ストアのファイル・リンク・`..`・後で保存されるもの、dry run・PATCH・組の PUT・サービスの `ca_file`、トークンのファイル、ほかの場所はよい、`allow_certs`、設定ファイルのルールは動く）、`tests/acme.rs`（`rules_may_not_name_acme_files`）、`tests/crowdsec.rs`（`rules_may_not_name_the_key_file`）、`tests/http_auth.rs`（`oidc_client_secrets_keep_to_one_use`）、`tests/check_config.rs`（`files_the_api_may_not_name_are_warnings`）。
+- レビューで足したもの：カーネルのファイルシステム（`/proc`・`/sys`・`/dev`、`statfs` の種類）を断る（`/proc/self/environ` の環境変数・`/proc/self/fd/N`）。木は（デバイス, inode）でも比べる（bind mount）。戻したルールは `Registry::warn_protected` が `rule.protected_file` を出す（`restore_as`・組の復元・引き継ぎの組）。PATCH は `Registry::updated_spec` で出来上がるルール全体を確かめる。確かめは 1 つずつ（`CHECKS`）で、通った変更のファイルは `Intent` として変更が終わるまで後の確かめに数える（変更の名前解決の間は誰も待たせない。ファイルのない変更は何も取らない）。`net::files::read` も開いた fd がカーネルのファイルシステムなら断る（後の読み直しを `/proc` へ向けられない）。ファイルを見るのは `spawn_blocking`、`Registry::file_refs` はロックの下では写すだけ。`409 secret_reuse` の文にほかのルールのことは出さない。`PUT /rulesets` の断りも監査に残す。`RPROXY_DIFF_TOKEN_FILE` も守る。
+- 残したもの：ほかのテナントのルールの鍵のファイル（守るファイルではないもの）を別のトークンが指せること（別の issue で扱う）。

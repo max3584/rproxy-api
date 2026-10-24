@@ -467,3 +467,29 @@ async fn crowdsec_on_a_rule_needs_global_crowdsec() {
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
 	assert!(v["error"].as_str().unwrap().contains("global.crowdsec"), "{v}");
 }
+
+/// #319: the CrowdSec key is a secret of the settings: a rule from the API may not
+/// name it (here as an OIDC client secret, which would send it to the issuer).
+#[tokio::test]
+async fn rules_may_not_name_the_key_file() {
+	let lapi_addr = fake_lapi(Shared::default()).await;
+	let key = key_file("protected", "cs-key-SECRET\n");
+	let b = bouncer(&format!("http://{lapi_addr}"), &key, None);
+	let h = harness_for(&b).await;
+	let cookie = key.with_file_name("cookie");
+	std::fs::write(&cookie, "a-long-cookie-secret-for-tests\n").unwrap();
+	let (status, v) = h
+		.post(http_rule(
+			free_port(),
+			json!({
+				"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:9", "middlewares": ["sso"]}],
+				"middlewares": {"sso": {"oidc": {"issuer": "https://idp.evil.example", "client_id": "x",
+					"client_secret_file": key, "cookie_secret_file": cookie}}},
+			}),
+		))
+		.await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("protected_file")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("global.crowdsec.api_key_file"), "{v}");
+	assert!(!v["error"].as_str().unwrap().contains("cs-key-SECRET"), "{v}");
+	b.stop();
+}

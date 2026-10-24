@@ -274,3 +274,173 @@ async fn leftovers_of_a_removal_are_cleaned_at_the_next_write() {
 	let rest: Vec<_> = fs::read_dir(&store).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with(".removing-")).collect();
 	assert!(rest.is_empty(), "{rest:?}");
 }
+
+/// #319: rules from the API may not name files of the certificate store (nor reach
+/// them through a symbolic link or `..`), nor secrets of the options; a token
+/// limited by `allow_certs` names no file at all; rules of the settings file may.
+#[tokio::test]
+async fn rule_files_may_not_reach_the_store() {
+	let dir = store();
+	let work = std::env::temp_dir().join(format!("rproxy-certs-files-{}", std::process::id()));
+	let _ = fs::remove_dir_all(&work);
+	fs::create_dir_all(&work).unwrap();
+	let tokens = work.join("tokens.yaml");
+	fs::write(
+		&tokens,
+		format!(
+			"tokens:\n  - {{name: team-a, sha256: {}, scopes: [rules:write, rules:read], allow_certs: [team-a-]}}\n  - {{name: admin, sha256: {}, scopes: [admin]}}\n",
+			token_sha("limited"),
+			token_sha("admin")
+		),
+	)
+	.unwrap();
+	// the token file is a secret of the options
+	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(Some(&tokens), None, None));
+	let h = harness_with(Tokens::from_file(tokens.clone()).unwrap()).await;
+	let pki = Pki::new("certs-files");
+	let issued = pki.server("f.pem", &["f.test"]);
+	let send = |method: reqwest::Method, path: String, token: &'static str, b: Value| {
+		let req = h.http.request(method, format!("{}{path}", h.base)).bearer_auth(token).json(&b);
+		async move {
+			let r = req.send().await.unwrap();
+			let status = r.status();
+			(status, r.json::<Value>().await.unwrap_or(Value::Null))
+		}
+	};
+	use reqwest::Method;
+	let caps: Value = h.http.get(format!("{}/capabilities", h.base)).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+	assert_eq!(caps["features"]["protected_files"], true, "{caps}");
+	assert_eq!(send(Method::PUT, "/certs/team-a-files".into(), "admin", body(&issued)).await.0, StatusCode::CREATED);
+	let stored = dir.join("team-a-files/current");
+	let (crt, key) = (stored.join("tls.crt"), stored.join("tls.key"));
+	let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+	let backend = tcp_backend("F:").await;
+	let files_rule = |port: u16, cert: &str, key: &str| {
+		let mut r = rule("tcp", port, backend);
+		r["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]});
+		r
+	};
+	let refused = |(status, v): (StatusCode, Value), code: &str, what: &str| {
+		assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some(code)), "{what}: {v}");
+	};
+
+	// the stored files themselves, through a symbolic link, through `..`, and one not stored yet
+	std::os::unix::fs::symlink(&key, work.join("link.key")).unwrap();
+	let outside = pki.write("outside.crt", &issued.cert.pem());
+	for (cert, key_file, what) in [
+		(s(&crt), s(&key), "the stored files"),
+		(outside.clone(), s(&work.join("link.key")), "a link into the store"),
+		(outside.clone(), format!("{}/../{}/team-a-files/current/tls.key", work.display(), dir.file_name().unwrap().to_string_lossy()), "`..`"),
+		(outside.clone(), s(&dir.join("team-a-later/current/tls.key")), "a certificate stored later"),
+	] {
+		let (status, v) = send(Method::POST, "/rules".into(), "admin", files_rule(free_port(), &cert, &key_file)).await;
+		refused((status, v.clone()), "protected_file", what);
+		assert!(v["error"].as_str().unwrap().contains("certificate store"), "{what}: {v}");
+	}
+	// dry runs, PATCH, a rule set's PUT, and the services' TLS files
+	let port = free_port();
+	refused(send(Method::POST, "/rules?dry_run=true".into(), "admin", files_rule(port, &s(&crt), &s(&key))).await, "protected_file", "dry run");
+	let (status, v) = send(Method::POST, "/rules".into(), "admin", rule("tcp", port, backend)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let tls = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(),
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": s(&crt), "key_file": s(&key)}]}});
+	refused(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{port}"), "admin", tls.clone()).await, "protected_file", "PATCH");
+	refused(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{port}?dry_run=true"), "admin", tls).await, "protected_file", "PATCH dry run");
+	let set = json!({"generation": 1, "rules": [files_rule(free_port(), &s(&crt), &s(&key))]});
+	let (status, v) = send(Method::PUT, "/rulesets/files".into(), "admin", set).await;
+	refused((status, v.clone()), "protected_file", "rule set");
+	assert!(v["error"].as_str().unwrap().starts_with("rules[0]: tls.certificates[0]"), "{v}");
+	let http = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+		"routes": [{"name": "a", "match": "PathPrefix(`/`)", "service": "s"}],
+		"services": {"s": {"servers": [{"url": format!("https://{backend}")}], "tls": {"ca_file": s(&crt)}}}}});
+	refused(send(Method::POST, "/rules".into(), "admin", http).await, "protected_file", "a service's ca_file");
+	// the token file is a secret of the options
+	let users = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+		"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["auth"]}],
+		"middlewares": {"auth": {"basic_auth": {"users_file": s(&tokens)}}}}});
+	let (status, v) = send(Method::POST, "/rules".into(), "admin", users).await;
+	refused((status, v.clone()), "protected_file", "the token file");
+	assert!(v["error"].as_str().unwrap().contains("RPROXY_TOKEN_FILE"), "{v}");
+
+	// files elsewhere are fine
+	let own_key = pki.write("own.key", &issued.key.serialize_pem());
+	let (status, v) = send(Method::POST, "/rules".into(), "admin", files_rule(free_port(), &outside, &own_key)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	// a token limited by allow_certs names stored certificates only, no file
+	let (status, v) = send(Method::POST, "/rules".into(), "limited", files_rule(free_port(), &outside, &own_key)).await;
+	refused((status, v.clone()), "file_not_allowed", "allow_certs");
+	assert!(v["error"].as_str().unwrap().contains("allow_certs"), "{v}");
+	let (status, v) = send(Method::POST, "/rules".into(), "limited", tls_rule(free_port(), backend, "team-a-files")).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	// a rule an earlier version accepted (restored from the database) runs, said with
+	// rule.protected_file (the field, not the path); a PATCH of only its targets is refused
+	logs::capture();
+	let legacy = free_port();
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(legacy, &s(&crt), &s(&key))).unwrap();
+	h.registry.restore(vec![spec]).await;
+	let line = logs::wait_for("rule.protected_file", |l| l["event"] == "rule.protected_file" && l["rule"] == format!("tcp/127.0.0.1:{legacy}")).await;
+	assert!(line["field"].as_str().unwrap().starts_with("tls.certificates[0]."), "{line}");
+	assert!(!line.to_string().contains(&s(&crt)), "{line}");
+	let (print, _conn) = served(&pki, legacy, "f.test").await;
+	assert_eq!(print, sha(issued.der().as_ref()));
+	let only_targets = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port()});
+	refused(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{legacy}"), "admin", only_targets).await, "protected_file", "PATCH of the targets");
+
+	// refusals of PUT /rulesets are audited like those of /rules
+	let set = json!({"generation": 1, "rules": [files_rule(free_port(), &s(&crt), &s(&key))]});
+	refused(send(Method::PUT, "/rulesets/audited".into(), "admin", set).await, "protected_file", "rule set");
+	let audit = logs::wait_for("audit", |l| l["event"] == "audit" && l["ruleset"] == "audited").await;
+	assert_eq!((audit["outcome"].as_str(), audit["code"].as_str()), (Some("forbidden"), Some("protected_file")), "{audit}");
+
+	// rules of the settings file are the administrator's: they may
+	let port = free_port();
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(port, &s(&crt), &s(&key))).unwrap();
+	h.registry.load_static(vec![spec]).await.unwrap();
+	let (print, mut conn) = served(&pki, port, "f.test").await;
+	assert_eq!(print, sha(issued.der().as_ref()));
+	assert_eq!(echo(&mut conn, "s").await, "F:s");
+	rproxy_api::net::protected::set_process(vec![]);
+	fs::remove_dir_all(work).unwrap();
+}
+
+/// #319: a change whose names take long to resolve holds up no other change (the
+/// files' check holds no lock over the change), and the files of a change under way
+/// still count for the checks made meanwhile.
+#[tokio::test]
+async fn a_slow_change_holds_up_no_other() {
+	let h = harness().await;
+	let pki = Pki::new("certs-slow");
+	let issued = pki.server("slow.pem", &["slow.test"]);
+	let cert = pki.write("slow.crt", &issued.cert.pem());
+	let key = pki.write("slow.key", &issued.key.serialize_pem());
+	let slow = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(),
+		"targets": (0..3).map(|i| json!({"addr": format!("t{i}.slow.test"), "port": 9})).collect::<Vec<_>>(),
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}});
+	let (http, base) = (h.http.clone(), h.base.clone());
+	let pending = tokio::spawn(async move { http.post(format!("{base}/rules")).json(&slow).send().await.unwrap().status() });
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let started = std::time::Instant::now();
+	let backend = tcp_backend("Q:").await;
+	// without files, and with other files
+	let (status, v) = h.post(rule("tcp", free_port(), backend)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let other_key = pki.write("other.key", &issued.key.serialize_pem());
+	let mut with_files = rule("tcp", free_port(), backend);
+	with_files["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": pki.write("other.crt", &issued.cert.pem()), "key_file": other_key}]});
+	let (status, v) = h.post(with_files).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// the key of the change under way may not become another rule's OIDC client secret
+	let cookie = pki.write("cookie", "a-long-cookie-secret-for-tests\n");
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+			"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["sso"]}],
+			"middlewares": {"sso": {"oidc": {"issuer": "https://idp.evil.example", "client_id": "x",
+				"client_secret_file": key, "cookie_secret_file": cookie}}}}}))
+		.await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("secret_reuse")), "{v}");
+	assert!(started.elapsed() < Duration::from_secs(5), "held up for {:?}", started.elapsed());
+	assert!(!pending.is_finished(), "the slow change is still resolving");
+	pending.abort();
+}

@@ -183,8 +183,8 @@ fn check_ports(principal: &Principal, first: u16, last: Option<u16>) -> AppResul
 fn audit<T>(principal: &Principal, client: &Client, action: &str, rule: &str, result: &AppResult<T>) {
 	let (outcome, code) = match result {
 		Ok(_) => ("ok", ""),
-		// refused by the token's allow_listen_ports
-		Err(e) if e.code == "forbidden" => ("forbidden", e.code),
+		// refused by the token's allow_listen_ports, allow_certs, or a protected file (#319)
+		Err(e) if e.status == StatusCode::FORBIDDEN => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
 	info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action, rule, outcome, code);
@@ -401,6 +401,7 @@ async fn create(
 	if crate::config::plan::dry_run(&query)? {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
 		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
+		drop(super::rule_files::check_create(&state.registry, &principal, &req).await?);
 		return Ok((StatusCode::OK, Json(crate::config::plan::plan_create(&state.registry, req).await?)).into_response());
 	}
 	let rule = parse_listen(&req.listen_addr, req.listen_port).map_or_else(|_| req.listen_addr.clone(), |a| a.to_string());
@@ -413,6 +414,8 @@ async fn create(
 		let result = async {
 			check_ports(&principal, req.listen_port, req.listen_port_end)?;
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
+			// the files are counted by other checks until the change is made (#319)
+			let _files = super::rule_files::check_create(&state.registry, &principal, &req).await?;
 			state.registry.create_as(req, origin).await
 		}
 		.await;
@@ -488,6 +491,7 @@ async fn update(
 	if crate::config::plan::dry_run(&query)? {
 		check_rule_ports(&state, &principal, &key).await?;
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+		drop(super::rule_files::check_update(&state.registry, &principal, &key, &req).await?);
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
 	to_the_end(async move {
@@ -495,6 +499,7 @@ async fn update(
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
 			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
 			state.registry.update(&key, req).await
 		}
 		.await;

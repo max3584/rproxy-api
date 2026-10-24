@@ -563,6 +563,12 @@ fn main() -> ExitCode {
 	if let Some(dir) = &opts.cert_store {
 		rproxy_api::tls::named::set_dir(dir.clone());
 	}
+	// the options' secrets rules from the API may not name (#319), also for --check-config's warnings
+	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(
+		opts.token_file.as_deref(),
+		opts.tls_key.as_deref(),
+		opts.diff_token_file.as_deref(),
+	));
 	if let Some(Command::Launch { .. }) = &opts.command {
 		return launch(&opts);
 	}

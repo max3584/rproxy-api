@@ -218,7 +218,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/
 ```
 
 - Errors: reasons are reported per file and per rule (such as `rproxy.yaml rule #2`). It does not stop at the first one; all are reported
-- Warnings: certificates close to expiry (`RPROXY_CERT_WARN_DAYS`), settings that cannot run with this version or these permissions (they become `failed` at startup), files the `rproxy` user may not be able to read (judged from owner and mode)
+- Warnings: certificates close to expiry (`RPROXY_CERT_WARN_DAYS`), settings that cannot run with this version or these permissions (they become `failed` at startup), files the `rproxy` user may not be able to read (judged from owner and mode), files a rule from the API could not name (the certificate store, the ACME storage, secret files, a reused OIDC client secret; v0.4.17, "Files rules from the API may name" in docs/en/API.md)
 - JSON: `{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - No name resolution is done (whether target names resolve is found out at startup)
 - If no configuration file is specified, there is nothing to check, so it exits 0
@@ -351,6 +351,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `http.access` | A request of an `http` rule (access log), with the middleware that refused it (`refused_by`, `middleware`) and `basic_auth`'s user (`user`) or why it refused (`auth_error`), and on rules with `tls.client_auth` the client certificate's `client_cn` and `client_verify` (`SUCCESS` / `FAILED` / `NONE`). `country` and `asn` with `global.geoip.log_country` (and when the `geoip` middleware refused). `raw_path`: the path as sent when normalisation changed it (v0.4.17) |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | Sign-in through the `oidc` middleware (`user`), refresh failure, failure communicating with the provider, a session too large to keep the refresh token |
 | `reload.secret` | A secret file of an authentication middleware (htpasswd, OIDC secret) was reloaded, or could not be reloaded and the current content continues to be used |
+| `rule.protected_file` | A restored rule (database, stored rule sets, reconcile, live upgrade) names a file a rule from the API could not name (the certificate store, the ACME storage, secrets, `/proc` and the like) (`rule`, `field`, `phase`; not the path. v0.4.17, #319) |
 | `http.health` / `http.breaker` | A target became down / up in a health check (`service`, `server`, `up`); a `circuit_breaker` opened / closed (`middleware`, `state`) |
 | `http.mirror` | What a copy of the `mirror` middleware came to (debug; `middleware`, `service`, `backend`, `status`, `error` on failure). It does not affect the client's response |
 | `crowdsec.sync` / `crowdsec.error` | Decisions were fetched from the CrowdSec LAPI (`added`, `deleted`, `decisions`) / could not be fetched or AppSec could not be queried (the previous decisions continue to be used) |

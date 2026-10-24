@@ -155,6 +155,11 @@ pub fn problem(path: &Path, link: Option<&std::fs::Metadata>, meta: &std::fs::Me
 pub fn read(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
 	let path = path.as_ref();
 	let mut file = std::fs::File::open(path)?;
+	// procfs, sysfs, devices: never a certificate, key or secret (#319), whatever the owner check
+	if crate::net::protected::opened_on_kernel_fs(&file) {
+		let why = format!("{} is on a kernel filesystem (/proc, /sys, /dev); only regular files on disk", path.display());
+		return Err(io::Error::new(io::ErrorKind::PermissionDenied, Refused(why)));
+	}
 	if owner_check() == OwnerCheck::Strict {
 		let meta = file.metadata()?;
 		let link = std::fs::symlink_metadata(path).ok();
@@ -239,6 +244,9 @@ mod tests {
 		let lmeta = std::fs::symlink_metadata(&link).unwrap();
 		assert!(problem(&link, Some(&lmeta), &meta, Kind::Secret, meta.uid(), false).is_none());
 		assert!(problem(&dir, None, &std::fs::metadata(&dir).unwrap(), Kind::Public, meta.uid(), false).unwrap().contains("not a regular file"));
+		// a kernel filesystem is refused whatever the owner check (#319)
+		let e = read("/proc/self/environ", Kind::Secret).unwrap_err();
+		assert!(is_refused(&e) && e.to_string().contains("kernel filesystem"), "{e}");
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 

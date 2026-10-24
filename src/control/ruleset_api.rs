@@ -53,7 +53,8 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(name): Path<String>) -
 fn audit(principal: &Principal, client: &Client, action: &str, name: &str, outcome: Result<(), &'static str>) {
 	let (outcome, code) = match outcome {
 		Ok(()) => ("ok", ""),
-		Err("forbidden") => ("forbidden", "forbidden"),
+		// the token's scopes and limits, a protected file (#319)
+		Err(code @ ("forbidden" | "protected_file" | "file_not_allowed")) => ("forbidden", code),
 		Err(code) => ("error", code),
 	};
 	info!(event = "audit", token = %principal.name, client = %client.0, action, rule = "", ruleset = name, outcome, code);
@@ -72,11 +73,19 @@ pub async fn put(
 	let dry_run = crate::config::plan::dry_run(&query)?;
 	let req: RulesetRequest = serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("invalid body: {e}")))?;
 	req.validate_shape()?;
+	// refusals of the token are audited as those of PUT /rules (#319)
+	let refused = |e: ApiError| {
+		if !dry_run {
+			audit(&principal, &client, "ruleset.put", &name, Err(e.code));
+		}
+		e
+	};
 	for (i, r) in req.rules.iter().enumerate() {
 		super::acme_api::check_rule_scope(&principal, Some(r), None)
-			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })?;
+			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })
+			.map_err(refused)?;
 	}
-	principal.may_use_ruleset(&name)?;
+	principal.may_use_ruleset(&name).map_err(refused)?;
 	let if_match = if_match(&headers)?.map(str::to_owned);
 	// a change runs to its end even if the client goes away (#144)
 	super::api::to_the_end(async move {
@@ -87,7 +96,18 @@ pub async fn put(
 		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
 		// refused if a live upgrade started meanwhile (#305)
 		let _change = if dry_run { None } else { super::api::changing(&state).await? };
+		// the files are counted by other checks until the change is made (#319)
+		let files = match super::rule_files::check_ruleset(&state.registry, &principal, &name, &req.rules).await {
+			Ok(intent) => intent,
+			Err(e) => {
+				if !dry_run {
+					audit(&principal, &client, "ruleset.put", &name, Err(e.code));
+				}
+				return Err(e.into());
+			}
+		};
 		let result = state.registry.put_ruleset(&name, req, opts).await;
+		drop(files);
 		if !dry_run {
 			audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));
 		}

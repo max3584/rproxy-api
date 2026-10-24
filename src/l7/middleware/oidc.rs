@@ -1,7 +1,8 @@
 //! `oidc` (#59): sign-in through an OpenID Connect provider (Keycloak and
 //! others) without an extra proxy. Authorization code flow with PKCE; the
-//! session is an encrypted cookie (AES-256-GCM, key from `cookie_secret_file`)
-//! holding the identity and the refresh token. ID tokens are verified with the
+//! session is an encrypted cookie (AES-256-GCM, key from `cookie_secret_file`,
+//! bound to the cookie name, the issuer and the client) holding the identity and
+//! the refresh token. ID tokens are verified with the
 //! provider's JWKS (RS256/384/512, PS256, ES256/384), which is cached and
 //! fetched again for an unknown key id.
 
@@ -348,13 +349,19 @@ impl Oidc {
 		URL_SAFE_NO_PAD.encode(b)
 	}
 
-	/// base64url(nonce || AES-256-GCM(json)); the cookie name is the associated data.
+	/// The associated data of a cookie: its name, the issuer and the client (#319, M4), so a
+	/// cookie of another middleware with the same cookie secret does not open here.
+	fn aad(&self, name: &str) -> Vec<u8> {
+		[name.as_bytes(), b"\0", self.issuer.as_bytes(), b"\0", self.client_id.as_bytes()].concat()
+	}
+
+	/// base64url(nonce || AES-256-GCM(json)); the cookie name, the issuer and the client are the associated data.
 	fn seal<T: Serialize>(&self, key: &[u8; 32], name: &str, value: &T) -> String {
 		let mut nonce = [0u8; 12];
 		self.rng.fill(&mut nonce).expect("the system random source works");
 		let mut data = serde_json::to_vec(value).unwrap_or_default();
 		let k = LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, key).expect("32-byte key"));
-		k.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(name.as_bytes()), &mut data)
+		k.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(self.aad(name)), &mut data)
 			.expect("sealing a cookie does not fail");
 		let mut out = nonce.to_vec();
 		out.extend(data);
@@ -369,7 +376,7 @@ impl Oidc {
 		let (nonce, rest) = raw.split_at(12);
 		let mut data = rest.to_vec();
 		let k = LessSafeKey::new(UnboundKey::new(&aead::AES_256_GCM, key).ok()?);
-		let plain = k.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::from(name.as_bytes()), &mut data).ok()?;
+		let plain = k.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::from(self.aad(name)), &mut data).ok()?;
 		serde_json::from_slice(plain).ok()
 	}
 
@@ -723,13 +730,17 @@ mod tests {
 	use super::*;
 
 	fn oidc(dir: &std::path::Path) -> Oidc {
+		oidc_for(dir, "http://127.0.0.1:1/realms/x", "app")
+	}
+
+	fn oidc_for(dir: &std::path::Path, issuer: &str, client_id: &str) -> Oidc {
 		std::fs::write(dir.join("client"), "s3cret\n").unwrap();
 		std::fs::write(dir.join("cookie"), "0123456789abcdef0123\n").unwrap();
 		Oidc::new(
 			"sso",
 			OidcSettings {
-				issuer: "http://127.0.0.1:1/realms/x",
-				client_id: "app",
+				issuer,
+				client_id,
 				client_secret_file: dir.join("client").to_str().unwrap(),
 				cookie_secret_file: dir.join("cookie").to_str().unwrap(),
 				scopes: &[],
@@ -765,6 +776,12 @@ mod tests {
 		assert_eq!(o.open::<Session>(&key, "_rproxy_oidc", &URL_SAFE_NO_PAD.encode(raw)), None, "tampered");
 		assert_eq!(o.open::<Session>(&[7u8; 32], "_rproxy_oidc", &sealed), None, "another key");
 		assert_eq!(o.open::<Session>(&key, "_rproxy_oidc", "garbage"), None);
+		// the same cookie secret in a middleware of another issuer or client (#319, M4)
+		let other = oidc_for(&d, "http://127.0.0.1:1/realms/y", "app");
+		assert_eq!(other.open::<Session>(&key, "_rproxy_oidc", &sealed), None, "bound to the issuer");
+		let other = oidc_for(&d, "http://127.0.0.1:1/realms/x", "app2");
+		assert_eq!(other.open::<Session>(&key, "_rproxy_oidc", &sealed), None, "bound to the client");
+		assert_eq!(oidc(&d).open::<Session>(&key, "_rproxy_oidc", &sealed), Some(s.clone()), "the same settings again");
 		std::fs::remove_dir_all(d).unwrap();
 	}
 

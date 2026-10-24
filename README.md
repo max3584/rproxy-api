@@ -218,7 +218,7 @@ rproxy-api --check-config /etc/rproxy/rproxy.yaml --diff --diff-token-file /etc/
 ```
 
 - 誤り：ファイル・ルール（`rproxy.yaml rule #2` など）ごとに理由を出す。最初の 1 つで止めず、すべて出す
-- 警告：期限が近い証明書（`RPROXY_CERT_WARN_DAYS`）、この版や権限で動かせない設定（起動すると `failed` になる）、`rproxy` のユーザーが読めないかもしれないファイル（所有者とモードからの判断）
+- 警告：期限が近い証明書（`RPROXY_CERT_WARN_DAYS`）、この版や権限で動かせない設定（起動すると `failed` になる）、`rproxy` のユーザーが読めないかもしれないファイル（所有者とモードからの判断）、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密のファイル、OIDC の client secret の使い回し。v0.4.17、docs/API.md の「API のルールが指せるファイル」）
 - JSON：`{"ok": false, "path": "...", "files": [...], "rules": 3, "errors": [{"rule": "rproxy.yaml rule #2", "message": "..."}], "warnings": [...]}`
 - 名前解決はしない（転送先の名前が引けるかは、起動したときに分かる）
 - 設定ファイルが指定されていなければ、確かめるものがないので 0 で終わる
@@ -351,6 +351,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）、`tls.client_auth` のあるルールではクライアント証明書の `client_cn`・`client_verify`（`SUCCESS` / `FAILED` / `NONE`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn`。正規化でパスが変わったときは送られたままのパスを `raw_path`（v0.4.17） |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | `oidc` ミドルウェアのサインイン（`user`）、リフレッシュの失敗、プロバイダとのやり取りの失敗、セッションが大きすぎてリフレッシュトークンを持てない |
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
+| `rule.protected_file` | 戻したルール（DB・組の保存・照合・引き継ぎ）が、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密・`/proc` など）を指している（`rule`・`field`・`phase`。パスは出さない。v0.4.17、#319） |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `http.mirror` | `mirror` ミドルウェアの写しの結果（debug。`middleware`、`service`、`backend`、`status`、失敗なら `error`）。クライアントの応答には影響しない |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |

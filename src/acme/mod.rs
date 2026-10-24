@@ -361,6 +361,21 @@ impl Acme {
 		out
 	}
 
+	/// The secrets rules from the API may not name (#319): the DNS providers' keys and
+	/// credentials, the EAB keys and the account keys given outside `storage` (where, file).
+	pub fn protected_files(&self) -> Vec<(String, String)> {
+		let mut out = vec![];
+		for (name, p) in &self.global.dns_providers {
+			let files = [&p.api_key_file, &p.secret_file, &p.tsig_secret_file, &p.credentials_file];
+			out.extend(files.into_iter().flatten().map(|f| (format!("dns_providers.{name}"), f.clone())));
+		}
+		for (name, a) in &self.global.accounts {
+			out.extend(a.eab.as_ref().map(|e| (format!("accounts.{name}.eab"), e.hmac_key_file.clone())));
+			out.extend(a.key_file.clone().map(|f| (format!("accounts.{name}.key_file"), f)));
+		}
+		out
+	}
+
 	/// Files read while running, for `--check-config`'s readability warnings.
 	pub fn secret_files(&self) -> Vec<String> {
 		let mut out: Vec<String> = Self::named_files(&self.global).into_iter().map(|(_, f)| f).collect();

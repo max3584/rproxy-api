@@ -267,6 +267,11 @@ impl Bouncer {
 		}))
 	}
 
+	/// `api_key_file` (#319: rules from the API may not name it).
+	pub fn key_file(&self) -> &std::path::Path {
+		&self.key_file
+	}
+
 	pub fn has_appsec(&self) -> bool {
 		self.appsec.is_some()
 	}

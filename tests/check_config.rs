@@ -376,3 +376,62 @@ fn trusted_dirs_must_be_absolute() {
 	fs::write(&file, "version: 1\nglobal: {files: {trusted_dirs: [/var/run/rproxy-gateway/certs]}}\nrules: []\n").unwrap();
 	assert_eq!(check_json(&dir, &file).0, 0);
 }
+
+/// #319: rules of the settings file may name files rules from the API may not (the
+/// certificate store, the options' secrets) and reuse an OIDC client secret; the
+/// check warns about them and passes.
+#[test]
+fn files_the_api_may_not_name_are_warnings() {
+	let dir = workdir("protected");
+	let pki = Pki::new("check-protected");
+	let cert = pki.server("p", &["p.test"]);
+	let stored = dir.join("store/p/current");
+	fs::create_dir_all(&stored).unwrap();
+	fs::copy(&cert.cert_file, stored.join("tls.crt")).unwrap();
+	fs::copy(&cert.key_file, stored.join("tls.key")).unwrap();
+	fs::write(dir.join("tokens"), "alice:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n").unwrap();
+	fs::write(dir.join("client"), "client-secret\n").unwrap();
+	fs::write(dir.join("cookie"), "a-long-cookie-secret-for-tests\n").unwrap();
+	let sso = |issuer: &str| {
+		format!(
+			"  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: {}\n    http: {{routes: [{{name: a, match: 'PathPrefix(`/`)', to: 'http://127.0.0.1:9', middlewares: [sso]}}], middlewares: {{sso: {{oidc: {{issuer: '{issuer}', client_id: app, client_secret_file: {}, cookie_secret_file: {}}}}}}}}}\n",
+			free_port(),
+			dir.join("client").display(),
+			dir.join("cookie").display()
+		)
+	};
+	let file = dir.join("rproxy.yaml");
+	fs::write(
+		&file,
+		format!(
+			"version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {}, remote_addr: 127.0.0.1, remote_port: 9, tls: {{mode: terminate, certificates: [{{cert_file: {}, key_file: {}}}]}}}}\n  - protocol: tcp\n    listen_addr: 127.0.0.1\n    listen_port: {}\n    http: {{routes: [{{name: a, match: 'PathPrefix(`/`)', to: 'http://127.0.0.1:9', middlewares: [auth]}}], middlewares: {{auth: {{basic_auth: {{users_file: {}}}}}}}}}\n{}{}",
+			free_port(),
+			stored.join("tls.crt").display(),
+			stored.join("tls.key").display(),
+			free_port(),
+			dir.join("tokens").display(),
+			sso("http://127.0.0.1:1/a"),
+			sso("https://idp.other.example"),
+		),
+	)
+	.unwrap();
+	let store = dir.join("store");
+	let tokens = dir.join("tokens");
+	let args = [file.to_str().unwrap(), "--check-config-format", "json"];
+	let env = [("RPROXY_CERT_STORE", store.to_str().unwrap()), ("RPROXY_TOKEN_FILE", tokens.to_str().unwrap())];
+	let (code, text) = check(&dir, &args, &env);
+	let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+	assert_eq!(code, 0, "{v}");
+	let warnings = messages(&v, "warnings");
+	assert!(warnings.contains("tls.certificates[0].cert_file") && warnings.contains("certificate store"), "{warnings}");
+	assert!(warnings.contains("tls.certificates[0].key_file"), "{warnings}");
+	assert!(warnings.contains("basic_auth.users_file") && warnings.contains("RPROXY_TOKEN_FILE"), "{warnings}");
+	assert!(warnings.contains("403 protected_file"), "{warnings}");
+	assert!(warnings.contains("client_secret_file") && warnings.contains("409 secret_reuse"), "{warnings}");
+	// without the store and the token file in the options, none of these
+	let (code, text) = check(&dir, &args, &[]);
+	let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+	assert_eq!(code, 0, "{v}");
+	assert!(!messages(&v, "warnings").contains("protected_file"), "{v}");
+	fs::remove_dir_all(dir).unwrap();
+}

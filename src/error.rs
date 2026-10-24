@@ -24,6 +24,22 @@ impl ApiError {
 		Self::new(StatusCode::FORBIDDEN, "forbidden", message)
 	}
 
+	/// A rule from the API names a file of the certificate store, the ACME storage or a
+	/// secret of the settings (#319).
+	pub fn protected_file(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::FORBIDDEN, "protected_file", message)
+	}
+
+	/// A token limited by `allow_certs` names a file in a rule (#319).
+	pub fn file_not_allowed(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::FORBIDDEN, "file_not_allowed", message)
+	}
+
+	/// An OIDC client secret file used for something else too (#319).
+	pub fn secret_reuse(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "secret_reuse", message)
+	}
+
 	pub fn invalid(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::BAD_REQUEST, "invalid", message)
 	}

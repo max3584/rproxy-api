@@ -214,6 +214,10 @@ pub struct Features {
 	pub route_source_ip: bool,
 	/// `proxy_protocol` of a udp rule: PROXY v2 (DGRAM) headers in front of each datagram from trusted front ends (#312)
 	pub proxy_protocol_in_udp: bool,
+	/// Rules from the API may not name files of the certificate store, the ACME storage or the
+	/// settings' secrets, `allow_certs` tokens no file at all, and an OIDC client secret file
+	/// keeps to one use (`403 protected_file`, `403 file_not_allowed`, `409 secret_reuse`; #319)
+	pub protected_files: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -278,6 +282,7 @@ impl Features {
 		proxy_protocol_in: true,
 		route_source_ip: true,
 		proxy_protocol_in_udp: true,
+		protected_files: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -325,6 +330,7 @@ impl Features {
 		proxy_protocol_in: true,
 		route_source_ip: true,
 		proxy_protocol_in_udp: true,
+		protected_files: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

@@ -40,6 +40,11 @@ pub fn fake_lookup(names: Names) -> Lookup {
 				return Ok(vec![addr]);
 			}
 			let host = target.rsplit_once(':').map(|(h, _)| h).unwrap_or(&target);
+			// a name that takes long to fail, like a resolver that does not answer
+			if host.ends_with(".slow.test") {
+				tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+				return Err(io::Error::other("timed out"));
+			}
 			names
 				.lock()
 				.unwrap()

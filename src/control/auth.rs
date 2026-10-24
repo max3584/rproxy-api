@@ -92,6 +92,12 @@ impl Principal {
 		}
 	}
 
+	/// Whether the token is limited to some stored certificates (`allow_certs`): it may
+	/// not name files in rules then (#319), which would get around the limit.
+	pub fn limited_to_stored_certs(&self) -> bool {
+		self.certs.is_some()
+	}
+
 	/// Whether the token may use the stored certificate `name` (`allow_certs`).
 	pub fn may_use_cert(&self, name: &str) -> Result<(), crate::error::ApiError> {
 		match &self.certs {
