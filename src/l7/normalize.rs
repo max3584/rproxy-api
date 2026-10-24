@@ -105,7 +105,8 @@ pub fn path(path: &str) -> Result<Cow<'_, str>, InvalidPath> {
 			}
 			i += 3;
 		} else {
-			// the target is ASCII (hyper and h3 refuse other bytes); a char boundary either way
+			// copied as it is, a whole UTF-8 character at a time: the `http` crate takes bytes
+			// from 0x80 up in a path (and `path()` is a `&str`), so `i` must stay on a boundary
 			let next = path[i..].chars().next().map_or(1, char::len_utf8);
 			decoded.push_str(&path[i..i + next]);
 			i += next;
@@ -132,6 +133,20 @@ pub fn path(path: &str) -> Result<Cow<'_, str>, InvalidPath> {
 		out.push('/');
 	}
 	Ok(Cow::Owned(out))
+}
+
+/// Characters some backends read differently from rproxy (#320, `http.strict_path`):
+/// an encoded `/`, `\`, `;` or `%`, a raw `;` (Tomcat's `..;/`) or `\`.
+pub fn risky(path: &str) -> bool {
+	let p = path.as_bytes();
+	p.iter().enumerate().any(|(i, &b)| match b {
+		b';' | b'\\' => true,
+		b'%' => matches!(
+			(p.get(i + 1).map(u8::to_ascii_uppercase), p.get(i + 2).map(u8::to_ascii_uppercase)),
+			(Some(b'2'), Some(b'F' | b'5')) | (Some(b'5'), Some(b'C')) | (Some(b'3'), Some(b'B'))
+		),
+		_ => false,
+	})
 }
 
 /// The host for matching: `request_host` has taken the port off and lowered it;
@@ -214,6 +229,16 @@ mod tests {
 		for p in ["/%61/%2e/./b//c/..", "/a%2fb/", "/x/../../y/%7E", "//a//b//"] {
 			let once = n(p);
 			assert!(matches!(path(&once), Ok(Cow::Borrowed(_))), "{p} -> {once}");
+		}
+	}
+
+	#[test]
+	fn risky_characters() {
+		for p in ["/a%2Fb", "/a%2fb", "/a%5cb", "/a%3B", "/a%25", "/a;b", "/..;/admin", "/a\\b"] {
+			assert!(risky(p), "{p}");
+		}
+		for p in ["/a/b", "/%61dmin", "/a%20b", "/%E3%81%82", "/a%2"] {
+			assert!(!risky(p), "{p}");
 		}
 	}
 

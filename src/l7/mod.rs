@@ -41,6 +41,10 @@ pub struct HttpSpec {
 	/// authentication or `ip_allow` routes: `/%61dmin` then misses `PathPrefix(`/admin`)`.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub raw_path: bool,
+	/// Refuse (400) paths with `%2F`, `%5C`, `%3B`, `%25`, `;` or `\\`, which some backends
+	/// read differently from rproxy (`..;/`, a decoded `%2F`, double decoding; #320).
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub strict_path: bool,
 	#[serde(default)]
 	pub routes: Vec<RouteSpec>,
 	/// What a request that matches no route gets (404 when left out).
@@ -902,6 +906,9 @@ impl HttpSpec {
 		}
 		if self.raw_path {
 			used.push("raw_path");
+		}
+		if self.strict_path {
+			used.push("strict_path");
 		}
 		let servers = || self.services.values().flat_map(|s| &s.servers);
 		if servers().any(|s| !s.middlewares.is_empty()) {

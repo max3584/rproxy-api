@@ -170,7 +170,8 @@ impl HttpGlobal {
 				client_cn = (!entry.client_cn.is_empty()).then_some(entry.client_cn.as_str()),
 				client_verify = (!entry.client_verify.is_empty()).then_some(entry.client_verify.as_str()),
 				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn,
-				proxy_peer = (!entry.proxy_peer.is_empty()).then_some(entry.proxy_peer.as_str())),
+				proxy_peer = (!entry.proxy_peer.is_empty()).then_some(entry.proxy_peer.as_str()),
+				raw_path = (!entry.raw_path.is_empty()).then_some(entry.raw_path.as_str())),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
 				line.push(b'\n');
@@ -253,6 +254,10 @@ pub struct AccessEntry {
 	/// client is `client`; left out without one.
 	#[serde(skip_serializing_if = "String::is_empty")]
 	pub proxy_peer: String,
+	/// The path as the client sent it, when the normalisation before routing changed it
+	/// (#320; `path` is the normalised one); left out otherwise.
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub raw_path: String,
 }
 
 #[derive(Serialize)]

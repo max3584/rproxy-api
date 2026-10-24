@@ -146,7 +146,7 @@ pub struct Features {
 	/// Other `http` options for the Gateway API (#224, #226-#235): `headers_add`, `redirect_status`,
 	/// `route_timeouts`, `server_middlewares`, `server_status`, `retry_status`; `misdirected`
 	/// (`tls.misdirected`, v0.4.3); `path_normalize` (paths and hosts normalised before routing),
-	/// `raw_path` (`http.raw_path`, to turn it off), `identity_headers` (identity headers of the
+	/// `raw_path` (`http.raw_path`, to turn it off), `strict_path` (`http.strict_path`), `identity_headers` (identity headers of the
 	/// rule's authentication middlewares dropped from every request) and `http_timeouts`
 	/// (`global.http.timeouts`), all v0.4.17 (#320)
 	pub http_options: &'static [&'static str],
@@ -223,7 +223,7 @@ const FORWARD_AUTH: &[&str] = &["service", "grpc", "client_request", "allow_stat
 const HTTP_OPTIONS: &[&str] =
 	&[
 		"headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected",
-		"path_normalize", "raw_path", "identity_headers", "http_timeouts",
+		"path_normalize", "raw_path", "identity_headers", "http_timeouts", "strict_path",
 	];
 
 /// `features.performance`: the `global.performance` keys this build applies;

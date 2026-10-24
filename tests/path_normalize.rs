@@ -255,12 +255,14 @@ async fn identity_headers_of_authentication_middlewares_are_dropped_on_every_rou
 				"routes": [
 					{"name": "admin", "match": "PathPrefix(`/admin`)", "to": to, "middlewares": ["basic"]},
 					{"name": "sso", "match": "PathPrefix(`/sso`)", "to": to, "middlewares": ["fa"]},
+					{"name": "sso2", "match": "PathPrefix(`/sso2`)", "to": to, "middlewares": ["fa_all"]},
 					{"name": "open", "match": "PathPrefix(`/`)", "to": to},
 				],
 				"middlewares": {
 					"basic": {"basic_auth": {"users_file": users, "user_header": "X-Forwarded-User"}},
-					"fa": {"forward_auth": {"address": "http://127.0.0.1:1/auth", "request_headers": ["X-Token", "Cookie"],
+					"fa": {"forward_auth": {"address": "http://127.0.0.1:1/auth", "request_headers": ["X-Token", "Cookie", "X-Forwarded-User"],
 						"response_headers": ["X-Auth-Request-Email", "X-Token", "Authorization"]}},
+					"fa_all": {"forward_auth": {"address": "http://127.0.0.1:1/auth", "response_headers": ["*"]}},
 				},
 			},
 		}))
@@ -273,7 +275,13 @@ async fn identity_headers_of_authentication_middlewares_are_dropped_on_every_rou
 		.header("X-Auth-Request-Email", "root@example.test")
 		.header("X-Token", "t0k3n")
 		.header("Authorization", "Bearer abc")
+		.header("Cookie", "s=1")
 		.header("X-Other", "kept")
+		.header("X-Forwarded_User", "root")
+		.header("x_auth_request_email", "root@example.test")
+		.header("X-Authentik-Username", "root")
+		.header("X-Authentik-Groups", "admins")
+		.header("Remote-User", "root")
 		.send()
 		.await
 		.unwrap();
@@ -282,9 +290,20 @@ async fn identity_headers_of_authentication_middlewares_are_dropped_on_every_rou
 	let headers = &v["headers"];
 	assert!(headers.get("x-forwarded-user").is_none(), "{v}");
 	assert!(headers.get("x-auth-request-email").is_none(), "{v}");
+	// a forward_auth's request_headers do not exempt a name: X-Token is set by the auth server
+	assert!(headers.get("x-token").is_none(), "{v}");
+	// spelt with `_` (CGI / WSGI read it as the same header)
+	assert!(
+		headers.get("x-forwarded_user").is_none() && headers.get("x_auth_request_email").is_none(),
+		"{v}"
+	);
+	// forward_auth with response_headers ["*"]: the usual names of Authentik, Authelia, oauth2-proxy
+	for name in ["x-authentik-username", "x-authentik-groups", "remote-user"] {
+		assert!(headers.get(name).is_none(), "{name}: {v}");
+	}
 	// what the client sends to authenticate stays
-	assert_eq!(headers["x-token"], "t0k3n");
 	assert_eq!(headers["authorization"], "Bearer abc");
+	assert_eq!(headers["cookie"], "s=1");
 	assert_eq!(headers["x-other"], "kept");
 	// through basic_auth the header is rproxy's
 	let resp = client
@@ -430,4 +449,174 @@ async fn a_slow_upload_passes_and_a_silent_one_is_cut() {
 		"{}",
 		String::from_utf8_lossy(&out)
 	);
+}
+
+#[tokio::test]
+async fn strict_path_refuses_what_backends_read_differently() {
+	let h = harness().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"http": {"strict_path": true, "routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{}", echo().await)}]},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let client = reqwest::Client::new();
+	for p in ["/a%2Fb", "/..;/admin", "/a;jsessionid=1", "/a%5cb", "/a%252e%252e/", "/a%3Bb"] {
+		let resp = client.get(format!("http://127.0.0.1:{port}{p}")).send().await.unwrap();
+		assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{p}");
+	}
+	let resp = client.get(format!("http://127.0.0.1:{port}/a/%61")).send().await.unwrap();
+	assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_access_log_keeps_the_path_as_sent_when_it_changed() {
+	let dir = std::env::temp_dir().join(format!("rproxy-pn-log-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let global = rproxy_api::l7::access::HttpGlobal::new(&[], Some(&dir.join("access.log")), 3).unwrap();
+	let h = harness_with_global(rproxy_api::control::auth::Tokens::disabled(), global).await;
+	let port = free_port();
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"http": {"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{}", echo().await)}]},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let client = reqwest::Client::new();
+	for p in ["/x//%65tc/passwd", "/plain"] {
+		assert_eq!(
+			client.get(format!("http://127.0.0.1:{port}{p}")).send().await.unwrap().status(),
+			StatusCode::OK
+		);
+	}
+	let mut lines: Vec<Value> = vec![];
+	for _ in 0..50 {
+		lines = std::fs::read_dir(&dir)
+			.unwrap()
+			.flat_map(|f| {
+				std::fs::read_to_string(f.unwrap().path())
+					.unwrap_or_default()
+					.lines()
+					.map(str::to_string)
+					.collect::<Vec<_>>()
+			})
+			.filter_map(|l| serde_json::from_str(&l).ok())
+			.collect();
+		if lines.len() >= 2 {
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let changed = lines
+		.iter()
+		.find(|l| l["path"] == "/x/etc/passwd")
+		.expect("the line of the changed path");
+	assert_eq!(changed["raw_path"], "/x//%65tc/passwd");
+	let plain = lines.iter().find(|l| l["path"] == "/plain").expect("the line of the plain path");
+	assert!(plain.get("raw_path").is_none(), "{plain}");
+}
+
+/// An h2c backend answering at once and echoing the request body as it comes
+/// (a bidirectional stream, like gRPC); `/collect` answers after the whole body, with its length.
+async fn streaming_h2c() -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { return };
+			tokio::spawn(async move {
+				let service = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					if req.uri().path() == "/collect" {
+						let n = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
+						return Ok::<_, std::convert::Infallible>(hyper::Response::new(
+							http_body_util::Full::new(Bytes::from(n.to_string()))
+								.map_err(|never| match never {})
+								.boxed(),
+						));
+					}
+					let body = req.into_body().map_err(std::io::Error::other).boxed();
+					Ok(hyper::Response::new(body))
+				});
+				let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+					.serve_connection(TokioIo::new(tcp), service)
+					.await;
+			});
+		}
+	});
+	addr
+}
+
+#[tokio::test]
+async fn quiet_request_streams_survive_once_answered_and_grpc_is_never_cut() {
+	let (port, _h) = {
+		let spec: rproxy_api::l7::timeouts::HttpTimeoutsSpec = serde_json::from_value(json!({"request_body_idle": "500ms"})).unwrap();
+		let global = rproxy_api::l7::access::HttpGlobal::default().with_timeouts(spec.resolve());
+		let h = harness_with_global(rproxy_api::control::auth::Tokens::disabled(), global).await;
+		let port = free_port();
+		let (status, v) = h
+			.post(json!({
+				"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+				"http": {
+					"routes": [{"name": "all", "match": "PathPrefix(`/`)", "service": "s"}],
+					"services": {"s": {"protocol": "h2c", "servers": [{"url": format!("http://{}", streaming_h2c().await)}]}},
+				},
+			}))
+			.await;
+		assert_eq!(status, StatusCode::CREATED, "{v}");
+		(port, h)
+	};
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+		.await
+		.unwrap();
+	tokio::spawn(conn);
+	// answered at once, then the client is quiet for 3x request_body_idle: the stream stays
+	let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+	let body = StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async move {
+		rx.recv().await.map(|f| (f, rx))
+	}));
+	let req = hyper::Request::post("http://a.test/watch")
+		.header("content-type", "application/octet-stream")
+		.body(body.boxed())
+		.unwrap();
+	tx.send(Ok(Frame::data(Bytes::from_static(b"first;")))).await.unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	assert_eq!(resp.status(), 200);
+	let mut answer = resp.into_body();
+	let first = answer.frame().await.unwrap().unwrap().into_data().unwrap();
+	assert_eq!(first, "first;");
+	tokio::time::sleep(Duration::from_millis(1500)).await;
+	tx.send(Ok(Frame::data(Bytes::from_static(b"later;")))).await.unwrap();
+	let later = tokio::time::timeout(Duration::from_secs(5), answer.frame())
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap()
+		.into_data()
+		.unwrap();
+	assert_eq!(later, "later;");
+	drop(tx);
+	// gRPC: quiet for 3x the limit before any answer, still not cut
+	let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(4);
+	let body = StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async move {
+		rx.recv().await.map(|f| (f, rx))
+	}));
+	let req = hyper::Request::post("http://a.test/collect")
+		.header("content-type", "application/grpc")
+		.body(body.boxed())
+		.unwrap();
+	let sending = tokio::spawn(async move {
+		tx.send(Ok(Frame::data(Bytes::from_static(b"ab")))).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+		tx.send(Ok(Frame::data(Bytes::from_static(b"cd")))).await.unwrap();
+	});
+	let resp = sender.send_request(req).await.unwrap();
+	assert_eq!(resp.status(), 200);
+	let n = resp.into_body().collect().await.unwrap().to_bytes();
+	assert_eq!(n, "4");
+	sending.await.unwrap();
 }

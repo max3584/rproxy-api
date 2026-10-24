@@ -112,6 +112,8 @@ pub struct Router {
 	match_headers: bool,
 	/// `http.raw_path`: the path is not normalised (#320).
 	raw_path: bool,
+	/// `http.strict_path`: paths with `%2F`, `%5C`, `%3B`, `%25`, `;` or `\` are refused (#320).
+	strict_path: bool,
 	/// Headers the rule's authentication middlewares set for the backend (`user_header`,
 	/// `oidc`'s, `forward_auth`'s `response_headers`): whatever a client sends under these
 	/// names is dropped from every request, on every route (#320).
@@ -226,6 +228,7 @@ impl Router {
 			secrets,
 			match_headers,
 			raw_path: spec.raw_path,
+			strict_path: spec.strict_path,
 			identity_headers,
 		})
 	}
@@ -251,9 +254,10 @@ impl Router {
 	}
 }
 
-/// Identity headers set by authentication middlewares, as `identity_headers` names them
-/// (also those of middlewares only `servers[].middlewares` use).
-const KNOWN_IDENTITY: [&str; 13] = [
+/// Identity headers set by authentication proxies, which `identity_headers` names for
+/// auth servers that pick their own names: oauth2-proxy (X-Auth-Request-*, X-Forwarded-*),
+/// Authelia (Remote-*) and Authentik (X-Authentik-*).
+const KNOWN_IDENTITY: [&str; 20] = [
 	"x-forwarded-user",
 	"x-forwarded-email",
 	"x-forwarded-groups",
@@ -263,10 +267,17 @@ const KNOWN_IDENTITY: [&str; 13] = [
 	"x-auth-request-email",
 	"x-auth-request-groups",
 	"x-auth-request-preferred-username",
+	"x-auth-request-access-token",
 	"remote-user",
 	"remote-email",
 	"remote-groups",
 	"remote-name",
+	"x-authentik-username",
+	"x-authentik-groups",
+	"x-authentik-email",
+	"x-authentik-name",
+	"x-authentik-uid",
+	"x-authentik-jwt",
 ];
 
 /// Headers a client must not set itself because a middleware of the rule sets them after
@@ -274,17 +285,17 @@ const KNOWN_IDENTITY: [&str; 13] = [
 /// -Groups / -Sub, `forward_auth`'s `response_headers`, and for `forward_auth` with
 /// `response_headers: ["*"]` or `protocol: grpc` (the auth server decides the names) the
 /// usual names of oauth2-proxy, Authelia and Authentik (`KNOWN_IDENTITY`).
-/// Credentials the client sends for the authentication itself (`Authorization`, `Cookie`,
-/// and what a `forward_auth` sends to its server, `request_headers`) are kept.
+/// Only the credentials the client sends for the authentication itself (`Authorization`,
+/// `Proxy-Authorization`, `Cookie`) and `Host` are kept. The names are removed once, before
+/// any middleware, so a value a middleware sets (oidc's) still reaches a later forward_auth.
 fn identity_headers<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Vec<HeaderName> {
-	let middlewares: Vec<&Middleware> = middlewares.collect();
 	let mut out: Vec<HeaderName> = vec![];
 	let mut add = |h: HeaderName| {
 		if !out.contains(&h) {
 			out.push(h);
 		}
 	};
-	for m in &middlewares {
+	for m in middlewares {
 		match m {
 			Middleware::BasicAuth(b) => b.user_header.iter().cloned().for_each(&mut add),
 			Middleware::Oidc(_) => oidc::IDENTITY_HEADERS.into_iter().map(HeaderName::from_static).for_each(&mut add),
@@ -297,13 +308,35 @@ fn identity_headers<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Ve
 			_ => {}
 		}
 	}
-	// what the client sends to authenticate, and what a forward_auth passes to its server
-	let sent = |h: &HeaderName| {
-		matches!(h.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host")
-			|| middlewares.iter().any(|m| matches!(m, Middleware::ForwardAuth(fa) if fa.request_headers.contains(h)))
-	};
-	out.retain(|h| !sent(h));
+	out.retain(|h| !matches!(h.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host"));
 	out
+}
+
+/// Removes the identity headers of the rule from a client's request: the names themselves,
+/// and names that become one of them with `_` read as `-` (CGI / WSGI backends turn both
+/// into `HTTP_X_FORWARDED_USER`).
+fn strip_identity(headers: &mut HeaderMap, identity: &[HeaderName]) {
+	if identity.is_empty() {
+		return;
+	}
+	for h in identity {
+		headers.remove(h);
+	}
+	if !headers.keys().any(|k| k.as_str().contains('_')) {
+		return;
+	}
+	let alike: Vec<HeaderName> = headers
+		.keys()
+		.filter(|k| k.as_str().contains('_'))
+		.filter(|k| {
+			let dashed = k.as_str().replace('_', "-");
+			identity.iter().any(|h| h.as_str() == dashed)
+		})
+		.cloned()
+		.collect();
+	for h in alike {
+		headers.remove(h);
+	}
 }
 
 /// Counts bytes of one client connection into the rule's statistics.
@@ -510,8 +543,15 @@ where
 		let busy = requests.begin();
 		async move {
 			let http1 = req.version() < hyper::Version::HTTP_2;
-			let req = req.map(|b| super::timeouts::IdleBody::new(b, limits.request_body_idle).boxed());
+			// request_body_idle: not for gRPC (streams that stay quiet), and only until the
+			// response head goes out (from then on the exchange may be bidirectional)
+			let watched = limits.request_body_idle.is_some() && !req.body().is_end_stream() && !super::timeouts::is_grpc(req.headers());
+			let responded = watched.then(super::timeouts::Responded::default);
+			let req = req.map(|b| super::timeouts::IdleBody::new(b, limits.request_body_idle, responded.clone()).boxed());
 			let mut resp = conn.handle(req).await;
+			if let Some(r) = &responded {
+				r.set();
+			}
 			// stopping (a graceful shutdown's drain, DELETE with drain, a live
 			// upgrade): tell HTTP/1.1 clients this connection ends with this
 			// response (HTTP/2 gets GOAWAY from graceful_shutdown)
@@ -540,14 +580,18 @@ where
 		_ = stop.cancelled() => served.as_mut().graceful_shutdown(),
 		why = activity.expired(&rx, &limits) => {
 			served.as_mut().graceful_shutdown();
-			let _ = tokio::time::timeout(EXPIRED_GRACE, served.as_mut()).await;
+			// a request that began meanwhile (within GOAWAY's last stream) is let finish
+			if tokio::time::timeout(EXPIRED_GRACE, served.as_mut()).await.is_err() && activity.in_progress() {
+				let _ = served.as_mut().await;
+			}
 			return Ok(why);
 		}
 	}
 	served.await.map(|()| "closed").map_err(io::Error::other)
 }
 
-/// How long a connection past a time limit may take to close after GOAWAY.
+/// How long a connection past a time limit may take to close after GOAWAY when no
+/// request is in progress (requests in progress are always let finish).
 const EXPIRED_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn full(status: StatusCode, text: &str) -> Response<Body> {
@@ -600,12 +644,14 @@ fn request_host<B>(req: &Request<B>) -> Option<String> {
 }
 
 /// Normalises the path of the request target in place (#320, `normalize::path`); the
-/// query stays as sent. Nothing is copied when the path is already normal.
-fn normalize_target(uri: &mut Uri) -> Result<(), super::normalize::InvalidPath> {
+/// query stays as sent. Nothing is copied when the path is already normal; otherwise the
+/// path as sent comes back (for the access log's `raw_path`).
+fn normalize_target(uri: &mut Uri) -> Result<Option<String>, super::normalize::InvalidPath> {
 	let normal = match super::normalize::path(uri.path())? {
-		std::borrow::Cow::Borrowed(_) => return Ok(()),
+		std::borrow::Cow::Borrowed(_) => return Ok(None),
 		std::borrow::Cow::Owned(p) => p,
 	};
+	let raw = uri.path().to_string();
 	let pq = match uri.query() {
 		Some(q) => format!("{normal}?{q}"),
 		None => normal,
@@ -613,7 +659,7 @@ fn normalize_target(uri: &mut Uri) -> Result<(), super::normalize::InvalidPath> 
 	let mut parts = std::mem::take(uri).into_parts();
 	parts.path_and_query = Some(PathAndQuery::try_from(pq).map_err(|_| super::normalize::InvalidPath)?);
 	*uri = Uri::from_parts(parts).map_err(|_| super::normalize::InvalidPath)?;
-	Ok(())
+	Ok(Some(raw))
 }
 
 fn strip_port(host: &str) -> &str {
@@ -730,12 +776,24 @@ impl Conn {
 		};
 		// identities are set by the rule's authentication middlewares alone (#320): a client's
 		// own goes before routing, so a route without authentication cannot receive one either
-		for h in &router.identity_headers {
-			req.headers_mut().remove(h);
-		}
+		strip_identity(req.headers_mut(), &router.identity_headers);
 		// the path routes, middlewares and backends see (#320): /%61dmin, //admin and
-		// /x/../admin are /admin; a broken percent-encoding is answered 400 below
-		let bad_path = !router.raw_path && normalize_target(req.uri_mut()).is_err();
+		// /x/../admin are /admin; a broken percent-encoding (or with http.strict_path a
+		// character backends read differently) is answered 400 below
+		let mut raw_path = None;
+		let bad_path = if router.strict_path && super::normalize::risky(req.uri().path()) {
+			Some("strict_path")
+		} else if router.raw_path {
+			None
+		} else {
+			match normalize_target(req.uri_mut()) {
+				Ok(raw) => {
+					raw_path = raw;
+					None
+				}
+				Err(_) => Some("bad_path"),
+			}
+		};
 		// an ACME CA validating HTTP-01 (global.acme): before routes and middlewares, so a
 		// redirect to HTTPS or an ip_allow does not get in the way
 		if req.uri().path().starts_with(crate::acme::challenge::HTTP_PREFIX) {
@@ -766,7 +824,7 @@ impl Conn {
 		// tls.misdirected: a coalesced HTTP/2 connection (or any) carrying a request for a name of
 		// another group than its TLS server name gets 421, before routing (RFC 9110 §15.5.20)
 		let misdirected = self.misdirected(&host);
-		let refused = misdirected || bad_path;
+		let refused = misdirected || bad_path.is_some();
 		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !refused) {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
 			None if refused => ("", None, &[][..], &[][..], None, None),
@@ -795,6 +853,7 @@ impl Conn {
 				client_cn: self.tls.as_ref().filter(|_| self.client_auth()).and_then(|t| t.client_cn.clone()).unwrap_or_default(),
 				client_verify: self.tls.as_ref().filter(|_| self.client_auth()).map(|t| t.client_verify().to_string()).unwrap_or_default(),
 				proxy_peer: self.proxy_peer.map(|p| p.to_string()).unwrap_or_default(),
+				raw_path: raw_path.unwrap_or_default(),
 				..Default::default()
 			}
 		} else {
@@ -841,9 +900,9 @@ impl Conn {
 		if misdirected {
 			answer = Some(error_response(StatusCode::MISDIRECTED_REQUEST));
 			answered_by = Some(("misdirected", ""));
-		} else if bad_path {
+		} else if let Some(why) = bad_path {
 			answer = Some(error_response(StatusCode::BAD_REQUEST));
-			answered_by = Some(("bad_path", ""));
+			answered_by = Some((why, ""));
 		}
 		// sign-in callbacks and logout of `oidc`, whichever route matched
 		if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {

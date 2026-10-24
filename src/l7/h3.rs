@@ -311,7 +311,11 @@ async fn conn_close(h3: &mut h3::server::Connection<h3_quinn::Connection, Bytes>
 
 async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<Runtime>, body_idle: Option<Duration>) {
 	let (mut send, recv) = stream.split();
-	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone(), body_idle))).await;
+	// request_body_idle: not for gRPC, and only until the response head goes out (#320)
+	let body_idle = body_idle.filter(|_| !super::timeouts::is_grpc(req.headers()));
+	let responded = super::timeouts::Responded::default();
+	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone(), body_idle, responded.clone()))).await;
+	responded.set();
 	if let Err(e) = respond(&mut send, resp, &rt).await {
 		warn!(event = "http.error", rule = %rt.key, error = %e, transport = "quic", "response cut short");
 		// reset the stream: dropping it would finish it (quinn), and the client would
@@ -322,23 +326,34 @@ async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<R
 
 /// The request body, read from the QUIC stream by a task as the backend takes it
 /// (one frame ahead). A client silent for `idle` while it is read ends it with an error.
-fn request_body(mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>, rt: Arc<Runtime>, idle: Option<Duration>) -> Body {
+fn request_body(
+	mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+	rt: Arc<Runtime>,
+	idle: Option<Duration>,
+	responded: super::timeouts::Responded,
+) -> Body {
 	let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
 	let kill = rt.kill.clone();
 	let tracker = rt.tracker.clone();
 	tracker.spawn(async move {
 		let read = async {
 			loop {
-				let data = match idle {
-					Some(limit) => match tokio::time::timeout(limit, recv.recv_data()).await {
-						Ok(d) => d,
-						Err(_) => {
-							recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-							let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
-							return;
+				let data = match idle.filter(|_| !responded.get()) {
+					Some(limit) => {
+						let read = recv.recv_data();
+						tokio::pin!(read);
+						tokio::select! {
+							d = &mut read => Some(d),
+							// once the response is under way the exchange may be bidirectional: keep waiting
+							_ = tokio::time::sleep(limit) => if responded.get() { Some(read.await) } else { None },
 						}
-					},
-					None => recv.recv_data().await,
+					}
+					None => Some(recv.recv_data().await),
+				};
+				let Some(data) = data else {
+					recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+					let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
+					return;
 				};
 				let frame = match data {
 					Ok(Some(mut data)) => {

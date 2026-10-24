@@ -159,6 +159,11 @@ impl Activity {
 		self.begun.load(Ordering::Relaxed)
 	}
 
+	/// Whether a request is in progress.
+	pub fn in_progress(&self) -> bool {
+		self.in_progress.load(Ordering::Acquire) != 0
+	}
+
 	/// Since when nothing is in progress; None while a request is.
 	fn quiet_since(&self) -> Option<Instant> {
 		if self.in_progress.load(Ordering::Acquire) != 0 {
@@ -272,11 +277,36 @@ pub fn body_timed_out() -> BoxError {
 	BoxError::new(BodyTimedOut)
 }
 
+/// A gRPC request (`content-type: application/grpc…`): its streams may stay quiet for
+/// as long as they like (etcd Watch, xDS), so `request_body_idle` does not apply.
+pub fn is_grpc(headers: &hyper::HeaderMap) -> bool {
+	headers
+		.get(hyper::header::CONTENT_TYPE)
+		.is_some_and(|v| v.as_bytes().len() >= 16 && v.as_bytes()[..16].eq_ignore_ascii_case(b"application/grpc"))
+}
+
+/// Set when the response head of a request goes out: from then on its body may be one
+/// direction of a bidirectional exchange, and `request_body_idle` no longer applies.
+#[derive(Clone, Default)]
+pub struct Responded(Arc<std::sync::atomic::AtomicBool>);
+
+impl Responded {
+	pub fn set(&self) {
+		self.0.store(true, Ordering::Release);
+	}
+
+	pub fn get(&self) -> bool {
+		self.0.load(Ordering::Acquire)
+	}
+}
+
 /// A request body that ends with an error when the client sends nothing for `limit`
-/// while it is being read. The timer is made only when a read has to wait.
+/// while it is being read, until the response head has gone out (`responded`). The
+/// timer is made only when a read has to wait.
 pub struct IdleBody<B> {
 	inner: B,
 	limit: Option<Duration>,
+	responded: Option<Responded>,
 	timer: Option<Pin<Box<Sleep>>>,
 	/// The timer runs for the read in progress.
 	armed: bool,
@@ -284,10 +314,12 @@ pub struct IdleBody<B> {
 }
 
 impl<B> IdleBody<B> {
-	pub fn new(inner: B, limit: Option<Duration>) -> Self {
+	/// Without `responded` there is no limit.
+	pub fn new(inner: B, limit: Option<Duration>, responded: Option<Responded>) -> Self {
 		IdleBody {
 			inner,
-			limit,
+			limit: limit.filter(|_| responded.is_some()),
+			responded,
 			timer: None,
 			armed: false,
 			failed: false,
@@ -324,6 +356,12 @@ where
 					this.armed = true;
 				}
 				match this.timer.as_mut().map(|t| t.as_mut().poll(cx)) {
+					// the response is under way: the exchange is bidirectional, wait as long as it takes
+					Some(Poll::Ready(())) if this.responded.as_ref().is_some_and(Responded::get) => {
+						this.limit = None;
+						this.timer = None;
+						Poll::Pending
+					}
 					Some(Poll::Ready(())) => {
 						this.failed = true;
 						Poll::Ready(Some(Err(body_timed_out())))
@@ -383,7 +421,7 @@ mod tests {
 		let inner = http_body_util::StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async move {
 			rx.recv().await.map(|f| (f, rx))
 		}));
-		let mut body = IdleBody::new(Box::pin(inner), Some(MS(300)));
+		let mut body = IdleBody::new(Box::pin(inner), Some(MS(300)), Some(Responded::default()));
 		for _ in 0..4 {
 			let tx = tx.clone();
 			tokio::spawn(async move {
@@ -395,6 +433,33 @@ mod tests {
 		let err = body.frame().await.unwrap().unwrap_err();
 		assert!(err.to_string().contains("request_body_idle"));
 		assert!(body.frame().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn no_limit_once_the_response_is_under_way() {
+		let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(1);
+		let inner = http_body_util::StreamBody::new(futures_util::stream::unfold(rx, |mut rx| async move {
+			rx.recv().await.map(|f| (f, rx))
+		}));
+		let responded = Responded::default();
+		let mut body = IdleBody::new(Box::pin(inner), Some(MS(100)), Some(responded.clone()));
+		responded.set();
+		tokio::spawn(async move {
+			tokio::time::sleep(MS(400)).await;
+			let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"x")))).await;
+		});
+		assert!(body.frame().await.unwrap().is_ok());
+		let mut grpc = hyper::HeaderMap::new();
+		grpc.insert(
+			hyper::header::CONTENT_TYPE,
+			hyper::header::HeaderValue::from_static("application/grpc+proto"),
+		);
+		assert!(is_grpc(&grpc));
+		grpc.insert(
+			hyper::header::CONTENT_TYPE,
+			hyper::header::HeaderValue::from_static("application/json"),
+		);
+		assert!(!is_grpc(&grpc));
 	}
 
 	#[tokio::test]
