@@ -140,6 +140,25 @@ fn mistakes_are_all_reported() {
 	assert!(text.contains("error: rproxy.yaml rule #2:") && text.contains("6 error(s)") && text.contains("NG"), "{text}");
 }
 
+/// A URL whose port is not a number (#324) fails the check (and loading), with the field.
+#[test]
+fn a_url_with_a_bad_port_is_an_error() {
+	let dir = workdir("url");
+	let file = dir.join("rproxy.yaml");
+	let port = free_port();
+	fs::write(
+		&file,
+		format!(
+			"version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {port}, http: {{routes: [{{name: app, match: 'PathPrefix(`/`)', to: 'http://127.0.0.1:8a/'}}]}}}}\n"
+		),
+	)
+	.unwrap();
+	let (code, v) = check_json(&dir, &file);
+	assert_eq!(code, 1, "{v}");
+	let errors = messages(&v, "errors");
+	assert!(errors.contains("route app: to") && errors.contains("port"), "{errors}");
+}
+
 #[test]
 fn a_certificate_close_to_expiry_is_a_warning() {
 	let dir = workdir("expiring");

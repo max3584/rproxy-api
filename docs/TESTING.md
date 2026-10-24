@@ -714,6 +714,7 @@ gh workflow run load.yml -f refs=master,perf/mimalloc -f scenarios=memory,soak -
 | `config` | `config::ConfigDoc::parse`（YAML / JSON）と、ルールごとの `RuleRequest::validate` | 先頭のバイト（偶数: YAML、奇数: JSON）、続けて文書 |
 | `dns_response` | `acme::dnsq::parse_response`：DNS-01 で読む DNS の応答（CNAME・SOA・TXT、名前の圧縮とそのループ） | バイト列そのまま |
 | `tsig_answer` | `acme::rfc2136::verify_answer`：RFC 2136 の UPDATE への応答の TSIG（署名のないもの・作ったものが通らないこと） | バイト列そのまま |
+| `http_url` | `net::url::parse`：rproxy がつなぐ http(s) の URL（#324。設定・API と、OIDC の discovery・ACME のディレクトリのようにインターネットから届くもの）。受け付けた URL は空でないホストと 1〜65535 のポートを持ち、`http::Uri` が同じように読み、読み直しても同じ | バイト列そのまま（UTF-8） |
 | `dpdk_packet` | `rproxy_dpdk::packet` と転送の `rproxy_dpdk::engine`：DPDK の道が受け取るフレーム（Ethernet・ARP・IPv4・UDP・ICMP の echo）。チェックサムの正しい UDP は、書き換えて送ってもチェックサムと中身が正しいまま | フレームごとに 16 ビットの長さを前に付ける |
 
 入力の種は `fuzz/seeds/<ターゲット>/`（`python3 fuzz/gen_seeds.py` で作り直せる。TLS の ClientHello は Python の ssl、QUIC は `tests/fixtures/quic` の RFC 9001 / 9369 の例、設定は `contrib/rproxy.example.yaml` と `docs/en/` の例）。

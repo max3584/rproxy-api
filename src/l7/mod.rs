@@ -660,7 +660,7 @@ impl MiddlewareSpec {
 				..
 			} => {
 				match (address.is_empty(), service) {
-					(false, None) => check_url(address, &format!("middleware {name}"))?,
+					(false, None) => check_url(address, &format!("middleware {name}: address"))?,
 					(true, Some(s)) => {
 						let Some(svc) = services.get(s) else {
 							return bad(format!("service {s:?} is not defined"));
@@ -699,7 +699,7 @@ impl MiddlewareSpec {
 				Ok(())
 			}
 			MiddlewareSpec::Oidc { issuer, client_id, callback_path, logout_path, cookie_name, .. } => {
-				check_url(issuer, &format!("middleware {name}: issuer"))?;
+				crate::net::url::parse_base(issuer).map_err(|e| invalid(format!("middleware {name}: issuer: {issuer:?} {e}")))?;
 				if client_id.is_empty() {
 					return bad("client_id is empty".into());
 				}
@@ -751,15 +751,9 @@ pub(crate) fn parse_status_range(s: &str) -> Result<(u16, u16), String> {
 	}
 }
 
+/// An http(s) URL rproxy connects to, read as at run time (`net::url`, #324).
 fn check_url(url: &str, what: &str) -> Result<(), ApiError> {
-	let rest = url
-		.strip_prefix("http://")
-		.or_else(|| url.strip_prefix("https://"))
-		.ok_or_else(|| invalid(format!("{what}: {url:?} must start with http:// or https://")))?;
-	if rest.is_empty() || rest.starts_with('/') {
-		return Err(invalid(format!("{what}: {url:?} has no host")));
-	}
-	Ok(())
+	crate::net::url::parse(url).map(|_| ()).map_err(|e| invalid(format!("{what}: {url:?} {e}")))
 }
 
 impl HttpSpec {
@@ -772,7 +766,7 @@ impl HttpSpec {
 			for (i, s) in svc.servers.iter().enumerate() {
 				let what = format!("service {name}: servers[{i}]");
 				match (s.url.is_empty(), s.status) {
-					(false, None) => check_url(&s.url, &format!("service {name}"))?,
+					(false, None) => check_url(&s.url, &format!("{what}.url"))?,
 					(true, Some(st)) if (100..=599).contains(&st) => {
 						if !s.middlewares.is_empty() {
 							return Err(invalid(format!("{what}: a status entry takes no middlewares")));
@@ -869,7 +863,7 @@ impl HttpSpec {
 				(Some(s), None) if !self.services.contains_key(s) => {
 					return Err(invalid(format!("route {}: service {s:?} is not defined", r.name)));
 				}
-				(None, Some(to)) => check_url(to, &format!("route {}", r.name))?,
+				(None, Some(to)) => check_url(to, &format!("route {}: to", r.name))?,
 				(None, None) if !answered => {
 					return Err(invalid(format!("route {}: needs service or to (or a redirect / respond middleware)", r.name)));
 				}

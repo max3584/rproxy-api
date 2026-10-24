@@ -539,11 +539,10 @@ fn forward_auth(label: &str, spec: &MiddlewareSpec, services: &std::collections:
 				protocol: if grpc { super::UpstreamProtocol::H2c } else { Default::default() },
 				tls: None,
 			};
-			let uri: Uri = address.parse().map_err(|e| ApiError::invalid(format!("{what}: address: {e}")))?;
-			let path = match uri.path_and_query().map(|p| p.as_str()) {
-				Some(p) if !p.is_empty() => p.to_string(),
-				_ => "/".to_string(),
-			};
+			let path = crate::net::url::parse(address)
+				.map_err(|e| ApiError::invalid(format!("{what}: address: {address:?} {e}")))?
+				.path_and_query()
+				.to_string();
 			(Arc::new(Service::compile(label, &spec, &Default::default())?), path, true)
 		}
 	};

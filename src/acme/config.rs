@@ -294,8 +294,8 @@ impl AcmeGlobal {
 				return Err(here("names are letters, digits, '-' and '_'"));
 			}
 			if let Some(d) = &a.directory {
-				if !(d.starts_with("https://") || d.starts_with("http://")) {
-					return Err(here("directory must be an http(s) URL"));
+				if let Err(e) = crate::net::url::parse(d) {
+					return Err(here(&format!("directory {d:?} {e}")));
 				}
 			}
 			for c in &a.contact {
@@ -329,7 +329,7 @@ impl AcmeGlobal {
 			if let Some(f) = p.set_fields().into_iter().find(|f| !fields.contains(f)) {
 				return Err(here(&format!("{f} is not used with type {} (it takes {})", p.kind, fields.join(", "))));
 			}
-			let http_url = |u: &str| u.starts_with("http://") || u.starts_with("https://");
+			let http_url = |u: &str| crate::net::url::parse(u).is_ok();
 			match p.kind.as_str() {
 				"powerdns" => {
 					if p.api_url.is_none() || p.api_key_file.is_none() {
@@ -366,8 +366,10 @@ impl AcmeGlobal {
 						return Err(here("type http needs add and remove"));
 					};
 					for (what, call) in [("add", add), ("remove", remove)] {
-						if !(call.url.starts_with("http://") || call.url.starts_with("https://")) {
-							return Err(here(&format!("{what}.url must be an http(s) URL")));
+						// the placeholders stand for names and values, read as one label
+						let sample = ["{fqdn}", "{value}", "{zone}", "{secret}"].iter().fold(call.url.clone(), |u, p| u.replace(p, "x"));
+						if let Err(e) = crate::net::url::parse(&sample) {
+							return Err(here(&format!("{what}.url must be an http(s) URL: {e}")));
 						}
 						if let Some(m) = &call.method {
 							if m.parse::<hyper::Method>().is_err() {

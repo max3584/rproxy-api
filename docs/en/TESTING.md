@@ -714,6 +714,7 @@ The parts that read what arrives from the internet with rproxy's own code are ch
 | `config` | `config::ConfigDoc::parse` (YAML / JSON) and `RuleRequest::validate` for each rule | A first byte (even: YAML, odd: JSON), then the document |
 | `dns_response` | `acme::dnsq::parse_response`: DNS answers read for DNS-01 (CNAME, SOA, TXT, name compression and its loops) | The bytes as they are |
 | `tsig_answer` | `acme::rfc2136::verify_answer`: the TSIG of answers to RFC 2136 updates (nothing unsigned or forged passes) | The bytes as they are |
+| `http_url` | `net::url::parse`: the http(s) URLs rproxy connects to (#324; from settings and the API, and from the internet like an OIDC discovery document or an ACME directory). An accepted URL has a non-empty host and a port between 1 and 65535, `http::Uri` reads it the same way, and it reads the same again | The bytes as they are (UTF-8) |
 | `dpdk_packet` | `rproxy_dpdk::packet` and the forwarder `rproxy_dpdk::engine`: frames the DPDK path receives (Ethernet, ARP, IPv4, UDP, ICMP echo). A UDP datagram with right checksums keeps right checksums and its payload when rewritten and passed on | Frames, each prefixed with a 16-bit length |
 
 The seeds are in `fuzz/seeds/<target>/` (rebuilt with `python3 fuzz/gen_seeds.py`: TLS ClientHellos from Python's ssl, QUIC from the RFC 9001 / 9369 examples in `tests/fixtures/quic`, settings from `contrib/rproxy.example.yaml` and the examples in `docs/en/`).
