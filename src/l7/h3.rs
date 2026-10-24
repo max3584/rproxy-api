@@ -19,8 +19,6 @@ use super::server::{Body, BoxError, Conn};
 use crate::core::proxy::Runtime;
 use crate::net::source::TlsInfo;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The QUIC side of a rule: whether it listens, and why not.
 #[derive(Default)]
 pub struct H3State {
@@ -220,13 +218,19 @@ async fn connection(connecting: quinn::Connecting, client: SocketAddr, local: So
 }
 
 async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAddr, rt: &Arc<Runtime>) -> Result<&'static str, String> {
-	let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
-		Ok(Ok(c)) => c,
-		Ok(Err(e)) => {
+	// global.http.timeouts (#320)
+	let limits = rt.global.timeouts();
+	let handshake = match limits.tls_handshake {
+		Some(limit) => tokio::time::timeout(limit, connecting).await.ok(),
+		None => Some(connecting.await),
+	};
+	let conn = match handshake {
+		Some(Ok(c)) => c,
+		Some(Err(e)) => {
 			rt.stats.tls_failed();
 			return Err(format!("QUIC handshake: {e}"));
 		}
-		Err(_) => {
+		None => {
 			rt.stats.tls_failed();
 			return Err("QUIC handshake timed out".into());
 		}
@@ -257,15 +261,37 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 		.build::<_, Bytes>(h3_quinn::Connection::new(conn))
 		.await
 		.map_err(|e| format!("HTTP/3: {e}"))?;
+	// requests in progress: a connection without any for `idle` is closed (#320; QUIC's own
+	// idle timeout does not see a client that keeps the connection with PINGs)
+	let activity = super::timeouts::Activity::new();
 	loop {
-		match h3.accept().await {
+		let accepted = match limits.idle {
+			// waiting in accept() keeps its state in the connection: safe to give up
+			Some(idle) => tokio::select! {
+				a = h3.accept() => a,
+				_ = activity.idle(idle) => {
+					conn_close(&mut h3).await;
+					return Ok("idle");
+				}
+			},
+			None => h3.accept().await,
+		};
+		match accepted {
 			Ok(Some(resolver)) => {
 				let handler = handler.clone();
 				let rt2 = rt.clone();
+				let busy = activity.begin();
 				rt.tracker.spawn(async move {
-					match resolver.resolve_request().await {
-						Ok((req, stream)) => request(handler, req, stream, rt2).await,
-						Err(e) => warn!(event = "http.error", rule = %rt2.key, error = %e, transport = "quic", "bad request"),
+					let _busy = busy;
+					// the request's headers (request_headers)
+					let resolved = match limits.request_headers {
+						Some(limit) => tokio::time::timeout(limit, resolver.resolve_request()).await.ok(),
+						None => Some(resolver.resolve_request().await),
+					};
+					match resolved {
+						Some(Ok((req, stream))) => request(handler, req, stream, rt2, limits.request_body_idle).await,
+						Some(Err(e)) => warn!(event = "http.error", rule = %rt2.key, error = %e, transport = "quic", "bad request"),
+						None => warn!(event = "http.error", rule = %rt2.key, error = "request headers timed out", transport = "quic", "bad request"),
 					}
 				});
 			}
@@ -278,9 +304,18 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 
 type Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
-async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<Runtime>) {
+/// Closes an idle HTTP/3 connection: GOAWAY, then the QUIC connection.
+async fn conn_close(h3: &mut h3::server::Connection<h3_quinn::Connection, Bytes>) {
+	let _ = tokio::time::timeout(Duration::from_secs(1), h3.shutdown(0)).await;
+}
+
+async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<Runtime>, body_idle: Option<Duration>) {
 	let (mut send, recv) = stream.split();
-	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone()))).await;
+	// request_body_idle: not for gRPC, and only until the response head goes out (#320)
+	let body_idle = body_idle.filter(|_| !super::timeouts::is_grpc(req.headers()));
+	let responded = super::timeouts::Responded::default();
+	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone(), body_idle, responded.clone()))).await;
+	responded.set();
 	if let Err(e) = respond(&mut send, resp, &rt).await {
 		warn!(event = "http.error", rule = %rt.key, error = %e, transport = "quic", "response cut short");
 		// reset the stream: dropping it would finish it (quinn), and the client would
@@ -290,15 +325,37 @@ async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<R
 }
 
 /// The request body, read from the QUIC stream by a task as the backend takes it
-/// (one frame ahead).
-fn request_body(mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>, rt: Arc<Runtime>) -> Body {
+/// (one frame ahead). A client silent for `idle` while it is read ends it with an error.
+fn request_body(
+	mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
+	rt: Arc<Runtime>,
+	idle: Option<Duration>,
+	responded: super::timeouts::Responded,
+) -> Body {
 	let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(1);
 	let kill = rt.kill.clone();
 	let tracker = rt.tracker.clone();
 	tracker.spawn(async move {
 		let read = async {
 			loop {
-				let frame = match recv.recv_data().await {
+				let data = match idle.filter(|_| !responded.get()) {
+					Some(limit) => {
+						let read = recv.recv_data();
+						tokio::pin!(read);
+						tokio::select! {
+							d = &mut read => Some(d),
+							// once the response is under way the exchange may be bidirectional: keep waiting
+							_ = tokio::time::sleep(limit) => if responded.get() { Some(read.await) } else { None },
+						}
+					}
+					None => Some(recv.recv_data().await),
+				};
+				let Some(data) = data else {
+					recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+					let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
+					return;
+				};
+				let frame = match data {
 					Ok(Some(mut data)) => {
 						let bytes = data.copy_to_bytes(data.remaining());
 						rt.stats.add_rx(bytes.len() as u64);

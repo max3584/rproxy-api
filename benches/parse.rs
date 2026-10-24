@@ -1,6 +1,7 @@
 //! CPU-only benchmarks (no sockets): the `match` expressions of L7 routes, the
-//! TLS ClientHello walk of `sni` rules, the QUIC Initial of UDP `sni` rules and the
-//! PROXY v2 header in front of each datagram of a UDP rule with `proxy_protocol`.
+//! TLS ClientHello walk of `sni` rules, the QUIC Initial of UDP `sni` rules, the
+//! PROXY v2 header in front of each datagram of a UDP rule with `proxy_protocol`, and
+//! the normalisation of request paths before routing (#320).
 //! Run with `cargo bench --bench parse`; CI compares a PR with its merge base
 //! (.github/workflows/bench.yml, docs/TESTING.md).
 
@@ -27,6 +28,20 @@ const ROUTES: &[&str] = &[
 	"Host(`api.example.com`) && PathPrefix(`/v1/`) && Query(`debug`)",
 	"Host(`api.example.com`) && PathPrefix(`/v2/`) && (Method(`GET`) || Method(`HEAD`)) && HeaderRegexp(`accept`, `json`)",
 ];
+
+/// The path check every L7 request goes through (#320): an already normal path is only
+/// scanned (borrowed, nothing allocated); one with escapes and dot segments is rebuilt.
+fn path_normalize(c: &mut Criterion) {
+	use rproxy_api::l7::normalize;
+	let mut g = c.benchmark_group("path_normalize");
+	g.throughput(Throughput::Elements(1));
+	let normal = "/api/v2/projects/42/issues/%E3%81%82/comments.json";
+	assert!(matches!(normalize::path(normal), Ok(std::borrow::Cow::Borrowed(_))));
+	g.bench_function("normal", |b| b.iter(|| normalize::path(black_box(normal)).map(|p| p.len())));
+	let odd = "/api//v2/./projects/%34%32/../42/issues/%e3%81%82/comments.json";
+	g.bench_function("rebuilt", |b| b.iter(|| normalize::path(black_box(odd)).map(|p| p.len())));
+	g.finish();
+}
 
 fn matcher(c: &mut Criterion) {
 	let mut g = c.benchmark_group("matcher");
@@ -140,6 +155,6 @@ fn config() -> Criterion {
 criterion_group! {
 	name = benches;
 	config = config();
-	targets = matcher, clienthello, quic, proxy_dgram
+	targets = matcher, path_normalize, clienthello, quic, proxy_dgram
 }
 criterion_main!(benches);

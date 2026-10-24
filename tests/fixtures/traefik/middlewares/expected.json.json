@@ -358,6 +358,7 @@
         ]
       },
       "http": {
+        "raw_path": true,
         "routes": [
           {
             "name": "admin",

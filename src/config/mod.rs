@@ -77,6 +77,9 @@ pub struct GlobalSpec {
 	/// The owner check of the files rules and settings name (v0.4, `net::files`).
 	#[serde(default)]
 	pub files: Option<crate::net::files::FilesGlobal>,
+	/// Time limits of the client connections of `http` rules (#320, v0.4.17).
+	#[serde(default)]
+	pub http: Option<crate::l7::timeouts::HttpGlobalSpec>,
 }
 
 impl GlobalSpec {
@@ -280,6 +283,9 @@ impl ConfigDoc {
 		if a.performance != b.performance {
 			out.push("global.performance");
 		}
+		if a.http != b.http {
+			out.push("global.http");
+		}
 		out
 	}
 
@@ -303,6 +309,9 @@ impl ConfigDoc {
 		}
 		if let Some(p) = &self.global.performance {
 			p.check()?;
+		}
+		if let Some(h) = &self.global.http {
+			h.check()?;
 		}
 		// geoip lists (rules and middlewares) need the databases of global.geoip
 		for (i, r) in self.rules.iter().enumerate() {
@@ -488,6 +497,9 @@ rules:
 		assert!(a.restart_needed(&b).is_empty());
 		let c = ConfigDoc::parse(Path::new("c.yaml"), "version: 1\nglobal: {access_log: /tmp/a.log}").unwrap();
 		assert_eq!(c.restart_needed(&a), ["global.trusted_proxies", "global.access_log"]);
+		let d = ConfigDoc::parse(Path::new("d.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8], http: {timeouts: {idle: 5m}}}").unwrap();
+		assert_eq!(d.restart_needed(&a), ["global.http"]);
+		assert_eq!(d.global.http.unwrap().timeouts().idle, Some(std::time::Duration::from_secs(300)));
 	}
 
 	#[test]
@@ -502,6 +514,8 @@ rules:
 				"not in allowed_names",
 			),
 			("version: 1\nglobl: {}", "unknown field"),
+			("version: 1\nglobal: {http: {timeouts: {idle: soon}}}", "global.http.timeouts.idle"),
+			("version: 1\nglobal: {http: {timeouts: {idel: 1s}}}", "unknown field"),
 			(
 				"version: 1\nrules: [{protocol: tcp, listen_addr: 0.0.0.0, listen_port: 443, remote_addr: a, remote_port: 1, tls: {mode: terminate, certificates: [{acme: le, domains: [a]}]}}]",
 				"not defined in global.acme",

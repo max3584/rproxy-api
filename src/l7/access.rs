@@ -37,11 +37,13 @@ pub struct HttpGlobal {
 	crowdsec: Option<Arc<Bouncer>>,
 	/// `global.geoip`: the databases of the `geoip` lists (#168).
 	geoip: Option<Arc<crate::net::geoip::Geoip>>,
+	/// `global.http.timeouts` (#320).
+	timeouts: super::timeouts::HttpTimeouts,
 }
 
 impl Default for HttpGlobal {
 	fn default() -> Self {
-		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None, geoip: None }
+		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None, geoip: None, timeouts: Default::default() }
 	}
 }
 
@@ -69,7 +71,7 @@ impl HttpGlobal {
 	pub fn new(trusted_proxies: &[String], access_log: Option<&Path>, keep_files: usize) -> Result<Self, AccessLogError> {
 		let trusted_proxies = cidr::parse_list(trusted_proxies).map_err(|e| AccessLogError::Config(e.message))?;
 		let Some(path) = access_log else {
-			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, crowdsec: None, geoip: None });
+			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, ..Default::default() });
 		};
 		let dir = access_log_dir(path)?;
 		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("access");
@@ -82,12 +84,12 @@ impl HttpGlobal {
 			.build(dir)
 			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
 		let (writer, guard) = tracing_appender::non_blocking(appender);
-		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, crowdsec: None, geoip: None })
+		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, ..Default::default() })
 	}
 
 	/// Same as `new` without an access log file, for when it cannot be written.
 	pub fn without_file(trusted_proxies: &[String]) -> Self {
-		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), sink: Sink::Log, crowdsec: None, geoip: None }
+		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), ..Default::default() }
 	}
 
 	/// Attaches the CrowdSec bouncer of `global.crowdsec`.
@@ -108,6 +110,16 @@ impl HttpGlobal {
 
 	pub fn geoip(&self) -> Option<&Arc<crate::net::geoip::Geoip>> {
 		self.geoip.as_ref()
+	}
+
+	/// Sets the time limits of client connections (`global.http.timeouts`, #320).
+	pub fn with_timeouts(mut self, timeouts: super::timeouts::HttpTimeouts) -> Self {
+		self.timeouts = timeouts;
+		self
+	}
+
+	pub fn timeouts(&self) -> super::timeouts::HttpTimeouts {
+		self.timeouts
 	}
 
 	/// The country (and ASN) of a client for the logs, when `global.geoip.log_country` is on.
@@ -158,7 +170,8 @@ impl HttpGlobal {
 				client_cn = (!entry.client_cn.is_empty()).then_some(entry.client_cn.as_str()),
 				client_verify = (!entry.client_verify.is_empty()).then_some(entry.client_verify.as_str()),
 				country = (!entry.country.is_empty()).then_some(entry.country.as_str()), asn = entry.asn,
-				proxy_peer = (!entry.proxy_peer.is_empty()).then_some(entry.proxy_peer.as_str())),
+				proxy_peer = (!entry.proxy_peer.is_empty()).then_some(entry.proxy_peer.as_str()),
+				raw_path = (!entry.raw_path.is_empty()).then_some(entry.raw_path.as_str())),
 			Sink::File { writer, .. } => {
 				let mut line = serde_json::to_vec(&FileLine { timestamp: now(), event: "http.access", entry }).unwrap_or_default();
 				line.push(b'\n');
@@ -241,6 +254,10 @@ pub struct AccessEntry {
 	/// client is `client`; left out without one.
 	#[serde(skip_serializing_if = "String::is_empty")]
 	pub proxy_peer: String,
+	/// The path as the client sent it, when the normalisation before routing changed it
+	/// (#320; `path` is the normalised one); left out otherwise.
+	#[serde(skip_serializing_if = "String::is_empty")]
+	pub raw_path: String,
 }
 
 #[derive(Serialize)]
