@@ -346,6 +346,24 @@ async fn the_authority_of_an_absolute_form_request_wins_over_host() {
 }
 
 #[tokio::test]
+async fn the_backend_gets_the_normalised_path_and_the_query_as_sent() {
+	// #320 (tests/path_normalize.rs has the routing side): unreserved escapes decoded,
+	// `.` / `..` / `//` resolved, reserved escapes kept (upper case), the query untouched
+	let s = setup("sem-normalise", json!({})).await;
+	let (status, _, body) = h1_fields(&s.h1_raw(b"GET /a/./b/../%63//d%2fe?x=/../%2e HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await);
+	assert_eq!(status, 200);
+	assert_eq!(json_body(&body)["uri"], "/a/c/d%2Fe?x=/../%2e");
+	let mut h2 = s.h2().await;
+	let (status, _, body) = h2_send(&mut h2, hyper::Request::get("https://a.test//x/%2E%2E/y/").body(empty()).unwrap()).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(json_body(&body)["uri"], "/y/");
+	let (mut h3, _ep) = s.h3().await;
+	let (status, _, body) = h3_get(&mut h3, hyper::Request::get("https://a.test/%7e/../q?r=%7e").body(()).unwrap()).await;
+	assert_eq!(status, StatusCode::OK);
+	assert_eq!(json_body(&body)["uri"], "/q?r=%7e");
+}
+
+#[tokio::test]
 async fn large_cookies_fit_on_every_protocol() {
 	let s = setup("sem-bigheaders", json!({})).await;
 	// browsers keep sending cookies up to about 4 KB each; with a few sites' worth of

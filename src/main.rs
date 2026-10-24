@@ -935,7 +935,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if let Some(g) = &geoip {
 		g.spawn();
 	}
-	let http_global = http_global.with_crowdsec(crowdsec.clone()).with_geoip(geoip.clone());
+	let http_timeouts = doc.as_ref().and_then(|(_, d)| d.global.http.as_ref()).map(|h| h.timeouts()).unwrap_or_default();
+	let http_global = http_global.with_crowdsec(crowdsec.clone()).with_geoip(geoip.clone()).with_timeouts(http_timeouts);
 	// global.acme: certificates of `tls.certificates[].acme`, obtained and renewed in the background
 	let acme = match doc.as_ref().and_then(|(path, d)| d.global.acme.as_ref().map(|a| (path, a))) {
 		Some((path, a)) => Some(rproxy_api::acme::Acme::new(a).map_err(|e| format!("{}: {e}", path.display()))?),

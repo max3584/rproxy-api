@@ -148,6 +148,16 @@ def main():
         ]
     ):
         put("matcher", f"expr-{i}", expr + request)
+    # path_normalize (#320): a path, then a host
+    for name, path in [
+        ("normal", "/api/v1/items%2Fx?q=1\napi.example.com"),
+        ("bypass-escape", "/%61dmin\nadmin.example.com."),
+        ("bypass-dots", "/x/./../%2e%2E//admin/.\n"),
+        ("above-root", "/../../a/b/..\nEXAMPLE.com."),
+        ("broken-escape", "/a%2\n"),
+        ("asterisk", "*\n"),
+    ]:
+        put("path_normalize", name, path)
     # just past the limits (#180): nesting 33 deep, 257 matchers
     put("matcher", "limit-not", "!" * 33 + "Host(`a`)" + request)
     put("matcher", "limit-paren", "(" * 33 + "Host(`a`)" + ")" * 33 + request)

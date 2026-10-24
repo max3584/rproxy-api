@@ -3,6 +3,7 @@
 #
 # Not converted / to check:
 # - providers.docker: Docker labels are read only with --docker (docker inspect output)
+# - entryPoints.admin: http.sanitizePath: false: raw_path keeps paths as sent; unsafe with path-based authentication routes
 # - entryPoints.admin: forwardedHeaders.insecure: list the proxies in global.trusted_proxies instead
 # - middleware security: forceSTSHeader: rproxy sends HSTS only on HTTPS
 # - middleware security: headers.isDevelopment is not converted
@@ -281,6 +282,7 @@ rules:
     - h2
     - http/1.1
   http:
+    raw_path: true
     routes:
     - name: admin
       match: Host(`admin.example.com`) && ClientIP(`192.0.2.0/24`)
