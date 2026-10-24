@@ -415,7 +415,10 @@ impl std::str::FromStr for Api {
 	fn from_str(api: &str) -> Result<Api, String> {
 		match api.strip_prefix("unix:") {
 			Some(path) if path.starts_with('/') => Ok(Api::Unix(path.into())),
-			None if api.starts_with("http://") || api.starts_with("https://") => Ok(Api::Url(api.trim_end_matches('/').to_string())),
+			None if api.starts_with("http://") || api.starts_with("https://") => match crate::net::url::parse_base(api) {
+				Ok(_) => Ok(Api::Url(api.trim_end_matches('/').to_string())),
+				Err(e) => Err(format!("--diff-api {api:?} {e}")),
+			},
 			_ => Err(format!("--diff-api {api:?} must be unix:/path or an http(s):// URL")),
 		}
 	}
@@ -625,6 +628,10 @@ mod tests {
 		assert_eq!("https://127.0.0.1:8080/".parse::<Api>().unwrap(), Api::Url("https://127.0.0.1:8080".into()));
 		assert!("ftp://x".parse::<Api>().unwrap_err().contains("--diff-api"));
 		assert!("unix:relative".parse::<Api>().is_err());
+		// read as the request will be (#324)
+		for bad in ["http://127.0.0.1:8a", "https://127.0.0.1:65536/", "http://u@127.0.0.1:8080", "http://127.0.0.1:8080/?x"] {
+			assert!(bad.parse::<Api>().unwrap_err().contains("--diff-api"), "{bad}");
+		}
 	}
 
 	#[test]

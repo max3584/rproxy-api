@@ -7,9 +7,11 @@
 //! never disagree on where a URL goes:
 //! - `http://` or `https://` (lower case) only;
 //! - visible ASCII only: no whitespace, control characters, non-ASCII or `\`
-//!   (which WHATWG reads as `/`), and no `#` (fragments are never sent);
+//!   (which WHATWG reads as `/`), and no `#` (fragments are never sent); base URLs
+//!   that paths are appended to ([`parse_base`]) take no query either;
 //! - no userinfo (`user:pass@`): it would end up in `Host`, and WHATWG strips it;
-//! - a host that is not empty: a name of letters, digits, `-`, `_` and `.`, an
+//! - a host that is not empty: a name of letters, digits, `-`, `_` and `.` (no empty
+//!   label, no `-` at either end of a label), an
 //!   IPv4 address in the dotted-quad form only (WHATWG reads `127.1` or `0x7f.1`
 //!   as addresses, resolvers may not), or an IPv6 literal in `[]` without a zone ID;
 //! - a port, when given, of decimal digits between 1 and 65535 (`:`, `:0`,
@@ -119,10 +121,25 @@ pub fn parse(url: &str) -> Result<HttpUrl, String> {
 	})
 }
 
+/// [`parse`] for a base URL that rproxy appends paths to (`oidc.issuer`, the CrowdSec
+/// LAPI and AppSec): no query either, which would end up before the appended path.
+pub fn parse_base(url: &str) -> Result<HttpUrl, String> {
+	let u = parse(url)?;
+	if u.uri.query().is_some() || url.contains('?') {
+		return Err("must not have a query (?): paths are appended to it".into());
+	}
+	Ok(u)
+}
+
 /// A host name or a dotted-quad IPv4 address.
 fn check_name(host: &str) -> Result<(), String> {
 	if let Some(c) = host.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))) {
 		return Err(format!("host {host:?} contains {c:?}"));
+	}
+	// labels (one trailing dot, a fully qualified name, is allowed): not empty, no - at either end
+	let labels = host.strip_suffix('.').unwrap_or(host);
+	if labels.split('.').any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-')) {
+		return Err(format!("host {host:?} has an empty label or one that starts or ends with -"));
 	}
 	// WHATWG reads a host whose last label is a number (decimal or 0x) as an IPv4
 	// address, in forms (127.1, 0x7f.1, 010.0.0.1) resolvers read otherwise
@@ -169,6 +186,17 @@ mod tests {
 	}
 
 	#[test]
+	fn base_urls_take_no_query() {
+		assert_eq!(parse_base("https://id.example/realms/x").unwrap().path_and_query(), "/realms/x");
+		assert!(parse_base("http://a-b.example:8080/").is_ok());
+		for url in ["https://id.example/realms/x?a=1", "http://127.0.0.1:8080?", "http://a/?"] {
+			let e = parse_base(url).err().unwrap_or_else(|| panic!("{url:?} was accepted"));
+			assert!(e.contains("query"), "{url:?}: {e}");
+		}
+		assert!(parse_base("http://a/#x").unwrap_err().contains("#"));
+	}
+
+	#[test]
 	fn ports_hosts_and_characters_other_parsers_read_otherwise_are_refused() {
 		for (url, why) in [
 			("http://127.0.0.1:8a/", "port"),
@@ -205,6 +233,13 @@ mod tests {
 			("http://010.0.0.1/", "IPv4"),
 			("http://1.2.3.4./", "IPv4"),
 			("http://2130706433/", "IPv4"),
+			("http://./", "label"),
+			("http://a..b/", "label"),
+			("http://.a/", "label"),
+			("http://a.b../", "label"),
+			("http://-/", "label"),
+			("http://-a.example/", "label"),
+			("http://a-.example/", "label"),
 			("HTTP://a/", "http://"),
 			("ftp://a/", "http://"),
 			("a:80", "http://"),

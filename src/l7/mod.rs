@@ -688,7 +688,7 @@ impl MiddlewareSpec {
 				Ok(())
 			}
 			MiddlewareSpec::Oidc { issuer, client_id, callback_path, logout_path, cookie_name, .. } => {
-				check_url(issuer, &format!("middleware {name}: issuer"))?;
+				crate::net::url::parse_base(issuer).map_err(|e| invalid(format!("middleware {name}: issuer: {issuer:?} {e}")))?;
 				if client_id.is_empty() {
 					return bad("client_id is empty".into());
 				}

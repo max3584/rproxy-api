@@ -408,9 +408,11 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - `http://` か `https://`（小文字）で始まる。
   - 見える ASCII の文字だけ（空白・制御文字・ASCII 以外は不可）。`\`（WHATWG は `/` と読む）と `#`（フラグメント）も不可。
   - ユーザー情報（`user:pass@`）は不可（`Host` に入ってしまい、WHATWG は取り除く）。
-  - ホストは空でない。名前は英数字・`-`・`_`・`.`、IPv4 は `a.b.c.d` の形だけ（`127.1`・`0x7f.0.0.1`・`010.0.0.1` のように最後のラベルが数字で、この形でないものは不可）、IPv6 は `[...]` でゾーン ID（`%25eth0`）なし。
+  - ホストは空でない。名前は英数字・`-`・`_`・`.`（空のラベル（`a..b`・`.`）と、`-` で始まる・終わるラベルは不可。末尾の `.` 1 つは可）、IPv4 は `a.b.c.d` の形だけ（`127.1`・`0x7f.0.0.1`・`010.0.0.1` のように最後のラベルが数字で、この形でないものは不可）、IPv6 は `[...]` でゾーン ID（`%25eth0`）なし。
   - ポートを書くなら 1〜65535 の 10 進の数字（`:`・`:0`・`:65536`・`:8a` は不可。v0.4.16 までは、こうした URL をポートなしとして 80 / 443 につないでいた）。
-  - OIDC の issuer が `https://` なら、discovery の `authorization_endpoint`・`token_endpoint`・`jwks_uri`・`end_session_endpoint` も `https://`。
+  - 後ろにパスを付ける URL（`oidc.issuer`・`lapi_url`・`appsec_url`・`--diff-api`）はクエリ（`?`）も不可。
+  - OIDC の issuer が `https://` なら、discovery の `authorization_endpoint`・`token_endpoint`・`jwks_uri`・`end_session_endpoint` も `https://`。必須のエンドポイントが外れたら discovery の失敗、任意の `end_session_endpoint` が外れたら警告（`oidc.error`）を出してないものとして扱う（ログアウトは `/` へ）。
+  - `RPROXY_UPDATE_SOURCE`（`https://` だけ）と `--check-config --diff-api` の URL も同じ読み方で、外れたら起動・`--check-config` の誤り。
 - 転送先とは HTTP/1.1 で話す（サービスの `protocol` で HTTP/2 も。下の「Gateway API 向けの L7・TLS」）。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。サービスに `tls`（#236）があれば、そのサービスでは `tls.upstream` の代わりにそれを使う。
 - 転送先への接続は、応答の本文を読み終えたあと、次のリクエストに使い回す（転送先ごとに待機中の接続は 1024 本まで、使われないまま 4 秒たったものは閉じる。`source_ip: transparent` のルールでは、送信元がクライアントごとに違うので使い回さない）。使い回そうとした接続を転送先が閉じていたら、新しい接続で送り直す。
 - `health_check`（v0.3.2）: `interval`（既定 `10s`）ごとに各 `servers` へ `GET <URLのパス><path>`（`Host` は転送先のホスト）を送り、`timeout`（既定 `3s`）以内に 2xx / 3xx が返れば up、そうでなければ down。down の転送先はラウンドロビンから外し、戻れば入れる。最初の確認までは up として扱う。すべて down なら 503。状態が変わると `event: "http.health"` のログ（`service`、`server`、`up`、down の理由の `error`）。ルールの `stats.http.services.<サービス名>` に `[{"url","up"}]`、`/metrics` に `rproxy_http_server_up{protocol,listen,service,server}`（1 / 0）。サービスの転送先がすべて down なら、ルールの `down_services` にサービスの名前が入り、`rproxy_http_service_down{protocol,listen,service}` が 1（v0.3.20）。

@@ -402,7 +402,12 @@ impl Oidc {
 				authorization: endpoint("authorization_endpoint", need("authorization_endpoint")?)?,
 				token: endpoint("token_endpoint", need("token_endpoint")?)?,
 				jwks: endpoint("jwks_uri", need("jwks_uri")?)?,
-				end_session: s("end_session_endpoint").map(|v| endpoint("end_session_endpoint", v)).transpose()?,
+				// optional: one that does not pass is left out (logout then goes home), not fatal
+				end_session: s("end_session_endpoint").and_then(|v| {
+					endpoint("end_session_endpoint", v)
+						.map_err(|e| warn!(event = "oidc.error", middleware = %self.name, error = %e, "end_session_endpoint ignored"))
+						.ok()
+				}),
 			})
 		});
 		match found {

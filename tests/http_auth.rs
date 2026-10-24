@@ -337,20 +337,22 @@ impl Provider {
 type Shared = Arc<Mutex<Provider>>;
 
 async fn provider(signer: Signer) -> (Shared, String) {
-	provider_with_jwks(signer, None).await
+	provider_with(signer, None, None).await
 }
 
-/// `jwks_uri`: what the discovery document says instead of `{base}/jwks`.
-async fn provider_with_jwks(signer: Signer, jwks_uri: Option<&str>) -> (Shared, String) {
+/// `jwks_uri` / `end_session`: what the discovery document says instead of
+/// `{base}/jwks` / `{base}/logout`.
+async fn provider_with(signer: Signer, jwks_uri: Option<&str>, end_session: Option<&str>) -> (Shared, String) {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let base = format!("http://{}/realms/test", listener.local_addr().unwrap());
 	let p: Shared = Arc::new(Mutex::new(Provider { signer, base: base.clone(), codes: HashMap::new(), ttl: 300, refreshes: 0, published: None }));
 	let discovery = {
 		let base = base.clone();
 		let jwks_uri = jwks_uri.map_or_else(|| format!("{base}/jwks"), str::to_string);
+		let end_session = end_session.map_or_else(|| format!("{base}/logout"), str::to_string);
 		move || async move {
 			axum::Json(json!({"issuer": base, "authorization_endpoint": format!("{base}/auth"), "token_endpoint": format!("{base}/token"),
-				"jwks_uri": jwks_uri, "end_session_endpoint": format!("{base}/logout")}))
+				"jwks_uri": jwks_uri, "end_session_endpoint": end_session}))
 		}
 	};
 	let jwks = {
@@ -605,7 +607,7 @@ async fn oidc_discovery_with_a_bad_endpoint_fails_cleanly() {
 	let rng = SystemRandom::new();
 	let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
 	let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng).unwrap();
-	let (_p, issuer) = provider_with_jwks(Signer::Ec(key), Some("http://127.0.0.1:8a/jwks")).await;
+	let (_p, issuer) = provider_with(Signer::Ec(key), Some("http://127.0.0.1:8a/jwks"), None).await;
 	let backend = echo_backend().await;
 	let h = harness().await;
 	let port = oidc_rule(&h, &dir, &issuer, backend).await;
@@ -615,4 +617,24 @@ async fn oidc_discovery_with_a_bad_endpoint_fails_cleanly() {
 	// the other routes still work
 	let r = client().get(format!("http://127.0.0.1:{port}/public/x")).send().await.unwrap();
 	assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// The optional `end_session_endpoint` that does not pass the check (#324) is left
+/// out: sign-in still works, and logout goes to / instead of to the provider.
+#[tokio::test]
+async fn oidc_discovery_with_a_bad_end_session_endpoint_leaves_it_out() {
+	let dir = workdir("bad-logout");
+	let rng = SystemRandom::new();
+	let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+	let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng).unwrap();
+	let (_p, issuer) = provider_with(Signer::Ec(key), None, Some("http://127.0.0.1:65536/logout")).await;
+	let backend = echo_backend().await;
+	let h = harness().await;
+	let port = oidc_rule(&h, &dir, &issuer, backend).await;
+	let r = client().get(format!("http://127.0.0.1:{port}/app/page")).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::FOUND);
+	assert!(r.headers()["location"].to_str().unwrap().starts_with(&format!("{issuer}/auth?")));
+	let r = client().get(format!("http://127.0.0.1:{port}/_rproxy/oidc/logout")).header("Host", "app.test").send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::FOUND);
+	assert_eq!(r.headers()["location"], "/");
 }

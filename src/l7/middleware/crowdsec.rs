@@ -215,7 +215,7 @@ impl std::fmt::Debug for Bouncer {
 }
 
 fn parse_url(url: &str, what: &str) -> Result<Uri, CrowdsecError> {
-	crate::net::url::parse(url.trim()).map(|u| u.uri).map_err(|e| CrowdsecError::Config(format!("{what}: {url:?} {e}")))
+	crate::net::url::parse_base(url.trim()).map(|u| u.uri).map_err(|e| CrowdsecError::Config(format!("{what}: {url:?} {e}")))
 }
 
 /// Reads the API key; a missing or empty file is a configuration error.
@@ -538,6 +538,15 @@ mod tests {
 
 	fn ip(s: &str) -> IpAddr {
 		s.parse().unwrap()
+	}
+
+	#[test]
+	fn lapi_and_appsec_urls_are_bases_read_strictly() {
+		assert!(parse_url(" http://127.0.0.1:8080/ ", "lapi_url").is_ok());
+		for (url, want) in [("http://127.0.0.1:8080/?x=1", "query"), ("http://127.0.0.1:8a", "port"), ("http://a..b:8080", "label")] {
+			let e = format!("{:?}", parse_url(url, "global.crowdsec.lapi_url").unwrap_err());
+			assert!(e.contains("global.crowdsec.lapi_url") && e.contains(want), "{url}: {e}");
+		}
 	}
 
 	#[test]

@@ -396,6 +396,13 @@ async fn http_rules_refuse_urls_read_otherwise() {
 					"cookie_secret_file": "/nonexistent/k"}}}}),
 			"middleware sso: issuer",
 		),
+		(
+			json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1", "middlewares": ["sso"]}],
+				"middlewares": {"sso": {"oidc": {"issuer": "https://id.test/realms/x?a=1", "client_id": "c", "client_secret_file": "/nonexistent/c",
+					"cookie_secret_file": "/nonexistent/k"}}}}),
+			"query",
+		),
+		(route("http://a..b/"), "label"),
 	] {
 		let (status, v) = h.post(http_rule(free_port(), http.clone())).await;
 		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{http}: {v}");
