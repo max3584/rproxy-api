@@ -1346,6 +1346,14 @@
           "http3": {
             "type": "boolean"
           },
+          "raw_path": {
+            "type": "boolean",
+            "description": "v0.4.17 (#320): route and forward the path as sent, without normalisation. Unsafe with path-based authentication or ip_allow routes."
+          },
+          "strict_path": {
+            "type": "boolean",
+            "description": "v0.4.17 (#320): answer 400 to paths with %2F, %5C, %3B, %25, ; or a backslash (characters some backends read differently)."
+          },
           "routes": {
             "type": "array",
             "items": {
@@ -1993,7 +2001,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235), misdirected (tls.misdirected, v0.4.3)"
+                "description": "headers_add, redirect_status, route_timeouts, server_middlewares, server_status, retry_status (#224, #226-#235), misdirected (tls.misdirected, v0.4.3), path_normalize, raw_path, identity_headers, http_timeouts, strict_path (v0.4.17, #320)"
               },
               "forward_auth": {
                 "type": "array",

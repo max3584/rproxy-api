@@ -131,6 +131,9 @@ struct Rule {
 	default_tls: Option<Value>,
 	/// `proxy_protocol` from the entry point's `proxyProtocol.trustedIPs` (tcp).
 	proxy_protocol: Option<Value>,
+	/// `http.sanitizePath: false` of the entry point: `raw_path` (rproxy normalises
+	/// paths like Traefik's default `sanitizePath: true`).
+	raw_path: bool,
 }
 
 /// The names of one certificate, in order and as a set.
@@ -368,6 +371,10 @@ impl Converter<'_> {
 				self.global.trusted_proxies.push(ip);
 			}
 			let where_ = format!("entryPoints.{name}");
+			let raw_path = !as_bool(g(http, &["sanitizePath"]), true);
+			if raw_path {
+				self.note(&where_, "http.sanitizePath: false: raw_path keeps paths as sent; unsafe with path-based authentication routes");
+			}
 			if as_bool(g(ep, &["forwardedHeaders", "insecure"]), false) {
 				self.note(&where_, "forwardedHeaders.insecure: list the proxies in global.trusted_proxies instead");
 			}
@@ -406,6 +413,7 @@ impl Converter<'_> {
 				default_middlewares,
 				default_tls,
 				proxy_protocol,
+				raw_path,
 			};
 			match self.rule_index(name) {
 				Some(i) => self.rules[i] = rule,
@@ -1221,6 +1229,9 @@ impl Converter<'_> {
 		let mut http = Map::new();
 		if self.rules[ri].http3 {
 			http.insert("http3", true);
+		}
+		if self.rules[ri].raw_path {
+			http.insert("raw_path", true);
 		}
 		let mut names = HashSet::new();
 		let mut list = vec![];

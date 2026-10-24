@@ -10,9 +10,11 @@ pub mod deadline;
 pub mod h3;
 pub mod matcher;
 pub mod mirror;
+pub mod normalize;
 pub mod resilience;
 pub mod middleware;
 pub mod server;
+pub mod timeouts;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -34,6 +36,15 @@ pub struct HttpSpec {
 	/// Also answer HTTP/3 (QUIC) on the same UDP port.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub http3: bool,
+	/// Route and forward the path as the client sent it, without the normalisation
+	/// of #320 (Traefik's `sanitizePath: false`). Unsafe with path-based
+	/// authentication or `ip_allow` routes: `/%61dmin` then misses `PathPrefix(`/admin`)`.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub raw_path: bool,
+	/// Refuse (400) paths with `%2F`, `%5C`, `%3B`, `%25`, `;` or `\\`, which some backends
+	/// read differently from rproxy (`..;/`, a decoded `%2F`, double decoding; #320).
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub strict_path: bool,
 	#[serde(default)]
 	pub routes: Vec<RouteSpec>,
 	/// What a request that matches no route gets (404 when left out).
@@ -886,6 +897,12 @@ impl HttpSpec {
 		}
 		if self.routes.iter().any(|r| r.timeouts.is_some()) {
 			used.push("route_timeouts");
+		}
+		if self.raw_path {
+			used.push("raw_path");
+		}
+		if self.strict_path {
+			used.push("strict_path");
 		}
 		let servers = || self.services.values().flat_map(|s| &s.servers);
 		if servers().any(|s| !s.middlewares.is_empty()) {

@@ -43,6 +43,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `entryPoints.<名前>.http.middlewares` | そのエントリポイントのすべてのルートの先頭に付ける |
 | `entryPoints.<名前>.http.tls`、ルーターの `tls` | ルールの `tls.mode: terminate` |
 | `entryPoints.<名前>.http3` | `http.http3: true` |
+| `entryPoints.<名前>.http.sanitizePath`（パスの正規化） | v0.4.17 から rproxy もルートの照合の前にパスを正規化し、Traefik v3 の既定の `sanitizePath: true` と同じ動きになった（unreserved のパーセント符号化を戻す・`.`・`..` を解く・`//` をまとめる。違いは `%2F` を区切りに戻さないことだけ。docs/API.md の「HTTP の転送の扱い」）。`sanitizePath: false` は `http.raw_path: true` にしてメモに出す（パスでの認証と組み合わせると安全でない）。Host は照合で末尾のドットを落とす |
 | `entryPoints.<名前>.forwardedHeaders.trustedIPs` | `global.trusted_proxies` |
 | `entryPoints.<名前>.proxyProtocol.trustedIPs`（受け取る PROXY protocol） | そのエントリポイントのルールの `proxy_protocol: {from: <trustedIPs>, required: false}`（v0.4.13。Traefik と同じく、ヘッダは付いていれば使う。`trustedIPs` のない形と `insecure: true` は変換せず、メモに出す。rproxy は `from` の外からのヘッダを断る） |
 | `accessLog.filePath` | `global.access_log`（書式は rproxy の JSON Lines。Traefik の書式やフィルタは変換しない） |

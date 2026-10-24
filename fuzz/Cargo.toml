@@ -69,6 +69,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "path_normalize"
+path = "fuzz_targets/path_normalize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "starttls"
 path = "fuzz_targets/starttls.rs"
 test = false

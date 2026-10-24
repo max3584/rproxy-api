@@ -20,6 +20,8 @@ entryPoints:
       trustedIPs: ["198.51.100.0/24"]
     forwardedHeaders:
       insecure: true
+    http:
+      sanitizePath: false
 providers:
   file:
     directory: dynamic
