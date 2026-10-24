@@ -18,7 +18,12 @@ targets = [
 # vulnerabilities, unmaintained and unsound crates and yanked versions all fail the check
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # crypto-bigint 0.5.5: dtls 0.17.2 (the latest; DTLS termination) uses p256 / p384 0.13 → elliptic-curve 0.13,
+    # which pins crypto-bigint 0.5; the fix is only in 0.7.6 (needs elliptic-curve 0.14) and the named operations
+    # (UintRef, BoxedMontyForm) are 0.7 APIs. Remove when dtls moves to elliptic-curve 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via dtls 0.17.2 / elliptic-curve 0.13; no 0.5 fix; remove when dtls uses elliptic-curve 0.14" },
+]
 
 [licenses]
 # what the dependency tree uses today (cargo deny list); all permissive
