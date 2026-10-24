@@ -155,6 +155,8 @@ mod tests {
 			("http://keycloak_1.internal.:80", false, "keycloak_1.internal.", 80, "/"),
 			("http://status-503.invalid", false, "status-503.invalid", 80, "/"),
 			("http://a?q", false, "a", 80, "?q"),
+			// found by fuzzing: '@' in the path is not userinfo
+			("http://369.254th/v@p//", false, "369.254th", 80, "/v@p//"),
 		] {
 			let u = parse(url).unwrap_or_else(|e| panic!("{url}: {e}"));
 			assert_eq!(

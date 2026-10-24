@@ -13,8 +13,12 @@ fuzz_target!(|data: &[u8]| {
 	let Ok(text) = std::str::from_utf8(data) else { return };
 	let Ok(u) = parse(text) else { return };
 	assert!(u.port > 0 && !u.host.is_empty(), "{text:?}");
-	assert!(!u.host.contains('%') && !text.contains('@') && !text.contains('\\'), "{text:?}");
 	let authority = u.uri.authority().expect("an authority");
+	// '@' may appear in the path, never in the authority (no userinfo)
+	assert!(
+		!u.host.contains('%') && !authority.as_str().contains('@') && !text.contains('\\'),
+		"{text:?}"
+	);
 	assert_eq!(authority.port_u16().unwrap_or(if u.https { 443 } else { 80 }), u.port, "{text:?}");
 	assert_eq!(authority.host().trim_matches(|c| c == '[' || c == ']'), u.host, "{text:?}");
 	let again = parse(&u.uri.to_string()).expect("reads again");
