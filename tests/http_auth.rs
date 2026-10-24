@@ -337,14 +337,20 @@ impl Provider {
 type Shared = Arc<Mutex<Provider>>;
 
 async fn provider(signer: Signer) -> (Shared, String) {
+	provider_with_jwks(signer, None).await
+}
+
+/// `jwks_uri`: what the discovery document says instead of `{base}/jwks`.
+async fn provider_with_jwks(signer: Signer, jwks_uri: Option<&str>) -> (Shared, String) {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let base = format!("http://{}/realms/test", listener.local_addr().unwrap());
 	let p: Shared = Arc::new(Mutex::new(Provider { signer, base: base.clone(), codes: HashMap::new(), ttl: 300, refreshes: 0, published: None }));
 	let discovery = {
 		let base = base.clone();
+		let jwks_uri = jwks_uri.map_or_else(|| format!("{base}/jwks"), str::to_string);
 		move || async move {
 			axum::Json(json!({"issuer": base, "authorization_endpoint": format!("{base}/auth"), "token_endpoint": format!("{base}/token"),
-				"jwks_uri": format!("{base}/jwks"), "end_session_endpoint": format!("{base}/logout")}))
+				"jwks_uri": jwks_uri, "end_session_endpoint": format!("{base}/logout")}))
 		}
 	};
 	let jwks = {
@@ -589,4 +595,24 @@ async fn oidc_refuses_tokens_it_cannot_trust() {
 	assert_eq!(r.status(), StatusCode::BAD_GATEWAY, "sign-in fails");
 	assert!(!set_cookies(&r).contains_key("_rproxy_oidc"));
 	std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A discovery document whose `jwks_uri` has a port that is not a number (#324)
+/// is refused as a whole: no sign-in redirect, 502, and nothing connected to port 80.
+#[tokio::test]
+async fn oidc_discovery_with_a_bad_endpoint_fails_cleanly() {
+	let dir = workdir("bad-jwks");
+	let rng = SystemRandom::new();
+	let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+	let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng).unwrap();
+	let (_p, issuer) = provider_with_jwks(Signer::Ec(key), Some("http://127.0.0.1:8a/jwks")).await;
+	let backend = echo_backend().await;
+	let h = harness().await;
+	let port = oidc_rule(&h, &dir, &issuer, backend).await;
+	let r = client().get(format!("http://127.0.0.1:{port}/app/page")).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
+	assert!(r.text().await.unwrap().contains("sign-in provider is not available"));
+	// the other routes still work
+	let r = client().get(format!("http://127.0.0.1:{port}/public/x")).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK);
 }

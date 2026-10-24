@@ -102,3 +102,10 @@ path = "fuzz_targets/dpdk_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http_url"
+path = "fuzz_targets/http_url.rs"
+test = false
+doc = false
+bench = false

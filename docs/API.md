@@ -404,6 +404,13 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 - `Host` はポートを除き、大文字小文字を区別しない。HTTP/2 では `:authority` を使う。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
 - `match` の式の上限（v0.3.18）：括弧と `!` の入れ子は 32 段まで、1 つの式に書ける条件（`Host(...)` など。引数の数は数えない）は 256 個まで。超えると設定の誤り（API は 400、設定ファイルは起動・再読み込み・`--check-config` の誤り）。
 - 時間の値（`10s`・`500ms`・`1m`・`2h` の形。`period`・`timeouts`・`health_check` の `interval` / `timeout`・`initial_interval`・`window` / `recovery`・`update_interval` など）は 365 日（`8760h`）まで（v0.3.18）。それより長い値は設定の誤り。
+- URL の値（`servers[].url`・ルートの `to`・`forward_auth.address`・`oidc.issuer` と discovery の各エンドポイント・`global.crowdsec` の `lapi_url` / `appsec_url`・ACME の `directory` / `api_url` / `url`）は、どれも同じ厳しい読み方をする（v0.4.17、#324。ブラウザや UI の WHATWG の URL と rproxy の読み方がずれて、前段の確かめをすり抜けられないように）。外れたものは設定の誤り（API は項目の名前つきで `400 invalid`、設定ファイルは起動・再読み込み・`--check-config` の誤り。OIDC の discovery の応答なら、そのプロバイダへのサインインが 502）：
+  - `http://` か `https://`（小文字）で始まる。
+  - 見える ASCII の文字だけ（空白・制御文字・ASCII 以外は不可）。`\`（WHATWG は `/` と読む）と `#`（フラグメント）も不可。
+  - ユーザー情報（`user:pass@`）は不可（`Host` に入ってしまい、WHATWG は取り除く）。
+  - ホストは空でない。名前は英数字・`-`・`_`・`.`、IPv4 は `a.b.c.d` の形だけ（`127.1`・`0x7f.0.0.1`・`010.0.0.1` のように最後のラベルが数字で、この形でないものは不可）、IPv6 は `[...]` でゾーン ID（`%25eth0`）なし。
+  - ポートを書くなら 1〜65535 の 10 進の数字（`:`・`:0`・`:65536`・`:8a` は不可。v0.4.16 までは、こうした URL をポートなしとして 80 / 443 につないでいた）。
+  - OIDC の issuer が `https://` なら、discovery の `authorization_endpoint`・`token_endpoint`・`jwks_uri`・`end_session_endpoint` も `https://`。
 - 転送先とは HTTP/1.1 で話す（サービスの `protocol` で HTTP/2 も。下の「Gateway API 向けの L7・TLS」）。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。サービスに `tls`（#236）があれば、そのサービスでは `tls.upstream` の代わりにそれを使う。
 - 転送先への接続は、応答の本文を読み終えたあと、次のリクエストに使い回す（転送先ごとに待機中の接続は 1024 本まで、使われないまま 4 秒たったものは閉じる。`source_ip: transparent` のルールでは、送信元がクライアントごとに違うので使い回さない）。使い回そうとした接続を転送先が閉じていたら、新しい接続で送り直す。
 - `health_check`（v0.3.2）: `interval`（既定 `10s`）ごとに各 `servers` へ `GET <URLのパス><path>`（`Host` は転送先のホスト）を送り、`timeout`（既定 `3s`）以内に 2xx / 3xx が返れば up、そうでなければ down。down の転送先はラウンドロビンから外し、戻れば入れる。最初の確認までは up として扱う。すべて down なら 503。状態が変わると `event: "http.health"` のログ（`service`、`server`、`up`、down の理由の `error`）。ルールの `stats.http.services.<サービス名>` に `[{"url","up"}]`、`/metrics` に `rproxy_http_server_up{protocol,listen,service,server}`（1 / 0）。サービスの転送先がすべて down なら、ルールの `down_services` にサービスの名前が入り、`rproxy_http_service_down{protocol,listen,service}` が 1（v0.3.20）。

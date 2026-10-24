@@ -304,6 +304,14 @@ def proxy_in_seeds():
     put("proxy_header_in", "v2-dgram-local-dtls", v2(0x20, 0x12, b"") + b"\x16\xfe\xfd\x00\x00")
     put("proxy_header_in", "v2-dgram-short", sig + b"\x21\x12\x00\x0c" + v4[:6])
 
+    # http_url (#324): good URLs and the ones another parser reads otherwise
+    for i, url in enumerate([
+        "http://10.0.0.1:8080/base/?x=1", "https://[2001:db8::1]:8443/p", "https://id.example/realms/x",
+        "http://127.0.0.1:8a/", "http://169.254.169.254:65536/", "http://a:/", "http://[fe80::1%25eth0]/",
+        "http://user@a/", "http://a\\@b/", "http://127.1/", "http://0x7f.0.0.1/",
+    ]):
+        put("http_url", f"url-{i}", url)
+
 
 if __name__ == "__main__":
     main()

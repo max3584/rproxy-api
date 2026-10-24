@@ -98,18 +98,15 @@ impl Server {
 	}
 
 	fn parse(url: &str, weight: u32) -> Result<Server, ApiError> {
-		let uri: Uri = url.parse().map_err(|e| ApiError::invalid(format!("{url:?}: {e}")))?;
-		let https = uri.scheme_str() == Some("https");
-		let authority = uri.authority().ok_or_else(|| ApiError::invalid(format!("{url:?} has no host")))?;
-		let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
+		let parsed = crate::net::url::parse(url).map_err(|e| ApiError::invalid(format!("{url:?} {e}")))?;
 		let id = Sha256::digest(url.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect();
 		Ok(Server {
 			url: url.to_string(),
-			https,
-			port: authority.port_u16().unwrap_or(if https { 443 } else { 80 }),
-			host,
-			authority: authority.as_str().to_string(),
-			prefix: uri.path().trim_end_matches('/').to_string(),
+			https: parsed.https,
+			port: parsed.port,
+			authority: parsed.authority().to_string(),
+			prefix: parsed.uri.path().trim_end_matches('/').to_string(),
+			host: parsed.host,
 			weight: u64::from(weight.max(1)),
 			id,
 			up: AtomicBool::new(true),

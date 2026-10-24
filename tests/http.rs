@@ -365,6 +365,64 @@ async fn http_rules_refuse_what_does_not_fit() {
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("unsupported")), "{v}");
 }
 
+/// URLs with a port, host or characters that another parser reads otherwise are
+/// refused with the field, not connected to 80 / 443 (#324): create, PATCH, rule sets.
+#[tokio::test]
+async fn http_rules_refuse_urls_read_otherwise() {
+	let h = harness().await;
+	let good = json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1"}]});
+	let route = |to: &str| json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": to}]});
+	for (http, want) in [
+		(route("http://127.0.0.1:8a/"), "route a: to"),
+		(route("http://169.254.169.254:65536/"), "port"),
+		(route("http://127.0.0.1:/"), "port"),
+		(route("http://[fe80::1%25eth0]/"), "zone"),
+		(route("http://user@127.0.0.1/"), "user"),
+		(route("http://127.0.0.1\\@evil/"), "visible ASCII"),
+		(route("http://127.1/"), "IPv4"),
+		(
+			json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "service": "s"}],
+				"services": {"s": {"servers": [{"url": "http://127.0.0.1:1"}, {"url": "https://b.test:99999"}]}}}),
+			"service s: servers[1].url",
+		),
+		(
+			json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1", "middlewares": ["fa"]}],
+				"middlewares": {"fa": {"forward_auth": {"address": "http://127.0.0.1:8a/auth"}}}}),
+			"middleware fa: address",
+		),
+		(
+			json!({"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:1", "middlewares": ["sso"]}],
+				"middlewares": {"sso": {"oidc": {"issuer": "https://id.test:0", "client_id": "c", "client_secret_file": "/nonexistent/c",
+					"cookie_secret_file": "/nonexistent/k"}}}}),
+			"middleware sso: issuer",
+		),
+	] {
+		let (status, v) = h.post(http_rule(free_port(), http.clone())).await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{http}: {v}");
+		assert!(v["error"].as_str().unwrap_or("").contains(want), "{want}: {v}");
+	}
+
+	// PATCH of a working rule
+	let port = free_port();
+	assert_eq!(h.post(http_rule(port, good.clone())).await.0, StatusCode::CREATED);
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{port}"), json!({"http": route("http://127.0.0.1:8a/")})).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	let (_, rule) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert_eq!(rule["http"]["routes"][0]["to"], "http://127.0.0.1:1", "unchanged: {rule}");
+
+	// a rule set
+	let r = h
+		.http
+		.put(format!("{}/rulesets/url-check", h.base))
+		.json(&json!({"generation": 1, "rules": [http_rule(free_port(), route("http://127.0.0.1:65536/"))]}))
+		.send()
+		.await
+		.unwrap();
+	assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+	let v: Value = r.json().await.unwrap();
+	assert!(v["error"].as_str().unwrap_or("").contains("route a: to"), "{v}");
+}
+
 /// A request without following redirects; returns the response.
 async fn raw(port: u16, method: reqwest::Method, host: &str, path: &str, headers: &[(&str, &str)]) -> reqwest::Response {
 	let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
