@@ -96,16 +96,17 @@ pub async fn put(
 		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
 		// refused if a live upgrade started meanwhile (#305)
 		let _change = if dry_run { None } else { super::api::changing(&state).await? };
-		// the files' check and the change together (#319)
-		let files = if dry_run { None } else { Some(super::rule_files::lock().await) };
-		if let Err(e) = super::rule_files::check_ruleset(&state.registry, &principal, &name, &req.rules).await {
-			if !dry_run {
-				audit(&principal, &client, "ruleset.put", &name, Err(e.code));
+		// the files are counted by other checks until the change is made (#319)
+		let files = match super::rule_files::check_ruleset(&state.registry, &principal, &name, &req.rules).await {
+			Ok(intent) => intent,
+			Err(e) => {
+				if !dry_run {
+					audit(&principal, &client, "ruleset.put", &name, Err(e.code));
+				}
+				return Err(e.into());
 			}
-			return Err(e.into());
-		}
+		};
 		let result = state.registry.put_ruleset(&name, req, opts).await;
-		// not held while the row is written (another change need not wait for the database)
 		drop(files);
 		if !dry_run {
 			audit(&principal, &client, "ruleset.put", &name, result.as_ref().map(|_| ()).map_err(|e| e.error.code));

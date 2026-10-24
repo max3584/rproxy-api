@@ -404,3 +404,43 @@ async fn rule_files_may_not_reach_the_store() {
 	rproxy_api::net::protected::set_process(vec![]);
 	fs::remove_dir_all(work).unwrap();
 }
+
+/// #319: a change whose names take long to resolve holds up no other change (the
+/// files' check holds no lock over the change), and the files of a change under way
+/// still count for the checks made meanwhile.
+#[tokio::test]
+async fn a_slow_change_holds_up_no_other() {
+	let h = harness().await;
+	let pki = Pki::new("certs-slow");
+	let issued = pki.server("slow.pem", &["slow.test"]);
+	let cert = pki.write("slow.crt", &issued.cert.pem());
+	let key = pki.write("slow.key", &issued.key.serialize_pem());
+	let slow = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(),
+		"targets": (0..3).map(|i| json!({"addr": format!("t{i}.slow.test"), "port": 9})).collect::<Vec<_>>(),
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}});
+	let (http, base) = (h.http.clone(), h.base.clone());
+	let pending = tokio::spawn(async move { http.post(format!("{base}/rules")).json(&slow).send().await.unwrap().status() });
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let started = std::time::Instant::now();
+	let backend = tcp_backend("Q:").await;
+	// without files, and with other files
+	let (status, v) = h.post(rule("tcp", free_port(), backend)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let other_key = pki.write("other.key", &issued.key.serialize_pem());
+	let mut with_files = rule("tcp", free_port(), backend);
+	with_files["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": pki.write("other.crt", &issued.cert.pem()), "key_file": other_key}]});
+	let (status, v) = h.post(with_files).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// the key of the change under way may not become another rule's OIDC client secret
+	let cookie = pki.write("cookie", "a-long-cookie-secret-for-tests\n");
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "http": {
+			"routes": [{"name": "a", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["sso"]}],
+			"middlewares": {"sso": {"oidc": {"issuer": "https://idp.evil.example", "client_id": "x",
+				"client_secret_file": key, "cookie_secret_file": cookie}}}}}))
+		.await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("secret_reuse")), "{v}");
+	assert!(started.elapsed() < Duration::from_secs(5), "held up for {:?}", started.elapsed());
+	assert!(!pending.is_finished(), "the slow change is still resolving");
+	pending.abort();
+}

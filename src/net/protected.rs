@@ -276,6 +276,30 @@ fn fs_type(_: &Path, _: bool) -> Option<(i64, PathBuf)> {
 	None
 }
 
+/// Whether an opened file is on a kernel filesystem (`net::files::read`: a directory
+/// swapped after the API's check cannot lead a later read to `/proc`).
+#[cfg(target_os = "linux")]
+pub fn opened_on_kernel_fs(file: &std::fs::File) -> bool {
+	use std::os::fd::AsRawFd;
+	// SAFETY: a zeroed statfs is a valid out buffer; the fd is open
+	let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+	if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+		return false;
+	}
+	let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap_or_default();
+	#[allow(clippy::unnecessary_cast)]
+	let t = st.f_type as i64;
+	kernel_fs_type(t, &real)
+		|| [Path::new("/proc"), Path::new("/sys"), Path::new("/dev")]
+			.iter()
+			.any(|d| real.starts_with(d))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn opened_on_kernel_fs(_: &std::fs::File) -> bool {
+	false
+}
+
 fn kernel_fs_type(t: i64, real: &Path) -> bool {
 	const PROC: i64 = 0x9fa0;
 	const SYSFS: i64 = 0x6265_6572;

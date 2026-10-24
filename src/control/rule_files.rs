@@ -9,8 +9,11 @@
 //!   (`403 protected_file`). A PATCH is judged by the rule it makes, so a protected
 //!   file an older version accepted does not stay through a PATCH of the targets.
 //! - An OIDC client secret file is used only as the client secret of the same issuer
-//!   and client, here and in every other rule (`409 secret_reuse`). The check and the
-//!   change run under `lock`, so two changes cannot pass it at once.
+//!   and client, here and in every other rule (`409 secret_reuse`). Checks run one at a
+//!   time (`CHECKS`); a change that passed registers its files (`Intent`) until it is
+//!   made, so a change checked meanwhile compares with them too. The change itself
+//!   (resolving names, starting the rule) holds no lock, and a change without files
+//!   takes none.
 //!
 //! The filesystem is looked at on a blocking thread (`spawn_blocking`).
 
@@ -20,12 +23,31 @@ use crate::core::rule::Key;
 use crate::error::ApiError;
 use crate::net::protected::{self, FileRef, Use};
 
-/// Held from the check to the end of the change (`POST` / `PATCH /rules`, `PUT /rulesets`).
-static CHANGES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One check at a time (the comparison and registering the `Intent`).
+static CHECKS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Taken before `check` by a change (not by a dry run), kept until the change is made.
-pub async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
-	CHANGES.lock().await
+/// The files of changes that passed the check and are not made yet: (id, files).
+static PENDING: std::sync::Mutex<Vec<(u64, Vec<FileRef>)>> = std::sync::Mutex::new(Vec::new());
+
+/// The files of a change that passed, counted by later checks until it is dropped
+/// (after the change is made, or refused). Empty for a change without files.
+#[must_use]
+pub struct Intent(Option<u64>);
+
+impl Drop for Intent {
+	fn drop(&mut self) {
+		if let Some(id) = self.0 {
+			PENDING.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, _)| *i != id);
+		}
+	}
+}
+
+fn register(refs: Vec<FileRef>) -> Intent {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static NEXT: AtomicU64 = AtomicU64::new(1);
+	let id = NEXT.fetch_add(1, Ordering::Relaxed);
+	PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((id, refs));
+	Intent(Some(id))
 }
 
 /// The rules the change replaces, whose files are left out of the comparison.
@@ -43,7 +65,7 @@ pub async fn check(
 	principal: &Principal,
 	rules: Vec<(String, Vec<FileRef>)>,
 	replacing: Replacing<'_>,
-) -> Result<(), ApiError> {
+) -> Result<Intent, ApiError> {
 	if principal.limited_to_stored_certs() {
 		if let Some((label, f)) = rules.iter().find_map(|(l, refs)| refs.first().map(|f| (l, f))) {
 			return Err(ApiError::file_not_allowed(format!(
@@ -51,11 +73,12 @@ pub async fn check(
 				f.field
 			)));
 		}
-		return Ok(());
+		return Ok(Intent(None));
 	}
 	if rules.iter().all(|(_, refs)| refs.is_empty()) {
-		return Ok(());
+		return Ok(Intent(None));
 	}
+	let _one = CHECKS.lock().await;
 	let global = registry.http_global();
 	let entries = protected::current(registry.acme().map(|a| a.as_ref()), global.crowdsec().map(|b| b.key_file()));
 	let existing: Vec<(String, FileRef)> = registry
@@ -68,10 +91,20 @@ pub async fn check(
 			Replacing::Ruleset(name) => set.as_deref() != Some(*name),
 		})
 		.flat_map(|(key, _, refs)| refs.into_iter().map(move |f| (key.to_string(), f)))
+		.chain(
+			PENDING
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.iter()
+				.flat_map(|(_, refs)| refs.iter().map(|f| ("being changed".to_string(), f.clone())))
+				.collect::<Vec<_>>(),
+		)
 		.collect();
+	let mine: Vec<FileRef> = rules.iter().flat_map(|(_, refs)| refs.iter().cloned()).collect();
 	tokio::task::spawn_blocking(move || judge(&entries, &rules, &existing))
 		.await
-		.unwrap_or_else(|e| Err(ApiError::internal(format!("checking the files did not finish: {e}"))))
+		.unwrap_or_else(|e| Err(ApiError::internal(format!("checking the files did not finish: {e}"))))?;
+	Ok(register(mine))
 }
 
 fn judge(entries: &[protected::Entry], rules: &[(String, Vec<FileRef>)], existing: &[(String, FileRef)]) -> Result<(), ApiError> {
@@ -121,7 +154,7 @@ fn judge(entries: &[protected::Entry], rules: &[(String, Vec<FileRef>)], existin
 }
 
 /// `POST /rules`.
-pub async fn check_create(registry: &Registry, principal: &Principal, req: &crate::core::rule::RuleRequest) -> Result<(), ApiError> {
+pub async fn check_create(registry: &Registry, principal: &Principal, req: &crate::core::rule::RuleRequest) -> Result<Intent, ApiError> {
 	let refs = protected::refs(req.tls.as_ref(), req.http.as_ref());
 	check(registry, principal, vec![(String::new(), refs)], Replacing::Nothing).await
 }
@@ -133,7 +166,7 @@ pub async fn check_update(
 	principal: &Principal,
 	key: &Key,
 	req: &crate::core::rule::UpdateRequest,
-) -> Result<(), ApiError> {
+) -> Result<Intent, ApiError> {
 	let refs = match registry.updated_spec(key, req.clone()).await {
 		Ok((_, spec, _, _)) => protected::refs(Some(&spec.tls), spec.http.as_ref()),
 		Err(_) => protected::refs(req.tls.as_ref(), req.http.as_ref()),
@@ -147,7 +180,7 @@ pub async fn check_ruleset(
 	principal: &Principal,
 	name: &str,
 	rules: &[crate::core::rule::RuleRequest],
-) -> Result<(), ApiError> {
+) -> Result<Intent, ApiError> {
 	let rules: Vec<(String, Vec<FileRef>)> = rules
 		.iter()
 		.enumerate()

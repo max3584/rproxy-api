@@ -401,7 +401,7 @@ async fn create(
 	if crate::config::plan::dry_run(&query)? {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
 		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
-		super::rule_files::check_create(&state.registry, &principal, &req).await?;
+		drop(super::rule_files::check_create(&state.registry, &principal, &req).await?);
 		return Ok((StatusCode::OK, Json(crate::config::plan::plan_create(&state.registry, req).await?)).into_response());
 	}
 	let rule = parse_listen(&req.listen_addr, req.listen_port).map_or_else(|_| req.listen_addr.clone(), |a| a.to_string());
@@ -414,9 +414,8 @@ async fn create(
 		let result = async {
 			check_ports(&principal, req.listen_port, req.listen_port_end)?;
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
-			// the files' check and the change together (#319: two changes cannot both pass)
-			let _files = super::rule_files::lock().await;
-			super::rule_files::check_create(&state.registry, &principal, &req).await?;
+			// the files are counted by other checks until the change is made (#319)
+			let _files = super::rule_files::check_create(&state.registry, &principal, &req).await?;
 			state.registry.create_as(req, origin).await
 		}
 		.await;
@@ -492,7 +491,7 @@ async fn update(
 	if crate::config::plan::dry_run(&query)? {
 		check_rule_ports(&state, &principal, &key).await?;
 		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
-		super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
+		drop(super::rule_files::check_update(&state.registry, &principal, &key, &req).await?);
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
 	to_the_end(async move {
@@ -500,8 +499,7 @@ async fn update(
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
 			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
-			let _files = super::rule_files::lock().await;
-			super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
+			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
 			state.registry.update(&key, req).await
 		}
 		.await;
