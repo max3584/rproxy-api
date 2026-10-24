@@ -331,7 +331,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `bad_certificates_and_names_are_refused` | 読めない PEM・鍵の不一致・期限切れ・鍵なし・知らない項目・名前の誤りは `400 invalid`（応答に鍵を出さない）、1 MiB を超える本文は 413、期限が近いものは `warnings`。保存していない名前を使うルールは `400 tls_config`、`cert` と `cert_file` の両方は誤り |
 | `a_failed_rule_starts_once_its_certificate_is_stored` | 設定ファイルのルールが保存していない名前を使うと `failed`、その名前を `PUT` すると動き出す |
 | `scopes_and_allow_certs` | `certs:read` / `certs:write` のスコープ、`allow_certs` の外の名前は `PUT`・ルールでの使用とも 403、`GET /certs` は `allow_certs` の内だけ |
-| `rule_files_may_not_reach_the_store` | #319：API のルールのファイルがストアの下（そのもの・シンボリックリンク・`..`・後で保存される名前）なら `403 protected_file`（`dry_run`・PATCH・組の PUT・サービスの `ca_file` も）、トークンのファイルも同じ。ほかの場所はよい。`allow_certs` のトークンはファイルを書けず `403 file_not_allowed`（`{"cert"}` はよい）。設定ファイルのルールはストアのファイルで動く。`features.protected_files` |
+| `rule_files_may_not_reach_the_store` | #319：API のルールのファイルがストアの下（そのもの・シンボリックリンク・`..`・後で保存される名前）なら `403 protected_file`（`dry_run`・PATCH・組の PUT・サービスの `ca_file` も）、トークンのファイルも同じ。ほかの場所はよい。`allow_certs` のトークンはファイルを書けず `403 file_not_allowed`（`{"cert"}` はよい）。設定ファイルのルールはストアのファイルで動く。戻したルールは動いて `rule.protected_file`（パスなし）、宛先だけの PATCH は 403。`PUT /rulesets` の断りは監査に残る。`features.protected_files` |
 
 ## 結合テスト：ルールの組の保存（`tests/ruleset_persist.rs`、#241、v0.4.2）
 
@@ -512,7 +512,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先 |
 | `tests/http.rs` | `http` のルールの L7 のルーティング |
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |
-| `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc`。OIDC の client secret のファイルの使い回しは `409 secret_reuse`（#319、`oidc_client_secrets_keep_to_one_use`） |
+| `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc`。OIDC の client secret のファイルの使い回しは `409 secret_reuse`（#319、`oidc_client_secrets_keep_to_one_use`。`/proc/self/environ`・`/proc/self/fd/N` は `403 protected_file`、誤りの文にほかのルールのことは出ない） |
 | `tests/http_resilience.rs` | ヘルスチェック・`sticky`・`compress`・`buffering`・`retry`・`circuit_breaker`・`errors`・転送先の接続の使い回し（#61・#63・#64・#65） |
 | `tests/http_semantics.rs` | HTTP の転送の約束（docs/API.md の「HTTP の転送の扱い」）：HTTP/2 の転送先のストリームが埋まったときの 504 と接続の追加（セキュリティレビュー M6）。`client_auth` のない HTTPS のルールでクライアントの証明書のヘッダを HTTP/1.1・HTTP/2・HTTP/3 とも消す（セキュリティレビュー H1）。クッキー・繰り返しのフィールド・hop-by-hop・本文・大きなヘッダ・時間切れを HTTP/1.1・HTTP/2・HTTP/3 のクライアントで。HTTP/2 の転送先（#233）：h2c の 1 本の接続の多重化、トレーラーの両方向（gRPC の trailers-only の応答を含む）、`te: trailers`、h2（TLS + ALPN）・`auto`（`h2` / `http/1.1` のどちらを選ぶ転送先でも）・`h2` を選ばない転送先は 502、`protocol` と URL のスキームの組み合わせ |
 | `tests/gateway_l7.rs` | Gateway API 向けの L7（#224・#226〜#232・#235）：`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`（504、送信ごと、本文の途中で切る）、`replace_host`、転送先ごとのミドルウェア、`cors`（プリフライト・ワイルドカードのオリジン）、`retry` の `status`、`mirror`（割合・本文・つながらないミラー）、`status` の転送先、`features`。許さないオリジンのプリフライトに rproxy が答える・転送先が 1 つでも `retry` が送り直す、クライアント証明書の `X-Client-Verify`・`X-Forwarded-Client-Cert`（`optional_no_verify`、偽のヘッダは消す）（#238）。`client_auth` のない平文のルール・Upgrade・`forward_auth`・`mirror` でも証明書のヘッダを偽れない、`mirror` の写しの X-Forwarded-For（セキュリティレビュー H1・M5） |

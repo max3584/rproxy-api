@@ -1226,20 +1226,45 @@ impl Registry {
 		self.apply_certs(&changes, false).await
 	}
 
-	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
-	/// The files every rule names (#319), with its key and rule set.
+	/// Rules started without the API's checks (restored from the database, a reconcile, a
+	/// live upgrade, stored rule sets): a file rules from the API may not name (#319), which
+	/// an earlier version accepted, is not refused but said (`rule.protected_file`, `warn`,
+	/// the field and not the path). A PATCH of the rule is refused until it is replaced.
+	pub fn warn_protected(&self, rule: &str, tls: Option<&tlsconf::TlsSpec>, http: Option<&crate::l7::HttpSpec>, phase: &str) {
+		let refs = crate::net::protected::refs(tls, http);
+		if refs.is_empty() {
+			return;
+		}
+		let global = self.http_global();
+		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), global.crowdsec().map(|b| b.key_file()));
+		for f in refs {
+			if crate::net::protected::protecting(&f.path, &entries).is_some() {
+				warn!(event = "rule.protected_file", rule, field = %f.field, phase,
+					"the rule names a file rules from the API may not name (#319); it runs, but changes to it through the API are refused until the file is replaced");
+			}
+		}
+	}
+
+	/// The files every rule names (#319), with its key and rule set (the specs are copied
+	/// under the lock and looked at after).
 	pub async fn file_refs(&self) -> Vec<(Key, Option<String>, Vec<crate::net::protected::FileRef>)> {
-		let rules = self.rules.lock().await;
-		rules
-			.values()
-			.map(|e| {
-				let spec = e.spec();
-				(spec.key, spec.ruleset.clone(), crate::net::protected::refs(Some(&spec.tls), spec.http.as_ref()))
-			})
+		let specs: Vec<(Key, Option<String>, tlsconf::TlsSpec, Option<crate::l7::HttpSpec>)> = {
+			let rules = self.rules.lock().await;
+			rules
+				.values()
+				.map(|e| e.spec())
+				.filter(|s| s.tls != tlsconf::TlsSpec::default() || s.http.is_some())
+				.map(|s| (s.key, s.ruleset.clone(), s.tls.clone(), s.http.clone()))
+				.collect()
+		};
+		specs
+			.into_iter()
+			.map(|(key, set, tls, http)| (key, set, crate::net::protected::refs(Some(&tls), http.as_ref())))
 			.filter(|(_, _, refs)| !refs.is_empty())
 			.collect()
 	}
 
+	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
 	pub async fn rules_using_cert(&self, name: &str) -> Vec<String> {
 		let mut keys: Vec<String> = self
 			.rules
@@ -1464,6 +1489,7 @@ impl Registry {
 				}
 			};
 			let key = spec.key;
+			self.warn_protected(&key.to_string(), Some(&spec.tls), spec.http.as_ref(), "restore");
 			match self.create_spec(spec.clone()).await {
 				Ok(_) => started += 1,
 				Err(e) if e.code == "already_exists" => {

@@ -414,6 +414,8 @@ async fn create(
 		let result = async {
 			check_ports(&principal, req.listen_port, req.listen_port_end)?;
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
+			// the files' check and the change together (#319: two changes cannot both pass)
+			let _files = super::rule_files::lock().await;
 			super::rule_files::check_create(&state.registry, &principal, &req).await?;
 			state.registry.create_as(req, origin).await
 		}
@@ -498,6 +500,7 @@ async fn update(
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
 			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+			let _files = super::rule_files::lock().await;
 			super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
 			state.registry.update(&key, req).await
 		}

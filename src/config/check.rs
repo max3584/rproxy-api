@@ -200,10 +200,10 @@ pub async fn check(input: &CheckInput) -> Report {
 			doc.labeled_rules().into_iter().map(|(label, r)| (label, protected::refs(r.tls.as_ref(), r.http.as_ref()))).collect();
 		for (label, files) in &refs {
 			for f in files {
-				if let Some(e) = protected::protecting(&f.path, &entries) {
+				if let Some(what) = protected::protecting(&f.path, &entries) {
 					report.warning(
 						label.clone(),
-						format!("{}: {} is {}; allowed in the settings file, but the same rule from the API is refused (403 protected_file)", f.field, f.path, e.what),
+						format!("{}: {} is {}; allowed in the settings file, but the same rule from the API is refused (403 protected_file)", f.field, f.path, what),
 					);
 				}
 			}

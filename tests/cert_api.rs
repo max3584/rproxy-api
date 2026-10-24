@@ -295,7 +295,7 @@ async fn rule_files_may_not_reach_the_store() {
 	)
 	.unwrap();
 	// the token file is a secret of the options
-	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(Some(&tokens), None));
+	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(Some(&tokens), None, None));
 	let h = harness_with(Tokens::from_file(tokens.clone()).unwrap()).await;
 	let pki = Pki::new("certs-files");
 	let issued = pki.server("f.pem", &["f.test"]);
@@ -373,6 +373,26 @@ async fn rule_files_may_not_reach_the_store() {
 	assert!(v["error"].as_str().unwrap().contains("allow_certs"), "{v}");
 	let (status, v) = send(Method::POST, "/rules".into(), "limited", tls_rule(free_port(), backend, "team-a-files")).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	// a rule an earlier version accepted (restored from the database) runs, said with
+	// rule.protected_file (the field, not the path); a PATCH of only its targets is refused
+	logs::capture();
+	let legacy = free_port();
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(legacy, &s(&crt), &s(&key))).unwrap();
+	h.registry.restore(vec![spec]).await;
+	let line = logs::wait_for("rule.protected_file", |l| l["event"] == "rule.protected_file" && l["rule"] == format!("tcp/127.0.0.1:{legacy}")).await;
+	assert!(line["field"].as_str().unwrap().starts_with("tls.certificates[0]."), "{line}");
+	assert!(!line.to_string().contains(&s(&crt)), "{line}");
+	let (print, _conn) = served(&pki, legacy, "f.test").await;
+	assert_eq!(print, sha(issued.der().as_ref()));
+	let only_targets = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port()});
+	refused(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{legacy}"), "admin", only_targets).await, "protected_file", "PATCH of the targets");
+
+	// refusals of PUT /rulesets are audited like those of /rules
+	let set = json!({"generation": 1, "rules": [files_rule(free_port(), &s(&crt), &s(&key))]});
+	refused(send(Method::PUT, "/rulesets/audited".into(), "admin", set).await, "protected_file", "rule set");
+	let audit = logs::wait_for("audit", |l| l["event"] == "audit" && l["ruleset"] == "audited").await;
+	assert_eq!((audit["outcome"].as_str(), audit["code"].as_str()), (Some("forbidden"), Some("protected_file")), "{audit}");
 
 	// rules of the settings file are the administrator's: they may
 	let port = free_port();

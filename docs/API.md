@@ -996,13 +996,14 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 
 ルールのファイルの項目（`tls` と `http` のすべての `*_file`：証明書・鍵・チェーン・CA（`client_auth`・`upstream`・`routes[].upstream`・サービスの `tls`）、`basic_auth.users_file`、`oidc.client_secret_file`・`cookie_secret_file`・`ca_file`）を、API（`POST` / `PATCH /rules`・`PUT /rulesets/{name}`、`dry_run` も）からは次のように制限する。`rules:write` のトークンが、保存した証明書や ACME の鍵で TLS を終端したり、秘密を自分の用意した issuer に送らせたりできないように。
 
-- 証明書のストア（`RPROXY_CERT_STORE`）と ACME の保存先（`global.acme.storage`）の下、設定とオプションの秘密のファイル（`global.crowdsec.api_key_file`、`global.acme` の DNS のプロバイダの `api_key_file`・`secret_file`・`tsig_secret_file`・`credentials_file`・EAB の `hmac_key_file`・アカウントの `key_file`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_KEY`）は指せない：`403 protected_file`。トークンのスコープ（`acme:write`・`admin`）に関係なく断る。保存した証明書は `{"cert": "<name>"}`、ACME の証明書は `{"acme": ...}`（`acme:write`）で使う。
-  - パスは実際に行き着く先で比べる：ファイルを開いて（読まずに、`O_PATH`）その fd の本当のパス（`/proc/self/fd`）と inode を見るので、シンボリックリンク・`..` では回り込めない（秘密のファイルはハードリンクも inode で見つける）。まだないパス（後で保存される証明書）は、ある親のディレクトリまでたどって比べる。
+- 証明書のストア（`RPROXY_CERT_STORE`）と ACME の保存先（`global.acme.storage`）の下、設定とオプションの秘密のファイル（`global.crowdsec.api_key_file`、`global.acme` の DNS のプロバイダの `api_key_file`・`secret_file`・`tsig_secret_file`・`credentials_file`・EAB の `hmac_key_file`・アカウントの `key_file`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_KEY`、`RPROXY_DIFF_TOKEN_FILE`）は指せない：`403 protected_file`。トークンのスコープ（`acme:write`・`admin`）に関係なく断る。保存した証明書は `{"cert": "<name>"}`、ACME の証明書は `{"acme": ...}`（`acme:write`）で使う。
+  - パスは書いたとおりと実際に行き着く先の両方で比べる：ファイルを開いて（読まずに、`O_PATH`）その fd の本当のパス（`/proc/self/fd`）と inode を見るので、シンボリックリンク・`..` では回り込めない（秘密のファイルはハードリンクも inode で見つける。ストア・ACME の保存先は、行き着く先のディレクトリのどれかがその（デバイス, inode）なら同じとみなすので、bind mount で別の場所に見せても断る）。まだないパス（後で保存される証明書）は、ある親のディレクトリまでたどって比べる。
+  - カーネルのファイルシステム（`/proc`・`/sys`・`/dev` の下と、procfs・sysfs・devtmpfs などの上のファイル。`statfs` の種類で見る）も断る：`/proc/self/environ`（DB のパスワードなどの環境変数）・`/proc/self/fd/N`（開いているファイル）は rproxy のもので所有者の確かめを通ってしまうため。
   - 秘密のファイルはそのファイルだけ（同じディレクトリのほかのファイルは指せる。既定の `/etc/rproxy` にはトークンとルールのファイルが並ぶため）。
 - `allow_certs` のあるトークン（保存した証明書の一部に絞ったトークン）は、ルールにファイルのパスを書けない：`403 file_not_allowed`。証明書は `allow_certs` の内の `{"cert": "<name>"}` で使う。
-- OIDC の client secret のファイル（rproxy が issuer に送る）は、同じ `issuer`（末尾の `/` を除く）と `client_id` の client secret としてだけ使える。ほかのルール（設定ファイル・API・組）を含めて、cookie の秘密・別の issuer や client の client secret・`users_file`・鍵などにも使っていれば `409 secret_reuse`（同じ client を複数のルールで使うのはよい）。
+- OIDC の client secret のファイル（rproxy が issuer に送る）は、同じ `issuer`（末尾の `/` を除く）と `client_id` の client secret としてだけ使える。ほかのルール（設定ファイル・API・組）を含めて、cookie の秘密・別の issuer や client の client secret・`users_file`・鍵などにも使っていれば `409 secret_reuse`（同じ client を複数のルールで使うのはよい）。`PUT /rulesets` での断りも `/rules` と同じく `event: audit`（`outcome: forbidden`、`code`）に残る。誤りの文はこの変更のルールのことだけで、ほかのルールのキー・項目・パスは出さない。確かめと変更は 1 つずつ（同時の 2 つの変更が両方通ることはない）。
 - 設定ファイルのルール（`origin: static`）は今までどおり（ホストの管理者のもの）。`--check-config` が同じものを警告にする（`... is under the certificate store ...; allowed in the settings file, but the same rule from the API is refused (403 protected_file)`、`409 secret_reuse`）。
-- 前の版で API から作ったルール（DB・組の保存から戻すものを含む）は、そのまま動く。次に変えるときに上の確かめを通る。
+- 前の版で API から作ったルール（DB・組の保存から戻すもの、DB との照合、引き継ぎ）は断らずに動かし、守るファイルを指していれば `rule.protected_file`（`warn`。ルールと項目だけで、パスは出さない）をログに出す。そのルールの API での変更（PATCH）は、PATCH で出来上がるルール全体で確かめるので、宛先だけの PATCH でも守るファイルを指したままなら `403 protected_file`（ファイルを置き換える PATCH は通る）。
 - `oidc` のセッションの cookie は、cookie の名前に加えて `issuer` と `client_id` にも結びつける（AES-256-GCM の関連データ）。同じ cookie の秘密を使うほかの `oidc` のミドルウェアの cookie は通らない。この版に上げると、今のセッションは一度だけサインインし直しになる。
 
 ## エンドポイント

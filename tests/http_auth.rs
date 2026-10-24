@@ -634,6 +634,21 @@ async fn oidc_client_secrets_keep_to_one_use() {
 		let r = h.http.post(format!("{}/rules?dry_run=true", h.base)).json(&http_rule(free_port(), http)).send().await.unwrap();
 		assert_eq!(r.status(), StatusCode::CONFLICT, "{what} (dry run)");
 	}
+	// kernel filesystems: the process's environment (the database password) and its open files
+	let open = std::fs::File::open(dir.join("client")).unwrap();
+	let fd = std::os::fd::AsRawFd::as_raw_fd(&open);
+	for secret in ["/proc/self/environ".to_string(), format!("/proc/self/fd/{fd}"), format!("/proc/{}/environ", std::process::id())] {
+		let mut http = sso("https://idp.evil.example", "x", "client", "cookie2");
+		http["middlewares"]["sso"]["oidc"]["client_secret_file"] = json!(secret);
+		let (status, v) = h.post(http_rule(free_port(), http)).await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("protected_file")), "{secret}: {v}");
+		assert!(v["error"].as_str().unwrap().contains("kernel filesystem"), "{v}");
+	}
+	drop(open);
+	// the message says nothing of the other rule (its key, field or path)
+	let (_, v) = h.post(http_rule(free_port(), sso("https://idp.evil.example", "x", "cookie", "cookie2"))).await;
+	let message = v["error"].as_str().unwrap();
+	assert!(message.contains("another rule") && !message.contains(&port.to_string()) && !message.contains("cookie_secret_file ("), "{message}");
 	// the cookie is bound to the issuer and client too (M4): unit test in l7::middleware::oidc
 	std::fs::remove_dir_all(dir).unwrap();
 }

@@ -750,6 +750,9 @@ impl State {
 					continue;
 				}
 			};
+			for (i, r) in rules.iter().enumerate() {
+				registry.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "handoff");
+			}
 			let req = crate::core::ruleset::RulesetRequest { generation: set.generation, rules };
 			let owner = if set.owner.is_empty() { set.updated_by.as_str() } else { set.owner.as_str() };
 			let opts = crate::core::ruleset::PutOptions {

@@ -5,9 +5,14 @@
 //! - A token limited by `allow_certs` names no file at all (`403 file_not_allowed`):
 //!   its certificates are the stored ones it may use.
 //! - No file under the certificate store or the ACME storage, nor a secret of the
-//!   settings or the options (`403 protected_file`).
+//!   settings or the options, nor one on a kernel filesystem (`/proc/self/environ`)
+//!   (`403 protected_file`). A PATCH is judged by the rule it makes, so a protected
+//!   file an older version accepted does not stay through a PATCH of the targets.
 //! - An OIDC client secret file is used only as the client secret of the same issuer
-//!   and client, here and in every other rule (`409 secret_reuse`).
+//!   and client, here and in every other rule (`409 secret_reuse`). The check and the
+//!   change run under `lock`, so two changes cannot pass it at once.
+//!
+//! The filesystem is looked at on a blocking thread (`spawn_blocking`).
 
 use crate::control::auth::Principal;
 use crate::core::registry::Registry;
@@ -15,15 +20,19 @@ use crate::core::rule::Key;
 use crate::error::ApiError;
 use crate::net::protected::{self, FileRef, Use};
 
+/// Held from the check to the end of the change (`POST` / `PATCH /rules`, `PUT /rulesets`).
+static CHANGES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Taken before `check` by a change (not by a dry run), kept until the change is made.
+pub async fn lock() -> tokio::sync::MutexGuard<'static, ()> {
+	CHANGES.lock().await
+}
+
 /// The rules the change replaces, whose files are left out of the comparison.
 pub enum Replacing<'a> {
 	Nothing,
-	/// A PATCH: the parts it replaces (`tls`, `http`) of this rule.
-	Rule {
-		key: &'a Key,
-		tls: bool,
-		http: bool,
-	},
+	/// A PATCH: the rule (its files are all in the change, as the PATCH makes it).
+	Rule(&'a Key),
 	/// A rule set's PUT: all its rules.
 	Ruleset(&'a str),
 }
@@ -32,7 +41,7 @@ pub enum Replacing<'a> {
 pub async fn check(
 	registry: &Registry,
 	principal: &Principal,
-	rules: &[(String, Vec<FileRef>)],
+	rules: Vec<(String, Vec<FileRef>)>,
 	replacing: Replacing<'_>,
 ) -> Result<(), ApiError> {
 	if principal.limited_to_stored_certs() {
@@ -49,41 +58,43 @@ pub async fn check(
 	}
 	let global = registry.http_global();
 	let entries = protected::current(registry.acme().map(|a| a.as_ref()), global.crowdsec().map(|b| b.key_file()));
+	let existing: Vec<(String, FileRef)> = registry
+		.file_refs()
+		.await
+		.into_iter()
+		.filter(|(key, set, _)| match &replacing {
+			Replacing::Nothing => true,
+			Replacing::Rule(k) => *k != key,
+			Replacing::Ruleset(name) => set.as_deref() != Some(*name),
+		})
+		.flat_map(|(key, _, refs)| refs.into_iter().map(move |f| (key.to_string(), f)))
+		.collect();
+	tokio::task::spawn_blocking(move || judge(&entries, &rules, &existing))
+		.await
+		.unwrap_or_else(|e| Err(ApiError::internal(format!("checking the files did not finish: {e}"))))
+}
+
+fn judge(entries: &[protected::Entry], rules: &[(String, Vec<FileRef>)], existing: &[(String, FileRef)]) -> Result<(), ApiError> {
 	for (label, refs) in rules {
 		for f in refs {
-			if let Some(e) = protected::protecting(&f.path, &entries) {
+			if let Some(what) = protected::protecting(&f.path, entries) {
 				return Err(ApiError::protected_file(format!(
-					"{label}{}: {} is {}; rules from the API may not name it",
-					f.field, f.path, e.what
+					"{label}{}: {} is {what}; rules from the API may not name it",
+					f.field, f.path
 				)));
 			}
 		}
 	}
 	// OIDC client secrets: against each other and every other rule's files
-	let existing = registry.file_refs().await;
-	let new_client = rules.iter().flat_map(|(_, refs)| refs).any(|f| f.client.is_some());
-	if !new_client && !existing.iter().any(|(_, _, refs)| refs.iter().any(|f| f.client.is_some())) {
+	let any_client = rules
+		.iter()
+		.flat_map(|(_, refs)| refs)
+		.chain(existing.iter().map(|(_, f)| f))
+		.any(|f| f.client.is_some());
+	if !any_client {
 		return Ok(());
 	}
-	let replacing = &replacing;
-	let kept: Vec<(String, &FileRef)> = existing
-		.iter()
-		.filter(|(_, set, _)| match replacing {
-			Replacing::Ruleset(name) => set.as_deref() != Some(name),
-			_ => true,
-		})
-		.flat_map(|(key, _, refs)| {
-			refs.iter()
-				.filter(move |f| match replacing {
-					Replacing::Rule { key: k, tls, http } if *k == key => {
-						!(*tls && f.field.starts_with("tls.") || *http && f.field.starts_with("http."))
-					}
-					_ => true,
-				})
-				.map(move |f| (key.to_string(), f))
-		})
-		.collect();
-	let mut uses: Vec<Use<'_>> = kept
+	let mut uses: Vec<Use<'_>> = existing
 		.iter()
 		.map(|(rule, f)| Use {
 			rule: format!("rule {rule}"),
@@ -112,23 +123,22 @@ pub async fn check(
 /// `POST /rules`.
 pub async fn check_create(registry: &Registry, principal: &Principal, req: &crate::core::rule::RuleRequest) -> Result<(), ApiError> {
 	let refs = protected::refs(req.tls.as_ref(), req.http.as_ref());
-	check(registry, principal, &[(String::new(), refs)], Replacing::Nothing).await
+	check(registry, principal, vec![(String::new(), refs)], Replacing::Nothing).await
 }
 
-/// `PATCH /rules/...`: the parts it replaces.
+/// `PATCH /rules/...`: the rule as the PATCH makes it (every file it will name, not only
+/// those in the request). A request the PATCH itself refuses is left to it.
 pub async fn check_update(
 	registry: &Registry,
 	principal: &Principal,
 	key: &Key,
 	req: &crate::core::rule::UpdateRequest,
 ) -> Result<(), ApiError> {
-	let refs = protected::refs(req.tls.as_ref(), req.http.as_ref());
-	let replacing = Replacing::Rule {
-		key,
-		tls: req.tls.is_some(),
-		http: req.http.is_some(),
+	let refs = match registry.updated_spec(key, req.clone()).await {
+		Ok((_, spec, _, _)) => protected::refs(Some(&spec.tls), spec.http.as_ref()),
+		Err(_) => protected::refs(req.tls.as_ref(), req.http.as_ref()),
 	};
-	check(registry, principal, &[(String::new(), refs)], replacing).await
+	check(registry, principal, vec![(String::new(), refs)], Replacing::Rule(key)).await
 }
 
 /// `PUT /rulesets/{name}`: every rule of the set (`rules[i]: ` in the errors).
@@ -143,5 +153,5 @@ pub async fn check_ruleset(
 		.enumerate()
 		.map(|(i, r)| (format!("rules[{i}]: "), protected::refs(r.tls.as_ref(), r.http.as_ref())))
 		.collect();
-	check(registry, principal, &rules, Replacing::Ruleset(name)).await
+	check(registry, principal, rules, Replacing::Ruleset(name)).await
 }

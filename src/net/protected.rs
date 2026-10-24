@@ -61,11 +61,12 @@ pub fn set_process(entries: Vec<Entry>) {
 	*PROCESS.write().unwrap_or_else(|e| e.into_inner()) = entries;
 }
 
-/// The options' secrets: `RPROXY_TOKEN_FILE` and `RPROXY_TLS_KEY`.
-pub fn process_entries(token_file: Option<&Path>, tls_key: Option<&Path>) -> Vec<Entry> {
+/// The options' secrets: `RPROXY_TOKEN_FILE`, `RPROXY_TLS_KEY` and `RPROXY_DIFF_TOKEN_FILE`.
+pub fn process_entries(token_file: Option<&Path>, tls_key: Option<&Path>, diff_token_file: Option<&Path>) -> Vec<Entry> {
 	let mut out = vec![];
 	out.extend(token_file.map(|p| Entry::file("the token file (RPROXY_TOKEN_FILE)", p)));
 	out.extend(tls_key.map(|p| Entry::file("the control API's TLS key (RPROXY_TLS_KEY)", p)));
+	out.extend(diff_token_file.map(|p| Entry::file("the token file of --diff (RPROXY_DIFF_TOKEN_FILE)", p)));
 	out
 }
 
@@ -182,20 +183,118 @@ fn best_effort(path: &Path) -> PathBuf {
 	}
 }
 
-/// The entry protecting `path`, if one does.
-pub fn protecting<'a>(path: &str, entries: &'a [Entry]) -> Option<&'a Entry> {
+/// What is said of a file on a kernel filesystem.
+pub const KERNEL_FS: &str =
+	"on a kernel filesystem (/proc, /sys, /dev: the process's environment, its open files, devices); only regular files on disk";
+
+/// Why `path` may not be named by a rule from the API, if it may not: what protects it
+/// (an entry's `what`), or `KERNEL_FS`.
+pub fn protecting(path: &str, entries: &[Entry]) -> Option<String> {
 	if path.is_empty() {
 		return None;
 	}
-	let r = resolve(Path::new(path));
-	entries.iter().find(|e| {
-		let p = resolve(&e.path);
-		if e.tree {
-			r.real.starts_with(&p.real)
-		} else {
-			r.same(&p)
+	let given = Path::new(path);
+	if on_kernel_fs(given) {
+		return Some(KERNEL_FS.to_string());
+	}
+	let r = resolve(given);
+	// the directories the file is in (device, inode), for trees mounted a second time
+	let mut ancestors: Vec<(u64, u64)> = vec![];
+	{
+		use std::os::unix::fs::MetadataExt;
+		let mut dir = r.real.parent();
+		while let Some(d) = dir {
+			if let Ok(m) = std::fs::metadata(d) {
+				ancestors.push((m.dev(), m.ino()));
+			}
+			dir = d.parent();
 		}
-	})
+	}
+	entries
+		.iter()
+		.find(|e| {
+			let p = resolve(&e.path);
+			if e.tree {
+				r.real.starts_with(&p.real) || p.id.is_some_and(|id| r.id == Some(id) || ancestors.contains(&id))
+			} else {
+				r.same(&p)
+			}
+		})
+		.map(|e| e.what.clone())
+}
+
+/// procfs, sysfs, devtmpfs and the like: `/proc/self/environ`, `/proc/self/fd/N` and
+/// devices pass the owner check (rproxy's own, 0400) but are no files to name.
+fn on_kernel_fs(path: &Path) -> bool {
+	// as written (`/proc/self/cwd/...`, `/proc/self/root/...` too) and where it leads
+	let written = if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		std::env::current_dir().unwrap_or_default().join(path)
+	};
+	let real = best_effort(path);
+	let kernel = |p: &Path| {
+		[Path::new("/proc"), Path::new("/sys"), Path::new("/dev")]
+			.iter()
+			.any(|d| p.starts_with(d))
+	};
+	if kernel(&written) || kernel(&real) {
+		return true;
+	}
+	// the file (followed and not), and the directory it is named in
+	let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).map(best_effort);
+	[
+		fs_type(path, true),
+		fs_type(path, false),
+		parent.as_deref().and_then(|p| fs_type(p, true)),
+	]
+	.into_iter()
+	.flatten()
+	.any(|(t, at)| kernel_fs_type(t, &at))
+}
+
+/// The filesystem type (`statfs` `f_type`) of `path` (`follow`: its last symbolic link
+/// too) and the real path, None when it cannot be opened.
+#[cfg(target_os = "linux")]
+fn fs_type(path: &Path, follow: bool) -> Option<(i64, PathBuf)> {
+	use std::os::fd::AsRawFd;
+	use std::os::unix::fs::OpenOptionsExt;
+	let flags = libc::O_PATH | libc::O_CLOEXEC | if follow { 0 } else { libc::O_NOFOLLOW };
+	let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).ok()?;
+	// SAFETY: a zeroed statfs is a valid out buffer; the fd is open
+	let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+	if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+		return None;
+	}
+	let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap_or_default();
+	#[allow(clippy::unnecessary_cast)]
+	Some((st.f_type as i64, real))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fs_type(_: &Path, _: bool) -> Option<(i64, PathBuf)> {
+	None
+}
+
+fn kernel_fs_type(t: i64, real: &Path) -> bool {
+	const PROC: i64 = 0x9fa0;
+	const SYSFS: i64 = 0x6265_6572;
+	const DEVPTS: i64 = 0x1cd1;
+	const DEBUGFS: i64 = 0x6462_6720;
+	const SECURITYFS: i64 = 0x7363_6673;
+	const TRACEFS: i64 = 0x7472_6163;
+	const CGROUP: i64 = 0x0027_e0eb;
+	const CGROUP2: i64 = 0x6367_7270;
+	const BPF: i64 = 0xcafe_4a11;
+	const CONFIGFS: i64 = 0x6265_6570;
+	const EFIVARFS: i64 = 0xde5e_81e4;
+	const PSTORE: i64 = 0x6165_676c;
+	// devtmpfs reports tmpfs's magic: judged by where it is
+	const TMPFS: i64 = 0x0102_1994;
+	matches!(
+		t,
+		PROC | SYSFS | DEVPTS | DEBUGFS | SECURITYFS | TRACEFS | CGROUP | CGROUP2 | BPF | CONFIGFS | EFIVARFS | PSTORE
+	) || (t == TMPFS && real.starts_with("/dev"))
 }
 
 /// A file a rule names.
@@ -287,9 +386,18 @@ pub fn secret_conflicts(uses: &[Use<'_>]) -> Vec<String> {
 			if b.file.is_client_secret() && j < i {
 				continue;
 			}
+			// said of the use in the change only: nothing of another rule (its key, field or path)
+			let (u, other) = if a.new { (a, b) } else { (b, a) };
+			let elsewhere = if other.new && other.rule == u.rule {
+				format!("also {} in the same rule", other.file.field)
+			} else if other.new {
+				format!("also {} {}", other.rule, other.file.field)
+			} else {
+				"also used by another rule in another way".to_string()
+			};
 			out.push(format!(
-				"{} {} ({}) is also {} {}: a file read as an OIDC client secret (sent to the issuer) may be used elsewhere only as the client secret of the same issuer and client_id",
-				a.rule, a.file.field, a.file.path, b.rule, b.file.field
+				"{} {} ({}) is {elsewhere}: a file read as an OIDC client secret (sent to the issuer) may be used elsewhere only as the client secret of the same issuer and client_id",
+				u.rule, u.file.field, u.file.path
 			));
 		}
 	}
@@ -319,32 +427,61 @@ mod tests {
 		std::fs::hard_link(d.join("token"), d.join("token2")).unwrap();
 		let entries = vec![Entry::tree("store", &store), Entry::file("token", d.join("token"))];
 		let s = |p: PathBuf| p.to_string_lossy().into_owned();
-		assert_eq!(protecting(&s(store.join("a/tls.key")), &entries).unwrap().what, "store");
+		assert_eq!(protecting(&s(store.join("a/tls.key")), &entries).unwrap(), "store");
 		assert_eq!(
-			protecting(&s(d.join("link.key")), &entries).unwrap().what,
+			protecting(&s(d.join("link.key")), &entries).unwrap(),
 			"store",
 			"a link into the store"
 		);
 		assert_eq!(
-			protecting(&s(d.join("other/../store/a/tls.key")), &entries).unwrap().what,
+			protecting(&s(d.join("other/../store/a/tls.key")), &entries).unwrap(),
 			"store",
 			"`..` does not get around it"
 		);
 		assert_eq!(
-			protecting(&s(store.join("later/current/tls.key")), &entries).unwrap().what,
+			protecting(&s(store.join("later/current/tls.key")), &entries).unwrap(),
 			"store",
 			"not stored yet"
 		);
-		assert_eq!(protecting(&s(d.join("nothing/../store/b.key")), &entries).unwrap().what, "store");
-		assert_eq!(protecting(&s(d.join("token")), &entries).unwrap().what, "token");
+		assert_eq!(protecting(&s(d.join("nothing/../store/b.key")), &entries).unwrap(), "store");
+		assert_eq!(protecting(&s(d.join("token")), &entries).unwrap(), "token");
 		assert_eq!(
-			protecting(&s(d.join("token2")), &entries).unwrap().what,
+			protecting(&s(d.join("token2")), &entries).unwrap(),
 			"token",
 			"a hard link is the same inode"
 		);
 		assert!(protecting(&s(d.join("mine.key")), &entries).is_none());
 		assert!(protecting(&s(d.join("store2.key")), &entries).is_none());
 		assert!(protecting("", &entries).is_none());
+		std::fs::remove_dir_all(d).unwrap();
+	}
+
+	#[test]
+	fn kernel_filesystems_are_refused() {
+		let d = dir("kernel");
+		std::os::unix::fs::symlink("/proc/self/environ", d.join("env")).unwrap();
+		std::os::unix::fs::symlink("/proc/self/fd", d.join("fds")).unwrap();
+		std::fs::write(d.join("plain"), b"x").unwrap();
+		let open = std::fs::File::open(d.join("plain")).unwrap();
+		let fd = {
+			use std::os::fd::AsRawFd;
+			open.as_raw_fd()
+		};
+		let s = |p: PathBuf| p.to_string_lossy().into_owned();
+		for path in [
+			"/proc/self/environ".to_string(),
+			format!("/proc/self/fd/{fd}"),
+			format!("/proc/{}/environ", std::process::id()),
+			"/proc/self/cwd/../../etc/hostname".to_string(),
+			s(d.join("env")),
+			s(d.join("fds").join(fd.to_string())),
+			"/dev/null".to_string(),
+			"/sys/kernel/mm/transparent_hugepage/enabled".to_string(),
+		] {
+			assert_eq!(protecting(&path, &[]).as_deref(), Some(KERNEL_FS), "{path}");
+		}
+		assert!(protecting(&s(d.join("plain")), &[]).is_none());
+		drop(open);
 		std::fs::remove_dir_all(d).unwrap();
 	}
 
