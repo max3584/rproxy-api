@@ -488,10 +488,8 @@ impl Fetcher {
 			if !url.starts_with("https://") {
 				return Err(format!("{url}: only https:// is fetched"));
 			}
-			let uri: hyper::Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
-			let authority = uri.authority().ok_or(format!("{url}: no host"))?.clone();
-			let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
-			let port = authority.port_u16().unwrap_or(443);
+			let crate::net::url::HttpUrl { uri, host, port, .. } = crate::net::url::parse(&url).map_err(|e| format!("{url}: {e}"))?;
+			let authority = uri.authority().ok_or("no host")?.clone();
 			let tcp = tokio::time::timeout(STEP, tokio::net::TcpStream::connect((host.as_str(), port)))
 				.await
 				.map_err(|_| format!("{authority}: timed out"))?

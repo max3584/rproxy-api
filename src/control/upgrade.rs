@@ -115,8 +115,10 @@ impl UpgradeOptions {
 			}
 		}
 		if let Some(src) = &self.update_source {
-			if !src.starts_with("https://") {
-				v.errors.push(format!("RPROXY_UPDATE_SOURCE must be an https:// URL: {src}"));
+			match crate::net::url::parse(src) {
+				Ok(u) if u.https => {}
+				Ok(_) => v.errors.push(format!("RPROXY_UPDATE_SOURCE must be an https:// URL: {src}")),
+				Err(e) => v.errors.push(format!("RPROXY_UPDATE_SOURCE {src:?} {e}")),
 			}
 		}
 		let handoff_set = self.handoff_socket.is_some() || self.handoff_timeout.is_some() || self.handoff_drain.is_some();
@@ -378,5 +380,15 @@ mod tests {
 		};
 		assert_eq!(bad.check(&Features::ALL).errors.len(), 3, "{:?}", bad.check(&Features::ALL));
 		assert!(check_pin("latest").is_err());
+		// the source is read as the download will be (#324)
+		for (src, want) in [("https://mirror.example:8a/releases", "port"), ("https://u@mirror.example/", "user"), ("https://mirror.example/r", "")] {
+			let o = UpgradeOptions { update_source: Some(src.into()), ..Default::default() };
+			let errors = o.check(&Features::ALL).errors;
+			if want.is_empty() {
+				assert!(errors.is_empty(), "{src}: {errors:?}");
+			} else {
+				assert!(errors.len() == 1 && errors[0].contains(want), "{src}: {errors:?}");
+			}
+		}
 	}
 }

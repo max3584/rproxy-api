@@ -396,12 +396,18 @@ impl Oidc {
 			if issuer.trim_end_matches('/') != self.issuer {
 				return Err(format!("{url}: issuer {issuer} is not {}", self.issuer));
 			}
+			let endpoint = |k: &str, v: String| endpoint(&self.issuer, k, v).map_err(|e| format!("{url}: {e}"));
 			Ok(Provider {
 				issuer,
-				authorization: need("authorization_endpoint")?,
-				token: need("token_endpoint")?,
-				jwks: need("jwks_uri")?,
-				end_session: s("end_session_endpoint"),
+				authorization: endpoint("authorization_endpoint", need("authorization_endpoint")?)?,
+				token: endpoint("token_endpoint", need("token_endpoint")?)?,
+				jwks: endpoint("jwks_uri", need("jwks_uri")?)?,
+				// optional: one that does not pass is left out (logout then goes home), not fatal
+				end_session: s("end_session_endpoint").and_then(|v| {
+					endpoint("end_session_endpoint", v)
+						.map_err(|e| warn!(event = "oidc.error", middleware = %self.name, error = %e, "end_session_endpoint ignored"))
+						.ok()
+				}),
 			})
 		});
 		match found {
@@ -691,6 +697,16 @@ fn strip_cookies(headers: &mut HeaderMap, names: &[&str]) {
 	}
 }
 
+/// An endpoint from the discovery document, read as `crowdsec::call` and the browser
+/// will (`net::url`, #324); an https issuer's endpoints must be https too.
+fn endpoint(issuer: &str, key: &str, value: String) -> Result<String, String> {
+	let url = crate::net::url::parse(&value).map_err(|e| format!("{key} {value:?} {e}"))?;
+	if issuer.starts_with("https://") && !url.https {
+		return Err(format!("{key} {value:?} must be https:// (the issuer is)"));
+	}
+	Ok(value)
+}
+
 fn set_cookie(name: &str, value: &str, https: bool, max_age: Option<u64>) -> Option<HeaderValue> {
 	let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
 	if https {
@@ -775,6 +791,23 @@ mod tests {
 		let e = Oidc::new("sso", settings("/nonexistent/cookie")).unwrap_err();
 		assert!(e.message.contains("cookie_secret_file"), "{}", e.message);
 		std::fs::remove_dir_all(d).unwrap();
+	}
+
+	#[test]
+	fn discovery_endpoints_are_read_strictly() {
+		assert_eq!(endpoint("https://id.example", "jwks_uri", "https://id.example/jwks".into()).unwrap(), "https://id.example/jwks");
+		assert!(endpoint("http://127.0.0.1:8080", "token_endpoint", "http://127.0.0.1:8080/token".into()).is_ok());
+		for (issuer, value, why) in [
+			("https://id.example", "http://id.example/jwks", "must be https"),
+			("https://id.example", "https://id.example:8a/jwks", "port"),
+			("https://id.example", "https://id.example:65536/jwks", "port"),
+			("https://id.example", "https://[fe80::1%25eth0]/jwks", "zone"),
+			("https://id.example", "https://u@id.example/jwks", "user"),
+			("https://id.example", "/jwks", "http://"),
+		] {
+			let e = endpoint(issuer, "jwks_uri", value.into()).unwrap_err();
+			assert!(e.contains(why) && e.starts_with("jwks_uri"), "{value}: {e}");
+		}
 	}
 
 	#[test]

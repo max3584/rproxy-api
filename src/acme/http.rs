@@ -34,15 +34,9 @@ pub fn connector(ca_file: Option<&str>) -> Result<tokio_rustls::TlsConnector, St
 /// Sends one request; the URI must be absolute.
 pub async fn send(tls: &tokio_rustls::TlsConnector, req: Request<Bytes>) -> Result<Response<Bytes>, String> {
 	let (mut parts, body) = req.into_parts();
-	let uri = parts.uri.clone();
-	let authority = uri.authority().ok_or_else(|| format!("{uri}: no host"))?.clone();
-	let https = match uri.scheme_str() {
-		Some("https") => true,
-		Some("http") => false,
-		_ => return Err(format!("{uri}: not an http(s) URL")),
-	};
-	let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
-	let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
+	let crate::net::url::HttpUrl { uri, https, host, port } =
+		crate::net::url::parse(&parts.uri.to_string()).map_err(|e| format!("{}: {e}", parts.uri))?;
+	let authority = uri.authority().ok_or("no host")?.clone();
 	let work = async {
 		let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| format!("{authority}: {e}"))?;
 		crate::net::source::nodelay(&tcp);

@@ -215,11 +215,7 @@ impl std::fmt::Debug for Bouncer {
 }
 
 fn parse_url(url: &str, what: &str) -> Result<Uri, CrowdsecError> {
-	let uri: Uri = url.trim().parse().map_err(|e| CrowdsecError::Config(format!("{what}: {url:?}: {e}")))?;
-	match (uri.scheme_str(), uri.authority()) {
-		(Some("http" | "https"), Some(_)) => Ok(uri),
-		_ => Err(CrowdsecError::Config(format!("{what}: {url:?} must be an http:// or https:// URL"))),
-	}
+	crate::net::url::parse_base(url.trim()).map(|u| u.uri).map_err(|e| CrowdsecError::Config(format!("{what}: {url:?} {e}")))
 }
 
 /// Reads the API key; a missing or empty file is a configuration error.
@@ -502,11 +498,8 @@ pub(super) async fn call(
 	body: Bytes,
 	timeout: Duration,
 ) -> Result<(StatusCode, Bytes), String> {
-	let uri: Uri = url.parse().map_err(|e| format!("{url}: {e}"))?;
-	let authority = uri.authority().ok_or_else(|| format!("{url}: no host"))?.clone();
-	let https = uri.scheme_str() == Some("https");
-	let host = authority.host().trim_matches(|c| c == '[' || c == ']').to_string();
-	let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
+	let crate::net::url::HttpUrl { uri, https, host, port } = crate::net::url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+	let authority = uri.authority().ok_or("no host")?.clone();
 	let work = async {
 		let tcp = tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(|e| format!("{authority}: {e}"))?;
 		crate::net::source::nodelay(&tcp);
@@ -545,6 +538,15 @@ mod tests {
 
 	fn ip(s: &str) -> IpAddr {
 		s.parse().unwrap()
+	}
+
+	#[test]
+	fn lapi_and_appsec_urls_are_bases_read_strictly() {
+		assert!(parse_url(" http://127.0.0.1:8080/ ", "lapi_url").is_ok());
+		for (url, want) in [("http://127.0.0.1:8080/?x=1", "query"), ("http://127.0.0.1:8a", "port"), ("http://a..b:8080", "label")] {
+			let e = format!("{:?}", parse_url(url, "global.crowdsec.lapi_url").unwrap_err());
+			assert!(e.contains("global.crowdsec.lapi_url") && e.contains(want), "{url}: {e}");
+		}
 	}
 
 	#[test]
