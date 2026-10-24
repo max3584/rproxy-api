@@ -43,6 +43,7 @@ rproxy-traefik-convert --static traefik.yml --capabilities caps.json -o rproxy.y
 | `entryPoints.<name>.http.middlewares` | Prepended to every route of that entry point |
 | `entryPoints.<name>.http.tls`, router `tls` | The rule's `tls.mode: terminate` |
 | `entryPoints.<name>.http3` | `http.http3: true` |
+| `entryPoints.<name>.http.sanitizePath` (path normalisation) | Since v0.4.17 rproxy also normalises the path before matching routes, behaving as Traefik v3's default `sanitizePath: true` (percent-encoded unreserved characters decoded, `.` and `..` resolved, `//` collapsed; the one difference is that `%2F` is never turned back into a separator; "HTTP forwarding semantics" in docs/en/API.md). `sanitizePath: false` becomes `http.raw_path: true` with a note (unsafe with path-based authentication). The Host is matched without a trailing dot |
 | `entryPoints.<name>.forwardedHeaders.trustedIPs` | `global.trusted_proxies` |
 | `entryPoints.<name>.proxyProtocol.trustedIPs` (receiving PROXY protocol) | `proxy_protocol: {from: <trustedIPs>, required: false}` on that entry point's rules (v0.4.13; as in Traefik, a header is used when present). Without `trustedIPs`, and `insecure: true`, it is not converted (a note). rproxy refuses headers from outside `from` |
 | `accessLog.filePath` | `global.access_log` (format is rproxy's JSON Lines; Traefik's format and filters are not converted) |

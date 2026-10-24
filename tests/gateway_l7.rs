@@ -504,7 +504,10 @@ async fn capabilities_list_the_gateway_features() {
 	}
 	assert_eq!(
 		f["http_options"],
-		json!(["headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected"])
+		json!([
+			"headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected",
+			"path_normalize", "raw_path", "identity_headers", "http_timeouts"
+		])
 	);
 	assert_eq!(f["tls_route_targets"], true);
 	assert_eq!(f["tls_route_upstream"], true);

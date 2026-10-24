@@ -290,3 +290,26 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 対象外：`http` のルールの HTTP/3（quinn の UDP）は今までどおりヘッダを読まない。
 - PATCH・組の PUT・再読み込みは `in_place`（次のデータグラムのまとまりから）。引き継ぎ・保存はルールの形のまま（UDP のセッションは引き継ぎで作り直し）。
 - 試験：単体（`net::proxy_in` の `parse_dgram`・`datagram`・`Slot`、`config::plan` の round trip と `in_place`、`l4::dpdk` の `dpdk_refuses_proxy_protocol_on_its_addresses`（機能 `dpdk`、CI の `dpdk.yml`））、`tests/proxy_protocol_udp.rs`（2 段の rproxy・`allow_from`・`required`・外からのヘッダ・壊れたヘッダ・送信元ごとの `limits`・QUIC の `sni` と route の `source_ip`・DTLS の終端・PATCH での付け外し・検証）、ファジングの `proxy_header_in`（DGRAM の seeds）、ベンチマーク。
+
+## 13. 照合の前のパスと Host の正規化・身元のヘッダ・接続の時間の上限（v0.4.17、#320）
+
+脆弱性の点検（2026-10-23）の高 C と中 M1。`RequestInfo.path` を生のまま照合していたので、`/%61dmin`・`//admin`・`/x/../admin` が `PathPrefix(`/admin`)` に付けた `basic_auth`・`oidc`・`forward_auth`・`ip_allow` を素通りして認証のないルートに流れた。Host の末尾のドットも当たらなかった。身元のヘッダ（X-Forwarded-User など）は認証のミドルウェアの中でしか消していなかった。HTTP の接続には、hyper-util の `auto` の判定・HTTP/2 のアイドル・リクエストの本文に待ち時間の上限がなかった。
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| パスの正規化 | なし（いつも）。`http.raw_path: true` で止める | `http_options` の `path_normalize`・`raw_path` | **正規化する**（オーナーの決定で既定を変える。「省略したときは前のパッチと同じ」の例外） |
+| Host の正規化 | なし（いつも） | `path_normalize` | 小文字・末尾のドットを落として照合 |
+| 身元のヘッダを消す | なし（いつも） | `identity_headers` | 認証のミドルウェアのあるルールで消す |
+| 接続の時間の上限 | `global.http.timeouts`（`tls_handshake`・`first_byte`・`request_headers`・`idle`・`request_body_idle`・`http2_ping_interval`・`http2_ping_timeout`） | `http_timeouts` | `10s`・`10s`・`30s`・`180s`・`60s`・`60s`・`20s` |
+
+- パス（`l7::normalize::path`）：Traefik v3 の `sanitizePath` に合わせる。unreserved（RFC 3986 2.3）のパーセント符号化だけを戻し、ほかは符号化のまま 16 進を大文字に（`%2F` は区切りにしない。Go の Traefik は `%2F` を戻した `URL.Path` で `..` を解くが、rproxy は符号化のままのパスで解く：`/a%2F..%2Fadmin` は 1 つの区切りのまま。区切りを増やさない方が安全なので、ここだけ違う）、`.`・`..`・空の区切りを解き、ルートより上は `/` で止め（決めたこと：400 にせずに切り詰める。Go の `path.Clean`・RFC 3986 の remove_dot_segments と同じ）、末尾の `/` は元のパスにあれば残す。`%` の後に 16 進が 2 つないものは 400（決めたこと：Go の HTTP サーバも 400）。クエリは変えない。
+- どこで：`server.rs` の `Conn::handle` の最初（HTTP/1.1・HTTP/2・HTTP/3 が通る 1 か所）で `normalize_target` が `Uri` を置き換える。以後の照合・ミドルウェア（`strip_prefix` など）・`forward_auth`（`X-Forwarded-Uri`）・`mirror`・転送先・アクセスログはどれも正規化したパスを見る。速さ：すでに正規化されたパスは 1 回なめるだけで `Cow::Borrowed`（割り当てなし、`Uri` もそのまま）。`benches/parse.rs` の `path_normalize`：手元（ほかの作業と共有の機械）で normal が約 70 ns、作り直しが約 750 ns（`matcher/route_table_7` の約 1 µs と同じ程度の機械）。
+- `raw_path`（ルールの `http`）：Traefik の `entryPoints.<name>.http.sanitizePath: false` の代わり（URL をパスに埋める転送先など、`//` を残したいとき）。パスでの認証・`ip_allow` と組み合わせると安全でないと文書に書く。Host の正規化と身元のヘッダは `raw_path` でも変わらない。変換ツール（`rproxy-traefik-convert`）は `sanitizePath: false` を `raw_path: true` と注意書きにする。
+- Host（`request_host`）：ポートを除き、小文字に、末尾のドットを 1 つ落とす。照合（`Host`・`HostRegexp`）と `tls.misdirected` が使う。転送先へ送る `Host`・`X-Forwarded-Host` はクライアントが送ったまま（決めたこと：転送先の仮想ホストの扱いを変えない。Traefik も送られたまま渡す）。
+- 身元のヘッダ（`Router.identity_headers`、`Router::compile` で一度だけ作る）：ルールの `http.middlewares` のすべて（`servers[].middlewares` だけで使うものも）から、`basic_auth` の `user_header`、`oidc` の `IDENTITY_HEADERS`、`forward_auth` の `response_headers`、`*` と gRPC の `forward_auth` はよく使われる名前（oauth2-proxy・Authelia・Authentik）。認証に使う `Authorization`・`Proxy-Authorization`・`Cookie`・`Host` と、どれかの `forward_auth` の `request_headers` の名前は除く（消すと認証が通らない）。`Conn::handle` の最初（ACME・`oidc` のコールバック・照合より前）にどのルートでも消す。空ならなにもしない。
+- 接続の時間の上限（`l7::timeouts`）：`HttpGlobal.timeouts`（`main` が `global.http` から入れる。再起動まで効かない）。
+  - `tcp.rs` の `handle_http`：TLS のハンドシェイクは `tls_handshake`（L4 の `terminate` は今までの 10 秒のまま）。
+  - `server.rs` の `serve`：接続ごとの `Activity`（始まったリクエストの数・処理中の数・最後に終わった時刻）。`service_fn` が `begin` し、応答の本文を包む `Tracked` が終わり（drop）で `Busy` を放す（応答の型を変えるだけで、もう 1 回は箱に入れない）。`Activity::expired` が、最初のリクエストの前は `first_byte`（`Metered` の rx が 0 のまま）と `request_headers`、いつも `idle`（処理中がないまま）を見て、過ぎたら `graceful_shutdown` と 1 秒の猶予の後に閉じる（`conn.close` の `reason`）。HTTP/1.1 の 2 つめからのヘッダは hyper の `header_read_timeout`（= `request_headers`）。HTTP/2 は `keep_alive_interval` / `keep_alive_timeout`（PING。PING に答えるクライアントは `idle` で閉じる）。
+  - リクエストの本文：`IdleBody` が、読もうとして待つときだけタイマーを作り（本文のない GET は作らない）、フレームが届くたびに止め、待つあいだに `request_body_idle` が過ぎたら誤りで終える（`deadline::until` と同じく、正常な終わりに見せない）。転送先が読まないあいだ（背圧）は読もうとしないので数えない。
+  - HTTP/3（`h3.rs`）：QUIC のハンドシェイクは `tls_handshake`、リクエストのヘッダ（`resolve_request`）は `request_headers`、本文を読むタスクの `recv_data` は `request_body_idle`（過ぎたら `stop_sending` と誤り）、処理中のリクエストのない接続は `idle` で GOAWAY（`h3.accept()` の待ちは接続に状態を持つので、`select!` で手放してよい）。
+- 試験：単体（`l7::normalize`・`l7::timeouts`・`config` の `global.http`）、`tests/path_normalize.rs`（`/%61dmin`・`//admin`・`/x/../admin`・`/admin/.` などと末尾のドットの Host を HTTP/1.1・HTTP/2・HTTP/3 で、転送先が受け取るパス、400、`raw_path`、認証のないルートでの身元のヘッダ、何も送らない接続・slowloris・HTTP/2 の前置きだけ、HTTP/2 のアイドル、遅いアップロードが通ることと止まった本文）、`tests/http_semantics.rs`（転送先へのパスとクエリ）、ベンチマーク `path_normalize`。

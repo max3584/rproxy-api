@@ -509,8 +509,9 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 	rt: &Runtime,
 	offset: u16,
 	config: Arc<rustls::ServerConfig>,
+	limit: Option<Duration>,
 ) -> io::Result<(tokio_rustls::server::TlsStream<S>, TlsInfo)> {
-	let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+	let handshake = async {
 		let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
 		let name = start.client_hello().server_name().map(str::to_string);
 		// an ACME CA validating TLS-ALPN-01 (global.acme): answer with the challenge certificate, then close
@@ -525,10 +526,12 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 			return Err(denied(rt, client, "unmatched", name.as_deref()));
 		}
 		start.into_stream(config).await
-	})
-	.await
-	.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))
-	.and_then(|r| r)
+	};
+	// `http` rules: global.http.timeouts.tls_handshake (#320, 0s is no limit)
+	let session = match limit {
+		Some(limit) => tokio::time::timeout(limit, handshake).await.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))),
+		None => handshake.await,
+	}
 	.inspect_err(|e| {
 		if !is_denied(e) {
 			rt.stats.tls_failed()
@@ -560,21 +563,22 @@ async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt
 	let serving = async {
 		match (tls.mode(), tls.server_config.clone()) {
 			(TlsMode::Terminate, Some(config)) => {
-				let (session, i) = accept_tls(Prefixed::new(prefix, inbound), client, &rt, offset, config).await?;
+				let limit = rt.global.timeouts().tls_handshake;
+				let (session, i) = accept_tls(Prefixed::new(prefix, inbound), client, &rt, offset, config, limit).await?;
 				info = Some(i.clone());
 				let stream = Metered::new(session, rt.clone(), client.ip(), rx.clone(), tx.clone());
-				http::serve(stream, client, local, rt.clone(), Some(i)).await
+				http::serve(stream, client, local, rt.clone(), Some(i), rx.clone()).await
 			}
 			(TlsMode::Terminate, None) => Err(io::Error::other("TLS is not configured")),
 			_ => {
 				let stream = Metered::new(inbound, rt.clone(), client.ip(), rx.clone(), tx.clone());
-				http::serve(stream, client, local, rt.clone(), None).await
+				http::serve(stream, client, local, rt.clone(), None, rx.clone()).await
 			}
 		}
 	};
 	let result = tokio::select! {
 		_ = rt.kill.cancelled() => Ok("stopped"),
-		r = serving => r.map(|()| "closed"),
+		r = serving => r,
 	};
 	rt.stats.closed();
 	let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -616,7 +620,7 @@ async fn terminate(
 		}
 	}
 
-	let (mut session, info) = accept_tls(Prefixed::new(prefix, &mut *inbound), client, rt, offset, config).await?;
+	let (mut session, info) = accept_tls(Prefixed::new(prefix, &mut *inbound), client, rt, offset, config, Some(HANDSHAKE_TIMEOUT)).await?;
 	let target = rt
 		.select(info.server_name.as_deref(), offset)
 		.ok_or_else(|| denied(rt, client, "unmatched", info.server_name.as_deref()))?;

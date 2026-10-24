@@ -110,6 +110,12 @@ pub struct Router {
 	secrets: Vec<Arc<Middleware>>,
 	/// Some route looks at headers (`RequestInfo.headers` is filled only then).
 	match_headers: bool,
+	/// `http.raw_path`: the path is not normalised (#320).
+	raw_path: bool,
+	/// Headers the rule's authentication middlewares set for the backend (`user_header`,
+	/// `oidc`'s, `forward_auth`'s `response_headers`): whatever a client sends under these
+	/// names is dropped from every request, on every route (#320).
+	identity_headers: Vec<HeaderName>,
 }
 
 impl Drop for Router {
@@ -208,7 +214,20 @@ impl Router {
 		let oidc = middlewares.values().filter_map(|m| if let Middleware::Oidc(o) = m.as_ref() { Some(o.clone()) } else { None }).collect();
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
-		Ok(Router { routes, default_status, default_service, services: all, dialer, health_stop, oidc, secrets, match_headers })
+		let identity_headers = identity_headers(middlewares.values().map(|m| m.as_ref()));
+		Ok(Router {
+			routes,
+			default_status,
+			default_service,
+			services: all,
+			dialer,
+			health_stop,
+			oidc,
+			secrets,
+			match_headers,
+			raw_path: spec.raw_path,
+			identity_headers,
+		})
 	}
 
 	/// SIGHUP: read the secret files of the authentication middlewares again.
@@ -230,6 +249,61 @@ impl Router {
 	fn route(&self, info: &RequestInfo) -> Option<&Route> {
 		self.routes.iter().find(|r| r.matcher.matches(info))
 	}
+}
+
+/// Identity headers set by authentication middlewares, as `identity_headers` names them
+/// (also those of middlewares only `servers[].middlewares` use).
+const KNOWN_IDENTITY: [&str; 13] = [
+	"x-forwarded-user",
+	"x-forwarded-email",
+	"x-forwarded-groups",
+	"x-forwarded-sub",
+	"x-forwarded-preferred-username",
+	"x-auth-request-user",
+	"x-auth-request-email",
+	"x-auth-request-groups",
+	"x-auth-request-preferred-username",
+	"remote-user",
+	"remote-email",
+	"remote-groups",
+	"remote-name",
+];
+
+/// Headers a client must not set itself because a middleware of the rule sets them after
+/// authenticating: `basic_auth`'s `user_header`, `oidc`'s X-Forwarded-User / -Email /
+/// -Groups / -Sub, `forward_auth`'s `response_headers`, and for `forward_auth` with
+/// `response_headers: ["*"]` or `protocol: grpc` (the auth server decides the names) the
+/// usual names of oauth2-proxy, Authelia and Authentik (`KNOWN_IDENTITY`).
+/// Credentials the client sends for the authentication itself (`Authorization`, `Cookie`,
+/// and what a `forward_auth` sends to its server, `request_headers`) are kept.
+fn identity_headers<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Vec<HeaderName> {
+	let middlewares: Vec<&Middleware> = middlewares.collect();
+	let mut out: Vec<HeaderName> = vec![];
+	let mut add = |h: HeaderName| {
+		if !out.contains(&h) {
+			out.push(h);
+		}
+	};
+	for m in &middlewares {
+		match m {
+			Middleware::BasicAuth(b) => b.user_header.iter().cloned().for_each(&mut add),
+			Middleware::Oidc(_) => oidc::IDENTITY_HEADERS.into_iter().map(HeaderName::from_static).for_each(&mut add),
+			Middleware::ForwardAuth(fa) => {
+				if fa.grpc || fa.all_response_headers {
+					KNOWN_IDENTITY.into_iter().map(HeaderName::from_static).for_each(&mut add);
+				}
+				fa.response_headers.iter().cloned().for_each(&mut add);
+			}
+			_ => {}
+		}
+	}
+	// what the client sends to authenticate, and what a forward_auth passes to its server
+	let sent = |h: &HeaderName| {
+		matches!(h.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host")
+			|| middlewares.iter().any(|m| matches!(m, Middleware::ForwardAuth(fa) if fa.request_headers.contains(h)))
+	};
+	out.retain(|h| !sent(h));
+	out
 }
 
 /// Counts bytes of one client connection into the rule's statistics.
@@ -411,40 +485,70 @@ impl Conn {
 }
 
 /// Serves HTTP/1.1 and HTTP/2 (by preface) on an accepted, possibly decrypted, connection.
-/// `tls` is the terminated session; None for plain HTTP.
-pub async fn serve<S>(stream: S, client: SocketAddr, local: SocketAddr, rt: Arc<Runtime>, tls: Option<TlsInfo>) -> io::Result<()>
+/// `tls` is the terminated session; None for plain HTTP. `rx` counts the bytes read from
+/// the client (`first_byte`). Returns why the connection ended (`conn.close`'s `reason`):
+/// `closed`, or a time limit of `global.http.timeouts` (#320).
+pub async fn serve<S>(
+	stream: S,
+	client: SocketAddr,
+	local: SocketAddr,
+	rt: Arc<Runtime>,
+	tls: Option<TlsInfo>,
+	rx: Arc<AtomicU64>,
+) -> io::Result<&'static str>
 where
 	S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+	let limits = rt.global.timeouts();
 	let conn = Arc::new(Conn::new(rt, client, local, tls, false));
 	let stop = conn.rt.stop.clone();
+	let activity = super::timeouts::Activity::new();
+	let requests = activity.clone();
 	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
 		let conn = conn.clone();
+		// in progress until the response body ends: a connection is idle only without one
+		let busy = requests.begin();
 		async move {
 			let http1 = req.version() < hyper::Version::HTTP_2;
-			let mut resp = conn.handle(req.map(|b| b.map_err(boxed_error).boxed())).await;
+			let req = req.map(|b| super::timeouts::IdleBody::new(b, limits.request_body_idle).boxed());
+			let mut resp = conn.handle(req).await;
 			// stopping (a graceful shutdown's drain, DELETE with drain, a live
 			// upgrade): tell HTTP/1.1 clients this connection ends with this
 			// response (HTTP/2 gets GOAWAY from graceful_shutdown)
 			if http1 && conn.rt.stop.is_cancelled() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
 				resp.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
 			}
-			Ok::<_, Infallible>(resp)
+			Ok::<_, Infallible>(resp.map(|b| super::timeouts::Tracked::new(b, busy)))
 		}
 	});
 	let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-	builder.http1().timer(TokioTimer::new());
-	builder.http2().timer(TokioTimer::new()).max_header_list_size(MAX_HEADER_SECTION);
+	// HTTP/1.1: each request's headers, also the wait for the next one on a kept connection
+	builder.http1().timer(TokioTimer::new()).header_read_timeout(limits.request_headers);
+	builder
+		.http2()
+		.timer(TokioTimer::new())
+		.max_header_list_size(MAX_HEADER_SECTION)
+		.keep_alive_interval(limits.http2_ping_interval)
+		.keep_alive_timeout(limits.http2_ping_timeout);
 	let served = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
 	tokio::pin!(served);
 	// the rule stops accepting (DELETE with drain, a live upgrade's drain): finish
-	// the requests in flight, then close instead of keeping the connection idle
+	// the requests in flight, then close instead of keeping the connection idle;
+	// a connection past a time limit (#320) is closed the same way, with a short grace
 	tokio::select! {
-		r = served.as_mut() => return r.map_err(io::Error::other),
+		r = served.as_mut() => return r.map(|()| "closed").map_err(io::Error::other),
 		_ = stop.cancelled() => served.as_mut().graceful_shutdown(),
+		why = activity.expired(&rx, &limits) => {
+			served.as_mut().graceful_shutdown();
+			let _ = tokio::time::timeout(EXPIRED_GRACE, served.as_mut()).await;
+			return Ok(why);
+		}
 	}
-	served.await.map_err(io::Error::other)
+	served.await.map(|()| "closed").map_err(io::Error::other)
 }
+
+/// How long a connection past a time limit may take to close after GOAWAY.
+const EXPIRED_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn full(status: StatusCode, text: &str) -> Response<Body> {
 	let mut resp = Response::new(Full::new(Bytes::from(format!("{text}\n"))).map_err(|never| match never {}).boxed());
@@ -486,10 +590,30 @@ fn request_authority(uri: &Uri, headers: &HeaderMap) -> Option<HeaderValue> {
 	}
 }
 
-/// Host of the request without the port (see `request_authority`).
+/// Host of the request without the port (see `request_authority`), in lower case and
+/// without a trailing dot (#320: `Host: EXAMPLE.com.` is `example.com` for routes).
 fn request_host<B>(req: &Request<B>) -> Option<String> {
 	let raw = request_authority(req.uri(), req.headers())?;
-	Some(strip_port(raw.to_str().ok()?).to_ascii_lowercase())
+	let mut host = strip_port(raw.to_str().ok()?).to_ascii_lowercase();
+	host.truncate(super::normalize::host(&host).len());
+	Some(host)
+}
+
+/// Normalises the path of the request target in place (#320, `normalize::path`); the
+/// query stays as sent. Nothing is copied when the path is already normal.
+fn normalize_target(uri: &mut Uri) -> Result<(), super::normalize::InvalidPath> {
+	let normal = match super::normalize::path(uri.path())? {
+		std::borrow::Cow::Borrowed(_) => return Ok(()),
+		std::borrow::Cow::Owned(p) => p,
+	};
+	let pq = match uri.query() {
+		Some(q) => format!("{normal}?{q}"),
+		None => normal,
+	};
+	let mut parts = std::mem::take(uri).into_parts();
+	parts.path_and_query = Some(PathAndQuery::try_from(pq).map_err(|_| super::normalize::InvalidPath)?);
+	*uri = Uri::from_parts(parts).map_err(|_| super::normalize::InvalidPath)?;
+	Ok(())
 }
 
 fn strip_port(host: &str) -> &str {
@@ -604,6 +728,14 @@ impl Conn {
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
+		// identities are set by the rule's authentication middlewares alone (#320): a client's
+		// own goes before routing, so a route without authentication cannot receive one either
+		for h in &router.identity_headers {
+			req.headers_mut().remove(h);
+		}
+		// the path routes, middlewares and backends see (#320): /%61dmin, //admin and
+		// /x/../admin are /admin; a broken percent-encoding is answered 400 below
+		let bad_path = !router.raw_path && normalize_target(req.uri_mut()).is_err();
 		// an ACME CA validating HTTP-01 (global.acme): before routes and middlewares, so a
 		// redirect to HTTPS or an ip_allow does not get in the way
 		if req.uri().path().starts_with(crate::acme::challenge::HTTP_PREFIX) {
@@ -634,9 +766,10 @@ impl Conn {
 		// tls.misdirected: a coalesced HTTP/2 connection (or any) carrying a request for a name of
 		// another group than its TLS server name gets 421, before routing (RFC 9110 §15.5.20)
 		let misdirected = self.misdirected(&host);
-		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !misdirected) {
+		let refused = misdirected || bad_path;
+		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !refused) {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
-			None if misdirected => ("", None, &[][..], &[][..], None, None),
+			None if refused => ("", None, &[][..], &[][..], None, None),
 			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
 		};
 		// timeouts.request (#227) counts from here
@@ -708,6 +841,9 @@ impl Conn {
 		if misdirected {
 			answer = Some(error_response(StatusCode::MISDIRECTED_REQUEST));
 			answered_by = Some(("misdirected", ""));
+		} else if bad_path {
+			answer = Some(error_response(StatusCode::BAD_REQUEST));
+			answered_by = Some(("bad_path", ""));
 		}
 		// sign-in callbacks and logout of `oidc`, whichever route matched
 		if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {

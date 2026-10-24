@@ -401,7 +401,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 
 - クライアントとは HTTP/1.1 と HTTP/2 で話す。`terminate` では、`tls.alpn` を指定していなければ ALPN で `h2` と `http/1.1` を提示する（`GET /rules` の `tls.alpn` は指定どおりのまま）。平文では HTTP/1.1 と、前置きで始まる HTTP/2（h2c）を受ける。
 - ルートは `priority` の大きい順（省略時は `match` の文字数。Traefik と同じ）、同じなら書いた順に試し、最初に一致したものを使う。どれにも一致しなければ `default`（`service` か `status`。省略時は 404）。
-- `Host` はポートを除き、大文字小文字を区別しない。HTTP/2 では `:authority` を使う。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
+- `Host` はポートを除き、大文字小文字を区別せず、末尾のドットを除いて比べる（`EXAMPLE.com.` は `example.com`。v0.4.17、#320）。HTTP/2 では `:authority` を使う。パスは照合の前に正規化する（下の「HTTP の転送の扱い」の「パス」）。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
 - `match` の式の上限（v0.3.18）：括弧と `!` の入れ子は 32 段まで、1 つの式に書ける条件（`Host(...)` など。引数の数は数えない）は 256 個まで。超えると設定の誤り（API は 400、設定ファイルは起動・再読み込み・`--check-config` の誤り）。
 - 時間の値（`10s`・`500ms`・`1m`・`2h` の形。`period`・`timeouts`・`health_check` の `interval` / `timeout`・`initial_interval`・`window` / `recovery`・`update_interval` など）は 365 日（`8760h`）まで（v0.3.18）。それより長い値は設定の誤り。
 - 転送先とは HTTP/1.1 で話す（サービスの `protocol` で HTTP/2 も。下の「Gateway API 向けの L7・TLS」）。`servers` は `weight`（既定 1）の重みつきラウンドロビン。`url` にパスがあれば、リクエストのパスの前に付ける。`https://` の転送先の証明書は、ルールの `tls.upstream` の `ca_file`（なければ Mozilla のルート）で検証し、`server_name` / `insecure_skip_verify` / クライアント証明書もそれに従う。`tls.upstream.tls` は使わない（URL の `https://` で決まる。指定すると `tls_config`）。サービスに `tls`（#236）があれば、そのサービスでは `tls.upstream` の代わりにそれを使う。
@@ -426,12 +426,31 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | そのほかのヘッダ | 同じ名前の複数のフィールドは順番どおり、値はバイトのまま（ASCII 以外も）渡す。`Authorization` は渡す |
 | ホップごとのヘッダ | 両方向で取り除く：`Connection` とそこに書かれた名前、`Keep-Alive`、`Proxy-Connection`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`（WebSocket などの `Upgrade` は付け直して中継する）。`Via` と `Forwarded`（RFC 7239）は付けない（Traefik・nginx の既定と同じ。`X-Forwarded-*` を使う）。HTTP/2 の転送先（`protocol`）へは、クライアントの `TE` に `trailers` があれば `te: trailers` だけを渡す |
 | トレーラー | 本文の後のトレーラーは、HTTP/2 の転送先と HTTP/2・HTTP/3 のクライアントのあいだで両方向にそのまま渡す（gRPC の `grpc-status` など。tests/http_semantics.rs）。HTTP/1.1 のクライアントへは、`TE: trailers` を送ってきたときだけ chunked の後に付ける |
-| `Host` | HTTP/2・HTTP/3 の `:authority`、HTTP/1.1 の absolute-form の宛先（`GET https://a.example/ HTTP/1.1`）の authority を、`Host` フィールドより優先する（RFC 9112 §3.2.2）。転送先には origin-form（パスとクエリ）で送る。`pass_host_header: false` なら転送先の URL のホスト |
+| `Host` | HTTP/2・HTTP/3 の `:authority`、HTTP/1.1 の absolute-form の宛先（`GET https://a.example/ HTTP/1.1`）の authority を、`Host` フィールドより優先する（RFC 9112 §3.2.2）。転送先には origin-form（パスとクエリ）で送る。`pass_host_header: false` なら転送先の URL のホスト。ルートの照合（`Host`・`HostRegexp`・`tls.misdirected`）では、ポートを除き、小文字にし、末尾のドットを 1 つ落とす（v0.4.17、#320。`Host: ADMIN.example.` は `Host(`admin.example`)` に当たる）。転送先へ送る `Host`・`X-Forwarded-Host` はクライアントが送ったまま（正規化しない） |
+| パス（v0.4.17、#320） | ルートの照合の前に、HTTP/1.1・HTTP/2・HTTP/3 とも Traefik v3 の `sanitizePath` と同じく正規化し、ミドルウェア・`forward_auth`・`mirror`・転送先・アクセスログにも正規化したパスを渡す（`/%61dmin`・`//admin`・`/x/../admin`・`/admin/.` が `PathPrefix(`/admin`)` の認証や `ip_allow` を素通りしないように）。決まり：(1) パーセントで符号化した unreserved の文字（RFC 3986 2.3 の `A-Z a-z 0-9 - . _ ~`）だけを戻し、ほかの符号化（`%2F`・`%20`・`%E3` など）はそのまま、16 進は大文字にそろえる（`%2f` → `%2F`。`%2F` は区切りにならない）。(2) `.` の区切りを除き、`..` は前の区切りを取り除く。ルートより上へは行かない（`/../a` は `/a`、`/..` は `/`）。(3) 空の区切り（`//`）はまとめる。(4) 末尾の `/` は元のパスの末尾が `/` のときだけ残す（`/admin/.` は `/admin`、`/admin/./` は `/admin/`。Go の `path.Clean` に末尾の `/` を戻す Traefik と同じ）。(5) `%` の後に 16 進が 2 つ続かないパスは 400（`refused_by: bad_path`）。クエリは変えない。`*`（`OPTIONS *`）と空のパスはそのまま。すでに正規化されたパスは写さない（割り当てなし）。`http.raw_path: true` のルールは送られたまま照合・転送する（Traefik の `sanitizePath: false`。パスでの認証・`ip_allow` と組み合わせると上の素通りが起きるので安全でない） |
+| 身元のヘッダ（v0.4.17、#320） | ルールの認証のミドルウェアが転送先に付けるヘッダの名前は、クライアントが送ったものを、どのルートでも（認証のないルートでも）リクエストの最初に消す：`basic_auth` の `user_header`、`oidc` の `X-Forwarded-User`・`-Email`・`-Groups`・`-Sub`、`forward_auth` の `response_headers`。`response_headers: ["*"]` と `protocol: grpc` の `forward_auth`（名前を認証サーバが決める）では、よく使われる名前（`X-Forwarded-User`・`-Email`・`-Groups`・`-Sub`・`-Preferred-Username`、`X-Auth-Request-User`・`-Email`・`-Groups`・`-Preferred-Username`、`Remote-User`・`-Email`・`-Groups`・`-Name`）も消す。認証に使うもの（`Authorization`・`Proxy-Authorization`・`Cookie`・`Host`）と、`forward_auth` の `request_headers` の名前（認証サーバに送るもの）は消さない。認証のミドルウェアのないルールでは何も消さない |
 | ヘッダの大きさ | HTTP/2・HTTP/3 は 1 リクエストのヘッダの合計 64 KiB まで（hyper の既定の 16 KiB では、大きなクッキーのブラウザで足りない）。HTTP/1.1 は約 400 KB まで。超えると 431 |
 | 本文 | 流しながら中継する（`buffering` がなければため込まない）。chunked、`Expect: 100-continue`、`HEAD`（`Content-Length` を保つ）、`204` / `304` に対応 |
 | タイムアウト | `timeouts.response` は本文を送り終えてから応答ヘッダまで。長いダウンロード・SSE・ロングポーリングの応答の本文は切らない |
+| 接続の時間の上限（v0.4.17、#320） | `global.http.timeouts`（下の表）。長いアップロード・ダウンロードは長さでは切らず、黙っている時間だけで切る |
 | 途中で切れた応答 | 転送先が応答の途中で切れたら（`Content-Length` に足りない、chunked の最後のチャンクがない、リセット）、クライアントにも完全な応答に見えないように切る：HTTP/1.1 は足りないまま接続を閉じる（chunked なら最後のチャンクを送らない）、HTTP/2 は RST_STREAM、HTTP/3 は RESET_STREAM。`compress` を通していても同じ（圧縮の終わりを付けない）。長さのない（接続を閉じて終わる）HTTP/1.0 型の応答は、転送先の側で途中かどうかが分からない |
 | 途中で切れたリクエスト | クライアントが本文の途中で切れたら（HTTP/1.1 の切断、HTTP/2 の RST_STREAM、HTTP/3 のリセット）、転送先への接続も本文を終えずに切り、転送先に完全なリクエストとして渡さない |
+
+`global.http.timeouts`（v0.4.17、#320）：`http` のルールのクライアントの接続の時間の上限。設定ファイルの `global` だけ（環境変数はない。再起動まで効かない、`GET /config` の `restart_needed` に `global.http`）。値は `10s` などの時間、`0s` は上限なし。省略した項目は既定。形の誤り（時間でない・知らない名前・`http2_ping_timeout: 0s`）は設定の誤り（起動・再読み込み・`--check-config`）。
+
+| 項目 | 既定 | 意味 |
+|---|---|---|
+| `tls_handshake` | `10s` | `terminate` の TLS のハンドシェイク（HTTP/3 は QUIC のハンドシェイク）。今までの決まった 10 秒と同じ |
+| `first_byte` | `10s` | 接続（TLS の後）から最初の 1 バイトまで。何も送らない接続を閉じる |
+| `request_headers` | `30s` | 接続から最初のリクエストのヘッダがそろうまで（HTTP/1.1・HTTP/2 の前置き・HTTP/2 のヘッダ。1 バイトずつ送り続ける slowloris も）。HTTP/1.1 では、2 つめからのリクエストのヘッダ（前の応答の後の keep-alive の待ちを含む）にも hyper の `header_read_timeout` として効く（今までの hyper の既定の 30 秒と同じ）。HTTP/3 はストリームごとのリクエストのヘッダ |
+| `idle` | `180s` | 処理中のリクエストがない接続を閉じるまで（HTTP/2 は GOAWAY、HTTP/3 も GOAWAY の後に閉じる。PING を返すだけのクライアントも閉じる）。応答の本文を送っているあいだ（長いダウンロード・SSE）と WebSocket は処理中 |
+| `request_body_idle` | `60s` | リクエストの本文を読むあいだ、クライアントが何も送らない時間（全体の時間ではない。少しずつでも送り続ける長いアップロードは切らない）。過ぎたら本文を誤りで終え（転送先へも完全なリクエストとして渡さない。tests/integrity.rs と同じ扱い）、HTTP/3 はストリームを止める |
+| `http2_ping_interval` | `60s` | HTTP/2 で、受け取るものがこの間ないと PING を送る（`0s` で送らない） |
+| `http2_ping_timeout` | `20s` | PING の答えを待つ時間。過ぎたら接続を閉じる（いなくなったクライアント） |
+
+- 上限で閉じた接続は `conn.close` の `reason` が `first_byte_timeout`・`request_headers_timeout`・`idle`（HTTP/3 は `idle`）。HTTP/1.1 のヘッダの時間切れを hyper が先に見つけたときは、今までどおり `conn.error`（`read header from client timeout`）。
+- 使えるかは `features.http_options` の `http_timeouts`（パスの正規化は `path_normalize`、`raw_path`、身元のヘッダは `identity_headers`）。
+
 - アクセスログ（`event: "http.access"`）はリクエストごとに 1 行：`rule`、`route`（一致しなければ `(none)`）、`service`、`backend`、`client`、`method`、`host`、`path`（クエリは含めない）、`query`（クエリ。`?` なし、なければ空。v0.3.8 から。秘密になりやすい名前のパラメータ（`token`・`code`・`state`・`password`・`secret`・`key`・`signature`・`auth`・`session` などを名前に含むもの）は値を `REDACTED` に置き換える。GitLab の `private_token`、OIDC の `code` / `state` などをログに残さないため）、`protocol`（`HTTP/1.1` / `HTTP/2.0`）、`status`、`duration_ms`（応答の本文を送り終えるまで）、`bytes_in`（`Content-Length`）、`bytes_out`（応答の本文）、`user_agent`、`sni`、`tls_version`、`refused_by`、`middleware`、`user`、`auth_error`。出す先は `global.access_log`。
   - `refused_by`・`middleware`（v0.3.20）：リクエストを断ったミドルウェアの種類（`ip_allow`・`basic_auth`・`forward_auth`・`oidc`・`crowdsec`・`rate_limit`・`in_flight`・`buffering`・`circuit_breaker`・`respond` など）と、設定での名前。ミドルウェアがエラー（4xx / 5xx）を返したときだけ入れ、ほかは空。リダイレクトや `respond` の 2xx は入れない。
   - `user`（v0.3.20）：`basic_auth` が通したユーザー名。
