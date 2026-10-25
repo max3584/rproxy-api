@@ -514,7 +514,8 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |
-| `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先 |
+| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
+| `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先。名前の続きを待つセッションの枠が送信元のプレフィックスごとに限られる（#332） |
 | `tests/http.rs` | `http` のルールの L7 のルーティング |
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |
 | `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc`。OIDC の client secret のファイルの使い回しは `409 secret_reuse`（#319、`oidc_client_secrets_keep_to_one_use`。`/proc/self/environ`・`/proc/self/fd/N` は `403 protected_file`、誤りの文にほかのルールのことは出ない） |

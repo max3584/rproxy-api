@@ -253,6 +253,65 @@ async fn other_udp_traffic_goes_to_the_rules_own_target() {
 	assert_eq!(quic_echo(&quic_client(&pki, 0), port, "a.test", "q").await.unwrap(), "A:q");
 }
 
+// ---- sessions waiting for the rest of their ClientHello (#332) ----
+
+/// The two DTLS records (one per datagram) of a ClientHello for `name` cut in two fragments.
+fn dtls_hello_in_two(name: &str) -> [Vec<u8>; 2] {
+	let mut body = vec![0xfe, 0xfd];
+	body.extend_from_slice(&[0x11; 32]); // random
+	body.extend_from_slice(&[0, 0]); // session id, cookie
+	body.extend_from_slice(&[0, 2, 0xc0, 0x2b, 1, 0]); // cipher suites, compression
+	let list = [&[0u8][..], &(name.len() as u16).to_be_bytes(), name.as_bytes()].concat();
+	let ext = [&[0u8, 0][..], &(list.len() as u16 + 2).to_be_bytes(), &(list.len() as u16).to_be_bytes(), &list].concat();
+	body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+	body.extend_from_slice(&ext);
+	let cut = body.len() / 2;
+	let record = |from: usize, to: usize| {
+		let mut hs = vec![1];
+		hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+		hs.extend_from_slice(&[0, 0]);
+		hs.extend_from_slice(&(from as u32).to_be_bytes()[1..]);
+		hs.extend_from_slice(&((to - from) as u32).to_be_bytes()[1..]);
+		hs.extend_from_slice(&body[from..to]);
+		[&[22u8, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0][..], &(hs.len() as u16).to_be_bytes(), &hs].concat()
+	};
+	[record(0, cut), record(cut, body.len())]
+}
+
+// spoofed (or many) sources of one network starting ClientHellos they never finish take at most 64 of the port's
+// slots for sessions waiting for the rest; a client elsewhere still gets through
+#[tokio::test]
+async fn sessions_waiting_for_their_hello_are_bounded_per_source_prefix() {
+	let named = udp_backend("D:").await;
+	let plain = udp_backend("U:").await;
+	let h = harness().await;
+	let port = free_udp_port();
+	let (status, v) = h.post(sni_rule(port, plain, json!([route(&["d.test"], named)]), "default")).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let [first, rest] = dtls_hello_in_two("d.test");
+	// 100 sources of 127.0.9.0/24 send the first half only (their sessions wait SNI_WAIT, 3 s)
+	let mut flood = vec![];
+	for _ in 0..100 {
+		let sock = UdpSocket::bind("127.0.9.1:0").await.unwrap();
+		sock.send_to(&first, ("127.0.0.1", port)).await.unwrap();
+		flood.push(sock);
+	}
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	wait_for(&h, &path, |v| v["stats"]["dropped"].as_u64() == Some(100 - 64)).await;
+	// a client of 127.0.0.0/24, in two datagrams: routed by its name
+	let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	sock.connect(("127.0.0.1", port)).await.unwrap();
+	sock.send(&first).await.unwrap();
+	sock.send(&rest).await.unwrap();
+	let mut buf = [0u8; 1024];
+	for want in [&first, &rest] {
+		let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await.expect("routed").unwrap();
+		assert_eq!(buf[..n], [b"D:", &want[..]].concat());
+	}
+	let (_, v) = h.get(&path).await;
+	assert_eq!(v["stats"]["dropped"], 100 - 64, "{v}");
+}
+
 #[tokio::test]
 async fn udp_sni_settings_are_validated() {
 	let h = harness().await;

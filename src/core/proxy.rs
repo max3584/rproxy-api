@@ -32,6 +32,9 @@ pub struct Stats {
 	pub limited: [AtomicU64; 4],
 	/// UDP datagrams dropped over `bandwidth` (#166; also in `dropped`).
 	pub bandwidth_dropped: AtomicU64,
+	/// UDP sessions now, from the first datagram (also while their server name is
+	/// read): for the default cap of `l4::udp` (#332). Not shown.
+	pub udp_sessions: AtomicU64,
 }
 
 impl Stats {

@@ -1,9 +1,9 @@
 // The per-client session model descends from the original rproxy project by
 // glacierx and has been rewritten around cancellation tokens for rproxy-api.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use webrtc_util::conn::Conn;
 
 use crate::core::balance::{Lease, Member};
 use crate::core::bandwidth::{Bandwidth, Dir, Gate};
-use crate::core::limits::{self, Permit, Reason};
+use crate::core::limits::{self, Limiter, Permit, Reason};
 use crate::tls::dtls::SessionConn;
 use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
@@ -35,9 +35,29 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SNI_WAIT: Duration = Duration::from_secs(3);
 const SNI_MAX_DATAGRAMS: usize = 16;
 const SNI_MAX_BYTES: usize = 64 * 1024;
-/// Sessions of one port reading their server name at the same time; beyond
-/// this, first datagrams of new clients are dropped (they retransmit).
+/// Sessions of one port reading their server name over more than one datagram
+/// at the same time (`SniSlots`); beyond this the oldest is given up.
 const SNI_MAX_PENDING: usize = 4096;
+/// ... of them from one source prefix (`SNI_PREFIX_V4` / `_V6`); beyond this, new
+/// ones from there are dropped (they retransmit), whatever the others do (#332).
+const SNI_MAX_PENDING_PER_PREFIX: usize = 64;
+const SNI_PREFIX_V4: u8 = 24;
+const SNI_PREFIX_V6: u8 = 48;
+/// Sessions of a rule without `limits.max_connections` (#332 L3): a flood from
+/// spoofed sources could otherwise open a backend socket per source until `udp_idle`.
+/// `RPROXY_UDP_MAX_SESSIONS` (`set_max_sessions`), 0 for none.
+pub const DEFAULT_MAX_SESSIONS: u64 = 16_384;
+static MAX_SESSIONS: AtomicU64 = AtomicU64::new(DEFAULT_MAX_SESSIONS);
+
+/// The sessions a udp rule without `limits.max_connections` may have (0: no limit).
+/// Read for each new session, so it can be set at any time (startup).
+pub fn set_max_sessions(max: u64) {
+	MAX_SESSIONS.store(max, Ordering::Relaxed);
+}
+
+pub fn max_sessions() -> u64 {
+	MAX_SESSIONS.load(Ordering::Relaxed)
+}
 
 /// A session is one client (address and port) talking to one local address:
 /// on a wildcard socket the same client may reach the rule at several addresses
@@ -82,11 +102,11 @@ impl std::hash::Hash for Peer {
 
 type Sessions = Arc<Mutex<HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>>>;
 
-/// What the shards of one port share: how many sessions are reading their
-/// server name (`SNI_MAX_PENDING` is for the port, not for each shard), and the
-/// size of each shard's receive batch.
+/// What the shards of one port share: the sessions reading their server name
+/// (`SNI_MAX_PENDING` is for the port, not for each shard), and the size of each
+/// shard's receive batch.
 pub struct Port {
-	sniffing: Arc<AtomicUsize>,
+	sniffing: Arc<SniSlots>,
 	batch: usize,
 }
 
@@ -95,8 +115,121 @@ impl Port {
 	/// one datagram), as each slot can hold up to 64 KiB once a large datagram
 	/// came through it (10 000 ports of 32 slots would take GBs).
 	pub fn new(ports: u16) -> Self {
-		Port { sniffing: Arc::default(), batch: (64 / usize::from(ports.max(1))).clamp(1, BATCH) }
+		Port {
+			sniffing: Arc::new(SniSlots::new(SNI_MAX_PENDING, SNI_MAX_PENDING_PER_PREFIX)),
+			batch: (64 / usize::from(ports.max(1))).clamp(1, BATCH),
+		}
 	}
+}
+
+/// The slots of the sessions of one port that hold their first datagrams while their
+/// server name comes in more than one datagram (`sniff`; a ClientHello in one datagram,
+/// the usual case, takes none). Sources can be spoofed (#332): one prefix (IPv4 /24,
+/// IPv6 /48) takes at most `per_prefix` of them, so a flood from one network cannot
+/// take the slots of the others; when all are taken (a flood from everywhere), the
+/// oldest is given up for the new one, so a client still gets its next datagram
+/// in, unless the flood fills every slot within that time.
+struct SniSlots {
+	max: usize,
+	per_prefix: usize,
+	table: Mutex<SniTable>,
+}
+
+#[derive(Default)]
+struct SniTable {
+	taken: usize,
+	by_prefix: HashMap<IpAddr, usize>,
+	/// Slots in the order they were taken; given back ones are skipped (and cleared out now and then).
+	order: VecDeque<Arc<SlotState>>,
+}
+
+struct SlotState {
+	prefix: IpAddr,
+	/// Given back or given up (under the table's lock).
+	done: AtomicBool,
+	/// Cancelled when it is given up for a newer one.
+	given_up: CancellationToken,
+}
+
+/// A session's slot while it reads its server name; given back on drop.
+struct SniSlot {
+	slots: Arc<SniSlots>,
+	state: Arc<SlotState>,
+}
+
+impl SniTable {
+	fn give_back(&mut self, state: &SlotState) {
+		if state.done.swap(true, Ordering::Relaxed) {
+			return;
+		}
+		self.taken -= 1;
+		if let Some(n) = self.by_prefix.get_mut(&state.prefix) {
+			*n -= 1;
+			if *n == 0 {
+				self.by_prefix.remove(&state.prefix);
+			}
+		}
+	}
+}
+
+impl SniSlots {
+	fn new(max: usize, per_prefix: usize) -> Self {
+		SniSlots { max: max.max(1), per_prefix, table: Mutex::default() }
+	}
+
+	/// A slot for a session of `client`; None when its prefix has all it may take.
+	fn take(self: &Arc<Self>, client: IpAddr) -> Option<SniSlot> {
+		let prefix = limits::source_key(client, SNI_PREFIX_V4, SNI_PREFIX_V6);
+		let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
+		if t.by_prefix.get(&prefix).is_some_and(|n| *n >= self.per_prefix) {
+			return None;
+		}
+		while t.taken >= self.max {
+			let Some(oldest) = t.order.pop_front() else { break };
+			if !oldest.done.load(Ordering::Relaxed) {
+				t.give_back(&oldest);
+				oldest.given_up.cancel();
+			}
+		}
+		if t.order.len() >= 2 * self.max {
+			t.order.retain(|s| !s.done.load(Ordering::Relaxed));
+		}
+		let state = Arc::new(SlotState { prefix, done: AtomicBool::new(false), given_up: CancellationToken::new() });
+		t.order.push_back(state.clone());
+		t.taken += 1;
+		*t.by_prefix.entry(prefix).or_default() += 1;
+		Some(SniSlot { slots: self.clone(), state })
+	}
+}
+
+impl Drop for SniSlot {
+	fn drop(&mut self) {
+		self.slots.table.lock().unwrap_or_else(|e| e.into_inner()).give_back(&self.state);
+	}
+}
+
+/// A session counted in its rule's `stats.udp_sessions` (the default cap, `MAX_SESSIONS`), and in
+/// its `limits` (`Permit`), until it ends.
+struct Admitted {
+	_permit: Option<Permit>,
+	_counted: Counted,
+}
+
+struct Counted(Arc<Runtime>);
+
+impl Drop for Counted {
+	fn drop(&mut self) {
+		self.0.stats.udp_sessions.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+/// Counts a new session of the rule; None over the default cap (`MAX_SESSIONS`), which a
+/// rule's own `limits.max_connections` replaces.
+fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>) -> Option<Counted> {
+	let before = rt.stats.udp_sessions.fetch_add(1, Ordering::Relaxed);
+	let counted = Counted(rt.clone());
+	let max = MAX_SESSIONS.load(Ordering::Relaxed);
+	(max == 0 || before < max || limiter.is_some_and(|l| l.max_connections().is_some())).then_some(counted)
 }
 
 /// Serves one socket of one port of the rule; `offset` is the port's place in a
@@ -167,10 +300,15 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 										return;
 									}
 								};
+								let Some(counted) = count_session(&rt, limiter.as_deref()) else {
+									limits::refused(&rt, client, Reason::MaxConnections, "udp");
+									return;
+								};
+								let admitted = Admitted { _permit: permit, _counted: counted };
 								let id = next_id.fetch_add(1, Ordering::Relaxed);
 								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
 								map.insert(peer, (id, tx.clone()));
-								let session = run_session(id, peer, rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), permit);
+								let session = run_session(id, peer, rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), admitted);
 								rt.tracker.spawn(proxy_in::with_peer(peer.via(), session));
 								tx
 							}
@@ -229,7 +367,7 @@ fn header_denied(rt: &Runtime, peer: SocketAddr, refusal: proxy_in::Refusal) {
 
 /// One client's session. With `tls.mode: sni`, a new QUIC connection from the
 /// same client socket to another server name starts it over with the new name.
-/// `permit` counts the session in the rule's `limits` until it ends.
+/// `admitted` counts the session in the rule's `limits` and default cap until it ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
 	id: u64,
@@ -239,10 +377,10 @@ async fn run_session(
 	rt: Arc<Runtime>,
 	sessions: Sessions,
 	offset: u16,
-	sniffing: Arc<AtomicUsize>,
-	permit: Option<Permit>,
+	sniffing: Arc<SniSlots>,
+	admitted: Admitted,
 ) {
-	let _permit = permit;
+	let _admitted = admitted;
 	let tls = rt.tls();
 	if tls.mode() == TlsMode::Terminate {
 		return dtls_session(id, peer, from_client, listener, rt, sessions, offset, tls).await;
@@ -265,7 +403,7 @@ async fn session(
 	rt: &Arc<Runtime>,
 	sessions: &Sessions,
 	offset: u16,
-	sniffing: &AtomicUsize,
+	sniffing: &Arc<SniSlots>,
 	carry: Vec<Vec<u8>>,
 ) -> Option<Vec<Vec<u8>>> {
 	let (client, reply_to, local) = (peer.client(), peer.from, peer.local);
@@ -280,7 +418,7 @@ async fn session(
 	// `tls.mode: sni` (#130): hold the first datagrams until the server name is read
 	let by_name = tls.mode() == TlsMode::Sni;
 	let (sni, first) = if by_name {
-		let Some(sniffed) = sniff(rt, from_client, sniffing, carry).await else {
+		let Some(sniffed) = sniff(rt, from_client, sniffing, client.ip(), carry).await else {
 			remove(sessions, peer, id);
 			return None;
 		};
@@ -580,37 +718,32 @@ fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Option<Picked
 /// Holds a new session's first datagrams until its server name is read (DTLS /
 /// QUIC, `udp_sni`), for at most `SNI_WAIT` and `SNI_MAX_*`. The name (None when
 /// there is none or it cannot be read) and the datagrams, which must still be
-/// sent on. None: the rule stopped, or too many sessions are reading their name.
+/// sent on. None: the rule stopped, or the session could not get or keep one of the
+/// port's `SniSlots` (needed once one datagram is not enough).
 async fn sniff(
 	rt: &Runtime,
 	from_client: &mut mpsc::Receiver<Vec<u8>>,
-	sniffing: &AtomicUsize,
+	slots: &Arc<SniSlots>,
+	client: IpAddr,
 	carry: Vec<Vec<u8>>,
 ) -> Option<(Option<String>, Vec<Vec<u8>>)> {
 	use crate::tls::udp_sni::{Sniff, Sniffer};
-	struct Pending<'a>(&'a AtomicUsize);
-	impl Drop for Pending<'_> {
-		fn drop(&mut self) {
-			self.0.fetch_sub(1, Ordering::Relaxed);
-		}
-	}
-	if sniffing.fetch_add(1, Ordering::Relaxed) >= SNI_MAX_PENDING {
-		sniffing.fetch_sub(1, Ordering::Relaxed);
-		rt.stats.dropped();
-		debug!(event = "udp.drop", rule = %rt.key, reason = "too many sessions reading their server name");
-		return None;
-	}
-	let _pending = Pending(sniffing);
 	let mut sniffer = Sniffer::default();
 	let (mut first, mut bytes) = (Vec::new(), 0usize);
 	let deadline = tokio::time::Instant::now() + SNI_WAIT;
 	let mut carry = carry.into_iter();
+	let mut slot: Option<SniSlot> = None;
 	loop {
 		let datagram = match carry.next() {
 			Some(d) => d,
 			None => tokio::select! {
 				_ = rt.kill.cancelled() => return None,
 				_ = sleep_until(deadline) => return Some((None, first)),
+				_ = async { match &slot { Some(s) => s.state.given_up.cancelled().await, None => std::future::pending().await } } => {
+					rt.stats.dropped();
+					debug!(event = "udp.drop", rule = %rt.key, reason = "given up for a newer session reading its server name");
+					return None;
+				}
 				d = from_client.recv() => d?,
 			},
 		};
@@ -621,6 +754,14 @@ async fn sniff(
 			Sniff::Done(name) => return Some((name, first)),
 			Sniff::Unknown => return Some((None, first)),
 			Sniff::NeedMore if first.len() >= SNI_MAX_DATAGRAMS || bytes >= SNI_MAX_BYTES => return Some((None, first)),
+			Sniff::NeedMore if slot.is_none() => match slots.take(client) {
+				Some(s) => slot = Some(s),
+				None => {
+					rt.stats.dropped();
+					debug!(event = "udp.drop", rule = %rt.key, reason = "too many sessions of the source prefix reading their server name");
+					return None;
+				}
+			},
 			Sniff::NeedMore => {}
 		}
 	}
@@ -921,6 +1062,61 @@ fn remove(sessions: &Sessions, peer: Peer, id: u64) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	fn taken(slots: &SniSlots) -> (usize, usize) {
+		let t = slots.table.lock().unwrap();
+		(t.taken, t.by_prefix.len())
+	}
+
+	// #332: spoofed sources of one network take at most their share of the slots, never those of another network
+	#[test]
+	fn sni_slots_are_bounded_per_source_prefix() {
+		let slots = Arc::new(SniSlots::new(8, 3));
+		let flood: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("192.0.2.{i}"))).unwrap()).collect();
+		// the rest of 192.0.2.0/24, any address in it, gets none
+		assert!(slots.take(ip("192.0.2.200")).is_none());
+		assert!(slots.take(ip("::ffff:192.0.2.9")).is_none(), "IPv4-mapped is the same source");
+		// another /24 and an IPv6 /48 still do
+		let other = slots.take(ip("198.51.100.1")).unwrap();
+		let v6: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("2001:db8:1:{i}::1"))).unwrap()).collect();
+		assert!(slots.take(ip("2001:db8:1:ffff::1")).is_none(), "one /48");
+		assert!(slots.take(ip("2001:db8:2::1")).is_some(), "another /48 (given back at once)");
+		assert_eq!(taken(&slots), (7, 3));
+		// given back: the prefix may take again
+		drop(flood);
+		assert_eq!(taken(&slots), (4, 2));
+		assert!(slots.take(ip("192.0.2.200")).is_some());
+		drop((other, v6));
+		assert_eq!(taken(&slots), (0, 0));
+	}
+
+	#[test]
+	fn sni_slots_give_up_the_oldest_when_all_are_taken() {
+		let slots = Arc::new(SniSlots::new(4, 4));
+		// a flood from everywhere: each source its own prefix
+		let flood: Vec<SniSlot> = (1..=4).map(|i| slots.take(ip(&format!("10.0.{i}.1"))).unwrap()).collect();
+		let legit = slots.take(ip("203.0.113.5")).expect("the newest gets a slot");
+		assert!(flood[0].state.given_up.is_cancelled(), "the oldest was given up");
+		assert!(flood[1..].iter().all(|s| !s.state.given_up.is_cancelled()));
+		assert!(!legit.state.given_up.is_cancelled());
+		assert_eq!(taken(&slots).0, 4);
+		// a given-up slot dropped later counts nothing twice
+		drop(flood);
+		assert_eq!(taken(&slots), (1, 1));
+		// many turns: the queue of slots stays bounded
+		for i in 0..10_000u32 {
+			let _ = slots.take(IpAddr::from(i.to_be_bytes()));
+		}
+		let t = slots.table.lock().unwrap();
+		assert!(t.order.len() <= 2 * 4 + 1, "{}", t.order.len());
+		assert_eq!(t.taken, 1, "the one still held");
+		drop(t);
+		drop(legit);
+	}
 
 	#[tokio::test]
 	async fn backend_replies_go_through_the_worker_buffer() {

@@ -92,6 +92,7 @@ When running under systemd, you can pass the same content with `EnvironmentFile=
 | `RPROXY_STATIC_RULES` | `--static-rules` | none | The 0.2 name of `RPROXY_CONFIG` (a JSON array of rules can also be read). Both cannot be specified |
 | `RPROXY_DATABASE_URL` | `--database-url` | none | MariaDB/MySQL from which rules are restored at startup (`mysql://user:pass@host:port/db`) |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | Maximum size of the port range one rule can open |
+| `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | Default cap of a udp rule's sessions (a rule's `limits.max_connections` replaces it; `0` for none. #332: spoofed sources cannot pile up sessions and backend sockets). Datagrams of new sessions beyond it are dropped, counted in `stats.limited` and logged as `conn.limited` (`reason: max_connections`). For a rule with many clients, give it `limits.max_connections` or raise this (and the file limit `LimitNOFILE`) |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | Interval (seconds) for re-resolving target host names. If resolution fails, the previous result continues to be used |
 
 Added in v0.4 (all of them work; settings of rules and `global` are in "v0.4 settings" of docs/en/API.md, control API hardening in "Control API hardening", live upgrades and the self-update in docs/en/UPGRADE.md):

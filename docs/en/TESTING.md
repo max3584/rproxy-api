@@ -514,7 +514,8 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99); listening on addresses not on the host yet (`listen_freebind`, v0.4.3; the real path is `scripts/test-freebind.sh`) |
 | `tests/udp_shards.rs` | Reading a UDP port with several `SO_REUSEPORT` sockets (#194): no session opened twice, the reply source (#137), counters add up |
 | `tests/udp_source.rs` | UDP replies on wildcard listeners leave from the address the client sent to (#137; to 127.0.0.2) |
-| `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends |
+| `tests/udp_sessions.rs` | The default cap of a udp rule's sessions (#332, `RPROXY_UDP_MAX_SESSIONS`): new sessions beyond it refused, taken again once idle ones end, a rule's `limits.max_connections` first, 0 for none (the cap is process-wide, so only this file's one test changes it) |
+| `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends; the slots of sessions waiting for the rest of their name are bounded per source prefix (#332) |
 | `tests/http.rs` | L7 routing of `http` rules |
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
 | `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc`. Reusing an OIDC client secret file is `409 secret_reuse` (#319, `oidc_client_secrets_keep_to_one_use`; `/proc/self/environ` and `/proc/self/fd/N` are `403 protected_file`; the message tells nothing of other rules) |
