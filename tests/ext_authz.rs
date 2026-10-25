@@ -255,6 +255,8 @@ async fn grpc_ext_authz() {
 				.header("authorization", "allow")
 				.header("x-drop", "d")
 				.header("x-other", "o")
+				.header("x-real-ip", "6.6.6.6")
+				.header("forwarded", "for=6.6.6.6")
 				.body("payload"),
 		)
 		.await;
@@ -273,6 +275,10 @@ async fn grpc_ext_authz() {
 			assert_eq!(check.body, b"payload");
 		}
 		assert!(names.contains(&":authority") && names.contains(&":path"), "{names:?}");
+		// the client as rproxy sees it, not as it says (#333)
+		let real: Vec<&str> = check.headers.iter().filter(|(k, _)| k == "x-real-ip").map(|(_, v)| v.as_str()).collect();
+		assert_eq!(real, ["127.0.0.1"], "{path}");
+		assert!(!names.contains(&"forwarded"), "{names:?}");
 	}
 	let (status, headers, v) = send(client().get(format!("{base}/a")).header("authorization", "nope")).await;
 	assert_eq!((status.as_u16(), v.as_str()), (401, Some("who are you")));

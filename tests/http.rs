@@ -253,6 +253,20 @@ async fn upgrades_pass_through() {
 	let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
 	assert_eq!(&buf[..n], b"WS:ping");
 
+	// #333: h2c among the protocols is dropped, websocket still goes through (with other
+	// names listed in Connection, which are removed at the start of the request)
+	let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	s2.write_all(b"GET /ws HTTP/1.1\r\nHost: ws.test\r\nConnection: keep-alive, Upgrade, X-Drop\r\nX-Drop: 1\r\nUpgrade: h2c, websocket\r\n\r\n").await.unwrap();
+	let mut head = vec![];
+	while !head.ends_with(b"\r\n\r\n") {
+		assert_eq!(s2.read(&mut b).await.unwrap(), 1, "{}", String::from_utf8_lossy(&head));
+		head.push(b[0]);
+	}
+	assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+	s2.write_all(b"pong").await.unwrap();
+	let n = tokio::time::timeout(Duration::from_secs(5), s2.read(&mut buf)).await.unwrap().unwrap();
+	assert_eq!(&buf[..n], b"WS:pong");
+
 	// deleting the rule closes upgraded connections too
 	assert_eq!(h.delete(&format!("tcp/127.0.0.1/{port}")).await, StatusCode::NO_CONTENT);
 	let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap_or(0);

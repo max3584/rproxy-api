@@ -107,6 +107,24 @@ async fn basic_auth() {
 		))
 		.await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	// a bad line: the answer does not quote the file (a user name), nor say it exists (#333)
+	let bad = dir.join("bad");
+	std::fs::write(&bad, "carol:plain\n").unwrap();
+	for file in [&bad, &dir.join("nope")] {
+		let (status, v) = h
+			.post(http_rule(
+				free_port(),
+				json!({
+					"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["auth"]}],
+					"middlewares": {"auth": {"basic_auth": {"users_file": file}}},
+				}),
+			))
+			.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+		let e = v["error"].as_str().unwrap();
+		assert!(e.contains("users_file") && e.contains("cannot be used"), "{e}");
+		assert!(!e.contains("carol") && !e.contains("line 1") && !e.contains("No such file"), "{e}");
+	}
 	std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -222,7 +240,16 @@ async fn forward_auth() {
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	let url = |p: &str| format!("http://127.0.0.1:{port}{p}");
 
-	let r = client().post(url("/app/doc?a=b")).header("X-Token", "good").header("X-User", "forged").header("Host", "app.test").send().await.unwrap();
+	let r = client()
+		.post(url("/app/doc?a=b"))
+		.header("X-Token", "good")
+		.header("X-User", "forged")
+		.header("Host", "app.test")
+		.header("X-Real-IP", "6.6.6.6")
+		.header("Forwarded", "for=6.6.6.6")
+		.send()
+		.await
+		.unwrap();
 	assert_eq!(r.status(), StatusCode::OK);
 	let v = body(r).await;
 	assert_eq!((v["x_user"].as_str(), v["x_other"].as_str()), (Some("alice"), Some("")), "{v}");
@@ -232,6 +259,9 @@ async fn forward_auth() {
 	assert_eq!(asked["x-forwarded-host"], "app.test");
 	assert_eq!(asked["x-forwarded-proto"], "http");
 	assert_eq!(asked["x-forwarded-for"], "127.0.0.1");
+	// the client as rproxy sees it, not as it says (#333)
+	assert_eq!(asked["x-real-ip"], "127.0.0.1");
+	assert!(!asked.contains_key("forwarded"), "{asked:?}");
 	assert_eq!(asked["x-token"], "good", "the client's headers go to the auth server");
 
 	// the auth server's refusal goes to the client as it is
@@ -544,8 +574,21 @@ async fn oidc_end_to_end(signer: Signer, tag: &str) {
 	assert_eq!(r.status(), StatusCode::OK);
 	assert_eq!(p.lock().unwrap().refreshes, 1, "the renewed session is good for a while");
 
-	// logout clears the cookie and goes to the provider's end_session_endpoint
-	let r = client().get(format!("http://127.0.0.1:{port}/_rproxy/oidc/logout")).header("Host", "app.test").send().await.unwrap();
+	// logout (#333): a GET shows a page whose button POSTs; a POST from another site does nothing
+	let logout = format!("http://127.0.0.1:{port}/_rproxy/oidc/logout");
+	let r = client().get(&logout).header("Host", "app.test").header("Cookie", format!("_rproxy_oidc={renewed}")).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK);
+	assert_eq!(r.headers()["content-type"], "text/html; charset=utf-8");
+	assert!(r.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
+	assert!(set_cookies(&r).is_empty(), "a GET does not sign out");
+	assert!(r.text().await.unwrap().contains(r#"<form method="post" action="/_rproxy/oidc/logout">"#));
+	let r = client().post(&logout).header("Host", "app.test").header("Origin", "https://evil.test").send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	assert!(set_cookies(&r).is_empty());
+	let r = client().put(&logout).header("Host", "app.test").send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
+	// the POST from the page clears the cookie and goes to the provider's end_session_endpoint
+	let r = client().post(&logout).header("Host", "app.test").header("Origin", "http://app.test").send().await.unwrap();
 	assert_eq!(r.status(), StatusCode::FOUND);
 	let location = r.headers()["location"].to_str().unwrap().to_string();
 	assert!(location.starts_with(&format!("{issuer}/logout?client_id=rproxy&post_logout_redirect_uri=http%3A%2F%2Fapp.test%2F")), "{location}");
@@ -696,7 +739,7 @@ async fn oidc_discovery_with_a_bad_end_session_endpoint_leaves_it_out() {
 	let r = client().get(format!("http://127.0.0.1:{port}/app/page")).send().await.unwrap();
 	assert_eq!(r.status(), StatusCode::FOUND);
 	assert!(r.headers()["location"].to_str().unwrap().starts_with(&format!("{issuer}/auth?")));
-	let r = client().get(format!("http://127.0.0.1:{port}/_rproxy/oidc/logout")).header("Host", "app.test").send().await.unwrap();
+	let r = client().post(format!("http://127.0.0.1:{port}/_rproxy/oidc/logout")).header("Host", "app.test").send().await.unwrap();
 	assert_eq!(r.status(), StatusCode::FOUND);
 	assert_eq!(r.headers()["location"], "/");
 }

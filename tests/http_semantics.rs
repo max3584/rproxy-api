@@ -334,6 +334,46 @@ async fn request_fields_pass_through_and_hop_by_hop_ones_are_dropped() {
 }
 
 #[tokio::test]
+async fn forwarding_headers_connection_names_and_h2c_upgrades() {
+	// #333: the client's Forwarded and X-Real-IP do not reach the backend (it is not a
+	// trusted proxy); names it lists in Connection cannot remove what a middleware sets
+	let s = setup("sem-fwd", json!({"mw": {"headers": {"request": {"set": {"X-Mw": "rproxy"}}}}})).await;
+	let mut req = b"GET /echo HTTP/1.1\r\nHost: a.test\r\n".to_vec();
+	req.extend_from_slice(b"Forwarded: for=6.6.6.6;proto=http;host=evil.test\r\nX-Real-IP: 6.6.6.6\r\nX-Mw: client\r\nX-Listed: 1\r\n");
+	req.extend_from_slice(b"Connection: close, X-Mw, X-Real-IP, X-Forwarded-For, X-Listed\r\n\r\n");
+	let (status, _, body) = h1_fields(&s.h1_raw(&req).await);
+	assert_eq!(status, 200);
+	let v = json_body(&body);
+	assert!(received(&v, "forwarded").is_empty(), "{v}");
+	assert_eq!(received_text(&v, "x-real-ip"), ["127.0.0.1"]);
+	assert_eq!(received_text(&v, "x-forwarded-for"), ["127.0.0.1"]);
+	assert_eq!(received_text(&v, "x-mw"), ["rproxy"], "a middleware's header stays: {v}");
+	assert!(received(&v, "x-listed").is_empty(), "a listed name is still hop-by-hop");
+	assert!(received(&v, "connection").is_empty());
+
+	// HTTP/2 has no Connection; Forwarded goes the same way
+	let mut h2 = s.h2().await;
+	let req =
+		hyper::Request::get("https://a.test/echo").header("forwarded", "for=6.6.6.6").header("x-real-ip", "6.6.6.6").body(empty()).unwrap();
+	let (status, _, body) = h2_send(&mut h2, req).await;
+	assert_eq!(status, StatusCode::OK);
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert!(received(&v, "forwarded").is_empty(), "{v}");
+	assert_eq!(received_text(&v, "x-real-ip"), ["127.0.0.1"]);
+
+	// an upgrade to h2c is not relayed: the request goes on as plain HTTP/1.1
+	let mut req = b"GET /echo HTTP/1.1\r\nHost: a.test\r\n".to_vec();
+	req.extend_from_slice(b"Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\nConnection: close\r\n\r\n");
+	let (status, fields, body) = h1_fields(&s.h1_raw(&req).await);
+	assert_eq!(status, 200, "{fields:?}");
+	assert!(values(&fields, "upgrade").is_empty());
+	let v = json_body(&body);
+	for name in ["upgrade", "http2-settings", "connection"] {
+		assert!(received(&v, name).is_empty(), "{name}: {v}");
+	}
+}
+
+#[tokio::test]
 async fn the_authority_of_an_absolute_form_request_wins_over_host() {
 	let s = setup("sem-absolute", json!({})).await;
 	// RFC 9112 §3.2.2: with an absolute-form target, the Host field is replaced by its authority
