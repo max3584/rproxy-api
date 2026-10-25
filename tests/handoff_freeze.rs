@@ -293,3 +293,59 @@ async fn a_handoff_that_panics_lets_the_changes_go_on() {
 	assert_eq!(*aborted.lock().unwrap(), [PathBuf::from("/opt/rproxy/rproxy-api-v99.0.0")]);
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// #327 / #323: the rules restored that did not validate go over a live upgrade as
+/// stored (still failed there, with who stored them), not as the rules to start; and
+/// who made each rule through the API goes with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_rules_and_owners_carry_over() {
+	let _one = ONE_AT_A_TIME.lock().await;
+	let dir = workdir("invalid");
+	let old = harness_with(tokens(&dir)).await;
+	let old_store = Arc::new(Store::memory("node-a"));
+	old.registry.set_persist(old_store.clone());
+	let made = stored_rule(&old).await;
+	let (api, dynamic) = (free_port(), free_port());
+	let bad = |port: u16| {
+		let mut r = rule("tcp", port, "127.0.0.1:9".parse().unwrap());
+		r["allow_from"] = json!(["not-an-address"]);
+		r
+	};
+	let row = rproxy_api::config::persist::StoredRule {
+		node: "node-a".into(),
+		spec: serde_json::from_value(bad(api)).unwrap(),
+		spec_version: 1,
+		created_by: "someone".into(),
+		created_at: 1_790_000_000,
+		updated_by: "someone".into(),
+		updated_at: 1_790_000_000,
+	};
+	old_store.memory_put_row(row.clone());
+	old_store.restored(std::slice::from_ref(&row));
+	old.registry.restore_as(vec![row.spec.clone()], rproxy_api::core::rule::Origin::Api).await;
+	old.registry.restore(vec![serde_json::from_value(bad(dynamic)).unwrap()]).await;
+
+	let state = handoff::prepare(&old.registry, Duration::from_secs(5)).await.unwrap();
+	assert!(state.rules.iter().all(|r| r["listen_port"] != api && r["listen_port"] != dynamic), "not as rules to start");
+	// as it goes over the socket
+	let state: handoff::State = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+	let new = harness_with(tokens(&dir)).await;
+	let new_store = Arc::new(old_store.memory_after_upgrade());
+	new.registry.set_persist(new_store.clone());
+	state.restore_rules(&new.registry).await;
+	old_store.release().await;
+
+	let (status, v) = call(&new, Method::GET, &format!("/rules/tcp/127.0.0.1/{api}"), None).await;
+	assert_eq!(
+		(status, &v["state"], &v["origin"], &v["created_by"], &v["persisted"], &v["allow_from"]),
+		(StatusCode::OK, &json!("failed"), &json!("api"), &json!("someone"), &json!(true), &json!(["not-an-address"])),
+		"{v}"
+	);
+	let (status, v) = call(&new, Method::GET, &format!("/rules/tcp/127.0.0.1/{dynamic}"), None).await;
+	assert_eq!((status, &v["state"], &v["origin"]), (StatusCode::OK, &json!("failed"), &json!("dynamic")), "{v}");
+	assert!(new.registry.owners().contains(&(key(made), "ci".to_string())), "{:?}", new.registry.owners());
+	// fixed in the new process
+	let (status, v) = call(&new, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{api}"), Some(json!({"remote_addr": "127.0.0.1", "remote_port": 9, "allow_from": []}))).await;
+	assert_eq!((status, &v["state"], &v["persisted"]), (StatusCode::OK, &json!("running"), &json!(true)), "{v}");
+	fs::remove_dir_all(dir).unwrap();
+}

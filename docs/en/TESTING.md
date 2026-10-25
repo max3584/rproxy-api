@@ -310,6 +310,7 @@ In-process, with a memory store and two registries (the old process, and the new
 | `a_change_that_does_not_end_in_time_stops_the_handoff` | A change that does not end within the wait (a slow write): the handoff does not happen (`prepare` fails) and the change runs to its end in the old process with `persisted: true` (`release` used to give up at its bound, and the change was in the old process only and not written) |
 | `after_a_failed_handoff_the_waiting_changes_go_on` | The handoff failed after the snapshot: changes that waited meanwhile go on (not refused) and are written |
 | `a_handoff_that_panics_lets_the_changes_go_on` | The handoff task panics after the snapshot: dropping `handoff::Running` clears the handoff mark and lets go of the lock, so the change that waited does not hang (nor get 503) but goes on and is written, and the self-update is told the handoff did not happen (`set_on_abort`: it takes back its trial) |
+| `invalid_rules_and_owners_carry_over` | #327, #323: restored rules that do not validate (`api`, `dynamic`) go over as their stored bodies, not in the snapshot's `rules`; they are `failed` in the new process too (with `created_by`) and a PATCH fixes them; who created each rule goes over too |
 
 ## Integration tests: shutting down on SIGTERM (`tests/shutdown.rs`, v0.4.1)
 
@@ -332,6 +333,7 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `a_failed_rule_starts_once_its_certificate_is_stored` | A settings-file rule naming a certificate not stored is `failed`, and starts once the name is `PUT` |
 | `scopes_and_allow_certs` | The `certs:read` / `certs:write` scopes; names outside `allow_certs` are 403 for `PUT` and in rules; `GET /certs` lists only names within `allow_certs` |
 | `rule_files_may_not_reach_the_store` | #319: a rule from the API naming a file under the store (itself, through a symbolic link, through `..`, a name stored later) gets `403 protected_file` (dry runs, PATCH, a rule set PUT, a service's `ca_file` too), and the token file the same. Other places are fine. An `allow_certs` token names no file: `403 file_not_allowed` (`{"cert"}` is fine). A settings file rule runs with the store's files. A restored rule runs with `rule.protected_file` (no path); a PATCH of only its targets is 403. Refusals of `PUT /rulesets` are audited. `features.protected_files` |
+| `key_files_keep_to_their_owner` | #323: another token naming the key of a rule (itself, a hard link, a symbolic link, `..`, a dry run) gets `409 file_in_use` (the error says nothing of the other rule); the same certificate with a copy of the key passes; the same token and `admin` pass; a PATCH adding it to an own rule is refused, one of the targets only passes; keys of another token's rule set, of the settings file and of a restored rule without a known creator are refused, the set owner's PUT passes; a share from before runs, said by `rule.shared_file` (no path) |
 
 ## Integration tests: storing rule sets (`tests/ruleset_persist.rs`, #241, v0.4.2)
 
@@ -454,6 +456,8 @@ The real binary is stopped with SIGKILL (as by the OOM killer or `kill -9`) and 
 | `a_delete_with_drain_spares_a_new_rule_with_the_key` | A `POST` with the same key while `DELETE ?drain_secs` drains: the `POST` does not wait for the drain, and the old rule's row is deleted first, so the new rule keeps its row and `persisted: true` |
 | `release_does_not_wait_for_a_drain` | While a delete drains, a live upgrade's `release` lets go of the lock at once (the row was deleted before the drain) |
 | `rules_survive_a_restart_with_mariadb` | MariaDB (`RPROXY_TEST_DATABASE_URL`) and the real binary: a created (and changed) rule is written to `rproxy_rules` and comes back as `api` after a restart. On the UI's key the UI's rule is used (`restore.conflict`); other nodes' rows stay out. Deleting removes the row |
+| `rows_that_do_not_validate_are_failed_rules` | #327 (memory store): rows that do not validate are `failed` in `GET /rules` (the reason, the stored body, `created_by`, `Invalid` in `conditions`); a `POST` with the key gets `409`, a PATCH that does not fix it `400`; a fixing PATCH (and its dry run) starts it and writes the row; `DELETE` removes it with its row. The periodic check shows a new row as `failed`, starts it once it changed, drops it once it is gone |
+| `rows_that_do_not_validate_with_mariadb` | #327 (MariaDB and the real binary): rows of `rproxy_rules` and `forward_rules` that do not validate are `failed`; the one fixed by a PATCH is written and runs after a restart; the `forward_rules` one goes with `DELETE` and is back at the next start |
 | `a_blank_node_name_stops_the_startup` | A blank `RPROXY_NODE_NAME` is a configuration error |
 ## Integration tests: rule sets, labels, conditions, readiness (`tests/rulesets.rs`, #28)
 

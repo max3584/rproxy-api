@@ -416,7 +416,7 @@ async fn create(
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
 			// the files are counted by other checks until the change is made (#319)
 			let _files = super::rule_files::check_create(&state.registry, &principal, &req).await?;
-			state.registry.create_as(req, origin).await
+			state.registry.create_by(req, origin, &principal.name).await
 		}
 		.await;
 		audit(&principal, &client, "create", &rule, &result);
@@ -478,6 +478,21 @@ async fn check_rule_ports(state: &AppState, principal: &Principal, key: &Key) ->
 	check_ports(principal, view.listen_port, view.listen_port_end)
 }
 
+/// The ports and scopes of a PATCH. A PATCH of a restored rule that did not validate
+/// (#327) starts the rule it makes as a new one: that body is checked as a `POST`.
+async fn check_update_scope(state: &AppState, principal: &Principal, key: &Key, req: &UpdateRequest) -> AppResult<()> {
+	match state.registry.invalid_patched(key, req) {
+		Some(body) => {
+			check_ports(principal, body.listen_port, body.listen_port_end)?;
+			super::acme_api::check_rule_scope(principal, Some(&body), None)
+		}
+		None => {
+			check_rule_ports(state, principal, key).await?;
+			super::acme_api::check_rule_scope(principal, None, Some(req))
+		}
+	}
+}
+
 async fn update(
 	State(state): State<Arc<AppState>>,
 	Extension(principal): Extension<Principal>,
@@ -489,16 +504,14 @@ async fn update(
 	let key = parse_key(&protocol, &addr, &port)?;
 	let req: UpdateRequest = parse_body(&body)?;
 	if crate::config::plan::dry_run(&query)? {
-		check_rule_ports(&state, &principal, &key).await?;
-		super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+		check_update_scope(&state, &principal, &key, &req).await?;
 		drop(super::rule_files::check_update(&state.registry, &principal, &key, &req).await?);
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		let result = async {
-			check_rule_ports(&state, &principal, &key).await?;
-			super::acme_api::check_rule_scope(&principal, None, Some(&req))?;
+			check_update_scope(&state, &principal, &key, &req).await?;
 			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
 			state.registry.update(&key, req).await
 		}

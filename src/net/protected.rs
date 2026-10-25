@@ -104,7 +104,7 @@ pub struct Resolved {
 
 impl Resolved {
 	/// The same file: the same inode, or (not opened) the same path.
-	fn same(&self, other: &Resolved) -> bool {
+	pub fn same(&self, other: &Resolved) -> bool {
 		match (self.id, other.id) {
 			(Some(a), Some(b)) => a == b,
 			_ => self.real == other.real,
@@ -335,6 +335,56 @@ impl FileRef {
 	fn is_client_secret(&self) -> bool {
 		self.field.ends_with("client_secret_file")
 	}
+
+	/// A key or a secret (#323): `key_file` (a certificate's, a service's client key),
+	/// `client_secret_file`, `cookie_secret_file`, `users_file`. Certificates, chains and
+	/// CAs are public and may be shared.
+	pub fn is_secret(&self) -> bool {
+		let name = self.field.rsplit('.').next().unwrap_or_default();
+		name.ends_with("key_file") || name.ends_with("secret_file") || name == "users_file"
+	}
+}
+
+/// Whose a rule is, for its key and secret files (#323): a token may name a key or a
+/// secret file another owner's rule names only with the `admin` scope.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Owner {
+	/// A rule of the settings file (`origin: static`).
+	Static,
+	/// The token that created the rule through the API (`created_by`), or the owner
+	/// of its rule set.
+	Token(String),
+	/// A rule restored without a known creator (`forward_rules` of the UI): one owner
+	/// of its own, no token's.
+	Restored,
+}
+
+impl Owner {
+	/// Whether a change by the token `name` may name a file this owner's rule names.
+	pub fn is(&self, name: &str) -> bool {
+		matches!(self, Owner::Token(t) if t == name)
+	}
+}
+
+/// Pairs of rules of different owners naming the same key or secret file (#323), as
+/// (rule, field, other rule, other field), each pair once. For warnings about rules
+/// restored from before the check (`Registry::warn_shared_files`).
+pub fn shared_secrets(rules: &[(String, Owner, Vec<FileRef>)]) -> Vec<(String, String, String, String)> {
+	let uses: Vec<(usize, &FileRef, Resolved)> = rules
+		.iter()
+		.enumerate()
+		.flat_map(|(i, (_, _, refs))| refs.iter().filter(|f| f.is_secret()).map(move |f| (i, f)))
+		.map(|(i, f)| (i, f, resolve(Path::new(&f.path))))
+		.collect();
+	let mut out = vec![];
+	for (a, (i, fa, ra)) in uses.iter().enumerate() {
+		for (j, fb, rb) in uses.iter().skip(a + 1) {
+			if i != j && rules[*i].1 != rules[*j].1 && ra.same(rb) {
+				out.push((rules[*i].0.clone(), fa.field.clone(), rules[*j].0.clone(), fb.field.clone()));
+			}
+		}
+	}
+	out
 }
 
 /// Every file a rule names: each `*_file` field of `tls` and `http` (certificates,
@@ -543,6 +593,46 @@ mod tests {
 		assert_eq!(found, want.map(|(a, b)| (a.to_string(), b.to_string())));
 		let cs = refs(None, Some(&http)).into_iter().find(|r| r.is_client_secret()).unwrap();
 		assert_eq!(cs.client, Some(("https://idp.example".into(), "x".into())));
+	}
+
+	#[test]
+	fn secrets_and_shares_between_owners() {
+		let d = dir("owners");
+		std::fs::write(d.join("k"), b"k").unwrap();
+		std::fs::write(d.join("c"), b"c").unwrap();
+		std::fs::hard_link(d.join("k"), d.join("k2")).unwrap();
+		let f = |field: &str, name: &str| FileRef {
+			field: field.into(),
+			path: d.join(name).to_string_lossy().into_owned(),
+			client: None,
+		};
+		for (field, secret) in [
+			("tls.certificates[0].key_file", true),
+			("http.services.s.tls.key_file", true),
+			("http.middlewares.o.oidc.client_secret_file", true),
+			("http.middlewares.o.oidc.cookie_secret_file", true),
+			("http.middlewares.b.basic_auth.users_file", true),
+			("tls.certificates[0].cert_file", false),
+			("tls.certificates[0].chain_file", false),
+			("tls.client_auth.ca_file", false),
+		] {
+			assert_eq!(f(field, "k").is_secret(), secret, "{field}");
+		}
+		let key = "tls.certificates[0].key_file";
+		let cert = "tls.certificates[0].cert_file";
+		let a = Owner::Token("a".into());
+		let rules = vec![
+			("r1".to_string(), a.clone(), vec![f(cert, "c"), f(key, "k")]),
+			("r2".to_string(), Owner::Token("b".into()), vec![f(cert, "c"), f(key, "k2")]),
+			("r3".to_string(), a.clone(), vec![f(key, "k")]),
+		];
+		// the certificate is not a secret; the key through a hard link is; r1 and r3 are a's
+		assert_eq!(
+			shared_secrets(&rules),
+			vec![("r1".into(), key.into(), "r2".into(), key.into()), ("r2".into(), key.into(), "r3".into(), key.into())]
+		);
+		assert!(a.is("a") && !a.is("b") && !Owner::Static.is("static") && !Owner::Restored.is(""));
+		std::fs::remove_dir_all(d).unwrap();
 	}
 
 	#[test]

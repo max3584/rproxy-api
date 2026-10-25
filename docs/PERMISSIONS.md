@@ -64,6 +64,7 @@ DPDK のデータプレーン（`global.performance.dpdk`、#261。`--features d
 - 信頼するディレクトリ（`global.files.trusted_dirs`、なければ環境変数 `RPROXY_FILES_TRUSTED_DIRS`。`:` か `,` 区切りの絶対パス、既定はなし）：開いたファイルの本当のパス（シンボリックリンクをすべてたどった先。`..` で外へは出られない）がその下にあれば、root のものも使う。Kubernetes の Secret のボリューム（root の持ち物、グループは fsGroup、0440、root の `..data` のリンク）のためで、rproxy-gateway は `RPROXY_FILES_TRUSTED_DIRS=/var/run/rproxy-gateway/certs` を渡す。ほかの確かめ（グループ・ほかの人が書けない、鍵はほかの人が読めない（0440 は通る）、リンクは rproxy か root のもの）はそのまま。root 以外のユーザーのファイルは、その下でも使わない。起動時に `files.trusted_dirs` のログに出す。`--check-config` も同じものを使う。そのディレクトリに root が置いたファイルは `rules:write` のトークンから鍵として使えるので、ほかの用途のファイルを置かない。
 - 制御 API の証明書・トークンのファイル（`RPROXY_TLS_*`、`RPROXY_TOKEN_FILE`）・GeoIP のデータベースは対象外（rproxy 自身が読むもので、この確かめを通さない）。
 - 所有者の確かめに加えて、API のルール（v0.4.17、#319）は証明書のストア（`RPROXY_CERT_STORE`）・ACME の保存先の下と、設定・オプションの秘密のファイル（CrowdSec・ACME の秘密、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_KEY`）を指せない（`403 protected_file`）。`allow_certs` のあるトークンはファイルを指せない（`403 file_not_allowed`）。OIDC の client secret のファイルはほかの用途に使えない（`409 secret_reuse`）。設定ファイルのルールは今までどおりで、`--check-config` が警告する。詳しくは docs/API.md の「API のルールが指せるファイル」。
+- ほかの持ち主（ほかのトークン・ほかのトークンの組・設定ファイル）のルールが指す鍵・秘密のファイル（`key_file`・`client_secret_file`・`cookie_secret_file`・`users_file`。inode で比べる）は、`admin` でないトークンの API のルールからは指せない（v0.4.18、#323、`409 file_in_use`）。複数のトークンで制御 API を使うときに、ほかのチームの鍵でそのサイトになりすませないように。証明書・CA は共有してよい。詳しくは docs/API.md の「ほかの持ち主の鍵・秘密のファイル」。
 
 ### ルールの宛先
 

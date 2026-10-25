@@ -281,6 +281,115 @@ async fn restored_rows_are_api_rules() {
 	assert_eq!(v["origin"], "dynamic");
 }
 
+/// #327: restored rules that do not validate are failed rules of `GET /rules` (the
+/// reason, the body as stored, who stored it) holding their key; a PATCH that fixes
+/// one starts it and writes its row, `DELETE` removes it and its row; the periodic
+/// check tries a row again once it changed and forgets one that is gone.
+#[tokio::test]
+async fn rows_that_do_not_validate_are_failed_rules() {
+	use reqwest::Method;
+	use rproxy_api::config::persist::StoredRule;
+	use rproxy_api::core::rule::{Key, Origin, Protocol};
+	let dir = workdir("invalid");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("n1"));
+	h.registry.set_persist(store.clone());
+	let backend = tcp_backend("I:").await;
+	let (fixed, deleted, ui) = (free_port(), free_port(), free_port());
+	let bad = |port: u16| {
+		let mut r = rule("tcp", port, backend);
+		r["allow_from"] = json!(["not-an-address"]);
+		r
+	};
+	let row = |spec: Value| StoredRule {
+		node: "n1".into(),
+		spec: serde_json::from_value(spec).unwrap(),
+		spec_version: 1,
+		created_by: "ci".into(),
+		created_at: 1_790_000_000,
+		updated_by: "ci".into(),
+		updated_at: 1_790_000_000,
+	};
+	let rows = vec![row(bad(fixed)), row(bad(deleted))];
+	for r in &rows {
+		store.memory_put_row(r.clone());
+	}
+	h.registry.restore(vec![serde_json::from_value(bad(ui)).unwrap()]).await;
+	store.restored(&rows);
+	h.registry.restore_as(rows.into_iter().map(|r| r.spec).collect(), Origin::Api).await;
+
+	// failed with the reason, the body as stored and who stored it
+	let (status, list) = call(&h, Method::GET, "/rules", "ui", None).await;
+	assert_eq!(status, StatusCode::OK);
+	let find = |list: &Value, port: u16| list.as_array().unwrap().iter().find(|v| v["listen_port"] == port).cloned();
+	let v = find(&list, fixed).expect("listed");
+	assert_eq!(
+		(&v["state"], &v["origin"], &v["created_by"], &v["persisted"], &v["allow_from"]),
+		(&json!("failed"), &json!("api"), &json!("ci"), &json!(true), &json!(["not-an-address"])),
+		"{v}"
+	);
+	assert!(v["error"].as_str().unwrap().contains("not-an-address"), "{v}");
+	let accepted = v["conditions"].as_array().unwrap().iter().find(|c| c["type"] == "Accepted").cloned().unwrap();
+	assert_eq!((&accepted["status"], &accepted["reason"]), (&json!("False"), &json!("Invalid")), "{v}");
+	assert_eq!(find(&list, ui).expect("the UI's rule")["origin"], "dynamic");
+	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{ui}"), "ui", None).await;
+	assert_eq!((status, &v["state"]), (StatusCode::OK, &json!("failed")), "{v}");
+
+	// it holds its key
+	let (status, v) = call(&h, Method::POST, "/rules", "ci", Some(rule("tcp", fixed, backend))).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("already_exists")), "{v}");
+	// a PATCH that leaves it invalid changes nothing; one that fixes it starts it and writes its row
+	let targets = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port()});
+	let (status, v) = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{fixed}"), "ci", Some(targets.clone())).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	let mut fix = targets.clone();
+	fix["allow_from"] = json!(["127.0.0.1/32"]);
+	let (status, v) = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{fixed}?dry_run=true"), "ci", Some(fix.clone())).await;
+	assert_eq!((status, &v["action"]), (StatusCode::OK, &json!("update")), "{v}");
+	let (status, v) = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{fixed}"), "ci", Some(fix)).await;
+	assert_eq!(
+		(status, &v["state"], &v["origin"], &v["persisted"], &v["created_by"]),
+		(StatusCode::OK, &json!("running"), &json!("api"), &json!(true), &json!("ci")),
+		"{v}"
+	);
+	let stored = store.memory_rows().into_iter().find(|r| r.spec.listen_port == fixed).unwrap();
+	assert_eq!(stored.spec.allow_from, vec!["127.0.0.1/32".to_string()]);
+	let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", fixed)).await.unwrap();
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	conn.write_all(b"x").await.unwrap();
+	let mut buf = [0u8; 8];
+	let n = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf)).await.unwrap().unwrap();
+	assert_eq!(&buf[..n], b"I:x");
+
+	// DELETE removes it, and its row
+	let (status, _) = call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{deleted}?dry_run=true"), "ci", None).await;
+	assert_eq!(status, StatusCode::OK);
+	let (status, v) = call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{deleted}"), "ci", None).await;
+	assert_eq!(status, StatusCode::NO_CONTENT, "{v}");
+	assert_eq!(call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{deleted}"), "ci", None).await.0, StatusCode::NOT_FOUND);
+	assert!(!store.memory_rows().iter().any(|r| r.spec.listen_port == deleted), "the row stays");
+	assert_eq!(call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{ui}"), "ui", None).await.0, StatusCode::NO_CONTENT);
+
+	// the periodic check: a new row that does not validate is shown, tried again once it
+	// changed (it validates now: it starts), and one whose row is gone is forgotten
+	let (later, gone) = (free_port(), free_port());
+	store.memory_put_row(row(bad(later)));
+	store.memory_put_row(row(bad(gone)));
+	store.reconcile(&h.registry).await.unwrap();
+	for port in [later, gone] {
+		let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{port}"), "ci", None).await;
+		assert_eq!((status, &v["state"]), (StatusCode::OK, &json!("failed")), "{v}");
+	}
+	store.reconcile(&h.registry).await.unwrap();
+	store.memory_put_row(row(rule("tcp", later, backend)));
+	store.memory_remove_row(&Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{gone}").parse().unwrap() });
+	store.reconcile(&h.registry).await.unwrap();
+	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{later}"), "ci", None).await;
+	assert_eq!((status, &v["state"]), (StatusCode::OK, &json!("running")), "{v}");
+	assert_eq!(call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{gone}"), "ci", None).await.0, StatusCode::NOT_FOUND);
+	fs::remove_dir_all(dir).unwrap();
+}
+
 struct Rproxy {
 	child: Child,
 	out: PathBuf,
@@ -366,6 +475,9 @@ const FORWARD_RULES: &str = "CREATE TABLE forward_rules (
 	options JSON NULL
 )";
 
+/// The database tests recreate the same tables: one at a time.
+static DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The real binary with MariaDB: a rule made by a persist token survives a
 /// restart; the UI's row wins on the same key; other nodes' rows stay out.
 #[tokio::test]
@@ -375,6 +487,7 @@ async fn rules_survive_a_restart_with_mariadb() {
 		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
 		return;
 	};
+	let _db = DB.lock().await;
 	let pool = sqlx::mysql::MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
 	pool.execute("DROP TABLE IF EXISTS forward_rules").await.unwrap();
 	pool.execute("DROP TABLE IF EXISTS rproxy_rules").await.unwrap();
@@ -455,6 +568,93 @@ async fn rules_survive_a_restart_with_mariadb() {
 		.await
 		.unwrap();
 	assert_eq!(left.0, 0);
+	pool.execute("DROP TABLE rproxy_rules").await.unwrap();
+	pool.execute("DROP TABLE forward_rules").await.unwrap();
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// #327 with the real binary and MariaDB: a row of `rproxy_rules` and one of
+/// `forward_rules` that do not validate are failed rules of `GET /rules`; a PATCH
+/// fixes the first and writes its row (it runs after a restart), `DELETE` removes the
+/// second until the next start (rproxy does not write `forward_rules`).
+#[tokio::test]
+async fn rows_that_do_not_validate_with_mariadb() {
+	use sqlx::Executor;
+	let Ok(url) = std::env::var("RPROXY_TEST_DATABASE_URL") else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let _db = DB.lock().await;
+	let pool = sqlx::mysql::MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+	pool.execute("DROP TABLE IF EXISTS forward_rules").await.unwrap();
+	pool.execute("DROP TABLE IF EXISTS rproxy_rules").await.unwrap();
+	pool.execute(FORWARD_RULES).await.unwrap();
+	pool.execute(RPROXY_RULES).await.unwrap();
+
+	let dir = workdir("db-invalid");
+	token_file(&dir);
+	let backend = tcp_backend("V:").await;
+	let (api_port, stored, ui) = (free_port(), free_port(), free_port());
+	let mut bad = rule("tcp", stored, backend);
+	bad["allow_from"] = json!(["not-an-address"]);
+	sqlx::query(
+		"INSERT INTO rproxy_rules (node, protocol, listen_addr, listen_port, spec, spec_version, created_by, created_at, updated_by, updated_at)
+		 VALUES ('node-a', 'tcp', '127.0.0.1', ?, ?, 1, 'ci', NOW(3), 'ci', NOW(3))",
+	)
+	.bind(u32::from(stored))
+	.bind(bad.to_string())
+	.execute(&pool)
+	.await
+	.unwrap();
+	// remote_port 0
+	sqlx::query("INSERT INTO forward_rules (auth_id, protocol, src_addr, src_port, dist_addr, dist_port) VALUES ('u', 'tcp', '127.0.0.1', ?, ?, 0)")
+		.bind(i32::from(ui))
+		.bind(backend.ip().to_string())
+		.execute(&pool)
+		.await
+		.unwrap();
+
+	let client = reqwest::Client::new();
+	let base = format!("http://127.0.0.1:{api_port}");
+	let get = |port: u16| client.get(format!("{base}/rules/tcp/127.0.0.1/{port}")).bearer_auth("ci").send();
+	{
+		let rp = Rproxy::start(&dir, api_port, &url, "first");
+		rp.wait(api_port).await;
+		let v: Value = get(stored).await.unwrap().json().await.unwrap();
+		assert_eq!((&v["state"], &v["origin"], &v["created_by"]), (&json!("failed"), &json!("api"), &json!("ci")), "{v}\n{}", rp.log());
+		assert!(v["error"].as_str().unwrap().contains("not-an-address"), "{v}");
+		let v: Value = get(ui).await.unwrap().json().await.unwrap();
+		assert_eq!((&v["state"], &v["origin"]), (&json!("failed"), &json!("dynamic")), "{v}");
+		assert!(v["error"].as_str().unwrap().contains("remote_port"), "{v}");
+		let r = client
+			.patch(format!("{base}/rules/tcp/127.0.0.1/{stored}"))
+			.bearer_auth("ci")
+			.json(&json!({"remote_addr": "127.0.0.1", "remote_port": backend.port(), "allow_from": ["127.0.0.0/8"]}))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(r.status(), StatusCode::OK);
+		let v: Value = r.json().await.unwrap();
+		assert_eq!((&v["state"], &v["persisted"]), (&json!("running"), &json!(true)), "{v}");
+		let r = client.delete(format!("{base}/rules/tcp/127.0.0.1/{ui}")).bearer_auth("ui").send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::NO_CONTENT);
+		assert_eq!(get(ui).await.unwrap().status(), StatusCode::NOT_FOUND);
+	}
+	let row: (String, String) = sqlx::query_as("SELECT CAST(spec AS CHAR), created_by FROM rproxy_rules WHERE node = 'node-a' AND listen_port = ?")
+		.bind(u32::from(stored))
+		.fetch_one(&pool)
+		.await
+		.unwrap();
+	let spec: Value = serde_json::from_str(&row.0).unwrap();
+	assert_eq!((&spec["allow_from"], row.1.as_str()), (&json!(["127.0.0.0/8"]), "ci"), "{spec}");
+	{
+		let rp = Rproxy::start(&dir, api_port, &url, "second");
+		rp.wait(api_port).await;
+		let v: Value = get(stored).await.unwrap().json().await.unwrap();
+		assert_eq!((&v["state"], &v["origin"]), (&json!("running"), &json!("api")), "{v}");
+		let v: Value = get(ui).await.unwrap().json().await.unwrap();
+		assert_eq!(v["state"], "failed", "the UI's row comes back: {v}");
+	}
 	pool.execute("DROP TABLE rproxy_rules").await.unwrap();
 	pool.execute("DROP TABLE forward_rules").await.unwrap();
 	fs::remove_dir_all(dir).unwrap();

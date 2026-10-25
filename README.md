@@ -329,7 +329,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 
 | `event` | 内容 |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も） |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も）。DB から戻すルールが検証に通らないときも `rule.failed`（`phase: restore` / `reconcile`、`code`。`GET /rules` に `failed` として出る。v0.4.18、#327） |
 | `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
@@ -353,6 +353,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `config.file` | ルールが指すファイル（証明書・鍵・`users_file` など）が使えない理由（`what`・`file`・`error`）。制御 API の答えには理由を出さないので、ここで見る（v0.4.18、#333） |
 | `rule.protected_file` | 戻したルール（DB・組の保存・照合・引き継ぎ）が、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密・`/proc` など）を指している（`rule`・`field`・`phase`。パスは出さない。v0.4.17、#319） |
+| `rule.shared_file` | 戻したルール（DB・組の保存・引き継ぎ）のうち、持ち主（トークン・組・設定ファイル）の違うルールが同じ鍵・秘密のファイルを指している（`rule`・`field`・`other_rule`・`other_field`・`phase`。パスは出さない。組み合わせごとに 1 回。API の新しいルールでは `409 file_in_use`。v0.4.18、#323） |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `http.mirror` | `mirror` ミドルウェアの写しの結果（debug。`middleware`、`service`、`backend`、`status`、失敗なら `error`）。クライアントの応答には影響しない |
 | `crowdsec.sync` / `crowdsec.error` | CrowdSec の LAPI から判定を取得した（`added`、`deleted`、`decisions`）/ 取得できない・AppSec に問い合わせできない（それまでの判定を使い続ける） |

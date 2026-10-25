@@ -42,6 +42,9 @@ pub struct Config {
 
 type Resolver = (CancellationToken, JoinHandle<()>);
 
+/// The cause in `conditions` of a restored rule that does not validate (#327).
+pub(crate) const INVALID: &str = "restore_invalid";
+
 /// One listening socket's task; true when it stopped because its address was
 /// taken off the rule (or the rule stopped), false when it ended on its own.
 type ListenerTask = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
@@ -316,6 +319,25 @@ pub struct Registry {
 	conditions: crate::core::ruleset::ConditionLog,
 	/// `GET /readyz` (#28).
 	readiness: crate::core::ruleset::Readiness,
+	/// The token that created each rule made through the API (#323); a rule of a set
+	/// is its set's owner's, an `api` rule restored from the database its row's
+	/// `created_by` (`Registry::owner_of`).
+	owners: std::sync::Mutex<HashMap<Key, String>>,
+	/// Rules restored from the database (or a live upgrade) that did not validate
+	/// (#327): shown as failed with the reason, deletable, fixed by a PATCH. They
+	/// hold their key (not their ports).
+	invalid: std::sync::Mutex<HashMap<Key, Invalid>>,
+	/// Rules of different owners naming the same key or secret file, said once (#323).
+	shared_warned: std::sync::Mutex<HashSet<(String, String, String, String)>>,
+}
+
+/// A rule restored from the database (`forward_rules`, `rproxy_rules`) or a live upgrade
+/// that did not validate (#327): its body as stored and why.
+#[derive(Clone, Debug)]
+pub struct Invalid {
+	pub request: RuleRequest,
+	pub origin: Origin,
+	pub error: String,
 }
 
 /// What `Registry::apply_certs` does with one rule.
@@ -464,6 +486,9 @@ impl Registry {
 			rulesets: Default::default(),
 			conditions: Default::default(),
 			readiness: Default::default(),
+			owners: Default::default(),
+			invalid: Default::default(),
+			shared_warned: Default::default(),
 		})
 	}
 
@@ -648,13 +673,137 @@ impl Registry {
 
 	pub async fn list(&self) -> Vec<RuleView> {
 		let rules = self.rules.lock().await;
-		let mut keys: Vec<&Key> = rules.keys().collect();
-		keys.sort_by_key(|k| (k.protocol == Protocol::Udp, k.listen));
-		keys.into_iter().map(|k| self.view_of(&rules[k])).collect()
+		let invalid = self.invalid_snapshot();
+		let mut views: Vec<(Key, RuleView)> = rules.iter().map(|(k, e)| (*k, self.view_of(e))).collect();
+		views.extend(invalid.iter().filter(|(k, _)| !rules.contains_key(k)).map(|(k, i)| (*k, self.invalid_view(k, i))));
+		views.sort_by_key(|(k, _)| (k.protocol == Protocol::Udp, k.listen));
+		views.into_iter().map(|(_, v)| v).collect()
 	}
 
 	pub async fn get(&self, key: &Key) -> Result<RuleView, ApiError> {
-		self.rules.lock().await.get(key).map(|e| self.view_of(e)).ok_or_else(|| ApiError::not_found(key.to_string()))
+		if let Some(view) = self.rules.lock().await.get(key).map(|e| self.view_of(e)) {
+			return Ok(view);
+		}
+		self.invalid_of(key).map(|i| self.invalid_view(key, &i)).ok_or_else(|| ApiError::not_found(key.to_string()))
+	}
+
+	fn invalid_snapshot(&self) -> HashMap<Key, Invalid> {
+		self.invalid.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	fn invalid_of(&self, key: &Key) -> Option<Invalid> {
+		self.invalid.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+	}
+
+	/// The view of a rule that did not validate (#327): failed, its body as stored.
+	fn invalid_view(&self, key: &Key, invalid: &Invalid) -> RuleView {
+		let mut view = RuleView::invalid(&invalid.request, *key, invalid.origin, invalid.error.clone());
+		if view.origin == Origin::Api {
+			if let Some(store) = self.persist() {
+				store.decorate(key, &mut view);
+			}
+		}
+		if self.caps().features.conditions {
+			view.conditions = self.conditions.stamp(*key, crate::core::ruleset::conditions(&view, Some((INVALID, false))));
+		}
+		view
+	}
+
+	/// The rules restored that did not validate (#327): (key, body as stored, origin).
+	pub fn invalid_rules(&self) -> Vec<(Key, RuleRequest, Origin)> {
+		self.invalid_snapshot().into_iter().map(|(k, i)| (k, i.request, i.origin)).collect()
+	}
+
+	/// Registers a restored rule that did not validate (#327), unless its key is taken
+	/// (by a rule, or by an earlier one of these: `rule.duplicate`). Without a key it
+	/// can be named by (`listen_addr` not an address) it is only logged.
+	pub(crate) async fn note_invalid(&self, req: RuleRequest, origin: Origin, e: &ApiError, phase: &str) {
+		let label = format!("{}/{}:{}", req.protocol, req.listen_addr, req.listen_port);
+		error!(event = "rule.failed", rule = %label, error = %e.message, code = e.code, phase, origin = ?origin,
+			"a restored rule does not validate; it is shown in GET /rules as failed: fix it with PATCH or delete it");
+		let Ok(listen) = crate::core::rule::parse_listen(&req.listen_addr, req.listen_port) else { return };
+		let key = Key { protocol: req.protocol, listen };
+		let rules = self.rules.lock().await;
+		let mut invalid = self.invalid.lock().unwrap_or_else(|e| e.into_inner());
+		if rules.contains_key(&key) || invalid.contains_key(&key) {
+			warn!(event = "rule.duplicate", rule = %key, phase);
+			return;
+		}
+		invalid.insert(key, Invalid { request: req, origin, error: e.message.clone() });
+	}
+
+	/// Forgets a rule that did not validate (its row changed or is gone, #327).
+	pub(crate) fn forget_invalid(&self, key: &Key) -> Option<Invalid> {
+		let gone = self.invalid.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+		if gone.is_some() {
+			self.conditions.forget(key);
+		}
+		gone
+	}
+
+	/// The body a PATCH makes of a rule that did not validate (#327): the stored body
+	/// with each field the PATCH has in place of its own, the targets as a whole (as a
+	/// PATCH of any rule). None when the key holds no such rule.
+	pub(crate) fn invalid_patched(&self, key: &Key, req: &UpdateRequest) -> Option<RuleRequest> {
+		self.invalid_of(key).map(|i| crate::core::rule::patched_request(i.request, req.clone()))
+	}
+
+	/// Whose a rule is, for its key and secret files (#323): the settings file's, its
+	/// set's owner's, the token that created it (`api` rules restored from the
+	/// database: their row's `created_by`), else `Owner::Restored`.
+	pub(crate) fn owner_of(&self, spec: &RuleSpec) -> crate::net::protected::Owner {
+		use crate::net::protected::Owner;
+		if spec.origin == Origin::Static {
+			return Owner::Static;
+		}
+		if let Some(set) = &spec.ruleset {
+			return self.rulesets.owner(set).map(Owner::Token).unwrap_or(Owner::Restored);
+		}
+		if let Some(by) = self.owners.lock().unwrap_or_else(|e| e.into_inner()).get(&spec.key) {
+			return Owner::Token(by.clone());
+		}
+		if spec.origin == Origin::Api {
+			if let Some(by) = self.persist().and_then(|s| s.created_by(&spec.key)) {
+				return Owner::Token(by);
+			}
+		}
+		Owner::Restored
+	}
+
+	/// The tokens that created the rules made through the API (a live upgrade, #323).
+	pub fn owners(&self) -> Vec<(Key, String)> {
+		self.owners.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, by)| (*k, by.clone())).collect()
+	}
+
+	/// Takes over the token that created a rule (a live upgrade, #323).
+	pub fn set_owner(&self, key: Key, by: &str) {
+		self.owners.lock().unwrap_or_else(|e| e.into_inner()).insert(key, by.to_string());
+	}
+
+	/// Rules of different owners that name the same key or secret file (#323), restored
+	/// from before the check (the database, stored rule sets, a live upgrade): not
+	/// refused but said once per pair (`rule.shared_file`, `warn`, the rules and fields,
+	/// not the path). Changes to them through the API that keep the file are allowed.
+	pub async fn warn_shared_files(&self, phase: &str) {
+		let rules: Vec<(String, crate::net::protected::Owner, Vec<crate::net::protected::FileRef>)> = self
+			.file_refs()
+			.await
+			.into_iter()
+			.filter(|(_, _, _, refs)| refs.iter().any(|f| f.is_secret()))
+			.map(|(key, _, owner, refs)| (key.to_string(), owner, refs))
+			.collect();
+		if rules.len() < 2 {
+			return;
+		}
+		let pairs = tokio::task::spawn_blocking(move || crate::net::protected::shared_secrets(&rules)).await.unwrap_or_default();
+		let mut warned = self.shared_warned.lock().unwrap_or_else(|e| e.into_inner());
+		for pair in pairs {
+			if warned.insert(pair.clone()) {
+				let (rule, field, other, other_field) = pair;
+				warn!(event = "rule.shared_file", rule, field, other_rule = other, other_field, phase,
+					"rules of different owners name the same key or secret file (#323); they run, but the API refuses it in new rules of a token without admin (409 file_in_use)");
+			}
+		}
 	}
 
 	fn spawn_resolver(
@@ -882,6 +1031,11 @@ impl Registry {
 	}
 
 	pub(super) async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
+		self.create_spec_in(spec, false).await
+	}
+
+	/// `create_spec`; `fixing`: in place of the rule of the key that did not validate (#327).
+	async fn create_spec_in(self: &Arc<Self>, spec: RuleSpec, fixing: bool) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
 		}
@@ -890,6 +1044,9 @@ impl Registry {
 		if rules.contains_key(&spec.key) {
 			return Err(ApiError::already_exists(spec.key.to_string()));
 		}
+		if !fixing {
+			self.refuse_invalid_key(&spec.key)?;
+		}
 		if let Some((_, e)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
 			return Err(ApiError::already_exists(overlap_message(&spec, e.spec())));
 		}
@@ -897,6 +1054,9 @@ impl Registry {
 		let entry = Entry::Running(self.start(spec, prepared)?);
 		let view = self.view_of(&entry);
 		rules.insert(key, entry);
+		if fixing {
+			self.forget_invalid(&key);
+		}
 		drop(rules);
 		// ACME learns about new certificates (their state is in the view)
 		self.gc_certs().await;
@@ -925,9 +1085,58 @@ impl Registry {
 		self.create_spec(spec).await
 	}
 
+	/// `create_as` by the token `by`, who owns the rule's files from then on (#323).
+	pub async fn create_by(self: &Arc<Self>, req: RuleRequest, origin: Origin, by: &str) -> Result<RuleView, ApiError> {
+		let mut spec = req.validate(&self.caps())?;
+		spec.origin = origin;
+		let key = spec.key;
+		let view = self.create_spec(spec).await?;
+		self.set_owner(key, by);
+		Ok(view)
+	}
+
+	/// `409 already_exists` while a rule that did not validate holds the key (#327).
+	fn refuse_invalid_key(&self, key: &Key) -> Result<(), ApiError> {
+		if self.invalid.lock().unwrap_or_else(|e| e.into_inner()).contains_key(key) {
+			return Err(ApiError::already_exists(format!(
+				"{key} is a restored rule that does not validate (state failed in GET /rules); fix it with PATCH or delete it first"
+			)));
+		}
+		Ok(())
+	}
+
 	pub async fn update(self: &Arc<Self>, key: &Key, req: UpdateRequest) -> Result<RuleView, ApiError> {
+		if let Some(fixed) = self.invalid_patched(key, &req) {
+			return self.fix_invalid(key, fixed).await;
+		}
 		let (_, spec, tls_changed, http_changed) = self.updated_spec(key, req).await?;
 		self.apply(key, spec, tls_changed, http_changed).await
+	}
+
+	/// A PATCH of a rule that did not validate (#327): the body it makes is validated
+	/// as a new rule (`400` and nothing changes while it still does not) and started in
+	/// its place, keeping its origin. One that validates but cannot start (a port in
+	/// use, a name that does not resolve) is registered as failed, as a PATCH of a
+	/// failed rule leaves it.
+	async fn fix_invalid(self: &Arc<Self>, key: &Key, req: RuleRequest) -> Result<RuleView, ApiError> {
+		let Some(origin) = self.invalid_of(key).map(|i| i.origin) else { return Err(ApiError::not_found(key.to_string())) };
+		let mut spec = req.validate(&self.caps())?;
+		if spec.key != *key {
+			return Err(ApiError::invalid(format!("the PATCH would move {key} to {}; delete and re-create the rule", spec.key)));
+		}
+		spec.origin = origin;
+		match self.create_spec_in(spec.clone(), true).await {
+			Ok(view) => {
+				info!(event = "rule.update", rule = %key, phase = "fixed", "a restored rule that did not validate was fixed");
+				Ok(view)
+			}
+			Err(e) if e.code == "already_exists" || e.code == "reserved" => Err(e),
+			Err(e) => {
+				error!(event = "rule.failed", rule = %key, error = %e.message, phase = "update");
+				self.insert_failed(spec, e.clone()).await;
+				Err(e)
+			}
+		}
 	}
 
 	/// What a PATCH makes of a rule: (current spec, new spec, whether `tls`
@@ -1072,6 +1281,9 @@ impl Registry {
 			let rules = self.rules.lock().await;
 			if replacing != Some(&spec.key) && rules.contains_key(&spec.key) {
 				return Err(ApiError::already_exists(spec.key.to_string()));
+			}
+			if replacing != Some(&spec.key) {
+				self.refuse_invalid_key(&spec.key)?;
 			}
 			if let Some((_, e)) = rules.iter().find(|(k, e)| Some(*k) != replacing && **k != spec.key && overlaps(e.spec(), spec)) {
 				return Err(ApiError::already_exists(overlap_message(spec, e.spec())));
@@ -1245,22 +1457,18 @@ impl Registry {
 		}
 	}
 
-	/// The files every rule names (#319), with its key and rule set (the specs are copied
-	/// under the lock and looked at after).
-	pub async fn file_refs(&self) -> Vec<(Key, Option<String>, Vec<crate::net::protected::FileRef>)> {
-		let specs: Vec<(Key, Option<String>, tlsconf::TlsSpec, Option<crate::l7::HttpSpec>)> = {
+	/// The files every rule names (#319), with its key, rule set and owner (#323; the
+	/// specs are copied under the lock and looked at after).
+	#[allow(clippy::type_complexity)]
+	pub async fn file_refs(&self) -> Vec<(Key, Option<String>, crate::net::protected::Owner, Vec<crate::net::protected::FileRef>)> {
+		let specs: Vec<RuleSpec> = {
 			let rules = self.rules.lock().await;
-			rules
-				.values()
-				.map(|e| e.spec())
-				.filter(|s| s.tls != tlsconf::TlsSpec::default() || s.http.is_some())
-				.map(|s| (s.key, s.ruleset.clone(), s.tls.clone(), s.http.clone()))
-				.collect()
+			rules.values().map(|e| e.spec()).filter(|s| s.tls != tlsconf::TlsSpec::default() || s.http.is_some()).cloned().collect()
 		};
 		specs
 			.into_iter()
-			.map(|(key, set, tls, http)| (key, set, crate::net::protected::refs(Some(&tls), http.as_ref())))
-			.filter(|(_, _, refs)| !refs.is_empty())
+			.map(|s| (s.key, s.ruleset.clone(), self.owner_of(&s), crate::net::protected::refs(Some(&s.tls), s.http.as_ref())))
+			.filter(|(_, _, _, refs)| !refs.is_empty())
 			.collect()
 	}
 
@@ -1410,16 +1618,27 @@ impl Registry {
 		let entry = {
 			let mut rules = self.rules.lock().await;
 			match rules.get(key) {
-				None => return Err(ApiError::not_found(key.to_string())),
+				// a rule that did not validate (#327) has nothing to stop
+				None => match self.forget_invalid(key) {
+					Some(_) => {
+						info!(event = "rule.delete", rule = %key, phase = "invalid");
+						return Ok(Taken { key: *key, entry: None });
+					}
+					None => return Err(ApiError::not_found(key.to_string())),
+				},
 				Some(e) if e.spec().origin == Origin::Static => {
 					return Err(ApiError::static_rule(format!("{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes")));
 				}
 				Some(e) if e.spec().ruleset.is_some() => {
 					return Err(crate::core::ruleset::owned(key, e.spec().ruleset.as_deref().unwrap_or_default()));
 				}
-				Some(_) => rules.remove(key).expect("checked above"),
+				Some(_) => match rules.remove(key) {
+					Some(entry) => entry,
+					None => return Err(ApiError::not_found(key.to_string())),
+				},
 			}
 		};
+		self.owners.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
 		entry.stop_accepting();
 		Ok(Taken { key: *key, entry: Some(entry) })
 	}
@@ -1481,10 +1700,10 @@ impl Registry {
 					self.insert_failed(spec, ApiError::unsupported(missing)).await;
 					continue;
 				}
+				// shown as failed (#327)
 				Err(e) => {
 					failed += 1;
-					error!(event = "rule.failed", rule = %format!("{}/{}:{}", req.protocol, req.listen_addr, req.listen_port),
-						error = %e.message, phase = "restore");
+					self.note_invalid(req, origin, &e, "restore").await;
 					continue;
 				}
 			};
@@ -1503,6 +1722,7 @@ impl Registry {
 			}
 		}
 		info!(event = "restore.done", started, failed, origin = ?origin);
+		self.warn_shared_files("restore").await;
 	}
 
 	/// Registers a rule that could not start; one whose targets could not be
@@ -1511,7 +1731,10 @@ impl Registry {
 		let generation = self.generation();
 		let key = spec.key;
 		let retry = (e.code == "resolve_failed").then(|| tokio::spawn(retry_start(Arc::downgrade(self), spec.clone(), generation)));
-		self.rules.lock().await.insert(key, Entry::Failed(Failed { generation, spec, error: e.message, code: e.code, retry }));
+		let mut rules = self.rules.lock().await;
+		// the key is this rule's now (#327)
+		self.forget_invalid(&key);
+		rules.insert(key, Entry::Failed(Failed { generation, spec, error: e.message, code: e.code, retry }));
 	}
 
 	/// The running rules' runtimes (a live upgrade reads and adds counters, #174).

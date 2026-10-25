@@ -218,6 +218,13 @@ pub struct Features {
 	/// settings' secrets, `allow_certs` tokens no file at all, and an OIDC client secret file
 	/// keeps to one use (`403 protected_file`, `403 file_not_allowed`, `409 secret_reuse`; #319)
 	pub protected_files: bool,
+	/// A token may not name a key or secret file a rule of another owner names (another
+	/// token's, a rule set's of another token, the settings file's) without `admin`
+	/// (`409 file_in_use`; #323)
+	pub file_owners: bool,
+	/// Rules restored from the database that do not validate are shown in `GET /rules` as
+	/// failed with the reason; `DELETE` removes them, `PATCH` fixes them (#327)
+	pub invalid_restored: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -283,6 +290,8 @@ impl Features {
 		route_source_ip: true,
 		proxy_protocol_in_udp: true,
 		protected_files: true,
+		file_owners: true,
+		invalid_restored: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -331,6 +340,8 @@ impl Features {
 		route_source_ip: true,
 		proxy_protocol_in_udp: true,
 		protected_files: true,
+		file_owners: true,
+		invalid_restored: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -455,7 +466,7 @@ impl V04Settings {
 }
 
 /// A rule as accepted from the API or the database.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuleRequest {
 	pub protocol: Protocol,
 	pub listen_addr: String,
@@ -1063,7 +1074,120 @@ pub struct RuleView {
 	pub acme: Vec<crate::acme::CertStatus>,
 }
 
+/// The body a PATCH (`UpdateRequest`) makes of a rule's body that did not validate
+/// (#327): each field the PATCH has replaces the body's, the backends (`remote_addr` /
+/// `targets`, `balance`, `health_check`) as a whole as in every PATCH. Nothing runs, so
+/// `source_ip`, `listen_freebind` and `listen_port_end` may change too.
+pub fn patched_request(mut body: RuleRequest, req: UpdateRequest) -> RuleRequest {
+	body.remote_addr = req.remote_addr;
+	body.remote_port = req.remote_port;
+	body.targets = req.targets;
+	body.balance = req.balance.unwrap_or_default();
+	body.health_check = req.health_check;
+	if req.connect_timeout.is_some() {
+		body.connect_timeout = req.connect_timeout;
+	}
+	if req.udp_idle_secs.is_some() {
+		body.udp_idle_secs = req.udp_idle_secs;
+	}
+	if let Some(s) = req.source_ip {
+		body.source_ip = s;
+	}
+	if let Some(f) = req.listen_freebind {
+		body.listen_freebind = f;
+	}
+	if req.listen_port_end.is_some() {
+		body.listen_port_end = req.listen_port_end;
+	}
+	if req.tls.is_some() {
+		body.tls = req.tls;
+		body.starttls = req.starttls;
+		body.starttls_required = req.starttls_required;
+	}
+	if let Some(list) = req.allow_from {
+		body.allow_from = list;
+	}
+	if let Some(pp) = req.proxy_protocol {
+		// `{}` removes it (as in a PATCH of a running rule: an empty one is none)
+		body.proxy_protocol = Some(pp);
+	}
+	if req.http.is_some() {
+		body.http = req.http;
+	}
+	if let Some(on) = req.crowdsec {
+		body.crowdsec = on;
+	}
+	if let Some(list) = req.extra_listen_addrs {
+		body.extra_listen_addrs = list;
+	}
+	if let Some(labels) = req.labels {
+		body.labels = labels;
+	}
+	if req.limits.is_some() {
+		body.limits = req.limits;
+	}
+	if req.bandwidth.is_some() {
+		body.bandwidth = req.bandwidth;
+	}
+	if req.geoip.is_some() {
+		body.geoip = req.geoip;
+	}
+	if req.outlier_detection.is_some() {
+		body.outlier_detection = req.outlier_detection;
+	}
+	body
+}
+
 impl RuleView {
+	/// A rule restored that did not validate (#327): failed with the reason, its body
+	/// as stored (what it leaves out at the defaults of a new rule).
+	pub fn invalid(req: &RuleRequest, key: Key, origin: Origin, error: String) -> Self {
+		RuleView {
+			protocol: key.protocol,
+			listen_addr: key.listen.ip().to_string(),
+			listen_port: key.listen.port(),
+			listen_port_end: req.listen_port_end,
+			extra_listen_addrs: req.extra_listen_addrs.clone(),
+			listen_freebind: req.listen_freebind,
+			remote_addr: req.remote_addr.clone(),
+			remote_port: req.remote_port,
+			targets: req.targets.clone(),
+			balance: (!req.targets.is_empty()).then_some(req.balance),
+			health_check: req.health_check.clone(),
+			connect_timeout: req.connect_timeout.clone(),
+			source_ip: req.source_ip.as_str(),
+			udp_idle_secs: req.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS),
+			tls: req.tls.clone().unwrap_or_default(),
+			starttls: req.starttls,
+			starttls_required: req.starttls != Some(StartTls::Smtp) || req.starttls_required.unwrap_or(true),
+			allow_from: req.allow_from.clone(),
+			proxy_protocol: req.proxy_protocol.clone(),
+			http: req.http.clone(),
+			crowdsec: req.crowdsec,
+			labels: req.labels.clone(),
+			limits: req.limits.clone(),
+			bandwidth: req.bandwidth.clone(),
+			geoip: req.geoip.clone(),
+			outlier_detection: req.outlier_detection.clone(),
+			origin,
+			ruleset: None,
+			conditions: vec![],
+			persisted: None,
+			created_by: None,
+			created_at: None,
+			state: State::Failed,
+			error: Some(error),
+			resolved: vec![],
+			connections: 0,
+			all_targets_down: false,
+			down_services: vec![],
+			stats: RuleStats::default(),
+			started_at: None,
+			cert_status: vec![],
+			acme: vec![],
+		}
+	}
+
 	pub fn new(spec: &RuleSpec, state: State, error: Option<String>, resolved: &[SocketAddr], connections: u64) -> Self {
 		RuleView {
 			protocol: spec.key.protocol,
@@ -1115,6 +1239,32 @@ impl RuleView {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// #327: a PATCH over a stored body that did not validate: the fields it has, the
+	/// targets as a whole, `{}` removing `proxy_protocol`.
+	#[test]
+	fn a_patch_over_a_stored_body() {
+		let mut body = req();
+		body.allow_from = vec!["not-an-address".into()];
+		body.udp_idle_secs = Some(0);
+		body.labels = serde_json::from_value(serde_json::json!({"team": "a"})).unwrap();
+		body.proxy_protocol = serde_json::from_value(serde_json::json!({"from": ["10.0.0.1"]})).unwrap();
+		let patch: UpdateRequest = serde_json::from_value(serde_json::json!({
+			"remote_addr": "10.0.0.2", "remote_port": 81, "allow_from": [], "proxy_protocol": {}, "source_ip": "proxy_v2"
+		}))
+		.unwrap();
+		let out = patched_request(body, patch);
+		assert_eq!((out.remote_addr.as_str(), out.remote_port), ("10.0.0.2", 81));
+		assert!(out.allow_from.is_empty());
+		assert_eq!(out.udp_idle_secs, Some(0), "left as stored");
+		assert_eq!(out.labels.len(), 1, "left as stored");
+		assert_eq!(out.source_ip, SourceIp::ProxyV2);
+		let caps = Caps { transparent: false, transparent_ipv6: false, max_range_ports: 100, features: Features::CURRENT };
+		assert!(out.clone().validate(&caps).unwrap_err().message.contains("udp_idle_secs"));
+		let fixed = patched_request(out, serde_json::from_value(serde_json::json!({"remote_addr": "10.0.0.2", "remote_port": 81, "udp_idle_secs": 30})).unwrap());
+		let spec = fixed.validate(&caps).unwrap();
+		assert!(spec.proxy_protocol.is_none(), "{{}} removed it");
+	}
 
 	fn req() -> RuleRequest {
 		RuleRequest {

@@ -302,6 +302,8 @@ pub fn conditions(view: &RuleView, cause: Option<(&'static str, bool)>) -> Vec<F
 	let error = view.error.clone().unwrap_or_default();
 	let accepted = match cause {
 		Some(("unsupported", _)) => Err(("Unsupported", error.clone())),
+		// a restored rule that does not validate (#327)
+		Some((crate::core::registry::INVALID, _)) => Err(("Invalid", error.clone())),
 		_ => Ok("Accepted"),
 	};
 	let mut programmed = found(
@@ -452,6 +454,11 @@ impl Rulesets {
 
 	fn get(&self, name: &str) -> Option<SetState> {
 		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+	}
+
+	/// The token that owns the set (#323).
+	pub(crate) fn owner(&self, name: &str) -> Option<String> {
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|s| s.owner.clone())
 	}
 
 	fn set(&self, name: &str, state: Option<SetState>) {
@@ -1000,6 +1007,7 @@ impl Registry {
 				Err(e) => error!(event = "restore.error", ruleset = %set.name, error = %e, "the stored rule set is not restored"),
 			}
 		}
+		self.warn_shared_files("restore").await;
 		restored
 	}
 

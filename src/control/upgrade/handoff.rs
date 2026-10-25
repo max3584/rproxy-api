@@ -162,6 +162,36 @@ pub struct State {
 	/// periodic check does not take the rows over them.
 	#[serde(default)]
 	pub persist_pending: crate::config::persist::Pending,
+	/// Rules restored from the database that did not validate (#327), with their
+	/// bodies as stored: restored (and validated) again, not in `rules`.
+	#[serde(default)]
+	pub invalid_rules: Vec<InvalidSnapshot>,
+	/// The tokens that created the rules made through the API (#323).
+	#[serde(default)]
+	pub owners: Vec<RuleOwner>,
+}
+
+/// A rule restored from the database that did not validate (#327), as handed over.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct InvalidSnapshot {
+	/// The body as stored.
+	pub rule: serde_json::Value,
+	/// `api` or `dynamic`.
+	pub origin: String,
+	#[serde(default)]
+	pub created_by: String,
+	#[serde(default)]
+	pub created_at: u64,
+	#[serde(default)]
+	pub persisted: bool,
+}
+
+/// The token that created a rule through the API (#323).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuleOwner {
+	pub protocol: crate::core::rule::Protocol,
+	pub listen: std::net::SocketAddr,
+	pub by: String,
 }
 
 /// A rule set (`PUT /rulesets/{name}`, #28) as handed over.
@@ -489,14 +519,33 @@ fn thaw(registry: &Registry) {
 
 /// The rules made through the API (and from the database) and the counters.
 async fn snapshot(registry: &Registry) -> State {
-	// the rules of rule sets go with their set
-	let rules = registry
-		.list()
-		.await
+	// the rules of rule sets go with their set; those that did not validate (#327) as stored
+	let invalid = registry.invalid_rules();
+	let views = registry.list().await;
+	let key_of = |v: &crate::core::rule::RuleView| {
+		crate::core::rule::parse_listen(&v.listen_addr, v.listen_port).ok().map(|listen| Key { protocol: v.protocol, listen })
+	};
+	let rules = views
 		.iter()
 		.filter(|v| v.origin != Origin::Static && v.ruleset.is_none())
+		.filter(|v| !key_of(v).is_some_and(|k| invalid.iter().any(|(i, _, _)| *i == k)))
 		.filter_map(request_value)
 		.collect();
+	let invalid_rules = invalid
+		.iter()
+		.filter_map(|(key, req, origin)| {
+			let view = views.iter().find(|v| key_of(v) == Some(*key));
+			Some(InvalidSnapshot {
+				rule: serde_json::to_value(req).ok()?,
+				origin: if *origin == Origin::Api { "api" } else { "dynamic" }.into(),
+				created_by: view.and_then(|v| v.created_by.clone()).unwrap_or_default(),
+				created_at: view.and_then(|v| v.created_at).unwrap_or(0),
+				persisted: view.and_then(|v| v.persisted).unwrap_or(false),
+			})
+		})
+		.collect();
+	let owners =
+		registry.owners().into_iter().map(|(k, by)| RuleOwner { protocol: k.protocol, listen: k.listen, by }).collect();
 	let mut rulesets = vec![];
 	for summary in registry.list_rulesets().await {
 		if let Ok(set) = registry.get_ruleset(&summary.name).await {
@@ -518,6 +567,8 @@ async fn snapshot(registry: &Registry) -> State {
 		counters,
 		rulesets,
 		persist_pending,
+		invalid_rules,
+		owners,
 	}
 }
 
@@ -733,6 +784,34 @@ impl State {
 		if !api.is_empty() {
 			registry.restore_as(api, Origin::Api).await;
 		}
+		// rules that did not validate (#327): validated again (this version may take them)
+		for inv in &self.invalid_rules {
+			let req = match serde_json::from_value::<RuleRequest>(inv.rule.clone()) {
+				Ok(r) => r,
+				Err(e) => {
+					warn!(event = "handoff.rule", error = %e, rule = %inv.rule, "a rule from the old process could not be read; dropped");
+					continue;
+				}
+			};
+			let origin = if inv.origin == "api" { Origin::Api } else { Origin::Dynamic };
+			if origin == Origin::Api {
+				if let (Some(store), Ok(listen)) = (registry.persist(), crate::core::rule::parse_listen(&req.listen_addr, req.listen_port)) {
+					store.adopt(
+						Key { protocol: req.protocol, listen },
+						crate::config::persist::Meta { created_by: inv.created_by.clone(), created_at: inv.created_at, persisted: inv.persisted },
+					);
+				}
+			}
+			registry.restore_as(vec![req], origin).await;
+		}
+		// who made the rules (#323), for the rules that came back
+		let present = registry.list().await;
+		for o in &self.owners {
+			let key = Key { protocol: o.protocol, listen: o.listen };
+			if present.iter().any(|v| v.protocol == key.protocol && crate::core::rule::parse_listen(&v.listen_addr, v.listen_port).ok() == Some(key.listen)) {
+				registry.set_owner(key, &o.by);
+			}
+		}
 		self.restore_rulesets(registry).await;
 		if let Some(store) = registry.persist() {
 			store.adopt_pending(self.persist_pending.clone());
@@ -767,6 +846,7 @@ impl State {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
 			}
 		}
+		registry.warn_shared_files("handoff").await;
 	}
 }
 

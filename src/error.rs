@@ -40,6 +40,11 @@ impl ApiError {
 		Self::new(StatusCode::CONFLICT, "secret_reuse", message)
 	}
 
+	/// A key or secret file another owner's rule names (#323).
+	pub fn file_in_use(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "file_in_use", message)
+	}
+
 	pub fn invalid(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::BAD_REQUEST, "invalid", message)
 	}
