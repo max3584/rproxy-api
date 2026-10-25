@@ -1407,6 +1407,26 @@ Description: web UI for rproxy-api
 
 Package: rproxy-ui
 Architecture: all
+Version: 0.4.10-1
+Priority: optional
+Section: web
+Maintainer: touka shiro / max3584 <max3584.work@gmail.com>
+Installed-Size: 36300
+Depends: nodejs (>= 22.19.0), passwd
+Suggests: rproxy-api
+Filename: pool/main/r/rproxy-ui/rproxy-ui_0.4.10-1_all.deb
+Size: 3389444
+MD5sum: 3ff6ab7eb0d291f1883894609cfb25ae
+SHA1: 337f4d2d7428b3215d5932199d716decf76aa20b
+SHA256: 86689d9d9e59f615c9e83daa69d1f1e2a25839f1885ce0200ff0efc8623b4eac
+SHA512: 6a2f157e41f79033f91ded93d347b49feae10ed314651be412db058c17ceb6293a419b59f9b722fda924eda75909719a41dadead343a352bcb0985cc503908de
+Homepage: https://github.com/max3584/TCP-UDP-rproxy-ui
+Description: web UI for rproxy-api
+ Dashboard and rule editor for rproxy-api, the L4 TCP/UDP forwarder managed
+ through an HTTP API. Sign-in with Keycloak; rules are stored in MariaDB.
+
+Package: rproxy-ui
+Architecture: all
 Version: 0.4.2-1
 Priority: optional
 Section: web
