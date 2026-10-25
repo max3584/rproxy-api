@@ -3,7 +3,7 @@
 //! must all succeed byte for byte, the process must stay up with its control
 //! API answering and its rules running, and once the hostile load stops the
 //! open descriptors, connections and threads must come back to where they
-//! were, and the memory must not keep growing from one round to the next.
+//! were, and the memory must stop growing from one round to the next.
 //!
 //! One test per kind of input rproxy parses: plain TCP, TLS (`sni`,
 //! `terminate`, `terminate` with a passthrough route), `http` rules, STARTTLS
@@ -14,7 +14,8 @@
 //! The hostile input is random but repeatable: each test prints its seed, and
 //! `RPROXY_TEST_HOSTILE_SEED` replays it (the interleaving of the concurrent
 //! clients still varies). Each round lasts `RPROXY_TEST_HOSTILE_SECS` seconds
-//! (default 2; two rounds per test); set it higher for longer manual runs.
+//! (default 2; two rounds per test, up to six while the memory still grows); set it
+//! higher for longer manual runs.
 
 #![cfg(target_os = "linux")]
 
@@ -51,7 +52,12 @@ fn round_secs() -> f64 {
 	std::env::var("RPROXY_TEST_HOSTILE_SECS").ok().and_then(|v| v.parse().ok()).filter(|s: &f64| *s > 0.0).unwrap_or(2.0)
 }
 
+/// Rounds of hostile load at least, and at most while the memory still grows (#328).
 const ROUNDS: usize = 2;
+const MAX_ROUNDS: usize = 6;
+/// What the memory after a round may grow over the round before and count as stopped:
+/// `MEMORY_STEP_KIB`, or a sixteenth of it.
+const MEMORY_STEP_KIB: u64 = 8 * 1024;
 const HOSTILE_WORKERS: usize = 16;
 const LEGIT_WORKERS: usize = 2;
 /// Open descriptors allowed above the baseline once the load is gone.
@@ -291,6 +297,14 @@ impl Drop for Server {
 /// Warms up with `legit`, then runs `ROUNDS` rounds of the hostile jobs (picked
 /// at random by `HOSTILE_WORKERS` workers) alongside `LEGIT_WORKERS` legitimate
 /// clients, and checks the process and its resources after each round.
+///
+/// The memory (RSS) after a round is not what is in use then but what the allocator
+/// kept from the round's peak, and the peak depends on how much CPU the round got:
+/// with the whole suite running alongside, a starved first round could stay well below
+/// the next one, which then looked like a leak (#328). The RSS climbs over the first
+/// rounds to where the peaks no longer add to it (the per-thread arenas, fragmentation)
+/// and stays there; a leak grows with every round. So rounds go on, up to `MAX_ROUNDS`,
+/// until one adds less than `MEMORY_STEP_KIB` (or a sixteenth) to the one before.
 async fn exercise(s: &Server, case: &str, legit: Job, hostile: Vec<(&'static str, Job)>) {
 	let mut rng = Rng(seed(case));
 	for _ in 0..4 {
@@ -307,8 +321,8 @@ async fn exercise(s: &Server, case: &str, legit: Job, hostile: Vec<(&'static str
 		return;
 	}
 	let hostile = Arc::new(hostile);
-	let mut after = vec![];
-	for round in 1..=ROUNDS {
+	let mut after: Vec<Usage> = vec![];
+	for round in 1..=MAX_ROUNDS {
 		let stop = Arc::new(AtomicBool::new(false));
 		let counts: Arc<Vec<AtomicU64>> = Arc::new(hostile.iter().map(|_| AtomicU64::new(0)).collect());
 		let failures: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -359,18 +373,26 @@ async fn exercise(s: &Server, case: &str, legit: Job, hostile: Vec<(&'static str
 		assert!(good > 0, "{case} round {round}: no legitimate exchange finished");
 		let now = s.settle(case, Some(base)).await;
 		eprintln!("hostile {case} round {round}: {now:?} (baseline {base:?})");
+		let before = after.last().map(|u| u.rss_kib);
 		after.push(now);
+		let Some(before) = before.filter(|_| round >= ROUNDS) else { continue };
+		let step = MEMORY_STEP_KIB.max(before / 16);
+		if now.rss_kib <= before + step {
+			break;
+		}
+		let rss: Vec<u64> = after.iter().map(|u| u.rss_kib).collect();
+		assert!(
+			round < MAX_ROUNDS,
+			"{case}: memory keeps growing: {rss:?} KiB after each round (baseline {} KiB), each more than {step} KiB over the last",
+			base.rss_kib
+		);
+		eprintln!("hostile {case}: the memory still grows ({rss:?} KiB), one more round");
 	}
 	// still serves, and the memory of the last round is not much above the first
 	for _ in 0..4 {
 		legit(rng.fork()).await.unwrap_or_else(|e| panic!("{case}: after the hostile load: {e}\n{}", s.log()));
 	}
-	let (first, last) = (after[0].rss_kib, after[ROUNDS - 1].rss_kib);
-	assert!(
-		last <= first + (first / 2).max(32 * 1024),
-		"{case}: memory keeps growing: {first} KiB after the first round, {last} KiB after the last (baseline {} KiB)",
-		base.rss_kib
-	);
+	let last = after[after.len() - 1].rss_kib;
 	assert!(last <= base.rss_kib + 256 * 1024, "{case}: memory did not come back: {last} KiB (baseline {} KiB)", base.rss_kib);
 	s.check_log(case);
 }
