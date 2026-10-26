@@ -113,6 +113,9 @@ struct Options {
 	/// Largest port range (listen_port..listen_port_end) one rule may open
 	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::core::rule::DEFAULT_MAX_RANGE_PORTS)]
 	max_range_ports: u16,
+	/// Sessions one udp rule may have when its `limits` set no `max_connections` (0: no limit)
+	#[arg(long, env = "RPROXY_UDP_MAX_SESSIONS", default_value_t = rproxy_api::l4::udp::DEFAULT_MAX_SESSIONS)]
+	udp_max_sessions: u64,
 	/// Seconds between attempts to open a control API listener that could not start
 	#[arg(long, env = "RPROXY_API_RETRY_SECS", default_value_t = 10, hide = true)]
 	api_retry_secs: u64,
@@ -953,6 +956,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
+	rproxy_api::l4::udp::set_max_sessions(opts.udp_max_sessions);
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_secs(opts.dns_interval.max(1)),
 		lookup: resolve::system_lookup(),
@@ -971,7 +975,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	}
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
-		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, nofile_limit = nofile.unwrap_or(0));
+		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
+		nofile_limit = nofile.unwrap_or(0));
 
 	// #144: rules of persist: true tokens, in rproxy_rules
 	if rproxy_api::core::rule::Features::CURRENT.persistence {

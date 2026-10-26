@@ -235,7 +235,8 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
 - 読めるもの：
   - DTLS 1.2 / 1.3 の ClientHello（平文。断片に分かれていても、データグラムをまたいでもつなぎ合わせる）
   - QUIC v1（RFC 9000 / 9001）/ v2（RFC 9369）の Initial パケット（HTTP/3 など）。Initial の鍵はクライアントが選んだ接続 ID から誰でも計算できる（RFC 9001 §5.2）ので、ヘッダの保護と暗号を外して CRYPTO フレームから ClientHello を読む。ClientHello が複数の Initial にまたがっても（大きな鍵共有など）つなぎ合わせる
-- 新しいクライアント（アドレスとポート）の最初のデータグラムを、名前が分かるまで持つ（最大 3 秒・16 データグラム・64 KiB）。名前が分かったら、持っていたデータグラムを順番どおり転送先へ送り、あとは今までの UDP と同じくそのクライアントのセッションとして中継する。名前を読んでいるセッションは 1 ポートあたり 4096 まで（超えた新しいクライアントの最初のデータグラムは捨てる。クライアントが再送する）
+- 新しいクライアント（アドレスとポート）の最初のデータグラムを、名前が分かるまで持つ（最大 3 秒・16 データグラム・64 KiB）。名前が分かったら、持っていたデータグラムを順番どおり転送先へ送り、あとは今までの UDP と同じくそのクライアントのセッションとして中継する。名前が 1 つのデータグラムで分からず続きを待つセッションは 1 ポートあたり 4096 まで、そのうち 1 つの送信元のプレフィックス（IPv4 は /24、IPv6 は /48）が持てるのは 64 まで（#332。送信元は偽れるので、1 つの網からの洪水がほかの網のクライアントの枠を取らないように）。超えたらその網のいちばん古いものを、4096 がすべて埋まったら全体のいちばん古いものをあきらめて（そのセッションは終わり、持っていたデータグラムは捨てる。クライアントが再送する）新しいものに渡す。新しいセッションは断らないので、洪水を受けている網のクライアントも、次のデータグラムが届くまでにその網から 64 の新しいセッションが来なければ通る。どれも `stats.dropped` に数える。1 つのデータグラムで名前が分かる ClientHello（ふつうの場合）は枠を使わない
+- つなぎ合わせる断片にも上限がある（#332）：1 つのセッションで ClientHello の断片（DTLS の断片・QUIC の CRYPTO フレーム。空のもの・同じものの再送も数える）は 512 まで、すき間の後の飛び飛びの部分は 1 つのメッセージで 128 まで、確保するメモリは DTLS の 1 セッションで 64 KiB まで（ClientHello は 32 KiB まで）。超えたら名前のないもの（下の `unmatched`）として扱う。持つのは受け取ったバイトだけで、断片が書く位置の分のメモリは取らない。断片が重なって中身が違うときは、先に届いたバイトを使う
 - DTLS でも QUIC でもないデータグラム、SNI がないもの、どの route にも一致しない名前：`unmatched: default`（既定）ならルールの宛先（`remote_addr` / `targets`）、`reject` なら捨てる（`stats.denied`、`conn.denied` の `reason: unmatched`）
 - 同じクライアントのソケットから、別の名前への新しい QUIC の接続（違う接続 ID の Initial）が来たら、名前を読み直し、違う名前ならセッションを作り直す（quinn などは 1 つのソケットから次の接続を始める）。同じ名前（Retry の後など）なら今の転送先のまま
 - `allow_from`・ルールの `crowdsec` は名前を読む前に効く。`conn.open` のログに `sni`
@@ -802,8 +803,8 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 `features.limits`・`features.bandwidth` は true（形は上の表と docs/DESIGN-v0.4.md の 4・5）。
 
-- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
-- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールだけ。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
+- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ。udp のルールで `max_connections` がなければ、既定の上限 `RPROXY_UDP_MAX_SESSIONS`（既定 16384、0 でなし。#332）が効く：偽った送信元でも 1 つずつ転送先へのソケットを持つセッションを `udp_idle_secs` まで作れるので。名前を読んでいるセッションも数え、断ったものは `max_connections` と同じく数えて記録する）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
+- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールと、UDP のセッションの既定の上限で断ったことのあるルール。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
 - 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら、接続の残っていない古いものから忘れる。接続の残っている送信元は忘れない（数え直しで制限をすり抜けられないように。セキュリティレビュー L8）。表がそういう送信元でいっぱいのあいだ、新しい送信元は `limits` では断り（`reason: source_connections`）、`bandwidth` では 1 つの共有のバケツを使う）。`max_sources` は 1,000,000 まで。
 - `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
 - `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3 は絞らない。
@@ -990,6 +991,7 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 ```
 
 - `from`・`required` の意味は TCP と同じ。違うのは、ヘッダが接続の最初に 1 回ではなく、`from` の前段からのデータグラムの 1 つ 1 つの前に付くこと（rproxy 自身の `source_ip: proxy_v2` が送る形）。
+- **`from` は外から偽れない網にいる前段だけにする**（#332）。UDP には接続（TCP のハンドシェイク）がないので、rproxy は前段をデータグラムの送信元の IP だけで信じる。`from` のアドレスを名乗ったデータグラムを外から届けられる網（送信元の偽装を止めていない網、インターネットに面したアドレス）では、だれでも好きなクライアントを名乗れる（`allow_from`・`geoip`・`crowdsec`・`limits`・ログ・転送先への `source_ip` がそのアドレスになる）。前段と rproxy の間は、外からのそのアドレスのパケットを捨てる私的な網（同じ L2・VPC の中、境界で送信元の検査（BCP 38）をする網）にする。
 - 受け付けるのは v2 の DGRAM（UDP over IPv4 / IPv6）だけ。v1（UDP の形がない）、STREAM（TCP）のヘッダ、壊れたヘッダ、データグラムの中で終わらないヘッダは捨てる。大きさの上限は TCP と同じ（固定の 16 バイトの後が 4096 バイトまで）。v2 の `LOCAL`・`AF_UNSPEC` は前段のアドレスのまま。TLV は読み飛ばす。
 - `required: true`（既定）なら、`from` からのヘッダのないデータグラムは捨てる。`from` の外からヘッダ（v2 の署名か `PROXY `）で始まるデータグラムも捨てる。捨てた数は `stats.denied`、ログは `conn.denied`（`warn`、`reason: proxy_protocol` / `proxy_protocol_untrusted`、`client` は前段）。ログは送信元ごとに間引く（ほかの UDP の拒否と同じ。省いた数は次の行の `suppressed`）。
 - セッションは（前段のアドレス・ポート, ヘッダのクライアント）ごと（ワイルドカードの待ち受けでは受けたアドレスごとにも分かれる）。返事は、データグラムが来た前段のアドレス・ポートへ、ヘッダを付けずに返す（外側の rproxy はセッションごとのソケットで受けて、クライアントへ返す）。同じ前段のポートからのヘッダが別のクライアントを書いてきたら、別のセッションになる（前のセッションは `udp_idle_secs` で終わる）。

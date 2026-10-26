@@ -464,6 +464,11 @@ impl Limiter {
 			.unwrap_or(false)
 	}
 
+	/// The rule's own cap of connections / sessions.
+	pub fn max_connections(&self) -> Option<u64> {
+		self.max_connections
+	}
+
 	/// Connections / sessions counted now.
 	pub fn active(&self) -> u64 {
 		self.counts.active.load(Ordering::Relaxed)

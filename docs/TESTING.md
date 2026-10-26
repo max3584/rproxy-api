@@ -398,7 +398,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 
 ## 結合テスト：壊れたもの・攻撃的なものを流す（`tests/hostile.rs`）
 
-本物のバイナリを自分のプロセスグループで起動し、不正な入力を送る 16 本と正規のクライアント 2 本を同時に動かす（1 回 `RPROXY_TEST_HOSTILE_SECS` 秒、既定 2。2 回繰り返す）。乱数のシードを表示し、`RPROXY_TEST_HOSTILE_SEED` で同じ入力を再現でき、`RPROXY_TEST_HOSTILE_ONLY=名前,…` で入力の種類を絞れる。毎回確かめること：正規のやり取りがバイト単位で一致する、プロセスが生きていて `GET /rules` が答えすべてのルールが running、負荷を止めた後に接続数が 0 に戻り `/proc/<pid>/fd` の数とスレッドの数が基準から余裕の範囲に戻る、RSS が回を重ねても増え続けない、ログに panicked・fatal・`rule.failed` がない。長く回すときは CI の Repeat ワークフローで（上の「CI の実行環境」）。
+本物のバイナリを自分のプロセスグループで起動し、不正な入力を送る 16 本と正規のクライアント 2 本を同時に動かす（1 回 `RPROXY_TEST_HOSTILE_SECS` 秒、既定 2。2 回、メモリがまだ増えていれば 6 回まで繰り返す）。乱数のシードを表示し、`RPROXY_TEST_HOSTILE_SEED` で同じ入力を再現でき、`RPROXY_TEST_HOSTILE_ONLY=名前,…` で入力の種類を絞れる。毎回確かめること：正規のやり取りがバイト単位で一致する、プロセスが生きていて `GET /rules` が答えすべてのルールが running、負荷を止めた後に接続数が 0 に戻り `/proc/<pid>/fd` の数とスレッドの数が基準から余裕の範囲に戻る、RSS が回を重ねても増え続けない（回の後の RSS はそのときに使っている量ではなく、その回の山の分をアロケータが持っているもので、山はその回が使えた CPU で変わる。全部の試験を並べて動かすと 1 回目が CPU を取れずに低く、2 回目との差がリークに見えた（#328）。最初の数回で山がもう足さない所まで上がって止まるので、前の回より 8 MiB（か 16 分の 1）以上増えた回が 6 回目まで続いたら失敗）、ログに panicked・fatal・`rule.failed` がない。長く回すときは CI の Repeat ワークフローで（上の「CI の実行環境」）。
 
 | テスト | 流すもの |
 |---|---|
@@ -514,7 +514,8 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |
-| `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先 |
+| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
+| `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先。名前の続きを待つセッションの枠が送信元のプレフィックスごとに限られる（#332） |
 | `tests/http.rs` | `http` のルールの L7 のルーティング |
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |
 | `tests/http_auth.rs` | 認証のミドルウェア（#59）：`basic_auth`・`forward_auth`・`oidc`。OIDC の client secret のファイルの使い回しは `409 secret_reuse`（#319、`oidc_client_secrets_keep_to_one_use`。`/proc/self/environ`・`/proc/self/fd/N` は `403 protected_file`、誤りの文にほかのルールのことは出ない） |

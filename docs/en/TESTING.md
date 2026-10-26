@@ -398,7 +398,7 @@ An HTTPS mirror (a small server in the test; binaries are answered with a redire
 
 ## Integration tests: hostile traffic (`tests/hostile.rs`)
 
-Runs the real binary in its own process group with 16 hostile senders and 2 legitimate clients at once (`RPROXY_TEST_HOSTILE_SECS` seconds per round, default 2; two rounds). The random seed is printed; `RPROXY_TEST_HOSTILE_SEED` repeats the same input and `RPROXY_TEST_HOSTILE_ONLY=name,...` narrows the kinds of input. Each round checks: legitimate exchanges match byte for byte; the process is alive, `GET /rules` answers and every rule is running; after the load stops, connections go back to 0 and the `/proc/<pid>/fd` and thread counts return to the baseline within a margin; RSS does not keep growing from round to round; no panicked, fatal or `rule.failed` in the log. Run it longer in CI's Repeat workflow ("CI environment" above).
+Runs the real binary in its own process group with 16 hostile senders and 2 legitimate clients at once (`RPROXY_TEST_HOSTILE_SECS` seconds per round, default 2; two rounds, up to six while the memory still grows). The random seed is printed; `RPROXY_TEST_HOSTILE_SEED` repeats the same input and `RPROXY_TEST_HOSTILE_ONLY=name,...` narrows the kinds of input. Each round checks: legitimate exchanges match byte for byte; the process is alive, `GET /rules` answers and every rule is running; after the load stops, connections go back to 0 and the `/proc/<pid>/fd` and thread counts return to the baseline within a margin; RSS stops growing from round to round (the RSS after a round is not what is in use then but what the allocator kept from the round's peak, and the peak depends on the CPU the round got: with the whole suite alongside, a starved first round stayed low and the second looked like a leak, #328. It climbs over the first rounds to where the peaks add nothing and stays there, so the test fails only if each round up to the sixth adds more than 8 MiB, or a sixteenth, to the one before); no panicked, fatal or `rule.failed` in the log. Run it longer in CI's Repeat workflow ("CI environment" above).
 
 | Test | What it sends |
 |---|---|
@@ -514,7 +514,8 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99); listening on addresses not on the host yet (`listen_freebind`, v0.4.3; the real path is `scripts/test-freebind.sh`) |
 | `tests/udp_shards.rs` | Reading a UDP port with several `SO_REUSEPORT` sockets (#194): no session opened twice, the reply source (#137), counters add up |
 | `tests/udp_source.rs` | UDP replies on wildcard listeners leave from the address the client sent to (#137; to 127.0.0.2) |
-| `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends |
+| `tests/udp_sessions.rs` | The default cap of a udp rule's sessions (#332, `RPROXY_UDP_MAX_SESSIONS`): new sessions beyond it refused, taken again once idle ones end, a rule's `limits.max_connections` first, 0 for none (the cap is process-wide, so only this file's one test changes it) |
+| `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends; the slots of sessions waiting for the rest of their name are bounded per source prefix (#332) |
 | `tests/http.rs` | L7 routing of `http` rules |
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |
 | `tests/http_auth.rs` | Authentication middlewares (#59): `basic_auth`, `forward_auth`, `oidc`. Reusing an OIDC client secret file is `409 secret_reuse` (#319, `oidc_client_secrets_keep_to_one_use`; `/proc/self/environ` and `/proc/self/fd/N` are `403 protected_file`; the message tells nothing of other rules) |

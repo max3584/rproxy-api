@@ -92,6 +92,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
+| `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | udp のルールのセッションの既定の上限（ルールの `limits.max_connections` があればそちら。`0` でなし。#332：偽った送信元でセッションと転送先へのソケットを増やせないように）。超えた新しいセッションのデータグラムは捨て、`stats.limited`・`conn.limited`（`reason: max_connections`）。多くのクライアントを受けるルールは `limits.max_connections` を付けるか、これを上げる（ファイルの数の上限 `LimitNOFILE` も） |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 
 v0.4 で足した項目（どれも動く。ルールに付ける設定と `global` の項目は docs/API.md の「v0.4 の設定」。制御 API の守りは「制御 API の守り」、再起動なしの更新・自動更新は docs/UPGRADE.md）：

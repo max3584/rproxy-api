@@ -2140,7 +2140,7 @@ impl Registry {
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
 			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
 			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, sending failed, or over bandwidth).", vec![]),
-			("rproxy_rule_limited_total", "counter", "Connections (TCP) or datagrams (UDP) refused by the rule's limits, by reason.", vec![]),
+			("rproxy_rule_limited_total", "counter", "Connections (TCP) or datagrams (UDP) refused by the rule's limits (or, UDP, the default cap of sessions), by reason.", vec![]),
 			("rproxy_rule_bandwidth_dropped_total", "counter", "UDP datagrams dropped over the rule's bandwidth.", vec![]),
 		];
 		for (key, entry) in rules.iter() {

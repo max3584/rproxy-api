@@ -1763,7 +1763,14 @@ mod tests {
 	}
 
 	fn free_port() -> u16 {
-		std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+		free_ports::<1>()[0]
+	}
+
+	/// `N` different free ports: the listeners are held until all are picked, or the kernel may hand out the
+	/// same port twice (a test then failed with `409 already_exists` on its own second rule).
+	fn free_ports<const N: usize>() -> [u16; N] {
+		let held: Vec<std::net::TcpListener> = (0..N).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+		std::array::from_fn(|i| held[i].local_addr().unwrap().port())
 	}
 
 	fn local(port: u16, remote_port: u16) -> RuleRequest {
@@ -1792,7 +1799,7 @@ mod tests {
 	async fn reconcile_leaves_rules_whose_row_is_not_up_to_date() {
 		let store = Arc::new(Store::memory("n1"));
 		let registry = registry(&store);
-		let (gone, stale, removed) = (free_port(), free_port(), free_port());
+		let [gone, stale, removed] = free_ports();
 		// what the old process ran: `gone` has no row, `stale` an older one; `removed` was deleted, its row stayed
 		for port in [gone, stale] {
 			registry.create_as(local(port, 81), Origin::Api).await.unwrap();
@@ -1834,7 +1841,7 @@ mod tests {
 		let store = Arc::new(Store::memory("n1"));
 		let registry = registry(&store);
 		store.fail_writes(true);
-		let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+		let ports = free_ports::<3>();
 		for &port in &ports {
 			registry.create_as(local(port, 81), Origin::Api).await.unwrap();
 			assert!(!store.save(&registry, &key(port), "ci").await);

@@ -1,5 +1,6 @@
 //! CPU-only benchmarks (no sockets): the `match` expressions of L7 routes, the
-//! TLS ClientHello walk of `sni` rules, the QUIC Initial of UDP `sni` rules, the
+//! TLS ClientHello walk of `sni` rules, the QUIC Initial and the DTLS ClientHello
+//! (whole, and in fragments, #332) of UDP `sni` rules, the
 //! PROXY v2 header in front of each datagram of a UDP rule with `proxy_protocol`, and
 //! the normalisation of request paths before routing (#320).
 //! Run with `cargo bench --bench parse`; CI compares a PR with its merge base
@@ -123,6 +124,72 @@ fn quic(c: &mut Criterion) {
 	g.finish();
 }
 
+/// DTLS records carrying the ClientHello rustls makes for `name` (as DTLS 1.2: an empty cookie after the session id),
+/// cut into fragments at `cuts`, one record each.
+fn dtls_hello(name: &str, alpn: &[&str], cuts: &[usize]) -> Vec<Vec<u8>> {
+	let tls = client_hello(name, alpn);
+	let mut hs = vec![];
+	let mut p = &tls[..];
+	while p.len() >= 5 {
+		let len = u16::from_be_bytes([p[3], p[4]]) as usize;
+		hs.extend_from_slice(&p[5..5 + len]);
+		p = &p[5 + len..];
+	}
+	let tls_body = &hs[4..];
+	let sid = usize::from(tls_body[34]);
+	let body = [&[0xfe, 0xfd][..], &tls_body[2..35 + sid], &[0], &tls_body[35 + sid..]].concat();
+	let mut bounds = vec![0];
+	bounds.extend_from_slice(cuts);
+	bounds.push(body.len());
+	bounds
+		.windows(2)
+		.enumerate()
+		.map(|(i, w)| {
+			let frag = &body[w[0]..w[1]];
+			let mut h = vec![1];
+			h.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+			h.extend_from_slice(&[0, 0]);
+			h.extend_from_slice(&(w[0] as u32).to_be_bytes()[1..]);
+			h.extend_from_slice(&(frag.len() as u32).to_be_bytes()[1..]);
+			h.extend_from_slice(frag);
+			let mut rec = vec![22, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, i as u8];
+			rec.extend_from_slice(&(h.len() as u16).to_be_bytes());
+			rec.extend_from_slice(&h);
+			rec
+		})
+		.collect()
+}
+
+/// The DTLS ClientHello of a UDP `sni` rule (#130): whole in one datagram, and in 8
+/// fragments, one datagram each, in order and in reverse order (the reassembly, #332).
+fn dtls(c: &mut Criterion) {
+	let mut g = c.benchmark_group("dtls_hello");
+	let alpn: Vec<String> = (0..6).map(|i| format!("{i:02}-{}", "x".repeat(150))).collect();
+	let alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
+	let whole = dtls_hello("www.example.com", &alpn, &[]).remove(0);
+	assert_eq!(Sniffer::default().push(&whole), Sniff::Done(Some("www.example.com".into())));
+	g.throughput(Throughput::Bytes(whole.len() as u64));
+	g.bench_function("one_datagram", |b| b.iter_batched(Sniffer::default, |mut s| s.push(black_box(&whole)), BatchSize::SmallInput));
+	let len = whole.len() - 25;
+	let cuts: Vec<usize> = (1..8).map(|i| len * i / 8).collect();
+	let mut parts = dtls_hello("www.example.com", &alpn, &cuts);
+	g.bench_function("fragments_8", |b| {
+		b.iter_batched(Sniffer::default, |mut s| parts.iter().map(|p| s.push(black_box(p))).last(), BatchSize::SmallInput)
+	});
+	parts.reverse();
+	let mut s = Sniffer::default();
+	let got: Vec<Sniff> = parts.iter().map(|p| s.push(p)).collect();
+	assert_eq!(got.last(), Some(&Sniff::Done(Some("www.example.com".into()))));
+	g.bench_function("fragments_8_reversed", |b| {
+		b.iter_batched(
+			Sniffer::default,
+			|mut s| parts.iter().map(|p| s.push(black_box(p))).last(),
+			BatchSize::SmallInput,
+		)
+	});
+	g.finish();
+}
+
 /// `proxy_protocol` of a udp rule (#312): what `l4::udp::serve` does for each datagram
 /// from a front end before the usual checks: is the peer in `from`, read the v2 DGRAM
 /// header, and the offset of the payload (nothing is copied or allocated).
@@ -155,6 +222,6 @@ fn config() -> Criterion {
 criterion_group! {
 	name = benches;
 	config = config();
-	targets = matcher, path_normalize, clienthello, quic, proxy_dgram
+	targets = matcher, path_normalize, clienthello, quic, dtls, proxy_dgram
 }
 criterion_main!(benches);

@@ -93,6 +93,24 @@ def quic_input(v2, dcid, packets):
     return out
 
 
+def dtls_fragment(seq, total, offset, body):
+    frag = bytes([1]) + total.to_bytes(3, "big") + seq.to_bytes(2, "big")
+    frag += offset.to_bytes(3, "big") + len(body).to_bytes(3, "big") + body
+    return bytes([22]) + b"\xfe\xfd" + b"\x00" * 8 + len(frag).to_bytes(2, "big") + frag
+
+
+def udp_sni_reassembly(recs):
+    """udp_sni seeds of the reassembly (#332): floods of fragments and fragments sent again."""
+    # empty fragments of a 32 KiB ClientHello at far offsets, one 64 KiB datagram
+    flood = b"".join(dtls_fragment(0, 32768, 32767 - i, b"") for i in range(2600))
+    put("udp_sni", "dtls-empty-fragment-flood", framed([flood]))
+    # one-byte runs with gaps, each message_seq
+    runs = b"".join(dtls_fragment(i % 4, 32768, 2 + 2 * i, b"\xaa") for i in range(80))
+    put("udp_sni", "dtls-gapped-runs", framed([runs]))
+    # the fragments of a real ClientHello sent twice, overlapping, the last first
+    put("udp_sni", "dtls-fragments-again", framed([recs[2], recs[1], recs[2], recs[0] + recs[1]]))
+
+
 def main():
     shutil.rmtree(SEEDS, ignore_errors=True)
 
@@ -113,6 +131,7 @@ def main():
     put("udp_sni", "dtls-one-record", framed([b"".join(dtls_hello("dtls.example"))]))
     recs = dtls_hello("frag.example", cookie=b"\x01" * 20, cuts=(50, 120))
     put("udp_sni", "dtls-fragments-reordered", framed([recs[2], recs[0], recs[1]]))
+    udp_sni_reassembly(recs)
 
     # quic_initial: CRYPTO frames carrying a ClientHello, whole or split
     hello = handshake(client_hello("quic.example", ["h3"]))

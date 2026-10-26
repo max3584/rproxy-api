@@ -124,4 +124,5 @@ target 10.0.0.43:443 (set up to receive PROXY v2)
 - The inner rule's replies go back to the outer rule's socket without a header, and the outer rule answers the client.
 - With `transparent` on the inner rule, it sends to the target as the header's client (for targets without PROXY protocol).
 - An inner rule with `tls.mode: sni` (QUIC, DTLS) reads the server name after stripping the header.
+- **Put in `from` only front ends on a network where their addresses cannot be spoofed from outside** (#332). UDP has no connection, so a front end is trusted by the source IP of a datagram alone; where datagrams claiming an address in `from` can arrive from outside, anyone can claim any client. Keep the path between the front end and rproxy on a private network that drops such packets from outside (the same L2 or VPC, a network that filters source addresses at its edge).
 - Only v2 DGRAM headers are accepted (datagrams with v1 or TCP-form headers are dropped). HTTP/3 of `http` rules and the DPDK path are not covered. The details are in "`udp` rules" in [API.md](API.md).
