@@ -225,12 +225,21 @@ fn rule_file_error_as(what: &str, path: &str, detail: &str, detailed: bool) -> S
 	)
 }
 
+/// A file a rule names loaded (#333): a later failure of it is logged again.
+pub fn rule_file_ok(path: &str) {
+	let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+	if let Some(i) = logged.iter().position(|(p, _)| p == path) {
+		logged.remove(i);
+	}
+}
+
+static LOGGED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
 /// Whether `path` fails with a reason not logged yet: `config.file` is logged once per file
 /// and reason, not on every retry (the certificate store looks again every
 /// `RPROXY_CERT_CHECK_SECS`). At most `LOGGED_MAX` files are remembered.
 fn newly_failing(path: &str, detail: &str) -> bool {
 	const LOGGED_MAX: usize = 1024;
-	static LOGGED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 	let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
 	match logged.iter_mut().find(|(p, _)| p == path) {
 		Some((_, d)) if d == detail => false,
@@ -369,6 +378,10 @@ mod tests {
 		assert!(!newly_failing("/srv/once", "mode 644"));
 		assert!(newly_failing("/srv/once", "missing"));
 		assert!(newly_failing("/srv/other", "missing"));
+		// fixed, then broken again the same way: logged again
+		rule_file_ok("/srv/once");
+		assert!(newly_failing("/srv/once", "missing"));
+		assert!(!newly_failing("/srv/other", "missing"), "only the file that loaded is forgotten");
 		let full = rule_file_error_as("middleware a: users_file", "/srv/users", detail, true);
 		assert_eq!(full, format!("middleware a: users_file: {detail}"));
 	}

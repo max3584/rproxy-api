@@ -271,6 +271,7 @@ async fn grpc_ext_authz() {
 		let names: Vec<&str> = check.headers.iter().map(|(k, _)| k.as_str()).collect();
 		if path.starts_with("/a") {
 			assert!(names.contains(&"x-other"), "all headers by default: {names:?}");
+			assert!(check.headers.contains(&("content-length".to_string(), "7".to_string())), "as Envoy: {names:?}");
 			assert!(check.body.is_empty());
 		} else {
 			assert!(!names.contains(&"x-other") && names.contains(&"authorization"), "{names:?}");

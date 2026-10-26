@@ -61,7 +61,11 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 		let unusable =
 			|e: &dyn std::fmt::Display| ApiError::invalid(crate::net::files::rule_file_error(what, shown, &format!("{shown}: {e}")));
 		let value = match crate::net::files::read_to_string(&path, crate::net::files::Kind::Secret) {
-			Ok(text) => Some(Arc::new(parse(&text).map_err(|e| unusable(&e))?)),
+			Ok(text) => {
+				let value = parse(&text).map_err(|e| unusable(&e))?;
+				crate::net::files::rule_file_ok(shown);
+				Some(Arc::new(value))
+			}
 			// a file rproxy may not use (owner, mode) is a mistake of the settings, not of the environment
 			Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) || crate::net::files::is_refused(&e) => {
 				return Err(unusable(&e));
@@ -183,6 +187,20 @@ pub enum Hash {
 /// `user:hash` lines: bcrypt, APR1 and {SHA} (what htpasswd writes, as in
 /// Traefik). Other schemes (crypt, plain text) are refused so that a file never
 /// silently lets nobody in.
+/// The users of an htpasswd file, and the hash an unknown name is checked against.
+#[derive(Debug)]
+pub struct Users {
+	pub map: HashMap<String, Hash>,
+	/// The file's most expensive hash (#333), found once per loaded file.
+	pub decoy: Option<Hash>,
+}
+
+pub fn parse_users(text: &str) -> Result<Users, String> {
+	let map = parse_htpasswd(text)?;
+	let decoy = map.values().max_by_key(|h| h.cost()).cloned();
+	Ok(Users { map, decoy })
+}
+
 pub fn parse_htpasswd(text: &str) -> Result<HashMap<String, Hash>, String> {
 	let mut users = HashMap::new();
 	for (i, line) in text.lines().enumerate() {
@@ -293,7 +311,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Debug)]
 pub struct BasicAuth {
 	pub name: String,
-	pub users: SecretFile<HashMap<String, Hash>>,
+	pub users: SecretFile<Users>,
 	pub realm: String,
 	/// Pass `Authorization` on to the backend.
 	pub keep_authorization: bool,
@@ -326,7 +344,7 @@ impl BasicAuth {
 		}
 		Ok(BasicAuth {
 			name: name.to_string(),
-			users: SecretFile::open(users_file, &what, parse_htpasswd)?,
+			users: SecretFile::open(users_file, &what, parse_users)?,
 			realm: realm.to_string(),
 			keep_authorization,
 			user_header,
@@ -349,8 +367,8 @@ impl BasicAuth {
 		// a user not in the file costs at least as much as a wrong password (#333): the password
 		// is checked against the file's most expensive hash anyway, so the answer's time does
 		// not tell which user names exist
-		let known = users.get(&user);
-		let Some(hash) = known.or_else(|| users.values().max_by_key(|h| h.cost())).cloned() else { return BasicVerdict::Deny("unknown_user") };
+		let known = users.map.get(&user);
+		let Some(hash) = known.or(users.decoy.as_ref()).cloned() else { return BasicVerdict::Deny("unknown_user") };
 		let known = known.is_some();
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
@@ -455,8 +473,10 @@ impl ForwardAuth {
 				out.remove(h);
 			}
 		} else if let Some(ClientForwarded(values)) = parts.extensions.get::<ClientForwarded>() {
-			// the client's, taken off the request at its start, unless the rule set one since
-			if !out.contains_key(header::FORWARDED) {
+			// the client's, taken off the request at its start: as a header the client sent
+			// (only when `request_headers` lets it through), unless the rule set one since
+			let wanted = self.request_headers.is_empty() || self.request_headers.contains(&header::FORWARDED);
+			if wanted && !parts.headers.contains_key(header::FORWARDED) {
 				for v in values {
 					out.append(header::FORWARDED, v.clone());
 				}
@@ -520,7 +540,13 @@ impl ForwardAuth {
 fn is_hop_by_hop(name: &HeaderName) -> bool {
 	matches!(
 		name.as_str(),
-		"connection" | "keep-alive" | "proxy-connection" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+		"connection"
+			| "keep-alive" | "proxy-connection"
+			| "proxy-authenticate"
+			| "proxy-authorization"
+			| "te" | "trailer"
+			| "transfer-encoding"
+			| "upgrade" | "http2-settings"
 	)
 }
 
@@ -616,13 +642,13 @@ mod tests {
 		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(_)));
 		assert!(matches!(b.check(&basic("mallory", "secret")).await, BasicVerdict::Deny("unknown_user")));
 		// the most expensive hash of the file is the one used
-		let users = parse_htpasswd(&format!(
+		let users = parse_users(&format!(
 			"a:{{SHA}}5en6G6MezRroT3XKqkdPOmY/BfQ=\nb:{}\nc:$apr1$r31.....$ARC3pREO82RIm0aQ2zszC0\nd:{}\n",
 			bcrypt::hash("x", 5).unwrap(),
 			bcrypt::hash("x", 4).unwrap()
 		))
 		.unwrap();
-		assert!(matches!(users.values().max_by_key(|h| h.cost()), Some(Hash::Bcrypt(h)) if h.starts_with("$2b$05$")));
+		assert!(matches!(&users.decoy, Some(Hash::Bcrypt(h)) if h.starts_with("$2b$05$")));
 		// with bcrypt the time is that of a wrong password
 		std::fs::write(&file, format!("alice:{}\n", bcrypt::hash("secret", 8).unwrap())).unwrap();
 		b.users.reload(true);
@@ -711,6 +737,15 @@ mod tests {
 		fa.trust_forward_header = false;
 		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"));
 		fa.trust_forward_header = true;
+		// request_headers decides for the client's value too; a value the rule set (not listed)
+		// is not replaced by the client's
+		fa.request_headers = vec![HeaderName::from_static("authorization")];
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"), "the rule's, not listed, not the client's");
+		taken.headers.remove("forwarded");
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"), "not listed");
+		fa.request_headers = vec![HeaderName::from_static("forwarded")];
+		assert_eq!(fa.request_headers(&taken, client, true, "a")["forwarded"], "for=6.6.6.6", "listed");
+		fa.request_headers = vec![];
 
 		fa.request_headers = vec![HeaderName::from_static("x-none")];
 		assert!(!fa.request_headers(&parts, client, true, "a").contains_key("cookie"));

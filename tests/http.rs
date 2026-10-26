@@ -176,8 +176,11 @@ async fn forwarded_headers_and_host() {
 async fn backend_failures_are_502_and_504() {
 	let h = harness().await;
 	let a = echo_backend("A").await;
-	// nothing listens on a port that was just free
-	let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+	// a port bound but not listening: connections are refused, and no other test's
+	// listener can take it meanwhile (a port that was just free could be)
+	let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+	reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+	let dead = reserved.local_addr().unwrap();
 	let port = free_port();
 	let (status, v) = h
 		.post(http_rule(

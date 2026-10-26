@@ -1282,7 +1282,7 @@ impl Conn {
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.to_string());
 		if fa.grpc {
-			return self.ext_authz(router, fa, index, parts, along, client, &authority).await;
+			return self.ext_authz(router, fa, index, parts, along, client, &authority, host).await;
 		}
 		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 		let (method, path) = if fa.client_request {
@@ -1337,6 +1337,7 @@ impl Conn {
 		along: Option<Bytes>,
 		client: IpAddr,
 		authority: &str,
+		host: &str,
 	) -> AuthOutcome {
 		let server = &fa.service.servers[index];
 		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
@@ -1345,7 +1346,13 @@ impl Conn {
 		// X-Forwarded-* / X-Real-IP (Forwarded) as HTTP forward_auth (#333: the client's only with
 		// trust_forward_header), and the client certificate's as rproxy saw it; a name repeated
 		// is joined with "," as Envoy does
-		let mut picked = fa.request_headers(parts, client, self.https, authority);
+		let mut picked = fa.request_headers(parts, client, self.https, host);
+		// Envoy's CheckRequest has the request's content-length among the headers
+		if fa.request_headers.is_empty() || fa.request_headers.contains(&header::CONTENT_LENGTH) {
+			if let Some(v) = parts.headers.get(header::CONTENT_LENGTH) {
+				picked.insert(header::CONTENT_LENGTH, v.clone());
+			}
+		}
 		self.client_cert_headers(&mut picked);
 		let mut headers: Vec<(String, String)> = vec![
 			(":authority".into(), authority.to_string()),

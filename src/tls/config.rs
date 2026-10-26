@@ -544,7 +544,10 @@ pub fn best_match<'a>(lists: impl IntoIterator<Item = &'a [String]>, name: &str)
 /// owner check (`net::files`). Why it cannot be read (owner, mode, whether it exists) is
 /// for the log and `--check-config`, not for the control API's answer (#333).
 fn read_kind(path: &str, kind: crate::net::files::Kind) -> Result<Vec<u8>, ApiError> {
-	crate::net::files::read(path, kind).map_err(|e| tls_error(crate::net::files::rule_file_error("", path, &format!("{path}: {e}"))))
+	let data =
+		crate::net::files::read(path, kind).map_err(|e| tls_error(crate::net::files::rule_file_error("", path, &format!("{path}: {e}"))))?;
+	crate::net::files::rule_file_ok(path);
+	Ok(data)
 }
 
 fn read(path: &str) -> Result<Vec<u8>, ApiError> {

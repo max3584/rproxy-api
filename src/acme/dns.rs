@@ -261,7 +261,11 @@ impl Provider {
 		let account: AcmeDnsAccount = serde_json::from_slice(resp.body()).map_err(|e| format!("acme-dns register: {e}"))?;
 		all.insert(domain.to_string(), account.clone());
 		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
-		super::store::write_private(Path::new(file), &serde_json::to_vec_pretty(&all).unwrap_or_default())
+		let (path, bytes) = (PathBuf::from(file), serde_json::to_vec_pretty(&all).unwrap_or_default());
+		tokio::task::spawn_blocking(move || super::store::write_private(&path, &bytes))
+			.await
+			.map_err(std::io::Error::other)
+			.and_then(|r| r)
 			.map_err(|e| format!("{file}: {e} (registered at acme-dns, but the account could not be kept)"))?;
 		info!(event = "acme.dns", action = "register", provider = %self.name, domain, fulldomain = %account.fulldomain,
 			"registered at acme-dns; create the CNAME _acme-challenge.{domain} -> {}", account.fulldomain);
