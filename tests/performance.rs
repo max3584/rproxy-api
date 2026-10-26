@@ -154,12 +154,21 @@ async fn the_settings_file_sets_workers_shards_and_pinning() {
 	assert!(sources(&perf).contains("workers=file") && sources(&perf).contains("udp_shards=file"), "{perf}");
 	rp.wait_log("static.loaded").await;
 
-	let workers = rp.workers();
-	assert_eq!(workers.len(), 3, "{:?}", rp.threads());
-	// worker i on the i-th listed CPU (round and round)
-	for (name, cpus) in &workers {
-		let i: usize = name.trim_start_matches("rproxy-wrk-").parse().unwrap();
-		assert_eq!(cpus, &listed[i % listed.len()], "{workers:?}");
+	// worker i on the i-th listed CPU (round and round). A worker is named before
+	// on_thread_start pins it, so wait for the pinning rather than read it once.
+	let pinned = |workers: &[(String, String)]| {
+		workers.len() == 3
+			&& workers.iter().all(|(name, cpus)| {
+				let i: usize = name.trim_start_matches("rproxy-wrk-").parse().unwrap();
+				cpus == &listed[i % listed.len()]
+			})
+	};
+	let deadline = Instant::now() + Duration::from_secs(10);
+	let mut workers = rp.workers();
+	while !pinned(&workers) {
+		assert!(Instant::now() < deadline, "{workers:?} (all threads: {:?})", rp.threads());
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		workers = rp.workers();
 	}
 	// udp_shards: auto = the workers
 	assert_eq!(udp_sockets_on(port), 3);
