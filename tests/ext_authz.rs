@@ -255,6 +255,10 @@ async fn grpc_ext_authz() {
 				.header("authorization", "allow")
 				.header("x-drop", "d")
 				.header("x-other", "o")
+				.header("x-real-ip", "6.6.6.6")
+				.header("forwarded", "for=6.6.6.6")
+				.header("x-forwarded-host", "evil.test")
+				.header("x-forwarded-for", "6.6.6.6")
 				.body("payload"),
 		)
 		.await;
@@ -267,12 +271,20 @@ async fn grpc_ext_authz() {
 		let names: Vec<&str> = check.headers.iter().map(|(k, _)| k.as_str()).collect();
 		if path.starts_with("/a") {
 			assert!(names.contains(&"x-other"), "all headers by default: {names:?}");
+			assert!(check.headers.contains(&("content-length".to_string(), "7".to_string())), "as Envoy: {names:?}");
 			assert!(check.body.is_empty());
 		} else {
 			assert!(!names.contains(&"x-other") && names.contains(&"authorization"), "{names:?}");
 			assert_eq!(check.body, b"payload");
 		}
 		assert!(names.contains(&":authority") && names.contains(&":path"), "{names:?}");
+		// the client as rproxy sees it, not as it says (#333)
+		let real: Vec<&str> = check.headers.iter().filter(|(k, _)| k == "x-real-ip").map(|(_, v)| v.as_str()).collect();
+		assert_eq!(real, ["127.0.0.1"], "{path}");
+		assert!(!names.contains(&"forwarded"), "{names:?}");
+		// X-Forwarded-* as for HTTP forward_auth: rproxy's, not the client's
+		let one = |name: &str| check.headers.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
+		assert_eq!((one("x-forwarded-host"), one("x-forwarded-for")), (vec!["app.example"], vec!["127.0.0.1"]), "{path}");
 	}
 	let (status, headers, v) = send(client().get(format!("{base}/a")).header("authorization", "nope")).await;
 	assert_eq!((status.as_u16(), v.as_str()), (401, Some("who are you")));

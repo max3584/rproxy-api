@@ -57,13 +57,92 @@ pub struct Written {
 	pub value: String,
 }
 
-fn read_secret(file: &str) -> Result<String, String> {
-	crate::net::files::read_to_string(file, crate::net::files::Kind::Secret).map(|s| s.trim().to_string()).map_err(|e| format!("{file}: {e}"))
+async fn read_secret(file: &str) -> Result<String, String> {
+	crate::net::files::read_to_string_async(file, crate::net::files::Kind::Secret)
+		.await
+		.map(|s| s.trim().to_string())
+		.map_err(|e| format!("{file}: {e}"))
 }
 
-/// Replaces `{fqdn}`, `{value}`, `{zone}` and `{secret}`.
-fn fill(template: &str, w: &Written, secret: &str) -> String {
-	template.replace("{fqdn}", &w.fqdn).replace("{value}", &w.value).replace("{zone}", &w.zone).replace("{secret}", secret)
+/// How a value put into a template is written (#333): the names come from DNS (after
+/// CNAMEs), so they must not be able to change the shape of the URL or of a JSON body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Escape {
+	/// Percent-encoded but for RFC 3986's unreserved characters (the URL, a form body).
+	Url,
+	/// As inside a JSON string (a body that is JSON).
+	Json,
+	/// As it is (headers: the HTTP library refuses line breaks).
+	Raw,
+}
+
+impl Escape {
+	/// A body is JSON when the template's `Content-Type` says so, or (no `Content-Type`)
+	/// when it starts with `{` or `[`; a form when it is `application/x-www-form-urlencoded`,
+	/// or (no `Content-Type`) when it has `=` or `&` (`name={fqdn}&value={value}`).
+	fn body(call: &HttpCallSpec) -> Escape {
+		let content_type = call.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.to_ascii_lowercase());
+		match content_type {
+			Some(t) if t.contains("json") => Escape::Json,
+			Some(t) if t.contains("x-www-form-urlencoded") => Escape::Url,
+			Some(_) => Escape::Raw,
+			None if call.body.as_deref().is_some_and(|b| b.trim_start().starts_with(['{', '['])) => Escape::Json,
+			None if call.body.as_deref().is_some_and(|b| b.contains(['=', '&'])) => Escape::Url,
+			None => Escape::Raw,
+		}
+	}
+
+	/// `value` percent-encoded (`Escape::Url`): the zone in PowerDNS's URL comes from DNS too.
+	fn url(value: &str) -> String {
+		let mut out = String::with_capacity(value.len());
+		Escape::Url.write(&mut out, value);
+		out
+	}
+
+	fn write(self, out: &mut String, value: &str) {
+		match self {
+			Escape::Raw => out.push_str(value),
+			Escape::Json => {
+				let quoted = serde_json::Value::String(value.to_string()).to_string();
+				out.push_str(&quoted[1..quoted.len() - 1]);
+			}
+			Escape::Url => {
+				for b in value.bytes() {
+					if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+						out.push(b as char);
+					} else {
+						out.push_str(&format!("%{b:02X}"));
+					}
+				}
+			}
+		}
+	}
+}
+
+/// Replaces `{fqdn}`, `{value}`, `{zone}` and `{secret}` in one pass (a value that holds
+/// `{secret}` stays as it is) and writes each value as `escape` says.
+fn fill(template: &str, w: &Written, secret: &str, escape: Escape) -> String {
+	let mut out = String::with_capacity(template.len() + 64);
+	let mut rest = template;
+	while let Some(at) = rest.find('{') {
+		out.push_str(&rest[..at]);
+		rest = &rest[at..];
+		let found = [("{fqdn}", w.fqdn.as_str()), ("{value}", w.value.as_str()), ("{zone}", w.zone.as_str()), ("{secret}", secret)]
+			.into_iter()
+			.find(|(name, _)| rest.starts_with(name));
+		match found {
+			Some((name, value)) => {
+				escape.write(&mut out, value);
+				rest = &rest[name.len()..];
+			}
+			None => {
+				out.push('{');
+				rest = &rest[1..];
+			}
+		}
+	}
+	out.push_str(rest);
+	out
 }
 
 /// A provider's answer for an error message: short, without the secret.
@@ -133,10 +212,10 @@ impl Provider {
 		Ok(Written { provider: self.name.clone(), domain: domain.to_string(), fqdn, zone, value: value.to_string() })
 	}
 
-	fn tsig_key(&self) -> Result<super::rfc2136::TsigKey, String> {
+	async fn tsig_key(&self) -> Result<super::rfc2136::TsigKey, String> {
 		use base64::Engine;
 		let file = self.spec.tsig_secret_file.as_deref().unwrap_or_default();
-		let text = read_secret(file)?;
+		let text = read_secret(file).await?;
 		let secret = base64::engine::general_purpose::STANDARD
 			.decode(text.trim())
 			.map_err(|_| format!("{file}: the TSIG secret is not base64"))?;
@@ -152,9 +231,9 @@ impl Provider {
 		super::config::parse_dns_server(self.spec.server.as_deref().unwrap_or_default())
 	}
 
-	fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
+	async fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
 		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
-		match crate::net::files::read(file, crate::net::files::Kind::Secret) {
+		match crate::net::files::read_async(file, crate::net::files::Kind::Secret).await {
 			Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{file}: {e}")),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
 			Err(e) => Err(format!("{file}: {e}")),
@@ -164,7 +243,7 @@ impl Provider {
 	/// The acme-dns account of `domain`, registered (and kept, 0600) when there is none.
 	async fn acme_dns_account(&self, domain: &str) -> Result<AcmeDnsAccount, String> {
 		let _one = self.register.lock().await;
-		let mut all = self.acme_dns_accounts()?;
+		let mut all = self.acme_dns_accounts().await?;
 		if let Some(a) = all.get(domain) {
 			return Ok(a.clone());
 		}
@@ -182,7 +261,11 @@ impl Provider {
 		let account: AcmeDnsAccount = serde_json::from_slice(resp.body()).map_err(|e| format!("acme-dns register: {e}"))?;
 		all.insert(domain.to_string(), account.clone());
 		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
-		super::store::write_private(Path::new(file), &serde_json::to_vec_pretty(&all).unwrap_or_default())
+		let (path, bytes) = (PathBuf::from(file), serde_json::to_vec_pretty(&all).unwrap_or_default());
+		tokio::task::spawn_blocking(move || super::store::write_private(&path, &bytes))
+			.await
+			.map_err(std::io::Error::other)
+			.and_then(|r| r)
 			.map_err(|e| format!("{file}: {e} (registered at acme-dns, but the account could not be kept)"))?;
 		info!(event = "acme.dns", action = "register", provider = %self.name, domain, fulldomain = %account.fulldomain,
 			"registered at acme-dns; create the CNAME _acme-challenge.{domain} -> {}", account.fulldomain);
@@ -190,7 +273,7 @@ impl Provider {
 	}
 
 	async fn acme_dns_update(&self, r: &Written) -> Result<(), String> {
-		let account = self.acme_dns_accounts()?.get(&r.domain).cloned().ok_or_else(|| format!("acme-dns: no account for {}", r.domain))?;
+		let account = self.acme_dns_accounts().await?.get(&r.domain).cloned().ok_or_else(|| format!("acme-dns: no account for {}", r.domain))?;
 		let base = self.spec.api_url.as_deref().unwrap_or_default().trim_end_matches('/');
 		let body = serde_json::json!({"subdomain": account.subdomain, "txt": r.value}).to_string();
 		let req = Request::builder()
@@ -244,7 +327,7 @@ impl Provider {
 	}
 
 	async fn powerdns(&self, method: Method, url: String, body: Option<serde_json::Value>) -> Result<Bytes, String> {
-		let key = read_secret(self.spec.api_key_file.as_deref().unwrap_or_default())?;
+		let key = read_secret(self.spec.api_key_file.as_deref().unwrap_or_default()).await?;
 		let mut req = Request::builder().method(method).uri(&url).header("X-API-Key", &key).header("Accept", "application/json");
 		if body.is_some() {
 			req = req.header("Content-Type", "application/json");
@@ -281,14 +364,14 @@ impl Provider {
 					"changetype": "REPLACE",
 					"records": records.iter().map(|r| serde_json::json!({"content": format!("\"{}\"", r.value), "disabled": false})).collect::<Vec<_>>(),
 				}]});
-				let url = format!("{}/zones/{}.", self.powerdns_base(), first.zone);
+				let url = format!("{}/zones/{}.", self.powerdns_base(), Escape::url(&first.zone));
 				self.powerdns(Method::PATCH, url, Some(rrset)).await.map(|_| ())
 			}
 			"rfc2136" => {
 				let ttl = self.spec.ttl.unwrap_or(DEFAULT_TTL);
 				let changes: Vec<_> =
 					records.iter().map(|r| super::rfc2136::Change::Add { name: &r.fqdn, value: &r.value, ttl }).collect();
-				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key()?).await
+				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key().await?).await
 			}
 			"acme_dns" => {
 				for r in records {
@@ -311,12 +394,12 @@ impl Provider {
 		match self.spec.kind.as_str() {
 			"powerdns" => {
 				let rrset = serde_json::json!({"rrsets": [{"name": format!("{}.", first.fqdn), "type": "TXT", "changetype": "DELETE"}]});
-				let url = format!("{}/zones/{}.", self.powerdns_base(), first.zone);
+				let url = format!("{}/zones/{}.", self.powerdns_base(), Escape::url(&first.zone));
 				self.powerdns(Method::PATCH, url, Some(rrset)).await.map(|_| ())
 			}
 			"rfc2136" => {
 				let changes: Vec<_> = records.iter().map(|r| super::rfc2136::Change::Delete { name: &r.fqdn, value: &r.value }).collect();
-				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key()?).await
+				super::rfc2136::send(self.rfc2136_server()?, &first.zone, &changes, &self.tsig_key().await?).await
 			}
 			// acme-dns keeps the two latest values and has no removal
 			"acme_dns" => Ok(()),
@@ -335,16 +418,16 @@ impl Provider {
 	async fn template(&self, call: Option<&HttpCallSpec>, w: &Written) -> Result<(), String> {
 		let call = call.ok_or("no template")?;
 		let secret = match &self.spec.secret_file {
-			Some(f) => read_secret(f)?,
+			Some(f) => read_secret(f).await?,
 			None => String::new(),
 		};
 		let method: Method = call.method.as_deref().unwrap_or("POST").parse().map_err(|_| "invalid method".to_string())?;
-		let url = fill(&call.url, w, "");
+		let url = fill(&call.url, w, "", Escape::Url);
 		let mut req = Request::builder().method(method).uri(&url);
 		for (name, value) in &call.headers {
-			req = req.header(name.as_str(), fill(value, w, &secret));
+			req = req.header(name.as_str(), fill(value, w, &secret, Escape::Raw));
 		}
-		let body = call.body.as_deref().map(|b| fill(b, w, &secret)).unwrap_or_default();
+		let body = call.body.as_deref().map(|b| fill(b, w, &secret, Escape::body(call))).unwrap_or_default();
 		let req = req.body(Bytes::from(body)).map_err(|e| format!("{url}: {}", excerpt(e.to_string().as_bytes(), &secret)))?;
 		let resp = http::send(&self.tls, req).await?;
 		if !resp.status().is_success() {
@@ -492,10 +575,54 @@ mod tests {
 	#[test]
 	fn templates_and_excerpts() {
 		let w = Written { provider: "p".into(), domain: "a.example".into(), fqdn: "_acme-challenge.a.example".into(), zone: "a.example".into(), value: "v4lue".into() };
-		assert_eq!(fill("{\"fqdn\":\"{fqdn}\",\"value\":\"{value}\",\"zone\":\"{zone}\"}", &w, "s"), r#"{"fqdn":"_acme-challenge.a.example","value":"v4lue","zone":"a.example"}"#);
-		assert_eq!(fill("Bearer {secret}", &w, "tok"), "Bearer tok");
+		assert_eq!(
+			fill("{\"fqdn\":\"{fqdn}\",\"value\":\"{value}\",\"zone\":\"{zone}\"}", &w, "s", Escape::Json),
+			r#"{"fqdn":"_acme-challenge.a.example","value":"v4lue","zone":"a.example"}"#
+		);
+		assert_eq!(fill("Bearer {secret}", &w, "tok", Escape::Raw), "Bearer tok");
+		assert_eq!(
+			fill("https://dns.example/{zone}/txt?name={fqdn}", &w, "", Escape::Url),
+			"https://dns.example/a.example/txt?name=_acme-challenge.a.example"
+		);
 		assert_eq!(excerpt(b"bad token tok\nend", "tok"), "bad ***en *** end");
 		assert_eq!(excerpt(&[b'x'; 500], "").len(), 200);
+	}
+
+	#[test]
+	fn names_from_dns_cannot_change_the_template() {
+		// #333: a CNAME target is anyone's name; it stays a value in the URL and in JSON
+		let w = Written {
+			provider: "p".into(),
+			domain: "a.example".into(),
+			fqdn: "x\",\"admin\":true,\"y\":\"/../?a=1&b=2#{secret}".into(),
+			zone: "z/../other".into(),
+			value: "v".into(),
+		};
+		let url = fill("https://dns.example/zones/{zone}/txt?name={fqdn}", &w, "", Escape::Url);
+		assert_eq!(
+			url,
+			"https://dns.example/zones/z%2F..%2Fother/txt?name=x%22%2C%22admin%22%3Atrue%2C%22y%22%3A%22%2F..%2F%3Fa%3D1%26b%3D2%23%7Bsecret%7D"
+		);
+		let body = fill(r#"{"fqdn":"{fqdn}","token":"{secret}"}"#, &w, "tok", Escape::Json);
+		let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+		assert_eq!(v["fqdn"], w.fqdn.as_str());
+		assert!(v.get("admin").is_none(), "{body}");
+		// one pass: a name holding {secret} does not bring the secret in
+		assert_eq!(v["token"], "tok");
+		assert!(!fill("{fqdn}", &w, "tok", Escape::Raw).contains("tok"));
+		// which escaping a body gets
+		let call = |ct: Option<&str>, body: &str| HttpCallSpec {
+			headers: ct.map(|c| [("Content-Type".to_string(), c.to_string())].into()).unwrap_or_default(),
+			body: Some(body.into()),
+			..Default::default()
+		};
+		assert_eq!(Escape::body(&call(None, r#" {"a":"{fqdn}"}"#)), Escape::Json);
+		assert_eq!(Escape::body(&call(Some("application/json"), "x")), Escape::Json);
+		assert_eq!(Escape::body(&call(Some("application/x-www-form-urlencoded"), "a={fqdn}")), Escape::Url);
+		assert_eq!(Escape::body(&call(Some("text/plain"), "{fqdn}")), Escape::Raw);
+		assert_eq!(Escape::body(&call(None, "name={fqdn}&value={value}")), Escape::Url, "a form without Content-Type");
+		assert_eq!(fill("name={fqdn}&value={value}", &w, "", Escape::Url).matches('&').count(), 1, "& in a name stays a value");
+		assert_eq!(Escape::body(&call(None, "txt {value}")), Escape::Raw);
 	}
 
 	#[test]

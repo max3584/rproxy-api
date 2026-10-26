@@ -176,8 +176,11 @@ async fn forwarded_headers_and_host() {
 async fn backend_failures_are_502_and_504() {
 	let h = harness().await;
 	let a = echo_backend("A").await;
-	// nothing listens on a port that was just free
-	let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+	// a port bound but not listening: connections are refused, and no other test's
+	// listener can take it meanwhile (a port that was just free could be)
+	let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+	reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+	let dead = reserved.local_addr().unwrap();
 	let port = free_port();
 	let (status, v) = h
 		.post(http_rule(
@@ -252,6 +255,20 @@ async fn upgrades_pass_through() {
 	let mut buf = [0u8; 16];
 	let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
 	assert_eq!(&buf[..n], b"WS:ping");
+
+	// #333: h2c among the protocols is dropped, websocket still goes through (with other
+	// names listed in Connection, which are removed at the start of the request)
+	let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	s2.write_all(b"GET /ws HTTP/1.1\r\nHost: ws.test\r\nConnection: keep-alive, Upgrade, X-Drop\r\nX-Drop: 1\r\nUpgrade: h2c, websocket\r\n\r\n").await.unwrap();
+	let mut head = vec![];
+	while !head.ends_with(b"\r\n\r\n") {
+		assert_eq!(s2.read(&mut b).await.unwrap(), 1, "{}", String::from_utf8_lossy(&head));
+		head.push(b[0]);
+	}
+	assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+	s2.write_all(b"pong").await.unwrap();
+	let n = tokio::time::timeout(Duration::from_secs(5), s2.read(&mut buf)).await.unwrap().unwrap();
+	assert_eq!(&buf[..n], b"WS:pong");
 
 	// deleting the rule closes upgraded connections too
 	assert_eq!(h.delete(&format!("tcp/127.0.0.1/{port}")).await, StatusCode::NO_CONTENT);

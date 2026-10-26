@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,9 @@ fn fingerprint(path: &Path) -> u64 {
 pub struct SecretFile<T> {
 	path: PathBuf,
 	parse: fn(&str) -> Result<T, String>,
-	state: RwLock<Loaded<T>>,
+	state: Arc<RwLock<Loaded<T>>>,
+	/// A reload runs on a blocking thread (`get`).
+	reloading: Arc<AtomicBool>,
 }
 
 struct Loaded<T> {
@@ -48,15 +51,24 @@ struct Loaded<T> {
 	reported: Option<u64>,
 }
 
-impl<T> SecretFile<T> {
+impl<T: Send + Sync + 'static> SecretFile<T> {
+	/// Errors say what is wrong with the file only in the log and in `--check-config`; the
+	/// control API's answer does not (no owner, mode, existence or line of it, #333).
 	pub fn open(path: &str, what: &str, parse: fn(&str) -> Result<T, String>) -> Result<SecretFile<T>, ApiError> {
+		let shown = path;
 		let path = PathBuf::from(path);
 		let print = fingerprint(&path);
+		let unusable =
+			|e: &dyn std::fmt::Display| ApiError::invalid(crate::net::files::rule_file_error(what, shown, &format!("{shown}: {e}")));
 		let value = match crate::net::files::read_to_string(&path, crate::net::files::Kind::Secret) {
-			Ok(text) => Some(Arc::new(parse(&text).map_err(|e| ApiError::invalid(format!("{what}: {}: {e}", path.display())))?)),
+			Ok(text) => {
+				let value = parse(&text).map_err(|e| unusable(&e))?;
+				crate::net::files::rule_file_ok(shown);
+				Some(Arc::new(value))
+			}
 			// a file rproxy may not use (owner, mode) is a mistake of the settings, not of the environment
 			Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) || crate::net::files::is_refused(&e) => {
-				return Err(ApiError::invalid(format!("{what}: {}: {e}", path.display())));
+				return Err(unusable(&e));
 			}
 			Err(e) => {
 				warn!(event = "degraded", part = "http.auth", file = %path.display(), error = %e,
@@ -64,10 +76,18 @@ impl<T> SecretFile<T> {
 				None
 			}
 		};
-		Ok(SecretFile { path, parse, state: RwLock::new(Loaded { value, print, checked: Instant::now(), reported: None }) })
+		Ok(SecretFile {
+			path,
+			parse,
+			state: Arc::new(RwLock::new(Loaded { value, print, checked: Instant::now(), reported: None })),
+			reloading: Arc::default(),
+		})
 	}
 
-	/// The current value, re-reading the file when it changed.
+	/// The current value. When it was last looked at a while ago, the file is looked at
+	/// again on a blocking thread (#333: a request's tokio worker does not wait for the
+	/// disk); the request goes on with the value it has, a changed file counts from the
+	/// next requests. Outside a tokio runtime the file is looked at right away.
 	pub fn get(&self) -> Option<Arc<T>> {
 		{
 			let s = self.state.read().unwrap();
@@ -75,34 +95,64 @@ impl<T> SecretFile<T> {
 				return s.value.clone();
 			}
 		}
-		self.reload(false);
+		match tokio::runtime::Handle::try_current() {
+			Ok(rt) => {
+				if !self.reloading.swap(true, Ordering::AcqRel) {
+					/// Lets the next reload start however this one ends (a panic in parse too).
+					struct Done(Arc<AtomicBool>);
+					impl Drop for Done {
+						fn drop(&mut self) {
+							self.0.store(false, Ordering::Release);
+						}
+					}
+					let done = Done(self.reloading.clone());
+					let (path, parse, state) = (self.path.clone(), self.parse, self.state.clone());
+					rt.spawn_blocking(move || {
+						let _done = done;
+						reload(&path, parse, &state, false);
+					});
+				}
+			}
+			Err(_) => self.reload(false),
+		}
 		self.state.read().unwrap().value.clone()
 	}
 
 	/// Re-reads the file if it changed (or always with `force`, for SIGHUP).
 	/// A file that no longer reads or parses keeps the current value.
 	pub fn reload(&self, force: bool) {
-		let print = fingerprint(&self.path);
-		let mut s = self.state.write().unwrap();
-		s.checked = Instant::now();
+		reload(&self.path, self.parse, &self.state, force);
+	}
+}
+
+fn reload<T>(path: &Path, parse: fn(&str) -> Result<T, String>, state: &RwLock<Loaded<T>>, force: bool) {
+	let print = fingerprint(path);
+	{
+		let s = state.read().unwrap();
 		if !force && print == s.print && s.value.is_some() {
+			drop(s);
+			state.write().unwrap().checked = Instant::now();
 			return;
 		}
-		let result = crate::net::files::read_to_string(&self.path, crate::net::files::Kind::Secret).map_err(|e| e.to_string()).and_then(|t| (self.parse)(&t));
-		match result {
-			Ok(v) => {
-				if s.value.is_some() && print != s.print {
-					info!(event = "reload.secret", file = %self.path.display());
-				}
-				s.value = Some(Arc::new(v));
-				s.print = print;
-				s.reported = None;
+	}
+	// read without holding the lock: requests keep the current value meanwhile
+	let result =
+		crate::net::files::read_to_string(path, crate::net::files::Kind::Secret).map_err(|e| e.to_string()).and_then(|t| parse(&t));
+	let mut s = state.write().unwrap();
+	s.checked = Instant::now();
+	match result {
+		Ok(v) => {
+			if s.value.is_some() && print != s.print {
+				info!(event = "reload.secret", file = %path.display());
 			}
-			Err(e) => {
-				if s.reported != Some(print) {
-					warn!(event = "reload.secret", file = %self.path.display(), error = %e, "keeping the current contents");
-					s.reported = Some(print);
-				}
+			s.value = Some(Arc::new(v));
+			s.print = print;
+			s.reported = None;
+		}
+		Err(e) => {
+			if s.reported != Some(print) {
+				warn!(event = "reload.secret", file = %path.display(), error = %e, "keeping the current contents");
+				s.reported = Some(print);
 			}
 		}
 	}
@@ -137,6 +187,20 @@ pub enum Hash {
 /// `user:hash` lines: bcrypt, APR1 and {SHA} (what htpasswd writes, as in
 /// Traefik). Other schemes (crypt, plain text) are refused so that a file never
 /// silently lets nobody in.
+/// The users of an htpasswd file, and the hash an unknown name is checked against.
+#[derive(Debug)]
+pub struct Users {
+	pub map: HashMap<String, Hash>,
+	/// The file's most expensive hash (#333), found once per loaded file.
+	pub decoy: Option<Hash>,
+}
+
+pub fn parse_users(text: &str) -> Result<Users, String> {
+	let map = parse_htpasswd(text)?;
+	let decoy = map.values().max_by_key(|h| h.cost()).cloned();
+	Ok(Users { map, decoy })
+}
+
 pub fn parse_htpasswd(text: &str) -> Result<HashMap<String, Hash>, String> {
 	let mut users = HashMap::new();
 	for (i, line) in text.lines().enumerate() {
@@ -168,6 +232,18 @@ pub fn parse_htpasswd(text: &str) -> Result<HashMap<String, Hash>, String> {
 		return Err("no users".into());
 	}
 	Ok(users)
+}
+
+impl Hash {
+	/// How expensive checking a password is, to compare hashes: bcrypt by its cost, above
+	/// APR1 (1000 rounds of MD5), above {SHA} (one SHA-1).
+	fn cost(&self) -> u32 {
+		match self {
+			Hash::Bcrypt(h) => 100 + h.get(4..6).and_then(|c| c.parse::<u32>().ok()).unwrap_or(0),
+			Hash::Apr1 { .. } => 2,
+			Hash::Sha1(_) => 1,
+		}
+	}
 }
 
 /// The hash part of Apache's `$apr1$` (MD5-crypt with the `$apr1$` magic).
@@ -235,7 +311,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Debug)]
 pub struct BasicAuth {
 	pub name: String,
-	pub users: SecretFile<HashMap<String, Hash>>,
+	pub users: SecretFile<Users>,
 	pub realm: String,
 	/// Pass `Authorization` on to the backend.
 	pub keep_authorization: bool,
@@ -268,7 +344,7 @@ impl BasicAuth {
 		}
 		Ok(BasicAuth {
 			name: name.to_string(),
-			users: SecretFile::open(users_file, &what, parse_htpasswd)?,
+			users: SecretFile::open(users_file, &what, parse_users)?,
 			realm: realm.to_string(),
 			keep_authorization,
 			user_header,
@@ -288,12 +364,20 @@ impl BasicAuth {
 				return BasicVerdict::Allow(user);
 			}
 		}
-		let Some(hash) = users.get(&user).cloned() else { return BasicVerdict::Deny("unknown_user") };
+		// a user not in the file costs at least as much as a wrong password (#333): the password
+		// is checked against the file's most expensive hash anyway, so the answer's time does
+		// not tell which user names exist
+		let known = users.map.get(&user);
+		let Some(hash) = known.or(users.decoy.as_ref()).cloned() else { return BasicVerdict::Deny("unknown_user") };
+		let known = known.is_some();
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
 			Hash::Apr1 { salt, hash } => constant_time_eq(apr1(password.as_bytes(), salt.as_bytes()).as_bytes(), hash.as_bytes()),
 			Hash::Bcrypt(h) => tokio::task::spawn_blocking(move || bcrypt::verify(password, &h).unwrap_or(false)).await.unwrap_or(false),
 		};
+		if !known {
+			return BasicVerdict::Deny("unknown_user");
+		}
 		if !ok {
 			return BasicVerdict::Deny("bad_password");
 		}
@@ -321,6 +405,12 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 	let (user, password) = text.split_once(':')?;
 	Some((user.to_string(), password.to_string()))
 }
+
+/// RFC 7239's `Forwarded` as a client that is not a trusted proxy sent it, taken off the
+/// request at its start (#333, `server.rs`): `forward_auth` with `trust_forward_header`
+/// still sends it to the auth server.
+#[derive(Clone, Debug)]
+pub struct ClientForwarded(pub Vec<HeaderValue>);
 
 /// `forward_auth`: what to ask and what to take from the answer.
 #[derive(Debug)]
@@ -353,12 +443,23 @@ pub struct ForwardAuth {
 /// Headers of an auth server's answer never copied to the request (they describe the answer).
 const ANSWER_ONLY: [&str; 6] = ["host", "content-length", "content-type", "content-encoding", "transfer-encoding", "date"];
 
-const FORWARDED: [&str; 6] =
-	["x-forwarded-method", "x-forwarded-proto", "x-forwarded-host", "x-forwarded-uri", "x-forwarded-for", "x-forwarded-port"];
+/// What the client may say of where the request came from: dropped and set again by rproxy
+/// unless `trust_forward_header` (`X-Real-IP` and RFC 7239's `Forwarded` too, #333).
+pub const FORWARDED: [&str; 8] = [
+	"x-forwarded-method",
+	"x-forwarded-proto",
+	"x-forwarded-host",
+	"x-forwarded-uri",
+	"x-forwarded-for",
+	"x-forwarded-port",
+	"x-real-ip",
+	"forwarded",
+];
 
 impl ForwardAuth {
 	/// Headers for the auth server: the client's (all, or `request_headers`),
-	/// without hop-by-hop ones, and X-Forwarded-Method / Proto / Host / Uri / For.
+	/// without hop-by-hop ones, and X-Forwarded-Method / Proto / Host / Uri / For and
+	/// X-Real-IP (the client as rproxy sees it). `Forwarded` only with `trust_forward_header`.
 	pub fn request_headers(&self, parts: &Parts, client: IpAddr, https: bool, host: &str) -> HeaderMap {
 		let mut out = HeaderMap::new();
 		for (name, value) in &parts.headers {
@@ -370,6 +471,15 @@ impl ForwardAuth {
 		if !self.trust_forward_header {
 			for h in FORWARDED {
 				out.remove(h);
+			}
+		} else if let Some(ClientForwarded(values)) = parts.extensions.get::<ClientForwarded>() {
+			// the client's, taken off the request at its start: as a header the client sent
+			// (only when `request_headers` lets it through), unless the rule set one since
+			let wanted = self.request_headers.is_empty() || self.request_headers.contains(&header::FORWARDED);
+			if wanted && !parts.headers.contains_key(header::FORWARDED) {
+				for v in values {
+					out.append(header::FORWARDED, v.clone());
+				}
 			}
 		}
 		let trust = self.trust_forward_header;
@@ -394,6 +504,7 @@ impl ForwardAuth {
 			}
 		}
 		set(&mut out, "x-forwarded-for", &client.to_string());
+		set(&mut out, "x-real-ip", &client.to_string());
 		out
 	}
 
@@ -429,7 +540,13 @@ impl ForwardAuth {
 fn is_hop_by_hop(name: &HeaderName) -> bool {
 	matches!(
 		name.as_str(),
-		"connection" | "keep-alive" | "proxy-connection" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+		"connection"
+			| "keep-alive" | "proxy-connection"
+			| "proxy-authenticate"
+			| "proxy-authorization"
+			| "te" | "trailer"
+			| "transfer-encoding"
+			| "upgrade" | "http2-settings"
 	)
 }
 
@@ -515,13 +632,50 @@ mod tests {
 		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 	}
 
+	#[tokio::test]
+	async fn unknown_users_cost_as_much_as_wrong_passwords() {
+		// #333: a name not in the file is checked against a hash of the file anyway, and
+		// is refused even when the password is that hash's
+		crate::net::files::private_umask();
+		let file = tempfile("decoy", "alice:{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ=\n");
+		let b = BasicAuth::new("auth", file.to_str().unwrap(), None, false, None).unwrap();
+		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(_)));
+		assert!(matches!(b.check(&basic("mallory", "secret")).await, BasicVerdict::Deny("unknown_user")));
+		// the most expensive hash of the file is the one used
+		let users = parse_users(&format!(
+			"a:{{SHA}}5en6G6MezRroT3XKqkdPOmY/BfQ=\nb:{}\nc:$apr1$r31.....$ARC3pREO82RIm0aQ2zszC0\nd:{}\n",
+			bcrypt::hash("x", 5).unwrap(),
+			bcrypt::hash("x", 4).unwrap()
+		))
+		.unwrap();
+		assert!(matches!(&users.decoy, Some(Hash::Bcrypt(h)) if h.starts_with("$2b$05$")));
+		// with bcrypt the time is that of a wrong password
+		std::fs::write(&file, format!("alice:{}\n", bcrypt::hash("secret", 8).unwrap())).unwrap();
+		b.users.reload(true);
+		let timed = |user: &'static str| {
+			let b = &b;
+			async move {
+				let start = Instant::now();
+				for _ in 0..3 {
+					assert!(matches!(b.check(&basic(user, "wrong")).await, BasicVerdict::Deny(_)));
+				}
+				start.elapsed()
+			}
+		};
+		let (wrong, unknown) = (timed("alice").await, timed("mallory").await);
+		assert!(unknown * 3 > wrong, "unknown user {unknown:?}, wrong password {wrong:?}");
+		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+	}
+
 	#[test]
 	fn missing_or_bad_files_are_configuration_errors() {
 		crate::net::files::private_umask();
 		let e = BasicAuth::new("a", "/nonexistent/rproxy/users", None, false, None).unwrap_err();
 		assert!(e.message.contains("users_file"), "{}", e.message);
 		let file = tempfile("bad", "alice:plain\n");
-		assert!(BasicAuth::new("a", file.to_str().unwrap(), None, false, None).unwrap_err().message.contains("only bcrypt"));
+		// the answer does not show the file's lines (a user name), the log does (#333)
+		let e = BasicAuth::new("a", file.to_str().unwrap(), None, false, None).unwrap_err();
+		assert!(e.message.contains("users_file") && e.message.contains("cannot be used") && !e.message.contains("alice"), "{}", e.message);
 		assert!(BasicAuth::new("a", file.to_str().unwrap(), Some("a\"b"), false, None).is_err());
 		std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 	}
@@ -548,6 +702,8 @@ mod tests {
 			.header("cookie", "a=b")
 			.header("x-forwarded-for", "6.6.6.6")
 			.header("x-forwarded-host", "evil")
+			.header("x-real-ip", "6.6.6.6")
+			.header("forwarded", "for=6.6.6.6;host=evil")
 			.header("connection", "keep-alive")
 			.body(())
 			.unwrap();
@@ -559,6 +715,9 @@ mod tests {
 		assert_eq!(h["x-forwarded-host"], "a.example");
 		assert_eq!(h["x-forwarded-uri"], "/app/x?y=1");
 		assert_eq!(h["x-forwarded-for"], "10.0.0.9");
+		// the client's own X-Real-IP and Forwarded do not reach the auth server (#333)
+		assert_eq!(h["x-real-ip"], "10.0.0.9");
+		assert!(!h.contains_key("forwarded"));
 		assert_eq!(h["cookie"], "a=b");
 		assert!(!h.contains_key("connection"));
 
@@ -566,6 +725,27 @@ mod tests {
 		let h = fa.request_headers(&parts, client, true, "a.example");
 		assert_eq!(h["x-forwarded-host"], "evil");
 		assert_eq!(h["x-forwarded-for"], "6.6.6.6, 10.0.0.9");
+		assert_eq!((h["x-real-ip"].as_bytes(), h["forwarded"].as_bytes()), (&b"6.6.6.6"[..], &b"for=6.6.6.6;host=evil"[..]));
+
+		// a client's Forwarded taken off the request at its start (#333) goes back to the auth
+		// server only with trust_forward_header; a value the rule set wins
+		let (mut taken, _) = hyper::Request::get("/").body(()).unwrap().into_parts();
+		taken.extensions.insert(ClientForwarded(vec![HeaderValue::from_static("for=6.6.6.6")]));
+		assert_eq!(fa.request_headers(&taken, client, true, "a")["forwarded"], "for=6.6.6.6");
+		taken.headers.insert("forwarded", HeaderValue::from_static("for=192.0.2.1"));
+		assert_eq!(fa.request_headers(&taken, client, true, "a").get_all("forwarded").iter().collect::<Vec<_>>(), ["for=192.0.2.1"]);
+		fa.trust_forward_header = false;
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"));
+		fa.trust_forward_header = true;
+		// request_headers decides for the client's value too; a value the rule set (not listed)
+		// is not replaced by the client's
+		fa.request_headers = vec![HeaderName::from_static("authorization")];
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"), "the rule's, not listed, not the client's");
+		taken.headers.remove("forwarded");
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"), "not listed");
+		fa.request_headers = vec![HeaderName::from_static("forwarded")];
+		assert_eq!(fa.request_headers(&taken, client, true, "a")["forwarded"], "for=6.6.6.6", "listed");
+		fa.request_headers = vec![];
 
 		fa.request_headers = vec![HeaderName::from_static("x-none")];
 		assert!(!fa.request_headers(&parts, client, true, "a").contains_key("cookie"));

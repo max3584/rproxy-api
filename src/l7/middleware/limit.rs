@@ -36,14 +36,40 @@ impl Source {
 			.map_err(|_| ApiError::invalid(format!("source {s:?}: {name:?} is not a header name")))
 	}
 
+	/// The bucket's key (#333): a header's value longer than `MAX_KEY_VALUE` is kept as its
+	/// SHA-256 (100 000 keys of 64 KiB values would be 6 GiB), an IPv6 client as its /64
+	/// (one host usually has a whole /64 and could take a new address for every request).
 	pub fn key(&self, headers: &HeaderMap, client: IpAddr) -> String {
 		match self {
 			Source::Header(name) => match headers.get(name).and_then(|v| v.to_str().ok()) {
-				Some(v) => format!("h:{v}"),
-				None => client.to_string(),
+				Some(v) if v.len() <= MAX_KEY_VALUE => format!("h:{v}"),
+				Some(v) => {
+					use sha2::Digest as _;
+					let digest = sha2::Sha256::digest(v.as_bytes());
+					let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+					format!("s:{hex}")
+				}
+				None => ip_key(client),
 			},
-			Source::Ip => client.to_string(),
+			Source::Ip => ip_key(client),
 		}
+	}
+}
+
+/// Header values up to this length are keys as they are; longer ones by their hash.
+pub const MAX_KEY_VALUE: usize = 64;
+
+/// An IPv4 client by its address, an IPv6 one by its /64.
+fn ip_key(client: IpAddr) -> String {
+	match client {
+		IpAddr::V4(a) => a.to_string(),
+		IpAddr::V6(a) => match a.to_ipv4_mapped() {
+			Some(v4) => v4.to_string(),
+			None => {
+				let prefix = u128::from(a) & !((1u128 << 64) - 1);
+				format!("{}/64", std::net::Ipv6Addr::from(prefix))
+			}
+		},
 	}
 }
 
@@ -257,6 +283,29 @@ mod tests {
 		let s = Source::parse("header: X-Api-Key").unwrap();
 		assert_eq!(s.key(&h, ip), "h:k1");
 		assert_eq!(s.key(&HeaderMap::new(), ip), "10.0.0.1", "no header: the client address");
+	}
+
+	#[test]
+	fn keys_are_bounded() {
+		// #333: a long header value is kept as its hash, the same value the same key
+		let s = Source::parse("header:x-key").unwrap();
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		let mut h = HeaderMap::new();
+		h.insert("x-key", "k".repeat(MAX_KEY_VALUE).parse().unwrap());
+		assert_eq!(s.key(&h, ip), format!("h:{}", "k".repeat(MAX_KEY_VALUE)));
+		h.insert("x-key", "k".repeat(60_000).parse().unwrap());
+		let long = s.key(&h, ip);
+		assert!(long.starts_with("s:") && long.len() == 66, "{long}");
+		assert_eq!(s.key(&h, ip), long);
+		h.insert("x-key", format!("{}x", "k".repeat(59_999)).parse().unwrap());
+		assert_ne!(s.key(&h, ip), long);
+		// IPv6 clients by their /64; IPv4 (and IPv4-mapped) by the address
+		let v6 = |a: &str| Source::Ip.key(&HeaderMap::new(), a.parse().unwrap());
+		assert_eq!(v6("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+		assert_eq!(v6("2001:db8:1:2:ffff:1:2:3"), v6("2001:db8:1:2::9"));
+		assert_ne!(v6("2001:db8:1:2::1"), v6("2001:db8:1:3::1"));
+		assert_eq!(v6("::ffff:10.0.0.1"), "10.0.0.1");
+		assert_eq!(s.key(&HeaderMap::new(), "2001:db8::5".parse().unwrap()), "2001:db8::/64", "no header: the client's /64");
 		assert!(Source::parse("cookie:x").is_err());
 		assert!(Source::parse("header:").is_err());
 		assert!(Source::parse("header:bad name").is_err());

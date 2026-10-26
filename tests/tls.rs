@@ -948,12 +948,25 @@ async fn files_others_may_write_or_read_are_refused() {
 	set(&cert.key_file, 0o644);
 	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
-	assert!(v["error"].as_str().unwrap().contains("may be read by anyone"), "{v}");
+	// the answer names the file but not why (owner, mode, whether it exists): that is in the
+	// log and in --check-config (#333)
+	let unusable = |v: &serde_json::Value, file: &str| {
+		let e = v["error"].as_str().unwrap();
+		assert!(e.contains(&format!("{file}: cannot be used")), "{v}");
+		assert!(!e.contains("mode") && !e.contains("uid") && !e.contains("read by anyone") && !e.contains("No such file"), "{v}");
+	};
+	unusable(&v, &cert.key_file);
 	set(&cert.key_file, 0o640);
 	set(&cert.cert_file, 0o664);
 	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
-	assert!(v["error"].as_str().unwrap().contains("written by the group"), "{v}");
+	unusable(&v, &cert.cert_file);
+	// a missing file reads the same
+	let missing = format!("{}.missing", cert.cert_file);
+	let tls_missing = json!({"mode": "terminate", "certificates": [{"cert_file": missing, "key_file": cert.key_file}]});
+	let (status, v) = h.post(tcp_rule(free_port(), backend, tls_missing)).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+	unusable(&v, &missing);
 	set(&cert.cert_file, 0o644);
 	let (status, v) = h.post(tcp_rule(free_port(), backend, tls())).await;
 	assert_eq!(status, StatusCode::CREATED, "a 0644 certificate and a 0640 key are fine: {v}");

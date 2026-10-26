@@ -670,6 +670,8 @@ fn check_kernel(opts: &Options) -> ExitCode {
 /// is set up (the report is the output), nothing listens.
 fn check_config(opts: &Options, path: Option<PathBuf>) -> ExitCode {
 	let json = opts.check_config_format == "json";
+	// the administrator on the host: say what is wrong with a file (the control API does not, #333)
+	rproxy_api::net::files::set_detailed_errors(true);
 	let fail = |message: String| {
 		if json {
 			let report = rproxy_api::config::check::Report {

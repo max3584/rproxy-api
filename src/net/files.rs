@@ -151,10 +151,17 @@ pub fn problem(path: &Path, link: Option<&std::fs::Metadata>, meta: &std::fs::Me
 	None
 }
 
-/// Reads a file, after the checks of `owner_check`.
+/// Reads a file, after the checks of `owner_check`. Only regular files, whatever the owner
+/// check (#333): the file is opened without waiting (`O_NONBLOCK`), so a FIFO or a device
+/// cannot hold the thread in `open` or in an endless read, and refused before anything is read.
+/// It still reads from disk: in async code, `read_async` does it on a blocking thread.
 pub fn read(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
+	use std::os::unix::fs::OpenOptionsExt;
 	let path = path.as_ref();
-	let mut file = std::fs::File::open(path)?;
+	let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
+	if !file.metadata()?.is_file() {
+		return Err(io::Error::new(io::ErrorKind::PermissionDenied, Refused(format!("{} is not a regular file", path.display()))));
+	}
 	// procfs, sysfs, devices: never a certificate, key or secret (#319), whatever the owner check
 	if crate::net::protected::opened_on_kernel_fs(&file) {
 		let why = format!("{} is on a kernel filesystem (/proc, /sys, /dev); only regular files on disk", path.display());
@@ -175,6 +182,79 @@ pub fn read(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
 	let mut out = vec![];
 	file.read_to_end(&mut out)?;
 	Ok(out)
+}
+
+/// `read` on a blocking thread (`spawn_blocking`), for async code (#333).
+pub async fn read_async(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
+	let path = path.as_ref().to_path_buf();
+	tokio::task::spawn_blocking(move || read(path, kind)).await.map_err(io::Error::other)?
+}
+
+/// `read_to_string` on a blocking thread.
+pub async fn read_to_string_async(path: impl AsRef<Path>, kind: Kind) -> io::Result<String> {
+	String::from_utf8(read_async(path, kind).await?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+static DETAILED: AtomicBool = AtomicBool::new(false);
+
+/// `--check-config` (run by the administrator on the host): the errors of files rules name
+/// say what is wrong (`rule_file_error`).
+pub fn set_detailed_errors(on: bool) {
+	DETAILED.store(on, Ordering::Relaxed);
+}
+
+/// The error of a file a rule names (`users_file`, certificates, keys…) as the control API
+/// answers it (#333): the reason (the owner and mode, whether the file exists, a line of
+/// it, such as a user name of an htpasswd file) is for the log, not for whoever holds a
+/// token that may write rules and could probe the host's files with it. `--check-config`
+/// says it all (`set_detailed_errors`).
+pub fn rule_file_error(what: &str, path: &str, detail: &str) -> String {
+	rule_file_error_as(what, path, detail, DETAILED.load(Ordering::Relaxed))
+}
+
+fn rule_file_error_as(what: &str, path: &str, detail: &str, detailed: bool) -> String {
+	let prefix = if what.is_empty() { String::new() } else { format!("{what}: ") };
+	if detailed {
+		return format!("{prefix}{detail}");
+	}
+	if newly_failing(path, detail) {
+		tracing::warn!(event = "config.file", what, file = path, error = detail, "a file a rule names cannot be used");
+	}
+	format!(
+		"{prefix}{path}: cannot be used (missing, not readable, not allowed by the file owner check or not valid); the reason is in rproxy's log (event config.file) and in --check-config"
+	)
+}
+
+/// A file a rule names loaded (#333): a later failure of it is logged again.
+pub fn rule_file_ok(path: &str) {
+	let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+	if let Some(i) = logged.iter().position(|(p, _)| p == path) {
+		logged.remove(i);
+	}
+}
+
+static LOGGED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `path` fails with a reason not logged yet: `config.file` is logged once per file
+/// and reason, not on every retry (the certificate store looks again every
+/// `RPROXY_CERT_CHECK_SECS`). At most `LOGGED_MAX` files are remembered.
+fn newly_failing(path: &str, detail: &str) -> bool {
+	const LOGGED_MAX: usize = 1024;
+	let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+	match logged.iter_mut().find(|(p, _)| p == path) {
+		Some((_, d)) if d == detail => false,
+		Some((_, d)) => {
+			*d = detail.to_string();
+			true
+		}
+		None => {
+			if logged.len() >= LOGGED_MAX {
+				logged.remove(0);
+			}
+			logged.push((path.to_string(), detail.to_string()));
+			true
+		}
+	}
 }
 
 /// The error of a file the owner check refused (not a permission problem of the environment).
@@ -247,7 +327,63 @@ mod tests {
 		// a kernel filesystem is refused whatever the owner check (#319)
 		let e = read("/proc/self/environ", Kind::Secret).unwrap_err();
 		assert!(is_refused(&e) && e.to_string().contains("kernel filesystem"), "{e}");
+		// a directory is refused before anything is read (#333)
+		let e = read(&dir, Kind::Public).unwrap_err();
+		assert!(is_refused(&e) && e.to_string().contains("not a regular file"), "{e}");
 		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn fifos_are_refused_without_waiting() {
+		// a FIFO with no writer would hold open(2) (and a tokio worker) forever (#333);
+		// with the owner check off too
+		let dir = std::env::temp_dir().join(format!("rproxy-files-fifo-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let fifo = dir.join("users");
+		let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+		// SAFETY: a valid C string
+		assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+		let (tx, rx) = std::sync::mpsc::channel();
+		let path = fifo.clone();
+		std::thread::spawn(move || {
+			let _ = tx.send(read(&path, Kind::Secret).map_err(|e| (is_refused(&e), e.to_string())));
+		});
+		let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("read must not wait for a writer");
+		let (refused, message) = result.unwrap_err();
+		assert!(refused && message.contains("not a regular file"), "{message}");
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn read_async_reads_on_a_blocking_thread() {
+		let dir = std::env::temp_dir().join(format!("rproxy-files-async-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let f = dir.join("secret");
+		std::fs::write(&f, b"s3cret\n").unwrap();
+		std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+		assert_eq!(read_to_string_async(&f, Kind::Secret).await.unwrap(), "s3cret\n");
+		assert_eq!(read_async(dir.join("none"), Kind::Secret).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn rule_file_errors_keep_the_reason_for_the_log() {
+		let detail = "/srv/users: line 2: user alice appears twice";
+		let answer = rule_file_error_as("middleware a: users_file", "/srv/users", detail, false);
+		assert!(answer.starts_with("middleware a: users_file: /srv/users: cannot be used"), "{answer}");
+		assert!(!answer.contains("alice") && !answer.contains("line 2"), "{answer}");
+		// --check-config says it all
+		// logged once per file and reason, not on every retry
+		assert!(newly_failing("/srv/once", "mode 644"));
+		assert!(!newly_failing("/srv/once", "mode 644"));
+		assert!(newly_failing("/srv/once", "missing"));
+		assert!(newly_failing("/srv/other", "missing"));
+		// fixed, then broken again the same way: logged again
+		rule_file_ok("/srv/once");
+		assert!(newly_failing("/srv/once", "missing"));
+		assert!(!newly_failing("/srv/other", "missing"), "only the file that loaded is forgotten");
+		let full = rule_file_error_as("middleware a: users_file", "/srv/users", detail, true);
+		assert_eq!(full, format!("middleware a: users_file: {detail}"));
 	}
 
 	#[test]

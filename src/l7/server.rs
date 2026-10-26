@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 use super::access::{AccessEntry, NO_ROUTE};
 use crate::core::bandwidth::{Dir, Gate};
-use super::middleware::auth::{BasicVerdict, ForwardAuth};
+use super::middleware::auth::{BasicVerdict, ClientForwarded, ForwardAuth};
 use super::middleware::ext_authz;
 use super::middleware::oidc::{self, Oidc};
 use super::backend::{self, Dialer, Sender, ServerHealth, Service};
@@ -615,7 +615,12 @@ fn oidc_response(outcome: oidc::Outcome) -> Response<Body> {
 				resp.headers_mut().remove(header::CONTENT_TYPE);
 			}
 			for (k, v) in headers {
-				resp.headers_mut().append(k, v);
+				// the logout page's own Content-Type replaces text/plain
+				if k == header::CONTENT_TYPE {
+					resp.headers_mut().insert(k, v);
+				} else {
+					resp.headers_mut().append(k, v);
+				}
 			}
 			resp
 		}
@@ -672,8 +677,10 @@ fn strip_port(host: &str) -> &str {
 	}
 }
 
-const HOP_BY_HOP: [HeaderName; 8] = [
+const HOP_BY_HOP: [HeaderName; 9] = [
 	header::CONNECTION,
+	// h2c's settings (RFC 9113 §3.2.1 had it listed in Connection), never passed on (#333)
+	HeaderName::from_static("http2-settings"),
 	HeaderName::from_static("keep-alive"),
 	HeaderName::from_static("proxy-connection"),
 	header::PROXY_AUTHENTICATE,
@@ -699,6 +706,39 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 	headers.remove(header::UPGRADE);
 }
 
+/// Removes the headers a client lists in `Connection` (RFC 9110 §7.6.1), at the start of a
+/// request, so that later only rproxy's own and the middlewares' headers are left (#333):
+/// `strip_hop_by_hop` at the backend reads `Connection` again, and would otherwise remove a
+/// header a middleware set under a name the client listed (an identity, `headers`).
+/// Kept for now, and still listed: `upgrade` (an upgrade is decided when forwarding), the
+/// names `strip_hop_by_hop` removes anyway (`TE` says whether trailers are wanted) and `Host`.
+fn drop_connection_listed(headers: &mut HeaderMap) {
+	if !headers.contains_key(header::CONNECTION) {
+		return;
+	}
+	let mut kept: Vec<String> = vec![];
+	let mut listed: Vec<HeaderName> = vec![];
+	for token in headers.get_all(header::CONNECTION).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).map(str::trim) {
+		let Ok(name) = HeaderName::from_bytes(token.as_bytes()) else { continue };
+		if name == header::UPGRADE || name == header::HOST || HOP_BY_HOP.contains(&name) {
+			kept.push(token.to_string());
+		} else {
+			listed.push(name);
+		}
+	}
+	for name in &listed {
+		headers.remove(name);
+	}
+	match HeaderValue::from_str(&kept.join(", ")) {
+		Ok(v) if !kept.is_empty() => {
+			headers.insert(header::CONNECTION, v);
+		}
+		_ => {
+			headers.remove(header::CONNECTION);
+		}
+	}
+}
+
 /// Joins several `cookie` fields into one, separated by "; ".
 /// HTTP/2 (RFC 9113 §8.2.3) and HTTP/3 (RFC 9114 §4.2.1) let clients (Chrome does)
 /// send each cookie as its own field, and require joining them this way before
@@ -715,7 +755,11 @@ fn join_cookie_fields(headers: &mut HeaderMap) {
 	}
 }
 
-/// The protocol a client asks to switch to (`Connection: upgrade` + `Upgrade`).
+/// The protocol a client asks to switch to (`Connection: upgrade` + `Upgrade`), without
+/// HTTP/2 (`h2c`, and `h2`, which RFC 9113 §3.1 does not allow in Upgrade): rproxy speaks
+/// HTTP/2 to clients itself (prior knowledge, ALPN) and would only blindly relay a
+/// connection it can no longer see the requests of (#333). A request asking for nothing
+/// else goes on as plain HTTP/1.1, as RFC 9110 §7.8 lets a server ignore Upgrade.
 fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 	let wants = headers
 		.get_all(header::CONNECTION)
@@ -723,11 +767,22 @@ fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 		.filter_map(|v| v.to_str().ok())
 		.flat_map(|v| v.split(','))
 		.any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
-	if wants {
-		headers.get(header::UPGRADE).cloned()
-	} else {
-		None
+	if !wants {
+		return None;
 	}
+	let value = headers.get(header::UPGRADE)?.to_str().ok()?;
+	let http2 = |p: &str| {
+		let name = p.split('/').next().unwrap_or("").trim();
+		name.eq_ignore_ascii_case("h2c") || name.eq_ignore_ascii_case("h2")
+	};
+	let kept: Vec<&str> = value.split(',').map(str::trim).filter(|p| !p.is_empty() && !http2(p)).collect();
+	if kept.is_empty() {
+		return None;
+	}
+	if kept.len() == value.split(',').filter(|p| !p.trim().is_empty()).count() {
+		return headers.get(header::UPGRADE).cloned();
+	}
+	HeaderValue::from_str(&kept.join(", ")).ok()
 }
 
 enum Failure {
@@ -771,12 +826,24 @@ impl Conn {
 		// dropped on every rule, before middlewares (forward_auth) or copies (mirror) see it
 		req.headers_mut().remove(X_FORWARDED_CLIENT_CERT);
 		req.headers_mut().remove(X_CLIENT_VERIFY);
+		// RFC 7239's Forwarded says the same as X-Forwarded-* (#333): believed only from trusted
+		// proxies. A client's goes now, before middlewares, so one the rule sets (`headers`, a
+		// server's ext_authz) still reaches the backend; forward_auth with trust_forward_header
+		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
+		if req.headers().contains_key(header::FORWARDED) && !self.rt.global.trusts(canonical(self.client.ip())) {
+			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
+			req.headers_mut().remove(header::FORWARDED);
+			req.extensions_mut().insert(ClientForwarded(values));
+		}
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
 		// identities are set by the rule's authentication middlewares alone (#320): a client's
 		// own goes before routing, so a route without authentication cannot receive one either
 		strip_identity(req.headers_mut(), &router.identity_headers);
+		// names the client lists in Connection go now, before middlewares (#333): removed only
+		// at the backend, `Connection: X-Forwarded-User` would take away what a middleware set
+		drop_connection_listed(req.headers_mut());
 		// the path routes, middlewares and backends see (#320): /%61dmin, //admin and
 		// /x/../admin are /admin; a broken percent-encoding (or with http.strict_path a
 		// character backends read differently) is answered 400 below
@@ -1215,7 +1282,7 @@ impl Conn {
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.to_string());
 		if fa.grpc {
-			return self.ext_authz(router, fa, index, parts, along, client, &authority).await;
+			return self.ext_authz(router, fa, index, parts, along, client, &authority, host).await;
 		}
 		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 		let (method, path) = if fa.client_request {
@@ -1270,16 +1337,20 @@ impl Conn {
 		along: Option<Bytes>,
 		client: IpAddr,
 		authority: &str,
+		host: &str,
 	) -> AuthOutcome {
 		let server = &fa.service.servers[index];
 		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
 		let scheme = if self.https { "https" } else { "http" };
-		// the client's headers (all, or `request_headers`) without hop-by-hop ones, and the
-		// client certificate's as rproxy saw it; a name repeated is joined with "," as Envoy does
-		let mut picked = HeaderMap::new();
-		for (name, value) in &parts.headers {
-			if (fa.request_headers.is_empty() || fa.request_headers.contains(name)) && !HOP_BY_HOP.contains(name) && name != header::UPGRADE {
-				picked.append(name.clone(), value.clone());
+		// the client's headers (all, or `request_headers`) without hop-by-hop ones, the same
+		// X-Forwarded-* / X-Real-IP (Forwarded) as HTTP forward_auth (#333: the client's only with
+		// trust_forward_header), and the client certificate's as rproxy saw it; a name repeated
+		// is joined with "," as Envoy does
+		let mut picked = fa.request_headers(parts, client, self.https, host);
+		// Envoy's CheckRequest has the request's content-length among the headers
+		if fa.request_headers.is_empty() || fa.request_headers.contains(&header::CONTENT_LENGTH) {
+			if let Some(v) = parts.headers.get(header::CONTENT_LENGTH) {
+				picked.insert(header::CONTENT_LENGTH, v.clone());
 			}
 		}
 		self.client_cert_headers(&mut picked);

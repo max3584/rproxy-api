@@ -351,6 +351,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）、`tls.client_auth` のあるルールではクライアント証明書の `client_cn`・`client_verify`（`SUCCESS` / `FAILED` / `NONE`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn`。正規化でパスが変わったときは送られたままのパスを `raw_path`（v0.4.17） |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | `oidc` ミドルウェアのサインイン（`user`）、リフレッシュの失敗、プロバイダとのやり取りの失敗、セッションが大きすぎてリフレッシュトークンを持てない |
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
+| `config.file` | ルールが指すファイル（証明書・鍵・`users_file` など）が使えない理由（`what`・`file`・`error`）。制御 API の答えには理由を出さないので、ここで見る（v0.4.18、#333） |
 | `rule.protected_file` | 戻したルール（DB・組の保存・照合・引き継ぎ）が、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密・`/proc` など）を指している（`rule`・`field`・`phase`。パスは出さない。v0.4.17、#319） |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `http.mirror` | `mirror` ミドルウェアの写しの結果（debug。`middleware`、`service`、`backend`、`status`、失敗なら `error`）。クライアントの応答には影響しない |

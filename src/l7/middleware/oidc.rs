@@ -218,7 +218,18 @@ impl Oidc {
 			return self.callback(parts, https, authority, &key).await;
 		}
 		if path == self.logout_path {
-			return self.logout(https, authority).await;
+			return match logout_request(parts, https, authority) {
+				LogoutRequest::Confirm => self.logout_page(),
+				LogoutRequest::Go => self.logout(https, authority).await,
+				LogoutRequest::CrossSite => respond(StatusCode::FORBIDDEN, "sign-out must come from this site"),
+				LogoutRequest::Method => {
+					let mut out = respond(StatusCode::METHOD_NOT_ALLOWED, "use POST (or open the page to sign out)");
+					if let Outcome::Respond { headers, .. } = &mut out {
+						headers.push((header::ALLOW, HeaderValue::from_static("GET, HEAD, POST")));
+					}
+					out
+				}
+			};
 		}
 		if let Some(session) = cookie(&parts.headers, &self.cookie).and_then(|c| self.open::<Session>(&key, &self.cookie, &c)) {
 			if session.exp > now() + REFRESH_EARLY {
@@ -314,6 +325,23 @@ impl Oidc {
 		// only paths on this site, never another origin
 		let back = if pending.return_to.starts_with('/') && !pending.return_to.starts_with("//") { pending.return_to } else { "/".into() };
 		redirect(&back, cookies)
+	}
+
+	/// A GET of the logout path (#333): a page with a button that POSTs to it. Signing out on
+	/// a GET would let any other site sign users out (an image, a link it makes them follow).
+	fn logout_page(&self) -> Outcome {
+		let action = html_escape(&self.logout_path);
+		let body = format!(
+			"<!doctype html>\n<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Sign out</title></head>\n<body><form method=\"post\" action=\"{action}\"><button type=\"submit\">Sign out</button></form></body></html>"
+		);
+		let headers = vec![
+			(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+			(header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+			// the button may not be framed by another site (clickjacking) and the page runs nothing
+			(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'")),
+			(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY")),
+		];
+		Outcome::Respond { status: StatusCode::OK, headers, body }
 	}
 
 	async fn logout(&self, https: bool, authority: &str) -> Outcome {
@@ -714,6 +742,56 @@ fn endpoint(issuer: &str, key: &str, value: String) -> Result<String, String> {
 	Ok(value)
 }
 
+/// What a request for the logout path asks.
+#[derive(Debug, PartialEq, Eq)]
+enum LogoutRequest {
+	/// GET / HEAD: the page with the sign-out button.
+	Confirm,
+	/// A POST from this site (or from a client that is not a browser): sign out.
+	Go,
+	/// A POST another site made the browser send (CSRF).
+	CrossSite,
+	Method,
+}
+
+/// A POST signs out only when the browser says it comes from this site (#333): `Origin` is
+/// this scheme and authority, or (no `Origin`) `Sec-Fetch-Site` is `same-origin` or `none`
+/// (typed by the user). A client that sends neither is not a browser another site could use.
+fn logout_request(parts: &Parts, https: bool, authority: &str) -> LogoutRequest {
+	if parts.method == Method::GET || parts.method == Method::HEAD {
+		return LogoutRequest::Confirm;
+	}
+	if parts.method != Method::POST {
+		return LogoutRequest::Method;
+	}
+	let ours = format!("{}://{authority}", if https { "https" } else { "http" });
+	if let Some(origin) = parts.headers.get(header::ORIGIN) {
+		return match origin.to_str() {
+			Ok(o) if o.eq_ignore_ascii_case(&ours) => LogoutRequest::Go,
+			_ => LogoutRequest::CrossSite,
+		};
+	}
+	match parts.headers.get("sec-fetch-site").map(|v| v.as_bytes()) {
+		None | Some(b"same-origin") | Some(b"none") => LogoutRequest::Go,
+		Some(_) => LogoutRequest::CrossSite,
+	}
+}
+
+fn html_escape(text: &str) -> String {
+	let mut out = String::with_capacity(text.len());
+	for c in text.chars() {
+		match c {
+			'&' => out.push_str("&amp;"),
+			'<' => out.push_str("&lt;"),
+			'>' => out.push_str("&gt;"),
+			'"' => out.push_str("&quot;"),
+			'\'' => out.push_str("&#39;"),
+			c => out.push(c),
+		}
+	}
+	out
+}
+
 fn set_cookie(name: &str, value: &str, https: bool, max_age: Option<u64>) -> Option<HeaderValue> {
 	let mut c = format!("{name}={value}; Path=/; HttpOnly; SameSite=Lax");
 	if https {
@@ -728,6 +806,30 @@ fn set_cookie(name: &str, value: &str, https: bool, max_age: Option<u64>) -> Opt
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn logout_needs_a_post_from_this_site() {
+		// #333: GET shows the button; a POST signs out only from this site
+		let req = |method: &str, headers: &[(&str, &str)]| {
+			let mut b = hyper::Request::builder().method(method).uri("/_rproxy/oidc/logout");
+			for (k, v) in headers {
+				b = b.header(*k, *v);
+			}
+			b.body(()).unwrap().into_parts().0
+		};
+		let ask = |p: &Parts| logout_request(p, true, "app.test");
+		assert_eq!(ask(&req("GET", &[])), LogoutRequest::Confirm);
+		assert_eq!(ask(&req("HEAD", &[])), LogoutRequest::Confirm);
+		assert_eq!(ask(&req("POST", &[("origin", "https://app.test")])), LogoutRequest::Go);
+		assert_eq!(ask(&req("POST", &[("origin", "https://evil.test")])), LogoutRequest::CrossSite);
+		assert_eq!(ask(&req("POST", &[("origin", "http://app.test")])), LogoutRequest::CrossSite, "another scheme");
+		assert_eq!(ask(&req("POST", &[("origin", "null")])), LogoutRequest::CrossSite);
+		assert_eq!(ask(&req("POST", &[("sec-fetch-site", "cross-site")])), LogoutRequest::CrossSite);
+		assert_eq!(ask(&req("POST", &[("sec-fetch-site", "same-origin")])), LogoutRequest::Go);
+		assert_eq!(ask(&req("POST", &[])), LogoutRequest::Go, "not a browser");
+		assert_eq!(ask(&req("DELETE", &[])), LogoutRequest::Method);
+		assert_eq!(html_escape("/a\"b<c>&'"), "/a&quot;b&lt;c&gt;&amp;&#39;");
+	}
 
 	fn oidc(dir: &std::path::Path) -> Oidc {
 		oidc_for(dir, "http://127.0.0.1:1/realms/x", "app")
@@ -803,8 +905,10 @@ mod tests {
 			cookie_name: None,
 			groups_claim: None,
 		};
+		// the control API's answer does not tell what is in the file (#333); the log does
 		let e = Oidc::new("sso", settings(d.join("cookie").to_str().unwrap())).unwrap_err();
-		assert!(e.message.contains("16 characters"), "{}", e.message);
+		assert!(e.message.contains("cookie_secret_file") && e.message.contains("cannot be used"), "{}", e.message);
+		assert!(parse_key("short").unwrap_err().contains("16 characters"));
 		let e = Oidc::new("sso", settings("/nonexistent/cookie")).unwrap_err();
 		assert!(e.message.contains("cookie_secret_file"), "{}", e.message);
 		std::fs::remove_dir_all(d).unwrap();
