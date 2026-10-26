@@ -609,8 +609,13 @@ impl Store {
 		self.meta.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|m| m.created_by.clone())
 	}
 
-	/// A row known not to make a rule is looked at again (its rule was deleted, fixed or
-	/// forgotten, #327).
+	/// What the view shows of a stored rule (`created_by`, ...) is forgotten: the key is
+	/// another rule's now (a restored rule set took it, #327).
+	pub fn forget_meta(&self, key: &Key) {
+		self.meta.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+	}
+
+	/// A row known not to make a rule is looked at again.
 	pub fn forget_invalid_row(&self, key: &Key) {
 		self.invalid.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
 	}

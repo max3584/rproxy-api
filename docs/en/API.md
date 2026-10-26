@@ -1060,8 +1060,8 @@ A rule restored from the database (`forward_rules`, `rproxy_rules`), or handed o
 - A live upgrade (SIGUSR2) hands the body over as stored; the new process validates it again (it runs if the new version takes it).
 - The periodic check (`RPROXY_PERSIST_CHECK_SECS`): a `rproxy_rules` row that changed is tried again; one that is gone takes the rule off the list.
 - A row whose `listen_addr` is not an IP address cannot be named through the API: only logged (`rule.failed`) as before.
-- Its key and secret files count as its owner's (`created_by` for `api`): another token may not name them (`409 file_in_use`); the owner's fixing PATCH may keep them. Deleting it forgets the owner too.
-- A rule of a rule set restored at startup or after a live upgrade with the same key wins: that rule stays and this one is taken off the list (`restore.conflict`; the periodic check keeps the row as a `restore.conflict`).
+- Its key and secret files count as its owner's (`created_by` for `api`): another token may not name them (`409 file_in_use`); a PATCH that fixes it may keep them (any token allowed to PATCH the rule, as for a running rule). Deleting it forgets the owner too.
+- A rule of a rule set restored at startup or after a live upgrade with the same key wins: that rule stays and this one is taken off the list (`restore.conflict`; the periodic check keeps the row as a `restore.conflict`). When the set leaves that rule out (it does not validate in this version, its ports overlap, ...), this one stays as it is. A rule set's `PUT` with a rule at its key is refused up front, as for any rule outside the set (`409`, `already_exists` in `errors`). The `created_by` of the row whose key the set took is forgotten.
 - Counted in `rproxy_rules{state="failed"}` of `/metrics`, with `rproxy_rule_up` 0.
 
 ## Endpoints

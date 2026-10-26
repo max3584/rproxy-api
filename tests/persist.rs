@@ -422,12 +422,17 @@ async fn invalid_rules_keep_their_files_and_count() {
 		updated_by: "ci".into(),
 		updated_at: 1_790_000_000,
 	};
-	let (mine, shared, set_port) = (free_port(), free_port(), free_port());
+	let (mine, shared, set_port, kept_port, put_port) = (free_port(), free_port(), free_port(), free_port(), free_port());
 	let mut bad = with_key(mine);
 	bad["allow_from"] = json!(["not-an-address"]);
 	let mut bad_set_key = rule("tcp", set_port, backend);
 	bad_set_key["allow_from"] = json!(["not-an-address"]);
-	let rows = vec![row(bad.clone()), row(bad_set_key)];
+	let invalid_at = |port: u16| {
+		let mut r = rule("tcp", port, backend);
+		r["allow_from"] = json!(["not-an-address"]);
+		r
+	};
+	let rows = vec![row(bad.clone()), row(bad_set_key), row(invalid_at(kept_port)), row(invalid_at(put_port))];
 	for r in &rows {
 		store.memory_put_row(r.clone());
 	}
@@ -444,14 +449,33 @@ async fn invalid_rules_keep_their_files_and_count() {
 		updated_by: "ci".into(),
 		updated_at: 1_790_000_000,
 	};
-	assert_eq!(h.registry.restore_rulesets(vec![set]).await, 1);
+	// a set whose rule with the key of another one is left out (it does not validate here either)
+	let leaves_out = StoredSet {
+		name: "ci/leaves-out".into(),
+		generation: 1,
+		etag: String::new(),
+		owner: "ci".into(),
+		rules: vec![serde_json::from_value(invalid_at(kept_port)).unwrap(), serde_json::from_value(rule("tcp", free_port(), backend)).unwrap()],
+		spec_version: 1,
+		updated_by: "ci".into(),
+		updated_at: 1_790_000_000,
+	};
+	assert_eq!(h.registry.restore_rulesets(vec![set, leaves_out]).await, 2);
 	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{set_port}"), "ci", None).await;
 	assert_eq!((status, &v["state"], &v["ruleset"]), (StatusCode::OK, &json!("running"), &json!("ci/set")), "{v}");
+	let set_key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{set_port}").parse().unwrap() };
+	assert_eq!(store.created_by(&set_key), None, "the row's created_by stays with the key");
+	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{kept_port}"), "ci", None).await;
+	assert_eq!((status, &v["state"], &v["origin"], &v["created_by"]), (StatusCode::OK, &json!("failed"), &json!("api"), &json!("ci")), "kept: {v}");
+	// a PUT of a set with its key: refused up front as for any rule outside the set
+	let (status, v) = call(&h, Method::PUT, "/rulesets/ci/other", "ci", Some(json!({"generation": 1, "rules": [rule("tcp", put_port, backend)]}))).await;
+	assert_eq!((status, v["errors"][0]["code"].as_str()), (StatusCode::CONFLICT, Some("already_exists")), "{v}");
+	assert!(v["errors"][0]["message"].as_str().unwrap().contains("does not belong to this rule set"), "{v}");
 
 	// counted in /metrics
 	let text = h.registry.metrics().await;
 	assert!(text.contains(&format!("rproxy_rule_up{{protocol=\"tcp\",listen=\"127.0.0.1:{mine}\"}} 0")), "{text}");
-	assert!(text.contains("rproxy_rules{state=\"failed\"} 1"), "{text}");
+	assert!(text.contains("rproxy_rules{state=\"failed\"} 3"), "{text}");
 
 	// another token may not name its key
 	let (status, v) = call(&h, Method::POST, "/rules", "ui", Some(with_key(free_port()))).await;

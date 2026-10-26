@@ -755,16 +755,44 @@ impl Registry {
 		gone
 	}
 
-	/// Rule sets restored at startup or after a live upgrade win over restored rules that
-	/// did not validate with the keys of their rules (#327): those are taken off the list
-	/// (`restore.conflict`), as a running rule of the UI wins over a row.
-	pub(crate) fn yield_invalid_to(&self, set: &str, reqs: &[RuleRequest]) {
-		for r in reqs {
-			let Ok(listen) = crate::core::rule::parse_listen(&r.listen_addr, r.listen_port) else { continue };
-			let key = Key { protocol: r.protocol, listen };
-			if self.drop_invalid(&key).is_some() {
-				warn!(event = "restore.conflict", rule = %key, ruleset = set,
-					"a restored rule that does not validate has the key of a rule of a restored rule set; the rule set's rule is kept");
+	/// A rule set restored at startup or after a live upgrade wins over restored rules that
+	/// did not validate with the keys of its rules (#327), as a running rule of the UI wins
+	/// over a row: they are put aside while the set is applied (`settle_invalid` after).
+	pub(crate) fn stash_invalid(&self, reqs: &[RuleRequest]) -> Vec<(Key, Invalid)> {
+		let mut invalid = self.invalid.lock().unwrap_or_else(|e| e.into_inner());
+		reqs.iter()
+			.filter_map(|r| crate::core::rule::parse_listen(&r.listen_addr, r.listen_port).ok().map(|listen| Key { protocol: r.protocol, listen }))
+			.filter_map(|key| invalid.remove(&key).map(|i| (key, i)))
+			.collect()
+	}
+
+	/// After a restored set was applied: the rules `stash_invalid` put aside whose keys the
+	/// set's rules hold now are gone (`restore.conflict`; who made them and their row's
+	/// `created_by` are forgotten); the others come back as they were.
+	pub(crate) async fn settle_invalid(&self, set: &str, stashed: Vec<(Key, Invalid)>) {
+		if stashed.is_empty() {
+			return;
+		}
+		let rules = self.rules.lock().await;
+		let mut invalid = self.invalid.lock().unwrap_or_else(|e| e.into_inner());
+		for (key, entry) in stashed {
+			match rules.get(&key) {
+				None => {
+					invalid.entry(key).or_insert(entry);
+				}
+				Some(e) => {
+					if e.spec().ruleset.as_deref() == Some(set) {
+						warn!(event = "restore.conflict", rule = %key, ruleset = set,
+							"a restored rule that does not validate has the key of a rule of a restored rule set; the rule set's rule is kept");
+					} else {
+						warn!(event = "rule.duplicate", rule = %key, phase = "restore");
+					}
+					self.owners.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+					if let Some(store) = self.persist().filter(|_| entry.origin == Origin::Api) {
+						store.forget_meta(&key);
+						store.forget_invalid_row(&key);
+					}
+				}
 			}
 		}
 	}
@@ -784,6 +812,12 @@ impl Registry {
 	}
 
 	/// `owner_of` by the rule's key, origin and set (a rule that did not validate has no spec).
+	///
+	/// The `owners` map wins over `created_by`: it holds the token that made the rule in
+	/// this process (or the old one of a live upgrade), the same as `created_by` for an
+	/// `api` rule made here. It is never stale: an entry is written as the rule goes into
+	/// the table (`create_spec_in`) and removed with it (`take`, `drop_invalid`, a stashed
+	/// rule a set took), and a rule made without a token (restored) clears it.
 	fn owner_of_key(&self, key: &Key, origin: Origin, ruleset: Option<&str>) -> crate::net::protected::Owner {
 		use crate::net::protected::Owner;
 		if origin == Origin::Static {

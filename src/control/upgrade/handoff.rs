@@ -829,7 +829,7 @@ impl State {
 					continue;
 				}
 			};
-			registry.yield_invalid_to(&set.name, &rules);
+			let stashed = registry.stash_invalid(&rules);
 			for (i, r) in rules.iter().enumerate() {
 				registry.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "handoff");
 			}
@@ -846,6 +846,7 @@ impl State {
 			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
 			}
+			registry.settle_invalid(&set.name, stashed).await;
 		}
 		registry.warn_shared_files("handoff").await;
 	}
