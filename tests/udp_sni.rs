@@ -278,8 +278,9 @@ fn dtls_hello_in_two(name: &str) -> [Vec<u8>; 2] {
 	[record(0, cut), record(cut, body.len())]
 }
 
-// spoofed (or many) sources of one network starting ClientHellos they never finish take at most 64 of the port's
-// slots for sessions waiting for the rest; a client elsewhere still gets through
+// spoofed (or many) sources of one network starting ClientHellos they never finish hold at most 64 of the port's
+// slots for sessions waiting for the rest (past that they give up their own oldest); a client elsewhere, and one of
+// the same network, still get through
 #[tokio::test]
 async fn sessions_waiting_for_their_hello_are_bounded_per_source_prefix() {
 	let named = udp_backend("D:").await;
@@ -289,7 +290,7 @@ async fn sessions_waiting_for_their_hello_are_bounded_per_source_prefix() {
 	let (status, v) = h.post(sni_rule(port, plain, json!([route(&["d.test"], named)]), "default")).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	let [first, rest] = dtls_hello_in_two("d.test");
-	// 100 sources of 127.0.9.0/24 send the first half only (their sessions wait SNI_WAIT, 3 s)
+	// 100 sources of 127.0.9.0/24 send the first half only (their sessions wait SNI_WAIT, 3 s): the 36 oldest are given up
 	let mut flood = vec![];
 	for _ in 0..100 {
 		let sock = UdpSocket::bind("127.0.9.1:0").await.unwrap();
@@ -298,18 +299,20 @@ async fn sessions_waiting_for_their_hello_are_bounded_per_source_prefix() {
 	}
 	let path = format!("/rules/udp/127.0.0.1/{port}");
 	wait_for(&h, &path, |v| v["stats"]["dropped"].as_u64() == Some(100 - 64)).await;
-	// a client of 127.0.0.0/24, in two datagrams: routed by its name
-	let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-	sock.connect(("127.0.0.1", port)).await.unwrap();
-	sock.send(&first).await.unwrap();
-	sock.send(&rest).await.unwrap();
-	let mut buf = [0u8; 1024];
-	for want in [&first, &rest] {
-		let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await.expect("routed").unwrap();
-		assert_eq!(buf[..n], [b"D:", &want[..]].concat());
+	// a client of 127.0.0.0/24 and one of the flooded 127.0.9.0/24, in two datagrams each: routed by their name
+	for from in ["127.0.0.1", "127.0.9.7"] {
+		let sock = UdpSocket::bind((from, 0)).await.unwrap();
+		sock.connect(("127.0.0.1", port)).await.unwrap();
+		sock.send(&first).await.unwrap();
+		sock.send(&rest).await.unwrap();
+		let mut buf = [0u8; 1024];
+		for want in [&first, &rest] {
+			let n = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await.expect("routed").unwrap();
+			assert_eq!(buf[..n], [b"D:", &want[..]].concat(), "{from}");
+		}
 	}
-	let (_, v) = h.get(&path).await;
-	assert_eq!(v["stats"]["dropped"], 100 - 64, "{v}");
+	// the client of the flooded network gave up one more of its oldest
+	wait_for(&h, &path, |v| v["stats"]["dropped"].as_u64() == Some(100 - 64 + 1)).await;
 }
 
 #[tokio::test]

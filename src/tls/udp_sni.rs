@@ -104,8 +104,9 @@ struct Reassembly {
 }
 
 impl Reassembly {
-	/// Takes `bytes` at `offset` (bytes already received are kept as they were).
-	/// False when it would go past `MAX_HELLO` or leave more than `MAX_PIECES` runs.
+	/// Takes `bytes` at `offset`. Bytes already received are kept as they were (the
+	/// first wins where fragments overlap and disagree). False when it would go past
+	/// `MAX_HELLO` or leave more than `MAX_PIECES` runs.
 	fn insert(&mut self, offset: usize, bytes: &[u8]) -> bool {
 		let Some(end) = offset.checked_add(bytes.len()).filter(|e| *e <= MAX_HELLO) else {
 			return false;
@@ -116,18 +117,21 @@ impl Reassembly {
 		if offset > self.data.len() {
 			return self.hold(offset, bytes);
 		}
-		let have = self.data.len();
-		self.data.extend_from_slice(&bytes[have - offset..]);
-		// the runs the start now reaches
-		while let Some(first) = self.pieces.first_entry() {
-			let at = *first.key();
-			if at > self.data.len() {
-				break;
+		// the new bytes up to the next run, the run (its bytes, not the new ones), and so on
+		loop {
+			let have = self.data.len();
+			let stop = self.pieces.first_key_value().map_or(end, |(at, _)| (*at).min(end)).max(have);
+			if stop > have {
+				grow(&mut self.data, stop - have);
+				self.data.extend_from_slice(&bytes[have - offset..stop - offset]);
 			}
+			let Some(first) = self.pieces.first_entry().filter(|e| *e.key() <= self.data.len()) else { break };
+			let at = *first.key();
 			let (from, len) = first.remove();
 			self.held -= len;
 			let have = self.data.len();
 			if at + len > have {
+				grow(&mut self.data, at + len - have);
 				self.data.extend_from_slice(&self.arena[from + (have - at)..from + len]);
 			}
 		}
@@ -163,10 +167,11 @@ impl Reassembly {
 	/// A new run at `at`: the end of the run before when that ends right there and was the last one written.
 	fn keep(&mut self, at: usize, bytes: &[u8]) {
 		let arena_end = self.arena.len();
-		if arena_end == 0 {
-			// fragments are about the same size: room for a few more like this one
-			self.arena.reserve(4 * bytes.len());
+		if self.arena.capacity() == 0 {
+			// fragments are about the same size: room for a few more like this one, never past the message's end
+			self.arena.reserve_exact((4 * bytes.len()).min(MAX_HELLO - at).max(bytes.len()));
 		}
+		grow(&mut self.arena, bytes.len());
 		self.arena.extend_from_slice(bytes);
 		self.held += bytes.len();
 		if let Some((s, (from, len))) = self.pieces.range_mut(..at).next_back() {
@@ -184,9 +189,25 @@ impl Reassembly {
 	}
 
 	/// Bytes held.
+	#[cfg(test)]
 	fn held(&self) -> usize {
 		self.data.len() + self.held
 	}
+
+	/// Bytes allocated.
+	fn allocated(&self) -> usize {
+		self.data.capacity() + self.arena.capacity()
+	}
+}
+
+/// Room for `extra` more bytes in `v`, which never holds more than `MAX_HELLO`: it grows
+/// as a `Vec` does, but never to more than `MAX_HELLO` (what is allocated stays bounded).
+fn grow(v: &mut Vec<u8>, extra: usize) {
+	if v.capacity() - v.len() >= extra {
+		return;
+	}
+	let target = (v.len() + extra).max((2 * v.capacity()).min(MAX_HELLO));
+	v.reserve_exact(target - v.len());
 }
 
 pub mod dtls {
@@ -196,8 +217,8 @@ pub mod dtls {
 	const CLIENT_HELLO: u8 = 1;
 	/// ClientHello messages tracked at once (by message_seq).
 	const MAX_MESSAGES: usize = 4;
-	/// Bytes held for all of them: a ClientHello and the one sent again with a cookie.
-	const MAX_HELD: usize = 2 * MAX_HELLO;
+	/// Bytes allocated for all of them: a ClientHello and the one sent again with a cookie.
+	pub(super) const MAX_HELD: usize = 2 * MAX_HELLO;
 
 	/// A DTLS handshake record (DTLS 1.0 0xfeff, 1.2 0xfefd, 1.3 uses 0xfefd too).
 	pub fn looks_like(d: &[u8]) -> bool {
@@ -214,9 +235,8 @@ pub mod dtls {
 
 	impl Assembler {
 		/// Bytes allocated for the messages' bytes.
-		#[cfg(test)]
 		pub(super) fn allocated(&self) -> usize {
-			self.messages.values().map(|(_, m)| m.data.capacity() + m.arena.capacity()).sum()
+			self.messages.values().map(|(_, m)| m.allocated()).sum()
 		}
 
 		pub fn push(&mut self, datagram: &[u8]) -> Sniff {
@@ -272,7 +292,8 @@ pub mod dtls {
 				if message.prefix() >= total {
 					return Some(Sniff::Done(sni::hello_server_name(&message.data[..total], true)));
 				}
-				if self.messages.values().map(|(_, m)| m.held()).sum::<usize>() > MAX_HELD {
+				// what is allocated, not only held, so that nothing grows past it
+				if self.allocated() > MAX_HELD {
 					return Some(Sniff::Done(None));
 				}
 			}
@@ -497,6 +518,12 @@ pub mod quic {
 	}
 
 	impl Assembler {
+		/// Bytes allocated for the CRYPTO stream.
+		#[cfg(test)]
+		pub(super) fn allocated(&self) -> usize {
+			self.crypto.allocated()
+		}
+
 		pub fn push(&mut self, datagram: &[u8]) -> Sniff {
 			let mut p = datagram;
 			// coalesced packets (RFC 9000 §12.2): long headers until a short one
@@ -1206,5 +1233,51 @@ mod tests {
 		assert_eq!(Sniffer::default().push(&initial(Version::V1, &dcid, 0, &frames, b"")), Sniff::Done(None));
 		let spent = thread_cpu() - started;
 		assert!(spent < std::time::Duration::from_millis(500), "{spent:?} of CPU");
+	}
+
+	// the bytes received first are kept where a later fragment overlaps them with other bytes, whichever way the
+	// later one comes in (past a gap, or reaching the start)
+	#[test]
+	fn reassembly_keeps_the_first_bytes_where_fragments_disagree() {
+		let mut r = Reassembly::default();
+		assert!(r.insert(5, b"BBBBB"));
+		assert!(r.insert(3, b"CCCCCCCCCC")); // 3..13 over 5..10
+		assert!(r.insert(0, b"AAAAAAAAAAAAAAAA")); // 0..16 over all of it
+		assert_eq!(r.data, b"AAACCBBBBBCCCAAA");
+		assert!(r.pieces.is_empty());
+		assert!(r.insert(2, b"ZZZZ"), "already there");
+		assert_eq!(r.data, b"AAACCBBBBBCCCAAA");
+	}
+
+	// #332 review: a large fragment past a gap must not reserve several times its size (one 64 KiB datagram with two
+	// 32 KiB fragments at offset 1 took ~320 KiB): what is allocated stays within the bound, not only what is held
+	#[test]
+	fn large_out_of_order_fragments_stay_within_the_allocation_bound() {
+		let mut a = dtls::Assembler::default();
+		let grams = dtls_flood((0..2).map(|seq| (seq, MAX_HELLO, 1, vec![0x55; 32_700])));
+		assert_eq!(grams.len(), 1, "one datagram");
+		match a.push(&grams[0]) {
+			Sniff::NeedMore => assert!(a.allocated() <= dtls::MAX_HELD, "{} bytes allocated", a.allocated()),
+			other => assert_eq!(other, Sniff::Done(None)),
+		}
+		// more of them (other message_seq, other datagrams): given up before going past the bound
+		for seq in 2..4 {
+			let gram = dtls_flood(std::iter::once((seq, MAX_HELLO, 1, vec![0x55; 32_700]))).remove(0);
+			match a.push(&gram) {
+				Sniff::NeedMore => assert!(a.allocated() <= dtls::MAX_HELD, "{} bytes allocated", a.allocated()),
+				other => {
+					assert_eq!(other, Sniff::Done(None));
+					break;
+				}
+			}
+		}
+		// QUIC: one large CRYPTO frame at offset 1
+		let mut q = quic::Assembler::default();
+		let packet = initial(Version::V1, &[7; 8], 0, &crypto_frame(1, &[0x55; 32_000]), b"");
+		assert_eq!(q.push(&packet), Sniff::NeedMore);
+		assert!(q.allocated() <= MAX_HELLO, "{} bytes allocated", q.allocated());
+		// and the rest: the ClientHello cannot be read from zeros, but nothing grows past the message either
+		let _ = q.push(&initial(Version::V1, &[7; 8], 1, &crypto_frame(0, &[0x01]), b""));
+		assert!(q.allocated() <= 2 * MAX_HELLO, "{} bytes allocated", q.allocated());
 	}
 }

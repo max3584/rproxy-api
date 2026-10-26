@@ -38,8 +38,8 @@ const SNI_MAX_BYTES: usize = 64 * 1024;
 /// Sessions of one port reading their server name over more than one datagram
 /// at the same time (`SniSlots`); beyond this the oldest is given up.
 const SNI_MAX_PENDING: usize = 4096;
-/// ... of them from one source prefix (`SNI_PREFIX_V4` / `_V6`); beyond this, new
-/// ones from there are dropped (they retransmit), whatever the others do (#332).
+/// ... of them from one source prefix (`SNI_PREFIX_V4` / `_V6`); beyond this, the
+/// prefix's own oldest is given up for the new one, whatever the others do (#332).
 const SNI_MAX_PENDING_PER_PREFIX: usize = 64;
 const SNI_PREFIX_V4: u8 = 24;
 const SNI_PREFIX_V6: u8 = 48;
@@ -125,10 +125,11 @@ impl Port {
 /// The slots of the sessions of one port that hold their first datagrams while their
 /// server name comes in more than one datagram (`sniff`; a ClientHello in one datagram,
 /// the usual case, takes none). Sources can be spoofed (#332): one prefix (IPv4 /24,
-/// IPv6 /48) takes at most `per_prefix` of them, so a flood from one network cannot
-/// take the slots of the others; when all are taken (a flood from everywhere), the
-/// oldest is given up for the new one, so a client still gets its next datagram
-/// in, unless the flood fills every slot within that time.
+/// IPv6 /48) holds at most `per_prefix` of them, so a flood from one network cannot
+/// take the slots of the others. Past that, the prefix's own oldest slot is given up
+/// for the new one, and when all are taken (a flood from everywhere) the oldest of all:
+/// a new session is never refused, so a client (of the flooded network too) still gets
+/// its next datagram in, unless the flood takes that many slots in the meantime.
 struct SniSlots {
 	max: usize,
 	per_prefix: usize,
@@ -138,7 +139,8 @@ struct SniSlots {
 #[derive(Default)]
 struct SniTable {
 	taken: usize,
-	by_prefix: HashMap<IpAddr, usize>,
+	/// The live slots of each prefix, oldest first (at most `per_prefix`).
+	by_prefix: HashMap<IpAddr, VecDeque<Arc<SlotState>>>,
 	/// Slots in the order they were taken; given back ones are skipped (and cleared out now and then).
 	order: VecDeque<Arc<SlotState>>,
 }
@@ -163,11 +165,19 @@ impl SniTable {
 			return;
 		}
 		self.taken -= 1;
-		if let Some(n) = self.by_prefix.get_mut(&state.prefix) {
-			*n -= 1;
-			if *n == 0 {
+		if let Some(slots) = self.by_prefix.get_mut(&state.prefix) {
+			slots.retain(|s| !std::ptr::eq(Arc::as_ptr(s), state));
+			if slots.is_empty() {
 				self.by_prefix.remove(&state.prefix);
 			}
+		}
+	}
+
+	/// Gives `state` up for a newer slot: its session ends.
+	fn give_up(&mut self, state: &SlotState) {
+		if !state.done.load(Ordering::Relaxed) {
+			self.give_back(state);
+			state.given_up.cancel();
 		}
 	}
 }
@@ -177,19 +187,17 @@ impl SniSlots {
 		SniSlots { max: max.max(1), per_prefix, table: Mutex::default() }
 	}
 
-	/// A slot for a session of `client`; None when its prefix has all it may take.
-	fn take(self: &Arc<Self>, client: IpAddr) -> Option<SniSlot> {
+	/// A slot for a session of `client`, giving up the oldest of its prefix (or of all) when full.
+	fn take(self: &Arc<Self>, client: IpAddr) -> SniSlot {
 		let prefix = limits::source_key(client, SNI_PREFIX_V4, SNI_PREFIX_V6);
 		let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
-		if t.by_prefix.get(&prefix).is_some_and(|n| *n >= self.per_prefix) {
-			return None;
+		while t.by_prefix.get(&prefix).is_some_and(|slots| slots.len() >= self.per_prefix.max(1)) {
+			let Some(oldest) = t.by_prefix.get_mut(&prefix).and_then(VecDeque::pop_front) else { break };
+			t.give_up(&oldest);
 		}
 		while t.taken >= self.max {
 			let Some(oldest) = t.order.pop_front() else { break };
-			if !oldest.done.load(Ordering::Relaxed) {
-				t.give_back(&oldest);
-				oldest.given_up.cancel();
-			}
+			t.give_up(&oldest);
 		}
 		if t.order.len() >= 2 * self.max {
 			t.order.retain(|s| !s.done.load(Ordering::Relaxed));
@@ -197,8 +205,8 @@ impl SniSlots {
 		let state = Arc::new(SlotState { prefix, done: AtomicBool::new(false), given_up: CancellationToken::new() });
 		t.order.push_back(state.clone());
 		t.taken += 1;
-		*t.by_prefix.entry(prefix).or_default() += 1;
-		Some(SniSlot { slots: self.clone(), state })
+		t.by_prefix.entry(prefix).or_default().push_back(state.clone());
+		SniSlot { slots: self.clone(), state }
 	}
 }
 
@@ -292,6 +300,11 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 							}
 							_ => {
 								// a new session: within the limits, or the datagram is dropped
+								// the default cap first: a refused datagram spends nothing of the source's `limits`
+								let Some(counted) = count_session(&rt, limiter.as_deref()) else {
+									limits::refused(&rt, client, Reason::MaxConnections, "udp");
+									return;
+								};
 								let permit = match limiter.as_ref().map(|l| l.admit(client.ip())) {
 									None => None,
 									Some(Ok(p)) => Some(p),
@@ -299,10 +312,6 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 										limits::refused(&rt, client, reason, "udp");
 										return;
 									}
-								};
-								let Some(counted) = count_session(&rt, limiter.as_deref()) else {
-									limits::refused(&rt, client, Reason::MaxConnections, "udp");
-									return;
 								};
 								let admitted = Admitted { _permit: permit, _counted: counted };
 								let id = next_id.fetch_add(1, Ordering::Relaxed);
@@ -718,8 +727,8 @@ fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Option<Picked
 /// Holds a new session's first datagrams until its server name is read (DTLS /
 /// QUIC, `udp_sni`), for at most `SNI_WAIT` and `SNI_MAX_*`. The name (None when
 /// there is none or it cannot be read) and the datagrams, which must still be
-/// sent on. None: the rule stopped, or the session could not get or keep one of the
-/// port's `SniSlots` (needed once one datagram is not enough).
+/// sent on. None: the rule stopped, or the session's slot of the port's `SniSlots`
+/// (taken once one datagram is not enough) was given up for a newer one.
 async fn sniff(
 	rt: &Runtime,
 	from_client: &mut mpsc::Receiver<Vec<u8>>,
@@ -754,14 +763,7 @@ async fn sniff(
 			Sniff::Done(name) => return Some((name, first)),
 			Sniff::Unknown => return Some((None, first)),
 			Sniff::NeedMore if first.len() >= SNI_MAX_DATAGRAMS || bytes >= SNI_MAX_BYTES => return Some((None, first)),
-			Sniff::NeedMore if slot.is_none() => match slots.take(client) {
-				Some(s) => slot = Some(s),
-				None => {
-					rt.stats.dropped();
-					debug!(event = "udp.drop", rule = %rt.key, reason = "too many sessions of the source prefix reading their server name");
-					return None;
-				}
-			},
+			Sniff::NeedMore if slot.is_none() => slot = Some(slots.take(client)),
 			Sniff::NeedMore => {}
 		}
 	}
@@ -1072,34 +1074,45 @@ mod tests {
 		(t.taken, t.by_prefix.len())
 	}
 
-	// #332: spoofed sources of one network take at most their share of the slots, never those of another network
+	fn given_up(s: &SniSlot) -> bool {
+		s.state.given_up.is_cancelled()
+	}
+
+	// #332: spoofed sources of one network hold at most their share of the slots, never those of another network;
+	// past it they give up their own oldest, so a client of the flooded network still gets a slot too
 	#[test]
 	fn sni_slots_are_bounded_per_source_prefix() {
 		let slots = Arc::new(SniSlots::new(8, 3));
-		let flood: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("192.0.2.{i}"))).unwrap()).collect();
-		// the rest of 192.0.2.0/24, any address in it, gets none
-		assert!(slots.take(ip("192.0.2.200")).is_none());
-		assert!(slots.take(ip("::ffff:192.0.2.9")).is_none(), "IPv4-mapped is the same source");
-		// another /24 and an IPv6 /48 still do
-		let other = slots.take(ip("198.51.100.1")).unwrap();
-		let v6: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("2001:db8:1:{i}::1"))).unwrap()).collect();
-		assert!(slots.take(ip("2001:db8:1:ffff::1")).is_none(), "one /48");
-		assert!(slots.take(ip("2001:db8:2::1")).is_some(), "another /48 (given back at once)");
+		let flood: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("192.0.2.{i}")))).collect();
+		// another /24 and an IPv6 /48 take theirs
+		let other = slots.take(ip("198.51.100.1"));
+		let v6: Vec<SniSlot> = (1..=3).map(|i| slots.take(ip(&format!("2001:db8:1:{i}::1")))).collect();
 		assert_eq!(taken(&slots), (7, 3));
-		// given back: the prefix may take again
+		// a fourth of 192.0.2.0/24 (any address in it, IPv4-mapped too) gives up that network's oldest
+		let newer = slots.take(ip("::ffff:192.0.2.200"));
+		assert!(given_up(&flood[0]) && !given_up(&flood[1]) && !given_up(&flood[2]) && !given_up(&newer));
+		assert!(!given_up(&other) && v6.iter().all(|s| !given_up(s)), "nothing of the other networks");
+		assert_eq!(taken(&slots), (7, 3));
+		let newest = slots.take(ip("192.0.2.9"));
+		assert!(given_up(&flood[1]) && !given_up(&newest));
+		// one /48
+		let v6_more = slots.take(ip("2001:db8:1:ffff::1"));
+		assert!(given_up(&v6[0]) && !given_up(&v6_more) && !given_up(&other));
+		assert_eq!(taken(&slots), (7, 3));
+		// given up and then dropped counts nothing twice; given back frees the place
 		drop(flood);
-		assert_eq!(taken(&slots), (4, 2));
-		assert!(slots.take(ip("192.0.2.200")).is_some());
-		drop((other, v6));
+		assert_eq!(taken(&slots), (6, 3));
+		drop((other, v6, v6_more, newer, newest));
 		assert_eq!(taken(&slots), (0, 0));
+		assert!(slots.table.lock().unwrap().by_prefix.is_empty());
 	}
 
 	#[test]
 	fn sni_slots_give_up_the_oldest_when_all_are_taken() {
 		let slots = Arc::new(SniSlots::new(4, 4));
 		// a flood from everywhere: each source its own prefix
-		let flood: Vec<SniSlot> = (1..=4).map(|i| slots.take(ip(&format!("10.0.{i}.1"))).unwrap()).collect();
-		let legit = slots.take(ip("203.0.113.5")).expect("the newest gets a slot");
+		let flood: Vec<SniSlot> = (1..=4).map(|i| slots.take(ip(&format!("10.0.{i}.1")))).collect();
+		let legit = slots.take(ip("203.0.113.5"));
 		assert!(flood[0].state.given_up.is_cancelled(), "the oldest was given up");
 		assert!(flood[1..].iter().all(|s| !s.state.given_up.is_cancelled()));
 		assert!(!legit.state.given_up.is_cancelled());
