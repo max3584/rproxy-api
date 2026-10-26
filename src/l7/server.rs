@@ -27,7 +27,7 @@ use tracing::{debug, warn};
 
 use super::access::{AccessEntry, NO_ROUTE};
 use crate::core::bandwidth::{Dir, Gate};
-use super::middleware::auth::{BasicVerdict, ForwardAuth};
+use super::middleware::auth::{BasicVerdict, ClientForwarded, ForwardAuth};
 use super::middleware::ext_authz;
 use super::middleware::oidc::{self, Oidc};
 use super::backend::{self, Dialer, Sender, ServerHealth, Service};
@@ -450,11 +450,6 @@ impl Conn {
 	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str) {
 		let peer = canonical(self.client.ip());
 		let trusted = self.rt.global.trusts(peer);
-		// RFC 7239's Forwarded says the same as X-Forwarded-* (#333): believed only from trusted
-		// proxies too; rproxy does not write one of its own
-		if !trusted {
-			headers.remove(header::FORWARDED);
-		}
 		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
 			let name = HeaderName::from_static(name);
 			if trusted && headers.contains_key(&name) {
@@ -831,6 +826,15 @@ impl Conn {
 		// dropped on every rule, before middlewares (forward_auth) or copies (mirror) see it
 		req.headers_mut().remove(X_FORWARDED_CLIENT_CERT);
 		req.headers_mut().remove(X_CLIENT_VERIFY);
+		// RFC 7239's Forwarded says the same as X-Forwarded-* (#333): believed only from trusted
+		// proxies. A client's goes now, before middlewares, so one the rule sets (`headers`, a
+		// server's ext_authz) still reaches the backend; forward_auth with trust_forward_header
+		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
+		if req.headers().contains_key(header::FORWARDED) && !self.rt.global.trusts(canonical(self.client.ip())) {
+			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
+			req.headers_mut().remove(header::FORWARDED);
+			req.extensions_mut().insert(ClientForwarded(values));
+		}
 		let Some(router) = self.rt.http_router() else {
 			return error_response(StatusCode::SERVICE_UNAVAILABLE);
 		};
@@ -1337,25 +1341,11 @@ impl Conn {
 		let server = &fa.service.servers[index];
 		let pq = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
 		let scheme = if self.https { "https" } else { "http" };
-		// the client's headers (all, or `request_headers`) without hop-by-hop ones, and the
-		// client certificate's as rproxy saw it; a name repeated is joined with "," as Envoy does
-		let mut picked = HeaderMap::new();
-		for (name, value) in &parts.headers {
-			if (fa.request_headers.is_empty() || fa.request_headers.contains(name)) && !HOP_BY_HOP.contains(name) && name != header::UPGRADE {
-				picked.append(name.clone(), value.clone());
-			}
-		}
-		// the client as rproxy sees it, not as the client says (#333): X-Real-IP and RFC 7239's
-		// Forwarded only with trust_forward_header, as for HTTP forward_auth
-		if !fa.trust_forward_header {
-			picked.remove("x-real-ip");
-			picked.remove(header::FORWARDED);
-		}
-		if !picked.contains_key("x-real-ip") {
-			if let Ok(v) = HeaderValue::from_str(&client.to_string()) {
-				picked.insert(HeaderName::from_static("x-real-ip"), v);
-			}
-		}
+		// the client's headers (all, or `request_headers`) without hop-by-hop ones, the same
+		// X-Forwarded-* / X-Real-IP (Forwarded) as HTTP forward_auth (#333: the client's only with
+		// trust_forward_header), and the client certificate's as rproxy saw it; a name repeated
+		// is joined with "," as Envoy does
+		let mut picked = fa.request_headers(parts, client, self.https, authority);
 		self.client_cert_headers(&mut picked);
 		let mut headers: Vec<(String, String)> = vec![
 			(":authority".into(), authority.to_string()),

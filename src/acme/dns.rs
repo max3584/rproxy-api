@@ -78,7 +78,8 @@ enum Escape {
 
 impl Escape {
 	/// A body is JSON when the template's `Content-Type` says so, or (no `Content-Type`)
-	/// when it starts with `{` or `[`; a form when it is `application/x-www-form-urlencoded`.
+	/// when it starts with `{` or `[`; a form when it is `application/x-www-form-urlencoded`,
+	/// or (no `Content-Type`) when it has `=` or `&` (`name={fqdn}&value={value}`).
 	fn body(call: &HttpCallSpec) -> Escape {
 		let content_type = call.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map(|(_, v)| v.to_ascii_lowercase());
 		match content_type {
@@ -86,6 +87,7 @@ impl Escape {
 			Some(t) if t.contains("x-www-form-urlencoded") => Escape::Url,
 			Some(_) => Escape::Raw,
 			None if call.body.as_deref().is_some_and(|b| b.trim_start().starts_with(['{', '['])) => Escape::Json,
+			None if call.body.as_deref().is_some_and(|b| b.contains(['=', '&'])) => Escape::Url,
 			None => Escape::Raw,
 		}
 	}
@@ -229,9 +231,9 @@ impl Provider {
 		super::config::parse_dns_server(self.spec.server.as_deref().unwrap_or_default())
 	}
 
-	fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
+	async fn acme_dns_accounts(&self) -> Result<BTreeMap<String, AcmeDnsAccount>, String> {
 		let file = self.spec.credentials_file.as_deref().unwrap_or_default();
-		match crate::net::files::read(file, crate::net::files::Kind::Secret) {
+		match crate::net::files::read_async(file, crate::net::files::Kind::Secret).await {
 			Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{file}: {e}")),
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
 			Err(e) => Err(format!("{file}: {e}")),
@@ -241,7 +243,7 @@ impl Provider {
 	/// The acme-dns account of `domain`, registered (and kept, 0600) when there is none.
 	async fn acme_dns_account(&self, domain: &str) -> Result<AcmeDnsAccount, String> {
 		let _one = self.register.lock().await;
-		let mut all = self.acme_dns_accounts()?;
+		let mut all = self.acme_dns_accounts().await?;
 		if let Some(a) = all.get(domain) {
 			return Ok(a.clone());
 		}
@@ -267,7 +269,7 @@ impl Provider {
 	}
 
 	async fn acme_dns_update(&self, r: &Written) -> Result<(), String> {
-		let account = self.acme_dns_accounts()?.get(&r.domain).cloned().ok_or_else(|| format!("acme-dns: no account for {}", r.domain))?;
+		let account = self.acme_dns_accounts().await?.get(&r.domain).cloned().ok_or_else(|| format!("acme-dns: no account for {}", r.domain))?;
 		let base = self.spec.api_url.as_deref().unwrap_or_default().trim_end_matches('/');
 		let body = serde_json::json!({"subdomain": account.subdomain, "txt": r.value}).to_string();
 		let req = Request::builder()
@@ -614,7 +616,9 @@ mod tests {
 		assert_eq!(Escape::body(&call(Some("application/json"), "x")), Escape::Json);
 		assert_eq!(Escape::body(&call(Some("application/x-www-form-urlencoded"), "a={fqdn}")), Escape::Url);
 		assert_eq!(Escape::body(&call(Some("text/plain"), "{fqdn}")), Escape::Raw);
-		assert_eq!(Escape::body(&call(None, "name={fqdn}")), Escape::Raw);
+		assert_eq!(Escape::body(&call(None, "name={fqdn}&value={value}")), Escape::Url, "a form without Content-Type");
+		assert_eq!(fill("name={fqdn}&value={value}", &w, "", Escape::Url).matches('&').count(), 1, "& in a name stays a value");
+		assert_eq!(Escape::body(&call(None, "txt {value}")), Escape::Raw);
 	}
 
 	#[test]

@@ -217,10 +217,35 @@ fn rule_file_error_as(what: &str, path: &str, detail: &str, detailed: bool) -> S
 	if detailed {
 		return format!("{prefix}{detail}");
 	}
-	tracing::warn!(event = "config.file", what, file = path, error = detail, "a file a rule names cannot be used");
+	if newly_failing(path, detail) {
+		tracing::warn!(event = "config.file", what, file = path, error = detail, "a file a rule names cannot be used");
+	}
 	format!(
 		"{prefix}{path}: cannot be used (missing, not readable, not allowed by the file owner check or not valid); the reason is in rproxy's log (event config.file) and in --check-config"
 	)
+}
+
+/// Whether `path` fails with a reason not logged yet: `config.file` is logged once per file
+/// and reason, not on every retry (the certificate store looks again every
+/// `RPROXY_CERT_CHECK_SECS`). At most `LOGGED_MAX` files are remembered.
+fn newly_failing(path: &str, detail: &str) -> bool {
+	const LOGGED_MAX: usize = 1024;
+	static LOGGED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+	let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+	match logged.iter_mut().find(|(p, _)| p == path) {
+		Some((_, d)) if d == detail => false,
+		Some((_, d)) => {
+			*d = detail.to_string();
+			true
+		}
+		None => {
+			if logged.len() >= LOGGED_MAX {
+				logged.remove(0);
+			}
+			logged.push((path.to_string(), detail.to_string()));
+			true
+		}
+	}
 }
 
 /// The error of a file the owner check refused (not a permission problem of the environment).
@@ -339,6 +364,11 @@ mod tests {
 		assert!(answer.starts_with("middleware a: users_file: /srv/users: cannot be used"), "{answer}");
 		assert!(!answer.contains("alice") && !answer.contains("line 2"), "{answer}");
 		// --check-config says it all
+		// logged once per file and reason, not on every retry
+		assert!(newly_failing("/srv/once", "mode 644"));
+		assert!(!newly_failing("/srv/once", "mode 644"));
+		assert!(newly_failing("/srv/once", "missing"));
+		assert!(newly_failing("/srv/other", "missing"));
 		let full = rule_file_error_as("middleware a: users_file", "/srv/users", detail, true);
 		assert_eq!(full, format!("middleware a: users_file: {detail}"));
 	}

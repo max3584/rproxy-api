@@ -94,10 +94,18 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 		match tokio::runtime::Handle::try_current() {
 			Ok(rt) => {
 				if !self.reloading.swap(true, Ordering::AcqRel) {
-					let (path, parse, state, reloading) = (self.path.clone(), self.parse, self.state.clone(), self.reloading.clone());
+					/// Lets the next reload start however this one ends (a panic in parse too).
+					struct Done(Arc<AtomicBool>);
+					impl Drop for Done {
+						fn drop(&mut self) {
+							self.0.store(false, Ordering::Release);
+						}
+					}
+					let done = Done(self.reloading.clone());
+					let (path, parse, state) = (self.path.clone(), self.parse, self.state.clone());
 					rt.spawn_blocking(move || {
+						let _done = done;
 						reload(&path, parse, &state, false);
-						reloading.store(false, Ordering::Release);
 					});
 				}
 			}
@@ -206,6 +214,18 @@ pub fn parse_htpasswd(text: &str) -> Result<HashMap<String, Hash>, String> {
 		return Err("no users".into());
 	}
 	Ok(users)
+}
+
+impl Hash {
+	/// How expensive checking a password is, to compare hashes: bcrypt by its cost, above
+	/// APR1 (1000 rounds of MD5), above {SHA} (one SHA-1).
+	fn cost(&self) -> u32 {
+		match self {
+			Hash::Bcrypt(h) => 100 + h.get(4..6).and_then(|c| c.parse::<u32>().ok()).unwrap_or(0),
+			Hash::Apr1 { .. } => 2,
+			Hash::Sha1(_) => 1,
+		}
+	}
 }
 
 /// The hash part of Apache's `$apr1$` (MD5-crypt with the `$apr1$` magic).
@@ -326,11 +346,11 @@ impl BasicAuth {
 				return BasicVerdict::Allow(user);
 			}
 		}
-		// a user not in the file costs the same as a wrong password (#333): the password is
-		// checked against a hash of the file anyway, so the answer's time does not tell
-		// which user names exist
+		// a user not in the file costs at least as much as a wrong password (#333): the password
+		// is checked against the file's most expensive hash anyway, so the answer's time does
+		// not tell which user names exist
 		let known = users.get(&user);
-		let Some(hash) = known.or_else(|| users.values().next()).cloned() else { return BasicVerdict::Deny("unknown_user") };
+		let Some(hash) = known.or_else(|| users.values().max_by_key(|h| h.cost())).cloned() else { return BasicVerdict::Deny("unknown_user") };
 		let known = known.is_some();
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
@@ -367,6 +387,12 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 	let (user, password) = text.split_once(':')?;
 	Some((user.to_string(), password.to_string()))
 }
+
+/// RFC 7239's `Forwarded` as a client that is not a trusted proxy sent it, taken off the
+/// request at its start (#333, `server.rs`): `forward_auth` with `trust_forward_header`
+/// still sends it to the auth server.
+#[derive(Clone, Debug)]
+pub struct ClientForwarded(pub Vec<HeaderValue>);
 
 /// `forward_auth`: what to ask and what to take from the answer.
 #[derive(Debug)]
@@ -427,6 +453,13 @@ impl ForwardAuth {
 		if !self.trust_forward_header {
 			for h in FORWARDED {
 				out.remove(h);
+			}
+		} else if let Some(ClientForwarded(values)) = parts.extensions.get::<ClientForwarded>() {
+			// the client's, taken off the request at its start, unless the rule set one since
+			if !out.contains_key(header::FORWARDED) {
+				for v in values {
+					out.append(header::FORWARDED, v.clone());
+				}
 			}
 		}
 		let trust = self.trust_forward_header;
@@ -582,6 +615,14 @@ mod tests {
 		let b = BasicAuth::new("auth", file.to_str().unwrap(), None, false, None).unwrap();
 		assert!(matches!(b.check(&basic("alice", "secret")).await, BasicVerdict::Allow(_)));
 		assert!(matches!(b.check(&basic("mallory", "secret")).await, BasicVerdict::Deny("unknown_user")));
+		// the most expensive hash of the file is the one used
+		let users = parse_htpasswd(&format!(
+			"a:{{SHA}}5en6G6MezRroT3XKqkdPOmY/BfQ=\nb:{}\nc:$apr1$r31.....$ARC3pREO82RIm0aQ2zszC0\nd:{}\n",
+			bcrypt::hash("x", 5).unwrap(),
+			bcrypt::hash("x", 4).unwrap()
+		))
+		.unwrap();
+		assert!(matches!(users.values().max_by_key(|h| h.cost()), Some(Hash::Bcrypt(h)) if h.starts_with("$2b$05$")));
 		// with bcrypt the time is that of a wrong password
 		std::fs::write(&file, format!("alice:{}\n", bcrypt::hash("secret", 8).unwrap())).unwrap();
 		b.users.reload(true);
@@ -659,6 +700,17 @@ mod tests {
 		assert_eq!(h["x-forwarded-host"], "evil");
 		assert_eq!(h["x-forwarded-for"], "6.6.6.6, 10.0.0.9");
 		assert_eq!((h["x-real-ip"].as_bytes(), h["forwarded"].as_bytes()), (&b"6.6.6.6"[..], &b"for=6.6.6.6;host=evil"[..]));
+
+		// a client's Forwarded taken off the request at its start (#333) goes back to the auth
+		// server only with trust_forward_header; a value the rule set wins
+		let (mut taken, _) = hyper::Request::get("/").body(()).unwrap().into_parts();
+		taken.extensions.insert(ClientForwarded(vec![HeaderValue::from_static("for=6.6.6.6")]));
+		assert_eq!(fa.request_headers(&taken, client, true, "a")["forwarded"], "for=6.6.6.6");
+		taken.headers.insert("forwarded", HeaderValue::from_static("for=192.0.2.1"));
+		assert_eq!(fa.request_headers(&taken, client, true, "a").get_all("forwarded").iter().collect::<Vec<_>>(), ["for=192.0.2.1"]);
+		fa.trust_forward_header = false;
+		assert!(!fa.request_headers(&taken, client, true, "a").contains_key("forwarded"));
+		fa.trust_forward_header = true;
 
 		fa.request_headers = vec![HeaderName::from_static("x-none")];
 		assert!(!fa.request_headers(&parts, client, true, "a").contains_key("cookie"));

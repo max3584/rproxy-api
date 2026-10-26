@@ -361,6 +361,13 @@ async fn forwarding_headers_connection_names_and_h2c_upgrades() {
 	assert!(received(&v, "forwarded").is_empty(), "{v}");
 	assert_eq!(received_text(&v, "x-real-ip"), ["127.0.0.1"]);
 
+	// a Forwarded the rule sets itself (`headers`) is not the client's: it reaches the backend
+	let set = setup("sem-fwd-set", json!({"mw": {"headers": {"request": {"set": {"Forwarded": "for=192.0.2.1;by=rproxy"}}}}})).await;
+	let req = b"GET /echo HTTP/1.1\r\nHost: a.test\r\nForwarded: for=6.6.6.6\r\nConnection: close\r\n\r\n";
+	let (status, _, body) = h1_fields(&set.h1_raw(req).await);
+	assert_eq!(status, 200);
+	assert_eq!(received_text(&json_body(&body), "forwarded"), ["for=192.0.2.1;by=rproxy"]);
+
 	// an upgrade to h2c is not relayed: the request goes on as plain HTTP/1.1
 	let mut req = b"GET /echo HTTP/1.1\r\nHost: a.test\r\n".to_vec();
 	req.extend_from_slice(b"Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\nConnection: close\r\n\r\n");
