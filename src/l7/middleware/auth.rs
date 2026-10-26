@@ -184,9 +184,6 @@ pub enum Hash {
 	Apr1 { salt: String, hash: String },
 }
 
-/// `user:hash` lines: bcrypt, APR1 and {SHA} (what htpasswd writes, as in
-/// Traefik). Other schemes (crypt, plain text) are refused so that a file never
-/// silently lets nobody in.
 /// The users of an htpasswd file, and the hash an unknown name is checked against.
 #[derive(Debug)]
 pub struct Users {
@@ -201,6 +198,9 @@ pub fn parse_users(text: &str) -> Result<Users, String> {
 	Ok(Users { map, decoy })
 }
 
+/// `user:hash` lines: bcrypt, APR1 and {SHA} (what htpasswd writes, as in
+/// Traefik). Other schemes (crypt, plain text) are refused so that a file never
+/// silently lets nobody in.
 pub fn parse_htpasswd(text: &str) -> Result<HashMap<String, Hash>, String> {
 	let mut users = HashMap::new();
 	for (i, line) in text.lines().enumerate() {
