@@ -780,19 +780,18 @@ impl Registry {
 				None => {
 					invalid.entry(key).or_insert(entry);
 				}
-				Some(e) => {
-					if e.spec().ruleset.as_deref() == Some(set) {
-						warn!(event = "restore.conflict", rule = %key, ruleset = set,
-							"a restored rule that does not validate has the key of a rule of a restored rule set; the rule set's rule is kept");
-					} else {
-						warn!(event = "rule.duplicate", rule = %key, phase = "restore");
-					}
+				Some(e) if e.spec().ruleset.as_deref() == Some(set) => {
+					warn!(event = "restore.conflict", rule = %key, ruleset = set,
+						"a restored rule that does not validate has the key of a rule of a restored rule set; the rule set's rule is kept");
 					self.owners.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
 					if let Some(store) = self.persist().filter(|_| entry.origin == Origin::Api) {
 						store.forget_meta(&key);
 						store.forget_invalid_row(&key);
 					}
 				}
+				// a rule outside the set took the key meanwhile (not reached today): only the
+				// stashed rule goes; who made the holder and its row's records are the holder's
+				Some(_) => warn!(event = "rule.duplicate", rule = %key, phase = "restore"),
 			}
 		}
 	}

@@ -464,7 +464,7 @@ async fn invalid_rules_keep_their_files_and_count() {
 	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{set_port}"), "ci", None).await;
 	assert_eq!((status, &v["state"], &v["ruleset"]), (StatusCode::OK, &json!("running"), &json!("ci/set")), "{v}");
 	let set_key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{set_port}").parse().unwrap() };
-	assert_eq!(store.created_by(&set_key), None, "the row's created_by stays with the key");
+	assert_eq!(store.created_by(&set_key), None, "the row's created_by is forgotten once the set took the key");
 	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{kept_port}"), "ci", None).await;
 	assert_eq!((status, &v["state"], &v["origin"], &v["created_by"]), (StatusCode::OK, &json!("failed"), &json!("api"), &json!("ci")), "kept: {v}");
 	// a PUT of a set with its key: refused up front as for any rule outside the set
