@@ -457,6 +457,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `release_does_not_wait_for_a_drain` | drain を待つ削除の途中でも、引き継ぎの `release` はすぐにロックを放す（行の削除は drain の前に済む） |
 | `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
 | `rows_that_do_not_validate_are_failed_rules` | #327（メモリのストア）：検証に通らない行は `GET /rules` に `failed`（理由・保存した本文・`created_by`・`conditions` の `Invalid`）、同じキーの `POST` は `409`、直らない PATCH は `400`、直す PATCH（dry run も）で動き行を書く、`DELETE` で行ごと消える。照合は新しい行を `failed` で出し、変われば動かし、なくなれば消す |
+| `invalid_rules_keep_their_files_and_count` | #327・#323：検証で落ちたルールの鍵はほかのトークンが指せず（`409 file_in_use`）、持ち主の直す PATCH は前からの共有があっても通る。`/metrics` の `failed` と `rproxy_rule_up 0`。戻す組のルールが同じキーなら組が勝つ。消すと持ち主を忘れ、同じ行が戻れば `failed` で出し直す |
 | `rows_that_do_not_validate_with_mariadb` | #327（MariaDB と本物のバイナリ）：`rproxy_rules` と `forward_rules` の検証に通らない行が `failed`。PATCH で直した行は書き直され再起動の後も動く、`forward_rules` のものは `DELETE` で消え、次の起動でまた出る |
 | `a_blank_node_name_stops_the_startup` | 空白だけの `RPROXY_NODE_NAME` は設定のエラー |
 ## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）

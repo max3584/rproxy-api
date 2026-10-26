@@ -1059,6 +1059,9 @@ DB（`forward_rules`・`rproxy_rules`）から戻すルール（と引き継ぎ�
 - 引き継ぎ（SIGUSR2）では保存されていたままの本文を渡し、新しいプロセスでもう一度検証する（新しい版で通れば動く）。
 - 照合（`RPROXY_PERSIST_CHECK_SECS`）：`rproxy_rules` の行が変わればもう一度試し、行がなくなれば一覧から消す。
 - `listen_addr` が IP アドレスでない行は API で指せないので、今までどおりログ（`rule.failed`）だけ。
+- 鍵・秘密のファイルはそのルールの持ち主（`api` は `created_by`）のものとして数える（ほかのトークンは指せない、`409 file_in_use`。持ち主の直す PATCH は同じファイルを指したまま）。消すと持ち主も忘れる。
+- 起動時・引き継ぎで戻すルールの組のルールと同じキーなら、組のルールを残し、このルールは一覧から外す（`restore.conflict`。照合でも行は `restore.conflict` のまま）。
+- `/metrics` の `rproxy_rules{state="failed"}` に数え、`rproxy_rule_up` は 0。
 
 ## エンドポイント
 

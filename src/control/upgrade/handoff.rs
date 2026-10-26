@@ -829,6 +829,7 @@ impl State {
 					continue;
 				}
 			};
+			registry.yield_invalid_to(&set.name, &rules);
 			for (i, r) in rules.iter().enumerate() {
 				registry.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "handoff");
 			}

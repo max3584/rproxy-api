@@ -390,6 +390,97 @@ async fn rows_that_do_not_validate_are_failed_rules() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
+/// #327 / #323 review: the files of a restored rule that did not validate are its
+/// owner's (another token may not name its key; its owner's fixing PATCH keeps it);
+/// deleting it forgets who made it and lets the same row be looked at again; it counts
+/// in `/metrics`; a restored rule set wins over it at startup.
+#[tokio::test]
+async fn invalid_rules_keep_their_files_and_count() {
+	use reqwest::Method;
+	use rproxy_api::config::persist::{StoredRule, StoredSet};
+	use rproxy_api::core::rule::{Key, Origin, Protocol};
+	let dir = workdir("invalid-files");
+	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;
+	let store = Arc::new(Store::memory("n1"));
+	h.registry.set_persist(store.clone());
+	let pki = common::pki::Pki::new("persist-invalid");
+	let issued = pki.server("i.pem", &["i.test"]);
+	let cert = pki.write("i.crt", &issued.cert.pem());
+	let key_file = pki.write("i.key", &issued.key.serialize_pem());
+	let backend = tcp_backend("K:").await;
+	let with_key = |port: u16| {
+		let mut r = rule("tcp", port, backend);
+		r["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key_file}]});
+		r
+	};
+	let row = |spec: Value| StoredRule {
+		node: "n1".into(),
+		spec: serde_json::from_value(spec).unwrap(),
+		spec_version: 1,
+		created_by: "ci".into(),
+		created_at: 1_790_000_000,
+		updated_by: "ci".into(),
+		updated_at: 1_790_000_000,
+	};
+	let (mine, shared, set_port) = (free_port(), free_port(), free_port());
+	let mut bad = with_key(mine);
+	bad["allow_from"] = json!(["not-an-address"]);
+	let mut bad_set_key = rule("tcp", set_port, backend);
+	bad_set_key["allow_from"] = json!(["not-an-address"]);
+	let rows = vec![row(bad.clone()), row(bad_set_key)];
+	for r in &rows {
+		store.memory_put_row(r.clone());
+	}
+	store.restored(&rows);
+	h.registry.restore_as(rows.into_iter().map(|r| r.spec).collect(), Origin::Api).await;
+	// a rule set restored after them wins over the one with its key
+	let set = StoredSet {
+		name: "ci/set".into(),
+		generation: 1,
+		etag: String::new(),
+		owner: "ci".into(),
+		rules: vec![serde_json::from_value(rule("tcp", set_port, backend)).unwrap()],
+		spec_version: 1,
+		updated_by: "ci".into(),
+		updated_at: 1_790_000_000,
+	};
+	assert_eq!(h.registry.restore_rulesets(vec![set]).await, 1);
+	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{set_port}"), "ci", None).await;
+	assert_eq!((status, &v["state"], &v["ruleset"]), (StatusCode::OK, &json!("running"), &json!("ci/set")), "{v}");
+
+	// counted in /metrics
+	let text = h.registry.metrics().await;
+	assert!(text.contains(&format!("rproxy_rule_up{{protocol=\"tcp\",listen=\"127.0.0.1:{mine}\"}} 0")), "{text}");
+	assert!(text.contains("rproxy_rules{state=\"failed\"} 1"), "{text}");
+
+	// another token may not name its key
+	let (status, v) = call(&h, Method::POST, "/rules", "ui", Some(with_key(free_port()))).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("file_in_use")), "{v}");
+	// a restored rule of no known creator shares it (from before); the owner's fix keeps the key
+	h.registry.restore(vec![serde_json::from_value(with_key(shared)).unwrap()]).await;
+	let fix = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(), "allow_from": []});
+	let (status, v) = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{mine}"), "ci", Some(fix)).await;
+	assert_eq!((status, &v["state"]), (StatusCode::OK, &json!("running")), "{v}");
+
+	// deleted: who made it is forgotten, and the same row coming back is shown again
+	let again = free_port();
+	let mut bad = rule("tcp", again, backend);
+	bad["allow_from"] = json!(["not-an-address"]);
+	store.memory_put_row(row(bad.clone()));
+	store.reconcile(&h.registry).await.unwrap();
+	assert_eq!(call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{again}"), "ci", None).await.1["state"], "failed");
+	let key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{again}").parse().unwrap() };
+	// as a live upgrade hands it over
+	h.registry.set_owner(key, "ui");
+	assert_eq!(call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{again}"), "ci", None).await.0, StatusCode::NO_CONTENT);
+	assert!(!h.registry.owners().iter().any(|(k, _)| *k == key));
+	store.memory_put_row(row(bad));
+	store.reconcile(&h.registry).await.unwrap();
+	let (status, v) = call(&h, Method::GET, &format!("/rules/tcp/127.0.0.1/{again}"), "ci", None).await;
+	assert_eq!((status, &v["state"]), (StatusCode::OK, &json!("failed")), "the same row again: {v}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
 struct Rproxy {
 	child: Child,
 	out: PathBuf,

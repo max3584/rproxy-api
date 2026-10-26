@@ -609,6 +609,12 @@ impl Store {
 		self.meta.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|m| m.created_by.clone())
 	}
 
+	/// A row known not to make a rule is looked at again (its rule was deleted, fixed or
+	/// forgotten, #327).
+	pub fn forget_invalid_row(&self, key: &Key) {
+		self.invalid.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+	}
+
 	/// Fills in `persisted`, `created_by` and `created_at` of an `api` rule's view.
 	pub fn decorate(&self, key: &Key, view: &mut RuleView) {
 		let meta = self.meta.lock().unwrap();
@@ -1143,7 +1149,7 @@ impl Store {
 			.map(|(k, req, _)| (k, format!("{req:?}")))
 			.collect();
 		for key in invalid.keys().filter(|k| !by_key.contains_key(k) && !leave.contains(k)) {
-			if registry.forget_invalid(key).is_some() {
+			if registry.drop_invalid(key).is_some() {
 				self.meta.lock().unwrap().remove(key);
 				info!(event = "persist.reconcile", rule = %key, action = "delete", "the row of a rule that did not validate is gone from rproxy_rules");
 				out.deleted += 1;
@@ -1157,7 +1163,7 @@ impl Store {
 				if *seen == format!("{:?}", row.spec) {
 					continue;
 				}
-				registry.forget_invalid(&key);
+				registry.drop_invalid(&key);
 			}
 			if registry.get(&key).await.is_ok() {
 				if self.conflicts.lock().unwrap().insert(key) {

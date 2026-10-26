@@ -958,6 +958,7 @@ impl Registry {
 		let everything = |_: u16, _: u16| true;
 		for set in sets {
 			let mut rules: Vec<(usize, RuleRequest)> = set.rules.into_iter().enumerate().collect();
+			self.yield_invalid_to(&set.name, &rules.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
 			for (i, r) in &rules {
 				self.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "restore");
 			}

@@ -737,8 +737,36 @@ impl Registry {
 		let gone = self.invalid.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
 		if gone.is_some() {
 			self.conditions.forget(key);
+			// the same row again is a new one to the periodic check
+			if let Some(store) = self.persist() {
+				store.forget_invalid_row(key);
+			}
 		}
 		gone
+	}
+
+	/// Forgets a rule that did not validate and who made it: it is deleted, its row is
+	/// gone or changed, or a rule set takes its key (#327, #323).
+	pub(crate) fn drop_invalid(&self, key: &Key) -> Option<Invalid> {
+		let gone = self.forget_invalid(key);
+		if gone.is_some() {
+			self.owners.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+		}
+		gone
+	}
+
+	/// Rule sets restored at startup or after a live upgrade win over restored rules that
+	/// did not validate with the keys of their rules (#327): those are taken off the list
+	/// (`restore.conflict`), as a running rule of the UI wins over a row.
+	pub(crate) fn yield_invalid_to(&self, set: &str, reqs: &[RuleRequest]) {
+		for r in reqs {
+			let Ok(listen) = crate::core::rule::parse_listen(&r.listen_addr, r.listen_port) else { continue };
+			let key = Key { protocol: r.protocol, listen };
+			if self.drop_invalid(&key).is_some() {
+				warn!(event = "restore.conflict", rule = %key, ruleset = set,
+					"a restored rule that does not validate has the key of a rule of a restored rule set; the rule set's rule is kept");
+			}
+		}
 	}
 
 	/// The body a PATCH makes of a rule that did not validate (#327): the stored body
@@ -752,18 +780,23 @@ impl Registry {
 	/// set's owner's, the token that created it (`api` rules restored from the
 	/// database: their row's `created_by`), else `Owner::Restored`.
 	pub(crate) fn owner_of(&self, spec: &RuleSpec) -> crate::net::protected::Owner {
+		self.owner_of_key(&spec.key, spec.origin, spec.ruleset.as_deref())
+	}
+
+	/// `owner_of` by the rule's key, origin and set (a rule that did not validate has no spec).
+	fn owner_of_key(&self, key: &Key, origin: Origin, ruleset: Option<&str>) -> crate::net::protected::Owner {
 		use crate::net::protected::Owner;
-		if spec.origin == Origin::Static {
+		if origin == Origin::Static {
 			return Owner::Static;
 		}
-		if let Some(set) = &spec.ruleset {
+		if let Some(set) = ruleset {
 			return self.rulesets.owner(set).map(Owner::Token).unwrap_or(Owner::Restored);
 		}
-		if let Some(by) = self.owners.lock().unwrap_or_else(|e| e.into_inner()).get(&spec.key) {
+		if let Some(by) = self.owners.lock().unwrap_or_else(|e| e.into_inner()).get(key) {
 			return Owner::Token(by.clone());
 		}
-		if spec.origin == Origin::Api {
-			if let Some(by) = self.persist().and_then(|s| s.created_by(&spec.key)) {
+		if origin == Origin::Api {
+			if let Some(by) = self.persist().and_then(|s| s.created_by(key)) {
 				return Owner::Token(by);
 			}
 		}
@@ -1031,11 +1064,12 @@ impl Registry {
 	}
 
 	pub(super) async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
-		self.create_spec_in(spec, false).await
+		self.create_spec_in(spec, false, None).await
 	}
 
-	/// `create_spec`; `fixing`: in place of the rule of the key that did not validate (#327).
-	async fn create_spec_in(self: &Arc<Self>, spec: RuleSpec, fixing: bool) -> Result<RuleView, ApiError> {
+	/// `create_spec`; `fixing`: in place of the rule of the key that did not validate (#327);
+	/// `by`: the token that owns it (#323), recorded as it goes into the table.
+	async fn create_spec_in(self: &Arc<Self>, spec: RuleSpec, fixing: bool, by: Option<&str>) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
 		}
@@ -1054,6 +1088,19 @@ impl Registry {
 		let entry = Entry::Running(self.start(spec, prepared)?);
 		let view = self.view_of(&entry);
 		rules.insert(key, entry);
+		{
+			let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
+			match by {
+				Some(by) => {
+					owners.insert(key, by.to_string());
+				}
+				// a fixed rule keeps who made it; another has none recorded
+				None if !fixing => {
+					owners.remove(&key);
+				}
+				None => {}
+			}
+		}
 		if fixing {
 			self.forget_invalid(&key);
 		}
@@ -1089,10 +1136,7 @@ impl Registry {
 	pub async fn create_by(self: &Arc<Self>, req: RuleRequest, origin: Origin, by: &str) -> Result<RuleView, ApiError> {
 		let mut spec = req.validate(&self.caps())?;
 		spec.origin = origin;
-		let key = spec.key;
-		let view = self.create_spec(spec).await?;
-		self.set_owner(key, by);
-		Ok(view)
+		self.create_spec_in(spec, false, Some(by)).await
 	}
 
 	/// `409 already_exists` while a rule that did not validate holds the key (#327).
@@ -1125,7 +1169,7 @@ impl Registry {
 			return Err(ApiError::invalid(format!("the PATCH would move {key} to {}; delete and re-create the rule", spec.key)));
 		}
 		spec.origin = origin;
-		match self.create_spec_in(spec.clone(), true).await {
+		match self.create_spec_in(spec.clone(), true, None).await {
 			Ok(view) => {
 				info!(event = "rule.update", rule = %key, phase = "fixed", "a restored rule that did not validate was fixed");
 				Ok(view)
@@ -1461,15 +1505,23 @@ impl Registry {
 	/// specs are copied under the lock and looked at after).
 	#[allow(clippy::type_complexity)]
 	pub async fn file_refs(&self) -> Vec<(Key, Option<String>, crate::net::protected::Owner, Vec<crate::net::protected::FileRef>)> {
-		let specs: Vec<RuleSpec> = {
+		let (specs, invalid): (Vec<RuleSpec>, HashMap<Key, Invalid>) = {
 			let rules = self.rules.lock().await;
-			rules.values().map(|e| e.spec()).filter(|s| s.tls != tlsconf::TlsSpec::default() || s.http.is_some()).cloned().collect()
+			let specs =
+				rules.values().map(|e| e.spec()).filter(|s| s.tls != tlsconf::TlsSpec::default() || s.http.is_some()).cloned().collect();
+			let invalid = self.invalid_snapshot().into_iter().filter(|(k, _)| !rules.contains_key(k)).collect();
+			(specs, invalid)
 		};
-		specs
+		let running = specs
 			.into_iter()
-			.map(|s| (s.key, s.ruleset.clone(), self.owner_of(&s), crate::net::protected::refs(Some(&s.tls), s.http.as_ref())))
-			.filter(|(_, _, _, refs)| !refs.is_empty())
-			.collect()
+			.map(|s| (s.key, s.ruleset.clone(), self.owner_of(&s), crate::net::protected::refs(Some(&s.tls), s.http.as_ref())));
+		// restored rules that do not validate (#327) are their owners' too: their files
+		// count, and a PATCH that fixes one keeps them
+		let invalid = invalid.into_iter().map(|(key, i)| {
+			let refs = crate::net::protected::refs(i.request.tls.as_ref(), i.request.http.as_ref());
+			(key, None, self.owner_of_key(&key, i.origin, None), refs)
+		});
+		running.chain(invalid).filter(|(_, _, _, refs)| !refs.is_empty()).collect()
 	}
 
 	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
@@ -1619,7 +1671,7 @@ impl Registry {
 			let mut rules = self.rules.lock().await;
 			match rules.get(key) {
 				// a rule that did not validate (#327) has nothing to stop
-				None => match self.forget_invalid(key) {
+				None => match self.drop_invalid(key) {
 					Some(_) => {
 						info!(event = "rule.delete", rule = %key, phase = "invalid");
 						return Ok(Taken { key: *key, entry: None });
@@ -2041,10 +2093,12 @@ impl Registry {
 		let rules = self.rules.lock().await;
 		let mut out = String::new();
 		let running = rules.values().filter(|e| matches!(e, Entry::Running(_))).count();
+		// restored rules that do not validate are failed rules too (#327)
+		let invalid: Vec<Key> = self.invalid_snapshot().into_keys().filter(|k| !rules.contains_key(k)).collect();
 		let _ = writeln!(out, "# HELP rproxy_rules Number of rules by state.");
 		let _ = writeln!(out, "# TYPE rproxy_rules gauge");
 		let _ = writeln!(out, "rproxy_rules{{state=\"running\"}} {running}");
-		let _ = writeln!(out, "rproxy_rules{{state=\"failed\"}} {}", rules.len() - running);
+		let _ = writeln!(out, "rproxy_rules{{state=\"failed\"}} {}", rules.len() - running + invalid.len());
 
 		let mut lines: [(&str, &str, &str, Vec<String>); 8] = [
 			("rproxy_rule_up", "gauge", "1 if the rule is running.", vec![]),
@@ -2082,6 +2136,9 @@ impl Registry {
 				}
 				Entry::Failed(_) => lines[0].3.push(format!("{{{labels}}} 0")),
 			}
+		}
+		for key in &invalid {
+			lines[0].3.push(format!("{{protocol=\"{}\",listen=\"{}\"}} 0", key.protocol, key.listen));
 		}
 		for (name, kind, help, samples) in lines.iter_mut() {
 			samples.sort();
