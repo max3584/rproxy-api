@@ -338,4 +338,22 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 設定ファイルのルール：断らない（ホストの管理者のもの）。`--check-config` が同じ判定を警告にする（`check.rs`）。DB・組の保存から戻すルール、引き継ぎで渡すルールも断らない（前の版で受け付けたもの。次の変更で確かめる）。
 - 試験：単体（`net::protected`：木・ファイル・リンク・`..`・ハードリンク・まだないパス、項目の拾い方、client secret の使い道。`oidc`：別の issuer・client の cookie は開かない）、`tests/cert_api.rs`（`rule_files_may_not_reach_the_store`：ストアのファイル・リンク・`..`・後で保存されるもの、dry run・PATCH・組の PUT・サービスの `ca_file`、トークンのファイル、ほかの場所はよい、`allow_certs`、設定ファイルのルールは動く）、`tests/acme.rs`（`rules_may_not_name_acme_files`）、`tests/crowdsec.rs`（`rules_may_not_name_the_key_file`）、`tests/http_auth.rs`（`oidc_client_secrets_keep_to_one_use`）、`tests/check_config.rs`（`files_the_api_may_not_name_are_warnings`）。
 - レビューで足したもの：カーネルのファイルシステム（`/proc`・`/sys`・`/dev`、`statfs` の種類）を断る（`/proc/self/environ` の環境変数・`/proc/self/fd/N`）。木は（デバイス, inode）でも比べる（bind mount）。戻したルールは `Registry::warn_protected` が `rule.protected_file` を出す（`restore_as`・組の復元・引き継ぎの組）。PATCH は `Registry::updated_spec` で出来上がるルール全体を確かめる。確かめは 1 つずつ（`CHECKS`）で、通った変更のファイルは `Intent` として変更が終わるまで後の確かめに数える（変更の名前解決の間は誰も待たせない。ファイルのない変更は何も取らない）。`net::files::read` も開いた fd がカーネルのファイルシステムなら断る（後の読み直しを `/proc` へ向けられない）。ファイルを見るのは `spawn_blocking`、`Registry::file_refs` はロックの下では写すだけ。`409 secret_reuse` の文にほかのルールのことは出さない。`PUT /rulesets` の断りも監査に残す。`RPROXY_DIFF_TOKEN_FILE` も守る。
-- 残したもの：ほかのテナントのルールの鍵のファイル（守るファイルではないもの）を別のトークンが指せること（別の issue で扱う）。
+- 残したもの：ほかのテナントのルールの鍵のファイル（守るファイルではないもの）を別のトークンが指せること（#323、15. で扱った）。
+
+## 15. ほかの持ち主の鍵・秘密のファイル・戻すときに検証で落ちたルール（v0.4.18、#323・#327）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| ほかの持ち主の鍵・秘密のファイル（#323） | 新しい設定はない。誤りの `code`：`409 file_in_use` | `file_owners` | いつも（`admin` のトークンと設定ファイルのルールは今までどおり） |
+| 戻すときに検証で落ちたルール（#327） | `GET /rules` の `state: failed`・`error`（形は今までの `failed` のルールと同じ）、`conditions` の `Accepted` が `False`（`Invalid`） | `invalid_restored` | いつも（前はログだけ） |
+
+- #323 の持ち主（`net::protected::Owner`、`Registry::owner_of`）：設定ファイルのルールは `Static`、組のルールは組の持ち主（`Rulesets::owner`）、API で作ったルールは作ったトークン（`Registry.owners`。`create_by` が入れ、`take` で消す。`api` のルールで覚えていなければ `persist::Store::created_by`）、それ以外（`forward_rules` から戻したもの）は `Restored`（どのトークンとも違う）。PATCH で持ち主は変えない（作ったトークンのまま）。
+- 比べるもの：`FileRef::is_secret`（`key_file` で終わる項目・`secret_file` で終わる項目・`users_file`）。証明書・チェーン・CA は公開のものなので比べない（`ca-certificates.crt` を全員が使えるように）。同じかは `Resolved::same`（inode。開けなければパス）。
+- どこで：`rule_files::check` の `judge` → `owners`。守るファイルの確かめの後、`secret_conflicts` の前。`admin` のスコープ（`Principal::has(Admin)`、トークンファイルがないときも）は飛ばす。`PENDING` の `Intent` も変更のトークンを持つ。
+- 決めたこと：PATCH・組の PUT は、置き換えるルールが今指すファイル（`Replacing` で外したルールのファイル）を比べない。宛先だけの PATCH が、前からの共有で断られないように（ポートの制限がそのルールの境界で、ファイルを新しく足すときだけ手が広がる）。
+- 誤りの文は相手のことを出さない（キー・持ち主・項目）。前の版で作られた共有は断らず、`Registry::warn_shared_files`（`restore_as`・組の復元・引き継ぎの後）が組み合わせごとに 1 回 `rule.shared_file`。
+- 引き継ぎ：状態に `owners`（足すだけ）。再起動では `dynamic` のルールの持ち主は残らない（`forward_rules` に列がない）。
+- #327：`Registry.invalid`（キー → `Invalid { request, origin, error }`）。`Entry` には入れない（`RuleSpec` がないので、`Entry::spec` を使うところを変えずに済むように。待ち受けもポートも持たない）。`list`・`get` が `RuleView::invalid`（本文から作る）で出し、`create_spec`・`check_start` は同じキーを `409 already_exists`（`refuse_invalid_key`）、`take`（`DELETE`）は消すだけ、`update`（`PATCH`）は `rule::patched_request` で本文に重ねて `fix_invalid`（検証に通らなければ何も変えない。通れば `create_spec_in(.., fixing)` が表に入れるときに消す）。`insert_failed` はそのキーを失敗したルールのものにする。
+- 戻す道：`restore_as` の検証の誤り → `note_invalid`（`listen_addr` が読めなければログだけ。キーが取られていれば `rule.duplicate`）。照合は `api` の行が変われば `forget_invalid` してもう一度、行がなくなれば消す。引き継ぎは状態の `invalid_rules`（保存されていたままの本文、足すだけ）を渡し、新しいプロセスが `restore_as` でもう一度検証する（`rules` には入れない：表示の形から戻すと既定で埋めた項目が変わるため）。
+- レビューで足したもの：検証で落ちたルールのファイルも `Registry::file_refs` に入れる（持ち主は `owner_of_key`。直す PATCH は、そのルールを PATCH できるトークンならどれでも `kept` にする。動いているルールと同じ）。消す・行がなくなる・変わる・組に譲るときは `drop_invalid` が持ち主も忘れ、`forget_invalid` は照合の `Store.invalid` も消す（同じ行が戻れば出し直す）。持ち主は `create_spec_in` が表に入れるときに覚える（同じトークンの同時の作成が `409` にならないように）。戻す組のルールと同じキーは、組を当てる間だけ外し（`stash_invalid`）、組がそのキーを取ったものだけ消して `restore.conflict`（持ち主と行の `created_by` も忘れる）、ほかは戻す（`settle_invalid`）。組の `PUT` の計画は、検証で落ちたルールのキーも組の外のルールと同じく先に断る。`/metrics` の `failed` と `rproxy_rule_up 0` に数える。
+- 試験：`tests/cert_api.rs`（`key_files_keep_to_their_owner`）、`tests/persist.rs`（`invalid_rules_keep_their_files_and_count`・`rows_that_do_not_validate_are_failed_rules`：メモリのストア、`rows_that_do_not_validate_with_mariadb`：本物のバイナリと MariaDB）、`tests/handoff_freeze.rs`（`invalid_rules_and_owners_carry_over`）。

@@ -444,3 +444,124 @@ async fn a_slow_change_holds_up_no_other() {
 	assert!(!pending.is_finished(), "the slow change is still resolving");
 	pending.abort();
 }
+
+/// #323: a token may not name a key or secret file a rule of another owner names (a
+/// rule of another token, of another token's rule set, of the settings file, or one
+/// restored without a known creator), by the same inode however it is reached
+/// (`409 file_in_use`, without saying whose); `admin` may. Certificates are public;
+/// a PATCH or a set's PUT may keep the files it names already; restored rules that
+/// share one already run, said by `rule.shared_file`.
+#[tokio::test]
+async fn key_files_keep_to_their_owner() {
+	let work = std::env::temp_dir().join(format!("rproxy-certs-owners-{}", std::process::id()));
+	let _ = fs::remove_dir_all(&work);
+	fs::create_dir_all(&work).unwrap();
+	let tokens = work.join("tokens.yaml");
+	fs::write(
+		&tokens,
+		format!(
+			"tokens:\n  - {{name: team-a, sha256: {}, scopes: [rules:write, rules:read]}}\n  - {{name: team-b, sha256: {}, scopes: [rules:write, rules:read]}}\n  - {{name: admin, sha256: {}, scopes: [admin]}}\n",
+			token_sha("a"),
+			token_sha("b"),
+			token_sha("admin")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(tokens).unwrap()).await;
+	let pki = Pki::new("certs-owners");
+	let issued = pki.server("o.pem", &["o.test"]);
+	let cert = pki.write("o.crt", &issued.cert.pem());
+	let key = pki.write("o.key", &issued.key.serialize_pem());
+	let backend = tcp_backend("O:").await;
+	let send = |method: reqwest::Method, path: String, token: &'static str, b: Value| {
+		let req = h.http.request(method, format!("{}{path}", h.base)).bearer_auth(token).json(&b);
+		async move {
+			let r = req.send().await.unwrap();
+			let status = r.status();
+			(status, r.json::<Value>().await.unwrap_or(Value::Null))
+		}
+	};
+	use reqwest::Method;
+	let files_rule = |port: u16, key: &str| {
+		let mut r = rule("tcp", port, backend);
+		r["tls"] = json!({"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]});
+		r
+	};
+	let in_use = |(status, v): (StatusCode, Value), what: &str| {
+		assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("file_in_use")), "{what}: {v}");
+		v
+	};
+	let created = |(status, v): (StatusCode, Value), what: &str| assert_eq!(status, StatusCode::CREATED, "{what}: {v}");
+	let caps: Value = h.http.get(format!("{}/capabilities", h.base)).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+	assert_eq!(caps["features"]["file_owners"], true, "{caps}");
+
+	let a_port = free_port();
+	created(send(Method::POST, "/rules".into(), "a", files_rule(a_port, &key)).await, "team-a's rule");
+	// another token: the key itself, a hard link, a symbolic link, `..`, a dry run
+	fs::hard_link(&key, work.join("hard.key")).unwrap();
+	std::os::unix::fs::symlink(&key, work.join("soft.key")).unwrap();
+	let s = |p: PathBuf| p.to_string_lossy().into_owned();
+	let dotted = format!("{}/../{}/hard.key", work.display(), work.file_name().unwrap().to_string_lossy());
+	for (k, what) in [(key.clone(), "the key"), (s(work.join("hard.key")), "a hard link"), (s(work.join("soft.key")), "a symbolic link"), (dotted, "`..`")] {
+		let v = in_use(send(Method::POST, "/rules".into(), "b", files_rule(free_port(), &k)).await, what);
+		let error = v["error"].as_str().unwrap();
+		assert!(error.starts_with("tls.certificates[0].key_file: "), "{what}: {v}");
+		assert!(!error.contains("team-a") && !error.contains(&a_port.to_string()), "says whose: {v}");
+	}
+	in_use(send(Method::POST, "/rules?dry_run=true".into(), "b", files_rule(free_port(), &key)).await, "dry run");
+	// the certificate is public, and a copy of the key is another file
+	let copy = pki.write("copy.key", &issued.key.serialize_pem());
+	created(send(Method::POST, "/rules".into(), "b", files_rule(free_port(), &copy)).await, "the same certificate with a key of its own");
+	// the same token, and admin, may
+	created(send(Method::POST, "/rules".into(), "a", files_rule(free_port(), &key)).await, "team-a again");
+	created(send(Method::POST, "/rules".into(), "admin", files_rule(free_port(), &key)).await, "admin");
+
+	// PATCH: adding the key to a rule of its own is refused; a PATCH of team-a's rule (its
+	// ports are team-b's too) that keeps the key it names is not
+	let b_port = free_port();
+	created(send(Method::POST, "/rules".into(), "b", rule("tcp", b_port, backend)).await, "team-b's rule");
+	let with_key = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(),
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}});
+	in_use(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{b_port}"), "b", with_key.clone()).await, "PATCH adding the key");
+	in_use(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{b_port}?dry_run=true"), "b", with_key).await, "PATCH dry run");
+	let (status, v) = send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{a_port}"), "b", json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(), "udp_idle_secs": 40})).await;
+	assert_eq!(status, StatusCode::OK, "a PATCH that keeps the rule's files: {v}");
+
+	// rule sets: another token's set may not, its owner's PUT keeps its files
+	let v = in_use(send(Method::PUT, "/rulesets/b-set".into(), "b", json!({"generation": 1, "rules": [files_rule(free_port(), &key)]})).await, "team-b's set");
+	assert!(v["error"].as_str().unwrap().starts_with("rules[0]: tls.certificates[0].key_file"), "{v}");
+	let set_key = pki.write("set.key", &issued.key.serialize_pem());
+	let set_port = free_port();
+	let (status, v) = send(Method::PUT, "/rulesets/a-set".into(), "a", json!({"generation": 1, "rules": [files_rule(set_port, &set_key)]})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	in_use(send(Method::POST, "/rules".into(), "b", files_rule(free_port(), &set_key)).await, "the key of team-a's set");
+	created(send(Method::POST, "/rules".into(), "a", files_rule(free_port(), &set_key)).await, "the key of its own set");
+	let (status, v) = send(Method::PUT, "/rulesets/a-set".into(), "a", json!({"generation": 2, "rules": [files_rule(set_port, &set_key)]})).await;
+	assert_eq!(status, StatusCode::OK, "the set's PUT keeps its file: {v}");
+
+	// the settings file's rules, and rules restored without a known creator, are no token's
+	let static_key = pki.write("static.key", &issued.key.serialize_pem());
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(free_port(), &static_key)).unwrap();
+	h.registry.load_static(vec![spec]).await.unwrap();
+	in_use(send(Method::POST, "/rules".into(), "a", files_rule(free_port(), &static_key)).await, "a static rule's key");
+	created(send(Method::POST, "/rules".into(), "admin", files_rule(free_port(), &static_key)).await, "admin and a static rule's key");
+	let restored_key = pki.write("restored.key", &issued.key.serialize_pem());
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(free_port(), &restored_key)).unwrap();
+	h.registry.restore(vec![spec]).await;
+	in_use(send(Method::POST, "/rules".into(), "a", files_rule(free_port(), &restored_key)).await, "a restored rule's key");
+
+	// restored rules that share a key with another owner's run, said once (rule and field, not the path)
+	logs::capture();
+	let shared = free_port();
+	let spec: rproxy_api::core::rule::RuleRequest = serde_json::from_value(files_rule(shared, &key)).unwrap();
+	h.registry.restore(vec![spec]).await;
+	let line = logs::wait_for("rule.shared_file", |l| {
+		l["event"] == "rule.shared_file" && (l["rule"] == format!("tcp/127.0.0.1:{shared}") || l["other_rule"] == format!("tcp/127.0.0.1:{shared}"))
+	})
+	.await;
+	assert!(line["field"].as_str().unwrap().ends_with("key_file"), "{line}");
+	assert!(!line.to_string().contains(&key), "{line}");
+	let (print, _conn) = served(&pki, shared, "o.test").await;
+	assert_eq!(print, sha(issued.der().as_ref()));
+	fs::remove_dir_all(work).unwrap();
+}

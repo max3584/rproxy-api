@@ -329,7 +329,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 
 | `event` | Content |
 |---|---|
-| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop (with `labels`, and `ruleset` for rules of a set) |
+| `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | Rule creation, change, deletion, abnormal stop (with `labels`, and `ruleset` for rules of a set). Also `rule.failed` for a rule restored from the DB that does not validate (`phase: restore` / `reconcile`, `code`; shown in `GET /rules` as `failed`; v0.4.18, #327) |
 | `ruleset.apply` / `ruleset.delete` | A rule set (v0.4, #28) was applied (`ruleset`, `generation`, `etag`, counts created / updated / deleted / unchanged / failed, `by`) / deleted |
 | `config.reload` / `config.error` | Application of the configuration file (counts, `global` changes that need a restart) and the reason it could not be applied |
 | `start` / `shutdown` / `fatal` | Startup (`version`, whether transparent, authentication and TLS are on, …) / exit / a configuration mistake that stops the startup |
@@ -353,6 +353,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `reload.secret` | A secret file of an authentication middleware (htpasswd, OIDC secret) was reloaded, or could not be reloaded and the current content continues to be used |
 | `config.file` | Why a file a rule names (certificate, key, `users_file`, …) cannot be used (`what`, `file`, `error`). The control API's answer does not say why; look here (v0.4.18, #333) |
 | `rule.protected_file` | A restored rule (database, stored rule sets, reconcile, live upgrade) names a file a rule from the API could not name (the certificate store, the ACME storage, secrets, `/proc` and the like) (`rule`, `field`, `phase`; not the path. v0.4.17, #319) |
+| `rule.shared_file` | Restored rules (database, stored rule sets, live upgrade) of different owners (tokens, rule sets, the settings file) name the same key or secret file (`rule`, `field`, `other_rule`, `other_field`, `phase`; not the path; once per pair; refused in new rules from the API with `409 file_in_use`; v0.4.18, #323) |
 | `http.health` / `http.breaker` | A target became down / up in a health check (`service`, `server`, `up`); a `circuit_breaker` opened / closed (`middleware`, `state`) |
 | `http.mirror` | What a copy of the `mirror` middleware came to (debug; `middleware`, `service`, `backend`, `status`, `error` on failure). It does not affect the client's response |
 | `crowdsec.sync` / `crowdsec.error` | Decisions were fetched from the CrowdSec LAPI (`added`, `deleted`, `decisions`) / could not be fetched or AppSec could not be queried (the previous decisions continue to be used) |

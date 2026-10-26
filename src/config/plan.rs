@@ -189,6 +189,22 @@ pub async fn plan_create(registry: &Registry, req: RuleRequest) -> Result<RulePl
 /// `PATCH /rules/...?dry_run=true`. PATCH changes rules in place (what it
 /// cannot is refused, as the change itself would); a failed rule is started.
 pub async fn plan_update(registry: &Registry, key: &Key, req: UpdateRequest) -> Result<RulePlan, ApiError> {
+	// a restored rule that did not validate (#327): the PATCH starts it as a new rule
+	if let Some(body) = registry.invalid_patched(key, &req) {
+		let new = body.validate(&registry.caps())?;
+		registry.check_start(&new, Some(key)).await?;
+		let after = shape(&new);
+		return Ok(RulePlan {
+			dry_run: true,
+			action: Action::Update,
+			change: Change::Recreate,
+			rule: key.to_string(),
+			before: None,
+			diff: diff(&Value::Object(Default::default()), &after),
+			after: Some(after),
+			warnings: vec!["the rule did not validate when it was restored; the PATCH starts it as a new rule".into()],
+		});
+	}
 	let (old, new, _, _) = registry.updated_spec(key, req).await?;
 	let (_, running, view) = registry.current(key).await.ok_or_else(|| ApiError::not_found(key.to_string()))?;
 	if running && old.extra_listen != new.extra_listen && is_dual_stack_wildcard(key) && old.v6only() != new.v6only() {
@@ -207,7 +223,22 @@ pub async fn plan_update(registry: &Registry, key: &Key, req: UpdateRequest) -> 
 
 /// `DELETE /rules/...?dry_run=true`.
 pub async fn plan_delete(registry: &Registry, key: &Key) -> Result<RulePlan, ApiError> {
-	let (old, _, view) = registry.current(key).await.ok_or_else(|| ApiError::not_found(key.to_string()))?;
+	let Some((old, _, view)) = registry.current(key).await else {
+		// a restored rule that did not validate (#327): nothing runs
+		if registry.invalid_rules().iter().any(|(k, _, _)| k == key) {
+			return Ok(RulePlan {
+				dry_run: true,
+				action: Action::Delete,
+				change: Change::None,
+				rule: key.to_string(),
+				before: None,
+				after: None,
+				diff: vec![],
+				warnings: vec![],
+			});
+		}
+		return Err(ApiError::not_found(key.to_string()));
+	};
 	if old.origin == Origin::Static {
 		return Err(ApiError::static_rule(format!(
 			"{key} is a static rule; edit the settings file (RPROXY_CONFIG), which is re-read when it changes"

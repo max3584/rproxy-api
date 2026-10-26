@@ -627,7 +627,7 @@ global:
   - 書き込みは 1 件ずつのトランザクションで、接続のセッションは 1 つの文を 3 秒で終わらせる（`max_statement_time`・`innodb_lock_wait_timeout`・`lock_wait_timeout`）。止まったプロセスが送っていた書き込みも、6 秒（文と COMMIT）のうちに確定か取り消しで終わる（確定する前に接続が切れたものは MariaDB が取り消す）。
   - MySQL（MariaDB でない）：`max_statement_time` がなく（`max_execution_time` は SELECT だけ）、書き込みの文そのものには時間の上限がない。行のロック（`innodb_lock_wait_timeout`）とテーブルのメタデータのロック（`lock_wait_timeout`。既定は 1 年）を待つのは 3 秒までにするが、それ以外で長くかかる文は止めない。接続のときに `degraded`（`part: "db"`）を出す。kill の直後の起動が、まだ動いている書き込みより先に行を読むことがありうる（MariaDB を勧める）。
   - 接続はノードごとのロック（`GET_LOCK`。名前は `rproxy-node-` と `node` の SHA-256 の先頭 32 桁）を持つ。MariaDB はその接続の文を終えるまでロックを放さないので、起動時はロックを最大 8 秒待ってから行を読む（`kill -9`・OOM killer の直後の起動で、確定の途中だった書き込みより先に読まない）。セッションの `wait_timeout` は 30 秒で（空いている接続は 10 秒ごとに ping。ping はロックを持っているかも確かめる文で、接続が切れて開き直したときはそこでロックを取り直す）、ホストごと止まって閉じられなかった接続も MariaDB が 30 秒のうちに切る。8 秒で取れないとき：持っている接続が 15 秒より長く何もしていなければ（生きている rproxy は 10 秒ごとに文を送る）残った接続とみなし、読める行で復元して `restore.wait`（warn、持っている接続の `connection`・`host`・`idle_secs`）を出し、5 秒ごとにロックを試し、取れたら行と照らし直す。そうでなければ合わせて 40 秒まで待ち、それでも持っていて、その間に文を送っていれば（`PROCESSLIST` の `TIME` が 0 に戻る、文が始まる）同じ名前の生きているプロセスとみなして起動をやめる（下）。1 回目は文の途中、2 回目は 15 秒より短く何もしていない（文が間に終わった）ときは決められないので（MySQL では、落ちたホストの長い書き込みが終わったときもこう見える）、断らずにもう 20 秒待ってもう 1 回見る。それでも決められなければ断らずに `restore.wait` で起動する（v0.4.15、#307）。ロックを取ったプロセスは、取った時から（復元の前から）10 秒ごとに ping を送るので、復元に時間がかかっても生きて見える（v0.4.15、#307）。
-  - 定期の照合（`RPROXY_PERSIST_CHECK_SECS`、既定 60 秒、0 でロックを持っていないときだけ）：列が空のとき、ロックを待たずに取れたら、まず書けなかったもの（`persisted: false` のルール・組、消せなかった行）を API の変更と同じように書き直し（1 回に 32 件まで、1 件失敗したらその回はやめる。API の変更は止めない）、次に行を読み、API の変更が途中でなく読んだ後に書き込みが列に入っていなければ、自分の `node` の行に合わせて `origin: "api"` のルール（組のものを除く）を作る・置き換える・消す（行が正：再起動で動くのは行のほう。1 回に 64 件まで。`persist.reconcile`）。UI・固定・組のルールには触らない（そのキーの行は `restore.conflict` を 1 回出して残す）。ルールにならない行（検証で落ちる）は `restore.skip`（warn）を 1 回出し、行が変わるまで試さない。組（`rproxy_rule_sets`）は書き直すだけで、動いている組は変えない。取れなければ次の回に回す。
+  - 定期の照合（`RPROXY_PERSIST_CHECK_SECS`、既定 60 秒、0 でロックを持っていないときだけ）：列が空のとき、ロックを待たずに取れたら、まず書けなかったもの（`persisted: false` のルール・組、消せなかった行）を API の変更と同じように書き直し（1 回に 32 件まで、1 件失敗したらその回はやめる。API の変更は止めない）、次に行を読み、API の変更が途中でなく読んだ後に書き込みが列に入っていなければ、自分の `node` の行に合わせて `origin: "api"` のルール（組のものを除く）を作る・置き換える・消す（行が正：再起動で動くのは行のほう。1 回に 64 件まで。`persist.reconcile`）。UI・固定・組のルールには触らない（そのキーの行は `restore.conflict` を 1 回出して残す）。ルールにならない行（検証で落ちる）は `GET /rules` に `failed` として出し（v0.4.18、#327。下の「戻すときに検証で落ちたルール」）、行が変わるまで試さない。組（`rproxy_rule_sets`）は書き直すだけで、動いている組は変えない。取れなければ次の回に回す。
   - **`node` の名前はノードごとに違うこと**（既定はホスト名。`--node-name` / `RPROXY_NODE_NAME`）。DB があって、同じ名前のプロセスがほかに動いていると、後から起動した方は上の 40 秒（決められないときは 60 秒）の待ちの後に `persist.duplicate_node`（error、`phase: "startup"`、相手の `connection`・`host`、`--node-name` / `RPROXY_NODE_NAME` を設定するように）を出し、`fatal` で終わる（終了コード 1。ロックは取り上げない）。systemd のユニット（`Restart=on-failure`）ではこの誤りをログに出しながら再起動を繰り返すので、名前を直すか片方を止める。kill の後の残った接続（同じホストの `kill -9` は接続がすぐ閉じる。ホストごと止まったときは `wait_timeout` の 30 秒）では止まらない。引き継ぎ（SIGUSR2）の新しいプロセスは、古いプロセスがロックを持っていると知っているので確かめない。この確かめは待ち受け（固定ルール・制御 API）を開く前にするので、断られるプロセスは転送も API も始めない。
   - `RPROXY_NODE_NAME` を固定した配置で、新旧のプロセスが重なる入れ替え（blue/green、Kubernetes の `RollingUpdate` で `maxSurge` が 1 以上など）では、新しい方が断られる。古い方を先に止める（Kubernetes では `strategy: Recreate`）か、インスタンスごとに違う名前にする（その名前の行だけが戻ることに注意）。同じホストでの入れ替えは引き継ぎ（SIGUSR2）を使う。
   - DB に届かないあいだに起動して後からロックが取れないと分かったとき（相手が先にいた）は、止めずにロックを取らず（取り上げない）、その書き込みは `persisted: false` になり、ロックが 46 秒（`wait_timeout` と書き込みの時間より長く）取れないままなら `persist.duplicate_node`（error、相手の `connection`・`host`）を出す。書き込みが通ればそこで数え直す。
@@ -1035,6 +1035,34 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - 前の版で API から作ったルール（DB・組の保存から戻すもの、DB との照合、引き継ぎ）は断らずに動かし、守るファイルを指していれば `rule.protected_file`（`warn`。ルールと項目だけで、パスは出さない）をログに出す。そのルールの API での変更（PATCH）は、PATCH で出来上がるルール全体で確かめるので、宛先だけの PATCH でも守るファイルを指したままなら `403 protected_file`（ファイルを置き換える PATCH は通る）。
 - `oidc` のセッションの cookie は、cookie の名前に加えて `issuer` と `client_id` にも結びつける（AES-256-GCM の関連データ）。同じ cookie の秘密を使うほかの `oidc` のミドルウェアの cookie は通らない。この版に上げると、今のセッションは一度だけサインインし直しになる。
 
+### ほかの持ち主の鍵・秘密のファイル（v0.4.18、#323、`features.file_owners`）
+
+ルールの鍵・秘密のファイル（`tls` と `http` の `key_file`（証明書の鍵・サービスのクライアント証明書の鍵）・`client_secret_file`・`cookie_secret_file`・`users_file`）は、ほかの持ち主のルールが指していれば、API（`POST` / `PATCH /rules`・`PUT /rulesets/{name}`、`dry_run` も）からは指せない：`409 file_in_use`。ルールの組やポートに絞ったトークンが、別のチームのルールの鍵で自分のポートの TLS を終端して、そのサイトになりすませないように。証明書・チェーン・CA のファイルは公開のものなので共有してよい。
+
+- 持ち主：API で作ったルールは作ったトークン（`origin: "api"` は `created_by`。`dynamic` は rproxy が覚える。ほかのトークンが PATCH しても持ち主は変わらない）、組のルールは組の持ち主、設定ファイルのルール（`origin: static`）は設定ファイル、UI の `forward_rules` から戻したルール（作ったトークンが分からない）はどのトークンのものでもない。
+- `admin` のスコープのトークン（トークンファイルがないときも）は断らない。同じトークンは自分のほかのルール・組と共有できる。
+- 同じファイルかは inode で比べる（ハードリンク・シンボリックリンク・`..` でも同じ）。中身が同じでも写しは別のファイル。
+- PATCH・組の PUT は、置き換えるルールが今指しているファイルを指したままにできる（新しく足すファイルだけを比べる。宛先だけの PATCH は通る）。
+- 誤りの文はこの変更のルールの項目とパスだけで、相手のルール・持ち主・項目は出さない。
+- 前の版で作られ、すでに持ち主の違うルールと同じファイルを指しているルール（DB・組の保存から戻すもの、DB との照合、引き継ぎ）は断らずに動かし、`rule.shared_file`（`warn`。`rule`・`field`・`other_rule`・`other_field`・`phase`、パスは出さない）を組み合わせごとに 1 回出す。
+- 作ったトークンは引き継ぎ（SIGUSR2）で渡す。再起動の後、`origin: "dynamic"` のルール（`forward_rules` から戻る）は作ったトークンが分からないので、どのトークンのものでもない。
+- UI は #155 からルールにファイルのパスを書かせないので、UI からの操作には関わらない。制御 API を直接使う複数のトークン（rproxy-gateway のコントローラ以外）の構成が対象。
+
+### 戻すときに検証で落ちたルール（v0.4.18、#327、`features.invalid_restored`）
+
+DB（`forward_rules`・`rproxy_rules`）から戻すルール（と引き継ぎで渡ったもの）が検証に通らないとき、起動は止めず、`GET /rules`・`GET /rules/{protocol}/{listen_addr}/{listen_port}` に `state: "failed"`・`error`（理由）で出す（前の版はログだけだった）。
+
+- 本文は保存されていたまま（省いた項目は新しいルールの既定）。`origin` は `dynamic`（`forward_rules`）か `api`（`rproxy_rules`。`persisted`・`created_by`・`created_at` も）。`conditions` は `Accepted` が `False`（`reason: Invalid`）、`Programmed` が `Failed`。ログは `rule.failed`（`phase: restore`、照合では `reconcile`、`code`）。
+- 待ち受けは開かず、ポートも持たないが、キーは持つ：同じキーの `POST`（組の PUT・設定ファイルのルールも）は `409 already_exists`。
+- `DELETE` で消せる（`api` のものは `rproxy_rules` の行も消す。`forward_rules` は rproxy が書かないので、UI で直さなければ次の起動でまた出る）。
+- `PATCH` で直せる：保存されていた本文に PATCH の項目を重ね（ある項目だけ。宛先は今までどおりまとめて置き換える）、新しいルールとして検証する。通らなければ `400` で何も変えない。通れば同じ `origin` で起動する（`api` は行を書き直す）。動いていないので `source_ip`・`listen_freebind`・`listen_port_end` も変えられる。起動できなければ（ポートが使用中など）ほかの PATCH と同じく `failed` のルールになる。`dry_run` も同じ（`action: update`、`change: recreate`）。
+- 引き継ぎ（SIGUSR2）では保存されていたままの本文を渡し、新しいプロセスでもう一度検証する（新しい版で通れば動く）。
+- 照合（`RPROXY_PERSIST_CHECK_SECS`）：`rproxy_rules` の行が変わればもう一度試し、行がなくなれば一覧から消す。
+- `listen_addr` が IP アドレスでない行は API で指せないので、今までどおりログ（`rule.failed`）だけ。
+- 鍵・秘密のファイルはそのルールの持ち主（`api` は `created_by`）のものとして数える（ほかのトークンは指せない、`409 file_in_use`。直す PATCH（そのルールを PATCH できるトークンならどれでも。動いているルールと同じ）は同じファイルを指したままにできる）。消すと持ち主も忘れる。
+- 起動時・引き継ぎで戻すルールの組のルールと同じキーなら、組のルールを残し、このルールは一覧から外す（`restore.conflict`。照合でも行は `restore.conflict` のまま）。組がそのルールを入れなかったとき（この版で検証に通らない・ポートが重なるなど）は、このルールをそのまま残す。組の `PUT` でそのキーのルールを足すと、組の外のルールと同じく先に断る（`409`、`errors` の `already_exists`）。組が取ったキーの行の `created_by` も忘れる。
+- `/metrics` の `rproxy_rules{state="failed"}` に数え、`rproxy_rule_up` は 0。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -1103,6 +1131,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `protected_file` | 403 | v0.4.17（#319）：API のルールが、証明書のストア・ACME の保存先の下か、設定・オプションの秘密のファイルを指している |
 | `file_not_allowed` | 403 | v0.4.17（#319）：`allow_certs` のあるトークンがルールにファイルのパスを書いた |
 | `secret_reuse` | 409 | v0.4.17（#319）：OIDC の client secret のファイルを、同じ issuer・client の client secret のほかにも使っている |
+| `file_in_use` | 409 | v0.4.18（#323）：ほかの持ち主（ほかのトークン・ほかのトークンの組・設定ファイル・作ったトークンの分からない戻したルール）のルールが指す鍵・秘密のファイルを、`admin` でないトークンが指した |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係
@@ -1124,7 +1153,7 @@ rproxy のルールには 4 つの出どころがある。どれも `GET /rules`
 
 ## 起動時の復元
 
-`--database-url mysql://user:pass@host:port/db` を指定すると、起動時に `forward_rules` テーブルの全ルールを読み込んで開始する。DB ユーザーには `SELECT` 権限だけを与えればよい。失敗したルールは `failed` として登録し、残りのルールは開始する。名前解決に失敗して `failed` になったルールは、再解決に成功した時点で自動的に開始する。
+`--database-url mysql://user:pass@host:port/db` を指定すると、起動時に `forward_rules` テーブルの全ルールを読み込んで開始する。DB ユーザーには `SELECT` 権限だけを与えればよい。失敗したルールは `failed` として登録し、残りのルールは開始する（検証に通らない行も、v0.4.18 から `failed` として出す。#327）。名前解決に失敗して `failed` になったルールは、再解決に成功した時点で自動的に開始する。
 
 v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自分の `node` の行も復元する（`origin: "api"`。同じキーは `forward_rules` の行が先。上の「API で作ったルールの保存」）。このテーブルには `SELECT`・`INSERT`・`UPDATE`・`DELETE` が要る。
 `forward_rules` のノードでの振り分けは UI 側でする（`target` 列、UI PR #103。ノードごとの DB のビューがその rproxy の行だけを見せる）ので、rproxy は `forward_rules` を絞り込まない。`rproxy_rules` は rproxy が自分の `node` の行だけを読む。

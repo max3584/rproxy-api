@@ -310,6 +310,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_change_that_does_not_end_in_time_stops_the_handoff` | 待ちの上限のうちに終わらない変更（遅い書き込み）：引き継ぎをしない（`prepare` が誤り）、変更は古いプロセスで最後まで動いて `persisted: true`（前は `release` が上限で諦め、変更は古いプロセスにだけあって書けなかった） |
 | `after_a_failed_handoff_the_waiting_changes_go_on` | 写しの後に引き継ぎが失敗した：止めていた間に順番を待った変更は断らずに続き、書かれる |
 | `a_handoff_that_panics_lets_the_changes_go_on` | 引き継ぎのタスクが写しの後に panic した：`handoff::Running` の drop が引き継ぎの印を外して鍵を放すので、待っていた変更は止まったままにならず（503 にもならず）続いて書かれ、自動更新には引き継ぎをしなかったことが伝わる（`set_on_abort`。試しを取り下げる） |
+| `invalid_rules_and_owners_carry_over` | #327・#323：戻すときに検証で落ちたルール（`api`・`dynamic`）は写しの `rules` ではなく保存されていたままの本文で渡り、新しいプロセスでも `failed`（`created_by` も）で、PATCH で直せる。作ったトークンも渡る |
 
 ## 結合テスト：SIGTERM での終わり方（`tests/shutdown.rs`、v0.4.1）
 
@@ -332,6 +333,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_failed_rule_starts_once_its_certificate_is_stored` | 設定ファイルのルールが保存していない名前を使うと `failed`、その名前を `PUT` すると動き出す |
 | `scopes_and_allow_certs` | `certs:read` / `certs:write` のスコープ、`allow_certs` の外の名前は `PUT`・ルールでの使用とも 403、`GET /certs` は `allow_certs` の内だけ |
 | `rule_files_may_not_reach_the_store` | #319：API のルールのファイルがストアの下（そのもの・シンボリックリンク・`..`・後で保存される名前）なら `403 protected_file`（`dry_run`・PATCH・組の PUT・サービスの `ca_file` も）、トークンのファイルも同じ。ほかの場所はよい。`allow_certs` のトークンはファイルを書けず `403 file_not_allowed`（`{"cert"}` はよい）。設定ファイルのルールはストアのファイルで動く。戻したルールは動いて `rule.protected_file`（パスなし）、宛先だけの PATCH は 403。`PUT /rulesets` の断りは監査に残る。`features.protected_files` |
+| `key_files_keep_to_their_owner` | #323：ほかのトークンのルールが指す鍵（そのもの・ハードリンク・シンボリックリンク・`..`、dry run）は `409 file_in_use`（誤りの文に相手のことを出さない）。同じ証明書と鍵の写しは通る。同じトークン・`admin` は通る。自分のルールに足す PATCH は断り、宛先だけの PATCH は通る。ほかのトークンの組・設定ファイル・作ったトークンの分からない戻したルールの鍵も断り、組の持ち主の PUT は通る。前からの共有は動かして `rule.shared_file`（パスなし） |
 
 ## 結合テスト：ルールの組の保存（`tests/ruleset_persist.rs`、#241、v0.4.2）
 
@@ -454,6 +456,9 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_delete_with_drain_spares_a_new_rule_with_the_key` | `DELETE ?drain_secs` の drain の間に同じキーの `POST`：`POST` は drain を待たず、古いルールの行の削除が先なので、新しいルールの行と `persisted: true` が残る |
 | `release_does_not_wait_for_a_drain` | drain を待つ削除の途中でも、引き継ぎの `release` はすぐにロックを放す（行の削除は drain の前に済む） |
 | `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
+| `rows_that_do_not_validate_are_failed_rules` | #327（メモリのストア）：検証に通らない行は `GET /rules` に `failed`（理由・保存した本文・`created_by`・`conditions` の `Invalid`）、同じキーの `POST` は `409`、直らない PATCH は `400`、直す PATCH（dry run も）で動き行を書く、`DELETE` で行ごと消える。照合は新しい行を `failed` で出し、変われば動かし、なくなれば消す |
+| `invalid_rules_keep_their_files_and_count` | #327・#323：検証で落ちたルールの鍵はほかのトークンが指せず（`409 file_in_use`）、持ち主の直す PATCH は前からの共有があっても通る。組が入れなかったキーのものは残り、組の `PUT` はそのキーを `409`（`already_exists`）で断る。組が取ったキーの行の `created_by` は忘れる。`/metrics` の `failed` と `rproxy_rule_up 0`。戻す組のルールが同じキーなら組が勝つ。消すと持ち主を忘れ、同じ行が戻れば `failed` で出し直す |
+| `rows_that_do_not_validate_with_mariadb` | #327（MariaDB と本物のバイナリ）：`rproxy_rules` と `forward_rules` の検証に通らない行が `failed`。PATCH で直した行は書き直され再起動の後も動く、`forward_rules` のものは `DELETE` で消え、次の起動でまた出る |
 | `a_blank_node_name_stops_the_startup` | 空白だけの `RPROXY_NODE_NAME` は設定のエラー |
 ## 結合テスト：ルールの組・ラベル・状態・readiness（`tests/rulesets.rs`、#28）
 

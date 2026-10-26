@@ -54,7 +54,8 @@
               "cert_store_unavailable",
               "protected_file",
               "file_not_allowed",
-              "secret_reuse"
+              "secret_reuse",
+              "file_in_use"
             ]
           }
         },
@@ -1841,7 +1842,8 @@
             "enum": [
               "running",
               "failed"
-            ]
+            ],
+            "description": "failed: the rule could not start, or (v0.4.18, #327) it was restored from the database and does not validate: its body as stored, the reason in error, Accepted False (reason Invalid) in conditions; DELETE removes it, PATCH fixes it"
           },
           "error": {
             "type": "string",
@@ -2125,6 +2127,14 @@
               "protected_files": {
                 "type": "boolean",
                 "description": "Rules from the API may not name files of the certificate store, the ACME storage or the settings' secrets (403 protected_file); allow_certs tokens name no file (403 file_not_allowed); an OIDC client secret file keeps to one use (409 secret_reuse) (v0.4.17, #319)"
+              },
+              "file_owners": {
+                "type": "boolean",
+                "description": "A token without admin may not name a key or secret file (key_file, client_secret_file, cookie_secret_file, users_file; by inode) that a rule of another owner names: another token's, another token's rule set's, the settings file's, a restored rule's whose creator is not known (409 file_in_use) (v0.4.18, #323)"
+              },
+              "invalid_restored": {
+                "type": "boolean",
+                "description": "Rules restored from the database that do not validate are shown in GET /rules with state failed and the reason in error (Accepted False, reason Invalid); DELETE removes them, PATCH fixes them (the PATCH over the stored body, validated as a new rule) (v0.4.18, #327)"
               }
             }
           },
@@ -3454,7 +3464,8 @@
               "shutting_down",
               "protected_file",
               "file_not_allowed",
-              "secret_reuse"
+              "secret_reuse",
+              "file_in_use"
             ]
           },
           "errors": {

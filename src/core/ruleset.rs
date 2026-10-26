@@ -302,6 +302,8 @@ pub fn conditions(view: &RuleView, cause: Option<(&'static str, bool)>) -> Vec<F
 	let error = view.error.clone().unwrap_or_default();
 	let accepted = match cause {
 		Some(("unsupported", _)) => Err(("Unsupported", error.clone())),
+		// a restored rule that does not validate (#327)
+		Some((crate::core::registry::INVALID, _)) => Err(("Invalid", error.clone())),
 		_ => Ok("Accepted"),
 	};
 	let mut programmed = found(
@@ -452,6 +454,11 @@ impl Rulesets {
 
 	fn get(&self, name: &str) -> Option<SetState> {
 		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+	}
+
+	/// The token that owns the set (#323).
+	pub(crate) fn owner(&self, name: &str) -> Option<String> {
+		self.sets.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|s| s.owner.clone())
 	}
 
 	fn set(&self, name: &str, state: Option<SetState>) {
@@ -748,6 +755,8 @@ impl Registry {
 			})
 			.collect();
 		let ours = |c: &Current| c.spec.ruleset.as_deref() == Some(name);
+		// restored rules that did not validate hold their keys too (#327)
+		let invalid: HashSet<Key> = self.invalid_rules().into_iter().map(|(k, _, _)| k).filter(|k| !current.contains_key(k)).collect();
 		for (i, spec) in &specs {
 			let label = spec.key.to_string();
 			if let Some(api) = self.reserved_clash(spec) {
@@ -763,6 +772,14 @@ impl Registry {
 					ApiError::already_exists(format!("{} exists and does not belong to this rule set", spec.key))
 				};
 				problems.push(finding(*i, label, e));
+				continue;
+			}
+			if invalid.contains(&spec.key) {
+				problems.push(finding(
+					*i,
+					label,
+					ApiError::already_exists(format!("{} exists and does not belong to this rule set (a restored rule that does not validate)", spec.key)),
+				));
 				continue;
 			}
 			if let Some((_, c)) = current.iter().find(|(k, c)| **k != spec.key && !ours(c) && overlaps(&c.spec, spec)) {
@@ -951,6 +968,7 @@ impl Registry {
 		let everything = |_: u16, _: u16| true;
 		for set in sets {
 			let mut rules: Vec<(usize, RuleRequest)> = set.rules.into_iter().enumerate().collect();
+			let stashed = self.stash_invalid(&rules.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
 			for (i, r) in &rules {
 				self.warn_protected(&format!("{}: rules[{i}]", set.name), r.tls.as_ref(), r.http.as_ref(), "restore");
 			}
@@ -999,7 +1017,9 @@ impl Registry {
 				}
 				Err(e) => error!(event = "restore.error", ruleset = %set.name, error = %e, "the stored rule set is not restored"),
 			}
+			self.settle_invalid(&set.name, stashed).await;
 		}
+		self.warn_shared_files("restore").await;
 		restored
 	}
 

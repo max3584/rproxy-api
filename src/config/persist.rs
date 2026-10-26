@@ -482,6 +482,14 @@ impl Store {
 		}
 	}
 
+	/// Takes a row out of a memory store behind rproxy's back (tests).
+	#[doc(hidden)]
+	pub fn memory_remove_row(&self, key: &Key) {
+		if let Some(m) = &self.memory {
+			m.rows.lock().unwrap().remove(key);
+		}
+	}
+
 	/// Whether `reconcile` would write the rule's row again or leaves it alone (tests).
 	#[doc(hidden)]
 	pub fn is_unwritten(&self, key: &Key) -> bool {
@@ -594,6 +602,22 @@ impl Store {
 	/// Whether this process holds the node's lock (as far as the last jobs showed).
 	pub fn holds_lock(&self) -> bool {
 		self.lock.lock().unwrap_or_else(|e| e.into_inner()).held
+	}
+
+	/// The token that created an `api` rule (#323).
+	pub fn created_by(&self, key: &Key) -> Option<String> {
+		self.meta.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|m| m.created_by.clone())
+	}
+
+	/// What the view shows of a stored rule (`created_by`, ...) is forgotten: the key is
+	/// another rule's now (a restored rule set took it, #327).
+	pub fn forget_meta(&self, key: &Key) {
+		self.meta.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+	}
+
+	/// A row known not to make a rule is looked at again.
+	pub fn forget_invalid_row(&self, key: &Key) {
+		self.invalid.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
 	}
 
 	/// Fills in `persisted`, `created_by` and `created_at` of an `api` rule's view.
@@ -1121,9 +1145,30 @@ impl Store {
 				},
 			}
 		}
+		// rules of rows that did not validate (#327): left alone while the row is the same,
+		// tried again once it changed, forgotten when it is gone
+		let invalid: HashMap<Key, String> = registry
+			.invalid_rules()
+			.into_iter()
+			.filter(|(_, _, origin)| *origin == Origin::Api)
+			.map(|(k, req, _)| (k, format!("{req:?}")))
+			.collect();
+		for key in invalid.keys().filter(|k| !by_key.contains_key(k) && !leave.contains(k)) {
+			if registry.drop_invalid(key).is_some() {
+				self.meta.lock().unwrap().remove(key);
+				info!(event = "persist.reconcile", rule = %key, action = "delete", "the row of a rule that did not validate is gone from rproxy_rules");
+				out.deleted += 1;
+			}
+		}
 		for (key, row) in by_key {
 			if running.contains_key(&key) || leave.contains(&key) {
 				continue;
+			}
+			if let Some(seen) = invalid.get(&key) {
+				if *seen == format!("{:?}", row.spec) {
+					continue;
+				}
+				registry.drop_invalid(&key);
 			}
 			if registry.get(&key).await.is_ok() {
 				if self.conflicts.lock().unwrap().insert(key) {
@@ -1141,7 +1186,10 @@ impl Store {
 			}
 			budget -= 1;
 			if let Err(e) = registry.validate_at_startup(row.spec.clone()) {
-				self.invalid_row(&key, &row, &e.message);
+				// shown as failed (#327), said by `rule.failed`
+				self.invalid.lock().unwrap().insert(key, format!("{:?}", row.spec));
+				self.restored(std::slice::from_ref(&row));
+				registry.note_invalid(row.spec.clone(), Origin::Api, &e, "reconcile").await;
 				continue;
 			}
 			registry.restore_as(vec![row.spec.clone()], Origin::Api).await;
@@ -1808,7 +1856,7 @@ mod tests {
 	}
 
 	/// A row that does not make a rule is said once and not counted as created
-	/// again every round.
+	/// again every round; it is a failed rule of the list (#327).
 	#[tokio::test]
 	async fn reconcile_counts_an_invalid_row_once() {
 		let store = Arc::new(Store::memory("n1"));
@@ -1819,7 +1867,8 @@ mod tests {
 			let r = store.reconcile(&registry).await.unwrap();
 			assert_eq!((r.created, r.skipped), (0, None), "{r:?}");
 		}
-		assert!(registry.get(&key(port)).await.is_err());
+		let view = registry.get(&key(port)).await.unwrap();
+		assert_eq!((view.state, view.origin), (crate::core::rule::State::Failed, Origin::Api));
 		// once the row is right, the rule starts
 		store.memory_put_row(row(port, 80));
 		assert_eq!(store.reconcile(&registry).await.unwrap().created, 1);
