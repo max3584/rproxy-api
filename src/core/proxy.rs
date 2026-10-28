@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::core::balance::{Lease, Member, Pool};
+use crate::core::balance::{Lease, Member, Pool, TargetFull};
 use crate::net::cidr::{self, Cidr};
 use crate::core::rule::{Key, SourceIp};
 use crate::tls::config::{best_match, TlsRuntime, Unmatched};
@@ -28,8 +28,8 @@ pub struct Stats {
 	/// UDP datagrams rproxy could not pass on: a session's queue was full, or
 	/// sending failed (the kernel's own socket-buffer drops are not seen here).
 	pub dropped: AtomicU64,
-	/// Refused by `limits` (#165), by `limits::Reason`.
-	pub limited: [AtomicU64; 4],
+	/// Refused by `limits` (#165) or because every target was full (#341), by `limits::Reason`.
+	pub limited: [AtomicU64; 5],
 	/// UDP datagrams dropped over `bandwidth` (#166; also in `dropped`).
 	pub bandwidth_dropped: AtomicU64,
 	/// UDP sessions now, from the first datagram (also while their server name is
@@ -106,9 +106,13 @@ pub struct Candidate {
 }
 
 impl Candidate {
-	/// Counts the connection on its target while the lease lives.
-	pub fn lease(&self) -> Option<Lease> {
-		self.member.clone().map(Lease::new)
+	/// Counts the connection on its target while the lease lives (None: not a
+	/// target of a pool). Err: the target is at its `max_connections` (#341).
+	pub fn lease(&self) -> Result<Option<Lease>, TargetFull> {
+		match &self.member {
+			Some(m) => Lease::take(m.clone()).map(Some).ok_or(TargetFull),
+			None => Ok(None),
+		}
 	}
 }
 

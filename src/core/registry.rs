@@ -962,15 +962,27 @@ impl Registry {
 	}
 
 	/// The run-time targets of a rule, with their name resolution and health checks.
-	fn install_pool(&self, spec: &RuleSpec, members: Vec<(TargetSpec, Vec<SocketAddr>)>, events: &Arc<watch::Sender<u64>>, kill: &CancellationToken) -> (Arc<Pool>, Backends) {
+	/// `before`: the pool they replace, whose open connections go on counting against
+	/// the targets' `max_connections` (#341).
+	fn install_pool(
+		&self,
+		spec: &RuleSpec,
+		members: Vec<(TargetSpec, Vec<SocketAddr>)>,
+		events: &Arc<watch::Sender<u64>>,
+		kill: &CancellationToken,
+		before: Option<&Pool>,
+	) -> (Arc<Pool>, Backends) {
 		let mut backends = Backends::default();
 		let mut pool_members = vec![];
+		let mut taken = vec![];
 		for (t, addrs) in members {
 			let tx = Arc::new(watch::channel(addrs).0);
 			backends.resolvers.extend(self.spawn_resolver(spec.key, &t.addr, t.remote(), &tx));
-			pool_members.push(Arc::new(Member::new(t, tx)));
+			let active = before.and_then(|p| p.counter_for(&t, &mut taken));
+			pool_members.push(Arc::new(Member::new(t, tx, active)));
 		}
-		let reported = pool_members.len() > 1 || spec.health_check.is_some();
+		// one target with `max_connections` (#341) shows its count and `full` too
+		let reported = pool_members.len() > 1 || spec.health_check.is_some() || pool_members.iter().any(|m| m.spec.max_connections.is_some());
 		let outlier = crate::core::outlier::L4Outlier::new(spec.outlier_detection.as_ref());
 		let pool = Arc::new(Pool::new(pool_members, spec.balance, events.clone(), reported).with_outlier(outlier));
 		if let Some(check) = spec.health_check.clone().filter(|_| !pool.members.is_empty()) {
@@ -982,21 +994,27 @@ impl Registry {
 	}
 
 	/// The run-time `tls.routes`: a pool of targets each (#234), like the rule's.
-	fn install_routes(&self, key: Key, routes: Vec<(Route, Resolved)>) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
+	/// `before`: the routes they replace; a route of the same names hands its targets'
+	/// counts on (`max_connections`, #341).
+	fn install_routes(&self, key: Key, routes: Vec<(Route, Resolved)>, before: &[RouteTarget]) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
 		let mut targets = vec![];
 		let mut resolvers = vec![];
 		for (route, members) in routes {
+			let patterns = route.patterns();
+			let old = before.iter().find(|r| r.patterns == patterns).map(|r| &r.pool);
+			let mut taken = vec![];
 			let mut pool_members = vec![];
 			for (t, addrs) in members {
 				// the resolver task keeps the sender; without one the last value stays readable
 				let tx = Arc::new(watch::channel(addrs).0);
 				resolvers.extend(self.spawn_resolver(key, &t.addr, t.remote(), &tx));
-				pool_members.push(Arc::new(Member::new(t, tx)));
+				let active = old.and_then(|p| p.counter_for(&t, &mut taken));
+				pool_members.push(Arc::new(Member::new(t, tx, active)));
 			}
 			let events = Arc::new(watch::channel(0).0);
 			let pool = Pool::new(pool_members, route.balance, events, false).with_outlier(crate::core::outlier::L4Outlier::new(None));
 			targets.push(RouteTarget {
-				patterns: route.patterns(),
+				patterns,
 				passthrough: route.passthrough,
 				source_ip: route.source_ip,
 				pool: Arc::new(pool),
@@ -1009,10 +1027,10 @@ impl Registry {
 	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
-		let (routes, route_resolvers) = self.install_routes(key, prepared.routes);
+		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[]);
 		let kill = CancellationToken::new();
 		let events = Arc::new(watch::channel(0).0);
-		let (pool, backends) = self.install_pool(&spec, prepared.members, &events, &kill);
+		let (pool, backends) = self.install_pool(&spec, prepared.members, &events, &kill, None);
 		let rt = Arc::new(Runtime {
 			key,
 			source_ip: spec.source_ip,
@@ -1437,7 +1455,8 @@ impl Registry {
 				if backends_changed {
 					// new connections use the new targets; UDP sessions move when theirs is gone
 					r.backends.stop();
-					let (pool, backends) = self.install_pool(&spec, prepared.members, &r.rt.pool_events, &r.rt.kill);
+					let before = r.rt.pool();
+					let (pool, backends) = self.install_pool(&spec, prepared.members, &r.rt.pool_events, &r.rt.kill, Some(&before));
 					*r.rt.pool.write().unwrap() = pool;
 					r.backends = backends;
 					r.rt.pool().notify();
@@ -1451,7 +1470,8 @@ impl Registry {
 				if tls_changed {
 					*r.rt.tls.write().unwrap() = prepared.tls;
 					r.stop_route_resolvers();
-					let (routes, resolvers) = self.install_routes(*key, prepared.routes);
+					let before = r.rt.routes.read().unwrap().clone();
+					let (routes, resolvers) = self.install_routes(*key, prepared.routes, &before);
 					*r.rt.routes.write().unwrap() = routes;
 					r.route_resolvers = resolvers;
 				}
@@ -2152,7 +2172,7 @@ impl Registry {
 					if key.protocol == Protocol::Udp {
 						lines[5].3.push(format!("{{{labels}}} {}", s.dropped.load(Ordering::Relaxed)));
 					}
-					if r.spec.limits.is_some() || s.limited_total() > 0 {
+					if r.spec.limits.is_some() || s.limited_total() > 0 || r.spec.has_target_caps() {
 						for reason in crate::core::limits::Reason::ALL {
 							let n = s.limited[reason.index()].load(Ordering::Relaxed);
 							lines[6].3.push(format!("{{{labels},reason=\"{}\"}} {n}", reason.as_str()));
@@ -2259,6 +2279,7 @@ impl Registry {
 fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut up = vec![];
 	let mut conns = vec![];
+	let mut full = vec![];
 	let mut all_down = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
 	keys.sort_by_key(|k| (k.protocol.to_string(), k.listen));
@@ -2270,10 +2291,13 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		}
 		all_down.push(format!("rproxy_rule_all_targets_down{{protocol=\"{}\",listen=\"{}\"}} {}", key.protocol, key.listen, u8::from(pool.all_down())));
 		for t in pool.status() {
-			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false }.remote();
+			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false, max_connections: None }.remote();
 			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, target.replace('"', "\\\""));
 			up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
 			conns.push(format!("rproxy_target_connections{{{labels}}} {}", t.connections));
+			if t.max_connections.is_some() {
+				full.push(format!("rproxy_target_full{{{labels}}} {}", u8::from(t.full)));
+			}
 		}
 	}
 	let _ = writeln!(out, "# HELP rproxy_target_up Targets of rules with several targets or a health check: 1 up, 0 down.");
@@ -2289,6 +2313,11 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_target_connections Open TCP connections or UDP sessions per target.");
 	let _ = writeln!(out, "# TYPE rproxy_target_connections gauge");
 	for line in conns {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_target_full Targets with max_connections: 1 while at it (skipped for new connections).");
+	let _ = writeln!(out, "# TYPE rproxy_target_full gauge");
+	for line in full {
 		let _ = writeln!(out, "{line}");
 	}
 }

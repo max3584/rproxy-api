@@ -66,6 +66,10 @@ pub struct Counters {
 	/// Refused by `limits` (#165), by reason (`Stats::limited`).
 	#[serde(default)]
 	pub limited: [u64; 4],
+	/// Refused because every target was full (#341, `limits::Reason::TargetFull`): apart
+	/// from `limited`, whose length an older process reads as it is.
+	#[serde(default)]
+	pub target_full: u64,
 	/// UDP datagrams dropped over `bandwidth` (#166).
 	#[serde(default)]
 	pub bandwidth_dropped: u64,
@@ -92,6 +96,7 @@ impl Counters {
 			denied: s.denied.load(Ordering::Relaxed),
 			dropped: s.dropped.load(Ordering::Relaxed),
 			limited: std::array::from_fn(|i| s.limited[i].load(Ordering::Relaxed)),
+			target_full: s.limited[crate::core::limits::Reason::TargetFull.index()].load(Ordering::Relaxed),
 			bandwidth_dropped: s.bandwidth_dropped.load(Ordering::Relaxed),
 			counters_since,
 			http: Some(rt.http_stats.export()).filter(|h| !h.is_empty()),
@@ -115,6 +120,7 @@ impl Counters {
 			denied: self.denied.saturating_sub(before.denied),
 			dropped: self.dropped.saturating_sub(before.dropped),
 			limited: std::array::from_fn(|i| self.limited[i].saturating_sub(before.limited[i])),
+			target_full: self.target_full.saturating_sub(before.target_full),
 			bandwidth_dropped: self.bandwidth_dropped.saturating_sub(before.bandwidth_dropped),
 			http: match (&self.http, &before.http) {
 				(Some(now), Some(then)) => Some(now.since(then)),
@@ -135,6 +141,7 @@ impl Counters {
 		for (mine, n) in s.limited.iter().zip(self.limited) {
 			mine.fetch_add(n, Ordering::Relaxed);
 		}
+		s.limited[crate::core::limits::Reason::TargetFull.index()].fetch_add(self.target_full, Ordering::Relaxed);
 		s.bandwidth_dropped.fetch_add(self.bandwidth_dropped, Ordering::Relaxed);
 		if let Some(h) = &self.http {
 			rt.http_stats.add(h);
@@ -919,5 +926,12 @@ mod tests {
 		let d = after.since(&before);
 		assert_eq!((d.total, d.rx_bytes, d.tx_bytes), (2, 0, 3));
 		assert_eq!(before.key().unwrap().to_string(), "tcp/127.0.0.1:80");
+		// target_full (#341) apart from `limited`: an older process reads the state as it was
+		let after = Counters { limited: [1, 0, 0, 0], target_full: 4, ..before.clone() };
+		let d = after.since(&Counters { target_full: 1, ..before.clone() });
+		assert_eq!((d.limited, d.target_full), ([1, 0, 0, 0], 3));
+		let old: serde_json::Value = serde_json::from_str(r#"{"protocol":"tcp","listen_addr":"127.0.0.1","listen_port":80,"total":1,"rx_bytes":0,"tx_bytes":0,"tls_failures":0,"denied":0,"dropped":0,"limited":[1,2,3,4]}"#).unwrap();
+		let read: Counters = serde_json::from_value(old).unwrap();
+		assert_eq!((read.limited, read.target_full), ([1, 2, 3, 4], 0), "the state of a process before #341");
 	}
 }

@@ -101,7 +101,7 @@ impl Route {
 		if !self.targets.is_empty() {
 			return self.targets.clone();
 		}
-		vec![crate::core::balance::TargetSpec { addr: self.remote_addr.clone(), port: self.remote_port, weight: None, backup: false }]
+		vec![crate::core::balance::TargetSpec { addr: self.remote_addr.clone(), port: self.remote_port, weight: None, backup: false, max_connections: None }]
 	}
 }
 

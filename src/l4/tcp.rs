@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::core::balance::Lease;
+use crate::core::balance::{Lease, TargetFull};
 use crate::l7::server::{self as http, Metered};
 use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
@@ -66,15 +66,22 @@ struct Connected {
 
 /// Connects to the first backend that answers, in the order `balance` gave;
 /// a target that refuses is marked down for a while and the next one is tried.
+/// A target at its `max_connections` is passed over (#341): `TargetFull` when no
+/// target could be tried for that.
 async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Result<Connected> {
 	let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no resolved target");
+	let (mut full, mut tried) = (false, false);
 	let bind_as = rt.bind_as_for(target, client);
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
 	let fallback = target.candidates.iter().filter(usable).count() > 1;
 	for c in target.candidates.iter().filter(usable) {
-		let lease = c.lease();
+		let Ok(lease) = c.lease() else {
+			full = true;
+			continue;
+		};
+		tried = true;
 		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
 			let attempt = source::connect_tcp(*addr, bind_as);
 			// the rule's connect_timeout (v0.4.3); without it, 5 s when another target can be tried
@@ -102,6 +109,9 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 		if let (Some(pool), Some(member)) = (&target.pool, &c.member) {
 			pool.failed(&rt.key, member, "connect", &last_err.to_string());
 		}
+	}
+	if full && !tried {
+		return Err(crate::core::balance::TargetFull::io());
 	}
 	Err(last_err)
 }
@@ -276,9 +286,17 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	if pass.is_none() && rt.http_router().is_some() {
 		return handle_http(inbound, prefix, client, rt, offset).await;
 	}
+	let pool = rt.pool();
+	// every target full (#341): refused before it counts as a connection; with
+	// `tls.routes`, the route's targets are looked at when connecting
+	if pool.all_full() && pass.is_none() && rt.routes.read().unwrap().is_empty() {
+		crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp");
+		return;
+	}
 	let started = Instant::now();
 	rt.stats.opened();
-	let short_lived = !rt.pool().outlier().short_lived.is_zero();
+	let short_lived = !pool.outlier().short_lived.is_zero();
+	drop(pool);
 	let mut detail = Detail {
 		geo: rt.geo_for_log(client.ip(), geo),
 		first: short_lived.then(Arc::default),
@@ -311,13 +329,15 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	let elapsed_ms = started.elapsed().as_millis() as u64;
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
-	if matches!(&result, Err(e) if !is_denied(e)) {
+	if matches!(&result, Err(e) if !is_denied(e) && !TargetFull::is(e)) {
 		// the relay failed (a side reset, or could not be written): end the client's
 		// connection with a reset too, not a clean close it would take for a complete one
 		reset_on_close(&inbound);
 	}
 	match result {
 		Err(e) if is_denied(&e) => {}
+		// closed with nothing sent to it, as `limits` refuses
+		Err(e) if TargetFull::is(&e) => crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp"),
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),

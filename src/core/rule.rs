@@ -225,6 +225,10 @@ pub struct Features {
 	/// Rules restored from the database that do not validate are shown in `GET /rules` as
 	/// failed with the reason; `DELETE` removes them, `PATCH` fixes them (#327)
 	pub invalid_restored: bool,
+	/// `max_connections` of L4 `targets[]` (also of `tls.routes[]`) and of `http` services'
+	/// `servers[]`: a full target is skipped by every `balance`, all full is refused
+	/// (`reason: target_full`); `stats.targets[].full` (#341)
+	pub target_max_connections: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -292,6 +296,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		target_max_connections: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -342,6 +347,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		target_max_connections: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -611,6 +617,12 @@ impl RuleSpec {
 		tls
 	}
 
+	/// Some target (`targets`, `tls.routes[].targets`) or `http` server has `max_connections` (#341).
+	pub fn has_target_caps(&self) -> bool {
+		self.targets.iter().chain(self.tls.routes.iter().flat_map(|r| &r.targets)).any(|t| t.max_connections.is_some())
+			|| self.http.as_ref().is_some_and(|h| h.services.values().flat_map(|s| &s.servers).any(|s| s.max_connections.is_some()))
+	}
+
 	/// The backends to spread connections over: `targets`, or the single
 	/// `remote_addr` / `remote_port`; none for `http` rules.
 	pub fn members(&self) -> Vec<TargetSpec> {
@@ -620,7 +632,7 @@ impl RuleSpec {
 		if self.http.is_some() || self.remote_host.is_empty() {
 			return vec![];
 		}
-		vec![TargetSpec { addr: self.remote_host.clone(), port: self.remote_port, weight: None, backup: false }]
+		vec![TargetSpec { addr: self.remote_host.clone(), port: self.remote_port, weight: None, backup: false, max_connections: None }]
 	}
 
 	pub fn remote(&self) -> String {
@@ -1338,8 +1350,8 @@ mod tests {
 		r.source_ip = SourceIp::Transparent;
 		assert_eq!(r.clone().validate(&caps).unwrap_err().code, "invalid");
 		r.targets = vec![
-			TargetSpec { addr: "10.0.0.1".into(), port: 80, weight: None, backup: false },
-			TargetSpec { addr: "2001:db8::10".into(), port: 80, weight: None, backup: false },
+			TargetSpec { addr: "10.0.0.1".into(), port: 80, weight: None, backup: false, max_connections: None },
+			TargetSpec { addr: "2001:db8::10".into(), port: 80, weight: None, backup: false, max_connections: None },
 		];
 		r.remote_addr = String::new();
 		r.remote_port = 0;
@@ -1347,7 +1359,7 @@ mod tests {
 		let no_v6 = Caps { transparent: true, transparent_ipv6: false, ..Default::default() };
 		assert_eq!(r.clone().validate(&no_v6).unwrap_err().code, "unsupported");
 		// a backend given by name is not checked here
-		r.targets = vec![TargetSpec { addr: "backend.local".into(), port: 80, weight: None, backup: false }];
+		r.targets = vec![TargetSpec { addr: "backend.local".into(), port: 80, weight: None, backup: false, max_connections: None }];
 		assert!(r.validate(&caps).is_ok());
 	}
 

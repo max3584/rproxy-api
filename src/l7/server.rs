@@ -1540,16 +1540,29 @@ impl Conn {
 		let mut server_headers: Vec<ext_authz::HeaderOption> = vec![];
 		let (mut resp, index, counted) = loop {
 			attempt += 1;
-			let Some(index) = service.pick(sticky.as_deref()) else {
-				warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, status = 503, error = "no server is up");
+			// counted while in progress, for `balance: least_conn` and `max_connections` (#341):
+			// a server filled by another request since `pick` is passed over
+			let mut picked = None;
+			for _ in 0..=service.servers.len() {
+				let Some(index) = service.pick(sticky.as_deref()) else { break };
+				if let Some(counted) = service.servers[index].admit() {
+					picked = Some((index, counted));
+					break;
+				}
+			}
+			let Some((index, counted)) = picked else {
+				if service.is_full() {
+					// counted and logged (`conn.limited`, at most `Throttle`'s rate per client) as `limits` refusals
+					crate::core::limits::refused(&self.rt, SocketAddr::new(client_ip, self.client.port()), crate::core::limits::Reason::TargetFull, "http");
+				} else {
+					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, status = 503, error = "no server is up");
+				}
 				return error_response(StatusCode::SERVICE_UNAVAILABLE);
 			};
 			let server = &service.servers[index];
 			if log {
 				*backend = if server.status.is_some() { server.url.clone() } else { server.addr() };
 			}
-			// counted while in progress, for `balance: least_conn`
-			let counted = Hold::counting(server.inflight.clone());
 			let again_after = |status: StatusCode| retry.as_ref().is_some_and(|p| p.retries(status.as_u16())) && attempt < attempts;
 			// a `status` entry answers itself (#235)
 			if let Some(status) = server.status {
@@ -2236,7 +2249,11 @@ mod tests {
 		assert_eq!(r.default_service.as_ref().unwrap().name, "s");
 		let health = r.health();
 		assert_eq!(health.keys().collect::<Vec<_>>(), ["s"], "only services with health_check");
-		assert_eq!(health["s"], [ServerHealth { url: "http://10.0.0.1".into(), up: true, ejected: false }], "up until a check fails");
+		assert_eq!(
+			health["s"],
+			[ServerHealth { url: "http://10.0.0.1".into(), up: true, ejected: false, max_connections: None, in_flight: None, full: None }],
+			"up until a check fails"
+		);
 	}
 
 	#[test]

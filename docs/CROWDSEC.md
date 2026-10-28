@@ -32,7 +32,7 @@ rproxy の .deb には `/usr/share/rproxy-api/crowdsec/` に次のファイル�
 | `parsers/s01-parse/rproxy-logs.yaml` | `/etc/crowdsec/parsers/s01-parse/` | rproxy の JSON のログのパーサー（`max3584/rproxy-logs`） |
 | `scenarios/rproxy-conn-denied.yaml` | `/etc/crowdsec/scenarios/` | L4：`allow_from` で断られた接続を同じ IP が短い間に繰り返す（ポートの探索など） |
 | `scenarios/rproxy-conn-flood.yaml` | `/etc/crowdsec/scenarios/` | L4：同じ IP からの新しい接続が多すぎる（平均 10 件/秒を超えて 200 件ぶん） |
-| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4：同じ IP がルールの `limits`（v0.4）に当たり続ける（TCP の `conn.limited` が 5 秒に 1 件を超えて 30 件ぶん。UDP は送信元を偽れるので数えない） |
+| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4：同じ IP がルールの `limits`（v0.4）に当たり続ける（TCP の `conn.limited` が 5 秒に 1 件を超えて 30 件ぶん。UDP は送信元を偽れるので数えない。宛先がすべていっぱいの `reason: target_full`（#341）は転送先の混み具合なので数えない） |
 | `acquis.d/rproxy.yaml` | `/etc/crowdsec/acquis.d/` | rproxy のログのファイル（`labels.type: rproxy`） |
 | `acquis.d/appsec.yaml` | `/etc/crowdsec/acquis.d/` | AppSec（127.0.0.1:7422） |
 
@@ -67,7 +67,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`・`rproxy_auth_error` | `refused_by`（断ったミドルウェアの種類。`basic_auth`・`ip_allow` など）・`auth_error`（`basic_auth` が断った理由。`bad_password` など）。v0.3.20 から |
 | `evt.StrTime` | `timestamp` |
 
-**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets`）、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
+**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full`（v0.4.19、#341））、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`、`target_full` は `http` も）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
 
 ## 3. rproxy から止める（bouncer）
 

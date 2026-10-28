@@ -176,6 +176,22 @@ impl Hold {
 		counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		Hold { limiter: None, key: String::new(), counter: Some(counter) }
 	}
+
+	/// Counts one request on `counter` unless `max` are counted already (a server's
+	/// `max_connections`, #341); the check and the count are one atomic step.
+	pub fn counting_below(counter: Arc<std::sync::atomic::AtomicU64>, max: u64) -> Option<Hold> {
+		use std::sync::atomic::Ordering::Relaxed;
+		let mut n = counter.load(Relaxed);
+		loop {
+			if n >= max {
+				return None;
+			}
+			match counter.compare_exchange_weak(n, n + 1, Relaxed, Relaxed) {
+				Ok(_) => return Some(Hold { limiter: None, key: String::new(), counter: Some(counter) }),
+				Err(now) => n = now,
+			}
+		}
+	}
 }
 
 impl Drop for Hold {

@@ -357,3 +357,19 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 戻す道：`restore_as` の検証の誤り → `note_invalid`（`listen_addr` が読めなければログだけ。キーが取られていれば `rule.duplicate`）。照合は `api` の行が変われば `forget_invalid` してもう一度、行がなくなれば消す。引き継ぎは状態の `invalid_rules`（保存されていたままの本文、足すだけ）を渡し、新しいプロセスが `restore_as` でもう一度検証する（`rules` には入れない：表示の形から戻すと既定で埋めた項目が変わるため）。
 - レビューで足したもの：検証で落ちたルールのファイルも `Registry::file_refs` に入れる（持ち主は `owner_of_key`。直す PATCH は、そのルールを PATCH できるトークンならどれでも `kept` にする。動いているルールと同じ）。消す・行がなくなる・変わる・組に譲るときは `drop_invalid` が持ち主も忘れ、`forget_invalid` は照合の `Store.invalid` も消す（同じ行が戻れば出し直す）。持ち主は `create_spec_in` が表に入れるときに覚える（同じトークンの同時の作成が `409` にならないように）。戻す組のルールと同じキーは、組を当てる間だけ外し（`stash_invalid`）、組がそのキーを取ったものだけ消して `restore.conflict`（持ち主と行の `created_by` も忘れる）、ほかは戻す（`settle_invalid`）。組の `PUT` の計画は、検証で落ちたルールのキーも組の外のルールと同じく先に断る。`/metrics` の `failed` と `rproxy_rule_up 0` に数える。
 - 試験：`tests/cert_api.rs`（`key_files_keep_to_their_owner`）、`tests/persist.rs`（`invalid_rules_keep_their_files_and_count`・`rows_that_do_not_validate_are_failed_rules`：メモリのストア、`rows_that_do_not_validate_with_mariadb`：本物のバイナリと MariaDB）、`tests/handoff_freeze.rs`（`invalid_rules_and_owners_carry_over`）。
+
+## 16. 宛先ごとの上限（v0.4.19、#341）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| 宛先ごとの上限 | L4 の `targets[].max_connections`（`tls.routes[].targets[]` も）・`http.services.<名前>.servers[].max_connections`（1 以上の整数）。断った `reason`：`target_full` | `target_max_connections` | なし（上限なし。今までと同じ） |
+
+- 出口の送信量で選ぶ方式は、つなぐ時点で量が分からず遅れて揺れるので採らない（#341）。宛先ごとの帯域の上限は次の段階（別の issue）。
+- L4：`balance::Member` の `active`（`Arc<AtomicU64>`）と `max`。`Lease::take` が比べて足すのを 1 つの CAS で行う（上限のない宛先は今までどおり `fetch_add` 1 回）。`Pool::order` はいっぱいの宛先を down と同じく選ぶ候補から外し、最後に並べる（それまでに空けば使える。`Lease::take` が断れば飛ばす）。上限のない `Pool`（`capped` が偽）では数を見ない。
+- 断る：TCP は `tcp.rs` の `handle_client` で `stats.opened` の前に `Pool::all_full`（`tls.routes` のないとき）、`connect` で試せる宛先がどれも `Lease::take` で断られたら `TargetFull`（何も送らずに閉じる。リセットしない）。UDP は `serve` の新しいセッションの前に同じく、`pick` が `Miss::Full` ならセッションを作らない。DTLS を終端するセッションと `tls.routes` の宛先も数える（UDP の route の宛先はこれまで数えていなかった）。HTTP は `forward` が `Service::pick`（いっぱいの転送先を飛ばす）→ `Server::admit`（`Hold::counting_below` の CAS）。取り合いで負けたら選び直す。どれも `limits::refused`（`Reason::TargetFull`）。
+- 数の正しさ：数は `Lease` / `Hold` の drop だけで減らすので、どの終わり方（誤り・`kill`・UDP のアイドル・移動）でも戻る。PATCH で `Pool` を作り直すときは同じアドレス・ポートの宛先に `active` を渡す（`Pool::counter_for`。`tls.routes` は同じ名前の route）。UDP のセッションは渡った宛先が up なら移らない（`Lease::carried_to` / `move_to`。DPDK の道も）。
+- 引き継ぎの状態：`Counters.limited` は `[u64; 4]` のまま（前の版のプロセスが読めるように）、`target_full` を別に足した。宛先ごとの数は渡さない（数はプロセスごと。古いプロセスの残りの接続は古いプロセスが数える）。
+- 表示：`stats.targets[]` の `max_connections`・`full`、1 つの宛先でも `max_connections` があれば `stats.targets` を出す（`Pool.reported`）。`rproxy_target_full`。`http` は `ServerHealth` の `max_connections`・`in_flight`・`full`（上限のある転送先だけ）。
+- CrowdSec の `rproxy-conn-limited` は `reason: target_full` を数えない（転送先の混み具合で、クライアントを ban しない）。
+- ベンチマーク：`benches/parse.rs` の `balance`（4 つの宛先の `order` と `Lease::take`。上限なしと、届かない上限つき）。
+- 試験：単体（`balance`：spillover・round_robin・least_conn・down と full・作り直しで数を渡す・8 スレッドで上限を超えない、`backend`：転送先の飛ばし方と `admit`、`handoff`：前の版の状態を読む）、`tests/target_caps.rs`（TCP の spillover と断り・接続の失敗で数が戻る・PATCH で数を渡す・UDP のアイドルで戻る・HTTP の spillover と 503・検証と `features`）。

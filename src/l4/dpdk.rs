@@ -443,12 +443,24 @@ impl RtRule {
 		}
 	}
 
-	/// The best target with an IPv4 address (by `balance`).
-	fn pick(&self, offset: u16, skip: Option<&Arc<Member>>) -> Option<(SocketAddrV4, Lease)> {
-		self.rt.pool().order().into_iter().filter(|m| !skip.is_some_and(|s| Arc::ptr_eq(s, m))).find_map(|m: Arc<Member>| {
-			let addr = m.addrs(offset).into_iter().find_map(v4)?;
-			Some((addr, Lease::new(m)))
-		})
+	/// The best target with an IPv4 address (by `balance`) and room (`max_connections`,
+	/// #341). Err(true): each one with an address was full.
+	fn pick(&self, offset: u16, skip: Option<&Arc<Member>>) -> Result<(SocketAddrV4, Lease), bool> {
+		let mut full = false;
+		self.rt
+			.pool()
+			.order()
+			.into_iter()
+			.filter(|m| !skip.is_some_and(|s| Arc::ptr_eq(s, m)))
+			.find_map(|m: Arc<Member>| {
+				let addr = m.addrs(offset).into_iter().find_map(v4)?;
+				let Some(lease) = Lease::take(m) else {
+					full = true;
+					return None;
+				};
+				Some((addr, lease))
+			})
+			.ok_or(full)
 	}
 }
 
@@ -512,10 +524,17 @@ impl Rule for RtRule {
 				return None;
 			}
 		};
-		let Some((target, lease)) = self.pick(offset, None) else {
-			rt.stats.dropped();
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved IPv4 target (the DPDK path is IPv4 only)");
-			return None;
+		let (target, lease) = match self.pick(offset, None) {
+			Ok(picked) => picked,
+			Err(true) => {
+				limits::refused(rt, SocketAddr::V4(client), Reason::TargetFull, "udp");
+				return None;
+			}
+			Err(false) => {
+				rt.stats.dropped();
+				warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved IPv4 target (the DPDK path is IPv4 only)");
+				return None;
+			}
 		};
 		rt.stats.opened();
 		let geo = rt.geo_for_log(ip, None);
@@ -557,12 +576,22 @@ impl Rule for RtRule {
 
 	fn retarget(&self, s: &mut RtSession, offset: u16, current: SocketAddrV4) -> Option<SocketAddrV4> {
 		let member = s.lease.as_ref().map(|l| l.member().clone())?;
-		let next = if self.rt.pool().contains(&member) && member.is_up() {
+		let pool = self.rt.pool();
+		// the targets were replaced and this one is still there (its count went on, #341)
+		let carried = (!pool.contains(&member)).then(|| s.lease.as_ref().and_then(|l| l.carried_to(&pool))).flatten();
+		let next = if let Some(same) = carried {
+			let addr = same.addrs(offset).into_iter().find_map(v4);
+			if let Some(l) = s.lease.as_mut() {
+				l.move_to(same);
+			}
+			let addr = addr?;
+			(addr != current).then_some((addr, None))
+		} else if pool.contains(&member) && member.is_up() {
 			// the same target; its address may have changed (name resolution)
 			let addr = member.addrs(offset).into_iter().find_map(v4)?;
 			(addr != current).then_some((addr, None))
 		} else {
-			self.pick(offset, Some(&member)).map(|(a, l)| (a, Some(l)))
+			self.pick(offset, Some(&member)).ok().map(|(a, l)| (a, Some(l)))
 		};
 		let (addr, lease) = next?;
 		info!(event = "conn.retarget", rule = %self.rt.key, from = %current, to = %addr, path = "dpdk");

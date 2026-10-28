@@ -2,7 +2,8 @@
 //! TLS ClientHello walk of `sni` rules, the QUIC Initial and the DTLS ClientHello
 //! (whole, and in fragments, #332) of UDP `sni` rules, the
 //! PROXY v2 header in front of each datagram of a UDP rule with `proxy_protocol`, and
-//! the normalisation of request paths before routing (#320).
+//! the normalisation of request paths before routing (#320), and the choice of an L4 target
+//! for a new connection (`balance`, with and without `max_connections`, #341).
 //! Run with `cargo bench --bench parse`; CI compares a PR with its merge base
 //! (.github/workflows/bench.yml, docs/TESTING.md).
 
@@ -219,9 +220,40 @@ fn config() -> Criterion {
 	Criterion::default().warm_up_time(Duration::from_secs(1)).measurement_time(Duration::from_secs(3))
 }
 
+/// What every new L4 connection / UDP session does before it connects: the targets in the
+/// order `balance` gives (`Pool::order`), and the count on the first one that has room
+/// (`Lease::take`). Four targets; `_capped` gives each a `max_connections` it never reaches,
+/// so the difference is the cost of looking at the counts.
+fn balance(c: &mut Criterion) {
+	use rproxy_api::core::balance::{Balance, Lease, Member, Pool, TargetSpec};
+	let pool = |balance: Balance, max_connections: Option<u32>| {
+		let members = (1..=4u16)
+			.map(|port| {
+				let spec = TargetSpec { addr: "127.0.0.1".into(), port, weight: None, backup: false, max_connections };
+				let tx = tokio::sync::watch::channel(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]).0;
+				Arc::new(Member::new(spec, Arc::new(tx), None))
+			})
+			.collect();
+		Pool::new(members, balance, Arc::new(tokio::sync::watch::channel(0).0), true)
+	};
+	let mut g = c.benchmark_group("balance");
+	g.throughput(Throughput::Elements(1));
+	for (name, balance, max) in [
+		("round_robin", Balance::RoundRobin, None),
+		("least_conn", Balance::LeastConn, None),
+		("failover", Balance::Failover, None),
+		("round_robin_capped", Balance::RoundRobin, Some(1_000_000)),
+		("least_conn_capped", Balance::LeastConn, Some(1_000_000)),
+	] {
+		let p = pool(balance, max);
+		g.bench_function(name, |b| b.iter(|| black_box(p.order().into_iter().find_map(Lease::take))));
+	}
+	g.finish();
+}
+
 criterion_group! {
 	name = benches;
 	config = config();
-	targets = matcher, path_normalize, clienthello, quic, dtls, proxy_dgram
+	targets = matcher, path_normalize, clienthello, quic, dtls, proxy_dgram, balance
 }
 criterion_main!(benches);
