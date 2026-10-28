@@ -357,3 +357,22 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 戻す道：`restore_as` の検証の誤り → `note_invalid`（`listen_addr` が読めなければログだけ。キーが取られていれば `rule.duplicate`）。照合は `api` の行が変われば `forget_invalid` してもう一度、行がなくなれば消す。引き継ぎは状態の `invalid_rules`（保存されていたままの本文、足すだけ）を渡し、新しいプロセスが `restore_as` でもう一度検証する（`rules` には入れない：表示の形から戻すと既定で埋めた項目が変わるため）。
 - レビューで足したもの：検証で落ちたルールのファイルも `Registry::file_refs` に入れる（持ち主は `owner_of_key`。直す PATCH は、そのルールを PATCH できるトークンならどれでも `kept` にする。動いているルールと同じ）。消す・行がなくなる・変わる・組に譲るときは `drop_invalid` が持ち主も忘れ、`forget_invalid` は照合の `Store.invalid` も消す（同じ行が戻れば出し直す）。持ち主は `create_spec_in` が表に入れるときに覚える（同じトークンの同時の作成が `409` にならないように）。戻す組のルールと同じキーは、組を当てる間だけ外し（`stash_invalid`）、組がそのキーを取ったものだけ消して `restore.conflict`（持ち主と行の `created_by` も忘れる）、ほかは戻す（`settle_invalid`）。組の `PUT` の計画は、検証で落ちたルールのキーも組の外のルールと同じく先に断る。`/metrics` の `failed` と `rproxy_rule_up 0` に数える。
 - 試験：`tests/cert_api.rs`（`key_files_keep_to_their_owner`）、`tests/persist.rs`（`invalid_rules_keep_their_files_and_count`・`rows_that_do_not_validate_are_failed_rules`：メモリのストア、`rows_that_do_not_validate_with_mariadb`：本物のバイナリと MariaDB）、`tests/handoff_freeze.rs`（`invalid_rules_and_owners_carry_over`）。
+
+## 16. 応答のキャッシュ（v0.4.19、#340）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| 応答のキャッシュ | ミドルウェア `cache`（`ttl` は必須。`stale_on_error`・`max_body`・`max_entries`・`max_memory`・`vary`・`status`・`share_credentials`・`share_after_auth`・`header`）。`stats.http.cache`・`rproxy_http_cache_*`・アクセスログの `cache` | `middlewares` の `cache` | 書いたルートだけ |
+
+- 置き場所：`l7/middleware/cache.rs`。状態（`Store`：キー → `Slot { entry, flight }`、古い順の `order`、バイト数）は組み立てた `Router` のミドルウェアにあり、`http` を変えると空から（`rate_limit` と同じ。引き継ぎでも渡さない。数だけ `HttpCounters.cache` で渡す、足すだけ）。
+- 道筋：`server.rs` の要求側で `Cache::request` がメモリから答える（`HIT`。後ろのミドルウェアは動かず、前のものの応答側は動く）か、`Pending` を `Sent.caches` に入れて先へ進む。応答側の `Cache::response` が持つかを決める。まとめ方は `tokio::sync::watch`：持っていないキーの最初のリクエストが `Lead`（`Slot.flight`）になり、同じキーのほかは待つ。`Lead` が答えを持てば `Fresh`、古い答えを返せば `Stale`、持てなければ `Uncacheable`（待っていたものはそれぞれ転送先へ。並ばせない）、drop（クライアントが切れた）なら `Abandoned`（待っていたものがもう一度見て、1 つが代わりに行く。3 回まで）。
+- 決めたこと：
+  - 持たないもの：GET・HEAD 以外、`Authorization`・`Cookie`・`Proxy-Authorization`（`share_credentials` で持つ）、`Range`・`Upgrade`・本文のあるリクエスト。`status` にない状態コード（選べるのは RFC 9110 §15.1 の既定でキャッシュできるもののうち 200・203・204・300・301・308・404・410）、`Set-Cookie`・`Cache-Control` の `no-store`・`private`・`no-cache`・`Vary: *`・`Content-Range`・`max_body` を超える本文・トレーラー・途中で切れた本文の応答。
+  - 時間は `ttl` だけ（転送先の `max-age` などは見ない。運用で決めた短い時間を守るため）。クライアントの `Cache-Control` も見ない（だれでも転送先へ毎回送らせられないように）。
+  - 認証：ルートで `cache` の後ろに通すかを決める種類（`GATES`：`ip_allow`・`geoip`・`crowdsec`・`basic_auth`・`forward_auth`・`oidc`）を置けない、前の利用者を確かめる種類（`SIGN_IN`）は `share_after_auth` が要る、ルートのサービスの転送先の `forward_auth` は断る（`HttpSpec::check_cache_route`）。キャッシュは利用者を区別しないので、利用者ごとに違う答えを別の利用者に見せないことを形で守る。
+  - `Vary`：応答の `Vary` の名前（`Content-Encoding` があれば `Accept-Encoding` も）と答えたリクエストの値を持ち、合わないリクエストには使わない。キーごとに 1 つだけ持つ（値の多いヘッダは `vary` でキーを分ける）。
+  - `max_memory`（既定 64 MiB）は issue になかったが足した：既定の `max_entries`（1024）× `max_body`（1 MiB）が 1 GiB になり、メモリを少なくする方針に合わないため。
+  - 古いものから捨てる：`ttl` はミドルウェアごとに同じなので、入れた順が期限の順。入れるたびに `stale_on_error` まで過ぎたものを先頭から捨て、超えた分も先頭から。
+  - 条件つきのリクエスト：先に行くリクエストからは `If-None-Match`・`If-Modified-Since` を外して全体を取り、`If-None-Match` だけ rproxy が 304 で答える。
+- 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる）。
+- 試験：`tests/http_cache.rs`、`src/l7/middleware/cache.rs` の単体テスト。

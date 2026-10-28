@@ -300,7 +300,7 @@ For `http` rules, `stats.http` also holds request counts (omitted for other rule
          "routes": {"site": {"requests": 3, "by_status": {"2xx": 3}}, "(none)": {"requests": 1, "by_status": {"4xx": 1}}}}
 ```
 
-If there are services with `health_check`, `services` holds per-server state (`{"app": [{"url": "http://10.0.0.20:80", "up": true}, ...]}`). If any requests were refused by `rate_limit` / `in_flight`, `limited` (total) and per-route `limited` (per middleware name) are included. Requests refused by `crowdsec` appear in the same shape under `blocked` (both are also counted under `4xx` in `by_status`).
+If there are services with `health_check`, `services` holds per-server state (`{"app": [{"url": "http://10.0.0.20:80", "up": true}, ...]}`). If any requests were refused by `rate_limit` / `in_flight`, `limited` (total) and per-route `limited` (per middleware name) are included. Requests refused by `crowdsec` appear in the same shape under `blocked` (both are also counted under `4xx` in `by_status`). Rules with `cache` (v0.4.19) also get `cache` (`hit`, `miss`, `stale`, `bypass`; see "Response cache").
 
 - `by_status` is grouped by the hundreds digit of the status code (`1xx`–`5xx`; empty classes are omitted). `routes` is per route name; requests that matched no route are under `(none)`.
 - Counted when the response body has been fully sent (or the client disconnected).
@@ -461,11 +461,11 @@ rproxy talks HTTP/1.1, HTTP/2 and HTTP/3 with clients and HTTP/1.1 (HTTP/2 with 
 - Closing for a limit sends GOAWAY and lets requests in progress (begun up to GOAWAY's last stream) finish; without any it closes after one second. Connections closed by a limit have `reason` `first_byte_timeout`, `request_headers_timeout` or `idle` in `conn.close` (HTTP/3: `idle`). When hyper notices an HTTP/1.1 header timeout first, it is `conn.error` (`read header from client timeout`) as before.
 - `features.http_options` lists `http_timeouts` (and `path_normalize`, `raw_path`, `strict_path` for paths, `identity_headers` for identity headers).
 
-- The access log (`event: "http.access"`) is one line per request: `rule`, `route` (`(none)` if nothing matched), `service`, `backend`, `client`, `method`, `host`, `path` (query not included), `query` (the query, without `?`, empty if none; since v0.3.8. Values of parameters with names likely to be secret (names containing `token`, `code`, `state`, `password`, `secret`, `key`, `signature`, `auth`, `session`, etc.) are replaced with `REDACTED`, so that GitLab's `private_token`, OIDC's `code` / `state` and the like are not left in logs), `protocol` (`HTTP/1.1` / `HTTP/2.0`), `status`, `duration_ms` (until the response body is fully sent), `bytes_in` (`Content-Length`), `bytes_out` (response body), `user_agent`, `sni`, `tls_version`, `refused_by`, `middleware`, `user`, `auth_error`, `raw_path` (v0.4.17, #320: the path as sent, only when normalisation changed it). The destination is `global.access_log`.
+- The access log (`event: "http.access"`) is one line per request: `rule`, `route` (`(none)` if nothing matched), `service`, `backend`, `client`, `method`, `host`, `path` (query not included), `query` (the query, without `?`, empty if none; since v0.3.8. Values of parameters with names likely to be secret (names containing `token`, `code`, `state`, `password`, `secret`, `key`, `signature`, `auth`, `session`, etc.) are replaced with `REDACTED`, so that GitLab's `private_token`, OIDC's `code` / `state` and the like are not left in logs), `protocol` (`HTTP/1.1` / `HTTP/2.0`), `status`, `duration_ms` (until the response body is fully sent), `bytes_in` (`Content-Length`), `bytes_out` (response body), `user_agent`, `sni`, `tls_version`, `refused_by`, `middleware`, `user`, `auth_error`, `raw_path` (v0.4.17, #320: the path as sent, only when normalisation changed it), `cache` (v0.4.19, #340: `HIT`, `MISS`, `STALE` or `BYPASS`, on routes with a cache only). The destination is `global.access_log`.
   - `refused_by` / `middleware` (v0.3.20): the kind of the middleware that refused the request (`ip_allow`, `basic_auth`, `forward_auth`, `oidc`, `crowdsec`, `rate_limit`, `in_flight`, `buffering`, `circuit_breaker`, `respond`, …) and its name in the settings. Set only when a middleware answered with an error (4xx / 5xx), empty otherwise; redirects and `respond` with 2xx are not included.
   - `user` (v0.3.20): the user name `basic_auth` let in.
   - `auth_error` (v0.3.20): why `basic_auth` refused: `no_credentials` (no `Authorization`), `unknown_user`, `bad_password`, `unavailable` (the users file cannot be read). Neither the name tried nor the password is logged.
-- `GET /metrics` exposes `rproxy_http_requests_total{protocol,listen,route,code}` (`code` is `2xx` etc.), `rproxy_http_request_duration_seconds{protocol,listen,route}` (histogram; buckets 5ms–10s), `rproxy_http_limited_total{protocol,listen,route,middleware}` (number refused by `rate_limit` / `in_flight`), and `rproxy_http_blocked_total{protocol,listen,route,middleware}` (number refused by `crowdsec`). With `global.crowdsec`, also `rproxy_crowdsec_decisions` (number of addresses and ranges blocked by decisions) `rproxy_crowdsec_synced` (1 once fetched from LAPI at least once), `rproxy_crowdsec_connected` (1 when the last fetch succeeded; v0.3.20) and `rproxy_crowdsec_last_success_timestamp_seconds` (time of the last successful fetch; v0.3.20; absent until one succeeds). Paths are not used as labels.
+- `GET /metrics` exposes `rproxy_http_requests_total{protocol,listen,route,code}` (`code` is `2xx` etc.), `rproxy_http_request_duration_seconds{protocol,listen,route}` (histogram; buckets 5ms–10s), `rproxy_http_limited_total{protocol,listen,route,middleware}` (number refused by `rate_limit` / `in_flight`), `rproxy_http_blocked_total{protocol,listen,route,middleware}` (number refused by `crowdsec`), and `rproxy_http_cache_total{protocol,listen,route,middleware,result}`, `rproxy_http_cache_entries` and `rproxy_http_cache_bytes` (`cache`, v0.4.19). With `global.crowdsec`, also `rproxy_crowdsec_decisions` (number of addresses and ranges blocked by decisions) `rproxy_crowdsec_synced` (1 once fetched from LAPI at least once), `rproxy_crowdsec_connected` (1 when the last fetch succeeded; v0.3.20) and `rproxy_crowdsec_last_success_timestamp_seconds` (time of the last successful fetch; v0.3.20; absent until one succeeds). Paths are not used as labels.
 - Middlewares act on the request in the order written in the route's `middlewares`, and on the response in reverse order (same as Traefik). If a middleware along the way returns a response (redirect, `respond`, refusal), processing does not go further. The response side of the middlewares passed so far (`headers` etc.) also acts on that response.
 - Available middlewares (v0.3.1; `features.middlewares`):
   - `redirect_scheme`: redirects requests received with a scheme different from `scheme` to `scheme://` with the same host, path and query. `port` is omitted if it is the default port (80 / 443).
@@ -1065,6 +1065,51 @@ A rule restored from the database (`forward_rules`, `rproxy_rules`), or handed o
 - Its key and secret files count as its owner's (`created_by` for `api`): another token may not name them (`409 file_in_use`); a PATCH that fixes it may keep them (any token allowed to PATCH the rule, as for a running rule). Deleting it forgets the owner too.
 - A rule of a rule set restored at startup or after a live upgrade with the same key wins: that rule stays and this one is taken off the list (`restore.conflict`; the periodic check keeps the row as a `restore.conflict`). When the set leaves that rule out (it does not validate in this version, its ports overlap, ...), this one stays as it is. A rule set's `PUT` with a rule at its key is refused up front, as for any rule outside the set (`409`, `already_exists` in `errors`). The `created_by` of the row whose key the set took is forgotten.
 - Counted in `rproxy_rules{state="failed"}` of `/metrics`, with `rproxy_rule_up` 0.
+
+### Response cache (v0.4.19, #340, `cache` in `features.middlewares`)
+
+The `cache` middleware keeps responses to GET in memory for `ttl` and answers the same requests meanwhile without sending them to the backend. It is meant for many clients polling the same JSON every few seconds (e.g. once every 5 seconds per world, while the data changes every second): with `ttl: 1s` clients still get the latest data every second, and the backend gets one request per key and second.
+
+```yaml
+http:
+  routes:
+    - name: state
+      match: Host(`api.example.com`) && Path(`/state.json`)
+      service: app
+      middlewares: [gzip, micro]
+  middlewares:
+    gzip: {compress: {}}
+    micro:
+      cache:
+        ttl: 1s                # required; 100ms-24h
+        stale_on_error: 30s    # default 0s
+        max_body: 1048576      # default 1 MiB (up to 64 MiB)
+        max_entries: 1024      # default 1024
+        max_memory: 67108864   # default 64 MiB
+        vary: [Accept-Language]
+        status: [200]          # default [200]
+        header: X-Cache        # default X-Cache; "" for none
+```
+
+- The key is the host (lower case, without the port), path and query (after earlier middlewares rewrote them: what the backend receives), and the values of the request headers named in `vary`. Only GET is kept; HEAD is answered from GET's answer without the body (HEAD alone keeps nothing).
+- Requests are coalesced: only the first request for a key with nothing fresh goes to the backend; requests for the same key arriving meanwhile wait for its answer and get the same one. If the first request's client goes away, one of the waiting requests goes instead. If the answer may not be kept (below), the waiting requests go to the backend each. They wait as long as the first request may take (the service's and the route's `timeouts`).
+- Kept in the process's memory (not shared between nodes nor handed over in a live upgrade). With N nodes the backend gets at most N requests per key and `ttl`. Changing the rule's `http` starts empty (as `rate_limit` does). Past `max_entries` or `max_memory` (bodies and headers) the oldest go first; answers past `ttl` and `stale_on_error` are dropped too.
+- Responses carry `X-Cache` (`header`): `HIT` (from memory), `MISS` (from the backend, kept or not), `STALE` (out of date, because the backend failed), `BYPASS` (a request the cache does not take). `HIT` and `STALE` carry `Age` (seconds since it was kept, added to the backend's `Age`).
+- `stale_on_error`: for this long after an answer went out of date, when the backend answers 5xx, cannot be reached (502) or times out (504), the kept answer is given as `STALE`.
+- The backend's `Cache-Control` `max-age` / `s-maxage` and `Expires` are not used (only `ttl` decides). The client's `Cache-Control` (`no-cache` etc.) is ignored too (so that no client can make every request go to the backend).
+- Conditional requests: a request going to the backend leaves `If-None-Match` and `If-Modified-Since` behind and fetches the whole answer; an `If-None-Match` matching the kept answer's `ETag` is answered 304 (on `HIT` and `MISS` alike).
+- Never kept (decided):
+  - Requests: methods other than GET / HEAD (`BYPASS`; a POST does not drop what is kept: `ttl` is meant to be short), requests with `Authorization`, `Cookie` or `Proxy-Authorization` (kept with `share_credentials: true`, only when they do not change the backend's answer; add `vary: [Authorization]` or `vary: [Cookie]` to keep one per user), `Range`, `Upgrade`, or a request body.
+  - Responses: a status not in `status` (200, 203, 204, 300, 301, 308, 404, 410 may be named), `Set-Cookie`, `Cache-Control` `no-store` / `private` / `no-cache`, `Vary: *`, `Content-Range`, a body over `max_body` (at once from `Content-Length`, otherwise while reading; what was read is sent on with the rest), trailers, a body that broke off (sent on as the error it is).
+  - The names in the answer's `Vary` (and `Accept-Encoding` for an answer with `Content-Encoding`) are kept with the values of the request it answered; a request with other values does not get it (one answer per key: name headers that often differ in `vary` to split the key).
+- With authentication (route checks, `400 invalid`):
+  - No middleware that decides who gets in (`ip_allow`, `geoip`, `crowdsec`, `basic_auth`, `forward_auth`, `oidc`) may come after `cache` (an answer from memory would not pass it): put it before. A `forward_auth` of the route's service's servers (`servers[].middlewares`) is refused for the same reason.
+  - A middleware that signs users in (`basic_auth`, `forward_auth`, `oidc`) before `cache` needs `share_after_auth: true`: the backend may answer each user differently (`X-Forwarded-User` etc.), and the cache does not tell users apart, so only when every user who gets in may see the same answer. `oidc` sends a session `Cookie`, so it needs `share_credentials: true` too.
+  - One `cache` per route; not in `servers[].middlewares`.
+  - `rate_limit` and `in_flight` after it do not run for answers from memory either (they protect the backend, so that is fine). Put them before it to cover every request. `mirror` copies no request answered from memory, before or after it (only those going to the backend).
+- Order with other middlewares: `compress`, `cors` and `headers` before the cache (outside) work on answers from memory too, per request (`compress` by that client's `Accept-Encoding`). After it, the answer is kept as they left it (`compress` adds `Vary: Accept-Encoding` and `cors` `Vary: Origin`, so other clients do not get it).
+- Statistics: `cache` in `stats.http` (totals of `hit`, `miss`, `stale`, `bypass`) and per route (`cache` by middleware name); handed over in a live upgrade. `/metrics` has `rproxy_http_cache_total{protocol,listen,route,middleware,result}` (`result` is `hit`, `miss`, `stale` or `bypass`) and what is kept: `rproxy_http_cache_entries{protocol,listen,middleware}` and `rproxy_http_cache_bytes{protocol,listen,middleware}`. The access log has `cache` (`HIT` etc.; on routes with a cache only). A 404 answered from memory is not `refused_by`.
+- There is no shared cache (Redis etc.). Should the backend's requests have to be bounded across nodes, that is another issue.
 
 ## Endpoints
 

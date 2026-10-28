@@ -4,6 +4,7 @@
 //! Traefik.
 
 pub mod auth;
+pub mod cache;
 pub mod cors;
 pub mod crowdsec;
 pub mod ext_authz;
@@ -128,6 +129,8 @@ pub enum Middleware {
 	Mirror { name: String, service: Arc<Service>, share: Share },
 	/// The Host for the backend (#228).
 	ReplaceHost(HeaderValue),
+	/// Responses from memory (#340, `cache.rs`), run by the server.
+	Cache(Arc<cache::Cache>),
 }
 
 impl Middleware {
@@ -158,6 +161,7 @@ impl Middleware {
 			Middleware::Cors(_) => "cors",
 			Middleware::Mirror { .. } => "mirror",
 			Middleware::ReplaceHost(_) => "replace_host",
+			Middleware::Cache(_) => "cache",
 		}
 	}
 }
@@ -315,6 +319,7 @@ impl Middleware {
 			}
 			MiddlewareSpec::Cors(c) => Middleware::Cors(Box::new(cors::Cors::new(c, &what)?)),
 			MiddlewareSpec::ReplaceHost { host } => Middleware::ReplaceHost(value(host, &what)?),
+			MiddlewareSpec::Cache(c) => Middleware::Cache(Arc::new(cache::Cache::new(label, c, &what)?)),
 			MiddlewareSpec::Mirror { .. } => return Err(ApiError::invalid(format!("{what}: mirror needs the rule's services"))),
 			#[allow(unreachable_patterns)]
 			other => return Err(ApiError::unsupported(format!("{what}: {} is not available in this version", other.kind()))),
@@ -460,6 +465,7 @@ impl Middleware {
 			| Middleware::BasicAuth(_)
 			| Middleware::ForwardAuth(_)
 			| Middleware::Mirror { .. }
+			| Middleware::Cache(_)
 			| Middleware::Oidc(_) => None,
 		}
 	}

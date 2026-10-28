@@ -417,6 +417,8 @@ pub enum MiddlewareSpec {
 	ReplaceHost {
 		host: String,
 	},
+	/// Responses kept in memory for `ttl` (#340, `middleware/cache.rs`).
+	Cache(middleware::cache::CacheSpec),
 }
 
 /// `protocol` of `forward_auth` (v0.4.3).
@@ -532,6 +534,7 @@ impl MiddlewareSpec {
 			MiddlewareSpec::Cors(_) => "cors",
 			MiddlewareSpec::Mirror { .. } => "mirror",
 			MiddlewareSpec::ReplaceHost { .. } => "replace_host",
+			MiddlewareSpec::Cache(_) => "cache",
 		}
 	}
 
@@ -622,6 +625,7 @@ impl MiddlewareSpec {
 			MiddlewareSpec::Respond { status, .. } if !(100..=599).contains(status) => bad(format!("status {status} is not an HTTP status")),
 			MiddlewareSpec::Geoip(g) => g.validate(&format!("middleware {name}")),
 			MiddlewareSpec::Cors(c) => c.validate(&format!("middleware {name}")),
+			MiddlewareSpec::Cache(c) => c.validate(&format!("middleware {name}")),
 			MiddlewareSpec::Mirror { service, percent, fraction } => {
 				if !services.contains_key(service) {
 					return bad(format!("service {service:?} is not defined"));
@@ -857,6 +861,7 @@ impl HttpSpec {
 					parse_duration(d).map_err(|e| invalid(format!("route {}: timeouts: {e}", r.name)))?;
 				}
 			}
+			self.check_cache_route(r)?;
 			let answered = r.middlewares.iter().any(|m| self.middlewares[m].answers());
 			match (&r.service, &r.to) {
 				(Some(_), Some(_)) => return Err(invalid(format!("route {}: give service or to, not both", r.name))),
@@ -879,6 +884,40 @@ impl HttpSpec {
 					return Err(invalid(format!("default: service {s:?} is not defined")));
 				}
 			}
+		}
+		Ok(())
+	}
+
+	/// `cache` in a route (#340): an answer from memory skips the middlewares after it and the
+	/// servers' own (`servers[].middlewares`), so none of those may decide who gets in; one
+	/// before it that signs users in needs `share_after_auth` (the answer is shared).
+	fn check_cache_route(&self, r: &RouteSpec) -> Result<(), ApiError> {
+		let kind = |m: &String| self.middlewares[m].kind();
+		let Some(at) = r.middlewares.iter().position(|m| kind(m) == "cache") else { return Ok(()) };
+		let what = format!("route {}: middleware {:?} (cache)", r.name, r.middlewares[at]);
+		if r.middlewares[at + 1..].iter().any(|m| kind(m) == "cache") {
+			return Err(invalid(format!("{what}: a route takes one cache")));
+		}
+		if let Some(m) = r.middlewares[at + 1..].iter().find(|m| middleware::cache::GATES.contains(&kind(m))) {
+			return Err(invalid(format!(
+				"{what}: {m:?} ({}) comes after it, and an answer from the cache would not pass it; put it before the cache",
+				kind(m)
+			)));
+		}
+		let MiddlewareSpec::Cache(spec) = &self.middlewares[&r.middlewares[at]] else { return Ok(()) };
+		if let Some(m) = r.middlewares[..at].iter().find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
+			if !spec.share_after_auth {
+				return Err(invalid(format!(
+					"{what}: {m:?} ({}) comes before it, so the backend may answer each user differently; set share_after_auth: true only if every user who gets in may see the same answer",
+					kind(m)
+				)));
+			}
+		}
+		let servers = r.service.as_ref().and_then(|s| self.services.get(s)).map(|s| s.servers.as_slice()).unwrap_or_default();
+		if let Some(m) = servers.iter().flat_map(|s| &s.middlewares).find(|m| self.middlewares.get(*m).is_some_and(|m| m.kind() == "forward_auth")) {
+			return Err(invalid(format!(
+				"{what}: the service's servers run forward_auth {m:?}, which an answer from the cache would not pass"
+			)));
 		}
 		Ok(())
 	}

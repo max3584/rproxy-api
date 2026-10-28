@@ -493,6 +493,54 @@ fn l7_http2(c: &mut Criterion) {
 	g.finish();
 }
 
+/// A `cache` (#340) in front of `backend`: after the first request every one is answered
+/// from memory (the hit path: key, lookup, the response from the kept answer).
+fn l7_cache(c: &mut Criterion) {
+	let rt = runtime();
+	let (h, mut sender) = rt.block_on(async {
+		let h = harness().await;
+		let port = free_port();
+		create(
+			&h,
+			json!({
+				"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+				"http": {
+					"routes": [{"name": "api", "match": "Host(`app.test`) && PathPrefix(`/api/`)", "to": format!("http://{}", http_backend().await), "middlewares": ["micro"]}],
+					// long enough that the benchmark measures hits only
+					"middlewares": {"micro": {"cache": {"ttl": "1h"}}},
+				},
+			}),
+		)
+		.await;
+		let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		tcp.set_nodelay(true).unwrap();
+		let (sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tcp)).await.unwrap();
+		tokio::spawn(conn);
+		(h, sender)
+	});
+	let mut g = c.benchmark_group("l7_cache");
+	g.throughput(Throughput::Elements(1));
+	g.bench_function("hit", |b| {
+		b.iter_custom(|iters| {
+			rt.block_on(async {
+				let start = Instant::now();
+				for _ in 0..iters {
+					guard(&h, "l7_cache/hit", async {
+						sender.ready().await.unwrap();
+						let req = hyper::Request::get("/api/v1/state.json?world=1").header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
+						let resp = sender.send_request(req).await.unwrap();
+						assert_eq!(resp.status(), StatusCode::OK);
+						resp.into_body().collect().await.unwrap();
+					})
+					.await;
+				}
+				start.elapsed()
+			})
+		})
+	});
+	g.finish();
+}
+
 fn config() -> Criterion {
 	Criterion::default().sample_size(20).warm_up_time(Duration::from_secs(1)).measurement_time(Duration::from_secs(3))
 }
@@ -500,6 +548,6 @@ fn config() -> Criterion {
 criterion_group! {
 	name = benches;
 	config = config();
-	targets = l4_tcp, l4_udp, tls_terminate, l7_http1, l7_http2
+	targets = l4_tcp, l4_udp, tls_terminate, l7_http1, l7_http2, l7_cache
 }
 criterion_main!(benches);

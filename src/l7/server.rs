@@ -34,7 +34,7 @@ use super::backend::{self, Dialer, Sender, ServerHealth, Service};
 use super::compress;
 use super::middleware::crowdsec::Verdict;
 use super::middleware::limit::Hold;
-use super::middleware::{self, Blocked, Ctx, HostOverride, Limited, Middleware};
+use super::middleware::{self, cache, Blocked, Ctx, HostOverride, Limited, Middleware};
 use super::{deadline, mirror};
 use super::resilience::{self, RetryPolicy, Ticket};
 use super::{HttpSpec, Matcher};
@@ -118,6 +118,8 @@ pub struct Router {
 	/// `oidc`'s, `forward_auth`'s `response_headers`): whatever a client sends under these
 	/// names is dropped from every request, on every route (#320).
 	identity_headers: Vec<HeaderName>,
+	/// `cache` middlewares (#340), for `/metrics`.
+	caches: Vec<Arc<cache::Cache>>,
 }
 
 impl Drop for Router {
@@ -217,6 +219,9 @@ impl Router {
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
 		let identity_headers = identity_headers(middlewares.values().map(|m| m.as_ref()));
+		let mut caches: Vec<Arc<cache::Cache>> =
+			middlewares.values().filter_map(|m| if let Middleware::Cache(c) = m.as_ref() { Some(c.clone()) } else { None }).collect();
+		caches.sort_by(|a, b| a.name.cmp(&b.name));
 		Ok(Router {
 			routes,
 			default_status,
@@ -230,7 +235,16 @@ impl Router {
 			raw_path: spec.raw_path,
 			strict_path: spec.strict_path,
 			identity_headers,
+			caches,
 		})
+	}
+
+	/// Each `cache` middleware: its name, the answers it keeps and their bytes (#340).
+	pub fn cache_usage(&self) -> Vec<(String, usize, u64)> {
+		self.caches.iter().map(|c| {
+			let (entries, bytes) = c.usage();
+			(c.name.clone(), entries, bytes)
+		}).collect()
 	}
 
 	/// SIGHUP: read the secret files of the authentication middlewares again.
@@ -815,6 +829,10 @@ struct Sent {
 	host: HeaderValue,
 	/// Admissions through circuit breakers, by position in the chain.
 	tickets: Vec<(usize, Ticket)>,
+	/// Requests that went past a `cache` (#340), by position in the chain.
+	caches: Vec<(usize, Box<cache::Pending>)>,
+	/// What the route's `cache` did (its name), for the statistics and the access log.
+	cached: Option<(String, cache::Outcome)>,
 }
 
 impl Conn {
@@ -946,6 +964,8 @@ impl Conn {
 			host: request_authority(req.uri(), req.headers())
 				.unwrap_or_else(|| HeaderValue::from_str(&host).unwrap_or(HeaderValue::from_static("localhost"))),
 			tickets: vec![],
+			caches: vec![],
+			cached: None,
 		};
 		// request side in the route's order, until one answers
 		let (mut parts, mut body) = req.into_parts();
@@ -1080,6 +1100,16 @@ impl Conn {
 					}
 					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 				},
+				Middleware::Cache(c) => match c.request(&mut parts, &host).await {
+					Ok((resp, outcome)) => {
+						sent.cached = Some((c.name.clone(), outcome));
+						Some(resp)
+					}
+					Err(pending) => {
+						sent.caches.push((i, pending));
+						None
+					}
+				},
 				m => m.on_request(&mut parts, &ctx),
 			};
 			if let Some(resp) = resp {
@@ -1091,7 +1121,7 @@ impl Conn {
 		// a middleware that refused the request (an error status; not redirects or answers like `respond` 200)
 		if log {
 			if let (Some(resp), Some((kind, name))) = (&answer, answered_by) {
-				if resp.status().is_client_error() || resp.status().is_server_error() {
+				if (resp.status().is_client_error() || resp.status().is_server_error()) && kind != "cache" {
 					entry.refused_by = kind.to_string();
 					entry.middleware = name.to_string();
 				}
@@ -1154,6 +1184,10 @@ impl Conn {
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
 			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
+		if let Some((name, outcome)) = sent.cached.take() {
+			self.rt.http_stats.cache(route_name, &name, outcome);
+			entry.cache = outcome.as_str();
+		}
 		entry.status = resp.status().as_u16();
 		// tell HTTP/1.1 and HTTP/2 clients that HTTP/3 is answered on the same port
 		if !self.h3 && self.https && !resp.headers().contains_key(header::ALT_SVC) {
@@ -1199,6 +1233,13 @@ impl Conn {
 					}
 					None => resp,
 				}
+			}
+			Middleware::Cache(c) => {
+				let Some(pos) = sent.caches.iter().position(|(at, _)| *at == i) else { return resp };
+				let (_, pending) = sent.caches.swap_remove(pos);
+				let (resp, outcome) = c.response(pending, resp).await;
+				sent.cached = Some((c.name.clone(), outcome));
+				resp
 			}
 			Middleware::Compress { encodings, min_size } => {
 				if !compress::compressible(resp.status(), resp.headers(), *min_size, sent.head) {
