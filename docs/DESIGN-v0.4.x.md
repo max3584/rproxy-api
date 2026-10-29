@@ -358,7 +358,40 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - レビューで足したもの：検証で落ちたルールのファイルも `Registry::file_refs` に入れる（持ち主は `owner_of_key`。直す PATCH は、そのルールを PATCH できるトークンならどれでも `kept` にする。動いているルールと同じ）。消す・行がなくなる・変わる・組に譲るときは `drop_invalid` が持ち主も忘れ、`forget_invalid` は照合の `Store.invalid` も消す（同じ行が戻れば出し直す）。持ち主は `create_spec_in` が表に入れるときに覚える（同じトークンの同時の作成が `409` にならないように）。戻す組のルールと同じキーは、組を当てる間だけ外し（`stash_invalid`）、組がそのキーを取ったものだけ消して `restore.conflict`（持ち主と行の `created_by` も忘れる）、ほかは戻す（`settle_invalid`）。組の `PUT` の計画は、検証で落ちたルールのキーも組の外のルールと同じく先に断る。`/metrics` の `failed` と `rproxy_rule_up 0` に数える。
 - 試験：`tests/cert_api.rs`（`key_files_keep_to_their_owner`）、`tests/persist.rs`（`invalid_rules_keep_their_files_and_count`・`rows_that_do_not_validate_are_failed_rules`：メモリのストア、`rows_that_do_not_validate_with_mariadb`：本物のバイナリと MariaDB）、`tests/handoff_freeze.rs`（`invalid_rules_and_owners_carry_over`）。
 
-## 16. 宛先ごとの上限（v0.4.19、#341）
+## 16. 応答のキャッシュ（v0.4.19、#340）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| 応答のキャッシュ | ミドルウェア `cache`（`ttl` は必須。`stale_on_error`・`max_body`・`max_entries`・`max_memory`・`vary`・`status`・`share_credentials`・`share_after_auth`・`header`）。`stats.http.cache`・`rproxy_http_cache_*`・アクセスログの `cache` | `middlewares` の `cache` | 書いたルートだけ |
+
+- 置き場所：`l7/middleware/cache.rs`。状態（`Store`：キー → `Slot { entry, flight }`、古い順の `order`、バイト数）は組み立てた `Router` のミドルウェアにあり、`http` を変えると空から（`rate_limit` と同じ。引き継ぎでも渡さない。数だけ `HttpCounters.cache` で渡す、足すだけ）。
+- 道筋：`server.rs` の要求側で `Cache::request` がメモリから答える（`HIT`。後ろのミドルウェアは動かず、前のものの応答側は動く）か、`Pending` を `Sent.caches` に入れて先へ進む。応答側の `Cache::response` が持つかを決める。まとめ方は `tokio::sync::watch`：持っていないキーの最初のリクエストが `Lead`（`Slot.flight`）になり、同じキーのほかは待つ。`Lead` が答えを持てば `Fresh`、古い答えを返せば `Stale`、持てなければ `Uncacheable`（待っていたものはそれぞれ転送先へ。並ばせない）、drop（クライアントが切れた）なら `Abandoned`（待っていたものがもう一度見て、1 つが代わりに行く。3 回まで）。
+- 決めたこと：
+  - 持たないもの：GET・HEAD 以外、`Authorization`・`Cookie`・`Proxy-Authorization`（`share_credentials` で持つ）、`Range`・`Upgrade`・本文のあるリクエスト。`status` にない状態コード（選べるのは RFC 9110 §15.1 の既定でキャッシュできるもののうち 200・203・204・300・301・308・404・410）、`Set-Cookie`・`Cache-Control` の `no-store`・`private`・`no-cache`・`Vary: *`・`Content-Range`・`max_body` を超える本文・トレーラー・途中で切れた本文の応答。
+  - 時間は `ttl` だけ（転送先の `max-age` などは見ない。運用で決めた短い時間を守るため）。クライアントの `Cache-Control` も見ない（だれでも転送先へ毎回送らせられないように）。
+  - 認証：ルートで `cache` の後ろに通すかを決める種類（`GATES`：`ip_allow`・`geoip`・`crowdsec`・`basic_auth`・`forward_auth`・`oidc`）を置けない、前の利用者を確かめる種類（`SIGN_IN`）は `share_after_auth` が要る、ルートのサービスの転送先の `forward_auth` は断る（`HttpSpec::check_cache_route`）。キャッシュは利用者を区別しないので、利用者ごとに違う答えを別の利用者に見せないことを形で守る。
+  - `Vary`：応答の `Vary` の名前（`Content-Encoding` があれば `Accept-Encoding` も）と答えたリクエストの値を持ち、合わないリクエストには使わない。キーごとに 1 つだけ持つ（値の多いヘッダは `vary` でキーを分ける）。
+  - `max_memory`（既定 64 MiB）は issue になかったが足した：既定の `max_entries`（1024）× `max_body`（1 MiB）が 1 GiB になり、メモリを少なくする方針に合わないため。
+  - 古いものから捨てる：`ttl` はミドルウェアごとに同じなので、入れた順が期限の順。入れるたびに `stale_on_error` まで過ぎたものを先頭から捨て、超えた分も先頭から。
+  - 条件つきのリクエスト：先に行くリクエストからは `If-None-Match`・`If-Modified-Since` を外して全体を取り、`If-None-Match` だけ rproxy が 304 で答える。
+- レビューで足したもの（#343）：
+  - キーにルートの名前（同じミドルウェアを書いたルートどうしで答えを混ぜない。`Header` で分けたベータ版のルート、`ip_allow` の後ろのルート）、受けた方式とポート、`tls.client_auth` のルールではクライアント証明書（`X-Client-Verify` と `X-Forwarded-Client-Cert` の中身）を入れる（`cache::Ask`）。証明書を出したリクエストは資格情報（`share_credentials` なしは `BYPASS`）。
+  - HTTP/2・HTTP/3 で `Content-Length` なしに DATA フレームを送る GET：`cache::settle` が本文を 1 秒まで見て（読んだものは戻す）、あれば `BYPASS`。
+  - 認証のミドルウェアが応答に付けるもの（`oidc` の `Set-Cookie`、gRPC の `forward_auth` の `response_headers_to_add`）は、そのミドルウェアの応答側（チェーンの位置ごと）で付ける。前は応答側の前に全部付けていたので、後ろのキャッシュが持って別の利用者に返していた。後ろのミドルウェアの応答側はもうこれを見ない（`headers` の `remove` で消すなら前に置く）。
+  - `cors`（と `headers` の `cors`）は許さないオリジンにも `Vary: Origin`（後ろのキャッシュが許さないオリジンへの答えを許したオリジンに返さないように）。
+  - 持てない答えのキーは `ttl` のあいだ並ばせない（`Store.passes`、`max_entries` まで）。古い答えのない 5xx は待っていたものに渡す（`Done::Error`）。待つのは `WAIT_LIMIT`（10 秒）まで、本文を読むのは `COLLECT_LIMIT`（5 秒）まで、`text/event-stream` は持たない。
+  - 落ちている間：`Slot.failed` から `ttl` は転送先へ行かずに `STALE`、その後は 1 つが試し、ほかはすぐ `STALE`。
+  - `header` にホップごと・本文の形・キャッシュのヘッダを使わせない。`MISS` は転送先の `Age` を残す。`/metrics` の数は期限を過ぎたものを捨ててから。If-None-Match は引用符の中の `,` を読む。`Accept-Encoding` は符号化の名前の組で比べる。`oidc` の後ろで `share_credentials` のない `cache` は `--check-config` の警告（`HttpSpec::warnings`）。
+  - 単体テストは止めた時計（`tokio::time::pause`、`Instant` は `tokio::time::Instant`）で時間を進める。
+- 2 回目のレビュー（#343）：
+  - `passes` は 1 人のクライアントでキャッシュを止められた（転送先が断るヘッダで 406、`Set-Cookie`、遅い本文）。答えそのものが理由のもの（`Verdict::Strike`：`Cache-Control`・`Set-Cookie`・`Vary: *`・大きさ・`text/event-stream`）だけを数え、`STRIKES`（3）回続いたら（前から `ttl` 以内）`ttl` のあいだ待たせない。リクエストのせいでも起きるもの（`Verdict::Reset`：`status` の外・`Content-Range`、遅い・切れた本文）は数え直し。`Pass` は答えの `Vary` の値を持ち、合うリクエストだけに効く。新しい答えを先に返す。`Pass` の大きさは `max_memory` に数え、期限を過ぎたものは `purge` が捨てる。
+  - `settle` はヘッダで BYPASS にならないとき（`Cache::admits`）だけ。`Expect` は BYPASS（HTTP/1.1 で `100 Continue` を送らせない）。空の DATA フレームは読み飛ばす（HTTP/2 で HEADERS に END_STREAM がなく、空の DATA で終わるもの）。HTTP/3 の本文 `ChannelBody` に `is_end_stream`（読み手が終わりまで送った）。
+  - 古い答えのない 5xx は待っていたものに渡すだけ（`Done::Error`、持たない）。待たずに 1 人で行ったリクエストが落ちたのを見ても `Slot.failed` を付け、すぐ `STALE` の時間が始まる。
+  - `cors` の `Vary: Origin` は、どのオリジンでも許して資格情報を許さない（`*`）ときも付ける：`Origin` のないリクエストの答え（CORS のヘッダなし）を、`Origin` のあるリクエストに返さないため（後ろのキャッシュ）。
+- 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる。最初に 1 回埋めて、測るものはすべて `HIT` を確かめる）。
+- 試験：`tests/http_cache.rs`、`src/l7/middleware/cache.rs` の単体テスト。
+
+## 17. 宛先ごとの上限（v0.4.19、#341）
 
 | 項目 | 形 | `features` | 既定 |
 |---|---|---|---|

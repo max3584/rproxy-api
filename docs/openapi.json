@@ -1346,6 +1346,78 @@
               "replace_host"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "cache": {
+                "type": "object",
+                "description": "#340, v0.4.19",
+                "properties": {
+                  "ttl": {
+                    "type": "string",
+                    "description": "100ms-24h"
+                  },
+                  "stale_on_error": {
+                    "type": "string"
+                  },
+                  "max_body": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 67108864
+                  },
+                  "max_entries": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000000
+                  },
+                  "max_memory": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "vary": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "status": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "enum": [
+                        200,
+                        203,
+                        204,
+                        300,
+                        301,
+                        308,
+                        404,
+                        410
+                      ]
+                    }
+                  },
+                  "share_credentials": {
+                    "type": "boolean"
+                  },
+                  "share_after_auth": {
+                    "type": "boolean"
+                  },
+                  "header": {
+                    "type": "string",
+                    "description": "default X-Cache; empty for none"
+                  }
+                },
+                "required": [
+                  "ttl"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "cache"
+            ],
+            "additionalProperties": false
           }
         ]
       },
@@ -1628,6 +1700,25 @@
           "blocked": {
             "type": "integer"
           },
+          "cache": {
+            "type": "object",
+            "description": "cache (#340, v0.4.19): requests by result",
+            "properties": {
+              "hit": {
+                "type": "integer"
+              },
+              "miss": {
+                "type": "integer"
+              },
+              "stale": {
+                "type": "integer"
+              },
+              "bypass": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
           "routes": {
             "type": "object",
             "properties": {},
@@ -1656,6 +1747,30 @@
                   "properties": {},
                   "additionalProperties": {
                     "type": "integer"
+                  }
+                },
+                "cache": {
+                  "type": "object",
+                  "description": "by cache middleware name (#340)",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "object",
+                    "description": "cache (#340, v0.4.19): requests by result",
+                    "properties": {
+                      "hit": {
+                        "type": "integer"
+                      },
+                      "miss": {
+                        "type": "integer"
+                      },
+                      "stale": {
+                        "type": "integer"
+                      },
+                      "bypass": {
+                        "type": "integer"
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 }
               },
