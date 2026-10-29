@@ -2250,6 +2250,10 @@
               "invalid_restored": {
                 "type": "boolean",
                 "description": "Rules restored from the database that do not validate are shown in GET /rules with state failed and the reason in error (Accepted False, reason Invalid); DELETE removes them, PATCH fixes them (the PATCH over the stored body, validated as a new rule) (v0.4.18, #327)"
+              },
+              "global_api": {
+                "type": "boolean",
+                "description": "GET / PATCH /config/global: the global items the settings file (and the environment) leaves out are set through the API (admin; crowdsec only over the Unix socket by default), stored in rproxy_global and put in force for the next request, connection or UDP session; the file's items win (409 static) (v0.4.19, #342)"
               }
             }
           },
@@ -2407,7 +2411,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
           },
           "crowdsec": {
             "$ref": "#/components/schemas/CrowdsecStatus"
@@ -2590,7 +2595,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
           },
           "files": {
             "type": "array",
@@ -3466,7 +3472,15 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
+          },
+          "global_changes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "global items whose value in force the reload would change (applied by the reload, #342), e.g. global.trusted_proxies"
           },
           "changes": {
             "type": "array",
@@ -3701,6 +3715,250 @@
         "required": [
           "cert",
           "key"
+        ]
+      },
+      "GlobalItem": {
+        "type": "object",
+        "description": "One item of global (#342)",
+        "properties": {
+          "value": {
+            "description": "The value in force (start-only items: as started)"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "file",
+              "env",
+              "api",
+              "default"
+            ],
+            "description": "Where the value in force comes from"
+          },
+          "apply": {
+            "type": "string",
+            "enum": [
+              "live",
+              "restart"
+            ],
+            "description": "live: the next request, connection or UDP session takes a new value; restart: read only at the start, not changed by the API"
+          },
+          "unix_only": {
+            "type": "boolean",
+            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec (and acme)"
+          },
+          "settable": {
+            "type": "boolean",
+            "description": "Whether PATCH may set it now (live and not from the file or the environment; see unix_only for the transport)"
+          },
+          "api_value": {
+            "description": "The value set through the API (present only when there is one)"
+          },
+          "shadowed": {
+            "type": "boolean",
+            "description": "With api_value: the file or the environment sets the item, so the API value is kept but not in force (config.global_shadowed)"
+          },
+          "error": {
+            "type": "string",
+            "description": "A restored API value that is not in force (refused or not built); it stays stored"
+          },
+          "kept": {
+            "type": "boolean",
+            "description": "crowdsec only: the file dropped it, but rules use it, so it stays in force (source file) until no rule does"
+          }
+        },
+        "required": [
+          "value",
+          "source",
+          "apply",
+          "unix_only",
+          "settable"
+        ]
+      },
+      "GlobalSettings": {
+        "type": "object",
+        "description": "GET /config/global (#342)",
+        "properties": {
+          "items": {
+            "type": "object",
+            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions (live); acme, geoip, performance, files, control_api (restart)",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/GlobalItem"
+            }
+          },
+          "storage": {
+            "type": "string",
+            "enum": [
+              "database",
+              "memory"
+            ],
+            "description": "database: API values are stored in rproxy_global (RPROXY_DATABASE_URL); memory: in this process only, lost on restart (kept over a live upgrade)"
+          },
+          "persisted": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the row of rproxy_global is up to date (null: no database)"
+          },
+          "loaded": {
+            "type": "boolean",
+            "description": "Whether the stored values could be read (false also for a row that does not read); false: PATCH answers 503 not_loaded until the periodic check reads them"
+          },
+          "updated_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Unix seconds"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "description": "config.global_shadowed"
+                },
+                "item": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "changes": {
+            "type": "array",
+            "description": "PATCH only",
+            "items": {
+              "$ref": "#/components/schemas/GlobalChange"
+            }
+          },
+          "applied": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "PATCH only: items whose value in force changed"
+          }
+        },
+        "required": [
+          "items",
+          "storage",
+          "persisted",
+          "warnings",
+          "loaded"
+        ]
+      },
+      "GlobalChange": {
+        "type": "object",
+        "properties": {
+          "item": {
+            "type": "string"
+          },
+          "before": {
+            "description": "In force before"
+          },
+          "after": {
+            "description": "In force after"
+          },
+          "api_before": {
+            "description": "The API value before (null: none)"
+          },
+          "api_after": {
+            "description": "The API value after (null: none)"
+          }
+        },
+        "required": [
+          "item",
+          "before",
+          "after",
+          "api_before",
+          "api_after"
+        ]
+      },
+      "GlobalPatch": {
+        "type": "object",
+        "description": "The shape of the settings file's global; an item set to null clears the API value (back to the default), [] and {} are values. Each named item is replaced as a whole.",
+        "properties": {
+          "trusted_proxies": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "CIDRs whose X-Forwarded-For is believed; [] trusts none. Unix socket only by default"
+          },
+          "access_log": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute path of a file right in RPROXY_API_ACCESS_LOG_DIR (unset: refused); a directory for rproxy's access logs only (pruning deletes files starting with the name); the name may not overlap rproxy's own log or files not of the form <name>.<YYYY-MM-DD>.<ext>. Unix socket only by default"
+          },
+          "crowdsec": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "As global.crowdsec (lapi_url, api_key_file (absolute), appsec_url, update_interval); swapped in once the new bouncer has pulled from its LAPI. Unix socket only by default (up to 10 s; other changes of global wait meanwhile)"
+          },
+          "http": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "timeouts": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "description": "As global.http.timeouts"
+              }
+            }
+          },
+          "udp_max_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "The default cap of UDP sessions per rule (RPROXY_UDP_MAX_SESSIONS; 0: none)"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GlobalRefused": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "static: the items the file or the environment sets; restart_only: the start-only items named"
+          }
+        },
+        "required": [
+          "code",
+          "error"
         ]
       }
     }
@@ -3939,6 +4197,139 @@
             "description": "Answer what applying the file would change (ConfigPlan) without changing anything. (v0.4, #169)"
           }
         ]
+      }
+    },
+    "/config/global": {
+      "get": {
+        "summary": "Every global item: its value in force, where it comes from, whether the API may change it (admin; v0.4.19, #342)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalSettings"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the admin scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Set (null: clear) the API values of the global items the settings file and the environment leave out (admin; crowdsec only over the Unix socket by default; v0.4.19, #342)",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Answer {dry_run, changes, applied} without changing anything"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GlobalPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Changed; live items are in force for the next request, connection or UDP session, and stored before the answer (persisted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown item, wrong shape or value, an access log directory that does not exist, a CrowdSec key file that cannot be read (code invalid)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks the admin scope; trusted_proxies, access_log or crowdsec over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, or an access log outside RPROXY_API_ACCESS_LOG_DIR (protected_file)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "static: the settings file or the environment sets the item; restart_only: the item is read only at the start; in_use: rules use the crowdsec (appsec) being taken away",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalRefused"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "crowdsec_unavailable: the new LAPI did not answer in time; the current bouncer stays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "not_loaded: the stored values could not be read yet; upgrading, shutting_down",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/rules": {

@@ -225,6 +225,9 @@ pub struct Features {
 	/// Rules restored from the database that do not validate are shown in `GET /rules` as
 	/// failed with the reason; `DELETE` removes them, `PATCH` fixes them (#327)
 	pub invalid_restored: bool,
+	/// `GET` / `PATCH /config/global`: the `global` items the settings file leaves out are
+	/// set through the API, stored with the rules and put in force while running (#342)
+	pub global_api: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -292,6 +295,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		global_api: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -342,6 +346,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		global_api: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

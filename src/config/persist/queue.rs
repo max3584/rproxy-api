@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{StoredRule, StoredSet};
+use super::{StoredGlobal, StoredRule, StoredSet};
 use crate::core::rule::Key;
 
 /// One job for the database of this node.
@@ -35,6 +35,9 @@ pub enum Job {
 	RemoveRule(Key),
 	SaveSet(SetRecord),
 	RemoveSet(String),
+	/// This node's row of `rproxy_global` (#342).
+	ReadGlobal,
+	SaveGlobal(GlobalRecord),
 	/// Keeps the connection open (it holds the lock), when one is open.
 	Ping,
 	/// The last job (the old process after a live upgrade): the connection closes
@@ -45,7 +48,7 @@ pub enum Job {
 impl Job {
 	/// Whether the job writes a row (and so goes through only under the lock).
 	pub fn writes(&self) -> bool {
-		matches!(self, Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_))
+		matches!(self, Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_) | Job::SaveGlobal(_))
 	}
 }
 
@@ -76,6 +79,16 @@ pub struct SetRecord {
 	pub now: u64,
 }
 
+/// The row of `rproxy_global` to write (#342).
+#[derive(Clone, Debug)]
+pub struct GlobalRecord {
+	/// `config::global::Values` as JSON.
+	pub spec: serde_json::Value,
+	pub by: String,
+	/// Unix milliseconds.
+	pub now: u64,
+}
+
 /// What a job did.
 #[derive(Debug)]
 pub enum Done {
@@ -84,6 +97,8 @@ pub enum Done {
 	Locked,
 	Rules(Vec<StoredRule>),
 	Sets(Vec<StoredSet>),
+	/// `ReadGlobal`: None when there is no row (or no table).
+	Global(Option<StoredGlobal>),
 }
 
 /// Which connection holds this node's lock (what MariaDB shows of it).

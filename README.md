@@ -82,6 +82,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_CERT_EXPIRY_CHECK_SECS` | `--cert-expiry-check-secs` | `86400` | 証明書の期限を確かめる間隔（秒。読み込むときにも確かめる）。切れたサーバ証明書は外し、ルールの証明書がすべて切れたらそのルールを止める（docs/API.md の「証明書の期限」）。`0` で止める |
 | `RPROXY_CERT_WARN_DAYS` | `--cert-warn-days` | `14` | 期限の何日前から `expiring`（警告）にするか |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
+| `RPROXY_API_ACCESS_LOG_DIR` | `--api-access-log-dir` | なし（API ではアクセスログを入れられない） | `PATCH /config/global` で入れるアクセスログ（`access_log`）を置けるディレクトリ（すぐ下のファイルだけ）。古いファイルの削除で同じ名前で始まるファイルを消すので、rproxy のアクセスログだけのディレクトリにする（v0.4.19、#342。docs/API.md の「global の設定の API」） |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない。YAML は 1.2 として読む（`yes`・`on` は文字列。`010`・`1_000` のような数は数になるので、文字列にするなら引用符で囲む。マージキー `<<` が使える） |
@@ -333,6 +334,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も）。DB から戻すルールが検証に通らないときも `rule.failed`（`phase: restore` / `reconcile`、`code`。`GET /rules` に `failed` として出る。v0.4.18、#327） |
 | `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
+| `config.global` / `config.global_shadowed` / `config.global_in_use` / `config.global_kept` / `crowdsec.swap` / `config.global.persist` / `restore.global` | `global` の項目を入れ替えた（`PATCH /config/global` の `token`・`items`・`applied`、読み直しは `source: file`。v0.4.19、#342）/ API で入れた値の項目がファイル・環境変数に書かれて効かなくなった（`item`）/ ルールが使う `crowdsec` をファイルから消したので残した / 新しい `crowdsec` の LAPI が答えないので今のものを残した / 新しい CrowdSec の bouncer に入れ替えた / API の値を `rproxy_global` に書いた / 起動・引き継ぎで API の値を戻した（`from`、`items`） |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
 | `shutdown.start` / `shutdown.drain` / `shutdown.now` / `shutdown.done` | `RPROXY_SHUTDOWN_DELAY` / `_DRAIN` のある SIGTERM：始めた（`delay_secs`・`drain_secs`）/ 待ち受けを閉じた（残りの接続・セッションの数 `connections`）/ 2 回目の SIGTERM ですぐ止める / 止めた（切った接続・セッションの数 `cut`） |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |

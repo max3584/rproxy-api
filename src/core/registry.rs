@@ -329,6 +329,8 @@ pub struct Registry {
 	invalid: std::sync::Mutex<HashMap<Key, Invalid>>,
 	/// Rules of different owners naming the same key or secret file, said once (#323).
 	shared_warned: std::sync::Mutex<HashSet<(String, String, String, String)>>,
+	/// `global`: the file's, the environment's and the API's items (#342).
+	global: crate::config::global::Settings,
 }
 
 /// A rule restored from the database (`forward_rules`, `rproxy_rules`) or a live upgrade
@@ -489,7 +491,85 @@ impl Registry {
 			owners: Default::default(),
 			invalid: Default::default(),
 			shared_warned: Default::default(),
+			global: Default::default(),
 		})
+	}
+
+	/// `global` and what is in force (#342, `GET` / `PATCH /config/global`).
+	pub fn global(&self) -> &crate::config::global::Settings {
+		&self.global
+	}
+
+	/// What the rules use of `global.crowdsec` (#342: it is not taken away from them).
+	pub async fn uses_crowdsec(&self) -> crate::config::global::CrowdsecUse {
+		crowdsec_use(&*self.rules.lock().await)
+	}
+
+	/// Runs `f` with the rules lock held and what the rules use of `global.crowdsec`
+	/// (#342): a change of `global` swapped in there cannot cross a rule being created
+	/// or changed (they check `crowdsec_gate` under the same lock).
+	pub async fn under_rules_lock<R>(&self, f: impl FnOnce(crate::config::global::CrowdsecUse) -> R) -> R {
+		let rules = self.rules.lock().await;
+		f(crowdsec_use(&rules))
+	}
+
+	/// Starts again the rules that failed for want of `global.crowdsec` (or its
+	/// `appsec_url`), after a change of `global` brought it (#342: the stored values
+	/// read late by the periodic check, a `PATCH`, a reload). Returns how many started.
+	pub async fn retry_waiting_for_crowdsec(self: &Arc<Self>) -> usize {
+		let waiting: Vec<(RuleSpec, u64)> = self
+			.rules
+			.lock()
+			.await
+			.values()
+			.filter_map(|e| match e {
+				Entry::Failed(f) if f.error.contains(NEEDS_CROWDSEC) => Some((f.spec.clone(), f.generation)),
+				_ => None,
+			})
+			.collect();
+		let mut started = 0;
+		for (spec, generation) in waiting {
+			let key = spec.key;
+			let prepared = self.prepare(&spec).await;
+			let mut rules = self.rules.lock().await;
+			let Some(Entry::Failed(f)) = rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation)) else {
+				continue;
+			};
+			let result = prepared.and_then(|p| self.start(spec, p));
+			match result {
+				Ok(running) => {
+					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
+					rules.insert(key, Entry::Running(running));
+					started += 1;
+				}
+				Err(e) => {
+					f.error = e.message;
+					f.code = e.code;
+				}
+			}
+		}
+		started
+	}
+
+	/// A rule that uses `crowdsec` (or its `appsec`) needs `global.crowdsec` (with
+	/// `appsec_url`) in force: checked again with the rules lock held, right before
+	/// it goes into the table, so a `global` change cannot take it away in between (#342).
+	fn crowdsec_gate(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+		let (mut any, mut appsec) = (spec.crowdsec, false);
+		for m in spec.http.iter().flat_map(|h| h.middlewares.values()) {
+			if let crate::l7::MiddlewareSpec::Crowdsec { appsec: a, .. } = m {
+				any = true;
+				appsec |= *a;
+			}
+		}
+		if !any {
+			return Ok(());
+		}
+		match self.cfg.http.crowdsec() {
+			None => Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"))),
+			Some(b) if appsec && !b.has_appsec() => Err(ApiError::invalid(format!("crowdsec appsec {NEEDS_CROWDSEC}.appsec_url"))),
+			Some(_) => Ok(()),
+		}
 	}
 
 	/// Sets the store of API-created rules (#144), before rules are restored.
@@ -895,7 +975,7 @@ impl Registry {
 	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
-			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
+			return Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
 		}
 		// geoip lists need the databases of global.geoip (#168)
 		let geoip = self.cfg.http.geoip().map(|g| g.spec());
@@ -909,7 +989,7 @@ impl Registry {
 						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::invalid)?;
 					}
 				}
-				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
+				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec().as_ref())?;
 				Some(Arc::new(crate::l7::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
 			}
 			None => None,
@@ -1007,6 +1087,8 @@ impl Registry {
 
 	/// Binds every port of the rule and starts serving. Called with the rules lock held.
 	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
+		// called with the rules lock held (#342)
+		self.crowdsec_gate(&spec)?;
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
 		let (routes, route_resolvers) = self.install_routes(key, prepared.routes);
@@ -1381,6 +1463,7 @@ impl Registry {
 		if let Some((other, _)) = rules.iter().find(|(k, e)| *k != key && overlaps(e.spec(), &spec)) {
 			return Err(ApiError::already_exists(format!("{key} overlaps with {other}")));
 		}
+		self.crowdsec_gate(&spec)?;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
@@ -1525,7 +1608,8 @@ impl Registry {
 			return;
 		}
 		let global = self.http_global();
-		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), global.crowdsec().map(|b| b.key_file()));
+		let crowdsec = global.crowdsec();
+		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), crowdsec.as_ref().map(|b| b.key_file()));
 		for f in refs {
 			if crate::net::protected::protecting(&f.path, &entries).is_some() {
 				warn!(event = "rule.protected_file", rule, field = %f.field, phase,
@@ -2459,6 +2543,26 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 			rules.insert(key, Entry::Failed(Failed { generation, spec, error, code: "failed", retry: None }));
 		}
 	}
+}
+
+/// In the error of a rule that cannot run without `global.crowdsec` (or its
+/// `appsec_url`): such rules are started again once it is in force (#342).
+pub const NEEDS_CROWDSEC: &str = "needs global.crowdsec";
+
+/// What the rules in the table use of `global.crowdsec` (#342).
+fn crowdsec_use(rules: &HashMap<Key, Entry>) -> crate::config::global::CrowdsecUse {
+	let mut out = crate::config::global::CrowdsecUse::default();
+	for e in rules.values() {
+		let spec = e.spec();
+		out.any |= spec.crowdsec;
+		for m in spec.http.iter().flat_map(|h| h.middlewares.values()) {
+			if let crate::l7::MiddlewareSpec::Crowdsec { appsec, .. } = m {
+				out.any = true;
+				out.appsec |= *appsec;
+			}
+		}
+	}
+	out
 }
 
 async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) {

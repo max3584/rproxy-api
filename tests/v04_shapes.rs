@@ -87,6 +87,9 @@ async fn new_endpoints_need_their_scopes() {
 	};
 	assert_eq!(as_reader(Method::GET, "/admin/update").await.unwrap().status(), StatusCode::FORBIDDEN);
 	assert_eq!(as_reader(Method::POST, "/config/plan").await.unwrap().status(), StatusCode::FORBIDDEN);
+	// #342: global through the API is admin's
+	assert_eq!(as_reader(Method::GET, "/config/global").await.unwrap().status(), StatusCode::FORBIDDEN);
+	assert_eq!(as_reader(Method::PATCH, "/config/global").await.unwrap().status(), StatusCode::FORBIDDEN);
 	fs::remove_dir_all(dir).unwrap();
 }
 

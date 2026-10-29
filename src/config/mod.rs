@@ -2,6 +2,7 @@
 
 pub mod check;
 pub mod db;
+pub mod global;
 pub mod offload;
 pub mod performance;
 pub mod persist;
@@ -36,7 +37,7 @@ pub fn from_file_text<T: DeserializeOwned>(path: &std::path::Path, text: &str) -
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::net::cidr::Cidr;
 use crate::core::rule::RuleRequest;
@@ -57,6 +58,9 @@ pub struct ConfigDoc {
 	/// The files read, in order (one unless `RPROXY_CONFIG` is a directory).
 	#[serde(skip)]
 	pub files: Vec<PathBuf>,
+	/// `global` as written (null when left out): which items the file names (#342).
+	#[serde(skip)]
+	pub global_raw: serde_json::Value,
 }
 
 /// Process-wide settings (docs/DESIGN-v0.3.md 2.).
@@ -101,12 +105,14 @@ impl GlobalSpec {
 
 pub use crate::acme::config::AcmeGlobal;
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CrowdsecGlobal {
 	pub lapi_url: String,
 	pub api_key_file: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub appsec_url: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub update_interval: Option<String>,
 }
 
@@ -167,11 +173,13 @@ impl ConfigDoc {
 
 	/// A document given as JSON (`POST /config/plan`); checked as a file would be.
 	pub fn from_value(value: serde_json::Value) -> Result<ConfigDoc, String> {
+		let raw = value.get("global").cloned().unwrap_or_default();
 		let mut doc = if value.is_array() {
 			ConfigDoc { version: 1, rules: serde_json::from_value(value).map_err(|e| format!("rules: {e}"))?, ..Default::default() }
 		} else {
 			serde_json::from_value::<ConfigDoc>(value).map_err(|e| e.to_string())?
 		};
+		doc.global_raw = raw;
 		doc.labels = (1..=doc.rules.len()).map(|i| format!("rule #{i}")).collect();
 		doc.check_duplicates()?;
 		doc.check()?;
@@ -184,6 +192,7 @@ impl ConfigDoc {
 			Some("yaml" | "yml") => yaml(text)?,
 			_ => serde_json::from_str(text).map_err(|e| e.to_string())?,
 		};
+		let raw = value.get("global").cloned().unwrap_or_default();
 		let has_global = value.get("global").is_some();
 		let mut doc = if value.is_array() {
 			ConfigDoc { version: 1, rules: serde_json::from_value(value).map_err(|e| format!("rules: {e}"))?, ..Default::default() }
@@ -193,6 +202,7 @@ impl ConfigDoc {
 		let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 		doc.labels = (1..=doc.rules.len()).map(|i| format!("{name} rule #{i}")).collect();
 		doc.files = vec![path.to_path_buf()];
+		doc.global_raw = raw;
 		Ok((doc, has_global))
 	}
 
@@ -224,6 +234,7 @@ impl ConfigDoc {
 				}
 				global_in = Some(file.clone());
 				merged.global = doc.global;
+				merged.global_raw = doc.global_raw;
 			}
 			merged.rules.extend(doc.rules);
 			merged.labels.extend(doc.labels);
@@ -261,21 +272,13 @@ impl ConfigDoc {
 	}
 
 	/// `global` settings that differ from `other` and take effect only after a
-	/// restart (the registry and the CrowdSec bouncer are built once).
+	/// restart. The live items (`trusted_proxies`, `access_log`, `crowdsec`,
+	/// `http.timeouts`; #342, `config::global`) are put in force by the reload.
 	pub fn restart_needed(&self, other: &ConfigDoc) -> Vec<&'static str> {
 		let (a, b) = (&self.global, &other.global);
 		let mut out = vec![];
-		if a.trusted_proxies != b.trusted_proxies {
-			out.push("global.trusted_proxies");
-		}
-		if a.access_log != b.access_log {
-			out.push("global.access_log");
-		}
 		if a.acme != b.acme {
 			out.push("global.acme");
-		}
-		if a.crowdsec != b.crowdsec {
-			out.push("global.crowdsec");
 		}
 		if a.geoip != b.geoip {
 			out.push("global.geoip");
@@ -283,8 +286,8 @@ impl ConfigDoc {
 		if a.performance != b.performance {
 			out.push("global.performance");
 		}
-		if a.http != b.http {
-			out.push("global.http");
+		if a.files != b.files {
+			out.push("global.files");
 		}
 		out
 	}
@@ -495,10 +498,12 @@ rules:
 		let a = ConfigDoc::parse(Path::new("a.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8]}").unwrap();
 		let b = ConfigDoc::parse(Path::new("b.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8]}\nrules: []").unwrap();
 		assert!(a.restart_needed(&b).is_empty());
-		let c = ConfigDoc::parse(Path::new("c.yaml"), "version: 1\nglobal: {access_log: /tmp/a.log}").unwrap();
-		assert_eq!(c.restart_needed(&a), ["global.trusted_proxies", "global.access_log"]);
-		let d = ConfigDoc::parse(Path::new("d.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8], http: {timeouts: {idle: 5m}}}").unwrap();
-		assert_eq!(d.restart_needed(&a), ["global.http"]);
+		// the live items are put in force by the reload (#342)
+		let c = ConfigDoc::parse(Path::new("c.yaml"), "version: 1\nglobal: {access_log: /tmp/a.log, crowdsec: {lapi_url: 'http://a', api_key_file: /k}}").unwrap();
+		assert!(c.restart_needed(&a).is_empty());
+		assert_eq!(c.global_raw["access_log"], "/tmp/a.log");
+		let d = ConfigDoc::parse(Path::new("d.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8], http: {timeouts: {idle: 5m}}, geoip: {country_db: /c.mmdb}, files: {owner_check: off}}").unwrap();
+		assert_eq!(d.restart_needed(&a), ["global.geoip", "global.files"]);
 		assert_eq!(d.global.http.unwrap().timeouts().idle, Some(std::time::Duration::from_secs(300)));
 	}
 
