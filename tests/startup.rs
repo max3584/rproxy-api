@@ -555,11 +555,14 @@ async fn the_settings_file_is_applied_again_when_it_changes() {
 	assert!(status["error"].as_str().unwrap().contains("both listen on"), "{status}");
 	assert_eq!(roundtrip_port(add, "6").await.as_deref(), Some("B:6"), "the last good rules keep running");
 
-	// a changed global is reported as needing a restart
-	rewrite(&cfg, &format!("version: 1\nglobal: {{trusted_proxies: [10.0.0.0/8]}}\nrules:\n{}", static_rule(keep, a.port(), "")));
+	// a changed start-only global item is reported as needing a restart; a live one is
+	// put in force by the reload (#342)
+	rewrite(&cfg, &format!("version: 1\nglobal: {{trusted_proxies: [10.0.0.0/8], files: {{owner_check: strict}}}}\nrules:\n{}", static_rule(keep, a.port(), "")));
 	wait_for("the second reload", &rp, || async { rp.log().contains("restart_needed") }).await;
 	let (_, status) = get_json(port, "/config").await;
-	assert_eq!((status["error"].as_str(), status["restart_needed"][0].as_str()), (None, Some("global.trusted_proxies")), "{status}");
+	assert_eq!(status["error"].as_str(), None, "{status}");
+	assert_eq!(status["restart_needed"], serde_json::json!(["global.files"]), "{status}");
+	assert!(rp.log().contains(r#""event":"config.global""#), "the live item applied: {}", rp.log());
 	assert_eq!(roundtrip_port(add, "7").await, None);
 }
 

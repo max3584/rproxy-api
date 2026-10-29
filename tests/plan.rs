@@ -237,7 +237,7 @@ async fn config_plan_compares_with_the_static_rules() {
 	changed["remote_port"] = json!(backend.port() + 1);
 	let mut recreated = static_rule(recreate);
 	recreated["source_ip"] = json!("proxy_v2");
-	let doc = json!({"version": 1, "global": {"trusted_proxies": ["10.0.0.0/8"]},
+	let doc = json!({"version": 1, "global": {"trusted_proxies": ["10.0.0.0/8"], "files": {"owner_check": "strict"}},
 		"rules": [static_rule(keep), changed, recreated, static_rule(add), static_rule(api)]});
 	let (status, plan) = post(&h, format!("{base}/config/plan"), Some(doc)).await;
 	assert_eq!(status, StatusCode::OK, "{plan}");
@@ -247,7 +247,9 @@ async fn config_plan_compares_with_the_static_rules() {
 		(&json!(2), &json!(1), &json!(2), &json!(1), &json!(1)),
 		"{plan}"
 	);
-	assert_eq!(plan["restart_needed"], json!(["global.trusted_proxies"]));
+	assert_eq!(plan["restart_needed"], json!(["global.files"]));
+	// live global items are applied by the reload (#342)
+	assert_eq!(plan["global_changes"], json!(["global.trusted_proxies"]));
 	let c = change(&plan, &format!("tcp/127.0.0.1:{change_it}"));
 	assert_eq!((c["action"].as_str(), c["change"].as_str()), (Some("update"), Some("in_place")));
 	assert_eq!(c["diff"][0]["path"], "remote_port");

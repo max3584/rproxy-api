@@ -169,6 +169,9 @@ pub struct State {
 	/// The tokens that created the rules made through the API (#323).
 	#[serde(default)]
 	pub owners: Vec<RuleOwner>,
+	/// The `global` values set through the API (#342), put in force before the rules.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub global: Option<crate::config::global::Handoff>,
 }
 
 /// A rule restored from the database that did not validate (#327), as handed over.
@@ -560,6 +563,7 @@ async fn snapshot(registry: &Registry) -> State {
 	}
 	let counters = registry.runtimes().await.iter().map(|(k, rt, since)| Counters::of(k, rt, Some(*since))).collect();
 	let persist_pending = registry.persist().map(|s| s.pending()).unwrap_or_default();
+	let global = registry.global().has_api_values().then(|| registry.global().handoff());
 	State {
 		version: env!("CARGO_PKG_VERSION").into(),
 		process_start_time: super::process_start_time().to_string(),
@@ -569,6 +573,7 @@ async fn snapshot(registry: &Registry) -> State {
 		persist_pending,
 		invalid_rules,
 		owners,
+		global,
 	}
 }
 
@@ -761,6 +766,16 @@ impl State {
 	/// with who made them, when, and whether their row was up to date; then the
 	/// rule sets.
 	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
+		// the global values set through the API first: rules using crowdsec need it (#342)
+		if let Some(g) = &self.global {
+			match serde_json::from_value::<crate::config::global::Values>(g.values.clone()) {
+				Ok(values) => {
+					let http = registry.http_global();
+					registry.global().restore(&http, values, g.updated_by.clone(), g.updated_at, g.persisted, "handoff").await;
+				}
+				Err(e) => warn!(event = "handoff.global", error = %e, "the global values of the old process could not be read; dropped"),
+			}
+		}
 		let (mut dynamic, mut api) = (vec![], vec![]);
 		for (req, view) in self.rules() {
 			if view["origin"] == "api" {

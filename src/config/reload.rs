@@ -89,7 +89,24 @@ impl ConfigReloader {
 				let restart: Vec<String> = doc.restart_needed(&self.base).into_iter().map(String::from).collect();
 				let files: Vec<String> = doc.files.iter().map(|f| f.display().to_string()).collect();
 				let rules = doc.rules.len();
-				match self.registry.reload_static(doc.labeled_rules()).await {
+				// the live global items first (rules using crowdsec need it): the file wins over the API (#342)
+				let uses = self.registry.uses_crowdsec().await;
+				let http = self.registry.http_global();
+				let global = self.registry.global().file_changed(&http, &doc.global, &doc.global_raw, uses).await;
+				let global = match global {
+					Ok(changed) => {
+						if !changed.is_empty() {
+							info!(event = "config.global", source = "file", applied = ?changed);
+						}
+						Ok(())
+					}
+					Err(e) => Err(e),
+				};
+				let applied = match global {
+					Ok(()) => self.registry.reload_static(doc.labeled_rules()).await.map_err(|e| e.to_string()),
+					Err(e) => Err(e),
+				};
+				match applied {
 					Ok(counts) => {
 						info!(event = "config.reload", added = counts.added, removed = counts.removed, changed = counts.changed,
 							unchanged = counts.unchanged, failed = counts.failed, files = files.len(), forced);

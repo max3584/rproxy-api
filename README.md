@@ -333,6 +333,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `rule.create` / `rule.update` / `rule.delete` / `rule.failed` | ルールの作成・変更・削除・異常停止（`labels`、組のルールは `ruleset` も）。DB から戻すルールが検証に通らないときも `rule.failed`（`phase: restore` / `reconcile`、`code`。`GET /rules` に `failed` として出る。v0.4.18、#327） |
 | `ruleset.apply` / `ruleset.delete` | ルールの組（v0.4、#28）を当てた（`ruleset`・`generation`・`etag`・作った・変えた・消した・そのまま・失敗の数・`by`）/ 組を消した |
 | `config.reload` / `config.error` | 設定ファイルの反映（件数、再起動が要る `global` の変更）と、反映できなかった理由 |
+| `config.global` / `config.global_shadowed` / `config.global_in_use` / `config.global.persist` / `restore.global` | `global` の項目を入れ替えた（`PATCH /config/global` の `token`・`items`・`applied`、読み直しは `source: file`。v0.4.19、#342）/ API で入れた値の項目がファイル・環境変数に書かれて効かなくなった（`item`）/ ルールが使う `crowdsec` をファイルから消したので残した / API の値を `rproxy_global` に書いた / 起動・引き継ぎで API の値を戻した（`from`、`items`） |
 | `start` / `shutdown` / `fatal` | 起動（`version`、transparent・認証・TLS の有無など）/ 終了 / 起動できない設定の誤り |
 | `shutdown.start` / `shutdown.drain` / `shutdown.now` / `shutdown.done` | `RPROXY_SHUTDOWN_DELAY` / `_DRAIN` のある SIGTERM：始めた（`delay_secs`・`drain_secs`）/ 待ち受けを閉じた（残りの接続・セッションの数 `connections`）/ 2 回目の SIGTERM ですぐ止める / 止めた（切った接続・セッションの数 `cut`） |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |

@@ -475,7 +475,7 @@ pub fn check_refs(spec: &HttpSpec, bouncer: Option<&Arc<Bouncer>>) -> Result<(),
 		match bouncer {
 			None => {
 				return Err(ApiError::invalid(format!(
-					"middleware {name}: crowdsec needs global.crowdsec in the settings file (RPROXY_CONFIG)"
+					"middleware {name}: crowdsec needs global.crowdsec (the settings file or PATCH /config/global)"
 				)))
 			}
 			Some(b) if *appsec && !b.has_appsec() => {

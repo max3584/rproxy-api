@@ -346,6 +346,17 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `the_check_writing_a_set_again_does_not_undo_a_put` | 書けなかった組を照合が書き直す途中で、同じ `generation` の `PUT` が最後まで動く（#306）：照合は列に入れるときの組を書くので、行は `PUT` の中身のまま、`persisted: true` |
 | `sets_survive_a_restart_with_mariadb` | 本物のバイナリと MariaDB（`RPROXY_TEST_DATABASE_URL`）：テーブルがなくても起動し `persisted: false`。保存 → 再起動で戻る。ほかのノードの行は戻さない。新しい `generation` の行を古い `PUT` で書き換えない。`DELETE` で行が消える |
 
+## 結合テスト：global の設定の API（`tests/global_api.rs`、#342、v0.4.19）
+
+| テスト | 確かめること |
+|---|---|
+| `the_api_sets_what_the_file_leaves_out_and_the_next_request_takes_it` | `admin` だけ。ファイルの項目は `409 static`（`items`）、`restart` の項目は `409 restart_only`、`crowdsec` は TCP から `403`、誤り・ない `access_log` のディレクトリは `400`、`/proc` は `403 protected_file`。`trusted_proxies` の dry run は何も変えず、本当の変更は次のリクエストから `X-Forwarded-For` を信じる。`access_log` は次の行からファイルへ。`null` で既定に戻る |
+| `udp_sessions_and_http_timeouts_change_for_the_next_session_and_connection` | `udp_max_sessions: 1` で次の新しいセッションを断り、消すと通る。`http.timeouts.first_byte: 1s` は新しい接続を 1 秒で閉じ、消すと既定に戻る |
+| `crowdsec_through_the_unix_socket_and_the_rules_that_need_it` | Unix ソケットから `crowdsec` を入れると、それを使うルールが作れる。使うルールがあると消せない（`409 in_use`）。API で入れたキーのファイルはルールから指せない |
+| `stored_restored_and_written_again` | メモリのストア：応答の前に行を書く（`persisted: true`）。書けなければ効かせたまま `persisted: false`、引き継ぎの `pending` に入り、照合が書き直す。再起動のときに戻すと効き、ファイルの項目は `shadowed`（`config.global_shadowed`） |
+| `a_live_upgrade_hands_the_values_over` | 引き継ぎの状態の `global` で、新しいプロセスがルールより先に同じ値を効かせる（書いた人・`persisted` も） |
+| `a_reload_that_brings_the_item_into_the_file_wins` | 読み直しでファイルに現れた項目はファイルが勝ち（`restart_needed` には出ない）、API の値は `shadowed`、API では変えられない（`409 static`）。live の項目の誤りは読み直しを断る。ファイルから消えれば API の値に戻る |
+
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 
 本物のバイナリを起動して、`global.performance` の効き目を外から確かめる。
@@ -456,6 +467,7 @@ HTTPS のミラー（テストの中の小さなサーバ。バイナリは GitH
 | `a_delete_with_drain_spares_a_new_rule_with_the_key` | `DELETE ?drain_secs` の drain の間に同じキーの `POST`：`POST` は drain を待たず、古いルールの行の削除が先なので、新しいルールの行と `persisted: true` が残る |
 | `release_does_not_wait_for_a_drain` | drain を待つ削除の途中でも、引き継ぎの `release` はすぐにロックを放す（行の削除は drain の前に済む） |
 | `rules_survive_a_restart_with_mariadb` | MariaDB（`RPROXY_TEST_DATABASE_URL`）と本物のバイナリ：作ったルールが `rproxy_rules` に書かれ（変更も）、再起動で `api` として戻る。UI の行と同じキーは UI のもの（`restore.conflict`）、ほかの `node` の行は戻らない。削除で行も消える |
+| `global_values_survive_a_restart_with_mariadb` | #342：本物のバイナリと MariaDB：`PATCH /config/global` は `rproxy_global` がなくても効き `persisted: false`、テーブルを作れば応答の前に 1 行書く（`persisted: true`）。再起動でルールより先に戻る（`restore.global`） |
 | `rows_that_do_not_validate_are_failed_rules` | #327（メモリのストア）：検証に通らない行は `GET /rules` に `failed`（理由・保存した本文・`created_by`・`conditions` の `Invalid`）、同じキーの `POST` は `409`、直らない PATCH は `400`、直す PATCH（dry run も）で動き行を書く、`DELETE` で行ごと消える。照合は新しい行を `failed` で出し、変われば動かし、なくなれば消す |
 | `invalid_rules_keep_their_files_and_count` | #327・#323：検証で落ちたルールの鍵はほかのトークンが指せず（`409 file_in_use`）、持ち主の直す PATCH は前からの共有があっても通る。組が入れなかったキーのものは残り、組の `PUT` はそのキーを `409`（`already_exists`）で断る。組が取ったキーの行の `created_by` は忘れる。`/metrics` の `failed` と `rproxy_rule_up 0`。戻す組のルールが同じキーなら組が勝つ。消すと持ち主を忘れ、同じ行が戻れば `failed` で出し直す |
 | `rows_that_do_not_validate_with_mariadb` | #327（MariaDB と本物のバイナリ）：`rproxy_rules` と `forward_rules` の検証に通らない行が `failed`。PATCH で直した行は書き直され再起動の後も動く、`forward_rules` のものは `DELETE` で消え、次の起動でまた出る |

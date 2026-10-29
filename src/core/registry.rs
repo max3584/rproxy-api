@@ -329,6 +329,8 @@ pub struct Registry {
 	invalid: std::sync::Mutex<HashMap<Key, Invalid>>,
 	/// Rules of different owners naming the same key or secret file, said once (#323).
 	shared_warned: std::sync::Mutex<HashSet<(String, String, String, String)>>,
+	/// `global`: the file's, the environment's and the API's items (#342).
+	global: crate::config::global::Settings,
 }
 
 /// A rule restored from the database (`forward_rules`, `rproxy_rules`) or a live upgrade
@@ -489,7 +491,30 @@ impl Registry {
 			owners: Default::default(),
 			invalid: Default::default(),
 			shared_warned: Default::default(),
+			global: Default::default(),
 		})
+	}
+
+	/// `global` and what is in force (#342, `GET` / `PATCH /config/global`).
+	pub fn global(&self) -> &crate::config::global::Settings {
+		&self.global
+	}
+
+	/// What the rules use of `global.crowdsec` (#342: it is not taken away from them).
+	pub async fn uses_crowdsec(&self) -> crate::config::global::CrowdsecUse {
+		let mut out = crate::config::global::CrowdsecUse::default();
+		let rules = self.rules.lock().await;
+		for e in rules.values() {
+			let spec = e.spec();
+			out.any |= spec.crowdsec;
+			for m in spec.http.iter().flat_map(|h| h.middlewares.values()) {
+				if let crate::l7::MiddlewareSpec::Crowdsec { appsec, .. } = m {
+					out.any = true;
+					out.appsec |= *appsec;
+				}
+			}
+		}
+		out
 	}
 
 	/// Sets the store of API-created rules (#144), before rules are restored.
@@ -895,7 +920,7 @@ impl Registry {
 	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
-			return Err(ApiError::invalid("crowdsec needs global.crowdsec in the settings file"));
+			return Err(ApiError::invalid("crowdsec needs global.crowdsec (the settings file or PATCH /config/global)"));
 		}
 		// geoip lists need the databases of global.geoip (#168)
 		let geoip = self.cfg.http.geoip().map(|g| g.spec());
@@ -909,7 +934,7 @@ impl Registry {
 						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::invalid)?;
 					}
 				}
-				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec())?;
+				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec().as_ref())?;
 				Some(Arc::new(crate::l7::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
 			}
 			None => None,
@@ -1525,7 +1550,8 @@ impl Registry {
 			return;
 		}
 		let global = self.http_global();
-		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), global.crowdsec().map(|b| b.key_file()));
+		let crowdsec = global.crowdsec();
+		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), crowdsec.as_ref().map(|b| b.key_file()));
 		for f in refs {
 			if crate::net::protected::protecting(&f.path, &entries).is_some() {
 				warn!(event = "rule.protected_file", rule, field = %f.field, phase,

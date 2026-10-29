@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -29,21 +29,58 @@ enum Sink {
 	File { writer: Mutex<NonBlocking>, _guard: WorkerGuard },
 }
 
-/// The `global` settings of the L7 data plane.
+/// Where access log lines go (`global.access_log`), opened by `AccessLog::open`.
+pub struct AccessLog(Sink);
+
+impl AccessLog {
+	/// Lines in the main log.
+	pub fn main_log() -> AccessLog {
+		AccessLog(Sink::Log)
+	}
+
+	/// Lines in `path` (rotated daily, `keep_files` kept), or in the main log for None.
+	pub fn open(path: Option<&Path>, keep_files: usize) -> Result<AccessLog, AccessLogError> {
+		let Some(path) = path else { return Ok(AccessLog(Sink::Log)) };
+		let dir = access_log_dir(path)?;
+		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("access");
+		let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
+		let appender = RollingFileAppender::builder()
+			.rotation(Rotation::DAILY)
+			.filename_prefix(stem)
+			.filename_suffix(ext)
+			.max_log_files(keep_files.max(1))
+			.build(dir)
+			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
+		let (writer, guard) = tracing_appender::non_blocking(appender);
+		Ok(AccessLog(Sink::File { writer: Mutex::new(writer), _guard: guard }))
+	}
+}
+
+/// The `global` settings of the L7 data plane. Every rule's `Runtime` shares one;
+/// the settings the control API changes while running (#342: `trusted_proxies`,
+/// `access_log`, `crowdsec`, `http.timeouts`) are swapped inside it and apply to
+/// the next request (`trusted_proxies`, `access_log`, `crowdsec`) or connection
+/// (`http.timeouts`).
 pub struct HttpGlobal {
-	trusted_proxies: Vec<Cidr>,
-	sink: Sink,
+	trusted_proxies: RwLock<Arc<Vec<Cidr>>>,
+	sink: RwLock<Arc<Sink>>,
 	/// `global.crowdsec`: the bouncer the `crowdsec` middleware asks.
-	crowdsec: Option<Arc<Bouncer>>,
+	crowdsec: RwLock<Option<Arc<Bouncer>>>,
 	/// `global.geoip`: the databases of the `geoip` lists (#168).
 	geoip: Option<Arc<crate::net::geoip::Geoip>>,
 	/// `global.http.timeouts` (#320).
-	timeouts: super::timeouts::HttpTimeouts,
+	timeouts: RwLock<super::timeouts::HttpTimeouts>,
 }
 
 impl Default for HttpGlobal {
 	fn default() -> Self {
-		HttpGlobal { trusted_proxies: vec![], sink: Sink::Log, crowdsec: None, geoip: None, timeouts: Default::default() }
+		HttpGlobal {
+			trusted_proxies: RwLock::default(),
+			sink: RwLock::new(Arc::new(Sink::Log)),
+			crowdsec: RwLock::default(),
+			geoip: None,
+			timeouts: RwLock::default(),
+		}
 	}
 }
 
@@ -70,36 +107,40 @@ impl HttpGlobal {
 	/// `trusted_proxies` must already be validated (ConfigDoc::check).
 	pub fn new(trusted_proxies: &[String], access_log: Option<&Path>, keep_files: usize) -> Result<Self, AccessLogError> {
 		let trusted_proxies = cidr::parse_list(trusted_proxies).map_err(|e| AccessLogError::Config(e.message))?;
-		let Some(path) = access_log else {
-			return Ok(HttpGlobal { trusted_proxies, sink: Sink::Log, ..Default::default() });
-		};
-		let dir = access_log_dir(path)?;
-		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("access");
-		let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
-		let appender = RollingFileAppender::builder()
-			.rotation(Rotation::DAILY)
-			.filename_prefix(stem)
-			.filename_suffix(ext)
-			.max_log_files(keep_files.max(1))
-			.build(dir)
-			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
-		let (writer, guard) = tracing_appender::non_blocking(appender);
-		Ok(HttpGlobal { trusted_proxies, sink: Sink::File { writer: Mutex::new(writer), _guard: guard }, ..Default::default() })
+		let AccessLog(sink) = AccessLog::open(access_log, keep_files)?;
+		Ok(HttpGlobal { trusted_proxies: RwLock::new(Arc::new(trusted_proxies)), sink: RwLock::new(Arc::new(sink)), ..Default::default() })
 	}
 
 	/// Same as `new` without an access log file, for when it cannot be written.
 	pub fn without_file(trusted_proxies: &[String]) -> Self {
-		HttpGlobal { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), ..Default::default() }
+		HttpGlobal { trusted_proxies: RwLock::new(Arc::new(cidr::parse_list(trusted_proxies).unwrap_or_default())), ..Default::default() }
 	}
 
 	/// Attaches the CrowdSec bouncer of `global.crowdsec`.
-	pub fn with_crowdsec(mut self, bouncer: Option<Arc<Bouncer>>) -> Self {
-		self.crowdsec = bouncer;
+	pub fn with_crowdsec(self, bouncer: Option<Arc<Bouncer>>) -> Self {
+		*self.crowdsec.write().unwrap_or_else(|e| e.into_inner()) = bouncer;
 		self
 	}
 
-	pub fn crowdsec(&self) -> Option<&Arc<Bouncer>> {
-		self.crowdsec.as_ref()
+	pub fn crowdsec(&self) -> Option<Arc<Bouncer>> {
+		self.crowdsec.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// Replaces the CrowdSec bouncer (#342) for the next requests and connections; returns
+	/// the one it replaces (the caller stops it).
+	pub fn set_crowdsec(&self, bouncer: Option<Arc<Bouncer>>) -> Option<Arc<Bouncer>> {
+		std::mem::replace(&mut *self.crowdsec.write().unwrap_or_else(|e| e.into_inner()), bouncer)
+	}
+
+	/// Replaces `trusted_proxies` (#342; validated) for the next requests.
+	pub fn set_trusted_proxies(&self, list: Vec<Cidr>) {
+		*self.trusted_proxies.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(list);
+	}
+
+	/// Replaces where access log lines go (#342) for the next lines; the file of the
+	/// one replaced is flushed and closed once the lines being written are done.
+	pub fn set_access_log(&self, log: AccessLog) {
+		*self.sink.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(log.0);
 	}
 
 	/// Attaches the databases of `global.geoip`.
@@ -113,13 +154,18 @@ impl HttpGlobal {
 	}
 
 	/// Sets the time limits of client connections (`global.http.timeouts`, #320).
-	pub fn with_timeouts(mut self, timeouts: super::timeouts::HttpTimeouts) -> Self {
-		self.timeouts = timeouts;
+	pub fn with_timeouts(self, timeouts: super::timeouts::HttpTimeouts) -> Self {
+		self.set_timeouts(timeouts);
 		self
 	}
 
+	/// Replaces the time limits (#342) for the next connections.
+	pub fn set_timeouts(&self, timeouts: super::timeouts::HttpTimeouts) {
+		*self.timeouts.write().unwrap_or_else(|e| e.into_inner()) = timeouts;
+	}
+
 	pub fn timeouts(&self) -> super::timeouts::HttpTimeouts {
-		self.timeouts
+		*self.timeouts.read().unwrap_or_else(|e| e.into_inner())
 	}
 
 	/// The country (and ASN) of a client for the logs, when `global.geoip.log_country` is on.
@@ -127,15 +173,20 @@ impl HttpGlobal {
 		self.geoip.as_ref().filter(|g| g.log_country()).map(|g| g.lookup(ip))
 	}
 
+	fn trusted(&self) -> Arc<Vec<Cidr>> {
+		self.trusted_proxies.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
 	pub fn trusts(&self, peer: IpAddr) -> bool {
-		!self.trusted_proxies.is_empty() && cidr::allows(&self.trusted_proxies, peer)
+		trusts(&self.trusted(), peer)
 	}
 
 	/// The client of a request: the TCP peer, or, when the peer is a trusted proxy,
 	/// the rightmost address of `X-Forwarded-For` that is not a trusted proxy.
 	pub fn client_ip<'a>(&self, peer: IpAddr, forwarded_for: impl Iterator<Item = &'a str>) -> IpAddr {
+		let trusted = self.trusted();
 		let peer = canonical(peer);
-		if !self.trusts(peer) {
+		if !trusts(&trusted, peer) {
 			return peer;
 		}
 		let chain: Vec<&str> = forwarded_for.flat_map(|v| v.split(',')).map(str::trim).filter(|s| !s.is_empty()).collect();
@@ -143,24 +194,28 @@ impl HttpGlobal {
 		for hop in chain.iter().rev() {
 			let Some(ip) = parse_hop(hop) else { break };
 			client = canonical(ip);
-			if !self.trusts(client) {
+			if !trusts(&trusted, client) {
 				break;
 			}
 		}
 		client
 	}
 
+	fn sink(&self) -> Arc<Sink> {
+		self.sink.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
 	/// Whether access log lines are written now: always to a file of their own, else
 	/// while the main log takes `info` (the server fills an entry only then; #195).
 	pub fn logging(&self) -> bool {
-		match self.sink {
+		match *self.sink() {
 			Sink::Log => tracing::enabled!(tracing::Level::INFO),
 			Sink::File { .. } => true,
 		}
 	}
 
 	pub fn log(&self, entry: &AccessEntry) {
-		match &self.sink {
+		match &*self.sink() {
 			Sink::Log => info!(event = "http.access", rule = %entry.rule, route = %entry.route, service = %entry.service,
 				backend = %entry.backend, client = %entry.client, method = %entry.method, host = %entry.host,
 				path = %entry.path, query = %entry.query, protocol = %entry.protocol, status = entry.status, duration_ms = entry.duration_ms,
@@ -179,6 +234,10 @@ impl HttpGlobal {
 			}
 		}
 	}
+}
+
+fn trusts(list: &[Cidr], peer: IpAddr) -> bool {
+	!list.is_empty() && cidr::allows(list, peer)
 }
 
 fn now() -> String {

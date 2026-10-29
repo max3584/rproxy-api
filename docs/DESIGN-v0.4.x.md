@@ -357,3 +357,19 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 戻す道：`restore_as` の検証の誤り → `note_invalid`（`listen_addr` が読めなければログだけ。キーが取られていれば `rule.duplicate`）。照合は `api` の行が変われば `forget_invalid` してもう一度、行がなくなれば消す。引き継ぎは状態の `invalid_rules`（保存されていたままの本文、足すだけ）を渡し、新しいプロセスが `restore_as` でもう一度検証する（`rules` には入れない：表示の形から戻すと既定で埋めた項目が変わるため）。
 - レビューで足したもの：検証で落ちたルールのファイルも `Registry::file_refs` に入れる（持ち主は `owner_of_key`。直す PATCH は、そのルールを PATCH できるトークンならどれでも `kept` にする。動いているルールと同じ）。消す・行がなくなる・変わる・組に譲るときは `drop_invalid` が持ち主も忘れ、`forget_invalid` は照合の `Store.invalid` も消す（同じ行が戻れば出し直す）。持ち主は `create_spec_in` が表に入れるときに覚える（同じトークンの同時の作成が `409` にならないように）。戻す組のルールと同じキーは、組を当てる間だけ外し（`stash_invalid`）、組がそのキーを取ったものだけ消して `restore.conflict`（持ち主と行の `created_by` も忘れる）、ほかは戻す（`settle_invalid`）。組の `PUT` の計画は、検証で落ちたルールのキーも組の外のルールと同じく先に断る。`/metrics` の `failed` と `rproxy_rule_up 0` に数える。
 - 試験：`tests/cert_api.rs`（`key_files_keep_to_their_owner`）、`tests/persist.rs`（`invalid_rules_keep_their_files_and_count`・`rows_that_do_not_validate_are_failed_rules`：メモリのストア、`rows_that_do_not_validate_with_mariadb`：本物のバイナリと MariaDB）、`tests/handoff_freeze.rs`（`invalid_rules_and_owners_carry_over`）。
+
+## 16. global の設定の API（v0.4.19、#342）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| `GET` / `PATCH /config/global` | `admin`。本文は設定ファイルの `global` の形、`null` で消す。誤りの `code`：`409 static`・`restart_only`・`in_use`、`403 protected_file`。テーブル `rproxy_global`（UI の migration 013） | `global_api` | API で何も入れなければ今までどおり（ファイル・環境変数・既定） |
+
+- オーナーの決定：ファイル（と環境変数）に書いた項目はファイルが勝つ。API は書いていない項目だけ。
+- 持ち主：`config::global::Settings`（`Registry::global`）。ファイルの項目（`Values::of_file`：書いたかは `ConfigDoc::global_raw` で見る。`trusted_proxies: []` も書いたうち）・環境変数の項目（`RPROXY_UDP_MAX_SESSIONS` を与えたか：`main` が clap の `value_source` で見る）・API の値・効いている値（`Live`）と出どころ。決め方は項目ごとに ファイル → 環境変数 → API → 既定。
+- 入れ替え：`HttpGlobal`（全ルールの `Runtime.global` が共有）の中の `trusted_proxies`・アクセスログの行き先・CrowdSec の bouncer・`http.timeouts` を `RwLock` で持ち、差し替える（`trusts`・`client_ip` はリクエストごとに 1 回写しを取る。`timeouts` は接続の始めに読む）。UDP は `udp::set_max_sessions`。先にすべて組み立て（ファイル・bouncer）、誤りがなければまとめて入れる（`build` → `commit`）。bouncer は新しいものを動かしてから古いものを止める。
+- 起動のときだけの項目（`acme`・`geoip`・`performance`・`files`・制御 API の待ち受け）は表示だけ。`acme`・`geoip` は #345 で（大きいので後に回した）。`files`（所有者の確認）は API で弱められないよう、これからも API では変えない案。
+- 読み直し：`ConfigReloader::reload` がルールより先に `Settings::file_changed`（ルールの `crowdsec` が要るため）。live の項目の誤りは読み直しを断る（何も変えない）。ルールが使う `crowdsec` をファイルから消したら残す（`config.global_in_use`）。`restart_needed` は起動のときだけの項目だけ（前は live の項目も出していた）。`plan_config` に `global_changes`。
+- 保存：`persist::Store::save_global`（`order` の中で値を読んで列に入れる。`Unwritten.global`・`latest_global`、引き継ぎの `Pending.global`）。照合は書き直すだけ（行は rproxy だけが書くので、行を正にしない）。起動は `forward_rules` を読んだ後・ルールを戻す前に `load_global` → `Settings::restore`（作れない項目は前の値のまま `error`）。
+- 引き継ぎ：状態の `global`（足すだけ。`Handoff`：値・書いた人・時刻・`persisted`）を `State::restore_rules` がルールより先に戻す。
+- 秘密：`crowdsec`（後の `acme`）は `Item::unix_only`、`RPROXY_API_RELOAD_UNIX_ONLY` の下で Unix ソケットからだけ（dry run も）。パスは絶対パス、`net::protected::protecting` で rproxy の秘密・ストア・カーネルのファイルシステムを断る。API で入れたキーのファイルも `protected::current` に入る（`HttpGlobal::crowdsec` が今のもの）。
+- 試験：`tests/global_api.rs`、`tests/persist.rs`（`global_values_survive_a_restart_with_mariadb`）、`src/config/global.rs` の単体テスト。

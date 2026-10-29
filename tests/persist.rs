@@ -688,6 +688,80 @@ async fn rules_survive_a_restart_with_mariadb() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
+/// The DDL of `rproxy_global` in docs/API.md (#342; the UI repository's migration 013).
+const RPROXY_GLOBAL: &str = "CREATE TABLE rproxy_global (
+	node         VARCHAR(255) NOT NULL,
+	spec         JSON         NOT NULL,
+	spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+	updated_by   VARCHAR(255) NOT NULL,
+	updated_at   DATETIME(3)  NOT NULL,
+	PRIMARY KEY (node)
+)";
+
+/// #342 with the real binary and MariaDB: `PATCH /config/global` writes the row of
+/// `rproxy_global` before the answer (without the table: `persisted: false`, in force
+/// anyway); a restart reads it back before the rules.
+#[tokio::test]
+async fn global_values_survive_a_restart_with_mariadb() {
+	use sqlx::Executor;
+	let Ok(url) = std::env::var("RPROXY_TEST_DATABASE_URL") else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let _db = DB.lock().await;
+	let pool = sqlx::mysql::MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+	for drop in ["DROP TABLE IF EXISTS forward_rules", "DROP TABLE IF EXISTS rproxy_rules", "DROP TABLE IF EXISTS rproxy_global"] {
+		pool.execute(drop).await.unwrap();
+	}
+	pool.execute(FORWARD_RULES).await.unwrap();
+	pool.execute(RPROXY_RULES).await.unwrap();
+	let dir = workdir("db-global");
+	fs::write(
+		dir.join("tokens.yaml"),
+		format!("tokens:\n  - {{name: ci, sha256: {}, scopes: [admin, rules:read, rules:write], persist: true}}\n", sha("ci")),
+	)
+	.unwrap();
+	let api_port = free_port();
+	let client = reqwest::Client::new();
+	let base = format!("http://127.0.0.1:{api_port}");
+	let patch = |body: Value| client.patch(format!("{base}/config/global")).bearer_auth("ci").json(&body).send();
+	{
+		let rp = Rproxy::start(&dir, api_port, &url, "first");
+		rp.wait(api_port).await;
+		// before migration 013: in force, not stored
+		let r = patch(json!({"trusted_proxies": ["192.0.2.0/24"]})).await.unwrap();
+		assert_eq!(r.status(), StatusCode::OK);
+		let v: Value = r.json().await.unwrap();
+		assert_eq!((&v["persisted"], &v["storage"], &v["items"]["trusted_proxies"]["source"]), (&json!(false), &json!("database"), &json!("api")), "{v}");
+		pool.execute(RPROXY_GLOBAL).await.unwrap();
+		let r = patch(json!({"http": {"timeouts": {"idle": "42s"}}})).await.unwrap();
+		let v: Value = r.json().await.unwrap();
+		assert_eq!(v["persisted"], true, "{v}\n{}", rp.log());
+	}
+	let row: (String, String, i64) =
+		sqlx::query_as("SELECT CAST(spec AS CHAR), updated_by, CAST(spec_version AS SIGNED) FROM rproxy_global WHERE node = 'node-a'")
+			.fetch_one(&pool)
+			.await
+			.unwrap();
+	let spec: Value = serde_json::from_str(&row.0).unwrap();
+	assert_eq!((&spec, row.1.as_str(), row.2), (&json!({"trusted_proxies": ["192.0.2.0/24"], "http": {"timeouts": {"idle": "42s"}}}), "ci", 1));
+	{
+		let rp = Rproxy::start(&dir, api_port, &url, "second");
+		rp.wait(api_port).await;
+		rp.wait_log("restore.global").await;
+		let v: Value = client.get(format!("{base}/config/global")).bearer_auth("ci").send().await.unwrap().json().await.unwrap();
+		assert_eq!(
+			(&v["items"]["trusted_proxies"]["value"], &v["items"]["http.timeouts"]["source"], &v["persisted"], &v["updated_by"]),
+			(&json!(["192.0.2.0/24"]), &json!("api"), &json!(true), &json!("ci")),
+			"{v}"
+		);
+	}
+	for drop in ["DROP TABLE IF EXISTS forward_rules", "DROP TABLE IF EXISTS rproxy_rules", "DROP TABLE IF EXISTS rproxy_global"] {
+		pool.execute(drop).await.unwrap();
+	}
+	fs::remove_dir_all(dir).unwrap();
+}
+
 /// #327 with the real binary and MariaDB: a row of `rproxy_rules` and one of
 /// `forward_rules` that do not validate are failed rules of `GET /rules`; a PATCH
 /// fixes the first and writes its row (it runs after a restart), `DELETE` removes the

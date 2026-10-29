@@ -230,6 +230,9 @@ struct Options {
 	busy_poll_usecs: Option<u32>,
 	#[command(subcommand)]
 	command: Option<Command>,
+	/// Options given in the environment or as flags (not their defaults), for `GET /config/global`.
+	#[arg(skip)]
+	given: Vec<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -561,7 +564,14 @@ fn main() -> ExitCode {
 	// a live upgrade (#174): the old process's handoff socket, for this process only
 	let handoff_from = std::env::var_os(rproxy_api::control::upgrade::handoff::ENV_FROM).map(PathBuf::from);
 	std::env::remove_var(rproxy_api::control::upgrade::handoff::ENV_FROM);
-	let opts = Options::parse();
+	let matches = <Options as clap::CommandFactory>::command().get_matches();
+	let mut opts = <Options as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+	// options given (not their defaults): the environment owns them in GET /config/global (#342)
+	opts.given = ["udp_max_sessions", "api_addr", "api_port", "api_socket"]
+		.into_iter()
+		.filter(|id| matches!(matches.value_source(id), Some(clap::parser::ValueSource::EnvVariable | clap::parser::ValueSource::CommandLine)))
+		.map(String::from)
+		.collect();
 	// stored certificates (#240): rules name them, also for --check-config
 	if let Some(dir) = &opts.cert_store {
 		rproxy_api::tls::named::set_dir(dir.clone());
@@ -986,6 +996,28 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			Err(e) => error!(event = "degraded", part = "db", error = %e, "rules made through the API are not stored"),
 		}
 	}
+	// global through the API (#342): what the start applied, and who owns each item
+	{
+		use rproxy_api::config::global::{Source, Values};
+		let given = |id: &str| opts.given.iter().any(|g| g == id);
+		let env = Values { udp_max_sessions: given("udp_max_sessions").then_some(opts.udp_max_sessions), ..Default::default() };
+		let mut startup = std::collections::BTreeMap::new();
+		let api_source = if ["api_addr", "api_port", "api_socket"].iter().any(|id| given(id)) { Source::Env } else { Source::Default };
+		startup.insert("control_api", (api_source, serde_json::json!({"addr": opts.api_addr, "port": opts.api_port, "socket": opts.api_socket})));
+		let perf_env = perf.sources.iter().any(|(_, s)| *s == rproxy_api::config::performance::Source::Env);
+		startup.insert(
+			"performance",
+			(
+				if perf_env { Source::Env } else { Source::Default },
+				serde_json::json!({"workers": perf.workers, "udp_shards": perf.udp_shards, "busy_poll_usecs": perf.busy_poll_usecs, "splice": perf.splice.enabled}),
+			),
+		);
+		if let Some(dirs) = &opts.files_trusted_dirs {
+			startup.insert("files", (Source::Env, serde_json::json!({"trusted_dirs": dirs.split(':').collect::<Vec<_>>()})));
+		}
+		let database = opts.database_url.is_some() && registry.persist().is_some();
+		registry.global().init(doc.as_ref().map(|(_, d)| (&d.global, &d.global_raw)), env, startup, opts.log_keep, database);
+	}
 	// before anything listens (not after a live upgrade, whose old process holds the
 	// lock until it lets go): a write an earlier process of this node left behind is
 	// done first, and another live process with this node name stops the startup
@@ -1050,6 +1082,22 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			},
 			None => vec![],
 		};
+		// the global values set through the API (#342), before the rules (rules using crowdsec need it)
+		if let Some(store) = registry.persist() {
+			match store.load_global().await {
+				Ok(Some(row)) => match serde_json::from_value::<rproxy_api::config::global::Values>(row.spec) {
+					Ok(values) => {
+						let http = registry.http_global();
+						registry.global().restore(&http, values, Some(row.updated_by), Some(row.updated_at), Some(true), "database").await;
+					}
+					Err(e) => error!(event = "restore.skip", table = rproxy_api::config::persist::GLOBAL_TABLE, error = %e,
+						"the stored global values could not be read; they are not in force"),
+				},
+				Ok(None) => {}
+				Err(e) => error!(event = "degraded", part = "db", table = rproxy_api::config::persist::GLOBAL_TABLE, error = %e,
+					"the global values stored by the API are not restored"),
+			}
+		}
 		info!(event = "restore.start", rules = ui.len(), api_rules = stored.len(),
 			node = registry.persist().map(|s| s.node()).unwrap_or(""));
 		registry.restore(ui).await;
