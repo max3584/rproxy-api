@@ -379,7 +379,12 @@ async fn global_patch(
 	let dry_run = crate::config::plan::dry_run(&query)?;
 	let secret = crate::config::global::unix_only_items(&body);
 	if !secret.is_empty() {
-		if let Err(e) = unix_only(&state, transport.is_some(), &format!("PATCH /config/global of {}", secret.join(", "))) {
+		// the message does not suggest turning the guard off (RPROXY_API_RELOAD_UNIX_ONLY, docs/API.md)
+		if state.reload_unix_only && transport.is_none() {
+			let e = ApiError::forbidden(format!(
+				"{} can be changed only over the Unix socket (RPROXY_API_SOCKET)",
+				secret.iter().map(|i| format!("global.{i}")).collect::<Vec<_>>().join(", ")
+			));
 			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "",
 				outcome = "forbidden", code = "unix_only", dry_run);
 			return Err(e);

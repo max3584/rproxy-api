@@ -966,7 +966,7 @@ GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
     - `400 invalid`：知らない項目、形や値の誤り、ない `access_log` のディレクトリ、書けないアクセスログ、読めない CrowdSec のキーのファイル。
     - `409 in_use`：ルールが使っている `crowdsec` を消す、`appsec` を使うルールがあるのに `appsec_url` を外す。
     - `403 protected_file`：パスが証明書のストア・ACME の保存先・rproxy の秘密（トークンファイルなど）・`/proc` などを指す。アクセスログが下の場所の外。
-    - `403 forbidden`：Unix ソケットだけの項目を TCP から（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も。dry run も同じ）。`event=audit` に `outcome: forbidden`・`code: unix_only`。
+    - `403 forbidden`：Unix ソケットだけの項目を TCP から（dry run も同じ。誤りの文は「Unix ソケット（`RPROXY_API_SOCKET`）からだけ」）。この守りは `POST /config/reload` などと同じ `RPROXY_API_RELOAD_UNIX_ONLY` で、`false` にすると TCP からも変えられる（勧めない）。`event=audit` に `outcome: forbidden`・`code: unix_only`。
     - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。そのため `crowdsec` の PATCH は最大 10 秒かかり、その間ほかの `global` の変更（PATCH・設定ファイルの読み直し）は順番を待つ。
     - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない、行が読めない形）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る（読めない形の行は直すまで）。
     - `503 upgrading` / `shutting_down`：引き継ぎ・終了の途中。

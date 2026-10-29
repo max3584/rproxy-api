@@ -967,7 +967,7 @@ The `global` items that the settings file (and the environment) leaves out are c
     - `400 invalid`: unknown items, wrong shapes or values, an `access_log` directory that does not exist, an access log that cannot be written, a CrowdSec key file that cannot be read.
     - `409 in_use`: clearing a `crowdsec` that rules use, or dropping `appsec_url` while rules use `appsec`.
     - `403 protected_file`: a path naming the certificate store, the ACME storage, rproxy's secrets (the token file etc.) or `/proc` and the like; an access log outside the place below.
-    - `403 forbidden`: a Unix-socket-only item over TCP (`RPROXY_API_RELOAD_UNIX_ONLY=false` allows TCP; dry runs too). Logged as `event=audit` with `outcome: forbidden`, `code: unix_only`.
+    - `403 forbidden`: a Unix-socket-only item over TCP (dry runs too; the error says it can be changed only over the Unix socket, `RPROXY_API_SOCKET`). The guard is `RPROXY_API_RELOAD_UNIX_ONLY`, as for `POST /config/reload` and others; `false` allows TCP too (not recommended). Logged as `event=audit` with `outcome: forbidden`, `code: unix_only`.
     - `502 crowdsec_unavailable`: the new LAPI did not answer within 10 seconds (the current bouncer stays; nothing changed). A `crowdsec` PATCH can so take up to 10 seconds, and other changes of `global` (PATCHes, reloads of the settings file) wait their turn meanwhile.
     - `503 not_loaded`: the stored values could not be read at the start (the DB was unreachable, or the row does not read). A write would destroy what is stored, so changes are refused until the periodic check has read them (a row that does not read: until it is fixed).
     - `503 upgrading` / `shutting_down`: a live upgrade or the shutdown is under way.

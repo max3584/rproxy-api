@@ -196,6 +196,8 @@ async fn the_api_sets_what_the_file_leaves_out_and_the_next_request_takes_it() {
 	for body in [json!({"crowdsec": null}), json!({"trusted_proxies": ["0.0.0.0/0"]}), json!({"access_log": dir.join("a.log")})] {
 		let (status, e) = patch(&tcp, "/config/global?dry_run=true", body.clone()).await;
 		assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("forbidden")), "{body}: {e}");
+		let text = e["error"].as_str().unwrap_or_default();
+		assert!(text.contains("only over the Unix socket") && !text.contains("RPROXY_API_RELOAD_UNIX_ONLY"), "{text}");
 	}
 	for body in [json!({"trusted_proxies": ["nope"]}), json!({"nope": 1}), json!({}), json!([1]), json!({"udp_max_sessions": -1})] {
 		let (status, e) = patch(&unix, "/config/global", body.clone()).await;
