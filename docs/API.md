@@ -959,7 +959,7 @@ GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
 | `files` | `restart` | | `global.files`、`RPROXY_FILES_TRUSTED_DIRS` |
 | `control_api` | `restart`（制御 API の待ち受け） | | `RPROXY_API_ADDR`・`RPROXY_API_PORT`・`RPROXY_API_SOCKET` |
 
-- `GET /config/global`（`admin`）：`{"items":{"trusted_proxies":{"value":[...],"source":"api","apply":"live","unix_only":true,"settable":true,"api_value":[...],"shadowed":false},...},"storage":"database","persisted":true,"loaded":true,"updated_by":"ui","updated_at":1790000000,"warnings":[]}`。`value` は今効いている値（`restart` の項目は起動したときの値）、`source` は `file` / `env` / `api` / `default`、`settable` は今 API で変えられるか（Unix ソケットだけの項目も true。`unix_only` を見る）、`api_value` は API の値（あるときだけ）、`shadowed` は API の値があるがファイル・環境変数が勝っていて効いていない、`error` は戻した API の値を効かせられなかった理由（効いていないが保存したまま）。`crowdsec` の `kept: true` は、ファイルから消えたがルールが使っているので残しているもの（`source` は `file`）。`loaded` は保存した値を読めたか（下の「保存」）。
+- `GET /config/global`（`admin`）：`{"items":{"trusted_proxies":{"value":[...],"source":"api","apply":"live","unix_only":true,"settable":true,"api_value":[...],"shadowed":false},...},"storage":"database","persisted":true,"loaded":true,"updated_by":"ui","updated_at":1790000000,"warnings":[]}`。`value` は今効いている値（`restart` の項目は起動したときの値。手で書いた値で秘密を含みうるので、`acme` は形だけ（文字列はすべて `***`。キー・数・真偽は残す）、ほかの `restart` の項目もヘッダの値・`body`・名前に `secret`・`token`・`key`・`password`・`credential`・`eab` を含むもの（ファイルの場所も）・URL の利用者とクエリを `***` にする。`api_value` も同じ。`crowdsec` の `lapi_url`・`appsec_url` は利用者・クエリ・`#` 以降を伏せる、#347）、`source` は `file` / `env` / `api` / `default`、`settable` は今 API で変えられるか（Unix ソケットだけの項目も true。`unix_only` を見る）、`api_value` は API の値（あるときだけ）、`shadowed` は API の値があるがファイル・環境変数が勝っていて効いていない、`error` は戻した API の値を効かせられなかった理由（効いていないが保存したまま）。`crowdsec` の `kept: true` は、ファイルから消えたがルールが使っているので残しているもの（`source` は `file`）。`loaded` は保存した値を読めたか（下の「保存」）。
 - `PATCH /config/global`（`admin`）：本文は設定ファイルの `global` と同じ形（`{"trusted_proxies":["10.0.0.0/8"],"http":{"timeouts":{"idle":"5m"}},"udp_max_sessions":4096}`）。名前を挙げた項目だけを、項目ごと丸ごと置き換える（`http.timeouts` の中も丸ごと）。`null` で API の値を消す（既定に戻る）。`[]`・`{}` は値として入る（`trusted_proxies: []` は「信じる前段なし」を API で決めたもの、`http: {"timeouts": {}}` はすべて既定の値を API で決めたもの）。答えは `GET` と同じ形に `changes`（`[{"item","before","after","api_before","api_after"}]`）と `applied`（効いている値が変わった項目）。`?dry_run=true` は何も変えずに `{"dry_run":true,"changes":[...],"applied":[...]}`（ファイルを開かず、bouncer も動かさない。形・パス・ルールが使うかは確かめる）。
   - 断るとき：
     - `409 static`（ファイル・環境変数の項目）、`409 restart_only`（`restart` の項目）。どちらも `items`。
@@ -970,11 +970,11 @@ GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
     - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。そのため `crowdsec` の PATCH は最大 10 秒かかり、その間ほかの `global` の変更（PATCH・設定ファイルの読み直し）は順番を待つ。
     - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない、行が読めない形）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る（読めない形の行は直すまで）。
     - `503 upgrading` / `shutting_down`：引き継ぎ・終了の途中。
-  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
+  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前・拡張子が空の名前（`x.`）は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
   - `event=audit`（`action: config.global`。dry run も `dry_run: true` で）と `config.global`（項目・効いた項目）に残る。
 - 入れ替え：live の項目はまとめて 1 つの写しとして入れ替わり、1 つのリクエストは始まったときの写しを最後まで使う（いくつかの項目を変える PATCH の途中の組み合わせは見えない）。CrowdSec を使うルールの作成・変更と `crowdsec` の変更はルールの表の鍵の下で順に行うので、`crowdsec` を使うルールが `crowdsec` なしで動くことはない。
 - 保存：DB（`RPROXY_DATABASE_URL`）があれば、応答の前にテーブル `rproxy_global` に自分の `node` の 1 行（API の値を JSON で）を書く（`persisted`）。書けなければ（DB に届かない、テーブルがない）値は効かせたまま `persisted: false`、`degraded`（`part: "db"`）、定期の照合（`RPROXY_PERSIST_CHECK_SECS`）が書き直す。行は項目ごとに読み、この版が知らない項目（後の版の `acme` など）や読めない値は効かせずにそのまま残して書き戻す（`spec_version` は `rproxy_global` だけの番号）。
-  - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec` は最初の取得を 2 秒まで待ち、取れなくても入れる（設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまでの判定はルールの `on_error`。L4 の `crowdsec` は通す）。
+  - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec`（起動のとき・引き継ぎ・定期の照合が後から読んだとき）は最初の取得を 2 秒まで待ち、取れなくても入れる（LAPI が答えなければ、起動はルールを戻す前に、照合もそれぞれ最大 2 秒遅れる。設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまでの判定はルールの `on_error`。L4 の `crowdsec` は通す）。
   - 読めなければ（DB に届かない、行が読めない形）`loaded: false` で、`PATCH` は `503 not_loaded`、行も書かない。定期の照合が読めたら効かせる。そのあいだ `crowdsec` がなくて起動できなかったルールは、`crowdsec` が効いたときに動かし直す（PATCH・読み直しで入ったときも同じ）。
   - DB がなければ値はこのプロセスの中だけ（`storage: "memory"`、再起動で消える）。行が正になることはない（書くのは rproxy だけ。照合は書き直すだけ）。
 - 引き継ぎ（`/admin/upgrade`）では、API の値（知らない項目も）・書いた人・時刻・`persisted`・読めていないこと・残している `crowdsec` を新しいプロセスに渡し、ルールより先に効かせる。v0.4.19 より前の版への引き継ぎ（戻すとき）では API の値は渡らない（その版は知らない。DB の行は残るので、v0.4.19 以後に戻せばまた読む）。
@@ -995,8 +995,9 @@ CREATE TABLE IF NOT EXISTS rproxy_global (
   PRIMARY KEY (node)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 GRANT SELECT, INSERT, UPDATE ON rproxy.rproxy_global TO 'rproxy'@'%';
-GRANT SELECT ON rproxy.rproxy_global TO 'rproxy_ui'@'%';
 ```
+
+  権限が要るのは rproxy のノードの DB ユーザーだけで、自分の行に `SELECT`・`INSERT`・`UPDATE`（複数の rproxy では UI の `db/node-view.mjs` が作るノードごとのビュー経由）。UI はこのテーブルを読まない（値は `GET` / `PATCH /config/global` で読み書きする）ので、UI の DB ユーザーには権限を与えない。
 
 ### まだホストにないアドレスで待ち受ける（v0.4.3、`features.listen_freebind`）
 

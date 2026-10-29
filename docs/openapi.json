@@ -4202,6 +4202,7 @@
     "/config/global": {
       "get": {
         "summary": "Every global item: its value in force, where it comes from, whether the API may change it (admin; v0.4.19, #342)",
+        "description": "The values of restart items are shown with what may be a secret masked as ***: acme keeps only its shape (every string masked); the others mask header values, body, anything named like secret, token, key, password, credential or eab, and the user and query of URLs (#347).",
         "responses": {
           "200": {
             "description": "OK",
