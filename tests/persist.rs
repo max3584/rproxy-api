@@ -729,10 +729,11 @@ async fn global_values_survive_a_restart_with_mariadb() {
 		let rp = Rproxy::start(&dir, api_port, &url, "first");
 		rp.wait(api_port).await;
 		// before migration 013: in force, not stored
-		let r = patch(json!({"trusted_proxies": ["192.0.2.0/24"]})).await.unwrap();
+		// (over TCP: the items that only the Unix socket may change are refused)
+		let r = patch(json!({"udp_max_sessions": 5})).await.unwrap();
 		assert_eq!(r.status(), StatusCode::OK);
 		let v: Value = r.json().await.unwrap();
-		assert_eq!((&v["persisted"], &v["storage"], &v["items"]["trusted_proxies"]["source"]), (&json!(false), &json!("database"), &json!("api")), "{v}");
+		assert_eq!((&v["persisted"], &v["storage"], &v["items"]["udp_max_sessions"]["source"]), (&json!(false), &json!("database"), &json!("api")), "{v}");
 		pool.execute(RPROXY_GLOBAL).await.unwrap();
 		let r = patch(json!({"http": {"timeouts": {"idle": "42s"}}})).await.unwrap();
 		let v: Value = r.json().await.unwrap();
@@ -744,15 +745,15 @@ async fn global_values_survive_a_restart_with_mariadb() {
 			.await
 			.unwrap();
 	let spec: Value = serde_json::from_str(&row.0).unwrap();
-	assert_eq!((&spec, row.1.as_str(), row.2), (&json!({"trusted_proxies": ["192.0.2.0/24"], "http": {"timeouts": {"idle": "42s"}}}), "ci", 1));
+	assert_eq!((&spec, row.1.as_str(), row.2), (&json!({"udp_max_sessions": 5, "http": {"timeouts": {"idle": "42s"}}}), "ci", 1));
 	{
 		let rp = Rproxy::start(&dir, api_port, &url, "second");
 		rp.wait(api_port).await;
 		rp.wait_log("restore.global").await;
 		let v: Value = client.get(format!("{base}/config/global")).bearer_auth("ci").send().await.unwrap().json().await.unwrap();
 		assert_eq!(
-			(&v["items"]["trusted_proxies"]["value"], &v["items"]["http.timeouts"]["source"], &v["persisted"], &v["updated_by"]),
-			(&json!(["192.0.2.0/24"]), &json!("api"), &json!(true), &json!("ci")),
+			(&v["items"]["udp_max_sessions"]["value"], &v["items"]["http.timeouts"]["source"], &v["persisted"], &v["updated_by"]),
+			(&json!(5), &json!("api"), &json!(true), &json!("ci")),
 			"{v}"
 		);
 	}

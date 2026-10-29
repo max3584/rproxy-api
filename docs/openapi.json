@@ -2296,7 +2296,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
           },
           "crowdsec": {
             "$ref": "#/components/schemas/CrowdsecStatus"
@@ -2479,7 +2480,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
           },
           "files": {
             "type": "array",
@@ -3355,7 +3357,8 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "global items changed in the file that take effect only after a restart: global.acme, global.geoip, global.performance, global.files (the live items are applied by the reload, #342)"
           },
           "global_changes": {
             "type": "array",
@@ -3626,11 +3629,11 @@
           },
           "unix_only": {
             "type": "boolean",
-            "description": "Names secrets: PATCH only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true"
+            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec (and acme)"
           },
           "settable": {
             "type": "boolean",
-            "description": "Whether PATCH may set it now (live and not from the file or the environment)"
+            "description": "Whether PATCH may set it now (live and not from the file or the environment; see unix_only for the transport)"
           },
           "api_value": {
             "description": "The value set through the API (present only when there is one)"
@@ -3641,7 +3644,11 @@
           },
           "error": {
             "type": "string",
-            "description": "A restored API value that could not be put in force (the value before it stays)"
+            "description": "A restored API value that is not in force (refused or not built); it stays stored"
+          },
+          "kept": {
+            "type": "boolean",
+            "description": "crowdsec only: the file dropped it, but rules use it, so it stays in force (source file) until no rule does"
           }
         },
         "required": [
@@ -3677,6 +3684,10 @@
               "null"
             ],
             "description": "Whether the row of rproxy_global is up to date (null: no database)"
+          },
+          "loaded": {
+            "type": "boolean",
+            "description": "Whether the stored values could be read; false: PATCH answers 503 not_loaded until the periodic check reads them"
           },
           "updated_by": {
             "type": [
@@ -3728,7 +3739,8 @@
           "items",
           "storage",
           "persisted",
-          "warnings"
+          "warnings",
+          "loaded"
         ]
       },
       "GlobalChange": {
@@ -3760,7 +3772,7 @@
       },
       "GlobalPatch": {
         "type": "object",
-        "description": "The shape of the settings file's global; an item set to null clears the API value (back to the default). Each named item is replaced as a whole.",
+        "description": "The shape of the settings file's global; an item set to null clears the API value (back to the default), [] and {} are values. Each named item is replaced as a whole.",
         "properties": {
           "trusted_proxies": {
             "type": [
@@ -3769,21 +3781,22 @@
             ],
             "items": {
               "type": "string"
-            }
+            },
+            "description": "CIDRs whose X-Forwarded-For is believed; [] trusts none. Unix socket only by default"
           },
           "access_log": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Absolute path; its directory must exist"
+            "description": "Absolute path of a file right in RPROXY_API_ACCESS_LOG_DIR (else the directory of RPROXY_LOG_FILE); its name may not overlap rproxy's own log. Unix socket only by default"
           },
           "crowdsec": {
             "type": [
               "object",
               "null"
             ],
-            "description": "As global.crowdsec (lapi_url, api_key_file (absolute), appsec_url, update_interval); only over the Unix socket by default"
+            "description": "As global.crowdsec (lapi_url, api_key_file (absolute), appsec_url, update_interval); swapped in once the new bouncer has pulled from its LAPI. Unix socket only by default"
           },
           "http": {
             "type": [
@@ -4162,7 +4175,7 @@
             }
           },
           "403": {
-            "description": "The token lacks the admin scope; crowdsec over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores (protected_file)",
+            "description": "The token lacks the admin scope; trusted_proxies, access_log or crowdsec over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, or an access log outside RPROXY_API_ACCESS_LOG_DIR (protected_file)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4181,8 +4194,18 @@
               }
             }
           },
+          "502": {
+            "description": "crowdsec_unavailable: the new LAPI did not answer in time; the current bouncer stays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "A live upgrade or the shutdown is under way (upgrading, shutting_down)",
+            "description": "not_loaded: the stored values could not be read yet; upgrading, shutting_down",
             "content": {
               "application/json": {
                 "schema": {

@@ -350,12 +350,16 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 
 | テスト | 確かめること |
 |---|---|
-| `the_api_sets_what_the_file_leaves_out_and_the_next_request_takes_it` | `admin` だけ。ファイルの項目は `409 static`（`items`）、`restart` の項目は `409 restart_only`、`crowdsec` は TCP から `403`、誤り・ない `access_log` のディレクトリは `400`、`/proc` は `403 protected_file`。`trusted_proxies` の dry run は何も変えず、本当の変更は次のリクエストから `X-Forwarded-For` を信じる。`access_log` は次の行からファイルへ。`null` で既定に戻る |
-| `udp_sessions_and_http_timeouts_change_for_the_next_session_and_connection` | `udp_max_sessions: 1` で次の新しいセッションを断り、消すと通る。`http.timeouts.first_byte: 1s` は新しい接続を 1 秒で閉じ、消すと既定に戻る |
-| `crowdsec_through_the_unix_socket_and_the_rules_that_need_it` | Unix ソケットから `crowdsec` を入れると、それを使うルールが作れる。使うルールがあると消せない（`409 in_use`）。API で入れたキーのファイルはルールから指せない |
-| `stored_restored_and_written_again` | メモリのストア：応答の前に行を書く（`persisted: true`）。書けなければ効かせたまま `persisted: false`、引き継ぎの `pending` に入り、照合が書き直す。再起動のときに戻すと効き、ファイルの項目は `shadowed`（`config.global_shadowed`） |
+| `the_api_sets_what_the_file_leaves_out_and_the_next_request_takes_it` | `admin` だけ。ファイルの項目は `409 static`（`items`）、`restart` の項目は `409 restart_only`、`trusted_proxies`・`access_log`・`crowdsec` は TCP から `403`（dry run も）、誤りは `400`、`/etc/profile.d`・`/proc` のアクセスログは `403 protected_file`。`trusted_proxies` の dry run は何も変えず、本当の変更は次のリクエストから `X-Forwarded-For` を信じる。`[]` は値、`null` で既定に戻る。`access_log` は次の行からファイルへ |
+| `udp_sessions_and_http_timeouts_change_for_the_next_session_and_connection` | TCP から：`udp_max_sessions: 1` で次の新しいセッションを断り、消すと通る。`http.timeouts.first_byte: 1s` は新しい接続を 1 秒で閉じ、消すと既定に戻る |
+| `crowdsec_through_the_unix_socket_swaps_only_a_synced_bouncer` | Unix ソケットから `crowdsec` を入れると、LAPI から取ってから効き（判定がある）、それを使うルールが作れる。答えない LAPI への変更は待ってから `502 crowdsec_unavailable` で、今の bouncer のまま。使うルールがあると消せない（`409 in_use`）。API で入れたキーのファイルはルールから指せない |
+| `clearing_crowdsec_never_crosses_a_rule_that_needs_it` | `crowdsec` を消す PATCH と、それを使うルールの作成を同時に 10 回：`crowdsec` がないのに動いているルールはない（ルールの鍵の下の `crowdsec_gate` を外すと落ちる） |
+| `stored_restored_and_written_again` | メモリのストア：新しい版が書いた知らない項目を残して書き戻す、応答の前に行を書く（`persisted: true`、`spec_version` 1）。書けなければ効かせたまま `persisted: false`、引き継ぎの `pending` に入り、照合が書き直す。再起動のときに戻すと効き、ファイルの項目は `shadowed`（`config.global_shadowed`） |
+| `a_change_waits_for_the_stored_values` | 起動で行を読めなかったとき：`PATCH` は `503 not_loaded`、`loaded: false`、行を書かない。照合が読んで効かせた後の `PATCH` は、行のほかの項目を残す |
 | `a_live_upgrade_hands_the_values_over` | 引き継ぎの状態の `global` で、新しいプロセスがルールより先に同じ値を効かせる（書いた人・`persisted` も） |
-| `a_reload_that_brings_the_item_into_the_file_wins` | 読み直しでファイルに現れた項目はファイルが勝ち（`restart_needed` には出ない）、API の値は `shadowed`、API では変えられない（`409 static`）。live の項目の誤りは読み直しを断る。ファイルから消えれば API の値に戻る |
+| `a_reload_that_brings_the_item_into_the_file_wins` | 読み直しでファイルに現れた項目はファイルが勝ち（`restart_needed` には出ない）、API の値は `shadowed`、API では変えられない（`409 static`）。live の項目の誤りでも、ルールの誤りでも、読み直しは何も変えない。ファイルから消えれば API の値に戻る |
+| `a_reload_keeps_the_crowdsec_rules_need` | 読み直し：新しい `crowdsec` は LAPI から取ってから効く。答えない LAPI・`appsec` を使うルールがあるのに `appsec_url` なし・ファイルから消す、はどれも今のものを残す（`kept`、ほかの PATCH でも残り、引き継ぎの状態にも）。使うルールがなくなった後の読み直しで外す |
+| `global_in_a_later_file_of_a_directory_is_the_file_s` | `RPROXY_CONFIG` がディレクトリで、`global` が 2 つ目のファイルにあっても、その項目はファイルのもの（`409 static`） |
 
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 

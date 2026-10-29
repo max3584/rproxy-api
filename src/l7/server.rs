@@ -830,7 +830,9 @@ impl Conn {
 		// proxies. A client's goes now, before middlewares, so one the rule sets (`headers`, a
 		// server's ext_authz) still reaches the backend; forward_auth with trust_forward_header
 		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
-		if req.headers().contains_key(header::FORWARDED) && !self.rt.global.trusts(canonical(self.client.ip())) {
+		// the global settings in force (#342), the same for the whole request
+		let snapshot = self.rt.global.snapshot();
+		if req.headers().contains_key(header::FORWARDED) && !snapshot.trusts(canonical(self.client.ip())) {
 			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
 			req.headers_mut().remove(header::FORWARDED);
 			req.extensions_mut().insert(ClientForwarded(values));
@@ -874,7 +876,7 @@ impl Conn {
 		// the client: the peer, or what a trusted proxy in front says (global.trusted_proxies)
 		let peer = canonical(self.client.ip());
 		let global = &self.rt.global;
-		let client_ip = global.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
+		let client_ip = snapshot.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
 		let headers: Vec<(String, String)> = if router.match_headers {
 			req.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
 		} else {
@@ -901,7 +903,7 @@ impl Conn {
 		let deadline = request_timeout.map(|d| tokio::time::Instant::now() + d);
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
 		// the access log line is put together only when it is written (the statistics need just the route)
-		let log = global.logging();
+		let log = snapshot.logging();
 		let route_label = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
 		let mut entry = if log {
 			AccessEntry {
@@ -1165,7 +1167,7 @@ impl Conn {
 		}
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
-		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, started, _holds: holds }.boxed())
+		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, global: snapshot, started, _holds: holds }.boxed())
 	}
 
 	/// The response side of one middleware.
@@ -2153,6 +2155,8 @@ struct Logged {
 	/// The entry is complete and the line is written (`HttpGlobal::logging` when the request came).
 	log: bool,
 	rt: Arc<Runtime>,
+	/// The global settings the request was handled with (its access log).
+	global: Arc<crate::l7::access::Snapshot>,
 	started: Instant,
 	/// `in_flight` places, freed with the response.
 	_holds: Vec<Hold>,
@@ -2191,7 +2195,7 @@ impl Drop for Logged {
 		self.entry.bytes_out = self.bytes;
 		self.rt.http_stats.record(&self.entry.route, self.entry.status, elapsed);
 		if self.log {
-			self.rt.global.log(&self.entry);
+			self.global.log(&self.entry);
 		}
 	}
 }

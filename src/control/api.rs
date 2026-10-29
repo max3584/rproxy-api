@@ -379,20 +379,21 @@ async fn global_patch(
 	let dry_run = crate::config::plan::dry_run(&query)?;
 	let secret = crate::config::global::unix_only_items(&body);
 	if !secret.is_empty() {
-		unix_only(&state, transport.is_some(), &format!("PATCH /config/global of {}", secret.join(", ")))?;
+		if let Err(e) = unix_only(&state, transport.is_some(), &format!("PATCH /config/global of {}", secret.join(", "))) {
+			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "",
+				outcome = "forbidden", code = "unix_only", dry_run);
+			return Err(e);
+		}
 	}
 	to_the_end(async move {
+		let audit = |outcome: &str, code: &str| {
+			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "",
+				outcome, code, dry_run);
+		};
 		// a dry run changes nothing: no turn among the changes to wait for
 		let _change = if dry_run { None } else { changing(&state).await? };
 		let registry = state.registry.clone();
-		let uses = registry.uses_crowdsec().await;
-		// the API may not point global at rproxy's own secrets or stores (#319)
-		let entries = crate::net::protected::current(registry.acme().map(|a| a.as_ref()), None);
-		let http = registry.http_global();
-		let result = registry
-			.global()
-			.patch(&http, &body, &principal.name, dry_run, uses, |p| crate::net::protected::protecting(p, &entries))
-			.await;
+		let result = registry.global().patch(&registry, &body, &principal.name, dry_run).await;
 		let refused = |status: StatusCode, code: &str, error: String, items: Option<&Vec<String>>| {
 			let mut v = json!({"code": code, "error": error});
 			if let Some(items) = items {
@@ -403,7 +404,7 @@ async fn global_patch(
 		use crate::config::global::PatchError;
 		let (answer, code) = match result {
 			Ok(patched) if dry_run => {
-				return Ok((StatusCode::OK, Json(json!({"dry_run": true, "changes": patched.changes, "applied": patched.applied}))).into_response())
+				(Json(json!({"dry_run": true, "changes": patched.changes, "applied": patched.applied})).into_response(), "")
 			}
 			Ok(patched) => {
 				if let Some(store) = registry.persist().filter(|s| s.enabled()) {
@@ -414,10 +415,14 @@ async fn global_patch(
 				v["applied"] = json!(patched.applied);
 				(Json(v).into_response(), "")
 			}
-			Err(PatchError::Invalid(e)) if dry_run => return Err(ApiError::invalid(e)),
 			Err(PatchError::Invalid(e)) => (ApiError::invalid(e).into_response(), "invalid"),
 			Err(PatchError::Protected(e)) => (ApiError::protected_file(e).into_response(), "protected_file"),
 			Err(PatchError::InUse(e)) => (refused(StatusCode::CONFLICT, "in_use", e, None), "in_use"),
+			Err(PatchError::Unavailable(e)) => (refused(StatusCode::BAD_GATEWAY, "crowdsec_unavailable", e, None), "crowdsec_unavailable"),
+			Err(PatchError::NotLoaded) => {
+				let e = "the stored global values could not be read yet (the database); try again after the next check".to_string();
+				(refused(StatusCode::SERVICE_UNAVAILABLE, "not_loaded", e, None), "not_loaded")
+			}
 			Err(PatchError::Static(items)) => {
 				let e = format!("the settings file (or the environment) sets {}; change it there", items.join(", "));
 				(refused(StatusCode::CONFLICT, "static", e, Some(&items)), "static")
@@ -427,11 +432,8 @@ async fn global_patch(
 				(refused(StatusCode::CONFLICT, "restart_only", e, Some(&items)), "restart_only")
 			}
 		};
-		if !dry_run {
-			let outcome = if code.is_empty() { "ok" } else { "error" };
-			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "", outcome, code);
-		}
-		Ok(answer)
+		audit(if code.is_empty() { "ok" } else { "error" }, code);
+		Ok::<_, ApiError>(answer)
 	})
 	.await
 }

@@ -78,6 +78,8 @@ impl ConfigReloader {
 	/// the API) reads even when the files look unchanged.
 	pub async fn reload(&self, forced: bool) -> Outcome {
 		let mut state = self.state.lock().await;
+		// an access log that could not be written is tried again on every check (#342)
+		self.registry.global().retry_access_log(&self.registry);
 		let now = fingerprint(&self.path);
 		if !forced && state.seen == Some(now) {
 			return Outcome::Unchanged;
@@ -89,22 +91,22 @@ impl ConfigReloader {
 				let restart: Vec<String> = doc.restart_needed(&self.base).into_iter().map(String::from).collect();
 				let files: Vec<String> = doc.files.iter().map(|f| f.display().to_string()).collect();
 				let rules = doc.rules.len();
-				// the live global items first (rules using crowdsec need it): the file wins over the API (#342)
-				let uses = self.registry.uses_crowdsec().await;
-				let http = self.registry.http_global();
-				let global = self.registry.global().file_changed(&http, &doc.global, &doc.global_raw, uses).await;
-				let global = match global {
-					Ok(changed) => {
-						if !changed.is_empty() {
-							info!(event = "config.global", source = "file", applied = ?changed);
+				// the live global items (#342): built first (files, a new bouncer synced), swapped
+				// in only once the rules are known to be valid, before the rules (rules using
+				// crowdsec need it); the file wins over the API
+				let applied = match self.registry.global().prepare_file(&doc.global, &doc.global_raw).await {
+					Err(e) => Err(e),
+					Ok(prepared) => match self.registry.validate_static(doc.labeled_rules()) {
+						// dropping what was built stops a new bouncer: nothing changed
+						Err(e) => Err(e),
+						Ok(_) => {
+							let changed = self.registry.global().commit_file(&self.registry, prepared).await;
+							if !changed.is_empty() {
+								info!(event = "config.global", source = "file", applied = ?changed);
+							}
+							self.registry.reload_static(doc.labeled_rules()).await.map_err(|e| e.to_string())
 						}
-						Ok(())
-					}
-					Err(e) => Err(e),
-				};
-				let applied = match global {
-					Ok(()) => self.registry.reload_static(doc.labeled_rules()).await.map_err(|e| e.to_string()),
-					Err(e) => Err(e),
+					},
 				};
 				match applied {
 					Ok(counts) => {

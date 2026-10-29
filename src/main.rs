@@ -87,6 +87,10 @@ struct Options {
 	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
 	#[arg(long, env = "RPROXY_LOG_FILE")]
 	log_file: Option<PathBuf>,
+	/// The directory access logs set through PATCH /config/global must be in
+	/// (default: that of RPROXY_LOG_FILE; without either, the API cannot set one) (#342)
+	#[arg(long, env = "RPROXY_API_ACCESS_LOG_DIR")]
+	api_access_log_dir: Option<PathBuf>,
 	/// Number of rotated log files to keep
 	#[arg(long, env = "RPROXY_LOG_KEEP", default_value_t = 14)]
 	log_keep: usize,
@@ -1016,7 +1020,18 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			startup.insert("files", (Source::Env, serde_json::json!({"trusted_dirs": dirs.split(':').collect::<Vec<_>>()})));
 		}
 		let database = opts.database_url.is_some() && registry.persist().is_some();
-		registry.global().init(doc.as_ref().map(|(_, d)| (&d.global, &d.global_raw)), env, startup, opts.log_keep, database);
+		let access_log_dir = opts
+			.api_access_log_dir
+			.clone()
+			.or_else(|| opts.log_file.as_ref().and_then(|f| f.parent()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf));
+		let options = rproxy_api::config::global::Options {
+			keep_files: opts.log_keep,
+			access_log_dir,
+			main_log: opts.log_file.clone(),
+			database,
+			..Default::default()
+		};
+		registry.global().init(doc.as_ref().map(|(_, d)| (&d.global, &d.global_raw)), env, startup, options);
 	}
 	// before anything listens (not after a live upgrade, whose old process holds the
 	// lock until it lets go): a write an earlier process of this node left behind is
@@ -1085,17 +1100,16 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		// the global values set through the API (#342), before the rules (rules using crowdsec need it)
 		if let Some(store) = registry.persist() {
 			match store.load_global().await {
-				Ok(Some(row)) => match serde_json::from_value::<rproxy_api::config::global::Values>(row.spec) {
-					Ok(values) => {
-						let http = registry.http_global();
-						registry.global().restore(&http, values, Some(row.updated_by), Some(row.updated_at), Some(true), "database").await;
-					}
-					Err(e) => error!(event = "restore.skip", table = rproxy_api::config::persist::GLOBAL_TABLE, error = %e,
-						"the stored global values could not be read; they are not in force"),
-				},
+				Ok(Some(row)) => {
+					registry.global().restore(&registry, &row.spec, Some(row.updated_by), Some(row.updated_at), Some(true), None, "database").await
+				}
 				Ok(None) => {}
-				Err(e) => error!(event = "degraded", part = "db", table = rproxy_api::config::persist::GLOBAL_TABLE, error = %e,
-					"the global values stored by the API are not restored"),
+				// a PATCH would overwrite what is stored: refused until the periodic check reads it
+				Err(e) => {
+					registry.global().set_not_loaded();
+					error!(event = "degraded", part = "db", table = rproxy_api::config::persist::GLOBAL_TABLE, error = %e,
+						"the global values stored by the API are not restored yet (read again by the periodic check)");
+				}
 			}
 		}
 		info!(event = "restore.start", rules = ui.len(), api_rules = stored.len(),

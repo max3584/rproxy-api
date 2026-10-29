@@ -1059,7 +1059,20 @@ impl Store {
 		};
 		let mut budget = RETRIES_PER_ROUND;
 		'retry: {
-			// the global values (#342): only written again, the row never wins over them
+			// the global values (#342): read first if they could not be at the start (a
+			// change waits for them), then only written again: the row never wins over them
+			if !registry.global().loaded() {
+				match self.load_global().await {
+					Ok(row) => {
+						let (spec, by, at) = match row {
+							Some(r) => (r.spec, Some(r.updated_by), Some(r.updated_at)),
+							None => (serde_json::json!({}), None, None),
+						};
+						registry.global().restore(registry, &spec, by, at, Some(true), None, "reconcile").await;
+					}
+					Err(_) => break 'retry,
+				}
+			}
 			if let Some(by) = global {
 				budget -= 1;
 				if !self.save_global(registry, &by).await {
@@ -1274,9 +1287,11 @@ impl Store {
 	/// queued is the latest. Returns whether the row is up to date (false
 	/// without a database).
 	pub async fn save_global(&self, registry: &Registry, by: &str) -> bool {
+		debug_assert!(!self.enabled() || registry.global().persisted().is_some(), "a database stores the values, but the settings do not know");
 		let (seq, job) = {
 			let _order = self.order.lock().await;
-			let (spec, _) = registry.global().stored();
+			// not read yet: writing now would lose what is stored
+			let Some((spec, _)) = registry.global().stored() else { return false };
 			let record = GlobalRecord { spec, by: by.into(), now: unix_millis() };
 			let seq = self.intend(|u, seq| {
 				u.global = Some(by.into());
@@ -1621,8 +1636,10 @@ impl DbWorker {
 		let get_int = |c: &str| row.try_get::<i64, _>(c).map_err(|e| format!("{c}: {e}"));
 		let read = || -> Result<StoredGlobal, String> {
 			let spec_version = u32::try_from(get_int("spec_version")?).unwrap_or(u32::MAX);
-			if spec_version > SPEC_VERSION {
-				return Err(format!("spec_version {spec_version} is newer than this build reads ({SPEC_VERSION})"));
+			// read item by item (`config::global::Values::read_stored`): what this build
+			// does not know is kept as stored
+			if spec_version > crate::config::global::GLOBAL_SPEC_VERSION {
+				warn!(event = "restore.global", spec_version, "rproxy_global was written by a newer version; reading the items this one knows");
 			}
 			Ok(StoredGlobal {
 				spec: serde_json::from_str(&get_str("spec")?).map_err(|e| format!("spec: {e}"))?,
@@ -1652,7 +1669,7 @@ impl DbWorker {
 				)
 				.bind(&self.node)
 				.bind(g.spec.to_string())
-				.bind(SPEC_VERSION)
+				.bind(crate::config::global::GLOBAL_SPEC_VERSION)
 				.bind(g.by)
 				.bind(g.now);
 				self.write(query).await
@@ -1796,7 +1813,7 @@ impl MemoryWorker {
 			Job::ReadGlobal => Ok(Done::Global(m.global.lock().unwrap().clone())),
 			Job::SaveGlobal(g) => {
 				*m.global.lock().unwrap() =
-					Some(StoredGlobal { spec: g.spec, spec_version: SPEC_VERSION, updated_by: g.by, updated_at: g.now / 1000 });
+					Some(StoredGlobal { spec: g.spec, spec_version: crate::config::global::GLOBAL_SPEC_VERSION, updated_by: g.by, updated_at: g.now / 1000 });
 				Ok(Done::Ok)
 			}
 			Job::SaveRule(r) => {

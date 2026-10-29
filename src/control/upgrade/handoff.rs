@@ -768,12 +768,13 @@ impl State {
 	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
 		// the global values set through the API first: rules using crowdsec need it (#342)
 		if let Some(g) = &self.global {
-			match serde_json::from_value::<crate::config::global::Values>(g.values.clone()) {
-				Ok(values) => {
-					let http = registry.http_global();
-					registry.global().restore(&http, values, g.updated_by.clone(), g.updated_at, g.persisted, "handoff").await;
-				}
-				Err(e) => warn!(event = "handoff.global", error = %e, "the global values of the old process could not be read; dropped"),
+			let settings = registry.global();
+			settings
+				.restore(registry, &g.values, g.updated_by.clone(), g.updated_at, g.persisted, g.kept_crowdsec.clone(), "handoff")
+				.await;
+			// the old process had not read the stored values: the periodic check reads them
+			if g.not_loaded {
+				settings.set_not_loaded();
 			}
 		}
 		let (mut dynamic, mut api) = (vec![], vec![]);
