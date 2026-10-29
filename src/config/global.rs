@@ -1284,7 +1284,9 @@ impl Settings {
 					None => s.startup.get(i.name).cloned().unwrap_or((Source::Default, Value::Null)),
 				},
 			};
-			v.insert("value".into(), value);
+			// restart items are shown as written: what may be a secret is masked (#347)
+			let shown = |v: Value| if i.apply == Apply::Restart { redacted(i.name, v) } else { v };
+			v.insert("value".into(), shown(value));
 			v.insert("source".into(), json!(source));
 			v.insert("apply".into(), json!(i.apply));
 			v.insert("unix_only".into(), json!(i.unix_only));
@@ -1292,7 +1294,7 @@ impl Settings {
 			let settable = i.apply == Apply::Live && !s.file.has(i.name) && !s.env.has(i.name);
 			v.insert("settable".into(), json!(settable));
 			if let Some(api) = s.api.get(i.name).or_else(|| get_at(&s.kept, i).cloned()) {
-				v.insert("api_value".into(), api);
+				v.insert("api_value".into(), shown(api));
 				v.insert("shadowed".into(), json!(matches!(source, Source::File | Source::Env)));
 			}
 			if i.name == "crowdsec" && s.kept_crowdsec.is_some() && s.live.crowdsec == s.kept_crowdsec && !s.file.has("crowdsec") {
@@ -1324,6 +1326,82 @@ impl Settings {
 			"warnings": warnings,
 		})
 	}
+}
+
+/// What `GET /config/global` shows in place of a value that may be a secret (#347).
+pub const MASKED: &str = "***";
+
+/// A restart item's value as `GET /config/global` shows it (#347): written by hand,
+/// so it may hold secrets inline. `acme` (accounts, contacts, EAB, DNS calls) keeps
+/// only its shape: every string is masked. In the others, headers, request bodies,
+/// anything named like a secret (`secret`, `token`, `key`, `password`, `credential`,
+/// `eab`; the files' places too) and the user and query of URLs are masked.
+fn redacted(item: &str, v: Value) -> Value {
+	if item == "acme" {
+		return masked(v);
+	}
+	redact_named(v)
+}
+
+/// Parts of names whose values `redacted` masks.
+const SECRET_NAMES: [&str; 8] = ["headers", "body", "secret", "token", "key", "password", "credential", "eab"];
+
+fn redact_named(v: Value) -> Value {
+	match v {
+		Value::Object(m) => Value::Object(
+			m.into_iter()
+				.map(|(k, v)| {
+					let lower = k.to_ascii_lowercase();
+					let v = if SECRET_NAMES.iter().any(|n| lower.contains(n)) {
+						masked(v)
+					} else if lower == "url" || lower.ends_with("_url") {
+						match v {
+							Value::String(u) => Value::String(masked_url(&u)),
+							other => redact_named(other),
+						}
+					} else {
+						redact_named(v)
+					};
+					(k, v)
+				})
+				.collect(),
+		),
+		Value::Array(a) => Value::Array(a.into_iter().map(redact_named).collect()),
+		other => other,
+	}
+}
+
+/// Every string masked; the shape (keys, numbers, booleans, null) kept.
+fn masked(v: Value) -> Value {
+	match v {
+		Value::String(_) => Value::String(MASKED.into()),
+		Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, masked(v))).collect()),
+		Value::Array(a) => Value::Array(a.into_iter().map(masked).collect()),
+		other => other,
+	}
+}
+
+/// A URL without its user (and password) and query.
+fn masked_url(u: &str) -> String {
+	let (u, query) = match u.split_once('?') {
+		Some((base, _)) => (base, true),
+		None => (u, false),
+	};
+	let mut out = match u.split_once("://") {
+		Some((scheme, rest)) => {
+			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+			match authority.rsplit_once('@') {
+				Some((_, host)) => format!("{scheme}://{MASKED}@{host}{path}"),
+				None => u.to_string(),
+			}
+		}
+		None => u.to_string(),
+	};
+	if query {
+		out.push('?');
+		out.push_str(MASKED);
+	}
+	out
 }
 
 /// Takes what `commit` swaps in out of `built`, leaving the fallback flag.
@@ -1406,6 +1484,36 @@ mod tests {
 			reserved: vec![],
 			http: Arc::new(crate::l7::access::HttpGlobal::default()),
 		})
+	}
+
+	#[test]
+	fn restart_items_are_shown_without_their_secrets() {
+		let acme = json!({"accounts": {"le": {"contact": ["mailto:a@example.com"], "eab": {"kid": "k1", "hmac_key_file": "/s/h"}}},
+			"dns_providers": {"x": {"kind": "http", "zones": ["example.com"], "ttl": 60,
+				"add": {"url": "https://h/add?token=t", "headers": {"Authorization": "Bearer t"}}}}});
+		let shown = redacted("acme", acme);
+		assert_eq!(shown["accounts"]["le"]["contact"], json!([MASKED]));
+		assert_eq!(shown["accounts"]["le"]["eab"], json!({"kid": MASKED, "hmac_key_file": MASKED}));
+		assert_eq!(shown["dns_providers"]["x"]["add"]["headers"], json!({"Authorization": MASKED}));
+		assert_eq!((&shown["dns_providers"]["x"]["zones"], &shown["dns_providers"]["x"]["ttl"]), (&json!([MASKED]), &json!(60)));
+		assert!(!shown.to_string().contains("example.com") && !shown.to_string().contains("Bearer"));
+		let other = json!({"tls": {"cert_file": "/c.pem", "key_file": "/k.pem", "client_secret": "s"}, "api_token": "t",
+			"url": "https://u:p@h:1/x?token=t", "lapi_url": "http://h/", "workers": 2,
+			"call": {"headers": {"X-Api-Key": "k"}, "body": "{\"token\":\"t\"}"}});
+		assert_eq!(
+			redacted("performance", other),
+			json!({"tls": {"cert_file": "/c.pem", "key_file": MASKED, "client_secret": MASKED}, "api_token": MASKED,
+				"url": format!("https://{MASKED}@h:1/x?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
+				"call": {"headers": {"X-Api-Key": MASKED}, "body": MASKED}})
+		);
+		// in the view: the file's acme, and a kept one (stored by a later release)
+		let r = registry();
+		let s = r.global();
+		let (spec, raw) = file("acme: {accounts: {le: {contact: [\"mailto:a@example.com\"]}}}\n");
+		s.init(Some((&spec, &raw)), Values::default(), BTreeMap::new(), Options::default());
+		let view = s.view();
+		assert_eq!(view["items"]["acme"]["value"]["accounts"]["le"]["contact"], json!([MASKED]), "{view}");
+		assert!(!view.to_string().contains("a@example.com"), "{view}");
 	}
 
 	#[test]
