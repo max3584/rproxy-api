@@ -3687,7 +3687,7 @@
           },
           "loaded": {
             "type": "boolean",
-            "description": "Whether the stored values could be read; false: PATCH answers 503 not_loaded until the periodic check reads them"
+            "description": "Whether the stored values could be read (false also for a row that does not read); false: PATCH answers 503 not_loaded until the periodic check reads them"
           },
           "updated_by": {
             "type": [
@@ -3789,14 +3789,14 @@
               "string",
               "null"
             ],
-            "description": "Absolute path of a file right in RPROXY_API_ACCESS_LOG_DIR (else the directory of RPROXY_LOG_FILE); its name may not overlap rproxy's own log. Unix socket only by default"
+            "description": "Absolute path of a file right in RPROXY_API_ACCESS_LOG_DIR (unset: refused); a directory for rproxy's access logs only (pruning deletes files starting with the name); the name may not overlap rproxy's own log or files not of the form <name>.<YYYY-MM-DD>.<ext>. Unix socket only by default"
           },
           "crowdsec": {
             "type": [
               "object",
               "null"
             ],
-            "description": "As global.crowdsec (lapi_url, api_key_file (absolute), appsec_url, update_interval); swapped in once the new bouncer has pulled from its LAPI. Unix socket only by default"
+            "description": "As global.crowdsec (lapi_url, api_key_file (absolute), appsec_url, update_interval); swapped in once the new bouncer has pulled from its LAPI. Unix socket only by default (up to 10 s; other changes of global wait meanwhile)"
           },
           "http": {
             "type": [

@@ -395,6 +395,10 @@ fn keep_item(to: &mut Live, before: &Live, item: &str) {
 	}
 }
 
+/// How long a restored bouncer (database, live upgrade) is waited for before it is
+/// put in force anyway (it then decides as one started with the settings file).
+pub const HANDOFF_SYNC_WAIT: Duration = Duration::from_secs(2);
+
 /// How strict building a new value is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -455,8 +459,9 @@ impl BuildError {
 	}
 }
 
-/// Starts a bouncer and, unless `wait` is zero, waits for its first pull.
-async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration) -> Result<NewBouncer, BuildError> {
+/// Starts a bouncer and, unless `wait` is zero, waits for its first pull (`required`:
+/// one that has not pulled by then is given up; otherwise it is used anyway).
+async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration, required: bool) -> Result<NewBouncer, BuildError> {
 	let b = match Bouncer::new(c) {
 		Ok(b) => b,
 		Err(CrowdsecError::Config(e)) => return Err(BuildError::Invalid(e)),
@@ -470,6 +475,10 @@ async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration) -> Result<NewBouncer,
 	loop {
 		let Some(bouncer) = b.0.as_ref() else { return Ok(b) };
 		if bouncer.synced() {
+			return Ok(b);
+		}
+		if tokio::time::Instant::now() >= deadline && !required {
+			warn!(event = "crowdsec.error", "the new bouncer has not pulled from its LAPI yet; in force anyway (as at the start)");
 			return Ok(b);
 		}
 		if tokio::time::Instant::now() >= deadline {
@@ -506,10 +515,15 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 			built.access_log_fallback = Some(fallback);
 		}
 		"crowdsec" => {
-			let wait = if mode == Mode::Restore { Duration::ZERO } else { opts.sync_wait };
+			// restores (no bouncer to keep) wait a little and go on: a live upgrade's new
+			// process mostly gets the decisions before it takes connections
+			let (wait, required) = match mode {
+				Mode::Restore => (HANDOFF_SYNC_WAIT.min(opts.sync_wait), false),
+				_ => (opts.sync_wait, true),
+			};
 			built.crowdsec = Some(match &to.crowdsec {
 				None => NewBouncer(None),
-				Some(c) => start_bouncer(c, wait).await?,
+				Some(c) => start_bouncer(c, wait, required).await?,
 			});
 		}
 		"http.timeouts" => built.timeouts = Some(to.timeouts.as_ref().map(HttpTimeoutsSpec::resolve).unwrap_or_default()),
@@ -719,7 +733,7 @@ impl State {
 	/// (not a link) whose rotation does not touch rproxy's own log.
 	fn access_log_allowed(&self, p: &str) -> Result<(), String> {
 		let Some(dir) = &self.opts.access_log_dir else {
-			return Err("no directory for access logs set through the API: set RPROXY_API_ACCESS_LOG_DIR (or RPROXY_LOG_FILE)".into());
+			return Err("no directory for access logs set through the API: set RPROXY_API_ACCESS_LOG_DIR".into());
 		};
 		let path = Path::new(p);
 		let outside = || format!("{p} is not in {} (RPROXY_API_ACCESS_LOG_DIR)", dir.display());
@@ -743,6 +757,20 @@ impl State {
 				return Err(format!("{p} would rotate rproxy's own log {}; choose another name", main.display()));
 			}
 		}
+		// the files the rotation would delete must be its own (<stem>.<YYYY-MM-DD>.<ext>)
+		let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
+		if let Ok(entries) = std::fs::read_dir(parent) {
+			for e in entries.flatten() {
+				let other = e.file_name().to_string_lossy().into_owned();
+				if other.starts_with(stem) && other.ends_with(ext) && !rotated_name(&other, stem, ext) {
+					return Err(format!(
+						"{} is in {} and would be deleted by the rotation of {p}; choose another name",
+						other,
+						dir.display()
+					));
+				}
+			}
+		}
 		Ok(())
 	}
 
@@ -760,12 +788,24 @@ impl State {
 	}
 }
 
+/// Whether `name` is `<stem>.<YYYY-MM-DD>.<ext>` (a file the access log's rotation wrote).
+fn rotated_name(name: &str, stem: &str, ext: &str) -> bool {
+	let Some(date) =
+		name.strip_prefix(stem).and_then(|r| r.strip_prefix('.')).and_then(|r| r.strip_suffix(ext)).and_then(|r| r.strip_suffix('.'))
+	else {
+		return false;
+	};
+	let b = date.as_bytes();
+	b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+}
+
 /// The `global` items: the file's, the environment's and the API's, and what is in force.
 #[derive(Default)]
 pub struct Settings {
 	state: std::sync::Mutex<State>,
-	/// One change at a time (`PATCH`, a reload of the file, a restore).
-	turn: tokio::sync::Mutex<()>,
+	/// One change at a time (`PATCH`, a reload of the file from `prepare_file` to
+	/// `commit_file`, a restore).
+	turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Unix seconds.
@@ -776,25 +816,49 @@ fn unix_now() -> u64 {
 /// A version of the settings file's live items, built and waiting for the rules
 /// to validate (`ConfigReloader::reload`).
 pub struct FilePrepared {
+	/// No other change runs until the commit (or until this is dropped).
+	_turn: tokio::sync::OwnedMutexGuard<()>,
 	file: Values,
 	raw: Value,
 	to: Live,
 	built: Built,
 	changed: Vec<&'static str>,
+	/// File items left as they were (a new LAPI that did not answer), and why.
+	not_in_force: Vec<(&'static str, String)>,
 }
 
-/// Swaps what was built in, under the rules lock; returns the bouncer replaced.
-fn commit(registry: &Registry, built: Built) -> Option<Arc<Bouncer>> {
+/// What a commit replaced, let go of after the rules lock.
+struct Swapped {
+	bouncer: Option<Arc<Bouncer>>,
+	snapshot: Arc<crate::l7::access::Snapshot>,
+}
+
+impl Swapped {
+	/// Stops the bouncer replaced; the snapshot before goes off the data plane (its
+	/// access log file is flushed and closed there).
+	fn finish(self) {
+		if let Some(b) = self.bouncer {
+			b.stop();
+		}
+		let old = self.snapshot;
+		if tokio::runtime::Handle::try_current().is_ok() {
+			drop(tokio::task::spawn_blocking(move || drop(old)));
+		}
+	}
+}
+
+/// Swaps what was built in, under the rules lock.
+fn commit(registry: &Registry, built: Built) -> Swapped {
 	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, .. } = built;
 	let crowdsec = crowdsec.map(|mut b| b.take());
 	if let Some(Some(b)) = &crowdsec {
 		info!(event = "crowdsec.swap", synced = b.synced(), "a new CrowdSec bouncer is in force");
 	}
-	let replaced = registry.http_global().update(Update { trusted_proxies, access_log, crowdsec, timeouts });
+	let (bouncer, snapshot) = registry.http_global().update(Update { trusted_proxies, access_log, crowdsec, timeouts });
 	if let Some(n) = udp_max_sessions {
 		crate::l4::udp::set_max_sessions(n);
 	}
-	replaced
+	Swapped { bouncer, snapshot }
 }
 
 impl Settings {
@@ -837,7 +901,7 @@ impl Settings {
 	#[allow(clippy::too_many_arguments)]
 	pub async fn restore(
 		&self,
-		registry: &Registry,
+		registry: &Arc<Registry>,
 		spec: &Value,
 		updated_by: Option<String>,
 		updated_at: Option<u64>,
@@ -880,25 +944,29 @@ impl Settings {
 			}
 		}
 		let fallback = built.access_log_fallback;
-		let replaced = registry.under_rules_lock(|_| commit(registry, built)).await;
-		if let Some(old) = replaced {
-			old.stop();
+		let brings_crowdsec = to.crowdsec.is_some() && to.crowdsec != before.crowdsec;
+		registry.under_rules_lock(|_| commit(registry, built)).await.finish();
+		{
+			let mut s = self.state();
+			s.kept = kept;
+			s.failed = failed;
+			if let Some(f) = fallback {
+				s.access_log_fallback = f;
+			}
+			s.settle(to, file, api);
+			s.updated_by = updated_by;
+			s.updated_at = updated_at;
+			s.not_loaded = false;
+			if s.persisted.is_some() {
+				s.persisted = Some(persisted.unwrap_or(true));
+			}
+			if s.api != Values::default() {
+				info!(event = "restore.global", from, items = ?live_items().filter(|i| s.api.has(i.name)).map(|i| i.name).collect::<Vec<_>>());
+			}
 		}
-		let mut s = self.state();
-		s.kept = kept;
-		s.failed = failed;
-		if let Some(f) = fallback {
-			s.access_log_fallback = f;
-		}
-		s.settle(to, file, api);
-		s.updated_by = updated_by;
-		s.updated_at = updated_at;
-		s.not_loaded = false;
-		if s.persisted.is_some() {
-			s.persisted = Some(persisted.unwrap_or(true));
-		}
-		if s.api != Values::default() {
-			info!(event = "restore.global", from, items = ?live_items().filter(|i| s.api.has(i.name)).map(|i| i.name).collect::<Vec<_>>());
+		// rules that could not start without it (read late by the periodic check)
+		if brings_crowdsec {
+			registry.retry_waiting_for_crowdsec().await;
 		}
 	}
 
@@ -908,6 +976,14 @@ impl Settings {
 	/// cannot be read) refuses the reload with nothing changed; a new LAPI that does not
 	/// answer leaves the CrowdSec in force (`config.global_kept`).
 	pub async fn prepare_file(&self, spec: &GlobalSpec, raw: &Value) -> Result<FilePrepared, String> {
+		// held to the commit: a PATCH in between would be undone by it
+		let turn = match self.turn.clone().try_lock_owned() {
+			Ok(t) => t,
+			Err(_) => {
+				info!(event = "config.reload", "waiting for a change of global under way (a PATCH may wait up to 10 s for a new LAPI)");
+				self.turn.clone().lock_owned().await
+			}
+		};
 		let (before, mut to, opts, file) = {
 			let s = self.state();
 			let file = Values::of_file(spec, raw);
@@ -916,26 +992,27 @@ impl Settings {
 		};
 		let mut built = Built::default();
 		let mut changed = vec![];
+		let mut not_in_force = vec![];
 		for item in differing(&before, &to) {
 			match build_item(item, &to, &mut built, &opts, Mode::File).await {
 				Ok(()) => changed.push(item),
 				Err(BuildError::NotSynced(e)) => {
 					warn!(event = "config.global_kept", item, error = %e, "the CrowdSec in force stays until its LAPI answers (reload again)");
 					keep_item(&mut to, &before, item);
+					not_in_force.push((item, e));
 				}
 				Err(BuildError::Invalid(e)) => return Err(e),
 			}
 		}
-		Ok(FilePrepared { file, raw: raw.clone(), to, built, changed })
+		Ok(FilePrepared { _turn: turn, file, raw: raw.clone(), to, built, changed, not_in_force })
 	}
 
 	/// Swaps a prepared version of the file in (after the rules were checked), under
 	/// the rules lock. A `crowdsec` the rules use (or its `appsec_url`) is not taken
 	/// away: it stays in force (`kept`, `config.global_in_use`) until no rule uses it.
 	/// Answers the items whose value in force changed.
-	pub async fn commit_file(&self, registry: &Registry, prepared: FilePrepared) -> Vec<&'static str> {
-		let _turn = self.turn.lock().await;
-		let FilePrepared { file, raw, mut to, mut built, mut changed } = prepared;
+	pub async fn commit_file(&self, registry: &Arc<Registry>, prepared: FilePrepared) -> Vec<&'static str> {
+		let FilePrepared { _turn, file, raw, mut to, mut built, mut changed, not_in_force } = prepared;
 		let before = self.state().live.clone();
 		let replaced = registry
 			.under_rules_lock(|uses| {
@@ -966,19 +1043,27 @@ impl Settings {
 				commit(registry, built_with_fallback(&mut built))
 			})
 			.await;
-		if let Some(old) = replaced {
-			old.stop();
+		replaced.finish();
+		let brings_crowdsec = {
+			let mut s = self.state();
+			s.file_raw = raw;
+			if let Some(f) = built.access_log_fallback {
+				s.access_log_fallback = f;
+			}
+			for item in &changed {
+				s.failed.remove(item);
+			}
+			for (item, e) in not_in_force {
+				s.failed.insert(item, e);
+			}
+			let api = s.api.clone();
+			let brings = changed.contains(&"crowdsec") && to.crowdsec.is_some();
+			s.settle(to, file, api);
+			brings
+		};
+		if brings_crowdsec {
+			registry.retry_waiting_for_crowdsec().await;
 		}
-		let mut s = self.state();
-		s.file_raw = raw;
-		if let Some(f) = built.access_log_fallback {
-			s.access_log_fallback = f;
-		}
-		for item in &changed {
-			s.failed.remove(item);
-		}
-		let api = s.api.clone();
-		s.settle(to, file, api);
 		changed
 	}
 
@@ -993,7 +1078,8 @@ impl Settings {
 			return;
 		};
 		if let Ok(log) = AccessLog::open(Some(Path::new(&path)), s.opts.keep_files) {
-			registry.http_global().update(Update { access_log: Some(log), ..Default::default() });
+			let (_, old) = registry.http_global().update(Update { access_log: Some(log), ..Default::default() });
+			Swapped { bouncer: None, snapshot: old }.finish();
 			s.access_log_fallback = false;
 			info!(event = "config.global", item = "access_log", "the access log can be written again");
 		}
@@ -1010,7 +1096,7 @@ impl Settings {
 	/// set to null clears the API's value. With `dry_run`, nothing changes.
 	pub async fn patch(
 		&self,
-		registry: &Registry,
+		registry: &Arc<Registry>,
 		body: &serde_json::Map<String, Value>,
 		by: &str,
 		dry_run: bool,
@@ -1049,7 +1135,12 @@ impl Settings {
 			for (i, _) in &named {
 				let _ = in_force.set(i, api.get(i));
 			}
-			let (to, _) = s.effective_with(&s.file, &in_force);
+			let (mut to, _) = s.effective_with(&s.file, &in_force);
+			// the items not named stay as they are in force (one the reload could not put
+			// in force is not tried again here)
+			for d in live_items().filter(|d| !named.iter().any(|(i, _)| i == d.name)) {
+				keep_item(&mut to, &s.live, d.name);
+			}
 			(s.live.clone(), s.opts.clone(), s.api.clone(), s.file.clone(), api, to)
 		};
 		let changes: Vec<Change> = named
@@ -1096,30 +1187,34 @@ impl Settings {
 				Ok(commit(registry, built_with_fallback(&mut built)))
 			})
 			.await?;
-		if let Some(old) = replaced {
-			old.stop();
-		}
-		let mut s = self.state();
-		for (i, _) in &named {
-			if let Some(d) = item(i) {
-				s.failed.remove(d.name);
-				take_at(&mut s.kept, d);
+		replaced.finish();
+		let brings_crowdsec = {
+			let mut s = self.state();
+			for (i, _) in &named {
+				if let Some(d) = item(i) {
+					s.failed.remove(d.name);
+					take_at(&mut s.kept, d);
+				}
 			}
+			if to.crowdsec != s.kept_crowdsec {
+				s.kept_crowdsec = None;
+			}
+			if let Some(f) = built.access_log_fallback {
+				s.access_log_fallback = f;
+			}
+			s.settle(to, file, api);
+			s.updated_by = Some(by.to_string());
+			s.updated_at = Some(unix_now());
+			if s.persisted.is_some() {
+				// written next (`persist::Store::save_global`)
+				s.persisted = Some(false);
+			}
+			info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
+			applied.contains(&"crowdsec") && s.live.crowdsec.is_some()
+		};
+		if brings_crowdsec {
+			registry.retry_waiting_for_crowdsec().await;
 		}
-		if to.crowdsec != s.kept_crowdsec {
-			s.kept_crowdsec = None;
-		}
-		if let Some(f) = built.access_log_fallback {
-			s.access_log_fallback = f;
-		}
-		s.settle(to, file, api);
-		s.updated_by = Some(by.to_string());
-		s.updated_at = Some(unix_now());
-		if s.persisted.is_some() {
-			// written next (`persist::Store::save_global`)
-			s.persisted = Some(false);
-		}
-		info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
 		Ok(Patched { changes, applied })
 	}
 
@@ -1434,6 +1529,12 @@ mod tests {
 		] {
 			assert!(matches!(refused(p.clone()).await, Err(PatchError::Protected(_))), "{}", p.display());
 		}
+		// what the rotation would delete must be its own files
+		std::fs::write(dir.join("web-old.log"), "").unwrap();
+		std::fs::write(dir.join("api.2026-10-01.log"), "").unwrap();
+		assert!(matches!(refused(dir.join("web.log")).await, Err(PatchError::Protected(ref m)) if m.contains("web-old.log")));
+		assert!(refused(dir.join("api.log")).await.is_ok(), "its own rotated files are fine");
+		assert!(rotated_name("a.2026-10-01.log", "a", "log") && !rotated_name("a.x.log", "a", "log") && !rotated_name("a.log", "a", "log"));
 		std::os::unix::fs::symlink("/etc/passwd", dir.join("link.log")).unwrap();
 		assert!(matches!(refused(dir.join("link.log")).await, Err(PatchError::Protected(_))));
 		assert!(refused(dir.join("access.log")).await.is_ok());

@@ -28,6 +28,7 @@ use rproxy_api::config::reload::{ConfigReloader, Outcome};
 use rproxy_api::control::api::{AppState, router};
 use rproxy_api::control::auth::Tokens;
 use rproxy_api::control::upgrade::handoff;
+use rproxy_api::core::rule::Origin;
 use rproxy_api::l7::middleware::crowdsec::Verdict;
 
 use common::*;
@@ -644,5 +645,73 @@ async fn global_in_a_later_file_of_a_directory_is_the_file_s() {
 	assert_eq!(view(&unix).await["items"]["trusted_proxies"]["source"], "file");
 	let (status, e) = patch(&unix, "/config/global", json!({"trusted_proxies": []})).await;
 	assert_eq!((status, &e["code"]), (StatusCode::CONFLICT, &json!("static")), "{e}");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// A PATCH while a reload waits for a new LAPI: it takes its turn after the reload,
+/// so the reload does not undo it (what is in force and what GET shows agree).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_patch_during_a_reload_is_not_undone() {
+	let dir = workdir("reload-race");
+	let h = harness_with(tokens(&dir)).await;
+	let key = dir.join("crowdsec.key");
+	fs::write(&key, "lapi-key\n").unwrap();
+	let file = dir.join("rproxy.yaml");
+	fs::write(&file, "version: 1\n").unwrap();
+	let reloader = Arc::new(reloader(&h, &file));
+	let unix = api(&h, &dir, true).await;
+	// a LAPI that does not answer: the reload waits for it (2 s here) holding its turn
+	let dead = format!("http://127.0.0.1:{}", dead_port());
+	fs::write(&file, format!("version: 1\nglobal: {{crowdsec: {}}}\n", crowdsec(&dead, &key, None))).unwrap();
+	let reload = {
+		let r = reloader.clone();
+		tokio::spawn(async move { r.reload(true).await })
+	};
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let (status, _) = patch(&unix, "/config/global", json!({"http": {"timeouts": {"idle": "7s"}}})).await;
+	assert_eq!(status, StatusCode::OK);
+	assert!(matches!(reload.await.unwrap(), Outcome::Applied(_)));
+	assert_eq!(h.registry.http_global().timeouts().idle, Some(Duration::from_secs(7)));
+	let v = view(&unix).await;
+	assert_eq!(
+		(&v["items"]["http.timeouts"]["value"]["idle"], &v["items"]["http.timeouts"]["source"]),
+		(&json!("7s"), &json!("api")),
+		"{v}"
+	);
+	assert!(h.registry.http_global().crowdsec().is_none(), "the LAPI never answered");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// The stored values read late (the database was down at the start): rules that
+/// could not start without their `crowdsec` start once it is in force.
+#[tokio::test]
+async fn rules_waiting_for_crowdsec_start_once_it_is_read() {
+	let dir = workdir("late");
+	let h = harness_with(tokens(&dir)).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	init_with_file(&h, &dir, "version: 1\n", true);
+	let key = dir.join("crowdsec.key");
+	fs::write(&key, "lapi-key\n").unwrap();
+	let lapi = format!("http://{}", fake_lapi().await);
+	store.memory_put_global(StoredGlobal {
+		spec: json!({"crowdsec": crowdsec(&lapi, &key, None)}),
+		spec_version: 1,
+		updated_by: "ui".into(),
+		updated_at: 1,
+	});
+	// as main does when load_global fails, then the rules
+	h.registry.global().set_not_loaded();
+	let backend = echo_backend().await;
+	let port = free_port();
+	h.registry.restore_as(vec![serde_json::from_value(crowdsec_rule(port, backend, false)).unwrap()], Origin::Dynamic).await;
+	let unix = api(&h, &dir, true).await;
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let (_, v) = call(&unix, "admin", Method::GET, &path, None).await;
+	assert_eq!(v["state"], "failed", "{v}");
+	store.reconcile(&h.registry).await.unwrap();
+	assert!(banned(&h));
+	let (_, v) = call(&unix, "admin", Method::GET, &path, None).await;
+	assert_eq!(v["state"], "running", "{v}");
 	fs::remove_dir_all(dir).unwrap();
 }

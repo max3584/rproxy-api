@@ -967,22 +967,22 @@ GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
     - `409 in_use`：ルールが使っている `crowdsec` を消す、`appsec` を使うルールがあるのに `appsec_url` を外す。
     - `403 protected_file`：パスが証明書のストア・ACME の保存先・rproxy の秘密（トークンファイルなど）・`/proc` などを指す。アクセスログが下の場所の外。
     - `403 forbidden`：Unix ソケットだけの項目を TCP から（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も。dry run も同じ）。`event=audit` に `outcome: forbidden`・`code: unix_only`。
-    - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。
-    - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る。
+    - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。そのため `crowdsec` の PATCH は最大 10 秒かかり、その間ほかの `global` の変更（PATCH・設定ファイルの読み直し）は順番を待つ。
+    - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない、行が読めない形）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る（読めない形の行は直すまで）。
     - `503 upgrading` / `shutting_down`：引き継ぎ・終了の途中。
-  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR`（なければ `RPROXY_LOG_FILE` のディレクトリ。どちらもなければ API では入れられない）のすぐ下のファイルだけ（下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるものは断る。そのディレクトリには rproxy のログのほかのファイルを置かない。
+  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
   - `event=audit`（`action: config.global`。dry run も `dry_run: true` で）と `config.global`（項目・効いた項目）に残る。
 - 入れ替え：live の項目はまとめて 1 つの写しとして入れ替わり、1 つのリクエストは始まったときの写しを最後まで使う（いくつかの項目を変える PATCH の途中の組み合わせは見えない）。CrowdSec を使うルールの作成・変更と `crowdsec` の変更はルールの表の鍵の下で順に行うので、`crowdsec` を使うルールが `crowdsec` なしで動くことはない。
 - 保存：DB（`RPROXY_DATABASE_URL`）があれば、応答の前にテーブル `rproxy_global` に自分の `node` の 1 行（API の値を JSON で）を書く（`persisted`）。書けなければ（DB に届かない、テーブルがない）値は効かせたまま `persisted: false`、`degraded`（`part: "db"`）、定期の照合（`RPROXY_PERSIST_CHECK_SECS`）が書き直す。行は項目ごとに読み、この版が知らない項目（後の版の `acme` など）や読めない値は効かせずにそのまま残して書き戻す（`spec_version` は `rproxy_global` だけの番号）。
-  - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec` は最初の取得を待たない（設定ファイルの `crowdsec` を起動のときに入れるのと同じ）。
-  - 読めなければ（DB に届かない）`loaded: false` で、`PATCH` は `503 not_loaded`、行も書かない。定期の照合が読めたら効かせる。
+  - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec` は最初の取得を 2 秒まで待ち、取れなくても入れる（設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまでの判定はルールの `on_error`。L4 の `crowdsec` は通す）。
+  - 読めなければ（DB に届かない、行が読めない形）`loaded: false` で、`PATCH` は `503 not_loaded`、行も書かない。定期の照合が読めたら効かせる。そのあいだ `crowdsec` がなくて起動できなかったルールは、`crowdsec` が効いたときに動かし直す（PATCH・読み直しで入ったときも同じ）。
   - DB がなければ値はこのプロセスの中だけ（`storage: "memory"`、再起動で消える）。行が正になることはない（書くのは rproxy だけ。照合は書き直すだけ）。
 - 引き継ぎ（`/admin/upgrade`）では、API の値（知らない項目も）・書いた人・時刻・`persisted`・読めていないこと・残している `crowdsec` を新しいプロセスに渡し、ルールより先に効かせる。v0.4.19 より前の版への引き継ぎ（戻すとき）では API の値は渡らない（その版は知らない。DB の行は残るので、v0.4.19 以後に戻せばまた読む）。
 - 設定ファイルを読み直したとき：
   - API の値がある項目がファイルに現れたらファイルが勝つ：API の値は残すが効かず、`GET /config/global` に `shadowed: true` と `warnings`（`{"code":"config.global_shadowed","item","message"}`）、ログに `config.global_shadowed`（1 回）。ファイルからまた消えたら API の値が効く。
   - live の項目は、ルールを確かめてから入れ替える（ルールの誤りで読み直しを断るときは何も変えない）。live の項目の誤りも読み直しを断る。
   - 書けないアクセスログは主のログに出し（`degraded`）、設定ファイルを確かめるたびに試し直す。
-  - 新しい `crowdsec` の LAPI が答えなければ今のものを残す（`config.global_kept`）。ルールが使う `crowdsec`（`appsec` を使うルールがあれば `appsec_url` も）をファイルから消したときは、使うルールがなくなるまで残す（`config.global_in_use`、`GET` の `kept`、ほかの項目の PATCH でも残り、引き継ぎでも渡す）。使うルールがなくなった後の読み直しで外す。
+  - 新しい `crowdsec` の LAPI が答えなければ今のものを残す（`config.global_kept`、`GET` の `error`。次の読み直しでまた試す）。読み直しが LAPI を待つあいだ、ほかの `global` の変更は順番を待つ（`config.reload` の行）。ルールが使う `crowdsec`（`appsec` を使うルールがあれば `appsec_url` も）をファイルから消したときは、使うルールがなくなるまで残す（`config.global_in_use`、`GET` の `kept`、ほかの項目の PATCH でも残り、引き継ぎでも渡す）。使うルールがなくなった後の読み直しで外す。
 - テーブル（UI リポジトリの `db/migrations/013_rproxy_global.sql`）：
 
 ```sql

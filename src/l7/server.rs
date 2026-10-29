@@ -447,9 +447,9 @@ impl Conn {
 	/// `mirror` copies (#238): X-Forwarded-*, X-Real-IP and the client certificate's.
 	/// X-Forwarded-* from the client are believed only from trusted proxies
 	/// (global.trusted_proxies): then the chain is extended and their Proto / Host / Port are kept.
-	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str) {
+	/// `trusted`: whether the peer is a trusted proxy, by the request's snapshot of `global` (#342).
+	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str, trusted: bool) {
 		let peer = canonical(self.client.ip());
-		let trusted = self.rt.global.trusts(peer);
 		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
 			let name = HeaderName::from_static(name);
 			if trusted && headers.contains_key(&name) {
@@ -832,6 +832,8 @@ impl Conn {
 		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
 		// the global settings in force (#342), the same for the whole request
 		let snapshot = self.rt.global.snapshot();
+		// for the request to the backend (`forward`), the same snapshot
+		req.extensions_mut().insert(snapshot.clone());
 		if req.headers().contains_key(header::FORWARDED) && !snapshot.trusts(canonical(self.client.ip())) {
 			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
 			req.headers_mut().remove(header::FORWARDED);
@@ -1031,7 +1033,7 @@ impl Conn {
 					answer => Some(oidc_response(answer)),
 				},
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
-					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
+					self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
 				// the client as global.trusted_proxies decided; refused like ip_allow
 				Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
@@ -1071,6 +1073,7 @@ impl Conn {
 							client_ip,
 							host: host.clone(),
 							forwarded: false,
+							trusted: snapshot.trusts(canonical(self.client.ip())),
 						});
 					}
 					None
@@ -1463,6 +1466,7 @@ impl Conn {
 	#[allow(clippy::too_many_arguments)]
 	async fn crowdsec(
 		&self,
+		global: &crate::l7::access::Snapshot,
 		name: &str,
 		appsec: bool,
 		block_on_error: bool,
@@ -1471,7 +1475,7 @@ impl Conn {
 		client: IpAddr,
 		host: &str,
 	) -> Option<Response<Body>> {
-		let Some(bouncer) = self.rt.global.crowdsec() else {
+		let Some(bouncer) = global.crowdsec() else {
 			// validation requires global.crowdsec; a rule restored without it fails closed or open as asked
 			return block_on_error.then(|| middleware::blocked(name));
 		};
@@ -1529,7 +1533,11 @@ impl Conn {
 			parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
 			parts.headers.insert(header::UPGRADE, u.clone());
 		}
-		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host);
+		let trusted = match parts.extensions.get::<Arc<crate::l7::access::Snapshot>>() {
+			Some(snapshot) => snapshot.trusts(canonical(self.client.ip())),
+			None => self.rt.global.trusts(canonical(self.client.ip())),
+		};
+		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host, trusted);
 		let path_and_query = parts.uri.path_and_query().cloned().unwrap_or_else(|| PathAndQuery::from_static("/"));
 		// kept for further attempts only
 		let again = (attempts > 1).then(|| (parts.method.clone(), parts.headers.clone()));
@@ -1611,6 +1619,7 @@ impl Conn {
 							client_ip,
 							host: host.to_string(),
 							forwarded: true,
+							trusted: false,
 						});
 					}
 					continue;
@@ -1762,7 +1771,7 @@ impl Conn {
 		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238);
 		// a server's copy has them already
 		if !copy.forwarded {
-			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host, copy.trusted);
 		}
 		headers.insert(header::HOST, host);
 		let mut req = Request::new(body);

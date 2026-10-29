@@ -87,8 +87,9 @@ struct Options {
 	/// Log file, rotated daily as <stem>.<date>.<ext> (default: stdout)
 	#[arg(long, env = "RPROXY_LOG_FILE")]
 	log_file: Option<PathBuf>,
-	/// The directory access logs set through PATCH /config/global must be in
-	/// (default: that of RPROXY_LOG_FILE; without either, the API cannot set one) (#342)
+	/// The directory access logs set through PATCH /config/global must be in, used
+	/// for nothing else (the rotation deletes old files there); unset, the API cannot
+	/// set one (#342)
 	#[arg(long, env = "RPROXY_API_ACCESS_LOG_DIR")]
 	api_access_log_dir: Option<PathBuf>,
 	/// Number of rotated log files to keep
@@ -1020,10 +1021,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			startup.insert("files", (Source::Env, serde_json::json!({"trusted_dirs": dirs.split(':').collect::<Vec<_>>()})));
 		}
 		let database = opts.database_url.is_some() && registry.persist().is_some();
-		let access_log_dir = opts
-			.api_access_log_dir
-			.clone()
-			.or_else(|| opts.log_file.as_ref().and_then(|f| f.parent()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf));
+		let access_log_dir = opts.api_access_log_dir.clone();
 		let options = rproxy_api::config::global::Options {
 			keep_files: opts.log_keep,
 			access_log_dir,

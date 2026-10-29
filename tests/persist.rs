@@ -757,6 +757,18 @@ async fn global_values_survive_a_restart_with_mariadb() {
 			"{v}"
 		);
 	}
+	// a row that does not read is not "no row": changes wait (503) instead of overwriting it
+	pool.execute("UPDATE rproxy_global SET spec = '[1]' WHERE node = 'node-a'").await.unwrap();
+	{
+		let rp = Rproxy::start(&dir, api_port, &url, "third");
+		rp.wait(api_port).await;
+		let v: Value = client.get(format!("{base}/config/global")).bearer_auth("ci").send().await.unwrap().json().await.unwrap();
+		assert_eq!(v["loaded"], false, "{v}");
+		let r = patch(json!({"udp_max_sessions": 6})).await.unwrap();
+		assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+	let row: (String,) = sqlx::query_as("SELECT CAST(spec AS CHAR) FROM rproxy_global WHERE node = 'node-a'").fetch_one(&pool).await.unwrap();
+	assert_eq!(row.0, "[1]", "not overwritten");
 	for drop in ["DROP TABLE IF EXISTS forward_rules", "DROP TABLE IF EXISTS rproxy_rules", "DROP TABLE IF EXISTS rproxy_global"] {
 		pool.execute(drop).await.unwrap();
 	}

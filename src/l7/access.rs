@@ -203,8 +203,9 @@ impl HttpGlobal {
 	}
 
 	/// Swaps the items of `update` in, all at once (#342); returns the bouncer replaced
-	/// (the caller stops it).
-	pub fn update(&self, update: Update) -> Option<Arc<Bouncer>> {
+	/// (the caller stops it) and the snapshot before (the caller lets go of it off the
+	/// data plane: dropping an access log file flushes it).
+	pub fn update(&self, update: Update) -> (Option<Arc<Bouncer>>, Arc<Snapshot>) {
 		let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
 		let mut replaced = None;
 		let next = Snapshot {
@@ -219,8 +220,8 @@ impl HttpGlobal {
 			},
 			timeouts: update.timeouts.unwrap_or(current.timeouts),
 		};
-		*current = Arc::new(next);
-		replaced
+		let old = std::mem::replace(&mut *current, Arc::new(next));
+		(replaced, old)
 	}
 
 	/// Attaches the CrowdSec bouncer of `global.crowdsec`.

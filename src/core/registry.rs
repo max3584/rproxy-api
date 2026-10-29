@@ -513,6 +513,44 @@ impl Registry {
 		f(crowdsec_use(&rules))
 	}
 
+	/// Starts again the rules that failed for want of `global.crowdsec` (or its
+	/// `appsec_url`), after a change of `global` brought it (#342: the stored values
+	/// read late by the periodic check, a `PATCH`, a reload). Returns how many started.
+	pub async fn retry_waiting_for_crowdsec(self: &Arc<Self>) -> usize {
+		let waiting: Vec<(RuleSpec, u64)> = self
+			.rules
+			.lock()
+			.await
+			.values()
+			.filter_map(|e| match e {
+				Entry::Failed(f) if f.error.contains(NEEDS_CROWDSEC) => Some((f.spec.clone(), f.generation)),
+				_ => None,
+			})
+			.collect();
+		let mut started = 0;
+		for (spec, generation) in waiting {
+			let key = spec.key;
+			let prepared = self.prepare(&spec).await;
+			let mut rules = self.rules.lock().await;
+			let Some(Entry::Failed(f)) = rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation)) else {
+				continue;
+			};
+			let result = prepared.and_then(|p| self.start(spec, p));
+			match result {
+				Ok(running) => {
+					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
+					rules.insert(key, Entry::Running(running));
+					started += 1;
+				}
+				Err(e) => {
+					f.error = e.message;
+					f.code = e.code;
+				}
+			}
+		}
+		started
+	}
+
 	/// A rule that uses `crowdsec` (or its `appsec`) needs `global.crowdsec` (with
 	/// `appsec_url`) in force: checked again with the rules lock held, right before
 	/// it goes into the table, so a `global` change cannot take it away in between (#342).
@@ -528,8 +566,8 @@ impl Registry {
 			return Ok(());
 		}
 		match self.cfg.http.crowdsec() {
-			None => Err(ApiError::invalid("crowdsec needs global.crowdsec (the settings file or PATCH /config/global)")),
-			Some(b) if appsec && !b.has_appsec() => Err(ApiError::invalid("crowdsec appsec needs global.crowdsec.appsec_url")),
+			None => Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"))),
+			Some(b) if appsec && !b.has_appsec() => Err(ApiError::invalid(format!("crowdsec appsec {NEEDS_CROWDSEC}.appsec_url"))),
 			Some(_) => Ok(()),
 		}
 	}
@@ -937,7 +975,7 @@ impl Registry {
 	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
-			return Err(ApiError::invalid("crowdsec needs global.crowdsec (the settings file or PATCH /config/global)"));
+			return Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
 		}
 		// geoip lists need the databases of global.geoip (#168)
 		let geoip = self.cfg.http.geoip().map(|g| g.spec());
@@ -2469,6 +2507,10 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 		}
 	}
 }
+
+/// In the error of a rule that cannot run without `global.crowdsec` (or its
+/// `appsec_url`): such rules are started again once it is in force (#342).
+pub const NEEDS_CROWDSEC: &str = "needs global.crowdsec";
 
 /// What the rules in the table use of `global.crowdsec` (#342).
 fn crowdsec_use(rules: &HashMap<Key, Entry>) -> crate::config::global::CrowdsecUse {

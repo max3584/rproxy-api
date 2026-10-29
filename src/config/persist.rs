@@ -1641,20 +1641,19 @@ impl DbWorker {
 			if spec_version > crate::config::global::GLOBAL_SPEC_VERSION {
 				warn!(event = "restore.global", spec_version, "rproxy_global was written by a newer version; reading the items this one knows");
 			}
+			let spec: serde_json::Value = serde_json::from_str(&get_str("spec")?).map_err(|e| format!("spec: {e}"))?;
+			if !spec.is_object() {
+				return Err("spec: not an object".into());
+			}
 			Ok(StoredGlobal {
-				spec: serde_json::from_str(&get_str("spec")?).map_err(|e| format!("spec: {e}"))?,
+				spec,
 				spec_version,
 				updated_by: get_str("updated_by")?,
 				updated_at: get_int("updated_at")?.max(0) as u64,
 			})
 		};
-		match read() {
-			Ok(g) => Ok(Done::Global(Some(g))),
-			Err(e) => {
-				warn!(event = "restore.skip", table = GLOBAL_TABLE, error = %e);
-				Ok(Done::Global(None))
-			}
-		}
+		// a row that does not read is not "no row": a change would overwrite it
+		read().map(|g| Done::Global(Some(g))).map_err(|e| JobError::Failed(format!("{GLOBAL_TABLE}: {e}")))
 	}
 
 	async fn job(&mut self, job: Job) -> JobResult {
