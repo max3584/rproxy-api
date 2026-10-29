@@ -31,6 +31,8 @@ pub struct Copy {
 	pub host: String,
 	/// Taken after the request got its X-Forwarded-* headers (a server's `mirror`, v0.4.3).
 	pub forwarded: bool,
+	/// Whether the peer was a trusted proxy for the request (its snapshot of `global`, #342).
+	pub trusted: bool,
 }
 
 enum Item {

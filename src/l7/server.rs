@@ -461,9 +461,9 @@ impl Conn {
 	/// `mirror` copies (#238): X-Forwarded-*, X-Real-IP and the client certificate's.
 	/// X-Forwarded-* from the client are believed only from trusted proxies
 	/// (global.trusted_proxies): then the chain is extended and their Proto / Host / Port are kept.
-	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str) {
+	/// `trusted`: whether the peer is a trusted proxy, by the request's snapshot of `global` (#342).
+	fn forwarding_headers(&self, headers: &mut HeaderMap, client_ip: IpAddr, original_host: Option<&HeaderValue>, host: &str, trusted: bool) {
 		let peer = canonical(self.client.ip());
-		let trusted = self.rt.global.trusts(peer);
 		let set = |headers: &mut HeaderMap, name: &'static str, value: &str| {
 			let name = HeaderName::from_static(name);
 			if trusted && headers.contains_key(&name) {
@@ -848,7 +848,9 @@ impl Conn {
 		// proxies. A client's goes now, before middlewares, so one the rule sets (`headers`, a
 		// server's ext_authz) still reaches the backend; forward_auth with trust_forward_header
 		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
-		if req.headers().contains_key(header::FORWARDED) && !self.rt.global.trusts(canonical(self.client.ip())) {
+		// the global settings in force (#342), the same for the whole request
+		let snapshot = self.rt.global.snapshot();
+		if req.headers().contains_key(header::FORWARDED) && !snapshot.trusts(canonical(self.client.ip())) {
 			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
 			req.headers_mut().remove(header::FORWARDED);
 			req.extensions_mut().insert(ClientForwarded(values));
@@ -892,7 +894,7 @@ impl Conn {
 		// the client: the peer, or what a trusted proxy in front says (global.trusted_proxies)
 		let peer = canonical(self.client.ip());
 		let global = &self.rt.global;
-		let client_ip = global.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
+		let client_ip = snapshot.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
 		let headers: Vec<(String, String)> = if router.match_headers {
 			req.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
 		} else {
@@ -919,7 +921,7 @@ impl Conn {
 		let deadline = request_timeout.map(|d| tokio::time::Instant::now() + d);
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
 		// the access log line is put together only when it is written (the statistics need just the route)
-		let log = global.logging();
+		let log = snapshot.logging();
 		let route_label = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
 		let mut entry = if log {
 			AccessEntry {
@@ -1051,7 +1053,7 @@ impl Conn {
 					answer => Some(oidc_response(answer)),
 				},
 				Middleware::Crowdsec { name, appsec, block_on_error } => {
-					self.crowdsec(name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
+					self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 				}
 				// the client as global.trusted_proxies decided; refused like ip_allow
 				Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
@@ -1091,6 +1093,7 @@ impl Conn {
 							client_ip,
 							host: host.clone(),
 							forwarded: false,
+							trusted: snapshot.trusts(canonical(self.client.ip())),
 						});
 					}
 					None
@@ -1178,7 +1181,9 @@ impl Conn {
 						self.mirror(router.clone(), copy, body);
 					}
 				}
-				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log, ctx: &ctx, backend_timeout };
+				let trusted = snapshot.trusts(canonical(self.client.ip()));
+				let target =
+					Target { router: &router, service: &service, route: route_name, host: &host, client_ip, trusted, log, ctx: &ctx, backend_timeout };
 				let forwarded = self.forward(target, req, replay, retry, &mut entry.backend, &mut holds);
 				match deadline {
 					Some(at) => match tokio::time::timeout_at(at, forwarded).await {
@@ -1221,7 +1226,7 @@ impl Conn {
 		}
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
-		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, started, _holds: holds }.boxed())
+		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, global: snapshot, started, _holds: holds }.boxed())
 	}
 
 	/// The response side of one middleware.
@@ -1524,6 +1529,7 @@ impl Conn {
 	#[allow(clippy::too_many_arguments)]
 	async fn crowdsec(
 		&self,
+		global: &crate::l7::access::Snapshot,
 		name: &str,
 		appsec: bool,
 		block_on_error: bool,
@@ -1532,7 +1538,7 @@ impl Conn {
 		client: IpAddr,
 		host: &str,
 	) -> Option<Response<Body>> {
-		let Some(bouncer) = self.rt.global.crowdsec() else {
+		let Some(bouncer) = global.crowdsec() else {
 			// validation requires global.crowdsec; a rule restored without it fails closed or open as asked
 			return block_on_error.then(|| middleware::blocked(name));
 		};
@@ -1569,7 +1575,7 @@ impl Conn {
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
-		let Target { router, service, route, host, client_ip, log, ctx, backend_timeout } = target;
+		let Target { router, service, route, host, client_ip, trusted, log, ctx, backend_timeout } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
 		let original_host = request_authority(req.uri(), req.headers());
@@ -1590,7 +1596,7 @@ impl Conn {
 			parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
 			parts.headers.insert(header::UPGRADE, u.clone());
 		}
-		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host);
+		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host, trusted);
 		let path_and_query = parts.uri.path_and_query().cloned().unwrap_or_else(|| PathAndQuery::from_static("/"));
 		// kept for further attempts only
 		let again = (attempts > 1).then(|| (parts.method.clone(), parts.headers.clone()));
@@ -1688,6 +1694,7 @@ impl Conn {
 							client_ip,
 							host: host.to_string(),
 							forwarded: true,
+							trusted: false,
 						});
 					}
 					continue;
@@ -1843,7 +1850,7 @@ impl Conn {
 		// the same X-Forwarded-* and client certificate headers as the request to the backend (#238);
 		// a server's copy has them already
 		if !copy.forwarded {
-			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host);
+			self.forwarding_headers(&mut headers, copy.client_ip, original_host.as_ref(), &copy.host, copy.trusted);
 		}
 		headers.insert(header::HOST, host);
 		let mut req = Request::new(body);
@@ -2068,6 +2075,8 @@ struct Target<'a> {
 	route: &'a str,
 	host: &'a str,
 	client_ip: IpAddr,
+	/// Whether the peer is a trusted proxy (the request's snapshot of `global`, #342).
+	trusted: bool,
 	/// The access log needs the backend's address.
 	log: bool,
 	/// For the servers' own middlewares (#229).
@@ -2236,6 +2245,8 @@ struct Logged {
 	/// The entry is complete and the line is written (`HttpGlobal::logging` when the request came).
 	log: bool,
 	rt: Arc<Runtime>,
+	/// The global settings the request was handled with (its access log).
+	global: Arc<crate::l7::access::Snapshot>,
 	started: Instant,
 	/// `in_flight` places, freed with the response.
 	_holds: Vec<Hold>,
@@ -2274,7 +2285,7 @@ impl Drop for Logged {
 		self.entry.bytes_out = self.bytes;
 		self.rt.http_stats.record(&self.entry.route, self.entry.status, elapsed);
 		if self.log {
-			self.rt.global.log(&self.entry);
+			self.global.log(&self.entry);
 		}
 	}
 }

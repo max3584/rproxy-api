@@ -225,6 +225,9 @@ pub struct Features {
 	/// Rules restored from the database that do not validate are shown in `GET /rules` as
 	/// failed with the reason; `DELETE` removes them, `PATCH` fixes them (#327)
 	pub invalid_restored: bool,
+	/// `GET` / `PATCH /config/global`: the `global` items the settings file leaves out are
+	/// set through the API, stored with the rules and put in force while running (#342)
+	pub global_api: bool,
 	/// `max_connections` of L4 `targets[]` (also of `tls.routes[]`) and of `http` services'
 	/// `servers[]`: a full target is skipped by every `balance`, all full is refused
 	/// (`reason: target_full`); `stats.targets[].full` (#341)
@@ -296,6 +299,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		global_api: true,
 		target_max_connections: true,
 	};
 
@@ -347,6 +351,7 @@ impl Features {
 		protected_files: true,
 		file_owners: true,
 		invalid_restored: true,
+		global_api: true,
 		target_max_connections: true,
 	};
 

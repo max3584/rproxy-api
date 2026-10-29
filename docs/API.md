@@ -338,7 +338,8 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
     - 変わったルールは、PATCH で変えられる項目（転送先、`udp_idle_secs`、`tls`、`starttls`、`allow_from`、`http`）だけの違いなら、そのまま変える（既存の接続は切らない。TCP は新しい接続から）。ポート範囲・`source_ip` などが変わったときは、停止してから作り直す。
     - 変わっていないルールには触らない（接続も切らない）。
     - 同じキーのルールが API（DB）から作られていれば、そちらを残してファイルのルールを `rule.failed` としてログに出す。
-  - `global` の変更は再起動するまで効かない（`trusted_proxies`・`access_log`・`acme`・`crowdsec`。起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
+  - **v0.4.19 から（#342）**：`global` のうちその場で変えられる項目（`trusted_proxies`・`access_log`・`crowdsec`・`http.timeouts`）は、読み直したときに入れ替える（新しいリクエスト・接続から。`config.global`。前は再起動まで効かなかった）。API で同じ項目に値を入れていても、ファイルに書いた値が勝つ（下の「global の設定の API」）。入れ替えるのはルールを確かめた後で、ルールの誤りでも live の項目の誤り（ない `access_log` のディレクトリ、読めない CrowdSec のキー）でも、何も変えずに読み直しを断る（**前は通っていた誤りで読み直しが止まるようになった**）。書けないアクセスログは主のログに出して試し直し、答えない LAPI の `crowdsec` は今のものを残し、ルールが使っている `crowdsec` をファイルから消したときは使うルールがなくなるまで残す（`config.global_in_use`）。
+  - 起動のときだけ読む項目（`acme`・`geoip`・`performance`・`files`）の変更は再起動するまで効かない（起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
   - 状態は `GET /config` で見える：`{"configured":true,"path":"/etc/rproxy/conf.d","files":[...],"loaded_at":1790000000,"rules":5,"last_reload":{"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0},"error":null,"restart_needed":[]}`（設定ファイルを使っていなければ `{"configured":false}`）。`error` は最新の版を反映できなかった理由（それまでの版が動いている）。
 - 反映する前に確かめる：`rproxy-api --check-config [PATH]` が、起動時・再読み込みと同じ検証（書式、ルールの値、待ち受けの重なり・制御 API との重なり、証明書・鍵・CA のファイルと期限、`global`、ミドルウェアの秘密のファイル）をして、問題がなければ 0、誤りがあれば 1 で終わる（待ち受けも DB も開かない。`--check-config-format json` で `{"ok","path","files","rules","errors":[{"rule","message"}],"warnings":[...]}`）。名前解決はしない。パッケージのユニットの `ExecReload` は、先にこの確認をする（誤りがあれば reload は失敗し、SIGHUP を送らない）。
 - 同じキーや重なるポートのルールを API や DB から作ろうとすると、`already_exists` になる。
@@ -447,7 +448,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
 | 途中で切れた応答 | 転送先が応答の途中で切れたら（`Content-Length` に足りない、chunked の最後のチャンクがない、リセット）、クライアントにも完全な応答に見えないように切る：HTTP/1.1 は足りないまま接続を閉じる（chunked なら最後のチャンクを送らない）、HTTP/2 は RST_STREAM、HTTP/3 は RESET_STREAM。`compress` を通していても同じ（圧縮の終わりを付けない）。長さのない（接続を閉じて終わる）HTTP/1.0 型の応答は、転送先の側で途中かどうかが分からない |
 | 途中で切れたリクエスト | クライアントが本文の途中で切れたら（HTTP/1.1 の切断、HTTP/2 の RST_STREAM、HTTP/3 のリセット）、転送先への接続も本文を終えずに切り、転送先に完全なリクエストとして渡さない |
 
-`global.http.timeouts`（v0.4.17、#320）：`http` のルールのクライアントの接続の時間の上限。設定ファイルの `global` だけ（環境変数はない。再起動まで効かない、`GET /config` の `restart_needed` に `global.http`）。値は `10s` などの時間、`0s` は上限なし。省略した項目は既定。形の誤り（時間でない・知らない名前・`http2_ping_timeout: 0s`）は設定の誤り（起動・再読み込み・`--check-config`）。
+`global.http.timeouts`（v0.4.17、#320）：`http` のルールのクライアントの接続の時間の上限。設定ファイルの `global` か、ファイルに書いていなければ `PATCH /config/global`（v0.4.19、#342。環境変数はない）。どちらも新しい接続から効く（今の接続はそのまま）。値は `10s` などの時間、`0s` は上限なし。省略した項目は既定。形の誤り（時間でない・知らない名前・`http2_ping_timeout: 0s`）は設定の誤り（起動・再読み込み・`--check-config`）。
 
 | 項目 | 既定 | 意味 |
 |---|---|---|
@@ -939,6 +940,65 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_sets TO 'rproxy'@'%';
 GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
 ```
 
+### global の設定の API（v0.4.19、#342、`features.global_api`）
+
+`global` の項目のうち設定ファイル（と環境変数）に書いていないものを、制御 API で変える（UI の設定の画面向け）。固定の値はファイル、変わる値は API に分ける。
+
+- **ファイル（と環境変数）に書いた項目はファイルが勝つ**：その項目は API で変えられない（`409 static`、`items` にファイル・環境変数のものになっている項目）。固定のルールと同じ考え方。`RPROXY_CONFIG` がディレクトリなら、`global` を書いたファイル（どれか 1 つ）の項目がファイルのもの。
+- 項目と変え方：
+
+| 項目 | 変え方 | Unix ソケットだけ | ファイル・環境変数 |
+|---|---|---|---|
+| `trusted_proxies` | `live`（新しいリクエストから） | ○（広げると、アドレスで守るルールを `X-Forwarded-For` で抜けられる） | `global.trusted_proxies` |
+| `access_log` | `live`（次の行から。前のファイルは書き終えてから閉じる） | ○（ファイルを書く） | `global.access_log` |
+| `crowdsec` | `live`（新しい bouncer が LAPI から最初に取れてから入れ替える。取れなければ今のまま） | ○（キーのファイルを読んで LAPI に送る） | `global.crowdsec` |
+| `http.timeouts` | `live`（新しい接続から） | | `global.http.timeouts` |
+| `udp_max_sessions` | `live`（新しいセッションから。今のセッションは切らない） | | `RPROXY_UDP_MAX_SESSIONS` |
+| `acme` | `restart`（API では変えない。後の版で、#345） | ○ | `global.acme` |
+| `geoip` | `restart`（同上） | | `global.geoip` |
+| `performance` | `restart`（`workers`・`udp_shards`・CPU の固定・`busy_poll_usecs`・`splice`・`xdp`） | | `global.performance`、`RPROXY_WORKERS` など |
+| `files` | `restart` | | `global.files`、`RPROXY_FILES_TRUSTED_DIRS` |
+| `control_api` | `restart`（制御 API の待ち受け） | | `RPROXY_API_ADDR`・`RPROXY_API_PORT`・`RPROXY_API_SOCKET` |
+
+- `GET /config/global`（`admin`）：`{"items":{"trusted_proxies":{"value":[...],"source":"api","apply":"live","unix_only":true,"settable":true,"api_value":[...],"shadowed":false},...},"storage":"database","persisted":true,"loaded":true,"updated_by":"ui","updated_at":1790000000,"warnings":[]}`。`value` は今効いている値（`restart` の項目は起動したときの値）、`source` は `file` / `env` / `api` / `default`、`settable` は今 API で変えられるか（Unix ソケットだけの項目も true。`unix_only` を見る）、`api_value` は API の値（あるときだけ）、`shadowed` は API の値があるがファイル・環境変数が勝っていて効いていない、`error` は戻した API の値を効かせられなかった理由（効いていないが保存したまま）。`crowdsec` の `kept: true` は、ファイルから消えたがルールが使っているので残しているもの（`source` は `file`）。`loaded` は保存した値を読めたか（下の「保存」）。
+- `PATCH /config/global`（`admin`）：本文は設定ファイルの `global` と同じ形（`{"trusted_proxies":["10.0.0.0/8"],"http":{"timeouts":{"idle":"5m"}},"udp_max_sessions":4096}`）。名前を挙げた項目だけを、項目ごと丸ごと置き換える（`http.timeouts` の中も丸ごと）。`null` で API の値を消す（既定に戻る）。`[]`・`{}` は値として入る（`trusted_proxies: []` は「信じる前段なし」を API で決めたもの、`http: {"timeouts": {}}` はすべて既定の値を API で決めたもの）。答えは `GET` と同じ形に `changes`（`[{"item","before","after","api_before","api_after"}]`）と `applied`（効いている値が変わった項目）。`?dry_run=true` は何も変えずに `{"dry_run":true,"changes":[...],"applied":[...]}`（ファイルを開かず、bouncer も動かさない。形・パス・ルールが使うかは確かめる）。
+  - 断るとき：
+    - `409 static`（ファイル・環境変数の項目）、`409 restart_only`（`restart` の項目）。どちらも `items`。
+    - `400 invalid`：知らない項目、形や値の誤り、ない `access_log` のディレクトリ、書けないアクセスログ、読めない CrowdSec のキーのファイル。
+    - `409 in_use`：ルールが使っている `crowdsec` を消す、`appsec` を使うルールがあるのに `appsec_url` を外す。
+    - `403 protected_file`：パスが証明書のストア・ACME の保存先・rproxy の秘密（トークンファイルなど）・`/proc` などを指す。アクセスログが下の場所の外。
+    - `403 forbidden`：Unix ソケットだけの項目を TCP から（dry run も同じ。誤りの文は「Unix ソケット（`RPROXY_API_SOCKET`）からだけ」）。この守りは `POST /config/reload` などと同じ `RPROXY_API_RELOAD_UNIX_ONLY` で、`false` にすると TCP からも変えられる（勧めない）。`event=audit` に `outcome: forbidden`・`code: unix_only`。
+    - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。そのため `crowdsec` の PATCH は最大 10 秒かかり、その間ほかの `global` の変更（PATCH・設定ファイルの読み直し）は順番を待つ。
+    - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない、行が読めない形）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る（読めない形の行は直すまで）。
+    - `503 upgrading` / `shutting_down`：引き継ぎ・終了の途中。
+  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
+  - `event=audit`（`action: config.global`。dry run も `dry_run: true` で）と `config.global`（項目・効いた項目）に残る。
+- 入れ替え：live の項目はまとめて 1 つの写しとして入れ替わり、1 つのリクエストは始まったときの写しを最後まで使う（いくつかの項目を変える PATCH の途中の組み合わせは見えない）。CrowdSec を使うルールの作成・変更と `crowdsec` の変更はルールの表の鍵の下で順に行うので、`crowdsec` を使うルールが `crowdsec` なしで動くことはない。
+- 保存：DB（`RPROXY_DATABASE_URL`）があれば、応答の前にテーブル `rproxy_global` に自分の `node` の 1 行（API の値を JSON で）を書く（`persisted`）。書けなければ（DB に届かない、テーブルがない）値は効かせたまま `persisted: false`、`degraded`（`part: "db"`）、定期の照合（`RPROXY_PERSIST_CHECK_SECS`）が書き直す。行は項目ごとに読み、この版が知らない項目（後の版の `acme` など）や読めない値は効かせずにそのまま残して書き戻す（`spec_version` は `rproxy_global` だけの番号）。
+  - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec` は最初の取得を 2 秒まで待ち、取れなくても入れる（設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまでの判定はルールの `on_error`。L4 の `crowdsec` は通す）。
+  - 読めなければ（DB に届かない、行が読めない形）`loaded: false` で、`PATCH` は `503 not_loaded`、行も書かない。定期の照合が読めたら効かせる。そのあいだ `crowdsec` がなくて起動できなかったルールは、`crowdsec` が効いたときに動かし直す（PATCH・読み直しで入ったときも同じ）。
+  - DB がなければ値はこのプロセスの中だけ（`storage: "memory"`、再起動で消える）。行が正になることはない（書くのは rproxy だけ。照合は書き直すだけ）。
+- 引き継ぎ（`/admin/upgrade`）では、API の値（知らない項目も）・書いた人・時刻・`persisted`・読めていないこと・残している `crowdsec` を新しいプロセスに渡し、ルールより先に効かせる。v0.4.19 より前の版への引き継ぎ（戻すとき）では API の値は渡らない（その版は知らない。DB の行は残るので、v0.4.19 以後に戻せばまた読む）。
+- 設定ファイルを読み直したとき：
+  - API の値がある項目がファイルに現れたらファイルが勝つ：API の値は残すが効かず、`GET /config/global` に `shadowed: true` と `warnings`（`{"code":"config.global_shadowed","item","message"}`）、ログに `config.global_shadowed`（1 回）。ファイルからまた消えたら API の値が効く。
+  - live の項目は、ルールを確かめてから入れ替える（ルールの誤りで読み直しを断るときは何も変えない）。live の項目の誤りも読み直しを断る。
+  - 書けないアクセスログは主のログに出し（`degraded`）、設定ファイルを確かめるたびに試し直す。
+  - 新しい `crowdsec` の LAPI が答えなければ今のものを残す（`config.global_kept`、`GET` の `error`。次の読み直しでまた試す）。読み直しが LAPI を待つあいだ、ほかの `global` の変更は順番を待つ（`config.reload` の行）。ルールが使う `crowdsec`（`appsec` を使うルールがあれば `appsec_url` も）をファイルから消したときは、使うルールがなくなるまで残す（`config.global_in_use`、`GET` の `kept`、ほかの項目の PATCH でも残り、引き継ぎでも渡す）。使うルールがなくなった後の読み直しで外す。
+- テーブル（UI リポジトリの `db/migrations/013_rproxy_global.sql`）：
+
+```sql
+CREATE TABLE IF NOT EXISTS rproxy_global (
+  node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (as in rproxy_rules)
+  spec         JSON         NOT NULL,   -- the values set through the API, in the shape of global
+  spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+  updated_by   VARCHAR(255) NOT NULL,
+  updated_at   DATETIME(3)  NOT NULL,
+  PRIMARY KEY (node)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+GRANT SELECT, INSERT, UPDATE ON rproxy.rproxy_global TO 'rproxy'@'%';
+GRANT SELECT ON rproxy.rproxy_global TO 'rproxy_ui'@'%';
+```
+
 ### まだホストにないアドレスで待ち受ける（v0.4.3、`features.listen_freebind`）
 
 VIP のように、今は別のホストが持っていて後からこのホストに来るアドレスで待ち受ける（Kubernetes の fleet で、VIP ごとに別の Gateway が同じポートを使う形。rproxy-gateway の docs/DESIGN-v0.4.x.md 7.）。
@@ -1150,7 +1210,7 @@ http:
 | `GET /capabilities` | | 200 | `{"version":"0.4.0","source_ip":[...],"transparent":true,"transparent_ipv6":true,"tls_modes":["passthrough","sni","terminate"],"dtls":true,"starttls":["smtp","imap","pop3"],"max_range_ports":20000,"features":{"http":true,"http3":true,"acme":true,"tls_options":true,"middlewares":["redirect_scheme","redirect_regex","ip_allow","headers","strip_prefix","add_prefix","replace_path","replace_path_regex","respond","rate_limit","in_flight","crowdsec","compress","buffering","retry","circuit_breaker","errors","basic_auth","forward_auth","oidc","geoip","cors","mirror","replace_host"],"services":["health_check","sticky","balance","outlier_detection","protocol","tls"],"http_options":["headers_add","redirect_status","route_timeouts","server_middlewares","server_status","retry_status","misdirected"],"server_middleware_kinds":["headers","replace_host","strip_prefix","add_prefix","replace_path","replace_path_regex","cors","redirect_scheme","redirect_regex","mirror","forward_auth"],"forward_auth":["service","grpc","client_request","allow_status","forward_body","all_response_headers"],"tls_route_targets":true,"client_auth_modes":["none","optional","required","optional_no_verify"],"rulesets":true,"labels":true,"conditions":true,"readyz":true,"limits":true,"bandwidth":true,"geoip":true,"outlier_detection":true,"dry_run":true,"persistence":true,"client_cert_auth":true,"token_expiry":true,"api_lockout":true,"handoff":true,"self_update":true,"performance":["workers","udp_shards","cpu_affinity","busy_poll_usecs","splice","xdp"],"graceful_shutdown":true,"cert_store":true,"ruleset_persistence":true},"build":{"version":"0.4.0","sha256":"…"}}`。`version` はこの rproxy-api のリリースの版（`Cargo.toml` の `version`。v0.3.18 から。それより古い版では含まれない。UI が組み合わせを確かめるのに使う）。`features` はこの版で動かせる v0.3・v0.4 の設定（上の「v0.3 の設定」「v0.4 の設定」。v0.4.0 ではすべて true、`performance` はすべての項目の名前）。`source_ip` の `transparent` は `IP_TRANSPARENT` が使えるときだけ含まれる。`transparent_ipv6` は IPv6 の待ち受けで transparent を使えるか（`IPV6_TRANSPARENT`）。`build` は動いているバイナリ `{"version","sha256"}`（v0.4、#174。`sha256` は起動の直後だけ `null`）。`performance` はカーネルでの転送（#260）の機能ごとの実際の状態 `{"xdp": {"requested": "off", "active": false, "mode": null, "reason": null}}`（起動時の試験の結果。上の「performance」） |
 | `GET /openapi.json` | | 200 | この API の OpenAPI 3.0 の定義（`docs/openapi.json` と同じ）。どのトークンでも読める |
 | `GET /config` | | 200 | 設定ファイル（`RPROXY_CONFIG`）の状態（上の「設定ファイル」）。`global.crowdsec` があれば `crowdsec` に LAPI との接続の状態（v0.3.20）：`{"connected":true,"synced":true,"last_success":1790000000,"last_error":null,"last_error_at":null,"failures":0,"decisions":12}`。`connected` は最後の取得が成功したか、`synced` は一度でも取得できたか、`failures` は続けて失敗した回数、時刻は Unix 秒。`rules:read` |
-| `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
+| `POST /config/reload` | | 200 | 設定ファイルをその場で読み直して反映し、結果を返す：`{"added","removed","changed","unchanged","failed","restart_needed":[...],"files":[...],"rules","warnings":[{"rule","message"}]}`（`?dry_run=true` の答えには、効いている値が変わる `global` の項目の `global_changes` も）。誤りがあれば何も変えずに `400 {"code":"invalid","error","errors":[...],"warnings":[...]}`（`errors` は `--check-config` と同じ検証の結果）。設定ファイルがなければ `409 no_config`。`admin` のスコープが要る（トークンファイルを使っていなければ、ほかのエンドポイントと同じく誰でも使える）。既定では Unix ソケット（`RPROXY_API_SOCKET`）から来たリクエストだけを受け付け、TCP からは `403`（`RPROXY_API_RELOAD_UNIX_ONLY=false` で TCP も受け付ける）。ファイルの変化の検知・SIGHUP と同じ処理で、同時には動かない。`event=audit`（`action: config.reload`）に残る |
 | `GET /interfaces` | | 200 | 待ち受けに使えるアドレス：`{"interfaces":[{"name":"ens18","addr":"172.16.5.1","family":"ipv4","loopback":false,"link_local":false}, ...],"reserved":[{"protocol":"tcp","addr":"127.0.0.1","port":8080,"purpose":"control API"}]}`。動作中のインターフェースだけを返す。`reserved` は rproxy 自身が使うアドレスで、ルールには使えない |
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
@@ -1167,6 +1227,8 @@ http:
 | `GET /rulesets/{name}` | | 200 | v0.4（#28）：`{"name","generation","etag","updated_at","updated_by","owner","rules":[...]}`（`ETag` ヘッダも）。名前の `/` はそのまま書ける。`rules:read` |
 | `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。詳しくは上の「ルールの組・状態・readiness」 |
 | `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて同時に止めて組を消す（`If-Match` も使える）。`rules:write` |
+| `GET /config/global` | | 200 | v0.4.19（#342）：`global` の項目ごとの今の値・出どころ（`file` / `env` / `api` / `default`）・変え方（`live` / `restart`）（上の「global の設定の API」）。`admin` |
+| `PATCH /config/global` | `global` の形の JSON（`null` で消す） | 200 | v0.4.19（#342）：ファイル・環境変数にない項目の API の値を変える。`live` の項目は新しいリクエスト・接続・セッションから。`dry_run`。`409 static` / `restart_only` / `in_use`、`403 protected_file`、`502 crowdsec_unavailable`、`503 not_loaded`。`admin`、`trusted_proxies`・`access_log`・`crowdsec` は既定で Unix ソケットからだけ |
 | `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |
 | `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ。docs/UPGRADE.md）。`{"status":"started"}` を返し、引き継ぎは後ろで進む（結果はログの `handoff.*` と `/metrics` の `rproxy_handoffs_total`）。すでに動いていれば `409 upgrading`。`admin`、既定では Unix ソケットからだけ |
 | `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current":{"version","sha256"},"available":{"version","sha256"}\|null,"last_check","error","bad_versions"}`。`admin` |

@@ -314,6 +314,8 @@ pub struct ConfigPlan {
 	pub counts: ReloadCounts,
 	/// `global` settings that would take effect only after a restart.
 	pub restart_needed: Vec<String>,
+	/// `global` items whose value in force would change (#342: applied by the reload).
+	pub global_changes: Vec<String>,
 	/// Rules that would be created, changed or deleted.
 	pub changes: Vec<ConfigChange>,
 	/// Rules that would be registered as failed, certificates about to expire, ...
@@ -348,6 +350,7 @@ pub async fn plan_config(registry: &Arc<Registry>, base: &ConfigDoc, doc: &Confi
 	let mut plan = ConfigPlan {
 		dry_run: true,
 		restart_needed: doc.restart_needed(base).into_iter().map(String::from).collect(),
+		global_changes: registry.global().preview(&doc.global, &doc.global_raw).into_iter().map(|i| format!("global.{i}")).collect(),
 		warnings: findings(check.errors.into_iter().chain(check.warnings).collect()),
 		..Default::default()
 	};
@@ -524,6 +527,9 @@ pub fn plan_text(plan: &Value) -> String {
 			c["change"].as_str().unwrap_or(""),
 			if paths.is_empty() || mark != "~" { String::new() } else { format!(": {}", paths.join(", ")) }
 		));
+	}
+	for r in plan["global_changes"].as_array().into_iter().flatten() {
+		out.push_str(&format!("~ {} changes now\n", r.as_str().unwrap_or("")));
 	}
 	for r in plan["restart_needed"].as_array().into_iter().flatten() {
 		out.push_str(&format!("! {} changes after a restart\n", r.as_str().unwrap_or("")));

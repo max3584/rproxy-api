@@ -54,7 +54,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::core::registry::Registry;
 use crate::core::rule::{parse_listen, Key, Origin, Protocol, RuleRequest, RuleView};
-use queue::{Done, Holder, Job, JobError, JobFuture, JobResult, Liveness, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
+use queue::{Done, GlobalRecord, Holder, Job, JobError, JobFuture, JobResult, Liveness, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
 
 /// rproxy's own table (definition and GRANT: the UI repository's `db/` migrations;
 /// the DDL is in docs/API.md).
@@ -66,6 +66,10 @@ pub const SPEC_VERSION: u32 = 1;
 /// Rule sets of `persist: true` tokens (#241, v0.4.2): one row per set (the
 /// UI repository's migration 012; the DDL is in docs/API.md).
 pub const SETS_TABLE: &str = "rproxy_rule_sets";
+
+/// The `global` values set through the API (#342): one row per node (the UI
+/// repository's migration 013; the DDL is in docs/API.md).
+pub const GLOBAL_TABLE: &str = "rproxy_global";
 
 /// Longest one statement of the write connection runs in MariaDB (the
 /// session's `max_statement_time` and `innodb_lock_wait_timeout`).
@@ -178,6 +182,17 @@ pub struct StoredSet {
 	pub updated_at: u64,
 }
 
+/// The row of `rproxy_global` (#342).
+#[derive(Clone, Debug)]
+pub struct StoredGlobal {
+	/// `config::global::Values` as JSON.
+	pub spec: serde_json::Value,
+	pub spec_version: u32,
+	pub updated_by: String,
+	/// Unix seconds.
+	pub updated_at: u64,
+}
+
 /// One row of `rproxy_rules`.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StoredRule {
@@ -213,6 +228,7 @@ pub struct Meta {
 struct Memory {
 	rows: Mutex<HashMap<Key, StoredRule>>,
 	sets: Mutex<HashMap<String, StoredSet>>,
+	global: Mutex<Option<StoredGlobal>>,
 	/// Makes the writes fail.
 	fail: AtomicBool,
 	/// Another connection holds the lock: the lock and the writes answer `Busy`.
@@ -243,6 +259,9 @@ struct Unwritten {
 	/// The last write queued for a rule or set (`Store::seq`).
 	latest: HashMap<Key, u64>,
 	latest_sets: HashMap<String, u64>,
+	/// The `global` row (#342): by whom, and the last write queued for it.
+	global: Option<String>,
+	latest_global: u64,
 }
 
 /// What a live upgrade hands over of the writes that are not done (#174): the
@@ -261,6 +280,9 @@ pub struct Pending {
 	/// Deleted rule sets whose row stayed.
 	#[serde(default)]
 	pub removed_sets: Vec<PendingSet>,
+	/// The `global` row is not up to date (#342): by whom.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub global: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,7 +745,13 @@ impl Store {
 		let sets = |m: &HashMap<String, String>| -> Vec<PendingSet> {
 			m.iter().map(|(name, by)| PendingSet { name: name.clone(), by: by.clone() }).collect()
 		};
-		Pending { rules: rules(&u.rules), removed_rules: rules(&u.removed_rules), sets: sets(&u.sets), removed_sets: sets(&u.removed_sets) }
+		Pending {
+			rules: rules(&u.rules),
+			removed_rules: rules(&u.removed_rules),
+			sets: sets(&u.sets),
+			removed_sets: sets(&u.removed_sets),
+			global: u.global.clone(),
+		}
 	}
 
 	/// Takes over the old process's writes that are not done (a live upgrade,
@@ -746,6 +774,9 @@ impl Store {
 		}
 		for s in pending.removed_sets {
 			u.removed_sets.insert(s.name, s.by);
+		}
+		if pending.global.is_some() {
+			u.global = pending.global;
 		}
 	}
 
@@ -1020,14 +1051,35 @@ impl Store {
 		}
 		let mut out = Reconciled::default();
 		// 1. what did not go through, written again (the first failure ends it: the database is in trouble)
-		let (rules, removed_rules, sets, removed_sets) = {
+		let (rules, removed_rules, sets, removed_sets, global) = {
 			let u = self.unwritten.lock().unwrap();
 			let take = |m: &HashMap<Key, String>| m.iter().map(|(k, by)| (*k, by.clone())).collect::<Vec<_>>();
 			let take_sets = |m: &HashMap<String, String>| m.iter().map(|(n, by)| (n.clone(), by.clone())).collect::<Vec<_>>();
-			(take(&u.rules), take(&u.removed_rules), take_sets(&u.sets), take_sets(&u.removed_sets))
+			(take(&u.rules), take(&u.removed_rules), take_sets(&u.sets), take_sets(&u.removed_sets), u.global.clone())
 		};
 		let mut budget = RETRIES_PER_ROUND;
 		'retry: {
+			// the global values (#342): read first if they could not be at the start (a
+			// change waits for them), then only written again: the row never wins over them
+			if !registry.global().loaded() {
+				match self.load_global().await {
+					Ok(row) => {
+						let (spec, by, at) = match row {
+							Some(r) => (r.spec, Some(r.updated_by), Some(r.updated_at)),
+							None => (serde_json::json!({}), None, None),
+						};
+						registry.global().restore(registry, &spec, by, at, Some(true), None, "reconcile").await;
+					}
+					Err(_) => break 'retry,
+				}
+			}
+			if let Some(by) = global {
+				budget -= 1;
+				if !self.save_global(registry, &by).await {
+					break 'retry;
+				}
+				out.written += 1;
+			}
 			for (key, by) in rules {
 				if budget == 0 {
 					break 'retry;
@@ -1211,6 +1263,74 @@ impl Store {
 		if self.invalid.lock().unwrap().insert(*key, seen.clone()).as_ref() != Some(&seen) {
 			warn!(event = "restore.skip", table = TABLE, rule = %key, error = %error,
 				"a row of rproxy_rules does not make a rule; it is left alone until it changes");
+		}
+	}
+}
+
+/// The `global` values set through the API (#342): one row per node in
+/// `rproxy_global`, written on every `PATCH /config/global` (before the answer)
+/// and read at the start before the rules. `reconcile` writes it again when a
+/// write did not go through; the row never wins over the running values (only
+/// this process writes it).
+impl Store {
+	/// This node's row (None: no row, or no table yet).
+	pub async fn load_global(&self) -> Result<Option<StoredGlobal>, String> {
+		match self.submit(Job::ReadGlobal).await {
+			Ok(Done::Global(row)) => Ok(row),
+			Ok(other) => Err(format!("unexpected answer {other:?}")),
+			Err(e) => Err(e.to_string()),
+		}
+	}
+
+	/// Writes the API values as they are now (after a change by `by`, or again by
+	/// `reconcile`); read under `order`, where the row is queued, so the last
+	/// queued is the latest. Returns whether the row is up to date (false
+	/// without a database).
+	pub async fn save_global(&self, registry: &Registry, by: &str) -> bool {
+		debug_assert!(!self.enabled() || registry.global().persisted().is_some(), "a database stores the values, but the settings do not know");
+		let (seq, job) = {
+			let _order = self.order.lock().await;
+			// not read yet: writing now would lose what is stored
+			let Some((spec, _)) = registry.global().stored() else { return false };
+			let record = GlobalRecord { spec, by: by.into(), now: unix_millis() };
+			let seq = self.intend(|u, seq| {
+				u.global = Some(by.into());
+				u.latest_global = seq;
+			});
+			(seq, self.enqueue(Job::SaveGlobal(record)))
+		};
+		let result = job.await;
+		self.note_lock(&result, true);
+		let persisted = result.is_ok();
+		let latest = {
+			let mut u = self.unwritten.lock().unwrap();
+			let latest = u.latest_global == seq;
+			if latest && persisted {
+				u.global = None;
+			}
+			latest || !self.enabled()
+		};
+		match result {
+			Ok(_) => info!(event = "config.global.persist", token = by),
+			Err(_) if !self.enabled() => {}
+			Err(e) => warn!(event = "degraded", part = "db", table = GLOBAL_TABLE, error = %e,
+				"the global values are in force but not stored in rproxy_global yet (written again by the next check)"),
+		}
+		if latest {
+			registry.global().set_persisted(persisted);
+		}
+		persisted
+	}
+
+	/// The row of a memory store (tests).
+	pub fn memory_global(&self) -> Option<StoredGlobal> {
+		self.memory.as_ref().and_then(|m| m.global.lock().unwrap().clone())
+	}
+
+	/// Puts a row in a memory store (tests).
+	pub fn memory_put_global(&self, row: StoredGlobal) {
+		if let Some(m) = &self.memory {
+			*m.global.lock().unwrap() = Some(row);
 		}
 	}
 }
@@ -1499,8 +1619,60 @@ impl DbWorker {
 		Ok(Done::Sets(out))
 	}
 
+	async fn read_global(&self) -> JobResult {
+		let mut conn = self.conn().await?;
+		let query = sqlx::query(
+			"SELECT CAST(spec AS CHAR) AS spec, CAST(spec_version AS SIGNED) AS spec_version, updated_by, \
+			 CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) AS updated_at FROM rproxy_global WHERE node = ?",
+		)
+		.bind(&self.node);
+		let row = match query.fetch_optional(&mut *conn).await {
+			Ok(row) => row,
+			Err(e) if missing_table(&e) => return Ok(Done::Global(None)),
+			Err(e) => return Err(failed(e)),
+		};
+		let Some(row) = row else { return Ok(Done::Global(None)) };
+		let get_str = |c: &str| row.try_get::<String, _>(c).map_err(|e| format!("{c}: {e}"));
+		let get_int = |c: &str| row.try_get::<i64, _>(c).map_err(|e| format!("{c}: {e}"));
+		let read = || -> Result<StoredGlobal, String> {
+			let spec_version = u32::try_from(get_int("spec_version")?).unwrap_or(u32::MAX);
+			// read item by item (`config::global::Values::read_stored`): what this build
+			// does not know is kept as stored
+			if spec_version > crate::config::global::GLOBAL_SPEC_VERSION {
+				warn!(event = "restore.global", spec_version, "rproxy_global was written by a newer version; reading the items this one knows");
+			}
+			let spec: serde_json::Value = serde_json::from_str(&get_str("spec")?).map_err(|e| format!("spec: {e}"))?;
+			if !spec.is_object() {
+				return Err("spec: not an object".into());
+			}
+			Ok(StoredGlobal {
+				spec,
+				spec_version,
+				updated_by: get_str("updated_by")?,
+				updated_at: get_int("updated_at")?.max(0) as u64,
+			})
+		};
+		// a row that does not read is not "no row": a change would overwrite it
+		read().map(|g| Done::Global(Some(g))).map_err(|e| JobError::Failed(format!("{GLOBAL_TABLE}: {e}")))
+	}
+
 	async fn job(&mut self, job: Job) -> JobResult {
 		match job {
+			Job::ReadGlobal => self.read_global().await,
+			Job::SaveGlobal(g) => {
+				let query = sqlx::query(
+					"INSERT INTO rproxy_global (node, spec, spec_version, updated_by, updated_at) \
+					 VALUES (?, ?, ?, ?, FROM_UNIXTIME(? / 1000)) \
+					 ON DUPLICATE KEY UPDATE spec = VALUES(spec), spec_version = VALUES(spec_version), \
+					 updated_by = VALUES(updated_by), updated_at = VALUES(updated_at)",
+				)
+				.bind(&self.node)
+				.bind(g.spec.to_string())
+				.bind(crate::config::global::GLOBAL_SPEC_VERSION)
+				.bind(g.by)
+				.bind(g.now);
+				self.write(query).await
+			}
 			Job::Lock { wait } => {
 				let mut conn = self.conn().await?;
 				self.take_lock(&mut conn, wait).await.map(|()| Done::Locked)
@@ -1637,6 +1809,12 @@ impl MemoryWorker {
 			Job::Lock { .. } | Job::Ping => Ok(Done::Locked),
 			Job::ReadRules => Ok(Done::Rules(m.rows.lock().unwrap().values().filter(|r| r.node == self.node).cloned().collect())),
 			Job::ReadSets => Ok(Done::Sets(m.sets.lock().unwrap().values().cloned().collect())),
+			Job::ReadGlobal => Ok(Done::Global(m.global.lock().unwrap().clone())),
+			Job::SaveGlobal(g) => {
+				*m.global.lock().unwrap() =
+					Some(StoredGlobal { spec: g.spec, spec_version: crate::config::global::GLOBAL_SPEC_VERSION, updated_by: g.by, updated_at: g.now / 1000 });
+				Ok(Done::Ok)
+			}
 			Job::SaveRule(r) => {
 				let spec = serde_json::from_value::<RuleRequest>(r.spec).map_err(|e| JobError::Failed(e.to_string()))?;
 				let row = StoredRule {

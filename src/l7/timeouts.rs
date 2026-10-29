@@ -13,29 +13,36 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, Sleep};
 
 use super::server::BoxError;
 
 /// `global.http` (v0.4.17).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpGlobalSpec {
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeouts: Option<HttpTimeoutsSpec>,
 }
 
 /// `global.http.timeouts`: durations like `10s`; `0s` is no limit. Left out, the default.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpTimeoutsSpec {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub tls_handshake: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub first_byte: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub request_headers: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub idle: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub request_body_idle: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub http2_ping_interval: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub http2_ping_timeout: Option<String>,
 }
 

@@ -66,6 +66,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/openapi.json", get(openapi))
 		.route("/config", get(config_status))
 		.route("/config/reload", post(config_reload))
+		// v0.4.19 (#342): global through the API
+		.route("/config/global", get(global_view).patch(global_patch))
 		.route("/interfaces", get(interfaces))
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
@@ -102,6 +104,8 @@ fn required_scope(method: &Method, path: &str) -> Option<Scope> {
 		"/metrics" => Some(Scope::MetricsRead),
 		// re-reads files on the host: only for administrators
 		"/config/reload" | "/config/plan" => Some(Scope::Admin),
+		// process-wide settings (#342), some naming secrets: only for administrators
+		"/config/global" => Some(Scope::Admin),
 		_ if path.starts_with("/admin/") => Some(Scope::Admin),
 		// stored certificates (#240): certs:read / certs:write
 		"/certs" => Some(Scope::CertsRead),
@@ -349,6 +353,94 @@ async fn config_plan(
 	let none = crate::config::ConfigDoc::default();
 	let base = state.reloader.as_ref().map(|r| r.base()).unwrap_or(&none);
 	Ok(config_plan_answer(&state, base, &doc).await)
+}
+
+/// `GET /config/global` (#342): every `global` item, its value in force, where it comes
+/// from and whether the API may change it.
+async fn global_view(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+	Json(state.registry.global().view())
+}
+
+/// `PATCH /config/global` (#342): sets (null: clears) the API's values of the items the
+/// settings file and the environment leave out; the live ones are in force for the next
+/// request, connection or session. Stored in `rproxy_global` before the answer.
+async fn global_patch(
+	State(state): State<Arc<AppState>>,
+	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
+	transport: Option<Extension<Transport>>,
+	Query(query): Query<HashMap<String, String>>,
+	body: Bytes,
+) -> AppResult<Response> {
+	let body: serde_json::Value = parse_body(&body)?;
+	let Some(body) = body.as_object().cloned() else {
+		return Err(ApiError::invalid("the body is an object in the shape of global (an item set to null clears it)"));
+	};
+	let dry_run = crate::config::plan::dry_run(&query)?;
+	let secret = crate::config::global::unix_only_items(&body);
+	if !secret.is_empty() {
+		// the message does not suggest turning the guard off (RPROXY_API_RELOAD_UNIX_ONLY, docs/API.md)
+		if state.reload_unix_only && transport.is_none() {
+			let e = ApiError::forbidden(format!(
+				"{} can be changed only over the Unix socket (RPROXY_API_SOCKET)",
+				secret.iter().map(|i| format!("global.{i}")).collect::<Vec<_>>().join(", ")
+			));
+			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "",
+				outcome = "forbidden", code = "unix_only", dry_run);
+			return Err(e);
+		}
+	}
+	to_the_end(async move {
+		let audit = |outcome: &str, code: &str| {
+			info!(event = "audit", token = %principal.name, auth = principal.auth, client = %client.0, action = "config.global", rule = "",
+				outcome, code, dry_run);
+		};
+		// a dry run changes nothing: no turn among the changes to wait for
+		let _change = if dry_run { None } else { changing(&state).await? };
+		let registry = state.registry.clone();
+		let result = registry.global().patch(&registry, &body, &principal.name, dry_run).await;
+		let refused = |status: StatusCode, code: &str, error: String, items: Option<&Vec<String>>| {
+			let mut v = json!({"code": code, "error": error});
+			if let Some(items) = items {
+				v["items"] = json!(items);
+			}
+			(status, Json(v)).into_response()
+		};
+		use crate::config::global::PatchError;
+		let (answer, code) = match result {
+			Ok(patched) if dry_run => {
+				(Json(json!({"dry_run": true, "changes": patched.changes, "applied": patched.applied})).into_response(), "")
+			}
+			Ok(patched) => {
+				if let Some(store) = registry.persist().filter(|s| s.enabled()) {
+					store.save_global(&registry, &principal.name).await;
+				}
+				let mut v = registry.global().view();
+				v["changes"] = json!(patched.changes);
+				v["applied"] = json!(patched.applied);
+				(Json(v).into_response(), "")
+			}
+			Err(PatchError::Invalid(e)) => (ApiError::invalid(e).into_response(), "invalid"),
+			Err(PatchError::Protected(e)) => (ApiError::protected_file(e).into_response(), "protected_file"),
+			Err(PatchError::InUse(e)) => (refused(StatusCode::CONFLICT, "in_use", e, None), "in_use"),
+			Err(PatchError::Unavailable(e)) => (refused(StatusCode::BAD_GATEWAY, "crowdsec_unavailable", e, None), "crowdsec_unavailable"),
+			Err(PatchError::NotLoaded) => {
+				let e = "the stored global values could not be read yet (the database); try again after the next check".to_string();
+				(refused(StatusCode::SERVICE_UNAVAILABLE, "not_loaded", e, None), "not_loaded")
+			}
+			Err(PatchError::Static(items)) => {
+				let e = format!("the settings file (or the environment) sets {}; change it there", items.join(", "));
+				(refused(StatusCode::CONFLICT, "static", e, Some(&items)), "static")
+			}
+			Err(PatchError::RestartOnly(items)) => {
+				let e = format!("{} are read only at the start; set them in the settings file and restart", items.join(", "));
+				(refused(StatusCode::CONFLICT, "restart_only", e, Some(&items)), "restart_only")
+			}
+		};
+		audit(if code.is_empty() { "ok" } else { "error" }, code);
+		Ok::<_, ApiError>(answer)
+	})
+	.await
 }
 
 /// Addresses of this host that rules can listen on, and the ones rproxy keeps for itself.
