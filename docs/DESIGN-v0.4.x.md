@@ -383,5 +383,10 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
   - 落ちている間：`Slot.failed` から `ttl` は転送先へ行かずに `STALE`、その後は 1 つが試し、ほかはすぐ `STALE`。
   - `header` にホップごと・本文の形・キャッシュのヘッダを使わせない。`MISS` は転送先の `Age` を残す。`/metrics` の数は期限を過ぎたものを捨ててから。If-None-Match は引用符の中の `,` を読む。`Accept-Encoding` は符号化の名前の組で比べる。`oidc` の後ろで `share_credentials` のない `cache` は `--check-config` の警告（`HttpSpec::warnings`）。
   - 単体テストは止めた時計（`tokio::time::pause`、`Instant` は `tokio::time::Instant`）で時間を進める。
+- 2 回目のレビュー（#343）：
+  - `passes` は 1 人のクライアントでキャッシュを止められた（転送先が断るヘッダで 406、`Set-Cookie`、遅い本文）。答えそのものが理由のもの（`Verdict::Strike`：`Cache-Control`・`Set-Cookie`・`Vary: *`・大きさ・`text/event-stream`）だけを数え、`STRIKES`（3）回続いたら（前から `ttl` 以内）`ttl` のあいだ待たせない。リクエストのせいでも起きるもの（`Verdict::Reset`：`status` の外・`Content-Range`、遅い・切れた本文）は数え直し。`Pass` は答えの `Vary` の値を持ち、合うリクエストだけに効く。新しい答えを先に返す。`Pass` の大きさは `max_memory` に数え、期限を過ぎたものは `purge` が捨てる。
+  - `settle` はヘッダで BYPASS にならないとき（`Cache::admits`）だけ。`Expect` は BYPASS（HTTP/1.1 で `100 Continue` を送らせない）。空の DATA フレームは読み飛ばす（HTTP/2 で HEADERS に END_STREAM がなく、空の DATA で終わるもの）。HTTP/3 の本文 `ChannelBody` に `is_end_stream`（読み手が終わりまで送った）。
+  - 古い答えのない 5xx は待っていたものに渡すだけ（`Done::Error`、持たない）。待たずに 1 人で行ったリクエストが落ちたのを見ても `Slot.failed` を付け、すぐ `STALE` の時間が始まる。
+  - `cors` の `Vary: Origin` は、どのオリジンでも許して資格情報を許さない（`*`）ときも付ける：`Origin` のないリクエストの答え（CORS のヘッダなし）を、`Origin` のあるリクエストに返さないため（後ろのキャッシュ）。
 - 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる。最初に 1 回埋めて、測るものはすべて `HIT` を確かめる）。
 - 試験：`tests/http_cache.rs`、`src/l7/middleware/cache.rs` の単体テスト。

@@ -46,9 +46,18 @@ async fn backend() -> Arc<Backend> {
 				if delay > 0 {
 					tokio::time::sleep(Duration::from_millis(delay)).await;
 				}
-				let status = AxStatus::from_u16(b.status.load(Ordering::SeqCst)).unwrap();
+				let mut status = AxStatus::from_u16(b.status.load(Ordering::SeqCst)).unwrap();
+				// an unkeyed header the backend refuses (#343)
+				if headers.contains_key("x-odd") {
+					status = AxStatus::NOT_ACCEPTABLE;
+				}
 				let user = headers.get("x-forwarded-user").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-				(status, [("content-type", "application/json")], axum::Json(json!({"n": n, "user": user}))).into_response()
+				let mut resp = (status, [("content-type", "application/json")], axum::Json(json!({"n": n, "user": user}))).into_response();
+				// a session made for whoever asks for one
+				if headers.contains_key("x-session") {
+					resp.headers_mut().insert("set-cookie", "s=1".parse().unwrap());
+				}
+				resp
 			}),
 		)
 		.route(
@@ -427,4 +436,36 @@ async fn client_certificates_are_credentials() {
 	assert_eq!(tls_get(&pki, port, Some(&bob), "/data").await.0, "MISS");
 	assert_eq!(tls_get(&pki, port, None, "/data").await.0, "MISS");
 	assert_eq!(tls_get(&pki, port, None, "/data").await.0, "HIT");
+}
+
+/// A client sending what makes the backend refuse (406) or open a session (Set-Cookie) does not
+/// stop the cache for the others (#343).
+#[tokio::test]
+async fn one_client_cannot_switch_the_cache_off() {
+	let h = harness().await;
+	let b = backend().await;
+	let port = rule(&h, &b, json!({"ttl": "10s"})).await;
+	for headers in [&[("x-odd", "1")][..], &[("x-session", "1")][..]] {
+		for _ in 0..2 {
+			let r = get(port, "/data", headers).await;
+			assert_eq!(x_cache(&r), "MISS");
+		}
+	}
+	let before = b.hits.load(Ordering::SeqCst);
+	assert_eq!(x_cache(&get(port, "/data", &[]).await), "MISS");
+	assert_eq!(x_cache(&get(port, "/data", &[]).await), "HIT");
+	assert_eq!(b.hits.load(Ordering::SeqCst) - before, 1);
+}
+
+#[tokio::test]
+async fn http2_streams_ending_with_an_empty_data_frame_and_expect_continue() {
+	let h = harness().await;
+	let b = backend().await;
+	let port = rule(&h, &b, json!({"ttl": "10s"})).await;
+	// HEADERS without END_STREAM, then an empty DATA frame with END_STREAM: no body
+	assert_eq!(h2_get(port, "/e", Some("")).await, (StatusCode::OK, "MISS".into()));
+	assert_eq!(h2_get(port, "/e", Some("")).await, (StatusCode::OK, "HIT".into()));
+	// Expect: 100-continue is BYPASS (the body is not asked for)
+	let r = get(port, "/e", &[("expect", "100-continue")]).await;
+	assert_eq!(x_cache(&r), "BYPASS");
 }

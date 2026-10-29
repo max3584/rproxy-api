@@ -7,12 +7,16 @@
 //!   rules with `tls.client_auth` the client certificate as rproxy saw it.
 //! - A request that finds nothing fresh leads: it goes to the backend, and the others asking
 //!   for the same key meanwhile wait for its answer (coalescing) instead of going too, at most
-//!   `WAIT_LIMIT`. An answer that may not be kept lets the requests of the next `ttl` go to the
-//!   backend without waiting (`Store.passes`); an error without an old answer is handed to
-//!   those waiting.
+//!   `WAIT_LIMIT`. When `STRIKES` leads in a row get answers that may not be kept for a reason
+//!   of their own (Cache-Control, Set-Cookie, Vary: *, size, a stream), the requests of the
+//!   next `ttl` with the same values of the answer's `Vary` go to the backend without waiting
+//!   (`Store.passes`); a status outside `status` or a slow or broken body (which a request may
+//!   cause) starts the count again, and a fresh answer is always given first. An error
+//!   without an old answer is handed to those waiting (`Done::Error`, not kept).
 //! - `stale_on_error`: when the backend fails (5xx, rproxy's 502 / 504), the last answer is
-//!   given for that long after it went out of date. After a failure the old answer is given at
-//!   once for `ttl` (no request goes), and while one request tries again (`Slot.failed`).
+//!   given for that long after it went out of date. After a failure (of the leading request,
+//!   or of one that went alone) the old answer is given at once for `ttl` (no request goes),
+//!   and while one request tries again (`Slot.failed`).
 //! - Never kept: other methods than GET (HEAD is answered from GET's answers), requests with
 //!   `Authorization` / `Cookie` / a client certificate (unless `share_credentials`), `Range`,
 //!   `Upgrade` or a body (also HTTP/2 and HTTP/3 DATA frames without a length: `settle`);
@@ -90,6 +94,8 @@ pub const COLLECT_LIMIT: Duration = Duration::from_secs(5);
 /// HTTP/3 can send DATA frames without Content-Length).
 const BODY_PEEK: Duration = Duration::from_secs(1);
 const DEFAULT_HEADER: &str = "x-cache";
+/// Leads in a row with answers that may not be kept before requests stop waiting for leads.
+const STRIKES: u8 = 3;
 
 fn is_false(b: &bool) -> bool {
 	!*b
@@ -271,13 +277,18 @@ pub async fn settle(body: &mut Body) -> bool {
 	if body.is_end_stream() {
 		return true;
 	}
-	let first = match tokio::time::timeout(BODY_PEEK, body.frame()).await {
-		Ok(None) => {
-			*body = empty();
-			return true;
+	let until = Instant::now() + BODY_PEEK;
+	let first = loop {
+		match tokio::time::timeout_at(until, body.frame()).await {
+			Ok(None) => {
+				*body = empty();
+				return true;
+			}
+			// HTTP/2: HEADERS without END_STREAM, then an empty DATA frame that ends the stream
+			Ok(Some(Ok(f))) if f.data_ref().is_some_and(Bytes::is_empty) => continue,
+			Ok(Some(f)) => break f,
+			Err(_) => return false,
 		}
-		Ok(Some(f)) => f,
-		Err(_) => return false,
 	};
 	let rest = std::mem::replace(body, empty());
 	let failed = first.is_err();
@@ -322,14 +333,44 @@ enum Done {
 	Abandoned,
 }
 
+type Varies = Vec<(HeaderName, Option<Vec<u8>>)>;
+
 /// What the end of a flight leaves for the key.
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
 	Nothing,
-	/// The answer may not be kept: the next `ttl` goes to the backend without waiting.
-	Pass,
+	/// The answer may not be kept for a reason of its own (Cache-Control, Set-Cookie, Vary: *,
+	/// size, a stream), with its `Vary` and the request's values: one strike (`Store::strike`).
+	Strike(Varies),
+	/// Not kept for a reason a request may cause (a status outside `status`, a slow or broken
+	/// body): the strikes start again.
+	Reset,
 	/// The backend failed: the old answer is given at once for `ttl`.
 	Failed,
+}
+
+/// Strikes against a key: after `STRIKES` in a row, requests with the same `Vary` values do
+/// not wait for leads until `until`.
+struct Pass {
+	strikes: u8,
+	/// The end of the streak (each strike gives `ttl` more), and of the pass.
+	until: Instant,
+	varies: Varies,
+	/// Counted in `Store.memory`.
+	size: u64,
+}
+
+impl Pass {
+	fn on(&self, now: Instant, request: &HeaderMap) -> bool {
+		self.strikes >= STRIKES && now < self.until && self.varies.iter().all(|(name, v)| joined(request, name) == *v)
+	}
+}
+
+/// Whether an answer may be kept, by its head.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+	Keep,
+	Strike,
+	Reset,
 }
 
 struct Flight {
@@ -351,8 +392,8 @@ struct Store {
 	/// in which they go out of date).
 	order: BTreeMap<u64, Vec<u8>>,
 	memory: u64,
-	/// Keys whose answers may not be kept, until when (at most `max_entries` of them).
-	passes: HashMap<Vec<u8>, Instant>,
+	/// Keys whose answers were not kept for a reason of their own (at most `max_entries`).
+	passes: HashMap<Vec<u8>, Pass>,
 }
 
 impl Store {
@@ -375,8 +416,9 @@ impl Store {
 		self.order.remove(&seq);
 	}
 
-	/// Drops the entries past `stale_on_error` (they are at the front).
+	/// Drops the entries past `stale_on_error` (they are at the front), and passes past theirs.
 	fn purge(&mut self, now: Instant) {
+		self.sweep(now);
 		while let Some(k) = self.order.first_key_value().map(|(_, k)| k.clone()) {
 			let dead = self.map.get(&k).and_then(|s| s.entry.as_ref()).is_none_or(|e| e.stale_until <= now);
 			if !dead {
@@ -386,15 +428,43 @@ impl Store {
 		}
 	}
 
-	fn pass(&mut self, key: &[u8], until: Instant, max: usize) {
+	fn sweep(&mut self, now: Instant) {
+		let mut freed = 0;
+		self.passes.retain(|_, p| {
+			let keep = p.until > now;
+			if !keep {
+				freed += p.size;
+			}
+			keep
+		});
+		self.memory -= freed;
+	}
+
+	fn unpass(&mut self, key: &[u8]) {
+		if let Some(p) = self.passes.remove(key) {
+			self.memory -= p.size;
+		}
+	}
+
+	/// One more strike in a row (within `ttl` of the last one).
+	fn strike(&mut self, key: &[u8], varies: Varies, now: Instant, ttl: Duration, max: usize) {
+		let strikes = match self.passes.get(key) {
+			Some(p) if now < p.until => p.strikes.saturating_add(1),
+			_ => 1,
+		};
+		self.unpass(key);
 		if self.passes.len() >= max {
-			let now = Instant::now();
-			self.passes.retain(|_, t| *t > now);
+			self.sweep(now);
 			if self.passes.len() >= max {
+				let freed: u64 = self.passes.values().map(|p| p.size).sum();
 				self.passes.clear();
+				self.memory -= freed;
 			}
 		}
-		self.passes.insert(key.to_vec(), until);
+		let size =
+			(key.len() + varies.iter().map(|(n, v)| n.as_str().len() + v.as_ref().map_or(0, Vec::len) + 32).sum::<usize>() + 96) as u64;
+		self.memory += size;
+		self.passes.insert(key.to_vec(), Pass { strikes, until: now + ttl, varies, size });
 	}
 }
 
@@ -434,19 +504,22 @@ impl Lead {
 			let now = Instant::now();
 			if let Some(e) = entry {
 				cache.insert(&mut store, &self.key, e);
-				store.passes.remove(&self.key);
+				store.unpass(&self.key);
 			}
-			if mark == Mark::Pass {
-				store.pass(&self.key, now + cache.settings.ttl, cache.settings.max_entries);
+			let failed = matches!(mark, Mark::Failed);
+			match mark {
+				Mark::Strike(varies) => store.strike(&self.key, varies, now, cache.settings.ttl, cache.settings.max_entries),
+				Mark::Reset => store.unpass(&self.key),
+				Mark::Nothing | Mark::Failed => {}
 			}
 			if let Some(slot) = store.map.get_mut(&self.key) {
 				if slot.flight.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
 					slot.flight = None;
 				}
-				match mark {
-					Mark::Failed => slot.failed = Some(now),
-					_ if slot.entry.as_ref().is_some_and(|e| e.fresh_until > now) => slot.failed = None,
-					_ => {}
+				if failed {
+					slot.failed = Some(now);
+				} else if slot.entry.as_ref().is_some_and(|e| e.fresh_until > now) {
+					slot.failed = None;
 				}
 				if slot.flight.is_none() && slot.entry.is_none() {
 					store.map.remove(&self.key);
@@ -496,19 +569,26 @@ impl Cache {
 		(store.order.len(), store.memory)
 	}
 
-	fn eligible(&self, parts: &Parts, ask: &Ask) -> bool {
+	/// Whether the request may be answered from the cache by its head (`settle` looks at the
+	/// body after this, so a request that is BYPASS anyway does not wait for it). `Expect:
+	/// 100-continue` is BYPASS, so that the body is not asked for.
+	pub fn admits(&self, parts: &Parts, ask: &Ask) -> bool {
 		let h = &parts.headers;
 		let credentials = h.contains_key(header::AUTHORIZATION)
 			|| h.contains_key(header::COOKIE)
 			|| h.contains_key(header::PROXY_AUTHORIZATION)
 			|| ask.cert.is_some_and(|(given, _)| given);
 		(parts.method == Method::GET || parts.method == Method::HEAD)
-			&& ask.body_empty
+			&& !h.contains_key(header::EXPECT)
 			&& !h.contains_key(header::RANGE)
 			&& !h.contains_key(header::UPGRADE)
 			&& !h.contains_key(header::TRANSFER_ENCODING)
 			&& h.get(header::CONTENT_LENGTH).is_none_or(|v| v.as_bytes() == b"0")
 			&& (self.settings.share_credentials || !credentials)
+	}
+
+	fn eligible(&self, parts: &Parts, ask: &Ask) -> bool {
+		ask.body_empty && self.admits(parts, ask)
 	}
 
 	/// The route, scheme and port, host, path and query, the `vary` headers and the client
@@ -551,9 +631,6 @@ impl Cache {
 			let mut rx = {
 				let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
 				let now = Instant::now();
-				if store.passes.get(&key).is_some_and(|t| *t > now) {
-					return Err(Pending::alone(key, parts, head));
-				}
 				let slot = store.map.get(&key);
 				let entry = slot.and_then(|s| s.entry.as_ref()).filter(|e| e.fits(&parts.headers));
 				if let Some(e) = entry.filter(|e| now < e.fresh_until) {
@@ -568,6 +645,10 @@ impl Cache {
 						drop(store);
 						return Ok((self.answer(&e, &parts.headers, head, Outcome::Stale), Outcome::Stale));
 					}
+				}
+				// answers for this key are not kept for a reason of their own: do not wait in line
+				if store.passes.get(&key).is_some_and(|p| p.on(now, &parts.headers)) {
+					return Err(Pending::alone(key, parts, head));
 				}
 				// HEAD does not lead: its answer has no body to keep
 				if head || tries >= RETRIES {
@@ -613,15 +694,16 @@ impl Cache {
 	/// kept), or gives the out-of-date one when the backend failed.
 	pub async fn response(&self, mut pending: Box<Pending>, resp: Response<Body>) -> (Response<Body>, Outcome) {
 		let Some(key) = pending.key.take() else { return (self.mark(resp, Outcome::Bypass), Outcome::Bypass) };
+		let p = &mut *pending;
 		if resp.status().is_server_error() {
-			if let Some(e) = self.stale(&key, &pending.headers) {
-				match pending.lead.as_mut() {
+			if let Some(e) = self.stale(&key, &p.headers) {
+				match p.lead.as_mut() {
 					Some(lead) => lead.finish(Done::Stale(e.clone()), None, Mark::Failed),
 					None => self.failed(&key),
 				}
-				return (self.answer(&e, &pending.headers, pending.head, Outcome::Stale), Outcome::Stale);
+				return (self.answer(&e, &p.headers, p.head, Outcome::Stale), Outcome::Stale);
 			}
-			let Some(lead) = pending.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
+			let Some(lead) = p.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
 			// no old answer: those waiting get this error rather than all asking the failing backend
 			if !shareable(resp.headers()) {
 				lead.finish(Done::Uncacheable, None, Mark::Nothing);
@@ -630,34 +712,45 @@ impl Cache {
 			let (parts, body) = resp.into_parts();
 			return match collect(body, self.settings.max_body).await {
 				Ok(bytes) => {
-					let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &pending.headers));
+					let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &p.headers));
 					lead.finish(Done::Error(e.clone()), None, Mark::Nothing);
-					(self.answer(&e, &pending.headers, pending.head, Outcome::Miss), Outcome::Miss)
+					(self.answer(&e, &p.headers, p.head, Outcome::Miss), Outcome::Miss)
 				}
-				Err(body) => {
+				Err((body, _)) => {
 					lead.finish(Done::Uncacheable, None, Mark::Nothing);
 					(self.mark(Response::from_parts(parts, body), Outcome::Miss), Outcome::Miss)
 				}
 			};
 		}
-		let Some(lead) = pending.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
-		if !self.storable(&resp) {
-			lead.finish(Done::Uncacheable, None, Mark::Pass);
-			return (self.mark(resp, Outcome::Miss), Outcome::Miss);
+		let Some(lead) = p.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
+		let strike = |headers: &HeaderMap| Mark::Strike(varies_of(headers, &p.headers));
+		match self.verdict(&resp) {
+			Verdict::Keep => {}
+			Verdict::Strike => {
+				let mark = strike(resp.headers());
+				lead.finish(Done::Uncacheable, None, mark);
+				return (self.mark(resp, Outcome::Miss), Outcome::Miss);
+			}
+			Verdict::Reset => {
+				lead.finish(Done::Uncacheable, None, Mark::Reset);
+				return (self.mark(resp, Outcome::Miss), Outcome::Miss);
+			}
 		}
 		let (parts, body) = resp.into_parts();
 		match collect(body, self.settings.max_body).await {
 			Ok(bytes) => {
-				let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &pending.headers));
+				let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &p.headers));
 				if e.size <= self.settings.max_memory {
 					lead.finish(Done::Fresh(e.clone()), Some(e.clone()), Mark::Nothing);
 				} else {
-					lead.finish(Done::Uncacheable, None, Mark::Pass);
+					let mark = strike(&e.headers);
+					lead.finish(Done::Uncacheable, None, mark);
 				}
-				(self.answer(&e, &pending.headers, pending.head, Outcome::Miss), Outcome::Miss)
+				(self.answer(&e, &p.headers, p.head, Outcome::Miss), Outcome::Miss)
 			}
-			Err(body) => {
-				lead.finish(Done::Uncacheable, None, Mark::Pass);
+			Err((body, too_big)) => {
+				let mark = if too_big { strike(&parts.headers) } else { Mark::Reset };
+				lead.finish(Done::Uncacheable, None, mark);
 				(self.mark(Response::from_parts(parts, body), Outcome::Miss), Outcome::Miss)
 			}
 		}
@@ -680,17 +773,24 @@ impl Cache {
 		}
 	}
 
-	fn storable(&self, resp: &Response<Body>) -> bool {
+	/// Whether an answer may be kept. A status outside `status` or a `Content-Range` may come
+	/// from what one request sent (an unkeyed header the backend refuses): `Reset`, never a
+	/// strike, so that one client cannot make the others stop waiting for leads.
+	fn verdict(&self, resp: &Response<Body>) -> Verdict {
 		let h = resp.headers();
 		let streaming = h
 			.get(header::CONTENT_TYPE)
 			.and_then(|v| v.to_str().ok())
 			.is_some_and(|t| t.trim_start().get(..17).is_some_and(|t| t.eq_ignore_ascii_case("text/event-stream")));
-		self.settings.status.contains(&resp.status().as_u16())
-			&& shareable(h)
-			&& !h.contains_key(header::CONTENT_RANGE)
-			&& !streaming
-			&& h.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok()).is_none_or(|n| n <= self.settings.max_body)
+		let too_big =
+			h.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok()).is_some_and(|n| n > self.settings.max_body);
+		if !self.settings.status.contains(&resp.status().as_u16()) || h.contains_key(header::CONTENT_RANGE) {
+			Verdict::Reset
+		} else if !shareable(h) || streaming || too_big {
+			Verdict::Strike
+		} else {
+			Verdict::Keep
+		}
 	}
 
 	fn entry(&self, key: &[u8], status: StatusCode, mut headers: HeaderMap, body: Bytes, request: &HeaderMap) -> Entry {
@@ -701,19 +801,7 @@ impl Cache {
 			headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
 		}
 		let age = headers.remove(header::AGE).and_then(|v| v.to_str().ok()?.trim().parse().ok()).unwrap_or(0);
-		let mut names: Vec<HeaderName> = vary_names(&headers).iter().filter_map(|n| HeaderName::from_bytes(n.as_bytes()).ok()).collect();
-		// an encoded body is for clients that accept the encoding, whatever Vary says
-		let encoded = headers.get(header::CONTENT_ENCODING).is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
-		if encoded && !names.contains(&header::ACCEPT_ENCODING) {
-			names.push(header::ACCEPT_ENCODING);
-		}
-		let varies: Vec<(HeaderName, Option<Vec<u8>>)> = names
-			.into_iter()
-			.map(|n| {
-				let v = joined(request, &n);
-				(n, v)
-			})
-			.collect();
+		let varies = varies_of(&headers, request);
 		let size = body.len() as u64
 			+ headers.iter().map(|(n, v)| (n.as_str().len() + v.len() + 32) as u64).sum::<u64>()
 			+ varies.iter().map(|(n, v)| (n.as_str().len() + v.as_ref().map_or(0, Vec::len) + 32) as u64).sum::<u64>()
@@ -763,6 +851,23 @@ impl Cache {
 		}
 		resp
 	}
+}
+
+/// The names in the answer's `Vary` (and `Accept-Encoding` for an encoded body: it is for
+/// clients that accept the encoding, whatever Vary says) with the request's values.
+fn varies_of(headers: &HeaderMap, request: &HeaderMap) -> Varies {
+	let mut names: Vec<HeaderName> = vary_names(headers).iter().filter_map(|n| HeaderName::from_bytes(n.as_bytes()).ok()).collect();
+	let encoded = headers.get(header::CONTENT_ENCODING).is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"));
+	if encoded && !names.contains(&header::ACCEPT_ENCODING) {
+		names.push(header::ACCEPT_ENCODING);
+	}
+	names
+		.into_iter()
+		.map(|n| {
+			let v = joined(request, &n);
+			(n, v)
+		})
+		.collect()
 }
 
 /// All values of a header, joined with ", ". `Accept-Encoding` is compared by its codings:
@@ -851,17 +956,17 @@ fn empty() -> Body {
 
 /// Reads a body of at most `max` bytes within `COLLECT_LIMIT`. Otherwise (larger, slower,
 /// trailers, an error) gives back a body that sends what was read and then the rest as it
-/// comes, the error included.
-async fn collect(mut body: Body, max: u64) -> Result<Bytes, Body> {
+/// comes, the error included; and whether it was too large (`true`) rather than slow or broken.
+async fn collect(mut body: Body, max: u64) -> Result<Bytes, (Body, bool)> {
 	use hyper::body::Body as _;
 	if body.size_hint().lower() > max {
-		return Err(body);
+		return Err((body, true));
 	}
 	let until = Instant::now() + COLLECT_LIMIT;
 	let mut buf = BytesMut::new();
 	loop {
 		let Ok(frame) = tokio::time::timeout_at(until, body.frame()).await else {
-			return Err(Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed());
+			return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), false));
 		};
 		match frame {
 			None => return Ok(buf.freeze()),
@@ -869,12 +974,12 @@ async fn collect(mut body: Body, max: u64) -> Result<Bytes, Body> {
 				Ok(data) => {
 					buf.extend_from_slice(&data);
 					if buf.len() as u64 > max {
-						return Err(Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed());
+						return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), true));
 					}
 				}
-				Err(frame) => return Err(Resumed { read: Some(buf.freeze()), next: Some(Ok(frame)), rest: Some(body) }.boxed()),
+				Err(frame) => return Err((Resumed { read: Some(buf.freeze()), next: Some(Ok(frame)), rest: Some(body) }.boxed(), false)),
 			},
-			Some(Err(e)) => return Err(Resumed { read: Some(buf.freeze()), next: Some(Err(e)), rest: None }.boxed()),
+			Some(Err(e)) => return Err((Resumed { read: Some(buf.freeze()), next: Some(Err(e)), rest: None }.boxed(), false)),
 		}
 	}
 }
@@ -1030,6 +1135,10 @@ mod tests {
 		// a stream that ends without data (HTTP/3 GET)
 		let mut body = http_body_util::StreamBody::new(futures_util::stream::iter(Vec::<Result<Frame<Bytes>, BoxError>>::new())).boxed();
 		assert!(settle(&mut body).await);
+		// HTTP/2: an empty DATA frame that ends the stream
+		let frames = vec![Ok::<_, BoxError>(Frame::data(Bytes::new()))];
+		let mut body = http_body_util::StreamBody::new(futures_util::stream::iter(frames)).boxed();
+		assert!(settle(&mut body).await);
 		// DATA frames without a length: put back
 		let frames = vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"ab"))), Ok(Frame::data(Bytes::from_static(b"c")))];
 		let mut body = http_body_util::StreamBody::new(futures_util::stream::iter(frames)).boxed();
@@ -1062,15 +1171,71 @@ mod tests {
 		.enumerate()
 		{
 			let path = format!("/{i}");
-			fill(&c, &mut req("GET", &path, &[]), resp(200, &headers, "x")).await;
+			for n in 1..=STRIKES {
+				let p = ask(&c, &mut req("GET", &path, &[])).await.expect_err("not kept");
+				assert!(p.lead.is_some(), "{headers:?}: lead {n} of {STRIKES}");
+				c.response(p, resp(200, &headers, "x")).await;
+			}
 			let p = ask(&c, &mut req("GET", &path, &[])).await.expect_err("not kept");
-			assert!(p.lead.is_none(), "{headers:?}: the next ttl goes without waiting in line");
+			assert!(p.lead.is_none(), "{headers:?}: after {STRIKES} in a row the next ttl goes without waiting in line");
 		}
 		fill(&c, &mut req("GET", "/s", &[]), resp(404, &[], "x")).await;
 		assert!(ask(&c, &mut req("GET", "/s", &[])).await.is_err(), "only 200 by default");
 		let c = cache("{ttl: 10s, status: [200, 404], share_credentials: true}");
 		fill(&c, &mut req("GET", "/", &[("cookie", "s=1")]), resp(404, &[], "x")).await;
 		assert!(ask(&c, &mut req("GET", "/", &[("authorization", "x")])).await.is_ok());
+	}
+
+	/// One client cannot make the others stop waiting for leads (or skip a fresh answer).
+	#[tokio::test(start_paused = true)]
+	async fn one_client_cannot_switch_the_cache_off() {
+		let c = cache("{ttl: 1s}");
+		let lead = |c: &Arc<Cache>, headers: &'static [(&'static str, &'static str)]| {
+			let c = c.clone();
+			async move { ask(&c, &mut req("GET", "/", headers)).await.expect_err("goes to the backend") }
+		};
+		// an unkeyed header the backend refuses (406), or a slow body: never a strike
+		for _ in 0..5 {
+			let p = lead(&c, &[("x-odd", "1")]).await;
+			assert!(p.lead.is_some());
+			c.response(p, resp(406, &[], "no")).await;
+		}
+		let p = lead(&c, &[]).await;
+		assert!(p.lead.is_some(), "406s do not make a pass");
+		c.response(p, resp(200, &[], "ok")).await;
+		assert_eq!(ask(&c, &mut req("GET", "/", &[])).await.ok().unwrap().1, Outcome::Hit);
+		// a Set-Cookie once or twice (a session made for one request) does not either
+		tokio::time::advance(Duration::from_millis(1001)).await;
+		for _ in 0..STRIKES - 1 {
+			let p = lead(&c, &[]).await;
+			c.response(p, resp(200, &[("set-cookie", "s=1")], "x")).await;
+		}
+		let p = lead(&c, &[]).await;
+		assert!(p.lead.is_some(), "two strikes are not a pass");
+		c.response(p, resp(200, &[], "ok")).await;
+		// a fresh answer comes before a pass; and a pass is for the Vary values it was made with
+		let c = cache("{ttl: 1s}");
+		fill(&c, &mut req("GET", "/v", &[("accept-language", "ja")]), resp(200, &[("vary", "Accept-Language")], "ja")).await;
+		for _ in 0..STRIKES {
+			let p = ask(&c, &mut req("GET", "/v", &[("accept-language", "en")])).await.unwrap_err();
+			c.response(p, resp(200, &[("vary", "Accept-Language"), ("cache-control", "private")], "en")).await;
+		}
+		assert!(ask(&c, &mut req("GET", "/v", &[("accept-language", "en")])).await.unwrap_err().lead.is_none(), "a pass for en");
+		assert_eq!(ask(&c, &mut req("GET", "/v", &[("accept-language", "ja")])).await.ok().unwrap().1, Outcome::Hit);
+		tokio::time::advance(Duration::from_millis(1001)).await;
+		assert!(ask(&c, &mut req("GET", "/v", &[("accept-language", "ja")])).await.unwrap_err().lead.is_some(), "ja still leads");
+		// passes are counted in the memory and swept when out of date
+		let (_, bytes) = c.usage();
+		assert_eq!(bytes, 0, "the pass and the old answer are gone");
+	}
+
+	#[tokio::test]
+	async fn the_head_decides_before_the_body_is_looked_at() {
+		let c = cache("{ttl: 1s}");
+		for (method, headers) in [("POST", vec![]), ("GET", vec![("expect", "100-continue")]), ("GET", vec![("cookie", "a=1")])] {
+			assert!(!c.admits(&req(method, "/", &headers), &ASK), "{method} {headers:?}");
+		}
+		assert!(c.admits(&req("GET", "/", &[]), &ASK));
 	}
 
 	#[tokio::test]
@@ -1099,7 +1264,9 @@ mod tests {
 		let c = cache("{ttl: 10s, max_body: 1000, max_memory: 1000}");
 		let (r, o) = fill(&c, &mut req("GET", "/", &[]), resp(200, &[], Box::leak("y".repeat(900).into_boxed_str()))).await;
 		assert_eq!((o, text(r).await.len()), (Outcome::Miss, 900));
-		assert_eq!(c.usage(), (0, 0));
+		// nothing kept but the strike against the key (counted in the memory)
+		let (n, bytes) = c.usage();
+		assert!(n == 0 && bytes > 0 && bytes < 1000, "{n} {bytes}");
 	}
 
 	#[tokio::test(start_paused = true)]

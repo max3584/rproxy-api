@@ -1103,22 +1103,24 @@ impl Conn {
 					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 				},
 				Middleware::Cache(c) => {
-					// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340)
-					let simple = parts.method == hyper::Method::GET || parts.method == hyper::Method::HEAD;
-					let body_empty = simple && cache::settle(&mut body).await;
 					// the client certificate is a credential, and part of the key (#340)
 					let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
 						let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
 						(t.client_cert, format!("{} {xfcc}", t.client_verify()))
 					});
-					let ask = cache::Ask {
+					let mut ask = cache::Ask {
 						host: &host,
 						route: route_name,
 						https: self.https,
 						port: self.local.port(),
 						cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
-						body_empty,
+						body_empty: false,
 					};
+					// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
+					// for only when the head would let the cache answer
+					if c.admits(&parts, &ask) {
+						ask.body_empty = cache::settle(&mut body).await;
+					}
 					match c.request(&mut parts, &ask).await {
 						Ok((resp, outcome)) => {
 							sent.cached = Some((c.name.clone(), outcome));

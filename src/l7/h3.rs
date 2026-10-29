@@ -405,6 +405,12 @@ impl hyper::body::Body for ChannelBody {
 	) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
 		self.0.poll_recv(cx)
 	}
+
+	/// The reader has seen the end of the stream (and sent everything before it): a GET whose
+	/// stream ended with its headers (#340: the cache need not look for a body).
+	fn is_end_stream(&self) -> bool {
+		self.0.is_closed() && self.0.is_empty()
+	}
 }
 
 async fn respond(
