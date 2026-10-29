@@ -996,8 +996,9 @@ CREATE TABLE IF NOT EXISTS rproxy_global (
   PRIMARY KEY (node)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 GRANT SELECT, INSERT, UPDATE ON rproxy.rproxy_global TO 'rproxy'@'%';
-GRANT SELECT ON rproxy.rproxy_global TO 'rproxy_ui'@'%';
 ```
+
+  Only rproxy's node DB user needs privileges: `SELECT`, `INSERT` and `UPDATE` on its own row (with several rproxies, through the per-node view the UI's `db/node-view.mjs` creates). The UI never reads this table (it reads and writes the values through `GET` / `PATCH /config/global`), so its DB user gets no privileges on it.
 
 ### Listening on an address not on the host yet (v0.4.3, `features.listen_freebind`)
 

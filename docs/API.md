@@ -995,8 +995,9 @@ CREATE TABLE IF NOT EXISTS rproxy_global (
   PRIMARY KEY (node)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 GRANT SELECT, INSERT, UPDATE ON rproxy.rproxy_global TO 'rproxy'@'%';
-GRANT SELECT ON rproxy.rproxy_global TO 'rproxy_ui'@'%';
 ```
+
+  権限が要るのは rproxy のノードの DB ユーザーだけで、自分の行に `SELECT`・`INSERT`・`UPDATE`（複数の rproxy では UI の `db/node-view.mjs` が作るノードごとのビュー経由）。UI はこのテーブルを読まない（値は `GET` / `PATCH /config/global` で読み書きする）ので、UI の DB ユーザーには権限を与えない。
 
 ### まだホストにないアドレスで待ち受ける（v0.4.3、`features.listen_freebind`）
 
