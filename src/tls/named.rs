@@ -140,6 +140,7 @@ fn store_error(e: impl std::fmt::Display) -> ApiError {
 		status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
 		code: "cert_store_unavailable",
 		message: format!("certificate store {}: {e}", dir().display()),
+		reason: None,
 	}
 }
 
@@ -291,6 +292,7 @@ pub fn put(name: &str, req: &PutRequest, by: &str, if_match_header: Option<&str>
 				status: axum::http::StatusCode::PRECONDITION_FAILED,
 				code: "precondition_failed",
 				message: format!("If-Match {h:?} does not match the certificate {name:?}"),
+				reason: None,
 			});
 		}
 	}
@@ -355,6 +357,7 @@ pub fn remove(name: &str, if_match_header: Option<&str>) -> Result<CertView, Api
 				status: axum::http::StatusCode::PRECONDITION_FAILED,
 				code: "precondition_failed",
 				message: format!("If-Match {h:?} does not match the certificate {name:?}"),
+				reason: None,
 			});
 		}
 	}

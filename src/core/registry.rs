@@ -143,6 +143,8 @@ pub(super) struct Failed {
 	/// The `code` of the error (`bind_failed`, `resolve_failed`, `tls_config`,
 	/// `unsupported`, ...; `failed` for a listener that died), for `conditions`.
 	code: &'static str,
+	/// What it waits for, from the error (#347).
+	reason: Option<crate::error::Reason>,
 	retry: Option<JoinHandle<()>>,
 }
 
@@ -532,7 +534,7 @@ impl Registry {
 			.await
 			.values()
 			.filter_map(|e| match e {
-				Entry::Failed(f) if f.error.contains(NEEDS_CROWDSEC) => Some((f.spec.clone(), f.generation)),
+				Entry::Failed(f) if f.reason == Some(crate::error::Reason::NeedsCrowdsec) => Some((f.spec.clone(), f.generation)),
 				_ => None,
 			})
 			.collect();
@@ -541,10 +543,13 @@ impl Registry {
 			let key = spec.key;
 			let prepared = self.prepare(&spec).await;
 			let mut rules = self.rules.lock().await;
-			let Some(Entry::Failed(f)) = rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation)) else {
+			// still the same failed rule: not replaced, nor changed in place meanwhile (#347)
+			let Some(Entry::Failed(f)) =
+				rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation && f.spec == spec))
+			else {
 				continue;
 			};
-			let result = prepared.and_then(|p| self.start(spec, p));
+			let result = prepared.and_then(|p| self.start(spec.clone(), p));
 			match result {
 				Ok(running) => {
 					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
@@ -552,8 +557,13 @@ impl Registry {
 					started += 1;
 				}
 				Err(e) => {
+					// targets that cannot be resolved yet are retried in the background, as in `insert_failed` (#347)
+					if e.code == "resolve_failed" && f.retry.is_none() {
+						f.retry = Some(tokio::spawn(retry_start(Arc::downgrade(self), spec, generation)));
+					}
 					f.error = e.message;
 					f.code = e.code;
+					f.reason = e.reason;
 				}
 			}
 		}
@@ -575,8 +585,8 @@ impl Registry {
 			return Ok(());
 		}
 		match self.cfg.http.crowdsec() {
-			None => Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"))),
-			Some(b) if appsec && !b.has_appsec() => Err(ApiError::invalid(format!("crowdsec appsec {NEEDS_CROWDSEC}.appsec_url"))),
+			None => Err(ApiError::needs_crowdsec(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"))),
+			Some(b) if appsec && !b.has_appsec() => Err(ApiError::needs_crowdsec(format!("crowdsec appsec {NEEDS_CROWDSEC}.appsec_url"))),
 			Some(_) => Ok(()),
 		}
 	}
@@ -984,7 +994,7 @@ impl Registry {
 	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
-			return Err(ApiError::invalid(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
+			return Err(ApiError::needs_crowdsec(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
 		}
 		// geoip lists need the databases of global.geoip (#168)
 		let geoip = self.cfg.http.geoip().map(|g| g.spec());
@@ -1593,6 +1603,7 @@ impl Registry {
 					Err(e) => {
 						f.error = e.message.clone();
 						f.code = e.code;
+						f.reason = e.reason;
 						return Err(e);
 					}
 				}
@@ -1758,7 +1769,10 @@ impl Registry {
 						if let Some(Entry::Running(r)) = rules.remove(&key) {
 							let generation = self.generation();
 							let code = "tls_config";
-							rules.insert(key, Entry::Failed(Failed { generation, spec: r.spec.clone(), error, code, retry: None }));
+							rules.insert(
+								key,
+								Entry::Failed(Failed { generation, spec: r.spec.clone(), error, code, reason: None, retry: None }),
+							);
 							stopped.push((key, r));
 						}
 					}
@@ -1781,6 +1795,7 @@ impl Registry {
 						if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
 							f.error = e.message;
 							f.code = e.code;
+							f.reason = e.reason;
 						}
 					}
 					continue;
@@ -1801,6 +1816,7 @@ impl Registry {
 					if let Some(Entry::Failed(f)) = rules.get_mut(&key) {
 						f.error = e.message;
 						f.code = e.code;
+						f.reason = e.reason;
 					}
 				}
 			}
@@ -1938,7 +1954,7 @@ impl Registry {
 		let mut rules = self.rules.lock().await;
 		// the key is this rule's now (#327)
 		self.forget_invalid(&key);
-		rules.insert(key, Entry::Failed(Failed { generation, spec, error: e.message, code: e.code, retry }));
+		rules.insert(key, Entry::Failed(Failed { generation, spec, error: e.message, code: e.code, reason: e.reason, retry }));
 	}
 
 	/// The running rules' runtimes (a live upgrade reads and adds counters, #174).
@@ -2601,13 +2617,14 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 			r.stop_resolver();
 			r.stop_route_resolvers();
 			let spec = r.spec.clone();
-			rules.insert(key, Entry::Failed(Failed { generation, spec, error, code: "failed", retry: None }));
+			rules.insert(key, Entry::Failed(Failed { generation, spec, error, code: "failed", reason: None, retry: None }));
 		}
 	}
 }
 
 /// In the error of a rule that cannot run without `global.crowdsec` (or its
-/// `appsec_url`): such rules are started again once it is in force (#342).
+/// `appsec_url`, `ApiError::needs_crowdsec`): such rules are started again once
+/// it is in force (#342, #347).
 pub const NEEDS_CROWDSEC: &str = "needs global.crowdsec";
 
 /// What the rules in the table use of `global.crowdsec` (#342).
@@ -2639,6 +2656,7 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 				if let Some(Entry::Failed(f)) = registry.rules.lock().await.get_mut(&spec.key) {
 					f.error = e.message;
 					f.code = e.code;
+					f.reason = e.reason;
 					f.retry = None;
 				}
 				return;
@@ -2660,6 +2678,7 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 				if let Some(Entry::Failed(f)) = rules.get_mut(&spec.key) {
 					f.error = e.message;
 					f.code = e.code;
+					f.reason = e.reason;
 					f.retry = None;
 				}
 			}

@@ -361,6 +361,8 @@ Sends SIGTERM to the real binary (section 2 of docs/en/DESIGN-v0.4.x.md, `RPROXY
 | `a_reload_keeps_the_crowdsec_rules_need` | Reload: a new `crowdsec` is in force once it has pulled from the LAPI. A LAPI that does not answer, no `appsec_url` while a rule uses `appsec`, and removing it from the file all keep the current one (`kept`, also over other PATCHes and in the handoff state). The reload after no rule uses it removes it |
 | `a_patch_during_a_reload_is_not_undone` | A `PATCH` while a reload waits for a LAPI that does not answer comes after the reload, and what is in force agrees with `GET` (fails if the reload lets go of its turn) |
 | `rules_waiting_for_crowdsec_start_once_it_is_read` | The row could not be read at the start and a rule could not start without `crowdsec`: it starts once the check has read the row and `crowdsec` is in force |
+| `a_patch_starts_the_rules_waiting_for_crowdsec` | Rules that could not start without `crowdsec` (the rule's own `crowdsec`, the middleware, the middleware's `appsec`) start after a PATCH brings `crowdsec` with `appsec_url` (found by the error's reason, retried after the `turn` is released, #347) |
+| `a_rule_waiting_for_crowdsec_is_retried_until_its_target_resolves` | A rule waiting for `crowdsec` whose target does not resolve yet when it comes is retried in the background like any rule that cannot be resolved, and starts once the name resolves (#347) |
 | `global_in_a_later_file_of_a_directory_is_the_file_s` | With `RPROXY_CONFIG` a directory and `global` in its second file, its items are the file's (`409 static`) |
 
 ## Integration tests: performance (`tests/performance.rs`, #194, #184)

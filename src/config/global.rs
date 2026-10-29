@@ -747,6 +747,10 @@ impl State {
 		if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
 			return Err(format!("{p} is not a regular file"));
 		}
+		// the rotation would prune every file that starts with the stem (#347)
+		if name.ends_with('.') {
+			return Err(format!("{p} has an empty extension; choose another name"));
+		}
 		// the appender prunes the files that start with the name's stem and end with its extension
 		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
 		if let Some(main) = &self.opts.main_log {
@@ -909,7 +913,7 @@ impl Settings {
 		kept_crowdsec: Option<CrowdsecGlobal>,
 		from: &str,
 	) {
-		let _turn = self.turn.lock().await;
+		let turn = self.turn.lock().await;
 		let (api, kept, mut failed) = Values::read_stored(spec);
 		for (item, e) in &failed {
 			warn!(event = "restore.skip", what = "global", item, from, error = %e, "a stored global value does not read; kept as stored, not in force");
@@ -964,7 +968,10 @@ impl Settings {
 				info!(event = "restore.global", from, items = ?live_items().filter(|i| s.api.has(i.name)).map(|i| i.name).collect::<Vec<_>>());
 			}
 		}
-		// rules that could not start without it (read late by the periodic check)
+		// rules that could not start without it (read late by the periodic check);
+		// not under the turn: name resolution may take a while, and each rule is
+		// checked again (its generation, `crowdsec_gate`) under the rules lock (#347)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1012,7 +1019,7 @@ impl Settings {
 	/// away: it stays in force (`kept`, `config.global_in_use`) until no rule uses it.
 	/// Answers the items whose value in force changed.
 	pub async fn commit_file(&self, registry: &Arc<Registry>, prepared: FilePrepared) -> Vec<&'static str> {
-		let FilePrepared { _turn, file, raw, mut to, mut built, mut changed, not_in_force } = prepared;
+		let FilePrepared { _turn: turn, file, raw, mut to, mut built, mut changed, not_in_force } = prepared;
 		let before = self.state().live.clone();
 		let replaced = registry
 			.under_rules_lock(|uses| {
@@ -1061,6 +1068,8 @@ impl Settings {
 			s.settle(to, file, api);
 			brings
 		};
+		// not under the turn (#347, as in `restore`)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1102,7 +1111,7 @@ impl Settings {
 		dry_run: bool,
 	) -> Result<Patched, PatchError> {
 		let named = named_items(body).map_err(PatchError::Invalid)?;
-		let _turn = self.turn.lock().await;
+		let turn = self.turn.lock().await;
 		let (before, opts, api_before, file, api, to) = {
 			let s = self.state();
 			if s.not_loaded {
@@ -1148,10 +1157,10 @@ impl Settings {
 			.filter_map(|(i, _)| item(i))
 			.map(|d| Change {
 				item: d.name,
-				before: live_value(&before, d.name),
-				after: live_value(&to, d.name),
-				api_before: api_before.get(d.name).unwrap_or(Value::Null),
-				api_after: api.get(d.name).unwrap_or(Value::Null),
+				before: shown(d, live_value(&before, d.name)),
+				after: shown(d, live_value(&to, d.name)),
+				api_before: shown(d, api_before.get(d.name).unwrap_or(Value::Null)),
+				api_after: shown(d, api.get(d.name).unwrap_or(Value::Null)),
 			})
 			.collect();
 		let applied = differing(&before, &to);
@@ -1212,6 +1221,8 @@ impl Settings {
 			info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
 			applied.contains(&"crowdsec") && s.live.crowdsec.is_some()
 		};
+		// not under the turn (#347, as in `restore`)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1273,7 +1284,9 @@ impl Settings {
 					None => s.startup.get(i.name).cloned().unwrap_or((Source::Default, Value::Null)),
 				},
 			};
-			v.insert("value".into(), value);
+			// what may be a secret is masked (#347)
+			let shown = |v: Value| shown(i, v);
+			v.insert("value".into(), shown(value));
 			v.insert("source".into(), json!(source));
 			v.insert("apply".into(), json!(i.apply));
 			v.insert("unix_only".into(), json!(i.unix_only));
@@ -1281,7 +1294,7 @@ impl Settings {
 			let settable = i.apply == Apply::Live && !s.file.has(i.name) && !s.env.has(i.name);
 			v.insert("settable".into(), json!(settable));
 			if let Some(api) = s.api.get(i.name).or_else(|| get_at(&s.kept, i).cloned()) {
-				v.insert("api_value".into(), api);
+				v.insert("api_value".into(), shown(api));
 				v.insert("shadowed".into(), json!(matches!(source, Source::File | Source::Env)));
 			}
 			if i.name == "crowdsec" && s.kept_crowdsec.is_some() && s.live.crowdsec == s.kept_crowdsec && !s.file.has("crowdsec") {
@@ -1313,6 +1326,100 @@ impl Settings {
 			"warnings": warnings,
 		})
 	}
+}
+
+/// What `GET /config/global` shows in place of a value that may be a secret (#347).
+pub const MASKED: &str = "***";
+
+/// An item's value as `GET` / `PATCH /config/global` show it (#347): a restart
+/// item `redacted`, the user and query of `crowdsec`'s URLs masked.
+fn shown(i: &Item, v: Value) -> Value {
+	match (i.apply, i.name, v) {
+		(Apply::Restart, name, v) => redacted(name, v),
+		(_, "crowdsec", Value::Object(mut m)) => {
+			for k in ["lapi_url", "appsec_url"] {
+				if let Some(Value::String(u)) = m.get_mut(k) {
+					*u = masked_url(u);
+				}
+			}
+			Value::Object(m)
+		}
+		(_, _, v) => v,
+	}
+}
+
+/// A restart item's value as `GET /config/global` shows it (#347): written by hand,
+/// so it may hold secrets inline. `acme` (accounts, contacts, EAB, DNS calls) keeps
+/// only its shape: every string is masked. In the others, headers, request bodies,
+/// anything named like a secret (`secret`, `token`, `key`, `password`, `credential`,
+/// `eab`; the files' places too) and the user and query of URLs are masked.
+fn redacted(item: &str, v: Value) -> Value {
+	if item == "acme" {
+		return masked(v);
+	}
+	redact_named(v)
+}
+
+/// Parts of names whose values `redacted` masks.
+const SECRET_NAMES: [&str; 8] = ["headers", "body", "secret", "token", "key", "password", "credential", "eab"];
+
+fn redact_named(v: Value) -> Value {
+	match v {
+		Value::Object(m) => Value::Object(
+			m.into_iter()
+				.map(|(k, v)| {
+					let lower = k.to_ascii_lowercase();
+					let v = if SECRET_NAMES.iter().any(|n| lower.contains(n)) {
+						masked(v)
+					} else if lower == "url" || lower.ends_with("_url") {
+						match v {
+							Value::String(u) => Value::String(masked_url(&u)),
+							other => redact_named(other),
+						}
+					} else {
+						redact_named(v)
+					};
+					(k, v)
+				})
+				.collect(),
+		),
+		Value::Array(a) => Value::Array(a.into_iter().map(redact_named).collect()),
+		other => other,
+	}
+}
+
+/// Every string masked; the shape (keys, numbers, booleans, null) kept.
+fn masked(v: Value) -> Value {
+	match v {
+		Value::String(_) => Value::String(MASKED.into()),
+		Value::Object(m) => Value::Object(m.into_iter().map(|(k, v)| (k, masked(v))).collect()),
+		Value::Array(a) => Value::Array(a.into_iter().map(masked).collect()),
+		other => other,
+	}
+}
+
+/// A URL without its user (and password), query and fragment.
+fn masked_url(u: &str) -> String {
+	let u = u.split_once('#').map_or(u, |(base, _)| base);
+	let (u, query) = match u.split_once('?') {
+		Some((base, _)) => (base, true),
+		None => (u, false),
+	};
+	let mut out = match u.split_once("://") {
+		Some((scheme, rest)) => {
+			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+			match authority.rsplit_once('@') {
+				Some((_, host)) => format!("{scheme}://{MASKED}@{host}{path}"),
+				None => u.to_string(),
+			}
+		}
+		None => u.to_string(),
+	};
+	if query {
+		out.push('?');
+		out.push_str(MASKED);
+	}
+	out
 }
 
 /// Takes what `commit` swaps in out of `built`, leaving the fallback flag.
@@ -1395,6 +1502,41 @@ mod tests {
 			reserved: vec![],
 			http: Arc::new(crate::l7::access::HttpGlobal::default()),
 		})
+	}
+
+	#[test]
+	fn restart_items_are_shown_without_their_secrets() {
+		let acme = json!({"accounts": {"le": {"contact": ["mailto:a@example.com"], "eab": {"kid": "k1", "hmac_key_file": "/s/h"}}},
+			"dns_providers": {"x": {"kind": "http", "zones": ["example.com"], "ttl": 60,
+				"add": {"url": "https://h/add?token=t", "headers": {"Authorization": "Bearer t"}}}}});
+		let acme = redacted("acme", acme);
+		assert_eq!(acme["accounts"]["le"]["contact"], json!([MASKED]));
+		assert_eq!(acme["accounts"]["le"]["eab"], json!({"kid": MASKED, "hmac_key_file": MASKED}));
+		assert_eq!(acme["dns_providers"]["x"]["add"]["headers"], json!({"Authorization": MASKED}));
+		assert_eq!((&acme["dns_providers"]["x"]["zones"], &acme["dns_providers"]["x"]["ttl"]), (&json!([MASKED]), &json!(60)));
+		assert!(!acme.to_string().contains("example.com") && !acme.to_string().contains("Bearer"));
+		let other = json!({"tls": {"cert_file": "/c.pem", "key_file": "/k.pem", "client_secret": "s"}, "api_token": "t",
+			"url": "https://u:p@h:1/x?token=t", "lapi_url": "http://h/", "workers": 2,
+			"call": {"headers": {"X-Api-Key": "k"}, "body": "{\"token\":\"t\"}"}});
+		assert_eq!(
+			redacted("performance", other),
+			json!({"tls": {"cert_file": "/c.pem", "key_file": MASKED, "client_secret": MASKED}, "api_token": MASKED,
+				"url": format!("https://{MASKED}@h:1/x?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
+				"call": {"headers": {"X-Api-Key": MASKED}, "body": MASKED}})
+		);
+		// in the view: the file's acme, and a kept one (stored by a later release)
+		let r = registry();
+		let s = r.global();
+		let (spec, raw) = file("acme: {accounts: {le: {contact: [\"mailto:a@example.com\"]}}}\n");
+		s.init(Some((&spec, &raw)), Values::default(), BTreeMap::new(), Options::default());
+		let view = s.view();
+		assert_eq!(view["items"]["acme"]["value"]["accounts"]["le"]["contact"], json!([MASKED]), "{view}");
+		assert!(!view.to_string().contains("a@example.com"), "{view}");
+		assert_eq!(masked_url("http://u:p@h:8080/v1?k=t#f"), format!("http://{MASKED}@h:8080/v1?{MASKED}"));
+		assert_eq!(masked_url("http://h:8080/#f"), "http://h:8080/");
+		let cs = item("crowdsec").unwrap();
+		let v = shown(cs, json!({"lapi_url": "http://u:p@lapi/?k=t", "appsec_url": "http://w/#x", "api_key_file": "/k"}));
+		assert_eq!(v, json!({"lapi_url": format!("http://{MASKED}@lapi/?{MASKED}"), "appsec_url": "http://w/", "api_key_file": "/k"}));
 	}
 
 	#[test]
@@ -1526,6 +1668,7 @@ mod tests {
 			dir.join("r.log"),
 			dir.join("rproxy-access.log"),
 			dir.join(".hidden.log"),
+			dir.join("x."),
 		] {
 			assert!(matches!(refused(p.clone()).await, Err(PatchError::Protected(_))), "{}", p.display());
 		}
@@ -1538,6 +1681,7 @@ mod tests {
 		std::os::unix::fs::symlink("/etc/passwd", dir.join("link.log")).unwrap();
 		assert!(matches!(refused(dir.join("link.log")).await, Err(PatchError::Protected(_))));
 		assert!(refused(dir.join("access.log")).await.is_ok());
+		assert!(matches!(refused(dir.join("web.")).await, Err(PatchError::Protected(ref m)) if m.contains("empty extension")));
 		// restored values are checked the same way: not in force
 		s.restore(&r, &json!({"access_log": "/etc/s.conf"}), None, None, None, None, "database").await;
 		let view = s.view();

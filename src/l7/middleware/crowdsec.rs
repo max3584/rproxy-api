@@ -24,6 +24,7 @@ use crate::l7::server::Body;
 use crate::l7::{HttpSpec, MiddlewareSpec};
 use crate::net::cidr::Cidr;
 use crate::config::CrowdsecGlobal;
+use crate::core::registry::NEEDS_CROWDSEC;
 use crate::error::ApiError;
 
 /// Default of `update_interval`, as in the CrowdSec bouncers.
@@ -474,12 +475,12 @@ pub fn check_refs(spec: &HttpSpec, bouncer: Option<&Arc<Bouncer>>) -> Result<(),
 		let MiddlewareSpec::Crowdsec { appsec, .. } = m else { continue };
 		match bouncer {
 			None => {
-				return Err(ApiError::invalid(format!(
-					"middleware {name}: crowdsec needs global.crowdsec (the settings file or PATCH /config/global)"
+				return Err(ApiError::needs_crowdsec(format!(
+					"middleware {name}: crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"
 				)))
 			}
 			Some(b) if *appsec && !b.has_appsec() => {
-				return Err(ApiError::invalid(format!("middleware {name}: appsec needs global.crowdsec.appsec_url")))
+				return Err(ApiError::needs_crowdsec(format!("middleware {name}: appsec {NEEDS_CROWDSEC}.appsec_url")))
 			}
 			_ => {}
 		}

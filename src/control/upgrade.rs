@@ -256,6 +256,7 @@ pub async fn guard(req: Request, next: Next) -> Response {
 			status: StatusCode::SERVICE_UNAVAILABLE,
 			code: "shutting_down",
 			message: "rproxy is shutting down; send changes to another instance".into(),
+			reason: None,
 		}
 		.into_response();
 	}
@@ -266,7 +267,7 @@ pub async fn guard(req: Request, next: Next) -> Response {
 }
 
 pub(crate) fn upgrading(message: &str) -> ApiError {
-	ApiError { status: StatusCode::SERVICE_UNAVAILABLE, code: "upgrading", message: message.into() }
+	ApiError { status: StatusCode::SERVICE_UNAVAILABLE, code: "upgrading", message: message.into(), reason: None }
 }
 
 /// `POST /admin/upgrade`: a handoff to the binary now on disk (`admin`, by
@@ -280,7 +281,7 @@ pub async fn upgrade(State(state): State<Arc<AppState>>, transport: Option<Exten
 	};
 	match u.upgrader.start(None, "api") {
 		Ok(()) => (StatusCode::ACCEPTED, Json(json!({"status": "started"}))).into_response(),
-		Err(e) => ApiError { status: StatusCode::CONFLICT, code: "upgrading", message: e }.into_response(),
+		Err(e) => ApiError { status: StatusCode::CONFLICT, code: "upgrading", message: e, reason: None }.into_response(),
 	}
 }
 
