@@ -231,7 +231,16 @@ impl Entry {
 						v.http3 = r.spec.http.as_ref().is_some_and(|h| h.http3).then(|| r.rt.h3.view());
 						v
 					}),
-					targets: if pool.reported { pool.status() } else { vec![] },
+					targets: if pool.shown() { pool.status() } else { vec![] },
+					tls_routes: r
+						.rt
+						.routes
+						.read()
+						.unwrap()
+						.iter()
+						.filter(|t| t.pool.members.len() > 1 || t.pool.capped())
+						.map(|t| crate::core::rule::RouteTargetsStatus { server_names: t.patterns.clone(), targets: t.pool.status() })
+						.collect(),
 				};
 				view.all_targets_down = pool.all_down();
 				if let Some(http) = &view.stats.http {
@@ -981,10 +990,13 @@ impl Registry {
 			let active = before.and_then(|p| p.counter_for(&t, &mut taken));
 			pool_members.push(Arc::new(Member::new(t, tx, active)));
 		}
-		// one target with `max_connections` (#341) shows its count and `full` too
-		let reported = pool_members.len() > 1 || spec.health_check.is_some() || pool_members.iter().any(|m| m.spec.max_connections.is_some());
+		let reported = pool_members.len() > 1 || spec.health_check.is_some();
 		let outlier = crate::core::outlier::L4Outlier::new(spec.outlier_detection.as_ref());
-		let pool = Arc::new(Pool::new(pool_members, spec.balance, events.clone(), reported).with_outlier(outlier));
+		let mut pool = Pool::new(pool_members, spec.balance, events.clone(), reported).with_outlier(outlier);
+		if let Some(before) = before {
+			pool = pool.retiring(before, &taken);
+		}
+		let pool = Arc::new(pool);
 		if let Some(check) = spec.health_check.clone().filter(|_| !pool.members.is_empty()) {
 			let stop = kill.child_token();
 			balance::spawn_health_checks(spec.key, pool.clone(), check, stop.clone());
@@ -1012,7 +1024,10 @@ impl Registry {
 				pool_members.push(Arc::new(Member::new(t, tx, active)));
 			}
 			let events = Arc::new(watch::channel(0).0);
-			let pool = Pool::new(pool_members, route.balance, events, false).with_outlier(crate::core::outlier::L4Outlier::new(None));
+			let mut pool = Pool::new(pool_members, route.balance, events, false).with_outlier(crate::core::outlier::L4Outlier::new(None));
+			if let Some(old) = old {
+				pool = pool.retiring(old, &taken);
+			}
 			targets.push(RouteTarget {
 				patterns,
 				passthrough: route.passthrough,
@@ -2160,7 +2175,7 @@ impl Registry {
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
 			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
 			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, sending failed, or over bandwidth).", vec![]),
-			("rproxy_rule_limited_total", "counter", "Connections (TCP) or datagrams (UDP) refused by the rule's limits (or, UDP, the default cap of sessions), by reason.", vec![]),
+			("rproxy_rule_limited_total", "counter", "Connections (TCP), datagrams (UDP) or requests (http, target_full) refused by the rule's limits (or, UDP, the default cap of sessions), or because every target was at its max_connections (reason target_full), by reason.", vec![]),
 			("rproxy_rule_bandwidth_dropped_total", "counter", "UDP datagrams dropped over the rule's bandwidth.", vec![]),
 		];
 		for (key, entry) in rules.iter() {
@@ -2286,17 +2301,33 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	for key in keys {
 		let Some(Entry::Running(r)) = rules.get(key) else { continue };
 		let pool = r.rt.pool();
-		if !pool.reported {
-			continue;
-		}
-		all_down.push(format!("rproxy_rule_all_targets_down{{protocol=\"{}\",listen=\"{}\"}} {}", key.protocol, key.listen, u8::from(pool.all_down())));
-		for t in pool.status() {
+		let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+		let mut one = |route: Option<&str>, t: crate::core::balance::TargetStatus, reported: bool| {
 			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false, max_connections: None }.remote();
-			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, target.replace('"', "\\\""));
-			up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
+			let route = route.map(|r| format!(",route=\"{}\"", esc(r))).unwrap_or_default();
+			let labels = format!("protocol=\"{}\",listen=\"{}\"{route},target=\"{}\"", key.protocol, key.listen, esc(&target));
+			// up / down only where it is reported (several targets or a health check), as before #341
+			if reported {
+				up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
+			}
 			conns.push(format!("rproxy_target_connections{{{labels}}} {}", t.connections));
 			if t.max_connections.is_some() {
 				full.push(format!("rproxy_target_full{{{labels}}} {}", u8::from(t.full)));
+			}
+		};
+		if pool.reported {
+			all_down.push(format!("rproxy_rule_all_targets_down{{protocol=\"{}\",listen=\"{}\"}} {}", key.protocol, key.listen, u8::from(pool.all_down())));
+		}
+		if pool.shown() {
+			for t in pool.status() {
+				one(None, t, pool.reported);
+			}
+		}
+		// the targets of `tls.routes[]` shown in `stats.tls_routes` (#341), with the route's names
+		for route in r.rt.routes.read().unwrap().iter().filter(|t| t.pool.members.len() > 1 || t.pool.capped()) {
+			let names = route.patterns.join(",");
+			for t in route.pool.status() {
+				one(Some(&names), t, false);
 			}
 		}
 	}
@@ -2310,7 +2341,7 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	for line in all_down {
 		let _ = writeln!(out, "{line}");
 	}
-	let _ = writeln!(out, "# HELP rproxy_target_connections Open TCP connections or UDP sessions per target.");
+	let _ = writeln!(out, "# HELP rproxy_target_connections Open TCP connections or UDP sessions per target (route: the tls.routes entry's names, for its targets).");
 	let _ = writeln!(out, "# TYPE rproxy_target_connections gauge");
 	for line in conns {
 		let _ = writeln!(out, "{line}");

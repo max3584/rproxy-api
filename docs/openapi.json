@@ -1745,11 +1745,36 @@
             "items": {
               "$ref": "#/components/schemas/TargetStatus"
             },
-            "description": "Rules with several targets or a health_check."
+            "description": "Rules with several targets or a health_check, or a target with max_connections (v0.4.19, #341)."
+          },
+          "tls_routes": {
+            "type": "array",
+            "description": "The targets of tls.routes[] with several targets or a max_connections, in the order of tls.routes (v0.4.19, #341).",
+            "items": {
+              "type": "object",
+              "properties": {
+                "server_names": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "targets": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TargetStatus"
+                  }
+                }
+              },
+              "required": [
+                "server_names",
+                "targets"
+              ]
+            }
           },
           "limited": {
             "type": "integer",
-            "description": "Refused by limits (v0.4, #165)"
+            "description": "Refused by limits (v0.4, #165), or because every target was full (reason target_full, v0.4.19, #341)"
           },
           "counters_since": {
             "type": "integer",
@@ -2443,7 +2468,18 @@
             "type": "integer",
             "description": "v0.4, #170"
           }
-        }
+        },
+        "required": [
+          "addr",
+          "port",
+          "up",
+          "connections",
+          "full",
+          "total_connections",
+          "resolved",
+          "ejected_until",
+          "ejections"
+        ]
       },
       "CertStatus": {
         "type": "object",

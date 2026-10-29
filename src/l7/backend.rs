@@ -456,7 +456,8 @@ impl Service {
 	/// Some server is at its `max_connections`: when `pick` found none, the request is
 	/// refused for that (`limits::Reason::TargetFull`, #341) rather than for servers down.
 	pub fn is_full(&self) -> bool {
-		self.capped() && self.servers.iter().any(Server::is_full)
+		// a full server that would be picked if it had room (up by its health check)
+		self.capped() && self.servers.iter().any(|s| s.is_full() && s.up.load(Ordering::Relaxed))
 	}
 
 	/// Some server has `max_connections`.

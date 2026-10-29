@@ -850,6 +850,50 @@ async fn terminate_does_not_stall_under_backpressure() {
 }
 
 #[tokio::test]
+async fn a_tls_route_target_takes_its_max_connections_and_a_patch_keeps_the_count() {
+	// #341: max_connections of tls.routes[].targets[], shown in stats.tls_routes
+	let pki = Pki::new("sni-caps");
+	let cert = pki.server("backend", &["a.test"]);
+	let (a, b, fallback) = (tls_backend(&pki, &cert, "A:").await, tls_backend(&pki, &cert, "B:").await, tls_backend(&pki, &cert, "D:").await);
+	let h = harness().await;
+	let port = free_port();
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	let routes = |targets: Value| json!({"mode": "sni", "routes": [{"server_name": "a.test", "balance": "failover", "targets": targets}]});
+	let (status, v) = h.post(tcp_rule(port, fallback, routes(json!([{"addr": "127.0.0.1", "port": a.port(), "max_connections": 1}])))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+
+	// one connection held open on A
+	let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let mut held = pki.connector(None).connect("a.test".to_string().try_into().unwrap(), tcp).await.unwrap();
+	held.write_all(b"1").await.unwrap();
+	let mut buf = [0u8; 16];
+	let n = held.read(&mut buf).await.unwrap();
+	assert_eq!(&buf[..n], b"A:1");
+	let v = wait_for(&h, &path, |v| v["stats"]["tls_routes"][0]["targets"][0]["full"] == true).await;
+	assert_eq!(v["stats"]["tls_routes"][0]["server_names"], json!(["a.test"]), "{v}");
+	assert!(v["stats"]["targets"].is_null(), "the rule's own single target is not shown: {v}");
+	// full: the next one is refused, the other names are not affected
+	assert!(tls_roundtrip(&pki, port, "a.test", None, "2").await.is_err());
+	wait_for(&h, &path, |v| v["stats"]["limited"] == 1).await;
+	let metrics = h.http.get(format!("{}/metrics", h.base)).send().await.unwrap().text().await.unwrap();
+	assert!(
+		metrics.contains(&format!("rproxy_target_full{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",route=\"a.test\",target=\"{a}\"}} 1")),
+		"{metrics}"
+	);
+
+	// a PATCH of the routes (same names) keeps counting the open connection on A
+	let both = routes(json!([{"addr": "127.0.0.1", "port": a.port(), "max_connections": 1}, {"addr": "127.0.0.1", "port": b.port()}]));
+	let mut body = rule("tcp", port, fallback);
+	body["tls"] = both;
+	let (status, v) = h.patch(&format!("tcp/127.0.0.1/{port}"), body).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(tls_roundtrip(&pki, port, "a.test", None, "3").await.unwrap(), "B:3", "A is still full");
+	drop(held);
+	wait_for(&h, &path, |v| v["stats"]["tls_routes"][0]["targets"][0]["connections"] == 0).await;
+	assert_eq!(tls_roundtrip(&pki, port, "a.test", None, "4").await.unwrap(), "A:4");
+}
+
+#[tokio::test]
 async fn a_tls_route_spreads_over_several_targets() {
 	// #234: TLSRoute with several backends
 	let pki = Pki::new("sni-targets");

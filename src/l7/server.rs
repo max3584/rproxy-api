@@ -1552,7 +1552,8 @@ impl Conn {
 			}
 			let Some((index, counted)) = picked else {
 				if service.is_full() {
-					// counted and logged (`conn.limited`, at most `Throttle`'s rate per client) as `limits` refusals
+					// counted and logged as `limits` refusals (`conn.limited` with `reason: target_full`, at most
+					// `Throttle`'s rate per client: a flood of 503s must not flood the log); `http.access` has the 503
 					crate::core::limits::refused(&self.rt, SocketAddr::new(client_ip, self.client.port()), crate::core::limits::Reason::TargetFull, "http");
 				} else {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, status = 503, error = "no server is up");
@@ -1567,6 +1568,8 @@ impl Conn {
 			// a `status` entry answers itself (#235)
 			if let Some(status) = server.status {
 				if again_after(status) {
+					// its place is not held while waiting to try again
+					drop(counted);
 					if let Some(p) = &retry {
 						tokio::time::sleep(p.wait(attempt + 1)).await;
 					}
@@ -1670,6 +1673,7 @@ impl Conn {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
 						status = resp.status().as_u16(), error = "status to retry", attempt, attempts);
 					drop(resp);
+					drop(counted);
 					if let Some(p) = &retry {
 						tokio::time::sleep(p.wait(attempt + 1)).await;
 					}
@@ -1681,6 +1685,7 @@ impl Conn {
 					if attempt >= attempts {
 						return error_response(status);
 					}
+					drop(counted);
 					if let Some(p) = &retry {
 						tokio::time::sleep(p.wait(attempt + 1)).await;
 					}
@@ -1692,7 +1697,9 @@ impl Conn {
 		if server.status.is_some() {
 			return resp;
 		}
-		if sticky.as_deref() != Some(server.id.as_str()) {
+		// a client pinned to a server that is up but was full just now (#341) keeps its pin
+		let pinned = sticky.as_deref().is_some_and(|id| service.servers.iter().any(|s| s.id == id && s.is_up()));
+		if sticky.as_deref() != Some(server.id.as_str()) && !pinned {
 			if let Some(cookie) = service.sticky_cookie(server, self.https) {
 				resp.headers_mut().append(header::SET_COOKIE, cookie);
 			}

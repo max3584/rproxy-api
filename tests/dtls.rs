@@ -68,6 +68,41 @@ async fn dtls_is_terminated_and_forwarded_as_plain_udp() {
 }
 
 #[tokio::test]
+async fn dtls_sessions_count_against_the_target_cap() {
+	// #341: a terminated DTLS session takes a place of its target's max_connections
+	let pki = Pki::new("dtls-caps");
+	let cert = pki.server("front", &["media.test"]);
+	let h = harness().await;
+	let port = free_udp_port();
+	let backend = udp_backend("P:").await;
+	let mut body = dtls_rule(port, backend, json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]}));
+	let obj = body.as_object_mut().unwrap();
+	obj.remove("remote_addr");
+	obj.remove("remote_port");
+	body["targets"] = json!([{"addr": "127.0.0.1", "port": backend.port(), "max_connections": 1}]);
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+
+	let c1 = dtls_client(&pki, port, "media.test", None).await.unwrap();
+	assert_eq!(dtls_roundtrip(&c1, "a").await, "P:a");
+	// the target is full: the second client's datagrams are dropped (each one counted), or, had
+	// a place come free meanwhile, its session would end after the handshake; nothing is forwarded
+	if let Ok(c2) = dtls_client(&pki, port, "media.test", None).await {
+		let _ = c2.write(b"b", None).await;
+		let mut buf = vec![0u8; 1500];
+		let read = tokio::time::timeout(Duration::from_millis(500), c2.read(&mut buf, None)).await;
+		assert!(!matches!(read, Ok(Ok(n)) if &buf[..n] == b"P:b"), "the second session was forwarded");
+	}
+	let v = wait_for(&h, &path, |v| v["stats"]["limited"].as_u64().is_some_and(|n| n >= 1)).await;
+	assert_eq!(v["stats"]["targets"][0]["full"], true, "{v}");
+	c1.close().await.unwrap();
+	wait_for(&h, &path, |v| v["stats"]["targets"][0]["connections"] == 0).await;
+	let c3 = dtls_client(&pki, port, "media.test", None).await.unwrap();
+	assert_eq!(dtls_roundtrip(&c3, "c").await, "P:c");
+}
+
+#[tokio::test]
 async fn dtls_client_certificates_can_be_required() {
 	let pki = Pki::new("dtls-mtls");
 	let cert = pki.server("front", &["media.test"]);

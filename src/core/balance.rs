@@ -217,22 +217,47 @@ pub struct Pool {
 	capped: bool,
 	/// `outlier_detection` (the defaults without it); PATCH changes it in place.
 	outlier: RwLock<L4Outlier>,
+	/// Counts of targets of earlier pools that this one does not have, while connections to
+	/// them are open (`remote`, count): a later PATCH that adds the target back counts them.
+	retired: Vec<(String, std::sync::Weak<AtomicU64>)>,
 }
 
 impl Pool {
 	pub fn new(members: Vec<Arc<Member>>, balance: Balance, events: Arc<watch::Sender<u64>>, reported: bool) -> Pool {
 		let capped = members.iter().any(|m| m.max != 0);
-		Pool { members, balance, next: AtomicU64::new(0), events, reported, capped, outlier: RwLock::new(L4Outlier::default()) }
+		Pool { members, balance, next: AtomicU64::new(0), events, reported, capped, outlier: RwLock::new(L4Outlier::default()), retired: vec![] }
 	}
 
 	/// The count of open connections to hand on to the target `spec` of a pool that
 	/// replaces this one: that of the first target of the same address and port not yet
 	/// handed on (`taken`), so what is still open here counts against the new pool's caps.
+	/// Also the count of such a target an earlier PATCH took out, while its connections last.
 	pub fn counter_for(&self, spec: &TargetSpec, taken: &mut Vec<usize>) -> Option<Arc<AtomicU64>> {
 		let remote = spec.remote();
-		let i = (0..self.members.len()).find(|i| !taken.contains(i) && self.members[*i].spec.remote() == remote)?;
-		taken.push(i);
-		Some(self.members[i].active.clone())
+		let n = self.members.len();
+		if let Some(i) = (0..n).find(|i| !taken.contains(i) && self.members[*i].spec.remote() == remote) {
+			taken.push(i);
+			return Some(self.members[i].active.clone());
+		}
+		let (j, count) = self.retired.iter().enumerate().find_map(|(j, (r, w))| {
+			if taken.contains(&(n + j)) || *r != remote {
+				return None;
+			}
+			w.upgrade().map(|c| (j, c))
+		})?;
+		taken.push(n + j);
+		Some(count)
+	}
+
+	/// Keeps the counts of `before`'s targets this pool did not take (`taken` of
+	/// `counter_for`) while their connections last, for a later pool (`counter_for`).
+	pub fn retiring(mut self, before: &Pool, taken: &[usize]) -> Pool {
+		let n = before.members.len();
+		let from_members = before.members.iter().enumerate().filter(|(i, _)| !taken.contains(i)).map(|(_, m)| (m.spec.remote(), Arc::downgrade(&m.active)));
+		let from_retired =
+			before.retired.iter().enumerate().filter(|(j, (_, w))| !taken.contains(&(n + j)) && w.strong_count() > 0).map(|(_, r)| r.clone());
+		self.retired = from_members.chain(from_retired).collect();
+		self
 	}
 
 	/// Some target has `max_connections`.
@@ -240,9 +265,29 @@ impl Pool {
 		self.capped
 	}
 
-	/// Every target is at its `max_connections` (false without caps): new connections are refused.
+	/// Whether `stats.targets` shows the targets: when their states are reported, or
+	/// for their `max_connections` (a single capped target is shown, but its up / down
+	/// is not reported: no `target.down` / `all_targets_down` it did not have before).
+	pub fn shown(&self) -> bool {
+		self.reported || self.capped
+	}
+
+	/// No target can take a new connection for `max_connections` (false without caps): every
+	/// target that is up is full, or (none up) every target is. New connections are refused
+	/// then (`order` puts only full targets in), as `http` does; down targets are tried only
+	/// while none is up, as before caps.
 	pub fn all_full(&self) -> bool {
-		self.capped && self.members.iter().all(|m| m.is_full())
+		if !self.capped {
+			return false;
+		}
+		let (mut up, mut up_open, mut open) = (false, false, false);
+		for m in &self.members {
+			let (is_up, room) = (m.is_up(), !m.is_full());
+			up |= is_up;
+			open |= room;
+			up_open |= is_up && room;
+		}
+		!up_open && (up || !open)
 	}
 
 	pub fn with_outlier(self, outlier: L4Outlier) -> Pool {
@@ -330,14 +375,16 @@ impl Pool {
 	/// target is marked down). A target at its `max_connections` (#341) is skipped
 	/// like one that is down, and comes last of all: `Lease::take` refuses it unless
 	/// a connection has ended in the meantime (with `failover`, targets fill up in
-	/// order, and backups take what the full primaries cannot).
+	/// order, and backups take what the full primaries cannot). When every target that
+	/// is up is full, the down ones are left out (the connection is refused, `all_full`).
 	pub fn order(&self) -> Vec<Arc<Member>> {
 		let n = self.members.len();
 		if n > 64 {
 			return self.order_slow();
 		}
 		// each target looked at once: the sets as bits (at most `MAX_TARGETS`), one allocation (the result)
-		let (mut open, mut up, mut backup) = (0u64, 0u64, 0u64);
+		// `up`: up with room; `alive`: up, full or not (only with caps)
+		let (mut open, mut up, mut alive, mut backup) = (0u64, 0u64, 0u64, 0u64);
 		for (i, m) in self.members.iter().enumerate() {
 			let bit = 1u64 << i;
 			// one branch per target without caps
@@ -346,10 +393,17 @@ impl Pool {
 				if m.is_up() {
 					up |= bit;
 				}
+			} else if m.is_up() {
+				alive |= bit;
 			}
 			if m.spec.backup {
 				backup |= bit;
 			}
+		}
+		// every target that is up is full: not the down ones either
+		let mut down = 0;
+		if up == 0 && alive != 0 {
+			(down, open) = (open, 0);
 		}
 		let (primary, backups) = (up & !backup, up & backup);
 		let mut eligible = [0usize; 64];
@@ -375,21 +429,23 @@ impl Pool {
 			}
 		}
 		let all = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+		let full = all & !(open | down);
 		for i in bits(primary).chain(bits(backups)).chain(bits(open)) {
 			push(i);
 		}
-		if self.capped {
-			for i in bits(all) {
-				push(i);
-			}
+		// the full ones last (`Lease::take` lets one in if a place came free)
+		for i in bits(full) {
+			push(i);
 		}
 		out
 	}
 
 	/// `order` for more targets than a u64 has bits (not reached: `MAX_TARGETS`).
 	fn order_slow(&self) -> Vec<Arc<Member>> {
-		let open = |i: usize| !self.capped || !self.members[i].is_full();
-		let up: Vec<usize> = (0..self.members.len()).filter(|&i| self.members[i].is_up() && open(i)).collect();
+		let room = |i: usize| !self.capped || !self.members[i].is_full();
+		let up: Vec<usize> = (0..self.members.len()).filter(|&i| self.members[i].is_up() && room(i)).collect();
+		let alive = (0..self.members.len()).any(|i| self.members[i].is_up());
+		let open = |i: usize| room(i) && (!up.is_empty() || !alive);
 		let primary: Vec<usize> = up.iter().copied().filter(|&i| !self.members[i].spec.backup).collect();
 		let backup: Vec<usize> = up.iter().copied().filter(|&i| self.members[i].spec.backup).collect();
 		let eligible = if primary.is_empty() { &backup } else { &primary };
@@ -404,11 +460,9 @@ impl Pool {
 				order.push(i);
 			}
 		}
-		if self.capped {
-			for i in 0..self.members.len() {
-				if !order.contains(&i) {
-					order.push(i);
-				}
+		for i in 0..self.members.len() {
+			if !order.contains(&i) && !room(i) {
+				order.push(i);
 			}
 		}
 		order.into_iter().map(|i| self.members[i].clone()).collect()
@@ -658,7 +712,11 @@ mod tests {
 				Arc::new(Member::new(spec, Arc::new(tx), active))
 			})
 			.collect();
-		Pool::new(members, balance, Arc::new(watch::channel(0).0), true)
+		let p = Pool::new(members, balance, Arc::new(watch::channel(0).0), true);
+		match before {
+			Some(b) => p.retiring(b, &taken),
+			None => p,
+		}
 	}
 
 	/// What a connection gets: the first target of `order` that `Lease::take` lets in.
@@ -779,13 +837,27 @@ mod tests {
 	}
 
 	#[test]
-	fn a_full_target_is_skipped_even_when_others_are_down() {
-		let p = capped(Balance::RoundRobin, &[(1, 1, false, Some(1)), (2, 1, false, None)], None);
+	fn up_targets_full_refuse_rather_than_try_down_ones() {
+		let p = capped(Balance::RoundRobin, &[(1, 1, false, Some(1)), (2, 1, false, None), (3, 1, true, None)], None);
 		p.members[1].healthy.store(false, Ordering::Relaxed);
+		p.members[2].healthy.store(false, Ordering::Relaxed);
 		let first = connect(&p).unwrap();
 		assert_eq!(first.member().spec.port, 1);
+		// the one target up is full: refused, as http does, not sent to the down ones
 		let order: Vec<u16> = p.order().iter().map(|m| m.spec.port).collect();
-		assert_eq!(order, [2, 1], "the down target is tried before the full one");
+		assert_eq!(order, [1], "only the full one, which Lease::take refuses");
+		assert!(p.all_full());
+		assert!(connect(&p).is_none());
+		// with room on a target that is up, the down ones are still tried after it (as before caps)
+		drop(first);
+		let order: Vec<u16> = p.order().iter().map(|m| m.spec.port).collect();
+		assert_eq!(order, [1, 2, 3]);
+		// nothing up at all: the down ones are tried, the full one last
+		let _again = connect(&p).unwrap();
+		p.members[0].healthy.store(false, Ordering::Relaxed);
+		assert!(!p.all_full());
+		let order: Vec<u16> = p.order().iter().map(|m| m.spec.port).collect();
+		assert_eq!(order, [2, 3, 1]);
 		assert_eq!(connect(&p).map(|l| l.member().spec.port), Some(2));
 	}
 
@@ -802,6 +874,22 @@ mod tests {
 		assert!(connect(&new).is_none(), "target 1 is still full with the old pool's connections");
 		drop(a);
 		assert_eq!(connect(&new).map(|l| l.member().spec.port), Some(1), "one of them ended");
+
+		// two PATCHes: the target taken out, then back; its connections still count
+		let first = capped(Balance::RoundRobin, &[(1, 1, false, Some(1))], None);
+		let open = connect(&first).unwrap();
+		let without = capped(Balance::RoundRobin, &[(2, 1, false, None)], Some(&first));
+		drop(first);
+		let back = capped(Balance::RoundRobin, &[(1, 1, false, Some(1))], Some(&without));
+		assert_eq!(back.members[0].active.load(Ordering::Relaxed), 1, "counted through the pool without it");
+		assert!(connect(&back).is_none());
+		drop(open);
+		assert!(connect(&back).is_some());
+		// nothing open any more: nothing is kept once the old pool is gone
+		let again = capped(Balance::RoundRobin, &[(2, 1, false, None)], Some(&back));
+		let spec = back.members[0].spec.clone();
+		drop(back);
+		assert!(again.counter_for(&spec, &mut vec![]).is_none());
 	}
 
 	#[test]
@@ -839,28 +927,38 @@ mod tests {
 			seed ^= seed << 17;
 			seed
 		};
-		for round in 0..500 {
-			let n = 1 + (next() % 9) as usize;
+		for round in 0..1500 {
+			// small pools mostly, and the edges of the bit sets (63, 64 = MAX_TARGETS)
+			let n = match round % 10 {
+				0 => MAX_TARGETS,
+				1 => MAX_TARGETS - 1,
+				2 => 1 + (next() % MAX_TARGETS as u64) as usize,
+				_ => 1 + (next() % 9) as usize,
+			};
 			let balance = [Balance::RoundRobin, Balance::LeastConn, Balance::Failover][round % 3];
-			let targets: Vec<(u16, u32, bool, Option<u32>)> =
-				(0..n).map(|i| (i as u16 + 1, 1 + (next() % 3) as u32, next() % 4 == 0, (next() % 3 == 0).then_some(1))).collect();
+			let targets: Vec<(u16, u32, bool, Option<u32>)> = (0..n)
+				.map(|i| (i as u16 + 1, 1 + (next() % 3) as u32, next() % 4 == 0, (next() % 3 == 0).then(|| 1 + (next() % 3) as u32)))
+				.collect();
 			if targets.iter().all(|t| t.2) {
 				continue;
 			}
 			let (a, b) = (capped(balance, &targets, None), capped(balance, &targets, None));
 			let mut held = vec![];
 			for i in 0..n {
-				let (down, busy) = (next() % 3 == 0, next() % 2 == 0);
+				let (down, busy) = (next() % 3 == 0, next() % 4);
 				for p in [&a, &b] {
 					p.members[i].healthy.store(!down, Ordering::Relaxed);
-					if busy {
+					for _ in 0..busy {
 						held.extend(Lease::take(p.members[i].clone()));
 					}
 				}
 			}
 			for _ in 0..3 {
 				let ports = |v: Vec<Arc<Member>>| v.iter().map(|m| m.spec.port).collect::<Vec<_>>();
-				assert_eq!(ports(a.order()), ports(b.order_slow()), "{targets:?}");
+				let order = a.order();
+				// refused (`all_full`) exactly when nothing in the order has room
+				assert_eq!(a.all_full(), a.capped() && order.iter().all(|m| m.is_full()), "{targets:?}");
+				assert_eq!(ports(order), ports(b.order_slow()), "{targets:?}");
 			}
 		}
 	}

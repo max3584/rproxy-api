@@ -1001,8 +1001,20 @@ pub struct RuleStats {
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::l7::access::HttpStatsView>,
-	/// State of each backend, for rules with `targets` or `health_check`.
+	/// State of each backend, for rules with `targets` or `health_check` (or a target's `max_connections`).
 	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<balance::TargetStatus>,
+	/// State of the targets of `tls.routes[]` with several `targets` or a `max_connections` (#341),
+	/// in the order of `tls.routes`.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub tls_routes: Vec<RouteTargetsStatus>,
+}
+
+/// The targets of one `tls.routes[]` entry (`stats.tls_routes`, #341).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RouteTargetsStatus {
+	/// The route's names (`server_name` or `server_names`), lower-cased.
+	pub server_names: Vec<String>,
 	pub targets: Vec<balance::TargetStatus>,
 }
 

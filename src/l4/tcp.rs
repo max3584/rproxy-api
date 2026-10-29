@@ -75,7 +75,8 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
-	let fallback = target.candidates.iter().filter(usable).count() > 1;
+	// a full target (#341) is not one to fall back on
+	let fallback = target.candidates.iter().filter(usable).filter(|c| !c.member.as_ref().is_some_and(|m| m.is_full())).count() > 1;
 	for c in target.candidates.iter().filter(usable) {
 		let Ok(lease) = c.lease() else {
 			full = true;
@@ -241,6 +242,12 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 		denied(&rt, client, "crowdsec", None);
 		return;
 	}
+	// every target full (#341): refused before it counts as a connection or spends anything of
+	// `limits`; with `tls.routes`, the route's targets are looked at when connecting
+	if rt.pool().all_full() && rt.routes.read().unwrap().is_empty() {
+		crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp");
+		return;
+	}
 	// `limits` (#165): held until the connection ends (also through `handle_http`)
 	let _permit = match rt.limits.get().map(|l| l.admit(client.ip())) {
 		None => None,
@@ -286,17 +293,9 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	if pass.is_none() && rt.http_router().is_some() {
 		return handle_http(inbound, prefix, client, rt, offset).await;
 	}
-	let pool = rt.pool();
-	// every target full (#341): refused before it counts as a connection; with
-	// `tls.routes`, the route's targets are looked at when connecting
-	if pool.all_full() && pass.is_none() && rt.routes.read().unwrap().is_empty() {
-		crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp");
-		return;
-	}
 	let started = Instant::now();
 	rt.stats.opened();
-	let short_lived = !pool.outlier().short_lived.is_zero();
-	drop(pool);
+	let short_lived = !rt.pool().outlier().short_lived.is_zero();
 	let mut detail = Detail {
 		geo: rt.geo_for_log(client.ip(), geo),
 		first: short_lived.then(Arc::default),
@@ -336,8 +335,11 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	}
 	match result {
 		Err(e) if is_denied(&e) => {}
-		// closed with nothing sent to it, as `limits` refuses
-		Err(e) if TargetFull::is(&e) => crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp"),
+		// closed with nothing sent to it, as `limits` refuses; not a connection (as when refused before `opened`)
+		Err(e) if TargetFull::is(&e) => {
+			rt.stats.total.fetch_sub(1, Ordering::Relaxed);
+			crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp");
+		}
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),

@@ -181,6 +181,33 @@ async fn udp_sessions_fill_the_targets_and_come_back_when_idle() {
 	assert_eq!(udp_roundtrip(&s3, "z").await, "A:z");
 }
 
+#[tokio::test]
+async fn a_udp_session_stays_on_its_target_through_a_patch() {
+	let h = harness().await;
+	let (a, b) = (udp_backend("A:").await, udp_backend("B:").await);
+	let port = free_udp_port();
+	let (status, v) = h.post(l4("udp", port, vec![capped(a, 2)], "failover")).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	// a single capped target: its count is shown, but not reported as up / down
+	let (_, v) = h.get(&path).await;
+	assert_eq!(v["stats"]["targets"][0]["max_connections"], 2, "{v}");
+	let m = metrics(&h).await;
+	assert!(!m.contains(&format!("rproxy_rule_all_targets_down{{protocol=\"udp\",listen=\"127.0.0.1:{port}\"}}")), "{m}");
+	assert!(!m.contains(&format!("rproxy_target_up{{protocol=\"udp\",listen=\"127.0.0.1:{port}\"")), "{m}");
+
+	let s1 = udp_client(port).await;
+	assert_eq!(udp_roundtrip(&s1, "x").await, "A:x");
+	// B in front: new sessions go there, the open one stays on A (still there, up), counted
+	let (status, v) = h.patch(&format!("udp/127.0.0.1/{port}"), json!({"targets": [capped(b, 1), capped(a, 2)], "balance": "failover"})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(udp_roundtrip(&s1, "y").await, "A:y");
+	let (_, v) = h.get(&path).await;
+	assert_eq!((&v["stats"]["targets"][0]["connections"], &v["stats"]["targets"][1]["connections"]), (&json!(0), &json!(1)), "{v}");
+	let s2 = udp_client(port).await;
+	assert_eq!(udp_roundtrip(&s2, "z").await, "B:z");
+}
+
 /// An HTTP backend answering its tag; a path ending in `/slow` takes a second.
 async fn http_backend(tag: &'static str) -> (SocketAddr, JoinHandle<()>) {
 	let app = axum::Router::new().fallback(move |req: axum::extract::Request| async move {

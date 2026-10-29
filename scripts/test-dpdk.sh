@@ -10,6 +10,8 @@
 #   - 10.98.0.2:5300 -> 10.99.0.1:7001 (client on port 1, backend on port 0: the
 #     source towards the backend is port 0's address)
 #   - 10.99.0.2:5400-5401 -> 10.99.0.1:7100-7101 (a port range)
+#   - 10.99.0.2:5500 -> 10.99.0.1:7000 with max_connections: 1 (#341): a second
+#     client's session is refused (target_full), and counted in stats.limited
 # Clients send datagrams of many sizes (0-1472 bytes) from many sockets and
 # compare every answer (SHA-256 of the payload and the sequence number). Then
 # GET /capabilities must show performance.dpdk active; a run with a port that
@@ -71,6 +73,7 @@ rules:
   - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5300, remote_addr: 10.99.0.1, remote_port: 7000 }
   - { protocol: udp, listen_addr: 10.98.0.2, listen_port: 5300, remote_addr: 10.99.0.1, remote_port: 7001 }
   - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5400, listen_port_end: 5401, remote_addr: 10.99.0.1, remote_port: 7100 }
+  - { protocol: udp, listen_addr: 10.99.0.2, listen_port: 5500, targets: [{ addr: 10.99.0.1, port: 7000, max_connections: 1 }] }
 EOF
 }
 
@@ -185,6 +188,33 @@ traced 10.99.0.2 5300 7000 10.99.0.1
 traced 10.98.0.2 5300 7001 10.98.0.1
 traced 10.99.0.2 5400 7100 10.99.0.1
 traced 10.99.0.2 5401 7101 10.99.0.1
+
+# max_connections (#341): one session takes the only place; a second client is dropped and counted
+python3 - <<'EOF' || { echo "max_connections on the DPDK path"; FAIL=1; }
+import json, socket, urllib.request
+def client():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("10.99.0.1", 0)); s.settimeout(1); s.connect(("10.99.0.2", 5500))
+    return s
+def ask(s, msg, tries=3):
+    for _ in range(tries):
+        s.send(msg)
+        try:
+            return s.recv(65535)
+        except socket.timeout:
+            continue
+    return None
+first, second = client(), client()
+assert ask(first, b"one") == b"7000:one", "the first session"
+assert ask(second, b"two") is None, "the second client was answered although the target is full"
+assert ask(first, b"again") == b"7000:again", "the first session goes on"
+rules = json.load(urllib.request.urlopen("http://localhost:18260/rules"))
+rules = rules.get("rules", rules) if isinstance(rules, dict) else rules
+r = next(r for r in rules if r["listen_port"] == 5500)
+s = r["stats"]
+assert s["limited"] >= 1 and s["targets"][0]["full"] and s["targets"][0]["connections"] == 1, s
+print("max_connections on the DPDK path: limited", s["limited"], "target", s["targets"][0])
+EOF
 
 # the kernel answered ARP for nothing on DPDK's ports, and DPDK answers ping on its addresses
 ping -c 2 -W 2 10.99.0.2 >/dev/null || { echo "no ping answer from 10.99.0.2"; FAIL=1; }
