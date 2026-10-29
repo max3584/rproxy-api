@@ -71,8 +71,6 @@ pub struct Server {
 	pub ejection: Arc<crate::core::outlier::Ejection>,
 	/// Requests in progress on this server (for `balance: least_conn`, and `max_connections`).
 	pub inflight: Arc<AtomicU64>,
-	/// `max_connections` (#341): requests in progress at most (0: no limit).
-	pub max: u64,
 	/// Last used at the end: taken from the end (the warmest), expired from the front.
 	idle: Mutex<Vec<(SendRequest<Body>, Instant)>>,
 	/// `status` entry (#235): rproxy answers with this instead of forwarding.
@@ -87,6 +85,9 @@ pub struct Server {
 	pub h2_opening: tokio::sync::Mutex<()>,
 	/// `protocol: auto`: what the server picked by ALPN (0 not known yet, 1 HTTP/1.1, 2 HTTP/2).
 	alpn: std::sync::atomic::AtomicU8,
+	/// `max_connections` (#341): requests in progress at most (0: no limit). Last, so the
+	/// fields of before keep their places.
+	pub max: u64,
 }
 
 impl Server {
@@ -267,8 +268,6 @@ pub struct Service {
 	pub name: String,
 	pub servers: Vec<Server>,
 	total_weight: u64,
-	/// Some server has `max_connections` (#341): without, `pick` and `forward` look at no count.
-	capped: bool,
 	next: AtomicU64,
 	pub pass_host: bool,
 	pub connect: Duration,
@@ -283,6 +282,8 @@ pub struct Service {
 	pub protocol: UpstreamProtocol,
 	/// TLS of this service (its `tls`, #236, or ALPN other than http/1.1); None uses the router's.
 	pub tls: Option<ServiceTls>,
+	/// Some server has `max_connections` (#341): without, `pick` and `forward` look at no count.
+	capped: bool,
 }
 
 /// The TLS client of one service.

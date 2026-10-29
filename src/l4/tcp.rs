@@ -335,11 +335,9 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	}
 	match result {
 		Err(e) if is_denied(&e) => {}
-		// closed with nothing sent to it, as `limits` refuses; not a connection (as when refused before `opened`)
-		Err(e) if TargetFull::is(&e) => {
-			rt.stats.total.fetch_sub(1, Ordering::Relaxed);
-			crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp");
-		}
+		// closed with nothing sent to it, as `limits` refuses. Counted in `total` (a counter is never
+		// taken back): only when the targets filled up after the check before `opened`, or with `tls.routes`
+		Err(e) if TargetFull::is(&e) => crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp"),
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),

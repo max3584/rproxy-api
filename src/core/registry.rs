@@ -2276,7 +2276,7 @@ impl Registry {
 					}
 					if r.spec.limits.is_some() || s.limited_total() > 0 || r.spec.has_target_caps() {
 						for reason in crate::core::limits::Reason::ALL {
-							let n = s.limited[reason.index()].load(Ordering::Relaxed);
+							let n = s.limited_counter(reason).load(Ordering::Relaxed);
 							lines[6].3.push(format!("{{{labels},reason=\"{}\"}} {n}", reason.as_str()));
 						}
 					}
@@ -2391,12 +2391,13 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
 		let mut one = |route: Option<&str>, t: crate::core::balance::TargetStatus, reported: bool| {
 			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false, max_connections: None }.remote();
-			let route = route.map(|r| format!(",route=\"{}\"", esc(r))).unwrap_or_default();
-			let labels = format!("protocol=\"{}\",listen=\"{}\"{route},target=\"{}\"", key.protocol, key.listen, esc(&target));
+			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, esc(&target));
 			// up / down only where it is reported (several targets or a health check), as before #341
 			if reported {
 				up.push(format!("rproxy_target_up{{{labels}}} {}", u8::from(t.up)));
 			}
+			// the same labels on every series: `route` empty for the rule's own targets
+			let labels = format!("protocol=\"{}\",listen=\"{}\",route=\"{}\",target=\"{}\"", key.protocol, key.listen, esc(route.unwrap_or("")), esc(&target));
 			conns.push(format!("rproxy_target_connections{{{labels}}} {}", t.connections));
 			if t.max_connections.is_some() {
 				full.push(format!("rproxy_target_full{{{labels}}} {}", u8::from(t.full)));

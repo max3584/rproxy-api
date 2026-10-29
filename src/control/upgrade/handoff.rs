@@ -96,7 +96,7 @@ impl Counters {
 			denied: s.denied.load(Ordering::Relaxed),
 			dropped: s.dropped.load(Ordering::Relaxed),
 			limited: std::array::from_fn(|i| s.limited[i].load(Ordering::Relaxed)),
-			target_full: s.limited[crate::core::limits::Reason::TargetFull.index()].load(Ordering::Relaxed),
+			target_full: s.target_full.load(Ordering::Relaxed),
 			bandwidth_dropped: s.bandwidth_dropped.load(Ordering::Relaxed),
 			counters_since,
 			http: Some(rt.http_stats.export()).filter(|h| !h.is_empty()),
@@ -141,7 +141,7 @@ impl Counters {
 		for (mine, n) in s.limited.iter().zip(self.limited) {
 			mine.fetch_add(n, Ordering::Relaxed);
 		}
-		s.limited[crate::core::limits::Reason::TargetFull.index()].fetch_add(self.target_full, Ordering::Relaxed);
+		s.target_full.fetch_add(self.target_full, Ordering::Relaxed);
 		s.bandwidth_dropped.fetch_add(self.bandwidth_dropped, Ordering::Relaxed);
 		if let Some(h) = &self.http {
 			rt.http_stats.add(h);

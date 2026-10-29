@@ -76,7 +76,7 @@ async fn tcp_failover_fills_the_targets_in_order_then_refuses() {
 	let t = &v["stats"]["targets"];
 	assert_eq!((&t[0]["connections"], &t[0]["max_connections"], &t[0]["full"]), (&json!(2), &json!(2), &json!(true)), "{v}");
 	assert_eq!((&t[1]["connections"], &t[1]["full"]), (&json!(1), &json!(true)), "{v}");
-	assert!(metrics(&h).await.contains(&format!("rproxy_target_full{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",target=\"{a}\"}} 1")));
+	assert!(metrics(&h).await.contains(&format!("rproxy_target_full{{protocol=\"tcp\",listen=\"127.0.0.1:{port}\",route=\"\",target=\"{a}\"}} 1")));
 
 	// every target full: closed, counted in limited, and not as a connection
 	let total = v["stats"]["total_connections"].clone();
