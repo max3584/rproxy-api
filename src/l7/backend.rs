@@ -267,6 +267,8 @@ pub struct Service {
 	pub name: String,
 	pub servers: Vec<Server>,
 	total_weight: u64,
+	/// Some server has `max_connections` (#341): without, `pick` and `forward` look at no count.
+	capped: bool,
 	next: AtomicU64,
 	pub pass_host: bool,
 	pub connect: Duration,
@@ -379,6 +381,7 @@ impl Service {
 		Ok(Service {
 			name: name.to_string(),
 			total_weight: servers.iter().map(|s| s.weight).sum(),
+			capped: servers.iter().any(|s| s.max != 0),
 			servers,
 			next: AtomicU64::new(0),
 			pass_host: spec.pass_host_header.unwrap_or(true),
@@ -423,15 +426,25 @@ impl Service {
 	/// every server is down. A server at its `max_connections` (#341) is skipped
 	/// like one that is down (also the sticky one); `is_full` tells why none was found.
 	pub fn pick(&self, sticky: Option<&str>) -> Option<usize> {
+		// without caps, exactly the choice of before #341 (no count looked at)
+		if self.capped {
+			self.pick_by(sticky, Server::open)
+		} else {
+			self.pick_by(sticky, Server::is_up)
+		}
+	}
+
+	#[inline(always)]
+	fn pick_by(&self, sticky: Option<&str>, usable: fn(&Server) -> bool) -> Option<usize> {
 		if let Some(id) = sticky {
-			if let Some(i) = self.servers.iter().position(|s| s.id == id && s.open()) {
+			if let Some(i) = self.servers.iter().position(|s| s.id == id && usable(s)) {
 				return Some(i);
 			}
 		}
 		match self.balance {
-			crate::core::balance::Balance::Failover => return self.servers.iter().position(Server::open),
+			crate::core::balance::Balance::Failover => return self.servers.iter().position(usable),
 			crate::core::balance::Balance::LeastConn => {
-				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| self.servers[i].open()).collect();
+				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| usable(&self.servers[i])).collect();
 				if up.is_empty() {
 					return None;
 				}
@@ -446,10 +459,10 @@ impl Service {
 			}
 			crate::core::balance::Balance::RoundRobin => {}
 		}
-		self.draw().or_else(|| {
+		self.draw(usable).or_else(|| {
 			// every server that is up by its health checks is ejected (max_ejected_percent: 100):
 			// still try one rather than refuse
-			self.servers.iter().position(|s| s.up.load(Ordering::Relaxed) && !s.is_full())
+			self.servers.iter().position(|s| s.up.load(Ordering::Relaxed) && !(self.capped && s.is_full()))
 		})
 	}
 
@@ -457,21 +470,22 @@ impl Service {
 	/// refused for that (`limits::Reason::TargetFull`, #341) rather than for servers down.
 	pub fn is_full(&self) -> bool {
 		// a full server that would be picked if it had room (up by its health check)
-		self.capped() && self.servers.iter().any(|s| s.is_full() && s.up.load(Ordering::Relaxed))
+		self.capped && self.servers.iter().any(|s| s.is_full() && s.up.load(Ordering::Relaxed))
 	}
 
 	/// Some server has `max_connections`.
 	pub fn capped(&self) -> bool {
-		self.servers.iter().any(|s| s.max != 0)
+		self.capped
 	}
 
-	fn draw(&self) -> Option<usize> {
+	#[inline(always)]
+	fn draw(&self, usable: fn(&Server) -> bool) -> Option<usize> {
 		// a few draws; with most servers down, fall back to scanning
 		for _ in 0..self.servers.len() * 4 {
 			let mut n = self.next.fetch_add(1, Ordering::Relaxed) % self.total_weight;
 			for (i, s) in self.servers.iter().enumerate() {
 				if n < s.weight {
-					if s.open() {
+					if usable(s) {
 						return Some(i);
 					}
 					break;
@@ -479,7 +493,7 @@ impl Service {
 				n -= s.weight;
 			}
 		}
-		self.servers.iter().position(Server::open)
+		self.servers.iter().position(usable)
 	}
 
 	/// The sticky cookie's value in a request, if this service is sticky.

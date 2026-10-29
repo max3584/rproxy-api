@@ -1612,11 +1612,15 @@ impl Conn {
 			// counted while in progress, for `balance: least_conn` and `max_connections` (#341):
 			// a server filled by another request since `pick` is passed over
 			let mut picked = None;
-			for _ in 0..=service.servers.len() {
-				let Some(index) = service.pick(sticky.as_deref()) else { break };
-				if let Some(counted) = service.servers[index].admit() {
-					picked = Some((index, counted));
-					break;
+			if !service.capped() {
+				picked = service.pick(sticky.as_deref()).map(|index| (index, Hold::counting(service.servers[index].inflight.clone())));
+			} else {
+				for _ in 0..=service.servers.len() {
+					let Some(index) = service.pick(sticky.as_deref()) else { break };
+					if let Some(counted) = service.servers[index].admit() {
+						picked = Some((index, counted));
+						break;
+					}
 				}
 			}
 			let Some((index, counted)) = picked else {
@@ -1768,7 +1772,7 @@ impl Conn {
 			return resp;
 		}
 		// a client pinned to a server that is up but was full just now (#341) keeps its pin
-		let pinned = sticky.as_deref().is_some_and(|id| service.servers.iter().any(|s| s.id == id && s.is_up()));
+		let pinned = service.capped() && sticky.as_deref().is_some_and(|id| service.servers.iter().any(|s| s.id == id && s.is_up()));
 		if sticky.as_deref() != Some(server.id.as_str()) && !pinned {
 			if let Some(cookie) = service.sticky_cookie(server, self.https) {
 				resp.headers_mut().append(header::SET_COOKIE, cookie);
