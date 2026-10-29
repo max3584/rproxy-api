@@ -171,12 +171,11 @@ impl Budget {
 	/// Drops what the other caches keep past its time. Called with `own` locked: the others
 	/// are only tried (never waited for), so two caches doing this at once do not deadlock.
 	fn purge_others(&self, own: *const Store, now: Instant) {
-		let stores: Vec<_> = {
-			let mut stores = self.stores.lock().unwrap_or_else(|e| e.into_inner());
-			stores.retain(|w| w.strong_count() > 0);
-			stores.iter().filter_map(Weak::upgrade).collect()
-		};
-		for store in &stores {
+		// under the list's lock, nothing collected: a store dropped meanwhile only gives its
+		// bytes back (`Store::drop` takes no lock)
+		let mut stores = self.stores.lock().unwrap_or_else(|e| e.into_inner());
+		stores.retain(|w| w.strong_count() > 0);
+		for store in stores.iter().filter_map(Weak::upgrade) {
 			let mut guard = match store.try_lock() {
 				Ok(g) => g,
 				Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -485,6 +484,8 @@ struct Store {
 	order: BTreeMap<u64, Vec<u8>>,
 	/// Bytes of the entries and passes, also counted in `budget`.
 	memory: u64,
+	/// Of `memory`, the passes' (only the entries can be dropped to make room).
+	pass_memory: u64,
 	/// Keys whose answers were not kept for a reason of their own (at most `max_entries`).
 	passes: HashMap<Vec<u8>, Pass>,
 }
@@ -497,7 +498,7 @@ impl Drop for Store {
 
 impl Store {
 	fn new(budget: &'static Budget) -> Store {
-		Store { budget, map: HashMap::new(), order: BTreeMap::new(), memory: 0, passes: HashMap::new() }
+		Store { budget, map: HashMap::new(), order: BTreeMap::new(), memory: 0, pass_memory: 0, passes: HashMap::new() }
 	}
 
 	fn free(&mut self, n: u64) {
@@ -529,6 +530,18 @@ impl Store {
 		self.order.remove(&seq);
 	}
 
+	/// Drops the oldest entry other than `key`'s; false when there is none.
+	fn take_oldest_but(&mut self, key: &[u8]) -> bool {
+		let Some(other) = self.order.values().find(|k| k.as_slice() != key).cloned() else { return false };
+		self.take(&other);
+		true
+	}
+
+	/// Bytes of the entries but one of `old` bytes (what dropping the others can free).
+	fn droppable(&self, old: u64) -> u64 {
+		self.memory - self.pass_memory - old
+	}
+
 	/// Drops the entries past `stale_on_error` (they are at the front), and passes past theirs.
 	fn purge(&mut self, now: Instant) {
 		self.sweep(now);
@@ -550,11 +563,13 @@ impl Store {
 			}
 			keep
 		});
+		self.pass_memory -= freed;
 		self.free(freed);
 	}
 
 	fn unpass(&mut self, key: &[u8]) {
 		if let Some(p) = self.passes.remove(key) {
+			self.pass_memory -= p.size;
 			self.free(p.size);
 		}
 	}
@@ -571,6 +586,7 @@ impl Store {
 			if self.passes.len() >= max {
 				let freed: u64 = self.passes.values().map(|p| p.size).sum();
 				self.passes.clear();
+				self.pass_memory -= freed;
 				self.free(freed);
 			}
 		}
@@ -585,6 +601,7 @@ impl Store {
 			}
 		}
 		self.hold(size);
+		self.pass_memory += size;
 		self.passes.insert(key.to_vec(), Pass { strikes, until: now + ttl, varies, size });
 	}
 }
@@ -942,32 +959,49 @@ impl Cache {
 	}
 
 	/// Puts an entry in place of the key's old one, making room by dropping the oldest. Not
-	/// kept when the process's budget has no room for it even without this cache's answers.
-	fn insert(&self, store: &mut Store, key: &[u8], entry: Arc<Entry>) {
+	/// kept when the process's budget has no room for it even without this cache's other
+	/// answers: then nothing is dropped, and the key's old answer stays (`stale_on_error`).
+	fn insert(&self, store: &mut Store, key: &[u8], entry: Arc<Entry>) -> bool {
 		let now = Instant::now();
-		store.take(key);
 		store.purge(now);
-		while !store.order.is_empty()
-			&& (store.order.len() >= self.settings.max_entries || store.memory + entry.size > self.settings.max_memory)
-		{
-			store.take_oldest();
-		}
-		let mut purged = false;
-		while !store.budget.reserve(entry.size) {
-			if !purged {
-				purged = true;
-				store.budget.purge_others(store, now);
-				continue;
+		let old = store.map.get(key).and_then(|s| s.entry.as_ref()).map_or(0, |e| e.size);
+		// the budget first: the old answer is replaced, so only what the new one adds
+		let grow = entry.size.saturating_sub(old);
+		if grow > 0 && !store.budget.reserve(grow) {
+			store.budget.purge_others(store, now);
+			loop {
+				if store.budget.reserve(grow) {
+					break;
+				}
+				// dropping this cache's other answers would not make room (looked at again
+				// each time: other caches take from the budget too): keep them
+				if store.droppable(old).saturating_add(store.budget.free()) < grow || !store.take_oldest_but(key) {
+					return false;
+				}
 			}
-			// dropping this cache's answers would not make room: keep them
-			if store.order.is_empty() || store.memory.saturating_add(store.budget.free()) < entry.size {
-				return;
-			}
-			store.take_oldest();
 		}
-		store.hold(entry.size);
+		// this cache's own limits, the key's old answer aside
+		loop {
+			let others = store.order.len() - usize::from(old > 0);
+			if others == 0 || (others < self.settings.max_entries && store.memory - old + entry.size <= self.settings.max_memory) {
+				break;
+			}
+			store.take_oldest_but(key);
+		}
+		if let Some(slot) = store.map.get_mut(key) {
+			if let Some(e) = slot.entry.take() {
+				store.order.remove(&e.seq);
+				store.memory -= e.size;
+			}
+		}
+		// counted: `grow` reserved above; a smaller answer gives the rest back
+		store.memory += entry.size;
+		if old > entry.size {
+			store.budget.release(old - entry.size);
+		}
 		store.order.insert(entry.seq, key.to_vec());
 		store.map.entry(key.to_vec()).or_default().entry = Some(entry);
+		true
 	}
 
 	/// The answer from an entry: `Age` (the backend's, plus the time kept for HIT / STALE),
@@ -1686,6 +1720,56 @@ mod tests {
 		// a cache that goes (its rule changed) gives its memory back
 		drop((a, b, c));
 		assert_eq!(used(budget), 0);
+	}
+
+	/// When dropping this cache's own answers cannot make room, none is dropped (#350).
+	#[tokio::test(start_paused = true)]
+	async fn nothing_is_dropped_when_it_cannot_fit() {
+		let budget: &'static Budget = Box::leak(Box::new(Budget::new(3000)));
+		let big = || resp(200, &[], Box::leak("x".repeat(900).into_boxed_str()));
+		let b = cache_in("{ttl: 60s, max_body: 1000}", budget);
+		fill(&b, &mut req("GET", "/1", &[]), big()).await;
+		fill(&b, &mut req("GET", "/2", &[]), big()).await;
+		let a = cache_in("{ttl: 10s, max_body: 1000}", budget);
+		fill(&a, &mut req("GET", "/s", &[]), resp(200, &[], "abc")).await;
+		// strikes too: passes cannot be dropped to make room
+		for _ in 0..STRIKES {
+			fill(&a, &mut req("GET", "/p", &[]), resp(200, &[("set-cookie", "s=1")], "x")).await;
+		}
+		let before = used(budget);
+		assert!(before <= 3000 && b.usage().0 == 2 && a.usage().0 == 1, "{before}");
+		let (r, o) = fill(&a, &mut req("GET", "/1", &[]), big()).await;
+		assert_eq!((o, text(r).await.len()), (Outcome::Miss, 900));
+		assert!(ask(&a, &mut req("GET", "/1", &[])).await.is_err(), "not kept");
+		assert_eq!(ask(&a, &mut req("GET", "/s", &[])).await.ok().unwrap().1, Outcome::Hit, "a's answer stays");
+		assert_eq!((used(budget), b.usage().0), (before, 2));
+	}
+
+	/// A new answer that does not fit leaves the old one for `stale_on_error` (#350).
+	#[tokio::test(start_paused = true)]
+	async fn a_refresh_that_does_not_fit_keeps_the_old_answer() {
+		let budget: &'static Budget = Box::leak(Box::new(Budget::new(0)));
+		let body = |n: usize| resp(200, &[], Box::leak("x".repeat(n).into_boxed_str()));
+		let a = cache_in("{ttl: 1s, stale_on_error: 30s, max_body: 2000}", budget);
+		fill(&a, &mut req("GET", "/1", &[]), body(900)).await;
+		let b = cache_in("{ttl: 60s, max_body: 2000}", budget);
+		fill(&b, &mut req("GET", "/1", &[]), body(900)).await;
+		budget.limit.store(used(budget) + 50, Ordering::Relaxed);
+		tokio::time::advance(Duration::from_millis(1100)).await;
+		// the backend's new answer is 100 bytes larger: given, not kept
+		let (r, o) = fill(&a, &mut req("GET", "/1", &[]), body(1000)).await;
+		assert_eq!((o, text(r).await.len()), (Outcome::Miss, 1000));
+		// the backend fails: the old answer is still there
+		let (r, o) = fill(&a, &mut req("GET", "/1", &[]), resp(500, &[], "down")).await;
+		assert_eq!((o, text(r).await.len()), (Outcome::Stale, 900));
+		assert!(used(budget) <= budget.limit.load(Ordering::Relaxed));
+		// a smaller answer replaces it and gives the difference back (after the `ttl` of
+		// immediate STALE that follows a failure)
+		tokio::time::advance(Duration::from_millis(1100)).await;
+		let before = used(budget);
+		fill(&a, &mut req("GET", "/1", &[]), body(100)).await;
+		assert_eq!(used(budget), before - 800);
+		assert_eq!(ask(&a, &mut req("GET", "/1", &[])).await.ok().unwrap().1, Outcome::Hit);
 	}
 
 	#[tokio::test(start_paused = true)]
