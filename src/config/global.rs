@@ -93,6 +93,8 @@ pub const ITEMS: &[Item] = &[
 	Item { name: "http.timeouts", apply: Apply::Live, unix_only: false, path: ("http", Some("timeouts")), in_file: true },
 	// RPROXY_UDP_MAX_SESSIONS (no file key)
 	Item { name: "udp_max_sessions", apply: Apply::Live, unix_only: false, path: ("udp_max_sessions", None), in_file: false },
+	// RPROXY_CACHE_MAX_MEMORY (#349, no file key)
+	Item { name: "cache_max_memory", apply: Apply::Live, unix_only: false, path: ("cache_max_memory", None), in_file: false },
 	// later through the API (#345); read at the start now
 	Item { name: "acme", apply: Apply::Restart, unix_only: true, path: ("acme", None), in_file: true },
 	Item { name: "geoip", apply: Apply::Restart, unix_only: false, path: ("geoip", None), in_file: true },
@@ -173,6 +175,8 @@ pub struct Values {
 	pub http: Option<HttpGlobalSpec>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub udp_max_sessions: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_max_memory: Option<u64>,
 }
 
 /// The live items in force.
@@ -183,6 +187,7 @@ pub struct Live {
 	pub crowdsec: Option<CrowdsecGlobal>,
 	pub timeouts: Option<HttpTimeoutsSpec>,
 	pub udp_max_sessions: u64,
+	pub cache_max_memory: u64,
 }
 
 impl Default for Live {
@@ -193,6 +198,7 @@ impl Default for Live {
 			crowdsec: None,
 			timeouts: None,
 			udp_max_sessions: crate::l4::udp::DEFAULT_MAX_SESSIONS,
+			cache_max_memory: crate::l7::middleware::cache::DEFAULT_PROCESS_MAX_MEMORY,
 		}
 	}
 }
@@ -208,6 +214,7 @@ impl Values {
 			crowdsec: spec.crowdsec.clone(),
 			http: spec.http.as_ref().and_then(|h| h.timeouts.clone()).map(|t| HttpGlobalSpec { timeouts: Some(t) }),
 			udp_max_sessions: None,
+			cache_max_memory: None,
 		}
 	}
 
@@ -218,6 +225,7 @@ impl Values {
 			"crowdsec" => self.crowdsec.is_some(),
 			"http.timeouts" => self.timeouts().is_some(),
 			"udp_max_sessions" => self.udp_max_sessions.is_some(),
+			"cache_max_memory" => self.cache_max_memory.is_some(),
 			_ => false,
 		}
 	}
@@ -234,6 +242,7 @@ impl Values {
 			"crowdsec" => serde_json::to_value(self.crowdsec.as_ref()?),
 			"http.timeouts" => serde_json::to_value(self.timeouts()?),
 			"udp_max_sessions" => serde_json::to_value(self.udp_max_sessions?),
+			"cache_max_memory" => serde_json::to_value(self.cache_max_memory?),
 			_ => return None,
 		};
 		v.ok()
@@ -253,6 +262,7 @@ impl Values {
 				next.http = v.map(|v| parse::<HttpTimeoutsSpec>(item, v)).transpose()?.map(|t| HttpGlobalSpec { timeouts: Some(t) })
 			}
 			("udp_max_sessions", v) => next.udp_max_sessions = v.map(|v| parse(item, v)).transpose()?,
+			("cache_max_memory", v) => next.cache_max_memory = v.map(|v| parse(item, v)).transpose()?,
 			_ => return Err(format!("global.{item} is not an item the API sets")),
 		}
 		next.check_item(item)?;
@@ -347,6 +357,7 @@ fn effective(file: &Values, env: &Values, api: &Values) -> (Live, BTreeMap<&'sta
 		crowdsec: pick("crowdsec").and_then(|v| v.crowdsec.clone()),
 		timeouts: pick("http.timeouts").and_then(|v| v.timeouts().cloned()),
 		udp_max_sessions: pick("udp_max_sessions").and_then(|v| v.udp_max_sessions).unwrap_or(d.udp_max_sessions),
+		cache_max_memory: pick("cache_max_memory").and_then(|v| v.cache_max_memory).unwrap_or(d.cache_max_memory),
 	};
 	(live, sources)
 }
@@ -369,6 +380,9 @@ fn differing(a: &Live, b: &Live) -> Vec<&'static str> {
 	if a.udp_max_sessions != b.udp_max_sessions {
 		out.push("udp_max_sessions");
 	}
+	if a.cache_max_memory != b.cache_max_memory {
+		out.push("cache_max_memory");
+	}
 	out
 }
 
@@ -379,6 +393,7 @@ fn live_value(l: &Live, item: &str) -> Value {
 		"crowdsec" => serde_json::to_value(&l.crowdsec).unwrap_or(Value::Null),
 		"http.timeouts" => serde_json::to_value(&l.timeouts).unwrap_or(Value::Null),
 		"udp_max_sessions" => json!(l.udp_max_sessions),
+		"cache_max_memory" => json!(l.cache_max_memory),
 		_ => Value::Null,
 	}
 }
@@ -391,6 +406,7 @@ fn keep_item(to: &mut Live, before: &Live, item: &str) {
 		"crowdsec" => to.crowdsec = before.crowdsec.clone(),
 		"http.timeouts" => to.timeouts = before.timeouts.clone(),
 		"udp_max_sessions" => to.udp_max_sessions = before.udp_max_sessions,
+		"cache_max_memory" => to.cache_max_memory = before.cache_max_memory,
 		_ => {}
 	}
 }
@@ -441,6 +457,7 @@ struct Built {
 	crowdsec: Option<NewBouncer>,
 	timeouts: Option<HttpTimeouts>,
 	udp_max_sessions: Option<u64>,
+	cache_max_memory: Option<u64>,
 }
 
 /// Why building one item failed.
@@ -528,6 +545,7 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 		}
 		"http.timeouts" => built.timeouts = Some(to.timeouts.as_ref().map(HttpTimeoutsSpec::resolve).unwrap_or_default()),
 		"udp_max_sessions" => built.udp_max_sessions = Some(to.udp_max_sessions),
+		"cache_max_memory" => built.cache_max_memory = Some(to.cache_max_memory),
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
 	Ok(())
@@ -639,7 +657,7 @@ struct State {
 	/// The file's live items, and its `global` as written.
 	file: Values,
 	file_raw: Value,
-	/// The environment's live items (RPROXY_UDP_MAX_SESSIONS).
+	/// The environment's live items (RPROXY_UDP_MAX_SESSIONS, RPROXY_CACHE_MAX_MEMORY).
 	env: Values,
 	/// The API's values (also those not in force: `failed`).
 	api: Values,
@@ -853,7 +871,7 @@ impl Swapped {
 
 /// Swaps what was built in, under the rules lock.
 fn commit(registry: &Registry, built: Built) -> Swapped {
-	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, .. } = built;
+	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, cache_max_memory, .. } = built;
 	let crowdsec = crowdsec.map(|mut b| b.take());
 	if let Some(Some(b)) = &crowdsec {
 		info!(event = "crowdsec.swap", synced = b.synced(), "a new CrowdSec bouncer is in force");
@@ -861,6 +879,9 @@ fn commit(registry: &Registry, built: Built) -> Swapped {
 	let (bouncer, snapshot) = registry.http_global().update(Update { trusted_proxies, access_log, crowdsec, timeouts });
 	if let Some(n) = udp_max_sessions {
 		crate::l4::udp::set_max_sessions(n);
+	}
+	if let Some(n) = cache_max_memory {
+		crate::l7::middleware::cache::set_max_memory(n);
 	}
 	Swapped { bouncer, snapshot }
 }
@@ -1431,6 +1452,7 @@ fn built_with_fallback(built: &mut Built) -> Built {
 		crowdsec: built.crowdsec.take(),
 		timeouts: built.timeouts.take(),
 		udp_max_sessions: built.udp_max_sessions.take(),
+		cache_max_memory: built.cache_max_memory.take(),
 	}
 }
 
@@ -1558,6 +1580,7 @@ mod tests {
 		let mut api = Values::default();
 		api.set("trusted_proxies", Some(json!(["192.0.2.0/24"]))).unwrap();
 		api.set("udp_max_sessions", Some(json!(7))).unwrap();
+		api.set("cache_max_memory", Some(json!(1024))).unwrap();
 		api.set("http.timeouts", Some(json!({"idle": "5s"}))).unwrap();
 		let (live, sources) = effective(&f, &env, &api);
 		assert_eq!(live.trusted_proxies, ["10.0.0.0/8"]);
@@ -1565,6 +1588,7 @@ mod tests {
 		assert_eq!(live.timeouts.unwrap().idle.as_deref(), Some("5s"));
 		assert_eq!(sources["trusted_proxies"], Source::File);
 		assert_eq!(sources["udp_max_sessions"], Source::Env);
+		assert_eq!((live.cache_max_memory, sources["cache_max_memory"]), (1024, Source::Api));
 		assert_eq!(sources["http.timeouts"], Source::Api);
 		assert_eq!(sources["access_log"], Source::Default);
 	}
@@ -1581,6 +1605,7 @@ mod tests {
 		let e = v.set("crowdsec", Some(json!({"lapi_url": "nope", "api_key_file": "/k"}))).unwrap_err();
 		assert!(e.contains("lapi_url"), "{e}");
 		assert!(v.set("udp_max_sessions", Some(json!(-1))).is_err());
+		assert!(v.set("cache_max_memory", Some(json!("512MiB"))).is_err());
 		assert!(v.set("performance", Some(json!({}))).is_err());
 		assert_eq!(v, Values::default(), "a refused value changes nothing");
 	}

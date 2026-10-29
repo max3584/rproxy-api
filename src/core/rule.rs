@@ -232,6 +232,9 @@ pub struct Features {
 	/// `servers[]`: a full target is skipped by every `balance`, all full is refused
 	/// (`reason: target_full`); `stats.targets[].full` (#341)
 	pub target_max_connections: bool,
+	/// All `cache` middlewares of the process together keep at most `RPROXY_CACHE_MAX_MEMORY`
+	/// (`global.cache_max_memory` in `GET /config/global`, live); `rproxy_http_cache_memory_bytes` (#349)
+	pub cache_process_memory: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -301,6 +304,7 @@ impl Features {
 		invalid_restored: true,
 		global_api: true,
 		target_max_connections: true,
+		cache_process_memory: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -353,6 +357,7 @@ impl Features {
 		invalid_restored: true,
 		global_api: true,
 		target_max_connections: true,
+		cache_process_memory: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
