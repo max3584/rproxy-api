@@ -976,9 +976,11 @@ impl Conn {
 		// copies for `mirror` (#232), as the request was at each
 		let mut mirrors: Vec<mirror::Copy> = vec![];
 		// cookies of the authentication middlewares for the response
-		let mut set_cookies: Vec<HeaderValue> = vec![];
+		// (#340) by position in the chain: put on the response at that middleware's response side,
+		// after a `cache` behind it has kept the backend's answer (they belong to this request)
+		let mut set_cookies: Vec<(usize, HeaderValue)> = vec![];
 		// headers an ext_authz server adds to the response (`forward_auth`, protocol grpc)
-		let mut response_headers: Vec<ext_authz::HeaderOption> = vec![];
+		let mut response_headers: Vec<(usize, ext_authz::HeaderOption)> = vec![];
 		let authority = request_authority(&parts.uri, &parts.headers)
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.clone());
@@ -1035,7 +1037,7 @@ impl Conn {
 				},
 				Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
 					AuthOutcome::Allow(add) => {
-						response_headers.extend(add);
+						response_headers.extend(add.into_iter().map(|h| (i, h)));
 						None
 					}
 					AuthOutcome::Deny(resp) => Some(resp),
@@ -1043,7 +1045,7 @@ impl Conn {
 				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
 					oidc::Outcome::Pass { session, set_cookie } => {
 						o.pass_identity(&mut parts.headers, &session);
-						set_cookies.extend(set_cookie);
+						set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
 						None
 					}
 					answer => Some(oidc_response(answer)),
@@ -1100,16 +1102,34 @@ impl Conn {
 					}
 					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 				},
-				Middleware::Cache(c) => match c.request(&mut parts, &host).await {
-					Ok((resp, outcome)) => {
-						sent.cached = Some((c.name.clone(), outcome));
-						Some(resp)
+				Middleware::Cache(c) => {
+					// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340)
+					let simple = parts.method == hyper::Method::GET || parts.method == hyper::Method::HEAD;
+					let body_empty = simple && cache::settle(&mut body).await;
+					// the client certificate is a credential, and part of the key (#340)
+					let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
+						let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
+						(t.client_cert, format!("{} {xfcc}", t.client_verify()))
+					});
+					let ask = cache::Ask {
+						host: &host,
+						route: route_name,
+						https: self.https,
+						port: self.local.port(),
+						cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
+						body_empty,
+					};
+					match c.request(&mut parts, &ask).await {
+						Ok((resp, outcome)) => {
+							sent.cached = Some((c.name.clone(), outcome));
+							Some(resp)
+						}
+						Err(pending) => {
+							sent.caches.push((i, pending));
+							None
+						}
 					}
-					Err(pending) => {
-						sent.caches.push((i, pending));
-						None
-					}
-				},
+				}
 				m => m.on_request(&mut parts, &ctx),
 			};
 			if let Some(resp) = resp {
@@ -1174,14 +1194,14 @@ impl Conn {
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
 		};
-		for c in set_cookies {
-			resp.headers_mut().append(header::SET_COOKIE, c);
-		}
-		for h in &response_headers {
-			h.apply(resp.headers_mut());
-		}
 		// response side in reverse, also for answers of the middlewares
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
+			for (_, c) in set_cookies.iter().filter(|(at, _)| *at == i) {
+				resp.headers_mut().append(header::SET_COOKIE, c.clone());
+			}
+			for (_, h) in response_headers.iter().filter(|(at, _)| *at == i) {
+				h.apply(resp.headers_mut());
+			}
 			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
 		if let Some((name, outcome)) = sent.cached.take() {

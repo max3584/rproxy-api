@@ -15,6 +15,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+use common::pki::{Issued, Pki};
 use common::*;
 
 /// A backend that counts requests, answers with the count and can be slowed down or broken.
@@ -257,4 +258,173 @@ async fn routes_keep_the_cache_away_from_authentication() {
 		.await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
 	assert!(v["error"].as_str().unwrap().contains("forward_auth"), "{v}");
+}
+
+/// One request over HTTP/2 with prior knowledge (h2c), with or without a body: status and X-Cache.
+async fn h2_get(port: u16, path: &str, body: Option<&'static str>) -> (StatusCode, String) {
+	use http_body_util::BodyExt;
+	let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	type Boxed = http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+	let (mut sender, conn) =
+		hyper::client::conn::http2::handshake::<_, _, Boxed>(hyper_util::rt::TokioExecutor::new(), hyper_util::rt::TokioIo::new(tcp))
+			.await
+			.unwrap();
+	tokio::spawn(conn);
+	// a body of unknown length: DATA frames without Content-Length
+	let body: Boxed = match body {
+		Some(b) => http_body_util::StreamBody::new(futures_util::stream::iter([Ok(hyper::body::Frame::data(bytes::Bytes::from_static(
+			b.as_bytes(),
+		)))]))
+		.boxed(),
+		None => http_body_util::Empty::new().boxed(),
+	};
+	let req = hyper::Request::get(format!("http://a.test{path}")).body(body).unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	let x = resp.headers().get("x-cache").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+	let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+	resp.into_body().collect().await.unwrap();
+	(status, x)
+}
+
+#[tokio::test]
+async fn a_get_with_a_body_over_http2_is_not_kept() {
+	let h = harness().await;
+	let b = backend().await;
+	let port = rule(&h, &b, json!({"ttl": "10s"})).await;
+	// DATA frames without Content-Length: BYPASS, every time to the backend
+	assert_eq!(h2_get(port, "/x", Some("payload")).await, (StatusCode::OK, "BYPASS".into()));
+	assert_eq!(h2_get(port, "/x", Some("payload")).await, (StatusCode::OK, "BYPASS".into()));
+	assert_eq!(b.hits.load(Ordering::SeqCst), 2);
+	// without a body: kept
+	assert_eq!(h2_get(port, "/x", None).await, (StatusCode::OK, "MISS".into()));
+	assert_eq!(h2_get(port, "/x", None).await, (StatusCode::OK, "HIT".into()));
+	assert_eq!(b.hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn routes_keep_their_own_answers() {
+	let h = harness().await;
+	let (stable, beta) = (backend().await, backend().await);
+	let port = free_port();
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"http": {
+				"routes": [
+					{"name": "beta", "match": "Host(`a.test`) && Header(`X-Beta`, `1`)", "to": format!("http://{}", beta.addr), "middlewares": ["micro"]},
+					{"name": "stable", "match": "Host(`a.test`)", "to": format!("http://{}", stable.addr), "middlewares": ["micro"]},
+					{"name": "inside", "match": "Host(`in.test`)", "to": format!("http://{}", stable.addr), "middlewares": ["lan", "micro"]},
+					{"name": "outside", "match": "Host(`out.test`)", "to": format!("http://{}", stable.addr), "middlewares": ["micro"]},
+				],
+				"middlewares": {"micro": {"cache": {"ttl": "10s"}}, "lan": {"ip_allow": {"source_range": ["127.0.0.0/8"]}}},
+			},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let r = get(port, "/data", &[("host", "a.test"), ("x-beta", "1")]).await;
+	assert_eq!(x_cache(&r), "MISS");
+	// the stable route does not get the beta answer kept under the same middleware
+	let r = get(port, "/data", &[("host", "a.test")]).await;
+	assert_eq!(x_cache(&r), "MISS");
+	assert_eq!((beta.hits.load(Ordering::SeqCst), stable.hits.load(Ordering::SeqCst)), (1, 1));
+	assert_eq!(x_cache(&get(port, "/data", &[("host", "a.test"), ("x-beta", "1")]).await), "HIT");
+	// an answer behind ip_allow stays on its route
+	assert_eq!(x_cache(&get(port, "/data", &[("host", "in.test")]).await), "MISS");
+	assert_eq!(x_cache(&get(port, "/data", &[("host", "out.test")]).await), "MISS");
+}
+
+#[tokio::test]
+async fn cors_after_the_cache_keeps_origins_apart() {
+	let h = harness().await;
+	let b = backend().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"http": {
+				"routes": [{"name": "api", "match": "PathPrefix(`/`)", "to": format!("http://{}", b.addr), "middlewares": ["micro", "c"]}],
+				"middlewares": {"micro": {"cache": {"ttl": "10s"}}, "c": {"cors": {"allow_origins": ["https://app.example"]}}},
+			},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let r = get(port, "/data", &[("origin", "https://evil.example")]).await;
+	assert!(!r.headers().contains_key("access-control-allow-origin"));
+	let r = get(port, "/data", &[("origin", "https://app.example")]).await;
+	assert_eq!((x_cache(&r).as_str(), r.headers()["access-control-allow-origin"].to_str().unwrap()), ("MISS", "https://app.example"));
+	let r = get(port, "/data", &[("origin", "https://app.example")]).await;
+	assert_eq!((x_cache(&r).as_str(), r.headers()["access-control-allow-origin"].to_str().unwrap()), ("HIT", "https://app.example"));
+	let r = get(port, "/data", &[("origin", "https://evil.example")]).await;
+	assert!(!r.headers().contains_key("access-control-allow-origin"), "{:?}", r.headers());
+}
+
+#[tokio::test]
+async fn an_outage_does_not_hold_every_client() {
+	let h = harness().await;
+	let b = backend().await;
+	let port = rule(&h, &b, json!({"ttl": "1s", "stale_on_error": "30s"})).await;
+	assert_eq!(get(port, "/data", &[]).await.json::<Value>().await.unwrap()["n"], 1);
+	tokio::time::sleep(Duration::from_millis(1050)).await;
+	b.status.store(503, Ordering::SeqCst);
+	b.delay_ms.store(300, Ordering::SeqCst);
+	let r = get(port, "/data", &[]).await;
+	assert_eq!(x_cache(&r), "STALE");
+	// within ttl after the failure: the old answer at once, the backend is left alone
+	for _ in 0..5 {
+		let r = get(port, "/data", &[]).await;
+		assert_eq!(x_cache(&r), "STALE");
+		assert_eq!(r.json::<Value>().await.unwrap()["n"], 1);
+	}
+	assert_eq!(b.hits.load(Ordering::SeqCst), 2);
+}
+
+/// One HTTPS/1.1 request to `a.test` with an optional client certificate: X-Cache and the backend's count.
+async fn tls_get(pki: &Pki, port: u16, client: Option<&Issued>, path: &str) -> (String, Value) {
+	use http_body_util::BodyExt;
+	let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let name = rustls::pki_types::ServerName::try_from("a.test").unwrap();
+	let tls = pki.connector_alpn(client, &["http/1.1"]).connect(name, tcp).await.unwrap();
+	let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+	tokio::spawn(conn);
+	let req = hyper::Request::get(path).header("host", "a.test").body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	let x = resp.headers().get("x-cache").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	(x, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn client_certificates_are_credentials() {
+	let h = harness().await;
+	let b = backend().await;
+	let pki = Pki::new("cache-mtls");
+	let server = pki.server("a", &["a.test"]);
+	let (alice, bob) = (pki.client("alice", "alice"), pki.client("bob", "bob"));
+	let port = free_port();
+	let to = format!("http://{}", b.addr);
+	let (status, v) = h
+		.post(json!({
+			"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port,
+			"tls": {"mode": "terminate", "certificates": [{"cert_file": server.cert_file, "key_file": server.key_file}],
+				"client_auth": {"mode": "optional", "ca_file": pki.ca_file}},
+			"http": {
+				"routes": [
+					{"name": "strict", "match": "PathPrefix(`/strict`)", "to": to, "middlewares": ["strict"]},
+					{"name": "shared", "match": "PathPrefix(`/`)", "to": to, "middlewares": ["shared"]},
+				],
+				"middlewares": {"strict": {"cache": {"ttl": "10s"}}, "shared": {"cache": {"ttl": "10s", "share_credentials": true}}},
+			},
+		}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(tls_get(&pki, port, Some(&alice), "/strict").await.0, "BYPASS");
+	assert_eq!(tls_get(&pki, port, Some(&alice), "/strict").await.0, "BYPASS");
+	assert_eq!(tls_get(&pki, port, None, "/strict").await.0, "MISS");
+	// shared, but one answer per certificate (and one for none)
+	let (x, first) = tls_get(&pki, port, Some(&alice), "/data").await;
+	assert_eq!(x, "MISS");
+	assert_eq!(tls_get(&pki, port, Some(&alice), "/data").await, ("HIT".into(), first));
+	assert_eq!(tls_get(&pki, port, Some(&bob), "/data").await.0, "MISS");
+	assert_eq!(tls_get(&pki, port, None, "/data").await.0, "MISS");
+	assert_eq!(tls_get(&pki, port, None, "/data").await.0, "HIT");
 }

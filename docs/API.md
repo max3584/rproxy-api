@@ -473,7 +473,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
   - リダイレクトの状態コードは、`permanent` なら 301、そうでなければ 302。GET / HEAD 以外は 308 / 307（メソッドと本文を保つ）。`status`（301・302・303・307・308、#226）を書けばそれを使う。
   - `respond`: `status`・`body`・`content_type`（既定 `text/plain; charset=utf-8`）で応答する。`service` のないルート（ブロックやメンテナンス表示）に使う。
   - `ip_allow`: 接続元の IP が `source_range` になければ 403。
-  - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）と `Vary: Origin` を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。
+  - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。`Vary: Origin` は許したオリジンでもそうでなくても付ける（v0.4.19、#340。前は許したときだけ。キャッシュがオリジンごとに答えを分けるように）。
   - `rate_limit`: トークンバケット。`period`（既定 `1s`）あたり平均 `average` 件、一度に `burst` 件まで（既定 1。Traefik と同じく、省くと 1 件ずつしか通さない）。超えたら 429 と `Retry-After`（秒）。`source` は `ip`（既定。`global.trusted_proxies` を反映したクライアントの IP。IPv6 は /64 ごと：v0.4.18、#333。1 台のホストがふつう /64 を持ち、リクエストごとにアドレスを替えられるため）か `header:<名前>`（そのヘッダの値ごと。ヘッダがなければクライアントの IP。64 バイトより長い値は SHA-256 で覚える：v0.4.18、#333）。
   - `in_flight`: クライアントの IP ごとに、同時に処理するリクエストを `amount` 件まで（超えたら 429）。応答の本文を送り終えたとき（WebSocket なら接続が終わったとき）に空く。
   - `crowdsec`: クライアントの IP（`global.trusted_proxies` を反映）が LAPI の判定にあれば 403。`appsec: true` なら、続けて AppSec にリクエストを問い合わせ、403 が返れば 403（`X-Crowdsec-Appsec-Ip` / `-Uri` / `-Host` / `-Verb` / `-Api-Key` / `-User-Agent` / `-Http-Version` と元のヘッダを送る。本文は `Content-Length` が 1 MiB 以下のときだけ送り、それより大きいか長さのない本文はヘッダだけで問い合わせる）。`on_error`（既定 `allow`）は、LAPI から一度も取得できていないときと AppSec に問い合わせできないとき（時間切れ 3 秒、200 / 403 以外の応答）に通すか 403 にするか。
@@ -727,7 +727,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
 - **`cors`**（#230）：
   - `allow_origins`：`https://www.foo.com`（スキーム・ホスト・ポートの完全一致、大文字小文字を区別しない）、`*`（すべて）、`https://*.bar.com`（`*` は 1 文字以上の何にでも一致。`.` を含む）。`*` は先頭のラベルとしてだけ書ける（`https://*bar.com` は `evilbar.com` に一致してしまうので `400 invalid`。セキュリティレビュー L13）。`*` と `allow_credentials: true` を同時に書くと、どのサイトにも資格情報つきのリクエストを許すことになるので `config.warning` を出す（Gateway API の決まりどおり `Origin` をそのまま返す）。
   - プリフライト（`OPTIONS` で `Origin` と `Access-Control-Request-Method` があるもの）は、オリジンを許すなら rproxy が 204 で答える：`Access-Control-Allow-Origin`（`allow_origins` が `*` で `allow_credentials` が false なら `*`、ほかは `Origin` の値）、`Access-Control-Allow-Methods`（`allow_methods` をカンマ区切りで。`*` なら、`allow_credentials` のときは求められたメソッド、そうでなければ `*`）、`Access-Control-Allow-Headers`（同じく。`*` なら `allow_credentials` のときは `Access-Control-Request-Headers` の値）、`Access-Control-Expose-Headers`、`Access-Control-Max-Age`（`max_age` があれば）、`Access-Control-Allow-Credentials: true`（`allow_credentials` のとき）、`Vary: Origin`。許さないオリジンのプリフライトも rproxy が 204 で答え、CORS のヘッダは付けない（`Vary: Origin` だけ。転送先へは送らない。#238。転送先が許してしまわないように）。`Origin` のない `OPTIONS` はプリフライトではないので転送先へ。
-  - ふつうのリクエストは転送先へ送り、オリジンを許すなら応答に `Access-Control-Allow-Origin`・`Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers`・`Vary: Origin` を付ける（転送先が返した同じ名前のヘッダは置き換える）。`allow_origins` が `*` で `allow_credentials` が false のとき、`Access-Control-Allow-Origin` は `*` だが、資格情報（`Cookie` か `Authorization`）付きのリクエストには `Origin` の値を返す（v0.4.12 から。Gateway API v1.5 の conformance の期待。v1.6 はどちらでもよい）。`Access-Control-Allow-Credentials` は付けないので、ブラウザがその応答を使わないのは前と同じ。
+  - ふつうのリクエストは転送先へ送り、オリジンを許すなら応答に `Access-Control-Allow-Origin`・`Access-Control-Allow-Credentials`・`Access-Control-Expose-Headers` を付ける（転送先が返した同じ名前のヘッダは置き換える）。`Vary: Origin` は許さないオリジン・`Origin` のないリクエストにも付ける（v0.4.19、#340。前は許したときだけ）。`allow_origins` が `*` で `allow_credentials` が false のとき、`Access-Control-Allow-Origin` は `*` だが、資格情報（`Cookie` か `Authorization`）付きのリクエストには `Origin` の値を返す（v0.4.12 から。Gateway API v1.5 の conformance の期待。v1.6 はどちらでもよい）。`Access-Control-Allow-Credentials` は付けないので、ブラウザがその応答を使わないのは前と同じ。
   - `headers` の `cors` はいままでのまま。
 - **`retry` の `status`**（#231）：転送先がこの状態コード（`"500"`・`"502-504"` のような値か範囲）を返したら、その応答を捨てて次の転送先へ送り直す（`balance` で選び直すので、転送先が 1 つなら同じ転送先へ。#238）。最後の回の応答はそのまま返す。送り直せる条件（冪等なメソッド、本文がないか `buffering` で読み切ったもの、Upgrade でない）と `attempts`（最初の 1 回を含む回数）・`initial_interval`（待ち時間。回ごとに倍）はいままでと同じ。Gateway API の `attempts` は送り直しの回数なので、写すときは `attempts + 1`。
 - **`mirror`**（#232）：
@@ -1090,23 +1090,29 @@ http:
         header: X-Cache        # 既定 X-Cache。"" で付けない
 ```
 
-- キーはホスト（小文字・ポートなし）・パス・クエリ（前のミドルウェアが書き換えた後。転送先が受け取るもの）と、`vary` に書いたリクエストのヘッダの値。メソッドは GET だけを持ち、HEAD は GET の答えから本文なしで答える（HEAD だけでは持たない）。
-- 同時のリクエストをまとめる：持っていない（期限が切れた）キーに最初に来たリクエストだけが転送先へ行き、その間に来た同じキーのリクエストはその答えを待って同じものを受け取る。最初のリクエストのクライアントが切れたら、待っていたもののうち 1 つが代わりに行く。答えが持てないもの（下）だったら、待っていたものはそれぞれ転送先へ行く。待つ時間の上限は最初のリクエストと同じ（サービスの `timeouts`、ルートの `timeouts`）。
-- 持つのはプロセスのメモリ（ノード間・引き継ぎで共有しない）。N 台なら転送先へはキーごとに最大 N 回 / `ttl`。ルールの `http` を変えると空から（`rate_limit` と同じ）。`max_entries` か `max_memory`（本文とヘッダ）を超えるときは古いものから捨てる。`ttl` と `stale_on_error` を過ぎたものも捨てる。
-- 応答には `X-Cache`（`header`）：`HIT`（メモリから）・`MISS`（転送先から。持ったかどうかは問わない）・`STALE`（期限切れのものを、転送先が落ちたので）・`BYPASS`（キャッシュの対象でないリクエスト）。`HIT`・`STALE` には `Age`（持ってからの秒。転送先の `Age` に足す）。
-- `stale_on_error`：期限が切れた後この時間のあいだは、転送先が 5xx を返した・つながらない（502）・時間切れ（504）のとき、持っていた答えを `STALE` で返す。
+- キー：ルート（同じミドルウェアを書いたルートでも、ルートごとに別の答え）、受けた方式とポート（`http:80`・`https:443` など）、ホスト（小文字・ポートなし）・パス・クエリ（前のミドルウェアが書き換えた後。転送先が受け取るもの）、`vary` に書いたリクエストのヘッダの値（`Accept-Encoding` は符号化の名前を小文字にして並べ替えて比べる）、`tls.client_auth` のあるルールではクライアント証明書（rproxy が転送先へ渡す `X-Client-Verify` と `X-Forwarded-Client-Cert` の中身。証明書のないクライアントも 1 つの値）。メソッドは GET だけを持ち、HEAD は GET の答えから本文なしで答える（HEAD だけでは持たない）。
+- 同時のリクエストをまとめる：持っていない（期限が切れた）キーに最初に来たリクエストだけが転送先へ行き、その間に来た同じキーのリクエストはその答えを待って同じものを受け取る。
+  - 最初のリクエストのクライアントが切れたら、待っていたもののうち 1 つが代わりに行く（3 回まで。その後はそれぞれ行く）。
+  - 待つのは 10 秒まで。過ぎたら待っていたものもそれぞれ転送先へ行く（持たない）。
+  - 答えが持てないもの（下）だったら、待っていたものはそれぞれ転送先へ行き、その後の `ttl` のあいだそのキーは待たずに転送先へ行く（持てない答えの後ろに並ばないように）。
+  - 転送先が 5xx を返し、古い答えもないときは、その誤りの答えを待っていたものにも返す（`MISS`。持たない。`Set-Cookie` などのある誤りは返さず、それぞれ転送先へ）。
+- 持つのはプロセスのメモリ（ノード間・引き継ぎで共有しない）。N 台なら転送先へはキーごとに最大 N 回 / `ttl`。ルールの `http` を変えると空から（`rate_limit` と同じ）。`max_entries` か `max_memory`（本文とヘッダ）を超えるときは古いものから捨てる。`ttl` と `stale_on_error` を過ぎたものも捨てる（`/metrics` の数にも入れない）。
+- 応答には `X-Cache`（`header`）：`HIT`（メモリから）・`MISS`（転送先から。持ったかどうかは問わない）・`STALE`（期限切れのものを、転送先が落ちたので）・`BYPASS`（キャッシュの対象でないリクエスト）。`HIT`・`STALE` には `Age`（持ってからの秒を転送先の `Age` に足す）、`MISS` は転送先の `Age` のまま。`header` にはホップごと・本文の形・キャッシュのヘッダ（`Connection`・`Transfer-Encoding`・`Content-Length`・`Age`・`Vary`・`Set-Cookie` など）は使えない。
+- `stale_on_error`：期限が切れた後この時間のあいだは、転送先が 5xx を返した・つながらない（502）・時間切れ（504）のとき、持っていた答えを `STALE` で返す。落ちた後の `ttl` のあいだは転送先へ行かずにすぐ `STALE` で答え、その後は 1 つのリクエストが試し、そのあいだのほかのリクエストもすぐ `STALE` で答える（落ちている間、どのクライアントも転送先の時間切れを待たないように）。
 - 転送先の `Cache-Control` の `max-age`・`s-maxage`・`Expires` は見ない（時間は `ttl` だけで決める）。クライアントの `Cache-Control`（`no-cache` など）も見ない（どのクライアントでも転送先に毎回送らせられないように）。
-- 条件つきのリクエスト：転送先へ行くリクエストからは `If-None-Match`・`If-Modified-Since` を外して全体を取り、`If-None-Match` が持っている答えの `ETag` に合えば 304 で答える（`HIT` でも `MISS` でも）。
+- 条件つきのリクエスト：転送先へ行くリクエストからは `If-None-Match`・`If-Modified-Since` を外して全体を取り、`If-None-Match` が持っている答えの `ETag` に合えば 304 で答える（`HIT` でも `MISS` でも。引用符の中の `,` も読む）。
+- 本文を読む時間：持つために本文を読むのは 5 秒まで。それより長く続く本文（長いポーリング、ゆっくり流れるもの）は読んだ分から続けてそのまま流し、持たない。`text/event-stream` は持たない。
 - 持たないもの（決めたこと）：
-  - リクエスト：GET・HEAD 以外（`BYPASS`。POST などで持っているものは消さない：`ttl` が短い前提）、`Authorization`・`Cookie`・`Proxy-Authorization` のあるもの（`share_credentials: true` で持つ：転送先の答えがそれで変わらないときだけ。利用者ごとに分けたいなら `vary: [Authorization]` か `vary: [Cookie]` も）、`Range`・`Upgrade`・本文のあるもの。
-  - 応答：`status` にない状態コード（選べるのは 200・203・204・300・301・308・404・410）、`Set-Cookie`、`Cache-Control` の `no-store`・`private`・`no-cache`、`Vary: *`、`Content-Range`、`max_body` より大きい本文（`Content-Length` で分かればすぐに、分からなければ読みながら。読んだ分から続けてそのまま送る）、トレーラー、途中で切れた本文（そのまま誤りとして送る）。
+  - リクエスト：GET・HEAD 以外（`BYPASS`。POST などで持っているものは消さない：`ttl` が短い前提）、`Authorization`・`Cookie`・`Proxy-Authorization` のあるもの・`tls.client_auth` のあるルールでクライアント証明書を出したもの（`share_credentials: true` で持つ：転送先の答えがそれで変わらないときだけ。証明書は `share_credentials` でもキーに入るので、証明書の違うクライアントには渡らない。利用者ごとに分けたいなら `vary: [Authorization]` か `vary: [Cookie]` も）、`Range`・`Upgrade`・本文のあるもの（HTTP/2・HTTP/3 で `Content-Length` なしに DATA フレームを送るものも。長さのないリクエストは本文があるかを 1 秒まで見る）。
+  - 応答：`status` にない状態コード（選べるのは 200・203・204・300・301・308・404・410）、`Set-Cookie`、`Cache-Control` の `no-store`・`private`・`no-cache`、`Vary: *`、`Content-Range`、`text/event-stream`、`max_body` より大きい本文（`Content-Length` で分かればすぐに、分からなければ読みながら。読んだ分から続けてそのまま送る）、5 秒で読み終わらない本文、トレーラー、途中で切れた本文（そのまま誤りとして送る）。
   - 応答の `Vary` の名前（と `Content-Encoding` のある応答の `Accept-Encoding`）は、答えたリクエストの値と一緒に持ち、値の違うリクエストには使わない（そのキーで持つのは 1 つ。よく違う値になるヘッダは `vary` に書いてキーを分ける）。
 - 認証との組み合わせ（ルートの検証、`400 invalid`）：
   - `cache` より後ろに、通すかを決めるミドルウェア（`ip_allow`・`geoip`・`crowdsec`・`basic_auth`・`forward_auth`・`oidc`）を置けない（メモリから答えると通らないため）。前に置く。ルートのサービスの転送先ごとの `forward_auth`（`servers[].middlewares`）も同じ理由で断る。
-  - `cache` より前に利用者を確かめるミドルウェア（`basic_auth`・`forward_auth`・`oidc`）があるときは `share_after_auth: true` が要る：転送先は利用者ごとに違う答えを返せる（`X-Forwarded-User` など）が、キャッシュは誰のものか区別しないので、通った利用者のだれにでも同じ答えを見せてよいときだけ。`oidc` はセッションの `Cookie` が付くので `share_credentials: true` も要る。
+  - `cache` より前に利用者を確かめるミドルウェア（`basic_auth`・`forward_auth`・`oidc`）があるときは `share_after_auth: true` が要る：転送先は利用者ごとに違う答えを返せる（`X-Forwarded-User` など）が、キャッシュは誰のものか区別しないので、通った利用者のだれにでも同じ答えを見せてよいときだけ。`oidc` はセッションの `Cookie` が付くので `share_credentials: true` も要る（ないとすべて `BYPASS`。`--check-config` が警告する）。
+  - 認証のミドルウェアがクライアントへの応答に付けるもの（`oidc` の `Set-Cookie`、gRPC の `forward_auth` の `response_headers_to_add`）は、キャッシュが転送先の答えを持った後に、そのリクエストの応答にだけ付ける（持たない。ほかの利用者に渡らない）。
   - 1 つのルートに `cache` は 1 つ。`servers[].middlewares` には書けない。
   - 後ろの `rate_limit`・`in_flight` もメモリから答えたときは動かない（転送先を守るためのものなのでそれでよい）。前に置けばすべてのリクエストに効く。`mirror` はメモリから答えたリクエストを、前でも後ろでも写さない（転送先へ行くものだけ）。
-- ほかのミドルウェアとの順：`compress`・`cors`・`headers` はキャッシュより前（外側）に置くと、メモリからの答えにもリクエストごとに働く（`compress` はそのクライアントの `Accept-Encoding` で）。後ろに置くと、働いた後の答えを持つ（`compress` は `Vary: Accept-Encoding`、`cors` は `Vary: Origin` を付けるので、違うクライアントには使わない）。
+- ほかのミドルウェアとの順：`compress` はキャッシュより前（外側）に置く（`[compress, cache]`）。メモリからの答えをそのクライアントの `Accept-Encoding` で圧縮するので、持つのは 1 つで済む。後ろに置くと、最初のクライアントの `Accept-Encoding` で圧縮したものを持ち（`Vary: Accept-Encoding`）、違う `Accept-Encoding` のクライアントでは持ち直しになる。`cors`・`headers` も前に置くと、メモリからの答えにもリクエストごとに働く。後ろの `cors`（と `headers` の `cors`）は、許したオリジンでもそうでなくても `Vary: Origin` を付ける（v0.4.19 から。オリジンごとに別の答えになる）。
 - 統計：`stats.http` の `cache`（`hit`・`miss`・`stale`・`bypass` の合計）とルートごとの `cache`（ミドルウェアの名前ごと）。引き継ぎで数を渡す。`/metrics` の `rproxy_http_cache_total{protocol,listen,route,middleware,result}`（`result` は `hit`・`miss`・`stale`・`bypass`）と、持っている数・バイト `rproxy_http_cache_entries{protocol,listen,middleware}`・`rproxy_http_cache_bytes{protocol,listen,middleware}`。アクセスログの `cache`（`HIT` など。`cache` のあるルートだけ）。メモリから答えた 404 などは `refused_by` に入れない。
 - 共有のキャッシュ（Redis など）は持たない。転送先への回数を全体で絞る必要が出たら別の issue。
 

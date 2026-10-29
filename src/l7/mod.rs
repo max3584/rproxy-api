@@ -922,6 +922,23 @@ impl HttpSpec {
 		Ok(())
 	}
 
+	/// What is allowed but likely not meant (`--check-config` warnings).
+	pub fn warnings(&self) -> Vec<String> {
+		let mut out = vec![];
+		for r in &self.routes {
+			let kinds: Vec<(&String, &MiddlewareSpec)> = r.middlewares.iter().filter_map(|m| self.middlewares.get(m).map(|s| (m, s))).collect();
+			let Some(at) = kinds.iter().position(|(_, s)| matches!(s, MiddlewareSpec::Cache(_))) else { continue };
+			let (name, MiddlewareSpec::Cache(c)) = kinds[at] else { continue };
+			if !c.share_credentials && kinds[..at].iter().any(|(_, s)| s.kind() == "oidc") {
+				out.push(format!(
+					"route {}: cache {name:?} comes after oidc, whose session cookie makes every request BYPASS the cache; set share_credentials: true if every signed-in user may get the same answer",
+					r.name
+				));
+			}
+		}
+		out
+	}
+
 	/// Names in `Features::http_options` that these settings use (#224, #226-#235).
 	pub fn options_used(&self) -> Vec<&'static str> {
 		let mut used = vec![];
@@ -989,6 +1006,24 @@ mod tests {
 		let s: HttpSpec = serde_json::from_value(v).map_err(|e| e.to_string())?;
 		s.validate().map_err(|e| e.message)?;
 		Ok(s)
+	}
+
+	#[test]
+	fn oidc_before_a_cache_without_share_credentials_is_a_warning() {
+		let http = |share: bool| {
+			spec(serde_json::json!({
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:9", "middlewares": ["o", "c"]}],
+				"middlewares": {
+					"o": {"oidc": {"issuer": "https://id.example", "client_id": "x", "client_secret_file": "/s", "cookie_secret_file": "/c"}},
+					"c": {"cache": {"ttl": "1s", "share_after_auth": true, "share_credentials": share}},
+				},
+			}))
+			.unwrap()
+		};
+		let w = http(false).warnings();
+		assert_eq!(w.len(), 1);
+		assert!(w[0].contains("share_credentials"), "{w:?}");
+		assert!(http(true).warnings().is_empty());
 	}
 
 	#[test]

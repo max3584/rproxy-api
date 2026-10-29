@@ -496,6 +496,7 @@ fn l7_http2(c: &mut Criterion) {
 /// A `cache` (#340) in front of `backend`: after the first request every one is answered
 /// from memory (the hit path: key, lookup, the response from the kept answer).
 fn l7_cache(c: &mut Criterion) {
+	const CACHED: &str = "/api/v1/state.json?world=1";
 	let rt = runtime();
 	let (h, mut sender) = rt.block_on(async {
 		let h = harness().await;
@@ -514,8 +515,13 @@ fn l7_cache(c: &mut Criterion) {
 		.await;
 		let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
 		tcp.set_nodelay(true).unwrap();
-		let (sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tcp)).await.unwrap();
+		let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(tcp)).await.unwrap();
 		tokio::spawn(conn);
+		// the first request fills the cache; every measured one is a hit
+		let req = hyper::Request::get(CACHED).header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
+		let resp = sender.send_request(req).await.unwrap();
+		assert_eq!(resp.headers()["x-cache"], "MISS");
+		resp.into_body().collect().await.unwrap();
 		(h, sender)
 	});
 	let mut g = c.benchmark_group("l7_cache");
@@ -527,9 +533,10 @@ fn l7_cache(c: &mut Criterion) {
 				for _ in 0..iters {
 					guard(&h, "l7_cache/hit", async {
 						sender.ready().await.unwrap();
-						let req = hyper::Request::get("/api/v1/state.json?world=1").header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
+						let req = hyper::Request::get(CACHED).header("host", "app.test").body(Empty::<Bytes>::new()).unwrap();
 						let resp = sender.send_request(req).await.unwrap();
 						assert_eq!(resp.status(), StatusCode::OK);
+						assert_eq!(resp.headers()["x-cache"], "HIT");
 						resp.into_body().collect().await.unwrap();
 					})
 					.await;

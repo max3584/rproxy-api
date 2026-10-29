@@ -497,8 +497,9 @@ impl Middleware {
 				if cors.allow_credentials {
 					headers.insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
 				}
-				headers.append(header::VARY, HeaderValue::from_static("Origin"));
 			}
+			// whether or not the origin is allowed, the answer depends on it (#340: caches)
+			cors::vary_origin(headers);
 		}
 	}
 }

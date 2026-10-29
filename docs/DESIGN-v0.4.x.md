@@ -374,5 +374,14 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
   - `max_memory`（既定 64 MiB）は issue になかったが足した：既定の `max_entries`（1024）× `max_body`（1 MiB）が 1 GiB になり、メモリを少なくする方針に合わないため。
   - 古いものから捨てる：`ttl` はミドルウェアごとに同じなので、入れた順が期限の順。入れるたびに `stale_on_error` まで過ぎたものを先頭から捨て、超えた分も先頭から。
   - 条件つきのリクエスト：先に行くリクエストからは `If-None-Match`・`If-Modified-Since` を外して全体を取り、`If-None-Match` だけ rproxy が 304 で答える。
-- 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる）。
+- レビューで足したもの（#343）：
+  - キーにルートの名前（同じミドルウェアを書いたルートどうしで答えを混ぜない。`Header` で分けたベータ版のルート、`ip_allow` の後ろのルート）、受けた方式とポート、`tls.client_auth` のルールではクライアント証明書（`X-Client-Verify` と `X-Forwarded-Client-Cert` の中身）を入れる（`cache::Ask`）。証明書を出したリクエストは資格情報（`share_credentials` なしは `BYPASS`）。
+  - HTTP/2・HTTP/3 で `Content-Length` なしに DATA フレームを送る GET：`cache::settle` が本文を 1 秒まで見て（読んだものは戻す）、あれば `BYPASS`。
+  - 認証のミドルウェアが応答に付けるもの（`oidc` の `Set-Cookie`、gRPC の `forward_auth` の `response_headers_to_add`）は、そのミドルウェアの応答側（チェーンの位置ごと）で付ける。前は応答側の前に全部付けていたので、後ろのキャッシュが持って別の利用者に返していた。後ろのミドルウェアの応答側はもうこれを見ない（`headers` の `remove` で消すなら前に置く）。
+  - `cors`（と `headers` の `cors`）は許さないオリジンにも `Vary: Origin`（後ろのキャッシュが許さないオリジンへの答えを許したオリジンに返さないように）。
+  - 持てない答えのキーは `ttl` のあいだ並ばせない（`Store.passes`、`max_entries` まで）。古い答えのない 5xx は待っていたものに渡す（`Done::Error`）。待つのは `WAIT_LIMIT`（10 秒）まで、本文を読むのは `COLLECT_LIMIT`（5 秒）まで、`text/event-stream` は持たない。
+  - 落ちている間：`Slot.failed` から `ttl` は転送先へ行かずに `STALE`、その後は 1 つが試し、ほかはすぐ `STALE`。
+  - `header` にホップごと・本文の形・キャッシュのヘッダを使わせない。`MISS` は転送先の `Age` を残す。`/metrics` の数は期限を過ぎたものを捨ててから。If-None-Match は引用符の中の `,` を読む。`Accept-Encoding` は符号化の名前の組で比べる。`oidc` の後ろで `share_credentials` のない `cache` は `--check-config` の警告（`HttpSpec::warnings`）。
+  - 単体テストは止めた時計（`tokio::time::pause`、`Instant` は `tokio::time::Instant`）で時間を進める。
+- 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる。最初に 1 回埋めて、測るものはすべて `HIT` を確かめる）。
 - 試験：`tests/http_cache.rs`、`src/l7/middleware/cache.rs` の単体テスト。

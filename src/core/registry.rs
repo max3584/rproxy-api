@@ -1987,6 +1987,9 @@ impl Registry {
 					format!("cannot run with this build or these permissions (it would be registered as failed): {missing}"),
 				));
 			}
+			for w in spec.http.as_ref().map(|h| h.warnings()).unwrap_or_default() {
+				out.warnings.push((label.clone(), w));
+			}
 			match self.build_parts(&spec) {
 				Ok(_) => out.ok += 1,
 				// the part this build cannot run is the warning above

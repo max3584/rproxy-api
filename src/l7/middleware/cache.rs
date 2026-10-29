@@ -2,16 +2,24 @@
 //! share them). Made for many clients polling the same JSON every few seconds: the backend gets
 //! one request per key and `ttl`, however many clients ask.
 //!
+//! - The key: the route (each route has its own answers, even with the same middleware), the
+//!   scheme and port the request came to, host, path and query, the `vary` headers, and on
+//!   rules with `tls.client_auth` the client certificate as rproxy saw it.
 //! - A request that finds nothing fresh leads: it goes to the backend, and the others asking
-//!   for the same key meanwhile wait for its answer (coalescing) instead of going too.
+//!   for the same key meanwhile wait for its answer (coalescing) instead of going too, at most
+//!   `WAIT_LIMIT`. An answer that may not be kept lets the requests of the next `ttl` go to the
+//!   backend without waiting (`Store.passes`); an error without an old answer is handed to
+//!   those waiting.
 //! - `stale_on_error`: when the backend fails (5xx, rproxy's 502 / 504), the last answer is
-//!   given for that long after it went out of date.
+//!   given for that long after it went out of date. After a failure the old answer is given at
+//!   once for `ttl` (no request goes), and while one request tries again (`Slot.failed`).
 //! - Never kept: other methods than GET (HEAD is answered from GET's answers), requests with
-//!   `Authorization` / `Cookie` (unless `share_credentials`), `Range`, `Upgrade` or a body;
+//!   `Authorization` / `Cookie` / a client certificate (unless `share_credentials`), `Range`,
+//!   `Upgrade` or a body (also HTTP/2 and HTTP/3 DATA frames without a length: `settle`);
 //!   answers with `Set-Cookie`, `Cache-Control: no-store / private / no-cache`, `Vary: *`,
-//!   `Content-Range`, a status outside `status`, a body over `max_body`, trailers, or a body
-//!   that broke off. The route's checks keep it out of the way of authentication
-//!   (`HttpSpec::check_cache_route`): nothing that decides who gets in may come after it.
+//!   `Content-Range`, `text/event-stream`, a status outside `status`, a body over `max_body`
+//!   or still coming after `COLLECT_LIMIT`, trailers, or a body that broke off. The route's
+//!   checks keep it out of the way of authentication (`HttpSpec::check_cache_route`).
 //! - The answer's `Vary` (and `Accept-Encoding` for an encoded body) is kept with it: a
 //!   request with other values of those headers does not get it.
 
@@ -19,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Empty, Full};
@@ -29,6 +37,7 @@ use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tokio::time::Instant;
 
 use crate::error::ApiError;
 use crate::l7::parse_duration;
@@ -41,6 +50,27 @@ pub const GATES: &[&str] = &["ip_allow", "geoip", "crowdsec", "basic_auth", "for
 pub const SIGN_IN: &[&str] = &["basic_auth", "forward_auth", "oidc"];
 /// Statuses `status` may name (cacheable by default in RFC 9110 §15.1, less 206 / 405 / 414 / 501).
 pub const STATUSES: &[u16] = &[200, 203, 204, 300, 301, 308, 404, 410];
+/// Names `header` may not take: hop-by-hop, framing, and what the cache itself sets or reads.
+const RESERVED_HEADERS: &[&str] = &[
+	"connection",
+	"keep-alive",
+	"proxy-connection",
+	"te",
+	"trailer",
+	"transfer-encoding",
+	"upgrade",
+	"content-length",
+	"content-encoding",
+	"content-range",
+	"content-type",
+	"host",
+	"age",
+	"vary",
+	"set-cookie",
+	"etag",
+	"cache-control",
+	"date",
+];
 const MIN_TTL: Duration = Duration::from_millis(100);
 const MAX_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const DEFAULT_MAX_BODY: u64 = 1 << 20;
@@ -51,6 +81,14 @@ pub const DEFAULT_MAX_MEMORY: u64 = 64 << 20;
 const MAX_MEMORY: u64 = 1 << 34;
 /// Times a waiting request looks again after the request it waited for went away.
 const RETRIES: usize = 3;
+/// How long a request waits for the one that went to the backend; then it goes itself.
+pub const WAIT_LIMIT: Duration = Duration::from_secs(10);
+/// How long the body of an answer is read to keep it; one still coming is sent on as it comes
+/// (long polls, slow streams) and not kept.
+pub const COLLECT_LIMIT: Duration = Duration::from_secs(5);
+/// How long a GET's body is looked for when the request does not say it has none (HTTP/2 and
+/// HTTP/3 can send DATA frames without Content-Length).
+const BODY_PEEK: Duration = Duration::from_secs(1);
 const DEFAULT_HEADER: &str = "x-cache";
 
 fn is_false(b: &bool) -> bool {
@@ -81,8 +119,9 @@ pub struct CacheSpec {
 	/// Statuses that are kept (default [200]; of `STATUSES`).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub status: Vec<u16>,
-	/// Requests with `Authorization` / `Cookie` are answered from the cache too (the backend's
-	/// answer does not depend on them).
+	/// Requests with `Authorization` / `Cookie` / a client certificate are answered from the
+	/// cache too (the backend's answer does not depend on them; a client certificate stays
+	/// part of the key).
 	#[serde(default, skip_serializing_if = "is_false")]
 	pub share_credentials: bool,
 	/// The route may sign users in before the cache (basic_auth, forward_auth, oidc): every
@@ -157,7 +196,13 @@ impl Settings {
 		let header = match spec.header.as_deref() {
 			None => Some(HeaderName::from_static(DEFAULT_HEADER)),
 			Some("") => None,
-			Some(h) => Some(HeaderName::from_bytes(h.as_bytes()).map_err(|_| bad(format!("header: {h:?} is not a header name")))?),
+			Some(h) => {
+				let name = HeaderName::from_bytes(h.as_bytes()).map_err(|_| bad(format!("header: {h:?} is not a header name")))?;
+				if RESERVED_HEADERS.contains(&name.as_str()) {
+					return Err(bad(format!("header: {h:?} is a header of the HTTP framing or of caching; pick another name")));
+				}
+				Some(name)
+			}
 		};
 		Ok(Settings {
 			ttl,
@@ -178,11 +223,11 @@ impl Settings {
 pub enum Outcome {
 	/// From memory.
 	Hit,
-	/// From the backend (kept or not).
+	/// From the backend (kept or not), or the error the request waited for.
 	Miss,
 	/// From memory although out of date: the backend failed (`stale_on_error`).
 	Stale,
-	/// Not for the cache (method, credentials, …): from the backend.
+	/// Not for the cache (method, credentials, a body, …): from the backend.
 	Bypass,
 }
 
@@ -201,6 +246,43 @@ impl Outcome {
 	pub fn index(self) -> usize {
 		self as usize
 	}
+}
+
+/// What the server knows of a request besides its parts.
+pub struct Ask<'a> {
+	/// Host without the port, lower case.
+	pub host: &'a str,
+	/// The route's name: each route keeps its own answers.
+	pub route: &'a str,
+	pub https: bool,
+	/// The port the request came to.
+	pub port: u16,
+	/// The client certificate on rules with `tls.client_auth`: whether one was given, and
+	/// what rproxy passes on about it (X-Client-Verify and X-Forwarded-Client-Cert).
+	pub cert: Option<(bool, &'a str)>,
+	/// The request has no body (`settle`).
+	pub body_empty: bool,
+}
+
+/// Whether the request's body is empty. One that may still send DATA frames (HTTP/2 and
+/// HTTP/3 without Content-Length) is looked at for `BODY_PEEK`; what was read is put back.
+pub async fn settle(body: &mut Body) -> bool {
+	use hyper::body::Body as _;
+	if body.is_end_stream() {
+		return true;
+	}
+	let first = match tokio::time::timeout(BODY_PEEK, body.frame()).await {
+		Ok(None) => {
+			*body = empty();
+			return true;
+		}
+		Ok(Some(f)) => f,
+		Err(_) => return false,
+	};
+	let rest = std::mem::replace(body, empty());
+	let failed = first.is_err();
+	*body = Resumed { read: None, next: Some(first), rest: (!failed).then_some(rest) }.boxed();
+	false
 }
 
 /// A kept answer.
@@ -232,10 +314,22 @@ enum Done {
 	Pending,
 	Fresh(Arc<Entry>),
 	Stale(Arc<Entry>),
+	/// The backend failed and there is no old answer: this is its error answer (not kept).
+	Error(Arc<Entry>),
 	/// The answer is not kept: go to the backend.
 	Uncacheable,
 	/// The request went away (its client did): look again.
 	Abandoned,
+}
+
+/// What the end of a flight leaves for the key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+	Nothing,
+	/// The answer may not be kept: the next `ttl` goes to the backend without waiting.
+	Pass,
+	/// The backend failed: the old answer is given at once for `ttl`.
+	Failed,
 }
 
 struct Flight {
@@ -246,6 +340,8 @@ struct Flight {
 struct Slot {
 	entry: Option<Arc<Entry>>,
 	flight: Option<Arc<Flight>>,
+	/// When the backend last failed for this key (cleared by a new answer).
+	failed: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -255,6 +351,8 @@ struct Store {
 	/// in which they go out of date).
 	order: BTreeMap<u64, Vec<u8>>,
 	memory: u64,
+	/// Keys whose answers may not be kept, until when (at most `max_entries` of them).
+	passes: HashMap<Vec<u8>, Instant>,
 }
 
 impl Store {
@@ -275,6 +373,28 @@ impl Store {
 		let key = key.clone();
 		self.take(&key);
 		self.order.remove(&seq);
+	}
+
+	/// Drops the entries past `stale_on_error` (they are at the front).
+	fn purge(&mut self, now: Instant) {
+		while let Some(k) = self.order.first_key_value().map(|(_, k)| k.clone()) {
+			let dead = self.map.get(&k).and_then(|s| s.entry.as_ref()).is_none_or(|e| e.stale_until <= now);
+			if !dead {
+				break;
+			}
+			self.take_oldest();
+		}
+	}
+
+	fn pass(&mut self, key: &[u8], until: Instant, max: usize) {
+		if self.passes.len() >= max {
+			let now = Instant::now();
+			self.passes.retain(|_, t| *t > now);
+			if self.passes.len() >= max {
+				self.passes.clear();
+			}
+		}
+		self.passes.insert(key.to_vec(), until);
 	}
 }
 
@@ -303,19 +423,30 @@ pub struct Lead {
 
 impl Lead {
 	/// Ends the flight: the slot no longer has it, and those waiting learn `done`.
-	fn finish(&mut self, done: Done, entry: Option<Arc<Entry>>) {
+	fn finish(&mut self, done: Done, entry: Option<Arc<Entry>>, mark: Mark) {
 		if self.done {
 			return;
 		}
 		self.done = true;
 		{
-			let mut store = self.cache.store.lock().unwrap_or_else(|e| e.into_inner());
+			let cache = &self.cache;
+			let mut store = cache.store.lock().unwrap_or_else(|e| e.into_inner());
+			let now = Instant::now();
 			if let Some(e) = entry {
-				self.cache.insert(&mut store, &self.key, e);
+				cache.insert(&mut store, &self.key, e);
+				store.passes.remove(&self.key);
+			}
+			if mark == Mark::Pass {
+				store.pass(&self.key, now + cache.settings.ttl, cache.settings.max_entries);
 			}
 			if let Some(slot) = store.map.get_mut(&self.key) {
 				if slot.flight.as_ref().is_some_and(|f| Arc::ptr_eq(f, &self.flight)) {
 					slot.flight = None;
+				}
+				match mark {
+					Mark::Failed => slot.failed = Some(now),
+					_ if slot.entry.as_ref().is_some_and(|e| e.fresh_until > now) => slot.failed = None,
+					_ => {}
 				}
 				if slot.flight.is_none() && slot.entry.is_none() {
 					store.map.remove(&self.key);
@@ -328,7 +459,7 @@ impl Lead {
 
 impl Drop for Lead {
 	fn drop(&mut self) {
-		self.finish(Done::Abandoned, None);
+		self.finish(Done::Abandoned, None, Mark::Nothing);
 	}
 }
 
@@ -344,8 +475,12 @@ pub struct Pending {
 }
 
 impl Pending {
-	fn bypass() -> Pending {
-		Pending { key: None, lead: None, headers: HeaderMap::new(), head: false }
+	fn bypass() -> Box<Pending> {
+		Box::new(Pending { key: None, lead: None, headers: HeaderMap::new(), head: false })
+	}
+
+	fn alone(key: Vec<u8>, parts: &Parts, head: bool) -> Box<Pending> {
+		Box::new(Pending { key: Some(key), lead: None, headers: parts.headers.clone(), head })
 	}
 }
 
@@ -354,31 +489,40 @@ impl Cache {
 		Ok(Cache { name: name.to_string(), settings: Settings::of(spec, what)?, store: Mutex::default(), next: Default::default() })
 	}
 
-	/// Answers kept and the bytes they take (`/metrics`).
+	/// Answers kept (those past `stale_on_error` are dropped first) and the bytes they take (`/metrics`).
 	pub fn usage(&self) -> (usize, u64) {
-		let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+		let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+		store.purge(Instant::now());
 		(store.order.len(), store.memory)
 	}
 
-	fn eligible(&self, parts: &Parts) -> bool {
+	fn eligible(&self, parts: &Parts, ask: &Ask) -> bool {
 		let h = &parts.headers;
+		let credentials = h.contains_key(header::AUTHORIZATION)
+			|| h.contains_key(header::COOKIE)
+			|| h.contains_key(header::PROXY_AUTHORIZATION)
+			|| ask.cert.is_some_and(|(given, _)| given);
 		(parts.method == Method::GET || parts.method == Method::HEAD)
+			&& ask.body_empty
 			&& !h.contains_key(header::RANGE)
 			&& !h.contains_key(header::UPGRADE)
 			&& !h.contains_key(header::TRANSFER_ENCODING)
 			&& h.get(header::CONTENT_LENGTH).is_none_or(|v| v.as_bytes() == b"0")
-			&& (self.settings.share_credentials
-				|| !(h.contains_key(header::AUTHORIZATION)
-					|| h.contains_key(header::COOKIE)
-					|| h.contains_key(header::PROXY_AUTHORIZATION)))
+			&& (self.settings.share_credentials || !credentials)
 	}
 
-	/// Host (lowercase, without the port), path and query, and the `vary` headers.
-	fn key(&self, parts: &Parts, host: &str) -> Vec<u8> {
+	/// The route, scheme and port, host, path and query, the `vary` headers and the client
+	/// certificate (rules with `tls.client_auth`).
+	fn key(&self, parts: &Parts, ask: &Ask) -> Vec<u8> {
 		let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-		let mut key = Vec::with_capacity(host.len() + pq.len() + 1);
-		key.extend(host.bytes().map(|b| b.to_ascii_lowercase()));
-		key.push(b' ');
+		let mut key = Vec::with_capacity(ask.route.len() + ask.host.len() + pq.len() + 16);
+		key.extend_from_slice(ask.route.as_bytes());
+		key.push(0);
+		key.extend_from_slice(if ask.https { b"https:" } else { b"http:" });
+		key.extend_from_slice(ask.port.to_string().as_bytes());
+		key.push(0);
+		key.extend(ask.host.bytes().map(|b| b.to_ascii_lowercase()));
+		key.push(0);
 		key.extend_from_slice(pq.as_bytes());
 		for name in &self.settings.vary {
 			key.push(b'\n');
@@ -387,30 +531,47 @@ impl Cache {
 				key.extend_from_slice(&v);
 			}
 		}
+		if let Some((_, cert)) = ask.cert {
+			key.extend_from_slice(b"\ncert=");
+			key.extend_from_slice(cert.as_bytes());
+		}
 		key
 	}
 
 	/// The request side: an answer from memory, or what the response side needs. A request
 	/// that finds another one already asking the backend for its key waits for that answer.
-	pub async fn request(self: &Arc<Self>, parts: &mut Parts, host: &str) -> Result<(Response<Body>, Outcome), Box<Pending>> {
-		if !self.eligible(parts) {
-			return Err(Box::new(Pending::bypass()));
+	pub async fn request(self: &Arc<Self>, parts: &mut Parts, ask: &Ask<'_>) -> Result<(Response<Body>, Outcome), Box<Pending>> {
+		if !self.eligible(parts, ask) {
+			return Err(Pending::bypass());
 		}
-		let key = self.key(parts, host);
+		let key = self.key(parts, ask);
 		let head = parts.method == Method::HEAD;
-		for _ in 0..RETRIES {
+		let mut tries = 0;
+		loop {
 			let mut rx = {
 				let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-				let slot = store.map.get(&key);
 				let now = Instant::now();
-				if let Some(e) = slot.and_then(|s| s.entry.as_ref()).filter(|e| now < e.fresh_until && e.fits(&parts.headers)) {
+				if store.passes.get(&key).is_some_and(|t| *t > now) {
+					return Err(Pending::alone(key, parts, head));
+				}
+				let slot = store.map.get(&key);
+				let entry = slot.and_then(|s| s.entry.as_ref()).filter(|e| e.fits(&parts.headers));
+				if let Some(e) = entry.filter(|e| now < e.fresh_until) {
 					let e = e.clone();
 					drop(store);
 					return Ok((self.answer(&e, &parts.headers, head, Outcome::Hit), Outcome::Hit));
 				}
+				// the backend failed lately: the old answer at once, for `ttl` and while one tries again
+				if let (Some(e), Some(failed)) = (entry.filter(|e| now < e.stale_until), slot.and_then(|s| s.failed)) {
+					if now < failed + self.settings.ttl || slot.is_some_and(|s| s.flight.is_some()) {
+						let e = e.clone();
+						drop(store);
+						return Ok((self.answer(&e, &parts.headers, head, Outcome::Stale), Outcome::Stale));
+					}
+				}
 				// HEAD does not lead: its answer has no body to keep
-				if head {
-					return Err(Box::new(Pending { key: Some(key), lead: None, headers: parts.headers.clone(), head }));
+				if head || tries >= RETRIES {
+					return Err(Pending::alone(key, parts, head));
 				}
 				match slot.and_then(|s| s.flight.as_ref()) {
 					Some(f) => f.tx.subscribe(),
@@ -428,37 +589,60 @@ impl Cache {
 					}
 				}
 			};
-			let done = match rx.wait_for(|d| !matches!(d, Done::Pending)).await {
-				Ok(d) => d.clone(),
-				Err(_) => Done::Abandoned,
+			let done = match tokio::time::timeout(WAIT_LIMIT, rx.wait_for(|d| !matches!(d, Done::Pending))).await {
+				Ok(Ok(d)) => d.clone(),
+				Ok(Err(_)) => Done::Abandoned,
+				// the request ahead takes too long: go too (without leading)
+				Err(_) => return Err(Pending::alone(key, parts, head)),
 			};
 			match done {
 				Done::Fresh(e) if e.fits(&parts.headers) => return Ok((self.answer(&e, &parts.headers, head, Outcome::Hit), Outcome::Hit)),
 				Done::Stale(e) if e.fits(&parts.headers) => {
 					return Ok((self.answer(&e, &parts.headers, head, Outcome::Stale), Outcome::Stale));
 				}
-				Done::Abandoned => continue,
-				_ => break,
+				Done::Error(e) if e.fits(&parts.headers) => {
+					return Ok((self.answer(&e, &parts.headers, head, Outcome::Miss), Outcome::Miss));
+				}
+				Done::Abandoned => tries += 1,
+				_ => return Err(Pending::alone(key, parts, head)),
 			}
 		}
-		Err(Box::new(Pending { key: Some(key), lead: None, headers: parts.headers.clone(), head }))
 	}
 
 	/// The response side: keeps the backend's answer (when this request led and it may be
 	/// kept), or gives the out-of-date one when the backend failed.
 	pub async fn response(&self, mut pending: Box<Pending>, resp: Response<Body>) -> (Response<Body>, Outcome) {
 		let Some(key) = pending.key.take() else { return (self.mark(resp, Outcome::Bypass), Outcome::Bypass) };
-		if resp.status().is_server_error() && !self.settings.stale.is_zero() {
+		if resp.status().is_server_error() {
 			if let Some(e) = self.stale(&key, &pending.headers) {
-				if let Some(lead) = pending.lead.as_mut() {
-					lead.finish(Done::Stale(e.clone()), None);
+				match pending.lead.as_mut() {
+					Some(lead) => lead.finish(Done::Stale(e.clone()), None, Mark::Failed),
+					None => self.failed(&key),
 				}
 				return (self.answer(&e, &pending.headers, pending.head, Outcome::Stale), Outcome::Stale);
 			}
+			let Some(lead) = pending.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
+			// no old answer: those waiting get this error rather than all asking the failing backend
+			if !shareable(resp.headers()) {
+				lead.finish(Done::Uncacheable, None, Mark::Nothing);
+				return (self.mark(resp, Outcome::Miss), Outcome::Miss);
+			}
+			let (parts, body) = resp.into_parts();
+			return match collect(body, self.settings.max_body).await {
+				Ok(bytes) => {
+					let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &pending.headers));
+					lead.finish(Done::Error(e.clone()), None, Mark::Nothing);
+					(self.answer(&e, &pending.headers, pending.head, Outcome::Miss), Outcome::Miss)
+				}
+				Err(body) => {
+					lead.finish(Done::Uncacheable, None, Mark::Nothing);
+					(self.mark(Response::from_parts(parts, body), Outcome::Miss), Outcome::Miss)
+				}
+			};
 		}
 		let Some(lead) = pending.lead.as_mut() else { return (self.mark(resp, Outcome::Miss), Outcome::Miss) };
 		if !self.storable(&resp) {
-			lead.finish(Done::Uncacheable, None);
+			lead.finish(Done::Uncacheable, None, Mark::Pass);
 			return (self.mark(resp, Outcome::Miss), Outcome::Miss);
 		}
 		let (parts, body) = resp.into_parts();
@@ -466,32 +650,46 @@ impl Cache {
 			Ok(bytes) => {
 				let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &pending.headers));
 				if e.size <= self.settings.max_memory {
-					lead.finish(Done::Fresh(e.clone()), Some(e.clone()));
+					lead.finish(Done::Fresh(e.clone()), Some(e.clone()), Mark::Nothing);
 				} else {
-					lead.finish(Done::Uncacheable, None);
+					lead.finish(Done::Uncacheable, None, Mark::Pass);
 				}
 				(self.answer(&e, &pending.headers, pending.head, Outcome::Miss), Outcome::Miss)
 			}
 			Err(body) => {
-				lead.finish(Done::Uncacheable, None);
+				lead.finish(Done::Uncacheable, None, Mark::Pass);
 				(self.mark(Response::from_parts(parts, body), Outcome::Miss), Outcome::Miss)
 			}
 		}
 	}
 
 	fn stale(&self, key: &[u8], request: &HeaderMap) -> Option<Arc<Entry>> {
+		if self.settings.stale.is_zero() {
+			return None;
+		}
 		let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
 		let e = store.map.get(key)?.entry.as_ref()?;
 		(Instant::now() < e.stale_until && e.fits(request)).then(|| e.clone())
 	}
 
+	/// A request that did not lead saw the backend fail.
+	fn failed(&self, key: &[u8]) {
+		let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+		if let Some(slot) = store.map.get_mut(key) {
+			slot.failed = Some(Instant::now());
+		}
+	}
+
 	fn storable(&self, resp: &Response<Body>) -> bool {
 		let h = resp.headers();
+		let streaming = h
+			.get(header::CONTENT_TYPE)
+			.and_then(|v| v.to_str().ok())
+			.is_some_and(|t| t.trim_start().get(..17).is_some_and(|t| t.eq_ignore_ascii_case("text/event-stream")));
 		self.settings.status.contains(&resp.status().as_u16())
-			&& !h.contains_key(header::SET_COOKIE)
+			&& shareable(h)
 			&& !h.contains_key(header::CONTENT_RANGE)
-			&& !forbids(h)
-			&& !vary_names(h).iter().any(|n| n == "*")
+			&& !streaming
 			&& h.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok()).is_none_or(|n| n <= self.settings.max_body)
 	}
 
@@ -530,15 +728,7 @@ impl Cache {
 	/// Puts an entry in place of the key's old one, making room by dropping the oldest.
 	fn insert(&self, store: &mut Store, key: &[u8], entry: Arc<Entry>) {
 		store.take(key);
-		let now = Instant::now();
-		// out of date for good
-		while let Some(k) = store.order.first_key_value().map(|(_, k)| k.clone()) {
-			let dead = store.map.get(&k).and_then(|s| s.entry.as_ref()).is_none_or(|e| e.stale_until <= now);
-			if !dead {
-				break;
-			}
-			store.take_oldest();
-		}
+		store.purge(Instant::now());
 		while !store.order.is_empty()
 			&& (store.order.len() >= self.settings.max_entries || store.memory + entry.size > self.settings.max_memory)
 		{
@@ -549,7 +739,8 @@ impl Cache {
 		store.map.entry(key.to_vec()).or_default().entry = Some(entry);
 	}
 
-	/// The answer from an entry: `Age` for HIT / STALE, 304 for a matching If-None-Match.
+	/// The answer from an entry: `Age` (the backend's, plus the time kept for HIT / STALE),
+	/// 304 for a matching If-None-Match.
 	fn answer(&self, e: &Entry, request: &HeaderMap, head: bool, outcome: Outcome) -> Response<Body> {
 		let not_modified = e.status == StatusCode::OK && none_match(request, e.headers.get(header::ETAG));
 		let body = if head || not_modified || e.body.is_empty() { empty() } else { full(e.body.clone()) };
@@ -559,8 +750,9 @@ impl Cache {
 		if not_modified {
 			resp.headers_mut().remove(header::CONTENT_LENGTH);
 		}
-		if outcome != Outcome::Miss {
-			resp.headers_mut().insert(header::AGE, HeaderValue::from(e.age.saturating_add(e.stored.elapsed().as_secs())));
+		let age = if outcome == Outcome::Miss { e.age } else { e.age.saturating_add(e.stored.elapsed().as_secs()) };
+		if outcome != Outcome::Miss || e.age > 0 {
+			resp.headers_mut().insert(header::AGE, HeaderValue::from(age));
 		}
 		self.mark(resp, outcome)
 	}
@@ -573,13 +765,26 @@ impl Cache {
 	}
 }
 
-/// All values of a header, joined with ", ".
+/// All values of a header, joined with ", ". `Accept-Encoding` is compared by its codings:
+/// lower case, without spaces, sorted.
 fn joined(headers: &HeaderMap, name: &HeaderName) -> Option<Vec<u8>> {
-	let mut values = headers.get_all(name).iter();
-	let first = values.next()?;
-	let mut out = first.as_bytes().to_vec();
-	for v in values {
-		out.extend_from_slice(b", ");
+	let mut values = headers.get_all(name).iter().peekable();
+	values.peek()?;
+	if name == header::ACCEPT_ENCODING {
+		let mut codings: Vec<Vec<u8>> = values
+			.flat_map(|v| v.as_bytes().split(|b| *b == b','))
+			.map(|c| c.iter().filter(|b| !b.is_ascii_whitespace()).map(u8::to_ascii_lowercase).collect::<Vec<u8>>())
+			.filter(|c| !c.is_empty())
+			.collect();
+		codings.sort();
+		codings.dedup();
+		return Some(codings.join(&b","[..]));
+	}
+	let mut out = vec![];
+	for (i, v) in values.enumerate() {
+		if i > 0 {
+			out.extend_from_slice(b", ");
+		}
 		out.extend_from_slice(v.as_bytes());
 	}
 	Some(out)
@@ -597,25 +802,43 @@ fn vary_names(headers: &HeaderMap) -> Vec<String> {
 		.collect()
 }
 
-/// `Cache-Control: no-store`, `private` or `no-cache` (also with field names) of an answer.
-fn forbids(headers: &HeaderMap) -> bool {
-	headers.get_all(header::CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(|d| {
+/// An answer that may go to other clients: no `Set-Cookie`, no `Cache-Control: no-store`,
+/// `private` or `no-cache` (also with field names), no `Vary: *`.
+fn shareable(headers: &HeaderMap) -> bool {
+	let forbids = headers.get_all(header::CACHE_CONTROL).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(|d| {
 		let name = d.split('=').next().unwrap_or("").trim();
 		["no-store", "private", "no-cache"].iter().any(|f| name.eq_ignore_ascii_case(f))
-	})
+	});
+	!forbids && !headers.contains_key(header::SET_COOKIE) && !vary_names(headers).iter().any(|n| n == "*")
+}
+
+/// The entity tags of a list (`If-None-Match`, `ETag`): their opaque part, `W/` dropped for
+/// the weak comparison; `*` as itself. Commas inside the quotes are part of the tag.
+fn entity_tags(v: &str) -> Vec<&str> {
+	let mut tags = vec![];
+	let mut rest = v;
+	loop {
+		rest = rest.trim_start_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+		if rest.is_empty() {
+			return tags;
+		}
+		if let Some(r) = rest.strip_prefix('*') {
+			tags.push("*");
+			rest = r;
+			continue;
+		}
+		let r = rest.strip_prefix("W/").unwrap_or(rest);
+		let Some(r) = r.strip_prefix('"') else { return tags };
+		let Some(end) = r.find('"') else { return tags };
+		tags.push(&r[..end]);
+		rest = &r[end + 1..];
+	}
 }
 
 /// Whether If-None-Match names the ETag (weak comparison, RFC 9110 §13.1.2).
 fn none_match(request: &HeaderMap, etag: Option<&HeaderValue>) -> bool {
-	let Some(etag) = etag.and_then(|e| e.to_str().ok()) else { return false };
-	let weak = |t: &str| t.trim().trim_start_matches("W/").to_string();
-	let etag = weak(etag);
-	request
-		.get_all(header::IF_NONE_MATCH)
-		.iter()
-		.filter_map(|v| v.to_str().ok())
-		.flat_map(|v| v.split(','))
-		.any(|t| t.trim() == "*" || weak(t) == etag)
+	let Some(etag) = etag.and_then(|e| e.to_str().ok()).and_then(|e| entity_tags(e).first().copied()) else { return false };
+	request.get_all(header::IF_NONE_MATCH).iter().filter_map(|v| v.to_str().ok()).flat_map(entity_tags).any(|t| t == "*" || t == etag)
 }
 
 fn full(bytes: Bytes) -> Body {
@@ -626,16 +849,21 @@ fn empty() -> Body {
 	Empty::new().map_err(|never| match never {}).boxed()
 }
 
-/// Reads a body of at most `max` bytes. Otherwise (larger, trailers, an error) gives back a
-/// body that sends what was read and then the rest as it comes, the error included.
+/// Reads a body of at most `max` bytes within `COLLECT_LIMIT`. Otherwise (larger, slower,
+/// trailers, an error) gives back a body that sends what was read and then the rest as it
+/// comes, the error included.
 async fn collect(mut body: Body, max: u64) -> Result<Bytes, Body> {
 	use hyper::body::Body as _;
 	if body.size_hint().lower() > max {
 		return Err(body);
 	}
+	let until = Instant::now() + COLLECT_LIMIT;
 	let mut buf = BytesMut::new();
 	loop {
-		match body.frame().await {
+		let Ok(frame) = tokio::time::timeout_at(until, body.frame()).await else {
+			return Err(Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed());
+		};
+		match frame {
 			None => return Ok(buf.freeze()),
 			Some(Ok(frame)) => match frame.into_data() {
 				Ok(data) => {
@@ -651,7 +879,7 @@ async fn collect(mut body: Body, max: u64) -> Result<Bytes, Body> {
 	}
 }
 
-/// What `collect` read, then the frame it stopped at, then the rest of the body.
+/// What was read, then the frame it stopped at, then the rest of the body.
 struct Resumed {
 	read: Option<Bytes>,
 	next: Option<Result<Frame<Bytes>, BoxError>>,
@@ -678,6 +906,7 @@ impl hyper::body::Body for Resumed {
 	fn is_end_stream(&self) -> bool {
 		self.read.as_ref().is_none_or(Bytes::is_empty) && self.next.is_none() && self.rest.as_ref().is_none_or(|r| r.is_end_stream())
 	}
+
 	/// The rest's, with what was read (so a known length stays known).
 	fn size_hint(&self) -> hyper::body::SizeHint {
 		let mut hint = self.rest.as_ref().map_or_else(|| hyper::body::SizeHint::with_exact(0), |r| r.size_hint());
@@ -722,6 +951,12 @@ mod tests {
 		String::from_utf8(r.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
 	}
 
+	const ASK: Ask<'static> = Ask { host: "a.example", route: "r", https: false, port: 80, cert: None, body_empty: true };
+
+	async fn ask(c: &Arc<Cache>, parts: &mut Parts) -> Result<(Response<Body>, Outcome), Box<Pending>> {
+		c.request(parts, &ASK).await
+	}
+
 	/// Until `n` requests wait for the one of `pending`.
 	async fn waiters(pending: &Pending, n: usize) {
 		let flight = &pending.lead.as_ref().unwrap().flight;
@@ -732,28 +967,74 @@ mod tests {
 
 	/// The request leads and the backend answers `back`; returns the outcome.
 	async fn fill(c: &Arc<Cache>, parts: &mut Parts, back: Response<Body>) -> (Response<Body>, Outcome) {
-		let pending = c.request(parts, "a.example").await.expect_err("a miss");
+		let pending = ask(c, parts).await.expect_err("a miss");
 		c.response(pending, back).await
 	}
 
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn kept_for_ttl_with_age_and_header() {
 		let c = cache("{ttl: 100ms}");
 		let (r, o) = fill(&c, &mut req("GET", "/j?x=1", &[]), resp(200, &[("content-type", "application/json")], "{\"n\":1}")).await;
 		assert_eq!((o, r.headers()["x-cache"].to_str().unwrap()), (Outcome::Miss, "MISS"));
 		assert!(!r.headers().contains_key("age"));
 		assert_eq!(text(r).await, "{\"n\":1}");
-		let (r, o) = c.request(&mut req("GET", "/j?x=1", &[]), "A.example").await.ok().expect("a hit");
+		let (r, o) = ask(&c, &mut req("GET", "/j?x=1", &[])).await.ok().expect("a hit");
 		assert_eq!((o, &r.headers()["age"], &r.headers()["content-length"]), (Outcome::Hit, &HeaderValue::from(0), &HeaderValue::from(7)));
 		assert_eq!(text(r).await, "{\"n\":1}");
 		// HEAD from GET's answer, without the body
-		let (r, _) = c.request(&mut req("HEAD", "/j?x=1", &[]), "a.example").await.ok().expect("a hit");
+		let (r, _) = ask(&c, &mut req("HEAD", "/j?x=1", &[])).await.ok().expect("a hit");
 		assert_eq!(r.headers()["content-length"], HeaderValue::from(7));
 		assert_eq!(text(r).await, "");
 		// another query, another key
-		assert!(c.request(&mut req("GET", "/j?x=2", &[]), "a.example").await.is_err());
-		tokio::time::sleep(Duration::from_millis(120)).await;
-		assert!(c.request(&mut req("GET", "/j?x=1", &[]), "a.example").await.is_err(), "out of date");
+		assert!(ask(&c, &mut req("GET", "/j?x=2", &[])).await.is_err());
+		tokio::time::advance(Duration::from_millis(101)).await;
+		assert!(ask(&c, &mut req("GET", "/j?x=1", &[])).await.is_err(), "out of date");
+		// the backend's Age stays on a MISS and grows on a HIT
+		fill(&c, &mut req("GET", "/aged", &[]), resp(200, &[("age", "30")], "x")).await;
+		tokio::time::advance(Duration::from_millis(50)).await;
+		let (r, _) = ask(&c, &mut req("GET", "/aged", &[])).await.ok().unwrap();
+		assert_eq!(r.headers()["age"], "30");
+		let (r, _) = fill(&c, &mut req("GET", "/aged2", &[]), resp(200, &[("age", "7")], "x")).await;
+		assert_eq!(r.headers()["age"], "7");
+	}
+
+	#[tokio::test]
+	async fn the_key_has_route_scheme_port_and_certificate() {
+		let c = cache("{ttl: 10s, share_credentials: true}");
+		fill(&c, &mut req("GET", "/", &[]), resp(200, &[], "x")).await;
+		for other in [
+			Ask { route: "other", ..ASK },
+			Ask { https: true, ..ASK },
+			Ask { port: 8080, ..ASK },
+			Ask { cert: Some((false, "NONE ")), ..ASK },
+		] {
+			assert!(c.request(&mut req("GET", "/", &[]), &other).await.is_err());
+		}
+		// a client certificate is a credential: not without share_credentials, and one per certificate
+		let alice = Ask { cert: Some((true, "SUCCESS Hash=aa")), ..ASK };
+		let bob = Ask { cert: Some((true, "SUCCESS Hash=bb")), ..ASK };
+		let strict = cache("{ttl: 10s}");
+		assert!(strict.request(&mut req("GET", "/", &[]), &alice).await.unwrap_err().key.is_none(), "BYPASS");
+		let p = c.request(&mut req("GET", "/", &[]), &alice).await.unwrap_err();
+		c.response(p, resp(200, &[], "alice")).await;
+		assert!(c.request(&mut req("GET", "/", &[]), &alice).await.is_ok());
+		assert!(c.request(&mut req("GET", "/", &[]), &bob).await.is_err());
+		// a request that may have a body is not for the cache
+		assert!(c.request(&mut req("GET", "/", &[]), &Ask { body_empty: false, ..ASK }).await.unwrap_err().key.is_none());
+	}
+
+	#[tokio::test]
+	async fn bodies_are_looked_for() {
+		let mut body = empty();
+		assert!(settle(&mut body).await);
+		// a stream that ends without data (HTTP/3 GET)
+		let mut body = http_body_util::StreamBody::new(futures_util::stream::iter(Vec::<Result<Frame<Bytes>, BoxError>>::new())).boxed();
+		assert!(settle(&mut body).await);
+		// DATA frames without a length: put back
+		let frames = vec![Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"ab"))), Ok(Frame::data(Bytes::from_static(b"c")))];
+		let mut body = http_body_util::StreamBody::new(futures_util::stream::iter(frames)).boxed();
+		assert!(!settle(&mut body).await);
+		assert_eq!(body.collect().await.unwrap().to_bytes(), "abc");
 	}
 
 	#[tokio::test]
@@ -765,26 +1046,31 @@ mod tests {
 			("GET", vec![("cookie", "s=1")]),
 			("GET", vec![("range", "bytes=0-1")]),
 		] {
-			let p = c.request(&mut req(method, "/", &headers), "a.example").await.err().unwrap();
+			let p = ask(&c, &mut req(method, "/", &headers)).await.err().unwrap();
 			let (r, o) = c.response(p, resp(200, &[], "x")).await;
 			assert_eq!((o, &r.headers()["x-cache"]), (Outcome::Bypass, &HeaderValue::from_static("BYPASS")), "{method} {headers:?}");
 		}
-		for headers in [
+		for (i, headers) in [
 			vec![("set-cookie", "a=1")],
 			vec![("cache-control", "private, max-age=60")],
 			vec![("cache-control", "no-store")],
 			vec![("cache-control", "no-cache=\"x\"")],
 			vec![("vary", "*")],
-		] {
-			fill(&c, &mut req("GET", "/", &[]), resp(200, &headers, "x")).await;
-			assert!(c.request(&mut req("GET", "/", &[]), "a.example").await.is_err(), "{headers:?} was kept");
+			vec![("content-type", "text/event-stream")],
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let path = format!("/{i}");
+			fill(&c, &mut req("GET", &path, &[]), resp(200, &headers, "x")).await;
+			let p = ask(&c, &mut req("GET", &path, &[])).await.expect_err("not kept");
+			assert!(p.lead.is_none(), "{headers:?}: the next ttl goes without waiting in line");
 		}
-		fill(&c, &mut req("GET", "/", &[]), resp(500, &[], "x")).await;
-		fill(&c, &mut req("GET", "/", &[]), resp(404, &[], "x")).await;
-		assert!(c.request(&mut req("GET", "/", &[]), "a.example").await.is_err(), "only 200 by default");
+		fill(&c, &mut req("GET", "/s", &[]), resp(404, &[], "x")).await;
+		assert!(ask(&c, &mut req("GET", "/s", &[])).await.is_err(), "only 200 by default");
 		let c = cache("{ttl: 10s, status: [200, 404], share_credentials: true}");
 		fill(&c, &mut req("GET", "/", &[("cookie", "s=1")]), resp(404, &[], "x")).await;
-		assert!(c.request(&mut req("GET", "/", &[("authorization", "x")]), "a.example").await.is_ok());
+		assert!(ask(&c, &mut req("GET", "/", &[("authorization", "x")])).await.is_ok());
 	}
 
 	#[tokio::test]
@@ -797,32 +1083,58 @@ mod tests {
 			Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"012"))),
 			Ok(Frame::data(Bytes::from_static(b"3456"))),
 		]);
-		let (r, _) = fill(&c, &mut req("GET", "/", &[]), Response::new(http_body_util::StreamBody::new(stream).boxed())).await;
+		let (r, _) = fill(&c, &mut req("GET", "/b", &[]), Response::new(http_body_util::StreamBody::new(stream).boxed())).await;
 		assert_eq!(text(r).await, "0123456");
 		// an error stays an error
 		let stream = futures_util::stream::iter([
 			Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"01"))),
 			Err(BoxError::new(std::io::Error::other("cut"))),
 		]);
-		let (r, _) = fill(&c, &mut req("GET", "/", &[]), Response::new(http_body_util::StreamBody::new(stream).boxed())).await;
+		let (r, _) = fill(&c, &mut req("GET", "/c", &[]), Response::new(http_body_util::StreamBody::new(stream).boxed())).await;
 		let mut body = r.into_body();
 		assert_eq!(body.frame().await.unwrap().unwrap().into_data().unwrap(), "01");
 		assert!(body.frame().await.unwrap().is_err());
-		assert!(c.request(&mut req("GET", "/", &[]), "a.example").await.is_err(), "nothing kept");
+		assert!(ask(&c, &mut req("GET", "/c", &[])).await.is_err(), "nothing kept");
+		// an answer larger than max_memory is given but not kept
+		let c = cache("{ttl: 10s, max_body: 1000, max_memory: 1000}");
+		let (r, o) = fill(&c, &mut req("GET", "/", &[]), resp(200, &[], Box::leak("y".repeat(900).into_boxed_str()))).await;
+		assert_eq!((o, text(r).await.len()), (Outcome::Miss, 900));
+		assert_eq!(c.usage(), (0, 0));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn slow_bodies_are_sent_on() {
+		let c = cache("{ttl: 10s}");
+		let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, BoxError>>(4);
+		tx.send(Ok(Frame::data(Bytes::from_static(b"first")))).await.unwrap();
+		let body = http_body_util::StreamBody::new(tokio_stream_from(rx)).boxed();
+		let (r, o) = fill(&c, &mut req("GET", "/", &[]), Response::new(body)).await;
+		assert_eq!(o, Outcome::Miss);
+		tx.send(Ok(Frame::data(Bytes::from_static(b" second")))).await.unwrap();
+		drop(tx);
+		assert_eq!(text(r).await, "first second");
+		assert_eq!(c.usage().0, 0);
+	}
+
+	fn tokio_stream_from(
+		mut rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, BoxError>>,
+	) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> {
+		futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
 	}
 
 	#[tokio::test]
 	async fn vary_and_encodings() {
 		let c = cache("{ttl: 10s, vary: [X-Lang]}");
 		fill(&c, &mut req("GET", "/", &[("x-lang", "ja")]), resp(200, &[], "ja")).await;
-		assert!(c.request(&mut req("GET", "/", &[("x-lang", "en")]), "a.example").await.is_err());
-		assert!(c.request(&mut req("GET", "/", &[("x-lang", "ja")]), "a.example").await.is_ok());
-		// the answer's Vary, and Accept-Encoding for an encoded body
-		fill(&c, &mut req("GET", "/g", &[("accept-encoding", "gzip")]), resp(200, &[("content-encoding", "gzip")], "z")).await;
-		assert!(c.request(&mut req("GET", "/g", &[]), "a.example").await.is_err());
-		assert!(c.request(&mut req("GET", "/g", &[("accept-encoding", "gzip")]), "a.example").await.is_ok());
+		assert!(ask(&c, &mut req("GET", "/", &[("x-lang", "en")])).await.is_err());
+		assert!(ask(&c, &mut req("GET", "/", &[("x-lang", "ja")])).await.is_ok());
+		// the answer's Vary, and Accept-Encoding for an encoded body (compared by its codings)
+		fill(&c, &mut req("GET", "/g", &[("accept-encoding", "gzip, br")]), resp(200, &[("content-encoding", "gzip")], "z")).await;
+		assert!(ask(&c, &mut req("GET", "/g", &[])).await.is_err());
+		assert!(ask(&c, &mut req("GET", "/g", &[("accept-encoding", "br,GZIP")])).await.is_ok());
 		fill(&c, &mut req("GET", "/o", &[("origin", "https://a")]), resp(200, &[("vary", "Origin")], "z")).await;
-		assert!(c.request(&mut req("GET", "/o", &[("origin", "https://b")]), "a.example").await.is_err());
+		assert!(ask(&c, &mut req("GET", "/o", &[("origin", "https://b")])).await.is_err());
+		assert!(ask(&c, &mut req("GET", "/o", &[])).await.is_err());
 	}
 
 	#[tokio::test]
@@ -830,25 +1142,31 @@ mod tests {
 		let c = cache("{ttl: 10s}");
 		// the leader's own condition is not sent on: the full answer is kept
 		let mut p = req("GET", "/", &[("if-none-match", "\"v1\"")]);
-		let pending = c.request(&mut p, "a.example").await.err().unwrap();
+		let pending = ask(&c, &mut p).await.err().unwrap();
 		assert!(!p.headers.contains_key("if-none-match"));
 		let (r, _) = c.response(pending, resp(200, &[("etag", "\"v1\"")], "body")).await;
 		assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
-		let (r, _) = c.request(&mut req("GET", "/", &[("if-none-match", "W/\"v1\"")]), "a.example").await.ok().unwrap();
+		let (r, _) = ask(&c, &mut req("GET", "/", &[("if-none-match", "W/\"v1\"")])).await.ok().unwrap();
 		assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
-		let (r, _) = c.request(&mut req("GET", "/", &[("if-none-match", "\"v0\"")]), "a.example").await.ok().unwrap();
+		let (r, _) = ask(&c, &mut req("GET", "/", &[("if-none-match", "\"v0\"")])).await.ok().unwrap();
 		assert_eq!((r.status(), text(r).await.as_str()), (StatusCode::OK, "body"));
+		// commas inside the quotes belong to the tag
+		fill(&c, &mut req("GET", "/c", &[]), resp(200, &[("etag", "\"a,b\"")], "body")).await;
+		let (r, _) = ask(&c, &mut req("GET", "/c", &[("if-none-match", "\"x\", \"a,b\"")])).await.ok().unwrap();
+		assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+		let (r, _) = ask(&c, &mut req("GET", "/c", &[("if-none-match", "\"a\", \"b\"")])).await.ok().unwrap();
+		assert_eq!(r.status(), StatusCode::OK);
+		assert_eq!(entity_tags("W/\"x\" ,\"y,z\", *"), ["x", "y,z", "*"]);
 	}
 
 	#[tokio::test]
 	async fn one_request_per_key_and_the_others_wait() {
 		let c = cache("{ttl: 10s}");
-		let mut first = req("GET", "/", &[]);
-		let pending = c.request(&mut first, "a.example").await.err().unwrap();
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
 		let waiting: Vec<_> = (0..10)
 			.map(|_| {
 				let c = c.clone();
-				tokio::spawn(async move { c.request(&mut req("GET", "/", &[]), "a.example").await.ok().map(|(_, o)| o) })
+				tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.ok().map(|(_, o)| o) })
 			})
 			.collect();
 		waiters(&pending, 10).await;
@@ -859,20 +1177,20 @@ mod tests {
 		}
 		// the first goes away: one of the others leads
 		let c = cache("{ttl: 10s}");
-		let pending = c.request(&mut req("GET", "/", &[]), "a.example").await.err().unwrap();
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
 		let other = {
 			let c = c.clone();
-			tokio::spawn(async move { c.request(&mut req("GET", "/", &[]), "a.example").await.is_err() })
+			tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.err().is_some_and(|p| p.lead.is_some()) })
 		};
 		waiters(&pending, 1).await;
 		drop(pending);
-		assert!(other.await.unwrap(), "it goes to the backend itself");
+		assert!(other.await.unwrap(), "it leads instead");
 		// an answer that is not kept: the others go to the backend without waiting in line
 		let c = cache("{ttl: 10s}");
-		let pending = c.request(&mut req("GET", "/", &[]), "a.example").await.err().unwrap();
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
 		let other = {
 			let c = c.clone();
-			tokio::spawn(async move { c.request(&mut req("GET", "/", &[]), "a.example").await.err().map(|p| p.lead.is_none()) })
+			tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.err().map(|p| p.lead.is_none()) })
 		};
 		waiters(&pending, 1).await;
 		c.response(pending, resp(200, &[("set-cookie", "a=1")], "x")).await;
@@ -880,32 +1198,120 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn waiting_has_its_limits() {
+		// those ahead keep going away: after RETRIES it goes alone
+		let c = cache("{ttl: 10s}");
+		let mut first = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
+		let other = {
+			let c = c.clone();
+			tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.err().map(|p| (p.key.is_some(), p.lead.is_none())) })
+		};
+		for _ in 0..RETRIES {
+			waiters(&first, 1).await;
+			// put another one ahead before letting this one go
+			let flight = first.lead.as_ref().unwrap().flight.clone();
+			let next = Arc::new(Flight { tx: watch::channel(Done::Pending).0 });
+			let lead = Lead { cache: c.clone(), key: first.key.clone().unwrap(), flight: next.clone(), done: false };
+			let replacement = Box::new(Pending { key: first.key.clone(), lead: Some(lead), headers: HeaderMap::new(), head: false });
+			{
+				let mut store = c.store.lock().unwrap();
+				store.map.get_mut(first.key.as_ref().unwrap()).unwrap().flight = Some(next);
+			}
+			first.lead.as_mut().unwrap().done = true;
+			flight.tx.send_replace(Done::Abandoned);
+			first = replacement;
+		}
+		assert_eq!(other.await.unwrap(), Some((true, true)), "a MISS of its own");
+		drop(first);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_slow_request_ahead_is_not_waited_for_forever() {
+		let c = cache("{ttl: 10s}");
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
+		let other = {
+			let c = c.clone();
+			tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.err().map(|p| p.lead.is_none()) })
+		};
+		waiters(&pending, 1).await;
+		tokio::time::advance(WAIT_LIMIT + Duration::from_millis(1)).await;
+		assert_eq!(other.await.unwrap(), Some(true));
+		drop(pending);
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn stale_on_error() {
 		let c = cache("{ttl: 100ms, stale_on_error: 10s}");
 		fill(&c, &mut req("GET", "/", &[]), resp(200, &[], "old")).await;
-		tokio::time::sleep(Duration::from_millis(120)).await;
+		tokio::time::advance(Duration::from_millis(101)).await;
 		let (r, o) = fill(&c, &mut req("GET", "/", &[]), resp(502, &[], "down")).await;
 		assert_eq!((o, r.headers()["x-cache"].to_str().unwrap()), (Outcome::Stale, "STALE"));
 		assert_eq!(text(r).await, "old");
-		let (r, o) = fill(&c, &mut req("GET", "/", &[]), resp(200, &[], "new")).await;
+		// for ttl after the failure, the old answer at once (nobody goes to the backend)
+		let (r, o) = ask(&c, &mut req("GET", "/", &[])).await.ok().expect("at once");
+		assert_eq!((o, text(r).await.as_str()), (Outcome::Stale, "old"));
+		let (r, o) = ask(&c, &mut req("HEAD", "/", &[])).await.ok().expect("HEAD too");
+		assert_eq!((o, text(r).await.as_str()), (Outcome::Stale, ""));
+		// then one tries again, and the others get the old answer meanwhile
+		tokio::time::advance(Duration::from_millis(101)).await;
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.expect_err("one tries");
+		assert!(pending.lead.is_some());
+		let (_, o) = ask(&c, &mut req("GET", "/", &[])).await.ok().expect("not waiting");
+		assert_eq!(o, Outcome::Stale);
+		let (r, o) = c.response(pending, resp(200, &[], "new")).await;
 		assert_eq!((o, text(r).await.as_str()), (Outcome::Miss, "new"));
+		let (r, o) = ask(&c, &mut req("GET", "/", &[])).await.ok().unwrap();
+		assert_eq!((o, text(r).await.as_str()), (Outcome::Hit, "new"));
+		// HEAD alone sees the backend fail: the old answer without the body
+		let c = cache("{ttl: 100ms, stale_on_error: 10s}");
+		fill(&c, &mut req("GET", "/", &[]), resp(200, &[], "old")).await;
+		tokio::time::advance(Duration::from_millis(101)).await;
+		let p = ask(&c, &mut req("HEAD", "/", &[])).await.expect_err("HEAD goes");
+		let (r, o) = c.response(p, resp(503, &[], "")).await;
+		assert_eq!((o, r.status(), text(r).await.as_str()), (Outcome::Stale, StatusCode::OK, ""));
 		// without stale_on_error the error goes through
 		let c = cache("{ttl: 100ms, header: ''}");
 		fill(&c, &mut req("GET", "/", &[]), resp(200, &[], "old")).await;
-		tokio::time::sleep(Duration::from_millis(120)).await;
+		tokio::time::advance(Duration::from_millis(101)).await;
 		let (r, o) = fill(&c, &mut req("GET", "/", &[]), resp(503, &[], "down")).await;
 		assert_eq!((o, r.status(), r.headers().contains_key("x-cache")), (Outcome::Miss, StatusCode::SERVICE_UNAVAILABLE, false));
 	}
 
 	#[tokio::test]
+	async fn an_error_is_handed_to_those_waiting() {
+		let c = cache("{ttl: 10s}");
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
+		let other = {
+			let c = c.clone();
+			tokio::spawn(async move {
+				let (r, o) = ask(&c, &mut req("GET", "/", &[])).await.ok().expect("the error");
+				(o, r.status(), text(r).await)
+			})
+		};
+		waiters(&pending, 1).await;
+		c.response(pending, resp(503, &[], "down")).await;
+		assert_eq!(other.await.unwrap(), (Outcome::Miss, StatusCode::SERVICE_UNAVAILABLE, "down".to_string()));
+		assert!(ask(&c, &mut req("GET", "/", &[])).await.err().unwrap().lead.is_some(), "the error is not kept");
+		// one with Set-Cookie is not handed on
+		let pending = ask(&c, &mut req("GET", "/", &[])).await.err().unwrap();
+		let other = {
+			let c = c.clone();
+			tokio::spawn(async move { ask(&c, &mut req("GET", "/", &[])).await.is_err() })
+		};
+		waiters(&pending, 1).await;
+		c.response(pending, resp(503, &[("set-cookie", "s=1")], "down")).await;
+		assert!(other.await.unwrap());
+	}
+
+	#[tokio::test(start_paused = true)]
 	async fn the_oldest_go_first() {
 		let c = cache("{ttl: 10s, max_entries: 2}");
 		for p in ["/1", "/2", "/3"] {
 			fill(&c, &mut req("GET", p, &[]), resp(200, &[], "x")).await;
 		}
 		assert_eq!(c.usage().0, 2);
-		assert!(c.request(&mut req("GET", "/1", &[]), "a.example").await.is_err());
-		assert!(c.request(&mut req("GET", "/3", &[]), "a.example").await.is_ok());
+		assert!(ask(&c, &mut req("GET", "/1", &[])).await.is_err());
+		assert!(ask(&c, &mut req("GET", "/3", &[])).await.is_ok());
 		// by memory
 		let c = cache("{ttl: 10s, max_body: 1000, max_memory: 2000}");
 		for p in ["/1", "/2", "/3"] {
@@ -913,7 +1319,10 @@ mod tests {
 		}
 		let (n, bytes) = c.usage();
 		assert!(n < 3 && bytes <= 2000, "{n} {bytes}");
-		assert!(c.request(&mut req("GET", "/3", &[]), "a.example").await.is_ok());
+		assert!(ask(&c, &mut req("GET", "/3", &[])).await.is_ok());
+		// out of date for good: not counted
+		tokio::time::advance(Duration::from_secs(11)).await;
+		assert_eq!(c.usage(), (0, 0));
 	}
 
 	#[test]
@@ -929,5 +1338,8 @@ mod tests {
 		assert!(bad("{ttl: 1s, max_body: 2048, max_memory: 1024}").contains("max_memory"));
 		assert!(bad("{ttl: 1s, vary: ['a b']}").contains("vary"));
 		assert!(bad("{ttl: 1s, max_entries: 0}").contains("max_entries"));
+		for h in ["Connection", "transfer-encoding", "Content-Length", "age", "set-cookie"] {
+			assert!(bad(&format!("{{ttl: 1s, header: {h}}}")).contains("header"), "{h}");
+		}
 	}
 }

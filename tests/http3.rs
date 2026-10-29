@@ -259,3 +259,38 @@ async fn http3_requests_go_through_basic_auth() {
 	stream.finish().await.unwrap();
 	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 200);
 }
+
+/// `cache` (#340) over HTTP/3: a GET ends its stream with the headers and is kept; one that
+/// sends DATA frames (no Content-Length) goes to the backend every time.
+#[tokio::test]
+async fn http3_gets_are_cached_unless_they_carry_a_body() {
+	let pki = Pki::new("h3-cache");
+	let cert = pki.server("front", &["a.test"]);
+	let a = backend("A").await;
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let mut rule = h3_rule(port, &cert, a);
+	rule["http"]["routes"][0]["middlewares"] = json!(["micro"]);
+	rule["http"]["middlewares"] = json!({"micro": {"cache": {"ttl": "10s"}}});
+	let (status, v) = h.post(rule).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let x_cache = |send: &mut H3Send, body: &'static [u8]| {
+		let mut send = send.clone();
+		async move {
+			let req = hyper::Request::get("https://a.test/state.json").body(()).unwrap();
+			let mut stream = send.send_request(req).await.unwrap();
+			if !body.is_empty() {
+				stream.send_data(Bytes::from_static(body)).await.unwrap();
+			}
+			stream.finish().await.unwrap();
+			let resp = stream.recv_response().await.unwrap();
+			while stream.recv_data().await.unwrap().is_some() {}
+			resp.headers().get("x-cache").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default()
+		}
+	};
+	assert_eq!(x_cache(&mut send, b"body").await, "BYPASS");
+	assert_eq!(x_cache(&mut send, b"").await, "MISS");
+	assert_eq!(x_cache(&mut send, b"").await, "HIT");
+	assert_eq!(x_cache(&mut send, b"body").await, "BYPASS");
+}

@@ -374,5 +374,14 @@ Security review (2026-10-23) high A, medium M2 and M3: a `rules:write` token cou
   - `max_memory` (default 64 MiB) was not in the issue but is added: the default `max_entries` (1024) times `max_body` (1 MiB) is 1 GiB, against the aim of using little memory.
   - The oldest go first: `ttl` is the same within a middleware, so the order kept is the order of going out of date. Every insert drops from the front what is past `stale_on_error`, then whatever exceeds the limits.
   - Conditional requests: the request that goes ahead leaves `If-None-Match` and `If-Modified-Since` behind and fetches the whole answer; rproxy answers `If-None-Match` alone with 304.
-- Measured: `l7_cache/hit` in `benches/dataplane.rs` (compared by the PR's `Benchmarks`).
+- Added in review (#343):
+  - The key has the route's name (routes naming the same middleware do not mix answers: a beta route split off by `Header`, a route behind `ip_allow`), the scheme and port the request came to, and on rules with `tls.client_auth` the client certificate (what goes into `X-Client-Verify` and `X-Forwarded-Client-Cert`) (`cache::Ask`). A request with a client certificate carries credentials (`BYPASS` without `share_credentials`).
+  - GETs sending DATA frames without `Content-Length` over HTTP/2 and HTTP/3: `cache::settle` looks for a body for up to 1 second (what it reads is put back) and makes them `BYPASS`.
+  - What authentication middlewares add to the response (`oidc`'s `Set-Cookie`, a gRPC `forward_auth`'s `response_headers_to_add`) is added at that middleware's response side (by position in the chain). Before, it was all added before the response sides, so a cache behind kept it and gave it to other users. The response sides of later middlewares no longer see it (put a `headers` that removes it before).
+  - `cors` (and the `cors` of `headers`) adds `Vary: Origin` for origins not allowed too (so a cache behind does not give an answer for a disallowed origin to an allowed one).
+  - Keys whose answers may not be kept do not line up for `ttl` (`Store.passes`, up to `max_entries`). A 5xx without an old answer is handed to those waiting (`Done::Error`). Waiting is bounded by `WAIT_LIMIT` (10 s), reading the body by `COLLECT_LIMIT` (5 s); `text/event-stream` is not kept.
+  - During an outage: for `ttl` after `Slot.failed` no request goes and `STALE` is given; then one tries while the others get `STALE` at once.
+  - `header` may not name hop-by-hop, framing or caching headers. `MISS` keeps the backend's `Age`. `/metrics` counts after dropping what is past its time. If-None-Match reads commas inside quotes. `Accept-Encoding` is compared as a set of codings. A `cache` after `oidc` without `share_credentials` is a `--check-config` warning (`HttpSpec::warnings`).
+  - The unit tests move a paused clock (`tokio::time::pause`; `Instant` is `tokio::time::Instant`).
+- Measured: `l7_cache/hit` in `benches/dataplane.rs` (compared by the PR's `Benchmarks`; filled once first, and every measured request is checked to be a `HIT`).
 - Tests: `tests/http_cache.rs`, unit tests in `src/l7/middleware/cache.rs`.

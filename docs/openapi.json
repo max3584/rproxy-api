@@ -1695,6 +1695,25 @@
           "blocked": {
             "type": "integer"
           },
+          "cache": {
+            "type": "object",
+            "description": "cache (#340, v0.4.19): requests by result",
+            "properties": {
+              "hit": {
+                "type": "integer"
+              },
+              "miss": {
+                "type": "integer"
+              },
+              "stale": {
+                "type": "integer"
+              },
+              "bypass": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
           "routes": {
             "type": "object",
             "properties": {},
@@ -1723,6 +1742,30 @@
                   "properties": {},
                   "additionalProperties": {
                     "type": "integer"
+                  }
+                },
+                "cache": {
+                  "type": "object",
+                  "description": "by cache middleware name (#340)",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "object",
+                    "description": "cache (#340, v0.4.19): requests by result",
+                    "properties": {
+                      "hit": {
+                        "type": "integer"
+                      },
+                      "miss": {
+                        "type": "integer"
+                      },
+                      "stale": {
+                        "type": "integer"
+                      },
+                      "bypass": {
+                        "type": "integer"
+                      }
+                    },
+                    "additionalProperties": false
                   }
                 }
               },
