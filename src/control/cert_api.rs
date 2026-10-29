@@ -95,6 +95,7 @@ pub async fn put(
 				status: StatusCode::FORBIDDEN,
 				code: "tls_required",
 				message: "PUT /certs carries a private key: use the control API over TLS, the Unix socket, or loopback".into(),
+				reason: None,
 			});
 		}
 		named::validate_name(&name)?;
@@ -135,6 +136,7 @@ pub async fn delete(
 					status: StatusCode::CONFLICT,
 					code: "in_use",
 					message: format!("certificate {name:?} is used by {}", used_by.join(", ")),
+					reason: None,
 				},
 				used_by,
 			));

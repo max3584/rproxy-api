@@ -717,3 +717,36 @@ async fn rules_waiting_for_crowdsec_start_once_it_is_read() {
 	assert_eq!(v["state"], "running", "{v}");
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// A PATCH that brings `crowdsec` (with its `appsec_url`) starts the rules waiting
+/// for it: the rule's own `crowdsec`, the middleware, the middleware's `appsec`
+/// (#347: matched by the reason of the error, after the change is done).
+#[tokio::test]
+async fn a_patch_starts_the_rules_waiting_for_crowdsec() {
+	let dir = workdir("patch-waiting");
+	let h = harness_with(tokens(&dir)).await;
+	init_with_file(&h, &dir, "version: 1\n", false);
+	let key = dir.join("crowdsec.key");
+	fs::write(&key, "lapi-key\n").unwrap();
+	let lapi = format!("http://{}", fake_lapi().await);
+	let appsec = format!("http://127.0.0.1:{}", dead_port());
+	let backend = echo_backend().await;
+	let ports = [free_port(), free_port(), free_port()];
+	let mut l4 = rule("tcp", ports[2], backend);
+	l4["crowdsec"] = json!(true);
+	let rules = [crowdsec_rule(ports[0], backend, false), crowdsec_rule(ports[1], backend, true), l4];
+	h.registry.restore_as(rules.into_iter().map(|r| serde_json::from_value(r).unwrap()).collect(), Origin::Dynamic).await;
+	let unix = api(&h, &dir, true).await;
+	let states = || async {
+		let mut out = vec![];
+		for port in ports {
+			out.push(call(&unix, "admin", Method::GET, &format!("/rules/tcp/127.0.0.1/{port}"), None).await.1["state"].clone());
+		}
+		out
+	};
+	assert_eq!(states().await, vec![json!("failed"); 3]);
+	let (status, v) = patch(&unix, "/config/global", json!({"crowdsec": crowdsec(&lapi, &key, Some(&appsec))})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(states().await, vec![json!("running"); 3]);
+	fs::remove_dir_all(dir).unwrap();
+}

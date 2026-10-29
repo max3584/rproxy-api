@@ -747,6 +747,10 @@ impl State {
 		if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
 			return Err(format!("{p} is not a regular file"));
 		}
+		// the rotation would prune every file that starts with the stem (#347)
+		if name.ends_with('.') {
+			return Err(format!("{p} has an empty extension; choose another name"));
+		}
 		// the appender prunes the files that start with the name's stem and end with its extension
 		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
 		if let Some(main) = &self.opts.main_log {
@@ -909,7 +913,7 @@ impl Settings {
 		kept_crowdsec: Option<CrowdsecGlobal>,
 		from: &str,
 	) {
-		let _turn = self.turn.lock().await;
+		let turn = self.turn.lock().await;
 		let (api, kept, mut failed) = Values::read_stored(spec);
 		for (item, e) in &failed {
 			warn!(event = "restore.skip", what = "global", item, from, error = %e, "a stored global value does not read; kept as stored, not in force");
@@ -964,7 +968,10 @@ impl Settings {
 				info!(event = "restore.global", from, items = ?live_items().filter(|i| s.api.has(i.name)).map(|i| i.name).collect::<Vec<_>>());
 			}
 		}
-		// rules that could not start without it (read late by the periodic check)
+		// rules that could not start without it (read late by the periodic check);
+		// not under the turn: name resolution may take a while, and each rule is
+		// checked again (its generation, `crowdsec_gate`) under the rules lock (#347)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1012,7 +1019,7 @@ impl Settings {
 	/// away: it stays in force (`kept`, `config.global_in_use`) until no rule uses it.
 	/// Answers the items whose value in force changed.
 	pub async fn commit_file(&self, registry: &Arc<Registry>, prepared: FilePrepared) -> Vec<&'static str> {
-		let FilePrepared { _turn, file, raw, mut to, mut built, mut changed, not_in_force } = prepared;
+		let FilePrepared { _turn: turn, file, raw, mut to, mut built, mut changed, not_in_force } = prepared;
 		let before = self.state().live.clone();
 		let replaced = registry
 			.under_rules_lock(|uses| {
@@ -1061,6 +1068,8 @@ impl Settings {
 			s.settle(to, file, api);
 			brings
 		};
+		// not under the turn (#347, as in `restore`)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1102,7 +1111,7 @@ impl Settings {
 		dry_run: bool,
 	) -> Result<Patched, PatchError> {
 		let named = named_items(body).map_err(PatchError::Invalid)?;
-		let _turn = self.turn.lock().await;
+		let turn = self.turn.lock().await;
 		let (before, opts, api_before, file, api, to) = {
 			let s = self.state();
 			if s.not_loaded {
@@ -1212,6 +1221,8 @@ impl Settings {
 			info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
 			applied.contains(&"crowdsec") && s.live.crowdsec.is_some()
 		};
+		// not under the turn (#347, as in `restore`)
+		drop(turn);
 		if brings_crowdsec {
 			registry.retry_waiting_for_crowdsec().await;
 		}
@@ -1526,6 +1537,7 @@ mod tests {
 			dir.join("r.log"),
 			dir.join("rproxy-access.log"),
 			dir.join(".hidden.log"),
+			dir.join("x."),
 		] {
 			assert!(matches!(refused(p.clone()).await, Err(PatchError::Protected(_))), "{}", p.display());
 		}
@@ -1538,6 +1550,7 @@ mod tests {
 		std::os::unix::fs::symlink("/etc/passwd", dir.join("link.log")).unwrap();
 		assert!(matches!(refused(dir.join("link.log")).await, Err(PatchError::Protected(_))));
 		assert!(refused(dir.join("access.log")).await.is_ok());
+		assert!(matches!(refused(dir.join("web.")).await, Err(PatchError::Protected(ref m)) if m.contains("empty extension")));
 		// restored values are checked the same way: not in force
 		s.restore(&r, &json!({"access_log": "/etc/s.conf"}), None, None, None, None, "database").await;
 		let view = s.view();

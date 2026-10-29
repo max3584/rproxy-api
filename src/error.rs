@@ -9,11 +9,21 @@ pub struct ApiError {
 	pub status: StatusCode,
 	pub code: &'static str,
 	pub message: String,
+	/// Why, for rproxy itself (not in the response): a rule that failed for it is
+	/// started again when it goes away (#347).
+	pub reason: Option<Reason>,
+}
+
+/// What a rule that could not start waits for (#347).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+	/// `global.crowdsec` (or its `appsec_url`) is not in force.
+	NeedsCrowdsec,
 }
 
 impl ApiError {
 	fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-		ApiError { status, code, message: message.into() }
+		ApiError { status, code, message: message.into(), reason: None }
 	}
 
 	pub fn unauthorized() -> Self {
@@ -47,6 +57,12 @@ impl ApiError {
 
 	pub fn invalid(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::BAD_REQUEST, "invalid", message)
+	}
+
+	/// `invalid` for a rule that uses `crowdsec` (or its `appsec`) without
+	/// `global.crowdsec` (or its `appsec_url`) in force (#342, #347).
+	pub fn needs_crowdsec(message: impl Into<String>) -> Self {
+		ApiError { reason: Some(Reason::NeedsCrowdsec), ..Self::invalid(message) }
 	}
 
 	pub fn unsupported(message: impl Into<String>) -> Self {

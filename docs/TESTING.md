@@ -361,6 +361,7 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_reload_keeps_the_crowdsec_rules_need` | 読み直し：新しい `crowdsec` は LAPI から取ってから効く。答えない LAPI・`appsec` を使うルールがあるのに `appsec_url` なし・ファイルから消す、はどれも今のものを残す（`kept`、ほかの PATCH でも残り、引き継ぎの状態にも）。使うルールがなくなった後の読み直しで外す |
 | `a_patch_during_a_reload_is_not_undone` | 読み直しが答えない LAPI を待つあいだの `PATCH` は読み直しの後に回り、効いている値と `GET` が合う（読み直しが順番を放すと落ちる） |
 | `rules_waiting_for_crowdsec_start_once_it_is_read` | 起動で行を読めず、`crowdsec` がなくて起動できなかったルールが、照合が行を読んで `crowdsec` が効いたときに動く |
+| `a_patch_starts_the_rules_waiting_for_crowdsec` | `crowdsec` がなくて起動できなかったルール（ルールの `crowdsec`・ミドルウェア・ミドルウェアの `appsec`）が、`appsec_url` つきの `crowdsec` を入れる PATCH の後に動く（誤りの理由で探す、`turn` を放してから動かし直す、#347） |
 | `global_in_a_later_file_of_a_directory_is_the_file_s` | `RPROXY_CONFIG` がディレクトリで、`global` が 2 つ目のファイルにあっても、その項目はファイルのもの（`409 static`） |
 
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）

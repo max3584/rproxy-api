@@ -247,7 +247,7 @@ impl SetError {
 	fn of(mut findings: Vec<(SetFinding, StatusCode)>) -> SetError {
 		findings.sort_by_key(|(f, _)| f.index);
 		let (first, status) = findings[0].clone();
-		let error = ApiError { status, code: first.code, message: format!("rules[{}]: {}", first.index, first.message) };
+		let error = ApiError { status, code: first.code, message: format!("rules[{}]: {}", first.index, first.message), reason: None };
 		SetError { error, errors: findings.into_iter().map(|(f, _)| f).collect() }
 	}
 }
