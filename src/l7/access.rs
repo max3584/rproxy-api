@@ -358,6 +358,9 @@ pub struct AccessEntry {
 	/// (#320; `path` is the normalised one); left out otherwise.
 	#[serde(skip_serializing_if = "String::is_empty")]
 	pub raw_path: String,
+	/// `HIT`, `MISS`, `STALE` or `BYPASS` on a route with `cache` (#340); left out otherwise.
+	#[serde(skip_serializing_if = "str::is_empty")]
+	pub cache: &'static str,
 }
 
 #[derive(Serialize)]
@@ -405,6 +408,8 @@ pub struct HttpStats {
 	limited: Mutex<BTreeMap<(String, String), u64>>,
 	/// Requests refused by `crowdsec`, by (route, middleware).
 	blocked: Mutex<BTreeMap<(String, String), u64>>,
+	/// Requests at `cache` middlewares by (route, middleware), by `cache::Outcome` (#340).
+	cache: Mutex<BTreeMap<(String, String), [u64; 4]>>,
 }
 
 impl HttpStats {
@@ -438,6 +443,21 @@ impl HttpStats {
 	pub fn blocked_snapshot(&self) -> BTreeMap<(String, String), u64> {
 		self.blocked.lock().unwrap().clone()
 	}
+
+	pub fn cache(&self, route: &str, middleware: &str, outcome: super::middleware::cache::Outcome) {
+		let route = if route.is_empty() { NO_ROUTE } else { route };
+		let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+		// few routes have a cache: looked up without making the key's strings
+		if let Some((_, c)) = cache.iter_mut().find(|((r, m), _)| r == route && m == middleware) {
+			c[outcome.index()] += 1;
+			return;
+		}
+		cache.entry((route.to_string(), middleware.to_string())).or_default()[outcome.index()] += 1;
+	}
+
+	pub fn cache_snapshot(&self) -> BTreeMap<(String, String), [u64; 4]> {
+		self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
 }
 
 /// `HttpStats` as plain data: handed over in a live upgrade (#174) and added to
@@ -448,6 +468,9 @@ pub struct HttpCounters {
 	/// (route, middleware, count)
 	pub limited: Vec<(String, String, u64)>,
 	pub blocked: Vec<(String, String, u64)>,
+	/// (route, middleware, [hit, miss, stale, bypass]) of `cache` (#340); left out before v0.4.19.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub cache: Vec<(String, String, [u64; 4])>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -460,7 +483,7 @@ pub struct RouteCountersData {
 
 impl HttpCounters {
 	pub fn is_empty(&self) -> bool {
-		self.routes.is_empty() && self.limited.is_empty() && self.blocked.is_empty()
+		self.routes.is_empty() && self.limited.is_empty() && self.blocked.is_empty() && self.cache.is_empty()
 	}
 
 	/// `self - before`, never below zero.
@@ -487,7 +510,15 @@ impl HttpCounters {
 				})
 				.collect()
 		};
-		HttpCounters { routes, limited: minus(&self.limited, &before.limited), blocked: minus(&self.blocked, &before.blocked) }
+		let cache = self
+			.cache
+			.iter()
+			.map(|(r, m, n)| {
+				let old = before.cache.iter().find(|(r2, m2, _)| r2 == r && m2 == m).map_or([0; 4], |t| t.2);
+				(r.clone(), m.clone(), std::array::from_fn(|i| sub(n[i], old[i])))
+			})
+			.collect();
+		HttpCounters { routes, limited: minus(&self.limited, &before.limited), blocked: minus(&self.blocked, &before.blocked), cache }
 	}
 }
 
@@ -501,6 +532,7 @@ impl HttpStats {
 				.collect(),
 			limited: self.limited_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
 			blocked: self.blocked_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
+			cache: self.cache_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
 		}
 	}
 
@@ -524,6 +556,13 @@ impl HttpStats {
 				*map.entry((r.clone(), m.clone())).or_default() += n;
 			}
 		}
+		let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+		for (r, m, n) in &c.cache {
+			let mine = cache.entry((r.clone(), m.clone())).or_default();
+			for (a, b) in mine.iter_mut().zip(n) {
+				*a += b;
+			}
+		}
 	}
 }
 
@@ -538,6 +577,9 @@ pub struct HttpStatsView {
 	/// Refused by `crowdsec` (also counted in `by_status` as 4xx).
 	#[serde(skip_serializing_if = "is_zero")]
 	pub blocked: u64,
+	/// Requests at `cache` middlewares (#340); left out without one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache: Option<CacheCounts>,
 	pub routes: BTreeMap<String, RouteStatsView>,
 	/// Servers of the services with `health_check`, and whether each is up.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -557,6 +599,33 @@ pub struct RouteStatsView {
 	/// Refused by each `crowdsec` middleware of the route.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub blocked: BTreeMap<String, u64>,
+	/// Each `cache` middleware of the route (#340).
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub cache: BTreeMap<String, CacheCounts>,
+}
+
+/// Requests at a `cache` middleware (#340): answered from memory (`hit`), from the backend
+/// (`miss`), from memory out of date because the backend failed (`stale`), or not for the
+/// cache (`bypass`).
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CacheCounts {
+	pub hit: u64,
+	pub miss: u64,
+	pub stale: u64,
+	pub bypass: u64,
+}
+
+impl CacheCounts {
+	fn of(n: [u64; 4]) -> CacheCounts {
+		CacheCounts { hit: n[0], miss: n[1], stale: n[2], bypass: n[3] }
+	}
+
+	fn add(&mut self, o: CacheCounts) {
+		self.hit += o.hit;
+		self.miss += o.miss;
+		self.stale += o.stale;
+		self.bypass += o.bypass;
+	}
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -586,6 +655,11 @@ impl HttpStatsView {
 		for ((route, middleware), n) in stats.blocked_snapshot() {
 			view.blocked += n;
 			view.routes.entry(route).or_default().blocked.insert(middleware, n);
+		}
+		for ((route, middleware), n) in stats.cache_snapshot() {
+			let c = CacheCounts::of(n);
+			view.cache.get_or_insert_with(Default::default).add(c);
+			view.routes.entry(route).or_default().cache.insert(middleware, c);
 		}
 		view.requests = total.iter().sum();
 		view.by_status = by_status(&total);

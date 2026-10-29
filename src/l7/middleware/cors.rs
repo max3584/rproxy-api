@@ -106,9 +106,7 @@ impl Cors {
 		if !self.spec.expose_headers.is_empty() {
 			insert(headers, header::ACCESS_CONTROL_EXPOSE_HEADERS, &self.spec.expose_headers.join(", "));
 		}
-		if !headers.get_all(header::VARY).iter().any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("origin")))) {
-			headers.append(header::VARY, HeaderValue::from_static("Origin"));
-		}
+		vary_origin(headers);
 	}
 
 	/// A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is
@@ -158,9 +156,18 @@ impl Cors {
 		if headers.contains_key(header::ACCESS_CONTROL_ALLOW_METHODS) && headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
 			return;
 		}
-		if let Some(allow) = self.allow_origin(origin, credentials) {
-			self.common(headers, allow);
+		match self.allow_origin(origin, credentials) {
+			Some(allow) => self.common(headers, allow),
+			// the answer depends on Origin whether or not it is allowed: a cache keeps it apart (#340)
+			None => vary_origin(headers),
 		}
+	}
+}
+
+/// `Vary: Origin`, once.
+pub fn vary_origin(headers: &mut HeaderMap) {
+	if !headers.get_all(header::VARY).iter().any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("origin")))) {
+		headers.append(header::VARY, HeaderValue::from_static("Origin"));
 	}
 }
 
@@ -232,7 +239,9 @@ mod tests {
 		assert!(c.on_request(&no_origin, None).is_none(), "OPTIONS without Origin is not a CORS preflight");
 		let mut resp = HeaderMap::new();
 		c.on_response(&mut resp, Some(&hv("https://foobar.com")), false);
-		assert!(resp.is_empty());
+		// no CORS headers, but Vary: Origin (a cache must not give this answer to an allowed origin, #340)
+		assert_eq!(resp.len(), 1);
+		assert_eq!(resp["vary"], "Origin");
 		c.on_response(&mut resp, Some(&hv("https://www.foo.com")), false);
 		assert_eq!(resp["access-control-allow-origin"], "https://www.foo.com");
 		assert_eq!(resp["vary"], "Origin");

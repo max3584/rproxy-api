@@ -92,7 +92,7 @@ async fn echo(tag: &'static str) -> (SocketAddr, Log) {
 }
 
 /// A gRPC ext_authz server (HTTP/2 with prior knowledge): `authorization: allow` is OK with a
-/// header for the request and one for the response, `broken` answers grpc-status 12
+/// header for the request and one for the response, `quiet` is OK with neither, `broken` answers grpc-status 12
 /// (UNIMPLEMENTED), anything else is denied with 401.
 async fn grpc_auth() -> (SocketAddr, Arc<Mutex<Vec<encode::Seen>>>) {
 	let log: Arc<Mutex<Vec<encode::Seen>>> = Arc::default();
@@ -122,6 +122,8 @@ async fn grpc_auth() -> (SocketAddr, Arc<Mutex<Vec<encode::Seen>>>) {
 								),
 								"0",
 							),
+							// another user, with nothing for the response (#340)
+							"quiet" => (encode::ok(&[encode::header("x-user", "bob", None)], &[], &[]), "0"),
 							"broken" => (Bytes::new(), "12"),
 							_ => (encode::denied(401, &[encode::header("www-authenticate", "Bearer", None)], "who are you"), "0"),
 						};
@@ -361,4 +363,34 @@ async fn forward_auth_shapes_are_checked() {
 		json!(["service", "grpc", "client_request", "allow_status", "forward_body", "all_response_headers"])
 	);
 	assert!(caps["features"]["server_middleware_kinds"].as_array().unwrap().iter().any(|k| k == "forward_auth"));
+}
+
+/// What the auth server adds to one user's response is not kept by a `cache` behind it and
+/// given to another user (#340).
+#[tokio::test]
+async fn auth_response_headers_stay_with_their_request() {
+	let h = harness().await;
+	let (authz, _) = grpc_auth().await;
+	let (b, log) = echo("b").await;
+	let port = rule(
+		&h,
+		json!({
+			"routes": [{"name": "r", "match": "PathPrefix(`/`)", "service": "b", "middlewares": ["authz", "micro"]}],
+			"services": {"b": {"servers": [{"url": format!("http://{b}")}]}},
+			"middlewares": {
+				"authz": {"forward_auth": {"address": format!("http://{authz}"), "protocol": "grpc"}},
+				"micro": {"cache": {"ttl": "10s", "share_after_auth": true, "share_credentials": true}},
+			},
+		}),
+	)
+	.await;
+	let url = format!("http://127.0.0.1:{port}/state");
+	let (status, headers, _) = send(client().get(&url).header("authorization", "allow")).await;
+	assert_eq!((status.as_u16(), headers["x-cache"].to_str().unwrap(), headers["x-resp"].to_str().unwrap()), (200, "MISS", "from-authz"));
+	let (status, headers, _) = send(client().get(&url).header("authorization", "quiet")).await;
+	assert_eq!((status.as_u16(), headers["x-cache"].to_str().unwrap()), (200, "HIT"));
+	assert!(!headers.contains_key("x-resp"), "alice's header from the auth server reached bob: {headers:?}");
+	let (_, headers, _) = send(client().get(&url).header("authorization", "allow")).await;
+	assert_eq!(headers.get_all("x-resp").iter().count(), 1, "once, for this request: {headers:?}");
+	assert_eq!(log.lock().unwrap().len(), 1);
 }

@@ -351,7 +351,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗 |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（ルートの `timeouts` を含む）・`retry` の `status` で送り直す（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
-| `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）、`tls.client_auth` のあるルールではクライアント証明書の `client_cn`・`client_verify`（`SUCCESS` / `FAILED` / `NONE`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn`。正規化でパスが変わったときは送られたままのパスを `raw_path`（v0.4.17） |
+| `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）、`tls.client_auth` のあるルールではクライアント証明書の `client_cn`・`client_verify`（`SUCCESS` / `FAILED` / `NONE`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn`。正規化でパスが変わったときは送られたままのパスを `raw_path`（v0.4.17）。`cache` ミドルウェアのあるルートは `cache`（`HIT`・`MISS`・`STALE`・`BYPASS`、v0.4.19） |
 | `oidc.login` / `oidc.refresh` / `oidc.error` / `oidc.cookie` | `oidc` ミドルウェアのサインイン（`user`）、リフレッシュの失敗、プロバイダとのやり取りの失敗、セッションが大きすぎてリフレッシュトークンを持てない |
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `config.file` | ルールが指すファイル（証明書・鍵・`users_file` など）が使えない理由（`what`・`file`・`error`）。制御 API の答えには理由を出さないので、ここで見る（v0.4.18、#333） |

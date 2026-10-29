@@ -34,7 +34,7 @@ use super::backend::{self, Dialer, Sender, ServerHealth, Service};
 use super::compress;
 use super::middleware::crowdsec::Verdict;
 use super::middleware::limit::Hold;
-use super::middleware::{self, Blocked, Ctx, HostOverride, Limited, Middleware};
+use super::middleware::{self, cache, Blocked, Ctx, HostOverride, Limited, Middleware};
 use super::{deadline, mirror};
 use super::resilience::{self, RetryPolicy, Ticket};
 use super::{HttpSpec, Matcher};
@@ -118,6 +118,8 @@ pub struct Router {
 	/// `oidc`'s, `forward_auth`'s `response_headers`): whatever a client sends under these
 	/// names is dropped from every request, on every route (#320).
 	identity_headers: Vec<HeaderName>,
+	/// `cache` middlewares (#340), for `/metrics`.
+	caches: Vec<Arc<cache::Cache>>,
 }
 
 impl Drop for Router {
@@ -217,6 +219,9 @@ impl Router {
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
 		let identity_headers = identity_headers(middlewares.values().map(|m| m.as_ref()));
+		let mut caches: Vec<Arc<cache::Cache>> =
+			middlewares.values().filter_map(|m| if let Middleware::Cache(c) = m.as_ref() { Some(c.clone()) } else { None }).collect();
+		caches.sort_by(|a, b| a.name.cmp(&b.name));
 		Ok(Router {
 			routes,
 			default_status,
@@ -230,7 +235,16 @@ impl Router {
 			raw_path: spec.raw_path,
 			strict_path: spec.strict_path,
 			identity_headers,
+			caches,
 		})
+	}
+
+	/// Each `cache` middleware: its name, the answers it keeps and their bytes (#340).
+	pub fn cache_usage(&self) -> Vec<(String, usize, u64)> {
+		self.caches.iter().map(|c| {
+			let (entries, bytes) = c.usage();
+			(c.name.clone(), entries, bytes)
+		}).collect()
 	}
 
 	/// SIGHUP: read the secret files of the authentication middlewares again.
@@ -815,6 +829,10 @@ struct Sent {
 	host: HeaderValue,
 	/// Admissions through circuit breakers, by position in the chain.
 	tickets: Vec<(usize, Ticket)>,
+	/// Requests that went past a `cache` (#340), by position in the chain.
+	caches: Vec<(usize, Box<cache::Pending>)>,
+	/// What the route's `cache` did (its name), for the statistics and the access log.
+	cached: Option<(String, cache::Outcome)>,
 }
 
 impl Conn {
@@ -832,8 +850,6 @@ impl Conn {
 		// gets the client's value back (`ClientForwarded`). rproxy writes no Forwarded of its own.
 		// the global settings in force (#342), the same for the whole request
 		let snapshot = self.rt.global.snapshot();
-		// for the request to the backend (`forward`), the same snapshot
-		req.extensions_mut().insert(snapshot.clone());
 		if req.headers().contains_key(header::FORWARDED) && !snapshot.trusts(canonical(self.client.ip())) {
 			let values: Vec<HeaderValue> = req.headers().get_all(header::FORWARDED).iter().cloned().collect();
 			req.headers_mut().remove(header::FORWARDED);
@@ -950,6 +966,8 @@ impl Conn {
 			host: request_authority(req.uri(), req.headers())
 				.unwrap_or_else(|| HeaderValue::from_str(&host).unwrap_or(HeaderValue::from_static("localhost"))),
 			tickets: vec![],
+			caches: vec![],
+			cached: None,
 		};
 		// request side in the route's order, until one answers
 		let (mut parts, mut body) = req.into_parts();
@@ -960,9 +978,11 @@ impl Conn {
 		// copies for `mirror` (#232), as the request was at each
 		let mut mirrors: Vec<mirror::Copy> = vec![];
 		// cookies of the authentication middlewares for the response
-		let mut set_cookies: Vec<HeaderValue> = vec![];
+		// (#340) by position in the chain: put on the response at that middleware's response side,
+		// after a `cache` behind it has kept the backend's answer (they belong to this request)
+		let mut set_cookies: Vec<(usize, HeaderValue)> = vec![];
 		// headers an ext_authz server adds to the response (`forward_auth`, protocol grpc)
-		let mut response_headers: Vec<ext_authz::HeaderOption> = vec![];
+		let mut response_headers: Vec<(usize, ext_authz::HeaderOption)> = vec![];
 		let authority = request_authority(&parts.uri, &parts.headers)
 			.and_then(|h| h.to_str().ok().map(str::to_string))
 			.unwrap_or_else(|| host.clone());
@@ -1019,7 +1039,7 @@ impl Conn {
 				},
 				Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
 					AuthOutcome::Allow(add) => {
-						response_headers.extend(add);
+						response_headers.extend(add.into_iter().map(|h| (i, h)));
 						None
 					}
 					AuthOutcome::Deny(resp) => Some(resp),
@@ -1027,7 +1047,7 @@ impl Conn {
 				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
 					oidc::Outcome::Pass { session, set_cookie } => {
 						o.pass_identity(&mut parts.headers, &session);
-						set_cookies.extend(set_cookie);
+						set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
 						None
 					}
 					answer => Some(oidc_response(answer)),
@@ -1085,6 +1105,36 @@ impl Conn {
 					}
 					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 				},
+				Middleware::Cache(c) => {
+					// the client certificate is a credential, and part of the key (#340)
+					let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
+						let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
+						(t.client_cert, format!("{} {xfcc}", t.client_verify()))
+					});
+					let mut ask = cache::Ask {
+						host: &host,
+						route: route_name,
+						https: self.https,
+						port: self.local.port(),
+						cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
+						body_empty: false,
+					};
+					// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
+					// for only when the head would let the cache answer
+					if c.admits(&parts, &ask) {
+						ask.body_empty = cache::settle(&mut body).await;
+					}
+					match c.request(&mut parts, &ask).await {
+						Ok((resp, outcome)) => {
+							sent.cached = Some((c.name.clone(), outcome));
+							Some(resp)
+						}
+						Err(pending) => {
+							sent.caches.push((i, pending));
+							None
+						}
+					}
+				}
 				m => m.on_request(&mut parts, &ctx),
 			};
 			if let Some(resp) = resp {
@@ -1096,7 +1146,7 @@ impl Conn {
 		// a middleware that refused the request (an error status; not redirects or answers like `respond` 200)
 		if log {
 			if let (Some(resp), Some((kind, name))) = (&answer, answered_by) {
-				if resp.status().is_client_error() || resp.status().is_server_error() {
+				if (resp.status().is_client_error() || resp.status().is_server_error()) && kind != "cache" {
 					entry.refused_by = kind.to_string();
 					entry.middleware = name.to_string();
 				}
@@ -1131,7 +1181,9 @@ impl Conn {
 						self.mirror(router.clone(), copy, body);
 					}
 				}
-				let target = Target { router: &router, service: &service, route: route_name, host: &host, client_ip, log, ctx: &ctx, backend_timeout };
+				let trusted = snapshot.trusts(canonical(self.client.ip()));
+				let target =
+					Target { router: &router, service: &service, route: route_name, host: &host, client_ip, trusted, log, ctx: &ctx, backend_timeout };
 				let forwarded = self.forward(target, req, replay, retry, &mut entry.backend, &mut holds);
 				match deadline {
 					Some(at) => match tokio::time::timeout_at(at, forwarded).await {
@@ -1149,15 +1201,19 @@ impl Conn {
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
 		};
-		for c in set_cookies {
-			resp.headers_mut().append(header::SET_COOKIE, c);
-		}
-		for h in &response_headers {
-			h.apply(resp.headers_mut());
-		}
 		// response side in reverse, also for answers of the middlewares
 		for (i, m) in chain[..ran].iter().enumerate().rev() {
+			for (_, c) in set_cookies.iter().filter(|(at, _)| *at == i) {
+				resp.headers_mut().append(header::SET_COOKIE, c.clone());
+			}
+			for (_, h) in response_headers.iter().filter(|(at, _)| *at == i) {
+				h.apply(resp.headers_mut());
+			}
 			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
+		}
+		if let Some((name, outcome)) = sent.cached.take() {
+			self.rt.http_stats.cache(route_name, &name, outcome);
+			entry.cache = outcome.as_str();
 		}
 		entry.status = resp.status().as_u16();
 		// tell HTTP/1.1 and HTTP/2 clients that HTTP/3 is answered on the same port
@@ -1204,6 +1260,13 @@ impl Conn {
 					}
 					None => resp,
 				}
+			}
+			Middleware::Cache(c) => {
+				let Some(pos) = sent.caches.iter().position(|(at, _)| *at == i) else { return resp };
+				let (_, pending) = sent.caches.swap_remove(pos);
+				let (resp, outcome) = c.response(pending, resp).await;
+				sent.cached = Some((c.name.clone(), outcome));
+				resp
 			}
 			Middleware::Compress { encodings, min_size } => {
 				if !compress::compressible(resp.status(), resp.headers(), *min_size, sent.head) {
@@ -1512,7 +1575,7 @@ impl Conn {
 		backend: &mut String,
 		holds: &mut Vec<Hold>,
 	) -> Response<Body> {
-		let Target { router, service, route, host, client_ip, log, ctx, backend_timeout } = target;
+		let Target { router, service, route, host, client_ip, trusted, log, ctx, backend_timeout } = target;
 		let upgrade = if req.version() == Version::HTTP_11 { upgrade_of(req.headers()) } else { None };
 		let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
 		let original_host = request_authority(req.uri(), req.headers());
@@ -1533,10 +1596,6 @@ impl Conn {
 			parts.headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
 			parts.headers.insert(header::UPGRADE, u.clone());
 		}
-		let trusted = match parts.extensions.get::<Arc<crate::l7::access::Snapshot>>() {
-			Some(snapshot) => snapshot.trusts(canonical(self.client.ip())),
-			None => self.rt.global.trusts(canonical(self.client.ip())),
-		};
 		self.forwarding_headers(&mut parts.headers, client_ip, original_host.as_ref(), host, trusted);
 		let path_and_query = parts.uri.path_and_query().cloned().unwrap_or_else(|| PathAndQuery::from_static("/"));
 		// kept for further attempts only
@@ -1996,6 +2055,8 @@ struct Target<'a> {
 	route: &'a str,
 	host: &'a str,
 	client_ip: IpAddr,
+	/// Whether the peer is a trusted proxy (the request's snapshot of `global`, #342).
+	trusted: bool,
 	/// The access log needs the backend's address.
 	log: bool,
 	/// For the servers' own middlewares (#229).

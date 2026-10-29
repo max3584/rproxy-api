@@ -2071,6 +2071,9 @@ impl Registry {
 					format!("cannot run with this build or these permissions (it would be registered as failed): {missing}"),
 				));
 			}
+			for w in spec.http.as_ref().map(|h| h.warnings()).unwrap_or_default() {
+				out.warnings.push((label.clone(), w));
+			}
 			match self.build_parts(&spec) {
 				Ok(_) => out.ok += 1,
 				// the part this build cannot run is the warning above
@@ -2385,6 +2388,8 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut durations = vec![];
 	let mut limited = vec![];
 	let mut blocked = vec![];
+	let mut cache = vec![];
+	let mut cache_usage = vec![];
 	let mut up = vec![];
 	let mut service_down = vec![];
 	let mut keys: Vec<&Key> = rules.keys().collect();
@@ -2429,7 +2434,24 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 				esc(&middleware)
 			));
 		}
+		for ((route, middleware), n) in r.rt.http_stats.cache_snapshot() {
+			for (outcome, n) in crate::l7::middleware::cache::Outcome::ALL.iter().zip(n) {
+				cache.push(format!(
+					"rproxy_http_cache_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\",result=\"{}\"}} {n}",
+					key.protocol,
+					key.listen,
+					esc(&route),
+					esc(&middleware),
+					outcome.as_str().to_ascii_lowercase()
+				));
+			}
+		}
 		if let Some(router) = r.rt.http_router() {
+			for (middleware, entries, bytes) in router.cache_usage() {
+				let labels = format!("protocol=\"{}\",listen=\"{}\",middleware=\"{}\"", key.protocol, key.listen, esc(&middleware));
+				cache_usage.push(format!("rproxy_http_cache_entries{{{labels}}} {entries}"));
+				cache_usage.push(format!("rproxy_http_cache_bytes{{{labels}}} {bytes}"));
+			}
 			for (service, servers) in router.health() {
 				service_down.push(format!(
 					"rproxy_http_service_down{{protocol=\"{}\",listen=\"{}\",service=\"{}\"}} {}",
@@ -2474,6 +2496,21 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_blocked_total HTTP requests of http rules refused by crowdsec.");
 	let _ = writeln!(out, "# TYPE rproxy_http_blocked_total counter");
 	for line in blocked {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_cache_total HTTP requests at cache middlewares of http rules by result: hit, miss, stale, bypass.");
+	let _ = writeln!(out, "# TYPE rproxy_http_cache_total counter");
+	for line in cache {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_cache_entries Answers kept by cache middlewares of http rules.");
+	let _ = writeln!(out, "# TYPE rproxy_http_cache_entries gauge");
+	for line in cache_usage.iter().filter(|l| l.starts_with("rproxy_http_cache_entries")) {
+		let _ = writeln!(out, "{line}");
+	}
+	let _ = writeln!(out, "# HELP rproxy_http_cache_bytes Bytes of the answers kept by cache middlewares of http rules.");
+	let _ = writeln!(out, "# TYPE rproxy_http_cache_bytes gauge");
+	for line in cache_usage.iter().filter(|l| l.starts_with("rproxy_http_cache_bytes")) {
 		let _ = writeln!(out, "{line}");
 	}
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
