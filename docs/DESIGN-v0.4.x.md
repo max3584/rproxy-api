@@ -388,8 +388,16 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
   - `settle` はヘッダで BYPASS にならないとき（`Cache::admits`）だけ。`Expect` は BYPASS（HTTP/1.1 で `100 Continue` を送らせない）。空の DATA フレームは読み飛ばす（HTTP/2 で HEADERS に END_STREAM がなく、空の DATA で終わるもの）。HTTP/3 の本文 `ChannelBody` に `is_end_stream`（読み手が終わりまで送った）。
   - 古い答えのない 5xx は待っていたものに渡すだけ（`Done::Error`、持たない）。待たずに 1 人で行ったリクエストが落ちたのを見ても `Slot.failed` を付け、すぐ `STALE` の時間が始まる。
   - `cors` の `Vary: Origin` は、どのオリジンでも許して資格情報を許さない（`*`）ときも付ける：`Origin` のないリクエストの答え（CORS のヘッダなし）を、`Origin` のあるリクエストに返さないため（後ろのキャッシュ）。
+- プロセス全体の上限（#349、`features.cache_process_memory`）：`max_memory` はミドルウェアごと（16 GiB まで）なので、ルールを何本も作って `cache` を付けるとプロセスのメモリを使い切れる（UI #172 のレビュー）。すべての `cache` の持つ量（答えと `passes`）の合計を `RPROXY_CACHE_MAX_MEMORY`（`--cache-max-memory`、既定 512 MiB、`0` でなし）までにする。
+  - 数え方：プロセスに 1 つの `cache::Budget`（原子的な `used` と `limit`）。`Store` が増やすとき（`insert`・`strike`）は先に `Budget::reserve`（比べて足すのを 1 つの CAS）、減らすとき（`take`・`sweep`・`unpass`）と `Store` の drop（`http` を変えた・ルールを消した）で戻す。`Store` は `Arc<Mutex<Store>>` にして `Budget` が `Weak` で持つ。
+  - 入らないとき：まずほかの `cache` の `stale_on_error` を過ぎた答えを捨てる（しばらく使われていない `cache` は期限を過ぎた答えを持ったままなので。ほかの `Store` は `try_lock` だけで待たない：2 つの `cache` が同時にしても止まらない）、次に自分の古い答えから捨てる。自分の答えを全部捨てても入らないなら捨てずに持たない（ほかの `cache` の答えは消さない）。答えは返す（`MISS`）。持てない理由は答えのせいではないので `passes` の数には入れない。`passes` の記録が入らなければ記録しない（待つのが前と同じになるだけ）。
+  - 下げたとき：持っている答えは期限か、場所を空けるまで残る。新しい答えは入るときだけ持つ。
+  - `0` を既定にしないのは、既定のままでルールを増やしてもプロセスを落とせないようにするため（前のパッチは上限なし。512 MiB は既定の `max_memory` 64 MiB の 8 個分）。
+  - `global` の API の live の項目 `cache_max_memory`（`RPROXY_UDP_MAX_SESSIONS` と同じく環境変数の項目で、ファイルの鍵はない。与えたら `409 static`）。入れ替えは `cache::set_max_memory`（原子的な値 1 つ）。
+  - `/metrics`：`rproxy_http_cache_memory_bytes`（合計。ルールごとの数を取るときに期限を過ぎたものを捨てた後）・`rproxy_http_cache_memory_limit_bytes`。
+  - 答えのある道（`HIT`）は変えない（`Store` の場所が 1 つ間接になるだけ。`Entry`・`Cache` の大きさは変えない）。
 - 測るもの：`benches/dataplane.rs` の `l7_cache/hit`（PR の `Benchmarks` が比べる。最初に 1 回埋めて、測るものはすべて `HIT` を確かめる）。
-- 試験：`tests/http_cache.rs`、`src/l7/middleware/cache.rs` の単体テスト。
+- 試験：`tests/http_cache.rs`、`tests/http_cache_budget.rs`（プロセス全体の上限。上限がプロセスで 1 つなので別のテストのバイナリ）、`src/l7/middleware/cache.rs` の単体テスト。
 
 ## 17. global の設定の API（v0.4.19、#342）
 
@@ -398,7 +406,7 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 | `GET` / `PATCH /config/global` | `admin`。本文は設定ファイルの `global` の形、`null` で消す。誤りの `code`：`409 static`・`restart_only`・`in_use`、`403 protected_file`、`502 crowdsec_unavailable`、`503 not_loaded`。テーブル `rproxy_global`（UI の migration 013）。`RPROXY_API_ACCESS_LOG_DIR` | `global_api` | API で何も入れなければ今までどおり（ファイル・環境変数・既定） |
 
 - オーナーの決定：ファイル（と環境変数）に書いた項目はファイルが勝つ。API は書いていない項目だけ。
-- 持ち主：`config::global::Settings`（`Registry::global`）。ファイルの項目（`Values::of_file`：書いたかは `ConfigDoc::global_raw` で見る。`trusted_proxies: []` も書いたうち）・環境変数の項目（`RPROXY_UDP_MAX_SESSIONS` を与えたか：`main` が clap の `value_source` で見る）・API の値（効かせていないもの `failed` も）・保存されていたがこの版が読まないもの（`kept`）・効いている値（`Live`）と出どころ。決め方は項目ごとに ファイル → 環境変数 → API → 既定。
+- 持ち主：`config::global::Settings`（`Registry::global`）。ファイルの項目（`Values::of_file`：書いたかは `ConfigDoc::global_raw` で見る。`trusted_proxies: []` も書いたうち）・環境変数の項目（`RPROXY_UDP_MAX_SESSIONS`・`RPROXY_CACHE_MAX_MEMORY`（#349）を与えたか：`main` が clap の `value_source` で見る）・API の値（効かせていないもの `failed` も）・保存されていたがこの版が読まないもの（`kept`）・効いている値（`Live`）と出どころ。決め方は項目ごとに ファイル → 環境変数 → API → 既定。
 - 入れ替え：`HttpGlobal` の中の `Snapshot`（`trusted_proxies`・アクセスログの行き先・CrowdSec の bouncer・`timeouts`）を丸ごと 1 回で差し替える（`HttpGlobal::update`）。`server.rs` の `Conn::handle` はリクエストの始めに写しを 1 つ取り、`Forwarded` の判定・`client_ip`・アクセスログ（`Logged`）まで同じものを使う。`timeouts` は接続の始めに読む。UDP は `udp::set_max_sessions`。
 - 組み立てと差し替え：先にすべて組み立て（ファイルを開く・新しい bouncer を動かして最初の取得を `BOUNCER_SYNC_WAIT` 10 秒まで待つ）、差し替えは `Registry::under_rules_lock` の中で行う（そこでルールが CrowdSec を使うかを読む）。ルールの作成・変更は表に入れる直前（`start`・`apply`、ルールの鍵の下）に `crowdsec_gate` でもう一度確かめるので、`crowdsec` を外す変更とそれを使うルールが入れ違うことはない（レビュー M3、`tests/global_api.rs` の `clearing_crowdsec_never_crosses_a_rule_that_needs_it`）。取得できない bouncer は入れず、古いものを残す（API は `502`、読み直しは `config.global_kept`）。古い bouncer は入れ替えた後に止める（`NewBouncer` は使われなければ drop で止まる）。戻すとき（DB・引き継ぎ・照合が後から読んだとき）は `HANDOFF_SYNC_WAIT`（2 秒）まで待ち、取れなくても入れる（設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまではルールの `on_error`）。
 - 起動のときだけの項目（`acme`・`geoip`・`performance`・`files`・制御 API の待ち受け）は表示だけ。表示は秘密を伏せる（`redacted`、#347：`acme` は形だけ、ほかはヘッダの値・`body`・秘密らしい名前・URL の利用者とクエリを `***`）。`acme`・`geoip` は #345 で（大きいので後に回した）。`files`（所有者の確認）は API で弱められないよう、これからも API では変えない案。

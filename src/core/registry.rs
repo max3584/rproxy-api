@@ -2590,6 +2590,14 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	for line in cache_usage.iter().filter(|l| l.starts_with("rproxy_http_cache_bytes")) {
 		let _ = writeln!(out, "{line}");
 	}
+	// all caches together (#349), after the ones above dropped what is past its time
+	let (limit, used) = crate::l7::middleware::cache::memory();
+	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_bytes Bytes all cache middlewares of the process keep together (answers and passes).");
+	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_bytes gauge");
+	let _ = writeln!(out, "rproxy_http_cache_memory_bytes {used}");
+	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_limit_bytes RPROXY_CACHE_MAX_MEMORY in force: bytes all cache middlewares may keep together (0: no limit).");
+	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_limit_bytes gauge");
+	let _ = writeln!(out, "rproxy_http_cache_memory_limit_bytes {limit}");
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
 	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
 	for line in durations {

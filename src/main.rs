@@ -121,6 +121,9 @@ struct Options {
 	/// Sessions one udp rule may have when its `limits` set no `max_connections` (0: no limit)
 	#[arg(long, env = "RPROXY_UDP_MAX_SESSIONS", default_value_t = rproxy_api::l4::udp::DEFAULT_MAX_SESSIONS)]
 	udp_max_sessions: u64,
+	/// Bytes all `cache` middlewares of the process may keep together (0: no limit beyond each one's max_memory)
+	#[arg(long, env = "RPROXY_CACHE_MAX_MEMORY", default_value_t = rproxy_api::l7::middleware::cache::DEFAULT_PROCESS_MAX_MEMORY)]
+	cache_max_memory: u64,
 	/// Seconds between attempts to open a control API listener that could not start
 	#[arg(long, env = "RPROXY_API_RETRY_SECS", default_value_t = 10, hide = true)]
 	api_retry_secs: u64,
@@ -572,7 +575,7 @@ fn main() -> ExitCode {
 	let matches = <Options as clap::CommandFactory>::command().get_matches();
 	let mut opts = <Options as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 	// options given (not their defaults): the environment owns them in GET /config/global (#342)
-	opts.given = ["udp_max_sessions", "api_addr", "api_port", "api_socket"]
+	opts.given = ["udp_max_sessions", "cache_max_memory", "api_addr", "api_port", "api_socket"]
 		.into_iter()
 		.filter(|id| matches!(matches.value_source(id), Some(clap::parser::ValueSource::EnvVariable | clap::parser::ValueSource::CommandLine)))
 		.map(String::from)
@@ -972,6 +975,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
 	rproxy_api::l4::udp::set_max_sessions(opts.udp_max_sessions);
+	rproxy_api::l7::middleware::cache::set_max_memory(opts.cache_max_memory);
 	let registry = Registry::new(Config {
 		dns_interval: Duration::from_secs(opts.dns_interval.max(1)),
 		lookup: resolve::system_lookup(),
@@ -991,7 +995,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
-		nofile_limit = nofile.unwrap_or(0));
+		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0));
 
 	// #144: rules of persist: true tokens, in rproxy_rules
 	if rproxy_api::core::rule::Features::CURRENT.persistence {
@@ -1005,7 +1009,11 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	{
 		use rproxy_api::config::global::{Source, Values};
 		let given = |id: &str| opts.given.iter().any(|g| g == id);
-		let env = Values { udp_max_sessions: given("udp_max_sessions").then_some(opts.udp_max_sessions), ..Default::default() };
+		let env = Values {
+			udp_max_sessions: given("udp_max_sessions").then_some(opts.udp_max_sessions),
+			cache_max_memory: given("cache_max_memory").then_some(opts.cache_max_memory),
+			..Default::default()
+		};
 		let mut startup = std::collections::BTreeMap::new();
 		let api_source = if ["api_addr", "api_port", "api_socket"].iter().any(|id| given(id)) { Source::Env } else { Source::Default };
 		startup.insert("control_api", (api_source, serde_json::json!({"addr": opts.api_addr, "port": opts.api_port, "socket": opts.api_socket})));

@@ -2300,6 +2300,10 @@
               "target_max_connections": {
                 "type": "boolean",
                 "description": "max_connections of L4 targets[] (also tls.routes[].targets[]) and of http services' servers[]: a full target is skipped by every balance, all full is refused (reason target_full); max_connections and full in stats.targets[] (v0.4.19, #341)"
+              },
+              "cache_process_memory": {
+                "type": "boolean",
+                "description": "All cache middlewares of the process together keep at most RPROXY_CACHE_MAX_MEMORY (default 512 MiB, 0: no limit): an answer that does not fit drops the oldest of its own cache, or is not kept; cache_max_memory in GET / PATCH /config/global (live, the environment wins); rproxy_http_cache_memory_bytes and rproxy_http_cache_memory_limit_bytes in /metrics (v0.4.19, #349)"
               }
             }
           },
@@ -3850,7 +3854,7 @@
         "properties": {
           "items": {
             "type": "object",
-            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions (live); acme, geoip, performance, files, control_api (restart)",
+            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions, cache_max_memory (live); acme, geoip, performance, files, control_api (restart)",
             "additionalProperties": {
               "$ref": "#/components/schemas/GlobalItem"
             }
@@ -4005,6 +4009,14 @@
             ],
             "minimum": 0,
             "description": "The default cap of UDP sessions per rule (RPROXY_UDP_MAX_SESSIONS; 0: none)"
+          },
+          "cache_max_memory": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Bytes all cache middlewares of the process keep together (RPROXY_CACHE_MAX_MEMORY; default 536870912, 0: none) (v0.4.19, #349)"
           }
         },
         "additionalProperties": false

@@ -199,7 +199,7 @@ async fn the_api_sets_what_the_file_leaves_out_and_the_next_request_takes_it() {
 		let text = e["error"].as_str().unwrap_or_default();
 		assert!(text.contains("only over the Unix socket") && !text.contains("RPROXY_API_RELOAD_UNIX_ONLY"), "{text}");
 	}
-	for body in [json!({"trusted_proxies": ["nope"]}), json!({"nope": 1}), json!({}), json!([1]), json!({"udp_max_sessions": -1})] {
+	for body in [json!({"trusted_proxies": ["nope"]}), json!({"nope": 1}), json!({}), json!([1]), json!({"udp_max_sessions": -1}), json!({"cache_max_memory": "1G"})] {
 		let (status, e) = patch(&unix, "/config/global", body.clone()).await;
 		assert_eq!((status, &e["code"]), (StatusCode::BAD_REQUEST, &json!("invalid")), "{body}: {e}");
 	}
@@ -281,6 +281,15 @@ async fn udp_sessions_and_http_timeouts_change_for_the_next_session_and_connecti
 	assert!(tokio::time::timeout(Duration::from_millis(500), b.recv(&mut buf)).await.is_err(), "over the cap");
 	patch(&base, "/config/global", json!({"udp_max_sessions": null})).await;
 	assert_eq!(udp_roundtrip(&b, "3").await, "U:3", "back to the default cap");
+
+	// the memory of all caches together (#349), also process-wide
+	use rproxy_api::l7::middleware::cache;
+	let (status, v) = patch(&base, "/config/global", json!({"cache_max_memory": 1_000_000})).await;
+	let item = &v["items"]["cache_max_memory"];
+	assert_eq!((status, &item["value"], &item["source"], &item["apply"]), (StatusCode::OK, &json!(1_000_000), &json!("api"), &json!("live")), "{v}");
+	assert_eq!(cache::memory().0, 1_000_000);
+	patch(&base, "/config/global", json!({"cache_max_memory": null})).await;
+	assert_eq!(cache::memory().0, cache::DEFAULT_PROCESS_MAX_MEMORY, "back to the default");
 
 	let http = echo_backend().await;
 	let port = free_port();
