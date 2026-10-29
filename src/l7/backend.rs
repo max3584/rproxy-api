@@ -62,7 +62,10 @@ pub struct Server {
 	pub authority: String,
 	/// Path of the URL without the trailing slash; prepended to request paths.
 	pub prefix: String,
-	pub weight: u64,
+	pub weight: u32,
+	/// `max_connections` (#341): requests in progress at most (0: no limit). Beside `weight`,
+	/// both u32: the struct keeps its size of before #341 (a larger `Server` measured slower).
+	pub max: u32,
 	/// Value of the sticky cookie that selects this server (from the URL, so it
 	/// survives restarts and changes of the other servers).
 	pub id: String,
@@ -85,9 +88,6 @@ pub struct Server {
 	pub h2_opening: tokio::sync::Mutex<()>,
 	/// `protocol: auto`: what the server picked by ALPN (0 not known yet, 1 HTTP/1.1, 2 HTTP/2).
 	alpn: std::sync::atomic::AtomicU8,
-	/// `max_connections` (#341): requests in progress at most (0: no limit). Last, so the
-	/// fields of before keep their places.
-	pub max: u64,
 }
 
 impl Server {
@@ -110,7 +110,7 @@ impl Server {
 			authority: parsed.authority().to_string(),
 			prefix: parsed.uri.path().trim_end_matches('/').to_string(),
 			host: parsed.host,
-			weight: u64::from(weight.max(1)),
+			weight: weight.max(1),
 			id,
 			up: AtomicBool::new(true),
 			ejection: Arc::default(),
@@ -173,7 +173,7 @@ impl Server {
 
 	/// At its `max_connections` now (never without one, #341).
 	pub fn is_full(&self) -> bool {
-		self.max != 0 && self.inflight.load(Ordering::Relaxed) >= self.max
+		self.max != 0 && self.inflight.load(Ordering::Relaxed) >= u64::from(self.max)
 	}
 
 	/// Up and not full: may take a new request.
@@ -188,7 +188,7 @@ impl Server {
 		if self.max == 0 {
 			return Some(Hold::counting(self.inflight.clone()));
 		}
-		Hold::counting_below(self.inflight.clone(), self.max)
+		Hold::counting_below(self.inflight.clone(), u64::from(self.max))
 	}
 
 	pub fn addr(&self) -> String {
@@ -342,7 +342,7 @@ impl Service {
 				Some(status) => Server::fixed(status, weight)?,
 				None => Server::parse(&s.url, weight)?,
 			};
-			server.max = s.max_connections.map_or(0, u64::from);
+			server.max = s.max_connections.unwrap_or(0);
 			for m in &s.middlewares {
 				let what = format!("service {name}: servers[{i}]: middleware {m}");
 				let spec = middlewares.get(m).ok_or_else(|| ApiError::invalid(format!("{what} is not defined")))?;
@@ -381,7 +381,7 @@ impl Service {
 		};
 		Ok(Service {
 			name: name.to_string(),
-			total_weight: servers.iter().map(|s| s.weight).sum(),
+			total_weight: servers.iter().map(|s| u64::from(s.weight)).sum(),
 			capped: servers.iter().any(|s| s.max != 0),
 			servers,
 			next: AtomicU64::new(0),
@@ -485,13 +485,13 @@ impl Service {
 		for _ in 0..self.servers.len() * 4 {
 			let mut n = self.next.fetch_add(1, Ordering::Relaxed) % self.total_weight;
 			for (i, s) in self.servers.iter().enumerate() {
-				if n < s.weight {
+				if n < u64::from(s.weight) {
 					if usable(s) {
 						return Some(i);
 					}
 					break;
 				}
-				n -= s.weight;
+				n -= u64::from(s.weight);
 			}
 		}
 		self.servers.iter().position(usable)
@@ -688,7 +688,7 @@ pub fn health_view<'a>(services: impl Iterator<Item = &'a Arc<Service>>) -> BTre
 					url: v.url.clone(),
 					up: v.is_up(),
 					ejected: v.ejection.is_ejected(),
-					max_connections: capped.then_some(v.max),
+					max_connections: capped.then_some(u64::from(v.max)),
 					in_flight: capped.then(|| v.inflight.load(Ordering::Relaxed)),
 					full: capped.then(|| v.is_full()),
 				}
