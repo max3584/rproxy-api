@@ -534,10 +534,13 @@ impl Registry {
 			let key = spec.key;
 			let prepared = self.prepare(&spec).await;
 			let mut rules = self.rules.lock().await;
-			let Some(Entry::Failed(f)) = rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation)) else {
+			// still the same failed rule: not replaced, nor changed in place meanwhile (#347)
+			let Some(Entry::Failed(f)) =
+				rules.get_mut(&key).filter(|e| matches!(e, Entry::Failed(f) if f.generation == generation && f.spec == spec))
+			else {
 				continue;
 			};
-			let result = prepared.and_then(|p| self.start(spec, p));
+			let result = prepared.and_then(|p| self.start(spec.clone(), p));
 			match result {
 				Ok(running) => {
 					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
@@ -545,6 +548,10 @@ impl Registry {
 					started += 1;
 				}
 				Err(e) => {
+					// targets that cannot be resolved yet are retried in the background, as in `insert_failed` (#347)
+					if e.code == "resolve_failed" && f.retry.is_none() {
+						f.retry = Some(tokio::spawn(retry_start(Arc::downgrade(self), spec, generation)));
+					}
 					f.error = e.message;
 					f.code = e.code;
 					f.reason = e.reason;

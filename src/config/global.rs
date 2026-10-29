@@ -1157,10 +1157,10 @@ impl Settings {
 			.filter_map(|(i, _)| item(i))
 			.map(|d| Change {
 				item: d.name,
-				before: live_value(&before, d.name),
-				after: live_value(&to, d.name),
-				api_before: api_before.get(d.name).unwrap_or(Value::Null),
-				api_after: api.get(d.name).unwrap_or(Value::Null),
+				before: shown(d, live_value(&before, d.name)),
+				after: shown(d, live_value(&to, d.name)),
+				api_before: shown(d, api_before.get(d.name).unwrap_or(Value::Null)),
+				api_after: shown(d, api.get(d.name).unwrap_or(Value::Null)),
 			})
 			.collect();
 		let applied = differing(&before, &to);
@@ -1284,8 +1284,8 @@ impl Settings {
 					None => s.startup.get(i.name).cloned().unwrap_or((Source::Default, Value::Null)),
 				},
 			};
-			// restart items are shown as written: what may be a secret is masked (#347)
-			let shown = |v: Value| if i.apply == Apply::Restart { redacted(i.name, v) } else { v };
+			// what may be a secret is masked (#347)
+			let shown = |v: Value| shown(i, v);
 			v.insert("value".into(), shown(value));
 			v.insert("source".into(), json!(source));
 			v.insert("apply".into(), json!(i.apply));
@@ -1330,6 +1330,23 @@ impl Settings {
 
 /// What `GET /config/global` shows in place of a value that may be a secret (#347).
 pub const MASKED: &str = "***";
+
+/// An item's value as `GET` / `PATCH /config/global` show it (#347): a restart
+/// item `redacted`, the user and query of `crowdsec`'s URLs masked.
+fn shown(i: &Item, v: Value) -> Value {
+	match (i.apply, i.name, v) {
+		(Apply::Restart, name, v) => redacted(name, v),
+		(_, "crowdsec", Value::Object(mut m)) => {
+			for k in ["lapi_url", "appsec_url"] {
+				if let Some(Value::String(u)) = m.get_mut(k) {
+					*u = masked_url(u);
+				}
+			}
+			Value::Object(m)
+		}
+		(_, _, v) => v,
+	}
+}
 
 /// A restart item's value as `GET /config/global` shows it (#347): written by hand,
 /// so it may hold secrets inline. `acme` (accounts, contacts, EAB, DNS calls) keeps
@@ -1381,8 +1398,9 @@ fn masked(v: Value) -> Value {
 	}
 }
 
-/// A URL without its user (and password) and query.
+/// A URL without its user (and password), query and fragment.
 fn masked_url(u: &str) -> String {
+	let u = u.split_once('#').map_or(u, |(base, _)| base);
 	let (u, query) = match u.split_once('?') {
 		Some((base, _)) => (base, true),
 		None => (u, false),
@@ -1491,12 +1509,12 @@ mod tests {
 		let acme = json!({"accounts": {"le": {"contact": ["mailto:a@example.com"], "eab": {"kid": "k1", "hmac_key_file": "/s/h"}}},
 			"dns_providers": {"x": {"kind": "http", "zones": ["example.com"], "ttl": 60,
 				"add": {"url": "https://h/add?token=t", "headers": {"Authorization": "Bearer t"}}}}});
-		let shown = redacted("acme", acme);
-		assert_eq!(shown["accounts"]["le"]["contact"], json!([MASKED]));
-		assert_eq!(shown["accounts"]["le"]["eab"], json!({"kid": MASKED, "hmac_key_file": MASKED}));
-		assert_eq!(shown["dns_providers"]["x"]["add"]["headers"], json!({"Authorization": MASKED}));
-		assert_eq!((&shown["dns_providers"]["x"]["zones"], &shown["dns_providers"]["x"]["ttl"]), (&json!([MASKED]), &json!(60)));
-		assert!(!shown.to_string().contains("example.com") && !shown.to_string().contains("Bearer"));
+		let acme = redacted("acme", acme);
+		assert_eq!(acme["accounts"]["le"]["contact"], json!([MASKED]));
+		assert_eq!(acme["accounts"]["le"]["eab"], json!({"kid": MASKED, "hmac_key_file": MASKED}));
+		assert_eq!(acme["dns_providers"]["x"]["add"]["headers"], json!({"Authorization": MASKED}));
+		assert_eq!((&acme["dns_providers"]["x"]["zones"], &acme["dns_providers"]["x"]["ttl"]), (&json!([MASKED]), &json!(60)));
+		assert!(!acme.to_string().contains("example.com") && !acme.to_string().contains("Bearer"));
 		let other = json!({"tls": {"cert_file": "/c.pem", "key_file": "/k.pem", "client_secret": "s"}, "api_token": "t",
 			"url": "https://u:p@h:1/x?token=t", "lapi_url": "http://h/", "workers": 2,
 			"call": {"headers": {"X-Api-Key": "k"}, "body": "{\"token\":\"t\"}"}});
@@ -1514,6 +1532,11 @@ mod tests {
 		let view = s.view();
 		assert_eq!(view["items"]["acme"]["value"]["accounts"]["le"]["contact"], json!([MASKED]), "{view}");
 		assert!(!view.to_string().contains("a@example.com"), "{view}");
+		assert_eq!(masked_url("http://u:p@h:8080/v1?k=t#f"), format!("http://{MASKED}@h:8080/v1?{MASKED}"));
+		assert_eq!(masked_url("http://h:8080/#f"), "http://h:8080/");
+		let cs = item("crowdsec").unwrap();
+		let v = shown(cs, json!({"lapi_url": "http://u:p@lapi/?k=t", "appsec_url": "http://w/#x", "api_key_file": "/k"}));
+		assert_eq!(v, json!({"lapi_url": format!("http://{MASKED}@lapi/?{MASKED}"), "appsec_url": "http://w/", "api_key_file": "/k"}));
 	}
 
 	#[test]
