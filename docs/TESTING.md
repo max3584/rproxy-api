@@ -399,7 +399,7 @@ cargo の機能 `dpdk` のビルドだけのもの（既定の CI の `cargo tes
 |---|---|
 | `crates/rproxy-dpdk` の単体テスト（DPDK なし。`cargo test -p rproxy-dpdk`） | フレームの解析・書き換え（チェックサムの差分の更新が一から計算したものと同じ、断片・壊れたヘッダ）、ARP・ping への返事、NAT のセッション（両向き・別のアドレスからの返事を捨てる・アイドル・ルールの止め方・ゲートウェイ・宛先の切り替え・2,000 クライアント）、起動時の確かめの筋書き（壊れたものを見つける） |
 | `crates/rproxy-dpdk/tests/ring.rs`（DPDK あり、root なし、`--no-huge`） | 起動時の確かめを `net_ring` のループバックのポートに本物の mbuf で通す。lcore のループ（`io::run`）を `net_memif` の組の片側で動かし、もう片側から 500 個のデータグラムを往復させて比べる |
-| `scripts/test-dpdk.sh`（sudo、ヒュージページ） | 本物の `rproxy-api` を `net_tap` と `net_af_packet`（veth）の 2 つのポートで起動し、カーネルの UDP のソケットと往復（クライアント 20 個 × 70 個、0〜1472 バイト、ポートをまたぐルール、ポートの範囲）、ping、`GET /capabilities` の `performance.dpdk`、`--check-kernel`、使えないときの `fallback: true`（degraded）・`false`（起動しない） |
+| `scripts/test-dpdk.sh`（sudo、ヒュージページ） | 本物の `rproxy-api` を `net_tap` と `net_af_packet`（veth）の 2 つのポートで起動し、カーネルの UDP のソケットと往復（クライアント 20 個 × 70 個、0〜1472 バイト、ポートをまたぐルール、ポートの範囲）、ping、`GET /capabilities` の `performance.dpdk`、`--check-kernel`、使えないときの `fallback: true`（degraded）・`false`（起動しない）、宛先の `max_connections`（#341。2 つ目のクライアントを `target_full` で捨てる） |
 
 手元では `sudo apt install libdpdk-dev` のあと `cargo test -p rproxy-dpdk --features ffi` と `cargo build --features dpdk && sudo scripts/test-dpdk.sh`。
 
@@ -522,6 +522,22 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `http_servers_that_keep_failing_are_ejected` | 500 を続けて返すサーバを外し、残りに送る（`stats.http.services` の `ejected`、`target.down` の `service`・`server`・`cause`） |
 | `http_ejection_leaves_at_least_half_by_default` | 既定の `max_ejected_percent: 50` で、全部は外さない |
 
+## 結合テスト：宛先ごとの上限（`tests/target_caps.rs`、#341）
+
+単体テスト（`core::balance`・`l7::backend`）は選び方（spillover・round_robin・least_conn・down といっぱい）、作り直しで数を渡すこと、8 スレッドから取り合っても上限を超えないこと。
+
+| テスト | 確かめること |
+|---|---|
+| `tcp_failover_fills_the_targets_in_order_then_refuses` | `failover` で上から上限まで詰めて次へ。すべていっぱいなら何も送らずに閉じ、`stats.limited`・`rproxy_rule_limited_total{reason="target_full"}` に数え、`total_connections` には数えない。`stats.targets[]` の `max_connections`・`full`、`rproxy_target_full`。閉じた接続の分が空く |
+| `failed_connections_give_their_place_back` | 接続に失敗した宛先の数が戻る（いっぱいにならない） |
+| `patching_the_targets_keeps_the_open_connections_counted` | PATCH で宛先を置き換えても、開いている接続を同じ宛先の上限に数える |
+| `a_udp_session_stays_on_its_target_through_a_patch` | PATCH の後も UDP のセッションは渡った宛先に残り、そこで数える。宛先が 1 つのルールは `stats.targets` を出すが up / down（`rproxy_target_up`・`rproxy_rule_all_targets_down`）は出さない |
+| `tests/tls.rs` の `a_tls_route_target_takes_its_max_connections_and_a_patch_keeps_the_count` | `tls.routes[].targets[]` の上限、`stats.tls_routes`・`route` のラベル、同じ名前の route の PATCH で数を渡す |
+| `tests/dtls.rs` の `dtls_sessions_count_against_the_target_cap` | DTLS を終端するセッションも宛先の上限に数える |
+| `udp_sessions_fill_the_targets_and_come_back_when_idle` | UDP のセッションの上限。いっぱいならデータグラムを捨て、アイドルで終わったセッションの分が空く |
+| `http_servers_take_their_max_requests_then_spill_over_or_answer_503` | `http` の転送先の処理中のリクエストの上限：`failover` で次の転送先へ、1 つだけなら 503 と `stats.limited`。`stats.http.services` の `in_flight`・`full` |
+| `caps_are_validated_and_shown_in_features` | `max_connections: 0` は `400`、`features.target_max_connections` |
+
 ## 結合テスト：そのほか
 
 ここまでの節にないテストのファイル（中身はファイルの先頭の説明とテストの名前を見る）。
@@ -577,6 +593,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `clienthello/*` | rustls が作る ClientHello（約 250 バイトと 3 KiB）からサーバ名を読む（`sni::parse_client_hello`） |
 | `quic_initial/v1` / `v2` | RFC 9001 / 9369 の Initial（`tests/fixtures/quic`）から鍵を計算し、ヘッダの保護と AEAD を外してサーバ名を読む（`udp_sni::Sniffer`） |
 | `proxy_dgram/v4` / `v6` / `untrusted_plain` | `udp` のルールの `proxy_protocol`（#312）でデータグラムごとにする判断（`proxy_in::datagram`：信じる前段か、v2 の DGRAM のヘッダの解析、外す位置。割り当てなし）。`untrusted_plain` は `from` の外のヘッダのないデータグラム |
+| `balance/*` | 新しい L4 の接続・UDP のセッションごとの宛先の選び方（4 つの宛先の `Pool::order` と `Lease::take`。`round_robin`・`least_conn`・`failover` と、届かない `max_connections` つきの `_capped`。#341） |
 | `benches/dataplane.rs` の `l4_tcp/*` | TCP の転送の 1 MiB の往復（スループット）と、新しい接続（接続 → 1 バイトの往復 → 切断） |
 | `l4_udp/*` | UDP の 1 KiB の往復と、新しいセッション（毎回新しい送信元ポート）。`roundtrip_1KiB_proxy_protocol` は同じ往復を `proxy_protocol` のルールに PROXY v2 のヘッダを付けて（#312） |
 | `tls_terminate/*` | TLS の終端の新しい接続（再開なしの完全なハンドシェイク）と、終端した接続での 1 MiB の往復 |

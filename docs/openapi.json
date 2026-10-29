@@ -396,6 +396,11 @@
                     "type": "string"
                   },
                   "description": "middlewares for this server only (#229): headers, replace_host, strip_prefix, add_prefix, replace_path, replace_path_regex"
+                },
+                "max_connections": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "requests in progress on this server at most (v0.4.19, #341): a full server is skipped like one that is down; all full is answered 503 (reason target_full). Not with status"
                 }
               },
               "additionalProperties": false,
@@ -1774,7 +1779,7 @@
           },
           "services": {
             "type": "object",
-            "description": "Services with health_check or outlier_detection: the state of their servers.",
+            "description": "Services with health_check, outlier_detection or a server's max_connections: the state of their servers.",
             "properties": {},
             "additionalProperties": {
               "type": "array",
@@ -1790,6 +1795,18 @@
                   "ejected": {
                     "type": "boolean",
                     "description": "Ejected by outlier_detection (#170); left out when not."
+                  },
+                  "max_connections": {
+                    "type": "integer",
+                    "description": "Servers with max_connections only (v0.4.19, #341)"
+                  },
+                  "in_flight": {
+                    "type": "integer",
+                    "description": "Requests in progress now; servers with max_connections only (v0.4.19, #341)"
+                  },
+                  "full": {
+                    "type": "boolean",
+                    "description": "At max_connections now; servers with max_connections only (v0.4.19, #341)"
                   }
                 }
               }
@@ -1843,11 +1860,36 @@
             "items": {
               "$ref": "#/components/schemas/TargetStatus"
             },
-            "description": "Rules with several targets or a health_check."
+            "description": "Rules with several targets or a health_check, or a target with max_connections (v0.4.19, #341)."
+          },
+          "tls_routes": {
+            "type": "array",
+            "description": "The targets of tls.routes[] with several targets or a max_connections, in the order of tls.routes (v0.4.19, #341).",
+            "items": {
+              "type": "object",
+              "properties": {
+                "server_names": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "targets": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TargetStatus"
+                  }
+                }
+              },
+              "required": [
+                "server_names",
+                "targets"
+              ]
+            }
           },
           "limited": {
             "type": "integer",
-            "description": "Refused by limits (v0.4, #165)"
+            "description": "Refused by limits (v0.4, #165), or because every target was full (reason target_full, v0.4.19, #341)"
           },
           "counters_since": {
             "type": "integer",
@@ -2254,6 +2296,10 @@
               "global_api": {
                 "type": "boolean",
                 "description": "GET / PATCH /config/global: the global items the settings file (and the environment) leaves out are set through the API (admin; crowdsec only over the Unix socket by default), stored in rproxy_global and put in force for the next request, connection or UDP session; the file's items win (409 static) (v0.4.19, #342)"
+              },
+              "target_max_connections": {
+                "type": "boolean",
+                "description": "max_connections of L4 targets[] (also tls.routes[].targets[]) and of http services' servers[]: a full target is skipped by every balance, all full is refused (reason target_full); max_connections and full in stats.targets[] (v0.4.19, #341)"
               }
             }
           },
@@ -2446,6 +2492,11 @@
           "backup": {
             "type": "boolean",
             "description": "Used only while every other target is down."
+          },
+          "max_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "TCP connections / UDP sessions this target takes at once (v0.4.19, #341): a full target is skipped like one that is down by every balance; all full refuses new ones (reason target_full)."
           }
         },
         "required": [
@@ -2511,6 +2562,14 @@
           "connections": {
             "type": "integer"
           },
+          "max_connections": {
+            "type": "integer",
+            "description": "The target's max_connections; left out without one (v0.4.19, #341)"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "At max_connections now: skipped for new connections (v0.4.19, #341)"
+          },
           "total_connections": {
             "type": "integer"
           },
@@ -2529,7 +2588,18 @@
             "type": "integer",
             "description": "v0.4, #170"
           }
-        }
+        },
+        "required": [
+          "addr",
+          "port",
+          "up",
+          "connections",
+          "full",
+          "total_connections",
+          "resolved",
+          "ejected_until",
+          "ejections"
+        ]
       },
       "CertStatus": {
         "type": "object",

@@ -228,6 +228,10 @@ pub struct Features {
 	/// `GET` / `PATCH /config/global`: the `global` items the settings file leaves out are
 	/// set through the API, stored with the rules and put in force while running (#342)
 	pub global_api: bool,
+	/// `max_connections` of L4 `targets[]` (also of `tls.routes[]`) and of `http` services'
+	/// `servers[]`: a full target is skipped by every `balance`, all full is refused
+	/// (`reason: target_full`); `stats.targets[].full` (#341)
+	pub target_max_connections: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -296,6 +300,7 @@ impl Features {
 		file_owners: true,
 		invalid_restored: true,
 		global_api: true,
+		target_max_connections: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -347,6 +352,7 @@ impl Features {
 		file_owners: true,
 		invalid_restored: true,
 		global_api: true,
+		target_max_connections: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -616,6 +622,12 @@ impl RuleSpec {
 		tls
 	}
 
+	/// Some target (`targets`, `tls.routes[].targets`) or `http` server has `max_connections` (#341).
+	pub fn has_target_caps(&self) -> bool {
+		self.targets.iter().chain(self.tls.routes.iter().flat_map(|r| &r.targets)).any(|t| t.max_connections.is_some())
+			|| self.http.as_ref().is_some_and(|h| h.services.values().flat_map(|s| &s.servers).any(|s| s.max_connections.is_some()))
+	}
+
 	/// The backends to spread connections over: `targets`, or the single
 	/// `remote_addr` / `remote_port`; none for `http` rules.
 	pub fn members(&self) -> Vec<TargetSpec> {
@@ -625,7 +637,7 @@ impl RuleSpec {
 		if self.http.is_some() || self.remote_host.is_empty() {
 			return vec![];
 		}
-		vec![TargetSpec { addr: self.remote_host.clone(), port: self.remote_port, weight: None, backup: false }]
+		vec![TargetSpec { addr: self.remote_host.clone(), port: self.remote_port, weight: None, backup: false, max_connections: None }]
 	}
 
 	pub fn remote(&self) -> String {
@@ -994,8 +1006,20 @@ pub struct RuleStats {
 	/// Requests of an `http` rule, in total and by route.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub http: Option<crate::l7::access::HttpStatsView>,
-	/// State of each backend, for rules with `targets` or `health_check`.
+	/// State of each backend, for rules with `targets` or `health_check` (or a target's `max_connections`).
 	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<balance::TargetStatus>,
+	/// State of the targets of `tls.routes[]` with several `targets` or a `max_connections` (#341),
+	/// in the order of `tls.routes`.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub tls_routes: Vec<RouteTargetsStatus>,
+}
+
+/// The targets of one `tls.routes[]` entry (`stats.tls_routes`, #341).
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RouteTargetsStatus {
+	/// The route's names (`server_name` or `server_names`), lower-cased.
+	pub server_names: Vec<String>,
 	pub targets: Vec<balance::TargetStatus>,
 }
 
@@ -1343,8 +1367,8 @@ mod tests {
 		r.source_ip = SourceIp::Transparent;
 		assert_eq!(r.clone().validate(&caps).unwrap_err().code, "invalid");
 		r.targets = vec![
-			TargetSpec { addr: "10.0.0.1".into(), port: 80, weight: None, backup: false },
-			TargetSpec { addr: "2001:db8::10".into(), port: 80, weight: None, backup: false },
+			TargetSpec { addr: "10.0.0.1".into(), port: 80, weight: None, backup: false, max_connections: None },
+			TargetSpec { addr: "2001:db8::10".into(), port: 80, weight: None, backup: false, max_connections: None },
 		];
 		r.remote_addr = String::new();
 		r.remote_port = 0;
@@ -1352,7 +1376,7 @@ mod tests {
 		let no_v6 = Caps { transparent: true, transparent_ipv6: false, ..Default::default() };
 		assert_eq!(r.clone().validate(&no_v6).unwrap_err().code, "unsupported");
 		// a backend given by name is not checked here
-		r.targets = vec![TargetSpec { addr: "backend.local".into(), port: 80, weight: None, backup: false }];
+		r.targets = vec![TargetSpec { addr: "backend.local".into(), port: 80, weight: None, backup: false, max_connections: None }];
 		assert!(r.validate(&caps).is_ok());
 	}
 

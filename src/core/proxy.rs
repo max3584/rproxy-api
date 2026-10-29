@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::core::balance::{Lease, Member, Pool};
+use crate::core::balance::{Lease, Member, Pool, TargetFull};
 use crate::net::cidr::{self, Cidr};
 use crate::core::rule::{Key, SourceIp};
 use crate::tls::config::{best_match, TlsRuntime, Unmatched};
@@ -28,13 +28,16 @@ pub struct Stats {
 	/// UDP datagrams rproxy could not pass on: a session's queue was full, or
 	/// sending failed (the kernel's own socket-buffer drops are not seen here).
 	pub dropped: AtomicU64,
-	/// Refused by `limits` (#165), by `limits::Reason`.
+	/// Refused by `limits` (#165), by `limits::Reason` (not `TargetFull`: `target_full`).
 	pub limited: [AtomicU64; 4],
 	/// UDP datagrams dropped over `bandwidth` (#166; also in `dropped`).
 	pub bandwidth_dropped: AtomicU64,
 	/// UDP sessions now, from the first datagram (also while their server name is
 	/// read): for the default cap of `l4::udp` (#332). Not shown.
 	pub udp_sessions: AtomicU64,
+	/// Refused because every target was full (#341, `limits::Reason::TargetFull`). Last, so
+	/// the counters of before keep their places.
+	pub target_full: AtomicU64,
 }
 
 impl Stats {
@@ -62,11 +65,19 @@ impl Stats {
 	}
 
 	pub fn limited(&self, reason: crate::core::limits::Reason) {
-		self.limited[reason.index()].fetch_add(1, Ordering::Relaxed);
+		self.limited_counter(reason).fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// The counter of `reason` (`target_full` apart from `limited`).
+	pub fn limited_counter(&self, reason: crate::core::limits::Reason) -> &AtomicU64 {
+		match reason {
+			crate::core::limits::Reason::TargetFull => &self.target_full,
+			r => &self.limited[r.index()],
+		}
 	}
 
 	pub fn limited_total(&self) -> u64 {
-		self.limited.iter().map(|n| n.load(Ordering::Relaxed)).sum()
+		self.limited.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>() + self.target_full.load(Ordering::Relaxed)
 	}
 
 	/// A UDP datagram over `bandwidth`.
@@ -106,9 +117,13 @@ pub struct Candidate {
 }
 
 impl Candidate {
-	/// Counts the connection on its target while the lease lives.
-	pub fn lease(&self) -> Option<Lease> {
-		self.member.clone().map(Lease::new)
+	/// Counts the connection on its target while the lease lives (None: not a
+	/// target of a pool). Err: the target is at its `max_connections` (#341).
+	pub fn lease(&self) -> Result<Option<Lease>, TargetFull> {
+		match &self.member {
+			Some(m) => Lease::take(m.clone()).map(Some).ok_or(TargetFull),
+			None => Ok(None),
+		}
 	}
 }
 

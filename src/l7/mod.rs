@@ -165,6 +165,10 @@ pub struct ServerSpec {
 	/// Middlewares (names in `http.middlewares`) for requests sent to this server only (#229).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub middlewares: Vec<String>,
+	/// Requests in progress the server takes at once (#341): a full server is skipped like
+	/// one that is down; when all are full, the request is answered 503.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max_connections: Option<u32>,
 }
 
 /// Middleware kinds that `servers[].middlewares` may use: those that only rewrite (#229), and
@@ -782,6 +786,11 @@ impl HttpSpec {
 				if s.weight == Some(0) {
 					return Err(invalid(format!("{what}: weight must be at least 1")));
 				}
+				match s.max_connections {
+					Some(0) => return Err(invalid(format!("{what}: max_connections must be at least 1"))),
+					Some(_) if s.status.is_some() => return Err(invalid(format!("{what}: a status entry takes no max_connections"))),
+					_ => {}
+				}
 				for m in &s.middlewares {
 					match self.middlewares.get(m) {
 						None => return Err(invalid(format!("{what}: middleware {m:?} is not defined"))),
@@ -1074,6 +1083,8 @@ middlewares:
 			(json!({"middlewares": {"m": {"ip_allow": {"source_range": ["nope"]}}}}), "middleware m"),
 			(json!({"middlewares": {"m": {"teleport": {}}}}), "unknown variant"),
 			(json!({"middlewares": {"m": {"redirect_scheme": {"scheme": "ftp"}}}}), "http or https"),
+			(json!({"routes": [{"name": "a", "match": "Host(`x`)", "service": "s"}], "services": {"s": {"servers": [{"url": "http://h", "max_connections": 0}]}}}), "max_connections must be at least 1"),
+			(json!({"routes": [{"name": "a", "match": "Host(`x`)", "service": "s"}], "services": {"s": {"servers": [{"status": 503, "max_connections": 5}]}}}), "takes no max_connections"),
 		] {
 			let err = spec(v.clone()).unwrap_err();
 			assert!(err.contains(want), "{v}: {err}");

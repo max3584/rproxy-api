@@ -62,14 +62,17 @@ pub struct Server {
 	pub authority: String,
 	/// Path of the URL without the trailing slash; prepended to request paths.
 	pub prefix: String,
-	pub weight: u64,
+	pub weight: u32,
+	/// `max_connections` (#341): requests in progress at most (0: no limit). Beside `weight`,
+	/// both u32: the struct keeps its size of before #341 (a larger `Server` measured slower).
+	pub max: u32,
 	/// Value of the sticky cookie that selects this server (from the URL, so it
 	/// survives restarts and changes of the other servers).
 	pub id: String,
 	up: AtomicBool,
 	/// Ejected by the service's `outlier_detection` (#170).
 	pub ejection: Arc<crate::core::outlier::Ejection>,
-	/// Requests in progress on this server (for `balance: least_conn`).
+	/// Requests in progress on this server (for `balance: least_conn`, and `max_connections`).
 	pub inflight: Arc<AtomicU64>,
 	/// Last used at the end: taken from the end (the warmest), expired from the front.
 	idle: Mutex<Vec<(SendRequest<Body>, Instant)>>,
@@ -107,11 +110,12 @@ impl Server {
 			authority: parsed.authority().to_string(),
 			prefix: parsed.uri.path().trim_end_matches('/').to_string(),
 			host: parsed.host,
-			weight: u64::from(weight.max(1)),
+			weight: weight.max(1),
 			id,
 			up: AtomicBool::new(true),
 			ejection: Arc::default(),
 			inflight: Arc::default(),
+			max: 0,
 			idle: Mutex::new(vec![]),
 			status: None,
 			middlewares: vec![],
@@ -165,6 +169,26 @@ impl Server {
 	/// Up by the health check and not ejected by `outlier_detection`.
 	pub fn is_up(&self) -> bool {
 		self.up.load(Ordering::Relaxed) && !self.ejection.is_ejected()
+	}
+
+	/// At its `max_connections` now (never without one, #341).
+	pub fn is_full(&self) -> bool {
+		self.max != 0 && self.inflight.load(Ordering::Relaxed) >= u64::from(self.max)
+	}
+
+	/// Up and not full: may take a new request.
+	fn open(&self) -> bool {
+		self.is_up() && !self.is_full()
+	}
+
+	/// Counts a request in progress while the hold lives; None when the server is at its
+	/// `max_connections` (taken by another request since `Service::pick`).
+	pub fn admit(&self) -> Option<crate::l7::middleware::limit::Hold> {
+		use crate::l7::middleware::limit::Hold;
+		if self.max == 0 {
+			return Some(Hold::counting(self.inflight.clone()));
+		}
+		Hold::counting_below(self.inflight.clone(), u64::from(self.max))
 	}
 
 	pub fn addr(&self) -> String {
@@ -258,6 +282,8 @@ pub struct Service {
 	pub protocol: UpstreamProtocol,
 	/// TLS of this service (its `tls`, #236, or ALPN other than http/1.1); None uses the router's.
 	pub tls: Option<ServiceTls>,
+	/// Some server has `max_connections` (#341): without, `pick` and `forward` look at no count.
+	capped: bool,
 }
 
 /// The TLS client of one service.
@@ -316,6 +342,7 @@ impl Service {
 				Some(status) => Server::fixed(status, weight)?,
 				None => Server::parse(&s.url, weight)?,
 			};
+			server.max = s.max_connections.unwrap_or(0);
 			for m in &s.middlewares {
 				let what = format!("service {name}: servers[{i}]: middleware {m}");
 				let spec = middlewares.get(m).ok_or_else(|| ApiError::invalid(format!("{what} is not defined")))?;
@@ -354,7 +381,8 @@ impl Service {
 		};
 		Ok(Service {
 			name: name.to_string(),
-			total_weight: servers.iter().map(|s| s.weight).sum(),
+			total_weight: servers.iter().map(|s| u64::from(s.weight)).sum(),
+			capped: servers.iter().any(|s| s.max != 0),
 			servers,
 			next: AtomicU64::new(0),
 			pass_host: spec.pass_host_header.unwrap_or(true),
@@ -396,17 +424,28 @@ impl Service {
 	/// The server for a request: the one its sticky cookie names while that is
 	/// up, otherwise the one `balance` picks among those up (weighted round
 	/// robin, fewest requests in progress, or the first in order). None when
-	/// every server is down.
+	/// every server is down. A server at its `max_connections` (#341) is skipped
+	/// like one that is down (also the sticky one); `is_full` tells why none was found.
 	pub fn pick(&self, sticky: Option<&str>) -> Option<usize> {
+		// without caps, exactly the choice of before #341 (no count looked at)
+		if self.capped {
+			self.pick_by(sticky, Server::open)
+		} else {
+			self.pick_by(sticky, Server::is_up)
+		}
+	}
+
+	#[inline(always)]
+	fn pick_by(&self, sticky: Option<&str>, usable: fn(&Server) -> bool) -> Option<usize> {
 		if let Some(id) = sticky {
-			if let Some(i) = self.servers.iter().position(|s| s.id == id && s.is_up()) {
+			if let Some(i) = self.servers.iter().position(|s| s.id == id && usable(s)) {
 				return Some(i);
 			}
 		}
 		match self.balance {
-			crate::core::balance::Balance::Failover => return self.servers.iter().position(Server::is_up),
+			crate::core::balance::Balance::Failover => return self.servers.iter().position(usable),
 			crate::core::balance::Balance::LeastConn => {
-				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| self.servers[i].is_up()).collect();
+				let up: Vec<usize> = (0..self.servers.len()).filter(|&i| usable(&self.servers[i])).collect();
 				if up.is_empty() {
 					return None;
 				}
@@ -421,28 +460,41 @@ impl Service {
 			}
 			crate::core::balance::Balance::RoundRobin => {}
 		}
-		self.draw().or_else(|| {
+		self.draw(usable).or_else(|| {
 			// every server that is up by its health checks is ejected (max_ejected_percent: 100):
 			// still try one rather than refuse
-			self.servers.iter().position(|s| s.up.load(Ordering::Relaxed))
+			self.servers.iter().position(|s| s.up.load(Ordering::Relaxed) && !(self.capped && s.is_full()))
 		})
 	}
 
-	fn draw(&self) -> Option<usize> {
+	/// Some server is at its `max_connections`: when `pick` found none, the request is
+	/// refused for that (`limits::Reason::TargetFull`, #341) rather than for servers down.
+	pub fn is_full(&self) -> bool {
+		// a full server that would be picked if it had room (up by its health check)
+		self.capped && self.servers.iter().any(|s| s.is_full() && s.up.load(Ordering::Relaxed))
+	}
+
+	/// Some server has `max_connections`.
+	pub fn capped(&self) -> bool {
+		self.capped
+	}
+
+	#[inline(always)]
+	fn draw(&self, usable: fn(&Server) -> bool) -> Option<usize> {
 		// a few draws; with most servers down, fall back to scanning
 		for _ in 0..self.servers.len() * 4 {
 			let mut n = self.next.fetch_add(1, Ordering::Relaxed) % self.total_weight;
 			for (i, s) in self.servers.iter().enumerate() {
-				if n < s.weight {
-					if s.is_up() {
+				if n < u64::from(s.weight) {
+					if usable(s) {
 						return Some(i);
 					}
 					break;
 				}
-				n -= s.weight;
+				n -= u64::from(s.weight);
 			}
 		}
-		self.servers.iter().position(Server::is_up)
+		self.servers.iter().position(usable)
 	}
 
 	/// The sticky cookie's value in a request, if this service is sticky.
@@ -614,13 +666,33 @@ pub struct ServerHealth {
 	/// Ejected by `outlier_detection` (#170); `up` is false meanwhile.
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub ejected: bool,
+	/// The server's `max_connections` (#341); with it, `in_flight` and `full`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub max_connections: Option<u64>,
+	/// Requests in progress now (servers with `max_connections`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub in_flight: Option<u64>,
+	/// At `max_connections` now: skipped for new requests (servers with `max_connections`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub full: Option<bool>,
 }
 
+/// Servers of the services with `health_check`, `outlier_detection` or a server's `max_connections`.
 pub fn health_view<'a>(services: impl Iterator<Item = &'a Arc<Service>>) -> BTreeMap<String, Vec<ServerHealth>> {
 	services
-		.filter(|s| s.health.is_some() || s.outlier.is_some())
+		.filter(|s| s.health.is_some() || s.outlier.is_some() || s.capped())
 		.map(|s| {
-			let servers = s.servers.iter().filter(|v| v.status.is_none()).map(|v| ServerHealth { url: v.url.clone(), up: v.is_up(), ejected: v.ejection.is_ejected() });
+			let servers = s.servers.iter().filter(|v| v.status.is_none()).map(|v| {
+				let capped = v.max != 0;
+				ServerHealth {
+					url: v.url.clone(),
+					up: v.is_up(),
+					ejected: v.ejection.is_ejected(),
+					max_connections: capped.then_some(u64::from(v.max)),
+					in_flight: capped.then(|| v.inflight.load(Ordering::Relaxed)),
+					full: capped.then(|| v.is_full()),
+				}
+			});
 			(s.name.clone(), servers.collect())
 		})
 		.collect()
@@ -771,6 +843,40 @@ mod tests {
 		assert_eq!(f.pick(None), Some(1));
 		f.servers[0].up.store(true, Ordering::Relaxed);
 		assert_eq!(f.pick(None), Some(0), "back to the first once it is up");
+	}
+
+	#[test]
+	fn full_servers_are_skipped_and_their_places_come_back() {
+		// failover: the first until it is full, then the next (spillover)
+		let s = service("servers: [{url: 'http://10.0.0.1', max_connections: 2}, {url: 'http://10.0.0.2', max_connections: 1}]\nbalance: failover");
+		let mut held = vec![];
+		let mut picks = vec![];
+		while let Some(i) = s.pick(None) {
+			held.push(s.servers[i].admit().unwrap());
+			picks.push(i);
+		}
+		assert_eq!(picks, [0, 0, 1]);
+		assert!(s.is_full(), "none picked because they are full, not down");
+		assert!(s.servers[0].admit().is_none(), "the check and the count are one step");
+		let view = health_view([Arc::new(s)].iter());
+		assert_eq!((view["s"][0].in_flight, view["s"][0].full, view["s"][0].max_connections), (Some(2), Some(true), Some(2)));
+		drop(held);
+		assert!(view["s"].iter().all(|v| v.up), "full is not down");
+
+		// round robin and least_conn pass over a full server; a sticky client is sent elsewhere
+		for balance in ["round_robin", "least_conn"] {
+			let s = service(&format!("servers: [{{url: 'http://10.0.0.1', max_connections: 1}}, {{url: 'http://10.0.0.2'}}]\nbalance: {balance}\nsticky: {{cookie: lb}}"));
+			let _one = s.servers[0].admit().unwrap();
+			assert!((0..6).all(|_| s.pick(None) == Some(1)), "{balance}");
+			assert_eq!(s.pick(Some(&s.servers[0].id.clone())), Some(1), "{balance}");
+		}
+		// without max_connections, nothing changes: no server is ever full
+		let s = service("servers: [{url: 'http://10.0.0.1'}]");
+		let held: Vec<_> = (0..100).map(|_| s.servers[0].admit().unwrap()).collect();
+		assert!(!s.is_full() && s.pick(None) == Some(0));
+		assert_eq!(s.servers[0].inflight.load(Ordering::Relaxed), 100);
+		drop(held);
+		assert_eq!(s.servers[0].inflight.load(Ordering::Relaxed), 0);
 	}
 
 	#[test]

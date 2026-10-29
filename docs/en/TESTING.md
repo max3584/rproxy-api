@@ -399,7 +399,7 @@ Only for builds with the cargo feature `dpdk` (not in the default CI's `cargo te
 |---|---|
 | Unit tests of `crates/rproxy-dpdk` (no DPDK; `cargo test -p rproxy-dpdk`) | Frame parsing and rewriting (the incremental checksum update equals one computed from scratch; fragments, broken headers), ARP and ping replies, NAT sessions (both ways, answers from other addresses dropped, idle, stopping rules, the gateway, retargeting, 2,000 clients), the startup check's scenario (it notices corruption) |
 | `crates/rproxy-dpdk/tests/ring.rs` (DPDK, no root, `--no-huge`) | The startup check through the `net_ring` loopback port in real mbufs. The lcore loop (`io::run`) on one end of a `net_memif` pair, 500 datagrams there and back from the other end, compared |
-| `scripts/test-dpdk.sh` (sudo, hugepages) | The real `rproxy-api` with two ports, `net_tap` and `net_af_packet` (veth), against kernel UDP sockets (20 clients × 70 datagrams of 0-1472 bytes, a rule across ports, a port range), ping, `performance.dpdk` of `GET /capabilities`, `--check-kernel`, and when it cannot be used `fallback: true` (degraded) / `false` (no start) |
+| `scripts/test-dpdk.sh` (sudo, hugepages) | The real `rproxy-api` with two ports, `net_tap` and `net_af_packet` (veth), against kernel UDP sockets (20 clients × 70 datagrams of 0-1472 bytes, a rule across ports, a port range), ping, `performance.dpdk` of `GET /capabilities`, `--check-kernel`, when it cannot be used `fallback: true` (degraded) / `false` (no start), and a target's `max_connections` (#341; a second client dropped with `target_full`) |
 
 Locally: after `sudo apt install libdpdk-dev`, `cargo test -p rproxy-dpdk --features ffi` and `cargo build --features dpdk && sudo scripts/test-dpdk.sh`.
 
@@ -522,6 +522,22 @@ The behaviour without the setting (one failure ejects for 10 s) is in `tests/tar
 | `max_ejected_percent_keeps_targets_and_patch_changes_it_in_place` | `max_ejected_percent: 0` never ejects; PATCH with `{}` goes back to the defaults |
 | `http_servers_that_keep_failing_are_ejected` | A server answering 500 in a row is ejected and the rest get the requests (`ejected` in `stats.http.services`; `target.down` with `service`, `server`, `cause`) |
 | `http_ejection_leaves_at_least_half_by_default` | The default `max_ejected_percent: 50` never ejects them all |
+## Integration tests: per-target caps (`tests/target_caps.rs`, #341)
+
+Unit tests (`core::balance`, `l7::backend`) cover the choice (spillover, round_robin, least_conn, down and full), handing counts on when the pool is rebuilt, and never going over the cap with 8 threads taking places at once.
+
+| Test | What it checks |
+|---|---|
+| `tcp_failover_fills_the_targets_in_order_then_refuses` | `failover` fills targets up to their cap in order. With all full the connection is closed with nothing sent, counted in `stats.limited` and `rproxy_rule_limited_total{reason="target_full"}`, not in `total_connections`. `max_connections` and `full` of `stats.targets[]`, `rproxy_target_full`. A closed connection frees its place |
+| `failed_connections_give_their_place_back` | A target whose connections fail gets its count back (never fills up) |
+| `patching_the_targets_keeps_the_open_connections_counted` | After a PATCH replacing the targets, open connections still count against the same target's cap |
+| `a_udp_session_stays_on_its_target_through_a_patch` | After a PATCH a UDP session stays on its carried-over target and is counted there. A rule with one target shows `stats.targets` but no up / down (`rproxy_target_up`, `rproxy_rule_all_targets_down`) |
+| `a_tls_route_target_takes_its_max_connections_and_a_patch_keeps_the_count` in `tests/tls.rs` | The cap of `tls.routes[].targets[]`, `stats.tls_routes` and the `route` label, the count handed on by a PATCH of a route of the same names |
+| `dtls_sessions_count_against_the_target_cap` in `tests/dtls.rs` | DTLS-terminating sessions count against the target's cap |
+| `udp_sessions_fill_the_targets_and_come_back_when_idle` | The cap on UDP sessions: datagrams are dropped while all are full, and a session ending idle frees its place |
+| `http_servers_take_their_max_requests_then_spill_over_or_answer_503` | The cap on requests in progress of `http` servers: `failover` moves to the next server, a single server answers 503 and counts in `stats.limited`. `in_flight` and `full` in `stats.http.services` |
+| `caps_are_validated_and_shown_in_features` | `max_connections: 0` is `400`, `features.target_max_connections` |
+
 ## Integration tests: others
 
 Test files not covered by the sections above (see the description at the top of each file and the test names).
@@ -577,6 +593,7 @@ Criterion benchmarks in `benches/`. They are there to notice changes that make t
 | `clienthello/*` | Reading the server name from a ClientHello made by rustls (about 250 bytes and 3 KiB; `sni::parse_client_hello`) |
 | `quic_initial/v1` / `v2` | Deriving the keys, removing header protection and AEAD, and reading the server name from the RFC 9001 / 9369 Initial packets (`tests/fixtures/quic`, `udp_sni::Sniffer`) |
 | `proxy_dgram/v4` / `v6` / `untrusted_plain` | What `proxy_protocol` of a `udp` rule (#312) decides for each datagram (`proxy_in::datagram`: trusted peer or not, parsing the v2 DGRAM header, the offset to strip; no allocation). `untrusted_plain` is a datagram without a header from outside `from` |
+| `balance/*` | Choosing the target of each new L4 connection / UDP session (`Pool::order` and `Lease::take` over 4 targets; `round_robin`, `least_conn`, `failover`, and `_capped` with a `max_connections` never reached; #341) |
 | `l4_tcp/*` in `benches/dataplane.rs` | A 1 MiB round trip through TCP forwarding (throughput), and new connections (connect → 1-byte round trip → close) |
 | `l4_udp/*` | A 1 KiB UDP round trip, and new sessions (a new source port every time). `roundtrip_1KiB_proxy_protocol` is the same round trip with a PROXY v2 header to a rule with `proxy_protocol` (#312) |
 | `tls_terminate/*` | New connections with TLS termination (full handshakes, no resumption), and a 1 MiB round trip on a terminated connection |

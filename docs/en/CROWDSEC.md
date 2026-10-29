@@ -32,7 +32,7 @@ The rproxy .deb ships the following files in `/usr/share/rproxy-api/crowdsec/` (
 | `parsers/s01-parse/rproxy-logs.yaml` | `/etc/crowdsec/parsers/s01-parse/` | Parser for rproxy's JSON logs (`max3584/rproxy-logs`) |
 | `scenarios/rproxy-conn-denied.yaml` | `/etc/crowdsec/scenarios/` | L4: the same IP repeatedly makes connections refused by `allow_from` within a short time (port probing, etc.) |
 | `scenarios/rproxy-conn-flood.yaml` | `/etc/crowdsec/scenarios/` | L4: too many new connections from the same IP (exceeding an average of 10/s, for 200 connections) |
-| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4: the same IP keeps hitting a rule's `limits` (v0.4; TCP `conn.limited` above one per 5 s, for 30 lines; UDP is not counted, as its sources can be spoofed) |
+| `scenarios/rproxy-conn-limited.yaml` | `/etc/crowdsec/scenarios/` | L4: the same IP keeps hitting a rule's `limits` (v0.4; TCP `conn.limited` above one per 5 s, for 30 lines; UDP is not counted, as its sources can be spoofed; nor is `reason: target_full` (#341, every target full), which is how busy the backends are) |
 | `acquis.d/rproxy.yaml` | `/etc/crowdsec/acquis.d/` | rproxy's log files (`labels.type: rproxy`) |
 | `acquis.d/appsec.yaml` | `/etc/crowdsec/acquis.d/` | AppSec (127.0.0.1:7422) |
 
@@ -67,7 +67,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`, `rproxy_auth_error` | `refused_by` (the kind of middleware that refused: `basic_auth`, `ip_allow`, …), `auth_error` (why `basic_auth` refused: `bad_password`, …). Since v0.3.20 |
 | `evt.StrTime` | `timestamp` |
 
-**L4 (`event: conn.open` / `conn.denied` / `conn.limited`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (for `conn.denied` `allow_from` / `geoip` / `crowdsec` (also TLS `unmatched`); for `conn.limited` `max_connections` / `source_connections` / `new_connections` / `packets`), `rproxy_rule`, `rproxy_transport` (`tcp` / `udp` of `conn.limited`). UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams).
+**L4 (`event: conn.open` / `conn.denied` / `conn.limited`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (for `conn.denied` `allow_from` / `geoip` / `crowdsec` (also TLS `unmatched`); for `conn.limited` `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full` (v0.4.19, #341)), `rproxy_rule`, `rproxy_transport` (`tcp` / `udp` of `conn.limited`; also `http` for `target_full`). UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams).
 
 ## 3. Blocking from rproxy (bouncer)
 

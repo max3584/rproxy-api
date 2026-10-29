@@ -300,6 +300,12 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 							}
 							_ => {
 								// a new session: within the limits, or the datagram is dropped
+								// every target full (#341): no session (with `tls.routes`, the route's
+								// targets are looked at once the name is read)
+								if rt.pool().all_full() && rt.routes.read().unwrap().is_empty() {
+									limits::refused(&rt, client, Reason::TargetFull, "udp");
+									return;
+								}
 								// the default cap first: a refused datagram spends nothing of the source's `limits`
 								let Some(counted) = count_session(&rt, limiter.as_deref()) else {
 									limits::refused(&rt, client, Reason::MaxConnections, "udp");
@@ -447,27 +453,45 @@ async fn session(
 				remove(sessions, peer, id);
 				return None;
 			}
-			// a `tls.routes` backend: its addresses as resolved now
+			// a `tls.routes` backend: its addresses as resolved now, counted on the route's
+			// target (`max_connections`, #341) but not moved when it goes down
 			Some(t) if t.from_route => {
 				source_ip = rt.source_ip_for(&t);
 				bind_as = rt.bind_as_for(&t, client);
+				let mut miss = Miss::NoTarget;
 				t.candidates
 					.iter()
-					.flat_map(|c| c.addrs.iter())
-					.copied()
-					.find(|a| source::usable(*a, bind_as))
-					.map(|addr| Picked { lease: None, addrs: None, addr })
+					.find_map(|c| {
+						let addr = c.addrs.iter().copied().find(|a| source::usable(*a, bind_as))?;
+						match c.lease() {
+							Ok(lease) => Some(Picked { lease, addrs: None, addr, routed: true }),
+							Err(_) => {
+								miss = Miss::Full;
+								None
+							}
+						}
+					})
+					.ok_or(miss)
 			}
 			Some(_) => pick(rt, offset, bind_as),
 		}
 	} else {
 		pick(rt, offset, bind_as)
 	};
-	let Some(Picked { mut lease, addrs: mut target_rx, addr }) = picked else {
-		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", sni = sni.as_deref().unwrap_or(""),
-			proxy_peer = peer_field());
-		remove(sessions, peer, id);
-		return None;
+	let Picked { mut lease, addrs: mut target_rx, addr, routed } = match picked {
+		Ok(p) => p,
+		Err(Miss::Full) => {
+			// the datagrams are dropped; the client's next one tries again
+			limits::refused(rt, client, Reason::TargetFull, "udp");
+			remove(sessions, peer, id);
+			return None;
+		}
+		Err(Miss::NoTarget) => {
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", sni = sni.as_deref().unwrap_or(""),
+				proxy_peer = peer_field());
+			remove(sessions, peer, id);
+			return None;
+		}
 	};
 	let mut target = Some(addr);
 
@@ -593,11 +617,21 @@ async fn session(
 					break "stopped";
 				}
 				// a `tls.routes` backend (sni) is not in the pool
-				let Some(member) = lease.as_ref().map(|l| l.member().clone()) else { continue };
-				if rt.pool().contains(&member) && member.is_up() {
+				let Some(member) = lease.as_ref().filter(|_| !routed).map(|l| l.member().clone()) else { continue };
+				let pool = rt.pool();
+				if pool.contains(&member) && member.is_up() {
 					continue;
 				}
-				let Some(next) = pick(rt, offset, bind_as).filter(|p| !p.lease.as_ref().is_some_and(|l| Arc::ptr_eq(l.member(), &member))) else { continue };
+				// the targets were replaced and this one is still there (its count went on, #341): stay
+				if let Some((l, same)) = lease.as_mut().and_then(|l| l.carried_to(&pool).map(|m| (l, m))) {
+					// not marked seen: a different address there moves the session below
+					target_rx = Some(same.addrs.clone());
+					l.move_to(same);
+					continue;
+				}
+				drop(pool);
+				// none (every other target full, too): it stays where it is
+				let Some(next) = pick(rt, offset, bind_as).ok().filter(|p| !p.lease.as_ref().is_some_and(|l| Arc::ptr_eq(l.member(), &member))) else { continue };
 				match upstream.connect(next.addr).await {
 					Ok(()) => {
 						info!(event = "conn.retarget", rule = %rt.key, client = %client, from = %addr_or_empty(target), to = %next.addr,
@@ -709,19 +743,38 @@ struct Picked {
 	lease: Option<Lease>,
 	addrs: Option<watch::Receiver<Vec<SocketAddr>>>,
 	addr: SocketAddr,
+	/// A `tls.routes` backend: not moved to the rule's targets when it goes down.
+	routed: bool,
+}
+
+/// Why a session got no target.
+#[derive(Clone, Copy)]
+enum Miss {
+	/// None with an address (of the client's family with `transparent`).
+	NoTarget,
+	/// Each one with an address was at its `max_connections` (#341).
+	Full,
 }
 
 /// The target for a new session, or for one whose target went down: the best
-/// one (by `balance`) that has addresses.
-/// The best target for a new session; with `transparent` (`bind_as`), only one
-/// of the client's address family.
-fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Option<Picked> {
-	rt.pool().order().into_iter().find_map(|m: Arc<Member>| {
-		let addr = m.addrs(offset).into_iter().find(|a| source::usable(*a, bind_as))?;
-		let mut addrs = m.addrs.clone();
-		addrs.borrow_and_update();
-		Some(Picked { lease: Some(Lease::new(m)), addrs: Some(addrs), addr })
-	})
+/// one (by `balance`) that has addresses and room (`max_connections`, #341);
+/// with `transparent` (`bind_as`), only one of the client's address family.
+fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Result<Picked, Miss> {
+	let mut miss = Miss::NoTarget;
+	rt.pool()
+		.order()
+		.into_iter()
+		.find_map(|m: Arc<Member>| {
+			let addr = m.addrs(offset).into_iter().find(|a| source::usable(*a, bind_as))?;
+			let mut addrs = m.addrs.clone();
+			let Some(lease) = Lease::take(m) else {
+				miss = Miss::Full;
+				return None;
+			};
+			addrs.borrow_and_update();
+			Some(Picked { lease: Some(lease), addrs: Some(addrs), addr, routed: false })
+		})
+		.ok_or(miss)
 }
 
 /// Holds a new session's first datagrams until its server name is read (DTLS /
@@ -954,13 +1007,25 @@ async fn dtls_session(
 		remove(&sessions, peer, id);
 		return;
 	};
-	let Some(chosen) = target.candidates.iter().find(|c| !c.addrs.is_empty()) else {
-		warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", dtls = true);
+	// the first with addresses and room (`max_connections`, #341)
+	let mut full = false;
+	let chosen = target.candidates.iter().filter(|c| !c.addrs.is_empty()).find_map(|c| match c.lease() {
+		Ok(lease) => Some((c, lease)),
+		Err(_) => {
+			full = true;
+			None
+		}
+	});
+	let Some((chosen, _lease)) = chosen else {
+		if full {
+			limits::refused(&rt, client, Reason::TargetFull, "udp");
+		} else {
+			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", dtls = true);
+		}
 		let _ = dtls.close().await;
 		remove(&sessions, peer, id);
 		return;
 	};
-	let _lease = chosen.lease();
 	let upstream = async {
 		let addr = chosen.addrs[0];
 		let socket = Arc::new(source::udp_upstream(addr, rt.bind_as(client)).await.map_err(|e| e.to_string())?);

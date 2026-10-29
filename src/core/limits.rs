@@ -327,10 +327,12 @@ pub enum Reason {
 	SourceConnections,
 	NewConnections,
 	Packets,
+	/// Every target (L4 `targets[]`) or server (`http`) is at its `max_connections` (#341).
+	TargetFull,
 }
 
 impl Reason {
-	pub const ALL: [Reason; 4] = [Reason::MaxConnections, Reason::SourceConnections, Reason::NewConnections, Reason::Packets];
+	pub const ALL: [Reason; 5] = [Reason::MaxConnections, Reason::SourceConnections, Reason::NewConnections, Reason::Packets, Reason::TargetFull];
 
 	pub fn as_str(self) -> &'static str {
 		match self {
@@ -338,6 +340,7 @@ impl Reason {
 			Reason::SourceConnections => "source_connections",
 			Reason::NewConnections => "new_connections",
 			Reason::Packets => "packets",
+			Reason::TargetFull => "target_full",
 		}
 	}
 

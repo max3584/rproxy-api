@@ -171,6 +171,7 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
   - `least_conn`：いま開いている接続（UDP はセッション）の数 ÷ `weight` が一番小さい宛先。同じなら順に回す。
   - `failover`：`targets` の上から順に、up の最初の宛先だけを使う。上位が戻れば、新しい接続から戻る。
 - up / down：`health_check` があれば、その結果（最初の確認までは up）。なくても、TCP の接続を断られた（または 5 秒以内に応答がない）宛先は、10 秒のあいだ down として飛ばし（外す）、同じ接続を次の宛先で接続し直す。UDP は、転送先から ICMP の到達不能が返った宛先を同じく外す。外す回数・時間・割合は v0.4 の `outlier_detection`（下の「v0.4 の設定」）で変えられる。
+- 宛先ごとの上限 `max_connections`（v0.4.19）：いっぱいの宛先は down と同じく飛ばし、すべていっぱいなら断る（下の「宛先ごとの上限」）。
 - `backup` の宛先は、ほかの宛先がすべて down のときだけ使う。すべて down なら、down の宛先も順に試す（接続を断らない）。
 - UDP の既存のセッションは、自分の宛先が down になったら次の宛先へ移る（`conn.retarget`、`reason: target down`）。`failover` で上位が戻っても、既存のセッションはそのまま。
 - 名前解決できない宛先があっても、ほかの宛先が解決できればルールは動く（解決できない宛先は後から再解決する）。すべて解決できなければ、これまでどおり `resolve_failed`。
@@ -300,7 +301,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
          "routes": {"site": {"requests": 3, "by_status": {"2xx": 3}}, "(none)": {"requests": 1, "by_status": {"4xx": 1}}}}
 ```
 
-`health_check` のあるサービスがあれば、`services` に転送先ごとの状態が入る（`{"app": [{"url": "http://10.0.0.20:80", "up": true}, ...]}`）。`rate_limit` / `in_flight` で断ったリクエストがあれば、`limited`（合計）とルートごとの `limited`（ミドルウェアの名前ごと）も入る。`crowdsec` で断ったリクエストは同じ形で `blocked` に入る（どちらも `by_status` の `4xx` にも数える）。`cache`（v0.4.19）のあるルールは `cache`（`hit`・`miss`・`stale`・`bypass`）も入る（「応答のキャッシュ」）。
+`health_check` のあるサービスがあれば、`services` に転送先ごとの状態が入る（`{"app": [{"url": "http://10.0.0.20:80", "up": true}, ...]}`。`max_connections` の転送先（v0.4.19）は `max_connections`・`in_flight`・`full` も）。`rate_limit` / `in_flight` で断ったリクエストがあれば、`limited`（合計）とルートごとの `limited`（ミドルウェアの名前ごと）も入る。`crowdsec` で断ったリクエストは同じ形で `blocked` に入る（どちらも `by_status` の `4xx` にも数える）。`cache`（v0.4.19）のあるルールは `cache`（`hit`・`miss`・`stale`・`bypass`）も入る（「応答のキャッシュ」）。
 
 - `by_status` は状態コードの百の位ごと（`1xx`〜`5xx`。0 件の区分は省く）。`routes` はルートの名前ごとで、どのルートにも一致しなかったリクエストは `(none)`。
 - 応答の本文を送り終えた（またはクライアントが切断した）ときに数える。
@@ -805,7 +806,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 `features.limits`・`features.bandwidth` は true（形は上の表と docs/DESIGN-v0.4.md の 4・5）。
 
 - `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ。udp のルールで `max_connections` がなければ、既定の上限 `RPROXY_UDP_MAX_SESSIONS`（既定 16384、0 でなし。#332）が効く：偽った送信元でも 1 つずつ転送先へのソケットを持つセッションを `udp_idle_secs` まで作れるので。名前を読んでいるセッションも数え、断ったものは `max_connections` と同じく数えて記録する）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
-- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` のあるルールと、UDP のセッションの既定の上限で断ったことのあるルール。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`）・`transport`（`tcp` / `udp`）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
+- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` か宛先の `max_connections`（v0.4.19）のあるルールと、UDP のセッションの既定の上限で断ったことのあるルール。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`、v0.4.19 から宛先がすべていっぱいの `target_full`）・`transport`（`tcp` / `udp`、`target_full` は `http` も）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
 - 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら、接続の残っていない古いものから忘れる。接続の残っている送信元は忘れない（数え直しで制限をすり抜けられないように。セキュリティレビュー L8）。表がそういう送信元でいっぱいのあいだ、新しい送信元は `limits` では断り（`reason: source_connections`）、`bandwidth` では 1 つの共有のバケツを使う）。`max_sources` は 1,000,000 まで。
 - `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
 - `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3 は絞らない。
@@ -1176,6 +1177,31 @@ http:
 - ほかのミドルウェアとの順：`compress` はキャッシュより前（外側）に置く（`[compress, cache]`）。メモリからの答えをそのクライアントの `Accept-Encoding` で圧縮するので、持つのは 1 つで済む。後ろに置くと、最初のクライアントの `Accept-Encoding` で圧縮したものを持ち（`Vary: Accept-Encoding`）、違う `Accept-Encoding` のクライアントでは持ち直しになる。`cors`・`headers` も前に置くと、メモリからの答えにもリクエストごとに働く。後ろの `cors`（と `headers` の `cors`）は、許したオリジンでもそうでなくても `Vary: Origin` を付ける（v0.4.19 から。オリジンごとに別の答えになる）。
 - 統計：`stats.http` の `cache`（`hit`・`miss`・`stale`・`bypass` の合計）とルートごとの `cache`（ミドルウェアの名前ごと）。引き継ぎで数を渡す。`/metrics` の `rproxy_http_cache_total{protocol,listen,route,middleware,result}`（`result` は `hit`・`miss`・`stale`・`bypass`）と、持っている数・バイト `rproxy_http_cache_entries{protocol,listen,middleware}`・`rproxy_http_cache_bytes{protocol,listen,middleware}`。アクセスログの `cache`（`HIT` など。`cache` のあるルートだけ）。メモリから答えた 404 などは `refused_by` に入れない。
 - 共有のキャッシュ（Redis など）は持たない。転送先への回数を全体で絞る必要が出たら別の issue。
+
+### 宛先ごとの上限（v0.4.19、#341、`features.target_max_connections`）
+
+宛先が受けられる量まで使い、いっぱいになったら別の宛先へ回す。
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 5432, "balance": "failover",
+ "targets": [{"addr": "10.0.0.11", "port": 5432, "max_connections": 200},
+             {"addr": "10.0.0.12", "port": 5432, "max_connections": 200},
+             {"addr": "10.0.0.13", "port": 5432, "backup": true}]}
+```
+
+- L4 の `targets[]`（`tls.routes[].targets[]` も）の `max_connections`：その宛先へ同時に張る TCP の接続・UDP のセッションの数の上限（1 以上）。`http` のサービスの `servers[].max_connections`：その転送先で同時に処理するリクエストの数の上限（応答の本文を送り終えるまで。WebSocket などの upgrade は接続が終わるまで。`retry` で次を待つ間は数えない。`status` の転送先には書けない）。省けば上限なし（今までと同じ）。
+- 上限はルールの宛先（`targets[]` の 1 つ、route の宛先の 1 つ）・サービスの転送先ごと。同じアドレスの転送先をほかのルール・route・サービスでも使えば、それぞれが別々に数える（アドレスごとの合計ではない）。
+- 上限に達した宛先は、`health_check` の down・`outlier_detection` で外した宛先と同じく飛ばす（`round_robin`・`least_conn`・`failover` のどれでも）。`failover` と組むと、上から順に上限まで詰めて次へ移る（spillover）。`backup` の宛先は、ほかの宛先がすべて down かいっぱいのときに使う。
+- `sticky` の転送先がいっぱいなら、そのリクエストはほかの転送先へ送るが、クッキーは付け替えない（いっぱいだったのは一時のことなので、次のリクエストはまた元の転送先へ。元の転送先が down なら今までどおり付け替える）。
+- 数えるのと確かめるのは 1 つの不可分な操作で、同時の接続でも上限を超えない。接続・セッション・リクエストがどう終わっても（正常に閉じる・接続の失敗・リセット・ルールの停止・UDP のセッションのアイドル・別の宛先への移動）空く。
+- 断るとき：up の宛先がすべていっぱいなら（down の宛先があっても、それは試さずに。`http` と同じ）、あるいは up の宛先がなく、すべていっぱいなら、新しいものを断る。TCP は何も送らずに閉じる、UDP はデータグラムを捨てる（セッションを作らない。次のデータグラムでまた試す）、`http` は 503。up の宛先がないときに down の宛先を順に試すのは今までどおり（いっぱいでない宛先だけ）。
+- 断った数は `stats.limited` と `/metrics` の `rproxy_rule_limited_total{protocol,listen,reason="target_full"}`、ログは `conn.limited`（`reason: target_full`、`transport` は `tcp` / `udp` / `http`。送信元ごとに間引く）。受け付けた時点ですべていっぱいなら（ふつうはそう）、TCP・UDP の `stats.total_connections` には数えない（TCP で、その確かめの後にいっぱいになったときと `tls.routes` の宛先のときは、接続として数える。数は減らさない）。CrowdSec の `max3584/rproxy-conn-limited` は `target_full` を数えない（クライアントのせいではない）。
+- 状態：`stats.targets[]` に `max_connections`（あるときだけ）と `full`（いま上限か）。`connections` が上限に対して数える今の数。宛先が 1 つのルールでも、その宛先に `max_connections` があれば `stats.targets` を出す（ただし宛先が 1 つで `health_check` もないルールの up / down は今までどおり報告しない：`target.down` / `target.up` のログ・`all_targets_down`・`rproxy_rule_all_targets_down`・`rproxy_target_up` は出ない）。`tls.routes[]` の宛先（`targets` が 2 つ以上か `max_connections` のあるもの）は `stats.tls_routes`：`[{"server_names": ["a.example"], "targets": [...]}]`（`tls.routes` の順、`targets` の中身は `stats.targets[]` と同じ形）。`/metrics` に `rproxy_target_full{protocol,listen,target}`（`max_connections` のある宛先だけ。1 / 0）、`rproxy_target_connections` と `rproxy_target_full` には `route` のラベル（route の宛先は route の名前を `,` でつないだもの、ルールの宛先は空の `route=""`。v0.4.19 からルールの宛先の `rproxy_target_connections` にも付く）。`http` は `stats.http.services.<名前>[]` に `max_connections`・`in_flight`・`full`（`max_connections` のある転送先だけ。そのサービスは `health_check` がなくても出す）。
+- PATCH で宛先を置き換えても、同じアドレス・ポートの宛先には開いている接続の数を引き継ぐ（前の宛先の接続も上限に数える。PATCH で一度外して次の PATCH で戻した宛先も、外していた間の接続が残っていれば数える。`tls.routes` は同じ名前の route どうしで、route の名前（`server_name` / `server_names`）を変えると引き継がない）。UDP のセッションは、自分の宛先が新しい宛先にも up で残っていれば移らない。`http` のルールの `http` を変えると、処理中のリクエストの数は最初からになる（`in_flight` と同じ）。
+- 数はプロセスごと。引き継ぎ（SIGUSR2）の間は、古いプロセスが終えるまでの接続と新しいプロセスの接続を別々に数える（その間は 1 つの宛先に上限の 2 倍まで届きうる）。
+- `forward_auth`・`mirror`・`errors` のページへの問い合わせは、いっぱいの転送先を選ばないが、数には入れない。
+- DPDK の道（UDP）も同じく数えて飛ばす。
+- 前の版に戻すとき：v0.4.18 以前は `max_connections` を知らないので、それを書いたルールは読めない（API で作ったルールの DB からの復元・設定ファイル・引き継ぎで誤りになる）。戻す前に外す。
 
 ## エンドポイント
 
