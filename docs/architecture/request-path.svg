@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" role="img" aria-label="接続は待ち受け、入口の確かめ、limits、TLS の順に通り、L4 のルールは宛先を選んで転送し、HTTP のルールはルートの照合、ミドルウェア、サービスへ進む。" font-family="IBM Plex Sans JP, Hiragino Sans, Noto Sans JP, sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#ffffff"/>
+        <defs>
+          <marker id="b-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:#1f6feb"/></marker>
+        </defs>
+        <g fill="none" stroke="currentColor" style="color:#1d232b">
+          <text x="20" y="28" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">すべてのルール</text>
+          <text x="700" y="28" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">L4（tcp・udp）のルール</text>
+          <text x="612" y="168" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">http のルール（L7）</text>
+
+          <rect x="20" y="40" width="140" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="90" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">待ち受け</text>
+          <text x="90" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">ポート・範囲</text>
+          <text x="90" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">UDP は shard ごと</text>
+          <rect x="190" y="40" width="140" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="260" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">入口の確かめ</text>
+          <text x="260" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">PROXY の受け取り</text>
+          <text x="260" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">allow_from・geoip</text>
+          <text x="260" y="116" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">crowdsec</text>
+          <rect x="360" y="40" width="140" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="430" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">limits</text>
+          <text x="430" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">接続数・送信元ごと</text>
+          <text x="430" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">UDP のセッション上限</text>
+          <rect x="530" y="40" width="140" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="600" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">TLS</text>
+          <text x="600" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">passthrough・SNI</text>
+          <text x="600" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">終端・STARTTLS</text>
+          <text x="600" y="116" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">DTLS・QUIC の名前</text>
+          <rect x="700" y="40" width="130" height="84" rx="4" style="fill:#e3edfd;stroke:#1f6feb"/>
+          <text x="765" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">宛先を選ぶ</text>
+          <text x="765" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">balance・health</text>
+          <text x="765" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">outlier・上限</text>
+          <rect x="860" y="40" width="120" height="84" rx="4" style="fill:#e3edfd;stroke:#1f6feb"/>
+          <text x="920" y="64" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">中継</text>
+          <text x="920" y="84" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">splice・bandwidth</text>
+          <text x="920" y="100" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">AF_XDP・DPDK</text>
+          <text x="920" y="116" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">（opt-in）</text>
+
+          <rect x="530" y="180" width="140" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="600" y="204" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">ルートの照合</text>
+          <text x="600" y="224" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">正規化した path</text>
+          <text x="600" y="240" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">Host・ヘッダ</text>
+          <rect x="700" y="180" width="130" height="84" rx="4" style="fill:#ffffff"/>
+          <text x="765" y="204" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">ミドルウェア</text>
+          <text x="765" y="224" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">認証・rate_limit</text>
+          <text x="765" y="240" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">cache・headers</text>
+          <rect x="860" y="180" width="120" height="84" rx="4" style="fill:#e3edfd;stroke:#1f6feb"/>
+          <text x="920" y="204" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">サービス</text>
+          <text x="920" y="224" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">servers・sticky</text>
+          <text x="920" y="240" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">retry・上限</text>
+
+          <line x1="160" y1="82" x2="186" y2="82" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="330" y1="82" x2="356" y2="82" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="500" y1="82" x2="526" y2="82" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="670" y1="82" x2="696" y2="82" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="830" y1="82" x2="856" y2="82" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="600" y1="124" x2="600" y2="176" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="670" y1="222" x2="696" y2="222" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <line x1="830" y1="222" x2="856" y2="222" stroke-width="2" marker-end="url(#b-data)" style="stroke:#1f6feb"/>
+          <path d="M765 264 C 765 290, 700 290, 700 290" stroke-dasharray="3 3" style="stroke:#5b6573"/>
+          <text x="694" y="294" text-anchor="end" stroke="none" font-size="11" style="fill:#5b6573">cache の HIT はここで答え、サービスへ行かない</text>
+        </g>
+      </svg>

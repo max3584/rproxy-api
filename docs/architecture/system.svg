@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 640" role="img" aria-label="クライアントの通信は VIP を通って rproxy-api のノードに入り、転送先へ流れる。UI は制御 API でノードを変え、MariaDB にルールと履歴を持つ。rproxy-gateway は Kubernetes の Gateway API をルールセットにしてノードへ送る。" font-family="IBM Plex Sans JP, Hiragino Sans, Noto Sans JP, sans-serif" font-size="12">
+<rect width="100%" height="100%" fill="#ffffff"/>
+        <defs>
+          <marker id="a-fg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+          <marker id="a-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:#1f6feb"/></marker>
+          <marker id="a-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:#8a5a00"/></marker>
+        </defs>
+        <g fill="none" stroke="currentColor" style="color:#1d232b">
+          <text x="20" y="66" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">外のサービス</text>
+          <text x="20" y="140" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">データの経路</text>
+          <text x="20" y="372" stroke="none" font-size="11" letter-spacing="1" style="fill:#5b6573">管理（コントロールプレーン）</text>
+          <line x1="20" y1="350" x2="980" y2="350" stroke-dasharray="2 4" style="stroke:#c9d0d9"/>
+
+          <rect x="360" y="40" width="140" height="50" rx="4" style="fill:#ffffff"/>
+          <text x="430" y="62" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">ACME の CA</text>
+          <text x="430" y="78" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">Let's Encrypt など</text>
+          <rect x="520" y="40" width="140" height="50" rx="4" style="fill:#ffffff"/>
+          <text x="590" y="62" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">CrowdSec LAPI</text>
+          <text x="590" y="78" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">遮断の判定・AppSec</text>
+          <rect x="680" y="40" width="140" height="50" rx="4" style="fill:#ffffff"/>
+          <text x="750" y="62" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">IdP・認証サーバ</text>
+          <text x="750" y="78" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">OIDC・forward_auth</text>
+          <rect x="840" y="40" width="140" height="50" rx="4" style="fill:#ffffff"/>
+          <text x="910" y="62" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">Prometheus</text>
+          <text x="910" y="78" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">監視</text>
+
+          <rect x="20" y="180" width="130" height="70" rx="4" style="fill:#ffffff"/>
+          <text x="85" y="210" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">クライアント</text>
+          <text x="85" y="228" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">TCP・UDP・HTTP</text>
+          <rect x="190" y="180" width="130" height="70" rx="4" stroke-dasharray="4 3" style="fill:#ffffff"/>
+          <text x="255" y="206" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">VIP・LB</text>
+          <text x="255" y="223" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">基盤が用意する</text>
+          <text x="255" y="238" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">keepalived・MetalLB</text>
+
+          <rect x="372" y="138" width="280" height="150" rx="5" opacity=".55" style="fill:#e3edfd;stroke:#1f6feb"/>
+          <rect x="360" y="150" width="280" height="150" rx="5" stroke-width="1.5" style="fill:#e3edfd;stroke:#1f6feb"/>
+          <text x="500" y="176" text-anchor="middle" stroke="none" font-weight="700" font-size="14" style="fill:#1f6feb">rproxy-api（ノード × N）</text>
+          <text x="380" y="202" fill="currentColor" stroke="none">L4：TCP・UDP、PROXY v1/v2</text>
+          <text x="380" y="222" fill="currentColor" stroke="none">TLS：SNI・終端、DTLS・QUIC</text>
+          <text x="380" y="242" fill="currentColor" stroke="none">L7：HTTP/1.1・2・3、認証・cache</text>
+          <text x="380" y="262" fill="currentColor" stroke="none">宛先：balance・health・上限</text>
+          <text x="380" y="284" stroke="none" font-size="11" font-family="IBM Plex Mono, monospace" style="fill:#5b6573">制御 API ：TCP + Unix ソケット</text>
+
+          <rect x="800" y="180" width="160" height="70" rx="4" style="fill:#ffffff"/>
+          <text x="880" y="210" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">転送先</text>
+          <text x="880" y="228" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">サーバ・サービス</text>
+
+          <line x1="150" y1="215" x2="186" y2="215" stroke-width="2.5" marker-end="url(#a-data)" style="stroke:#1f6feb"/>
+          <line x1="320" y1="215" x2="356" y2="215" stroke-width="2.5" marker-end="url(#a-data)" style="stroke:#1f6feb"/>
+          <line x1="640" y1="215" x2="796" y2="215" stroke-width="2.5" marker-end="url(#a-data)" style="stroke:#1f6feb"/>
+          <text x="718" y="206" text-anchor="middle" stroke="none" font-size="11" style="fill:#1f6feb">転送</text>
+          <text x="718" y="234" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">送信元 IP を保つ</text>
+
+          <line x1="430" y1="150" x2="430" y2="94" marker-end="url(#a-fg)"/>
+          <text x="436" y="126" stroke="none" font-size="11" style="fill:#5b6573">証明書を取る</text>
+          <line x1="590" y1="150" x2="590" y2="94" marker-end="url(#a-fg)"/>
+          <text x="596" y="126" stroke="none" font-size="11" style="fill:#5b6573">判定を取る</text>
+          <line x1="640" y1="160" x2="726" y2="94" marker-end="url(#a-fg)"/>
+          <text x="692" y="136" stroke="none" font-size="11" style="fill:#5b6573">問い合わせ</text>
+          <line x1="890" y1="90" x2="646" y2="168" marker-end="url(#a-fg)"/>
+          <text x="808" y="136" stroke="none" font-size="11" style="fill:#5b6573">/metrics を読む</text>
+
+          <rect x="40" y="400" width="160" height="70" rx="4" style="fill:#ffffff"/>
+          <text x="120" y="430" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">Keycloak</text>
+          <text x="120" y="448" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">管理者・利用者のサインイン</text>
+          <rect x="260" y="400" width="200" height="70" rx="4" stroke-width="1.5" style="fill:#fbf0d9;stroke:#8a5a00"/>
+          <text x="360" y="426" text-anchor="middle" stroke="none" font-weight="700" font-size="13" style="fill:#8a5a00">TCP-UDP-rproxy-ui</text>
+          <text x="360" y="444" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">Next.js・ルールの編集・履歴</text>
+          <text x="360" y="460" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">グループ・act/stb・global の画面</text>
+          <rect x="520" y="400" width="160" height="70" rx="4" style="fill:#ffffff"/>
+          <text x="600" y="426" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">MariaDB</text>
+          <text x="600" y="444" text-anchor="middle" stroke="none" font-size="11" font-family="IBM Plex Mono, monospace" style="fill:#5b6573">forward_rules・履歴</text>
+          <text x="600" y="460" text-anchor="middle" stroke="none" font-size="11" font-family="IBM Plex Mono, monospace" style="fill:#5b6573">rproxy_rules・_global</text>
+          <rect x="760" y="400" width="200" height="70" rx="4" stroke-width="1.5" style="fill:#fbf0d9;stroke:#8a5a00"/>
+          <text x="860" y="426" text-anchor="middle" stroke="none" font-weight="700" font-size="13" style="fill:#8a5a00">rproxy-gateway</text>
+          <text x="860" y="444" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">Gateway API → ルールセット</text>
+          <text x="860" y="460" text-anchor="middle" fill="currentColor" stroke="none" font-size="11">rproxy の Pod を配置</text>
+          <rect x="790" y="540" width="170" height="50" rx="4" stroke-dasharray="4 3" style="fill:#ffffff"/>
+          <text x="875" y="562" text-anchor="middle" fill="currentColor" stroke="none" font-weight="500">Kubernetes API</text>
+          <text x="875" y="578" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">Gateway・HTTPRoute など</text>
+
+          <line x1="400" y1="400" x2="400" y2="304" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="294" y="330" stroke="none" font-size="11" style="fill:#8a5a00">制御 API（REST）</text>
+          <text x="294" y="345" stroke="none" font-size="11" style="fill:#5b6573">Bearer・mTLS・Unix</text>
+          <line x1="260" y1="435" x2="204" y2="435" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="232" y="488" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">OIDC</text>
+          <line x1="460" y1="435" x2="516" y2="435" stroke-width="1.5" stroke-dasharray="6 4" marker-start="url(#a-ctl)" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="488" y="488" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">読み書き</text>
+          <line x1="600" y1="300" x2="600" y2="396" stroke-width="1.5" stroke-dasharray="6 4" marker-start="url(#a-ctl)" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="608" y="330" stroke="none" font-size="11" style="fill:#8a5a00">起動時に復元</text>
+          <text x="608" y="345" stroke="none" font-size="11" style="fill:#5b6573">API の値を保存</text>
+          <line x1="790" y1="400" x2="650" y2="292" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="730" y="326" stroke="none" font-size="11" font-family="IBM Plex Mono, monospace" style="fill:#8a5a00">PUT /rulesets</text>
+          <line x1="875" y1="536" x2="875" y2="474" marker-start="url(#a-fg)"/>
+          <text x="882" y="512" stroke="none" font-size="11" style="fill:#5b6573">watch・状態</text>
+          <polyline points="770,470 770,612 330,612 330,474" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a-ctl)" style="stroke:#8a5a00"/>
+          <text x="550" y="606" text-anchor="middle" stroke="none" font-size="11" style="fill:#5b6573">発見の Secret（Pod の一覧・UI 用のトークン）</text>
+        </g>
+      </svg>
