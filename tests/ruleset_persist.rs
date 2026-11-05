@@ -160,8 +160,7 @@ async fn persist_tokens_store_their_sets() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
-/// Restoring: a stored set comes back with its generation, etag and owner; a
-/// rule whose key is taken already is left out, the rest of the set applies.
+/// A stored set with a name the API would refuse now (#358) is restored and runs.
 #[tokio::test]
 async fn stored_sets_keep_names_the_api_refuses() {
 	let h = harness().await;
@@ -188,6 +187,8 @@ async fn stored_sets_keep_names_the_api_refuses() {
 	assert_eq!(reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
 
+/// Restoring: a stored set comes back with its generation, etag and owner; a
+/// rule whose key is taken already is left out, the rest of the set applies.
 #[tokio::test]
 async fn stored_sets_are_restored() {
 	let dir = workdir("restore");

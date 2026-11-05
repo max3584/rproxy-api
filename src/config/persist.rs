@@ -452,7 +452,11 @@ impl Store {
 						}
 						// a new connection (also after the old one broke) takes the lock at once
 						// if it is free, so the lock is held all the time
-						let _ = sqlx::query("SELECT GET_LOCK(?, 0)").bind(&lock).execute(&mut *conn).await;
+						let got: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 0)").bind(&lock).fetch_one(&mut *conn).await.unwrap_or(None);
+						if got != Some(1) {
+							// held by another connection now: each write asks again (`take_lock`)
+							tracing::info!(event = "persist.lock", lock = %lock, "a new database connection did not get the node's lock yet");
+						}
 						Ok(())
 					})
 				})
@@ -1790,14 +1794,16 @@ impl DbWorker {
 }
 
 impl Worker for DbWorker {
-	fn reset(&mut self) {
-		match (self.connect)() {
-			Ok(pool) => {
-				let old = std::mem::replace(&mut self.pool, pool);
-				tokio::spawn(async move { old.close().await });
+	fn reset(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+		Box::pin(async move {
+			// the old session ends first, so its node lock is free when the new one asks
+			// (every write takes it again anyway: `take_lock`)
+			self.pool.close().await;
+			match (self.connect)() {
+				Ok(pool) => self.pool = pool,
+				Err(e) => warn!(event = "degraded", part = "db", error = %e, "could not open the database again after a job panicked"),
 			}
-			Err(e) => warn!(event = "degraded", part = "db", error = %e, "could not open the database again after a job panicked"),
-		}
+		})
 	}
 
 	fn run(&mut self, job: Job) -> JobFuture<'_> {

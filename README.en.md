@@ -346,6 +346,7 @@ One JSON event per line. Common fields are `timestamp`, `level`, `event`, and `r
 | `degraded` | Part of rproxy was left out because of the environment and the rest runs (`part`: `api`, `api_tls`, `tokens`, `log`, `global.*`, …) |
 | `api.listening` / `api.retry` / `api.stopped` | The control API started listening / cannot listen and retries / stopped |
 | `api.connections_full` | The control API has `RPROXY_API_MAX_CONNECTIONS` TCP connections open and closes new ones (at most once a minute, #358) |
+| `token.freebind` | A token without `allow_freebind` set `listen_freebind` in a rule set because it has `allow_rulesets` (once per token; `allow_freebind: true` stops it, #358) |
 | `audit` | Changes through the control API (token name, `client`, operation, rule, result) and refused requests: a missing or wrong token (`outcome: unauthorized`, `reason`), insufficient permissions (`outcome: forbidden`), a locked-out source (`outcome: locked_out`). How the caller authenticated (`auth`: `token`, `cert`, `token+cert`). Lines of refused requests are thinned out per sender (`suppressed`) |
 | `token.expiring` / `token.expired` | A control API token is close to expiry (closer than `RPROXY_TOKEN_WARN_DAYS`) / has expired (`token`, `expires`, `days_left`). At startup, on SIGHUP and daily, once per change of state |
 | `api.lockout` / `api.unlock` | A source that kept failing authentication (`client`; IPv6 by /64) was locked out (`failures`, `until`) / unlocked |

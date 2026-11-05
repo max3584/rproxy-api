@@ -32,6 +32,19 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	Json(state.registry.list_rulesets().await)
 }
 
+/// Says once per token that it may set `listen_freebind` only because of its `allow_rulesets`
+/// (#358): `allow_freebind: true` in the token file says it on purpose.
+fn freebind_by_rulesets(token: &str) {
+	static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+	let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+	if said.iter().any(|t| t == token) {
+		return;
+	}
+	said.push(token.to_string());
+	tracing::warn!(event = "token.freebind", token,
+		"this token sets listen_freebind in rule sets only because it has allow_rulesets; give it allow_freebind: true in the token file to say so");
+}
+
 /// Bodies of `PUT /rulesets/{name}` read and parsed at a time (#358): each may be
 /// `ruleset::MAX_BODY`, and the changes run one at a time anyway.
 static PUT_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -130,6 +143,9 @@ pub async fn put(
 	super::api::to_the_end(async move {
 		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 		let admin = principal.has(crate::control::auth::Scope::Admin);
+		if principal.freebind_by_rulesets_only() && req.rules.iter().any(|r| r.listen_freebind) {
+			freebind_by_rulesets(&principal.name);
+		}
 		let limits = Some(ruleset::SetLimits {
 			max_rules: principal.max_rules,
 			max_rulesets: principal.max_rulesets,

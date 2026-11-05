@@ -216,7 +216,9 @@ pub trait Worker: Send + 'static {
 	fn run(&mut self, job: Job) -> JobFuture<'_>;
 
 	/// After a job panicked: let go of what it may have left half way (the connection, #358).
-	fn reset(&mut self) {}
+	fn reset(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+		Box::pin(async {})
+	}
 }
 
 type Item = (Job, oneshot::Sender<JobResult>);
@@ -241,13 +243,14 @@ impl LocalQueue {
 				let counted = Counted(done.clone());
 				let last = matches!(job, Job::Release);
 				// a job that panics fails alone: the worker goes on with the next (#358)
-				let result = match std::panic::AssertUnwindSafe(worker.run(job)).catch_unwind().await {
+				let caught = std::panic::AssertUnwindSafe(worker.run(job)).catch_unwind().await;
+				let result = match caught {
 					Ok(result) => result,
 					Err(p) => {
 						let error = crate::core::supervise::panic_message(p.as_ref());
 						tracing::error!(event = "degraded", part = "persist", error = %error, "a database job panicked; the next ones run on a new connection");
 						crate::core::supervise::count_restart("persist");
-						worker.reset();
+						worker.reset().await;
 						Err(JobError::Failed(format!("the job panicked: {error}")))
 					}
 				};
@@ -307,6 +310,41 @@ impl PersistQueue for LocalQueue {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Panics on its first job; counts its resets.
+	struct Panicky {
+		runs: usize,
+		resets: Arc<AtomicUsize>,
+	}
+
+	impl Worker for Panicky {
+		fn run(&mut self, _: Job) -> JobFuture<'_> {
+			self.runs += 1;
+			let first = self.runs == 1;
+			Box::pin(async move {
+				if first {
+					panic!("the first job");
+				}
+				Ok(Done::Ok)
+			})
+		}
+
+		fn reset(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+			self.resets.fetch_add(1, Ordering::SeqCst);
+			Box::pin(async {})
+		}
+	}
+
+	/// A job that panics fails alone, the worker is reset, and the next job runs (#358).
+	#[tokio::test]
+	async fn a_panicking_job_fails_alone() {
+		let resets = Arc::new(AtomicUsize::new(0));
+		let q = LocalQueue::start(4, Panicky { runs: 0, resets: resets.clone() });
+		assert!(matches!(q.submit(Job::Ping, Duration::from_secs(5)).await, Err(JobError::Failed(_))));
+		assert_eq!(resets.load(Ordering::SeqCst), 1);
+		assert!(matches!(q.submit(Job::Ping, Duration::from_secs(5)).await, Ok(Done::Ok)));
+		assert!(q.idle());
+	}
 
 	/// Waits until the test lets it go, for every job.
 	struct Gate(Arc<tokio::sync::Semaphore>);

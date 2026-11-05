@@ -1476,14 +1476,15 @@ pub fn name_ok(name: &str) -> bool {
 		&& !name.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}'))
 }
 
-/// `name` with what rproxy does not take replaced by `_` (and cut to 512 bytes).
+/// `name` with what rproxy does not take replaced by `_` (and cut to 500 bytes, leaving room
+/// for `safe_names`' suffix).
 fn safe_name(name: &str) -> String {
 	let mut out: String =
 		name.chars().map(|c| if c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}') { '_' } else { c }).collect();
 	if out.is_empty() {
 		out.push('_');
 	}
-	while out.len() > 512 {
+	while out.len() > 500 {
 		out.pop();
 	}
 	out
@@ -1503,9 +1504,14 @@ fn safe_names(rule: &mut Value) -> Vec<(&'static str, String, String)> {
 	let plan = |kind: &'static str, names: Vec<String>, renamed: &mut Vec<(&'static str, String, String)>| {
 		let mut map = std::collections::HashMap::new();
 		for n in names.iter().filter(|n| !name_ok(n)) {
-			let mut new = safe_name(n);
-			while names.contains(&new) || map.values().any(|v| v == &new) {
-				new.push('_');
+			let base = safe_name(n);
+			let mut new = base.clone();
+			// made unique with a numbered suffix: at most 512 bytes still
+			for i in 2.. {
+				if !names.contains(&new) && !map.values().any(|v| v == &new) {
+					break;
+				}
+				new = format!("{base}_{i}");
 			}
 			renamed.push((kind, n.clone(), new.clone()));
 			map.insert(n.clone(), new);

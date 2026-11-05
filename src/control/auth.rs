@@ -96,6 +96,11 @@ impl Principal {
 		self.has(Scope::Admin) || self.allow_freebind || (in_ruleset && self.rulesets.is_some())
 	}
 
+	/// `may_freebind(true)` holds only because of `allow_rulesets` (logged once, #358).
+	pub fn freebind_by_rulesets_only(&self) -> bool {
+		!self.has(Scope::Admin) && !self.allow_freebind && self.rulesets.is_some()
+	}
+
 	pub fn has(&self, scope: Scope) -> bool {
 		self.scopes.iter().any(|s| *s == scope || *s == Scope::Admin)
 	}

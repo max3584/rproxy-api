@@ -346,6 +346,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |
 | `api.listening` / `api.retry` / `api.stopped` | 制御 API の待ち受けの開始 / 開けないので再試行 / 止まった |
 | `api.connections_full` | 制御 API の TCP の接続が `RPROXY_API_MAX_CONNECTIONS` に達し、新しい接続を閉じた（1 分に 1 回まで、#358） |
+| `token.freebind` | `allow_freebind` のないトークンが、`allow_rulesets` があるので組の `listen_freebind` を通した（トークンごとに 1 回。`allow_freebind: true` を書けば出ない、#358） |
 | `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）、一時停止中（`outcome: locked_out`）。認証の方法（`auth`：`token`・`cert`・`token+cert`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |
 | `token.expiring` / `token.expired` | 制御 API のトークンの期限が近い（`RPROXY_TOKEN_WARN_DAYS` より近い）/ 切れた（`token`、`expires`、`days_left`）。起動・SIGHUP・1 日 1 回、状態が変わったときに 1 回だけ |
 | `api.lockout` / `api.unlock` | 認証の失敗が続いた送信元（`client`。IPv6 は /64）を止めた（`failures`、`until`）/ 解いた |
