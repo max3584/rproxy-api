@@ -278,6 +278,10 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `check_config_validates_the_v0_4_shapes`・`a_0_3_settings_file_still_passes` | `--check-config` は v0.4 の形の誤りをエラーにする。v0.4 の設定はすべて動くので警告にならない。0.3 の設定ファイルは警告なしで通る |
 | `v0_4_flags_are_checked_at_startup` | 引数・環境変数の誤り（`--tls-client-auth` に CA がない、`--tls-client-ca` に `--tls-cert` がない、`--token-warn-days 0` など）は起動を止める |
 
+## 結合テスト：制御 API の上限（`tests/control_limits.rs`、#358）
+
+ルート・ミドルウェアの名前（改行・引用符・空白・長すぎる名前は `400`、rproxy-gateway の形の名前と日本語は通り、`/metrics` に出る）、`PATCH` でなくなったルートの数が `stats.http`・`/metrics` から消えること、`users_file` の大きさの上限（16 MiB）、`admin` でないトークンの `listen_freebind` と大きなポート範囲（`POST /rules`・組の `PUT` とも `403`）、トークンの `max_rules`（組のルールも数え、組をその場で変えても数は同じ）と `max_rulesets`（`409 limit`）。プロセスの上限（`RPROXY_MAX_RULES` など）はプロセス全体の値なので単体テスト（`core::quota`）で、背景のタスクの再起動は `core::supervise`、ファイルの大きさは `net::files` で確かめる。
+
 ## 結合テスト：制御 API の守り（`tests/api_hardening.rs`、#167）
 
 | テスト | 確かめること |

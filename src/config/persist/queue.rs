@@ -228,19 +228,31 @@ pub struct LocalQueue {
 impl LocalQueue {
 	/// Starts the worker task (in the current tokio runtime).
 	pub fn start(capacity: usize, mut worker: impl Worker) -> LocalQueue {
+		use futures_util::FutureExt;
 		let (tx, mut rx) = mpsc::channel::<Item>(capacity);
 		let pending = Arc::new(AtomicUsize::new(0));
 		let done = pending.clone();
 		tokio::spawn(async move {
 			while let Some((job, reply)) = rx.recv().await {
+				// the job counts as pending until it is answered, whatever happens (#358)
+				let counted = Counted(done.clone());
 				let last = matches!(job, Job::Release);
-				let result = worker.run(job).await;
-				done.fetch_sub(1, Ordering::AcqRel);
+				// a job that panics fails alone: the worker goes on with the next (#358)
+				let result = match std::panic::AssertUnwindSafe(worker.run(job)).catch_unwind().await {
+					Ok(result) => result,
+					Err(p) => {
+						let error = crate::core::supervise::panic_message(p.as_ref());
+						tracing::error!(event = "degraded", part = "persist", error = %error, "a database job panicked; the next ones run");
+						Err(JobError::Failed(format!("the job panicked: {error}")))
+					}
+				};
+				// off the count before the answer, as `idle` is looked at by whoever waits for it
+				drop(counted);
 				let _ = reply.send(result);
 				if last {
 					rx.close();
 					while let Ok((_, reply)) = rx.try_recv() {
-						done.fetch_sub(1, Ordering::AcqRel);
+						drop(Counted(done.clone()));
 						let _ = reply.send(Err(JobError::Closed));
 					}
 					return;
@@ -248,6 +260,15 @@ impl LocalQueue {
 			}
 		});
 		LocalQueue { tx, pending }
+	}
+}
+
+/// Takes one job off the pending count when dropped.
+struct Counted(Arc<AtomicUsize>);
+
+impl Drop for Counted {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::AcqRel);
 	}
 }
 

@@ -492,6 +492,7 @@ async fn create(
 	let req: RuleRequest = parse_body(&body)?;
 	if crate::config::plan::dry_run(&query)? {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
+		check_limits(&state, &principal, &req).await?;
 		super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
 		drop(super::rule_files::check_create(&state.registry, &principal, &req).await?);
 		return Ok((StatusCode::OK, Json(crate::config::plan::plan_create(&state.registry, req).await?)).into_response());
@@ -505,6 +506,7 @@ async fn create(
 		let _change = changing(&state).await?;
 		let result = async {
 			check_ports(&principal, req.listen_port, req.listen_port_end)?;
+			check_limits(&state, &principal, &req).await?;
 			super::acme_api::check_rule_scope(&principal, Some(&req), None)?;
 			// the files are counted by other checks until the change is made (#319)
 			let _files = super::rule_files::check_create(&state.registry, &principal, &req).await?;
@@ -516,6 +518,31 @@ async fn create(
 		Ok((StatusCode::CREATED, Json(view)).into_response())
 	})
 	.await
+}
+
+/// The limits of #358 for a new rule (the process's are checked again as it goes into
+/// the table): what only `admin` may ask for, and the token's `max_rules`.
+async fn check_limits(state: &AppState, principal: &Principal, req: &RuleRequest) -> AppResult<()> {
+	if !principal.has(Scope::Admin) {
+		crate::core::quota::check_non_admin(req.listen_freebind, req.listen_port, req.listen_port_end)?;
+	}
+	if principal.max_rules.is_some() {
+		let usage = state.registry.usage(&principal.name).await;
+		crate::core::quota::check_token("rules", usage.owned + 1, 1, principal.max_rules)?;
+	}
+	Ok(())
+}
+
+/// What a PATCH adds to the listening sockets (`extra_listen_addrs`, `http.http3`) within
+/// `RPROXY_MAX_LISTENERS` (#358).
+async fn check_update_limits(state: &AppState, key: &Key, req: &UpdateRequest) -> AppResult<()> {
+	let Ok((old, new, _, _)) = state.registry.updated_spec(key, req.clone()).await else { return Ok(()) };
+	let added = crate::core::quota::sockets(&new).saturating_sub(crate::core::quota::sockets(&old));
+	if added > 0 {
+		let usage = state.registry.usage("").await;
+		crate::core::quota::check_process(usage.rules, 0, usage.sockets + added, added)?;
+	}
+	Ok(())
 }
 
 /// Runs a change to its end in a task of its own: a client that goes away (or
@@ -604,6 +631,7 @@ async fn update(
 		let _change = changing(&state).await?;
 		let result = async {
 			check_update_scope(&state, &principal, &key, &req).await?;
+			check_update_limits(&state, &key, &req).await?;
 			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
 			state.registry.update(&key, req).await
 		}
@@ -627,13 +655,7 @@ async fn delete(
 		check_rule_ports(&state, &principal, &key).await?;
 		return Ok(Json(crate::config::plan::plan_delete(&state.registry, &key).await?).into_response());
 	}
-	let drain = match query.get("drain_secs") {
-		Some(s) => {
-			let secs: u64 = s.parse().map_err(|_| ApiError::invalid(format!("invalid drain_secs: {s}")))?;
-			(secs > 0).then(|| Duration::from_secs(secs))
-		}
-		None => None,
-	};
+	let drain = drain_query(&query)?;
 	to_the_end(async move {
 		let change = changing(&state).await?;
 		// #144: the row of an api rule goes with it
@@ -641,6 +663,9 @@ async fn delete(
 			Some(store) if state.registry.get(&key).await.is_ok_and(|v| v.origin == Origin::Api) => Some(store.clone()),
 			_ => None,
 		};
+		if let Some(store) = &stored {
+			store.check_backlog()?;
+		}
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
 			state.registry.take(&key).await
@@ -662,6 +687,20 @@ async fn delete(
 		Ok(StatusCode::NO_CONTENT.into_response())
 	})
 	.await
+}
+
+/// The longest drain of a `DELETE` (`drain_secs`, #358): a longer one is cut to it.
+pub(crate) const MAX_DRAIN: Duration = Duration::from_secs(3600);
+
+/// `drain_secs` of a `DELETE` (0 or none: no drain), at most `MAX_DRAIN`.
+pub(crate) fn drain_query(query: &HashMap<String, String>) -> AppResult<Option<Duration>> {
+	match query.get("drain_secs") {
+		Some(s) => {
+			let secs: u64 = s.parse().map_err(|_| ApiError::invalid(format!("invalid drain_secs: {s}")))?;
+			Ok((secs > 0).then(|| Duration::from_secs(secs).min(MAX_DRAIN)))
+		}
+		None => Ok(None),
+	}
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {

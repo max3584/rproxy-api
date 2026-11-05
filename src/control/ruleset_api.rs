@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +30,24 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	Json(state.registry.list_rulesets().await)
+}
+
+/// Bodies of `PUT /rulesets/{name}` read and parsed at a time (#358): each may be
+/// `ruleset::MAX_BODY`, and the changes run one at a time anyway.
+static PUT_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// How long a `PUT` waits for its turn to send the body (`503 busy` after).
+const PUT_WAIT: Duration = Duration::from_secs(30);
+/// How long the body may take to arrive (`408 timeout` after): a slow client does not
+/// keep the others waiting.
+const BODY_TIME: Duration = Duration::from_secs(60);
+
+/// The body of a `PUT`, at most `ruleset::MAX_BODY` bytes, within `BODY_TIME`.
+async fn read_body(body: Body) -> Result<Bytes, ApiError> {
+	match tokio::time::timeout(BODY_TIME, axum::body::to_bytes(body, ruleset::MAX_BODY)).await {
+		Ok(Ok(bytes)) => Ok(bytes),
+		Ok(Err(e)) => Err(ApiError::too_large(format!("the body could not be read (at most {} bytes): {e}", ruleset::MAX_BODY))),
+		Err(_) => Err(ApiError::timeout(format!("the body did not arrive within {} s", BODY_TIME.as_secs()))),
+	}
 }
 
 /// The etag as an `ETag` header (a quoted string).
@@ -67,11 +85,18 @@ pub async fn put(
 	Path(name): Path<String>,
 	Query(query): Query<HashMap<String, String>>,
 	headers: HeaderMap,
-	body: Bytes,
+	body: Body,
 ) -> Result<Response, SetError> {
 	ruleset::validate_name(&name)?;
 	let dry_run = crate::config::plan::dry_run(&query)?;
+	// at most `PUT_BODIES` bodies (up to `ruleset::MAX_BODY` each) are read and parsed at a time (#358)
+	let permit = match tokio::time::timeout(PUT_WAIT, PUT_BODIES.acquire()).await {
+		Ok(Ok(permit)) => permit,
+		_ => return Err(ApiError::busy("other rule sets are being sent; try again in a moment").into()),
+	};
+	let body = read_body(body).await?;
 	let req: RulesetRequest = serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("invalid body: {e}")))?;
+	drop((body, permit));
 	req.validate_shape()?;
 	// refusals of the token are audited as those of PUT /rules (#319)
 	let refused = |e: ApiError| {
@@ -91,8 +116,16 @@ pub async fn put(
 	super::api::to_the_end(async move {
 		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 		let admin = principal.has(crate::control::auth::Scope::Admin);
-		let opts =
-			PutOptions { if_match: if_match.as_deref(), dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
+		let limits = Some(ruleset::SetLimits { max_rules: principal.max_rules, max_rulesets: principal.max_rulesets });
+		let opts = PutOptions {
+			if_match: if_match.as_deref(),
+			dry_run,
+			by: &principal.name,
+			admin,
+			owner: None,
+			may_use_ports: &may_use_ports,
+			limits,
+		};
 		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
 		// refused if a live upgrade started meanwhile (#305)
 		let _change = if dry_run { None } else { super::api::changing(&state).await? };
@@ -144,13 +177,7 @@ pub async fn delete(
 	Query(query): Query<HashMap<String, String>>,
 	headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-	let drain = match query.get("drain_secs") {
-		Some(s) => {
-			let secs: u64 = s.parse().map_err(|_| ApiError::invalid(format!("invalid drain_secs: {s}")))?;
-			(secs > 0).then(|| Duration::from_secs(secs))
-		}
-		None => None,
-	};
+	let drain = super::api::drain_query(&query)?;
 	principal.may_use_ruleset(&name)?;
 	let if_match = if_match(&headers)?.map(str::to_owned);
 	// a change runs to its end even if the client goes away (#144)
@@ -160,6 +187,9 @@ pub async fn delete(
 		let store = set_store(&state, &principal, &name);
 		// refused if a live upgrade started meanwhile (#305)
 		let change = super::api::changing(&state).await?;
+		if let Some(store) = &store {
+			store.check_backlog()?;
+		}
 		let result = state.registry.take_ruleset(&name, if_match.as_deref(), &may_use_ports, (&principal.name, admin)).await;
 		audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
 		let taken = result?;

@@ -55,7 +55,11 @@
               "protected_file",
               "file_not_allowed",
               "secret_reuse",
-              "file_in_use"
+              "file_in_use",
+              "limit",
+              "busy",
+              "too_large",
+              "timeout"
             ]
           }
         },
@@ -2304,6 +2308,10 @@
               "cache_process_memory": {
                 "type": "boolean",
                 "description": "All cache middlewares of the process together keep at most RPROXY_CACHE_MAX_MEMORY (default 512 MiB, 0: no limit): an answer that does not fit drops the oldest of its own cache, or is not kept; cache_max_memory in GET / PATCH /config/global (live, the environment wins); rproxy_http_cache_memory_bytes and rproxy_http_cache_memory_limit_bytes in /metrics (v0.4.19, #349)"
+              },
+              "control_limits": {
+                "type": "boolean",
+                "description": "The control API's limits: max_rules / max_rulesets of a token, RPROXY_MAX_RULES / RPROXY_MAX_LISTENERS / RPROXY_MAX_RULESETS (409 limit), listen_freebind and port ranges over RPROXY_MAX_RANGE_PORTS_NON_ADMIN only for admin tokens (403), route / middleware / service names of 1-512 bytes without control characters, white space, \", \\, `, { or } (v0.4.20, #358)"
               }
             }
           },
@@ -3668,7 +3676,11 @@
               "protected_file",
               "file_not_allowed",
               "secret_reuse",
-              "file_in_use"
+              "file_in_use",
+              "limit",
+              "busy",
+              "too_large",
+              "timeout"
             ]
           },
           "errors": {

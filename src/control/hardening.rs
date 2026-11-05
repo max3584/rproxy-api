@@ -335,6 +335,102 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Connections (#358)
+
+/// `RPROXY_API_MAX_CONNECTIONS`: TCP connections the control API keeps at a time.
+pub const DEFAULT_API_MAX_CONNECTIONS: usize = 512;
+
+/// How long the control API waits for a request's headers, and between the requests of
+/// a kept-alive HTTP/1.1 connection (hyper's `header_read_timeout`, #358).
+pub const API_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// An acceptor that takes a connection only while fewer than its limit are open: one
+/// more is closed right away (`api.connections_full`, at most once a minute in the log).
+#[derive(Clone)]
+pub struct Capped<A> {
+	inner: A,
+	open: Arc<tokio::sync::Semaphore>,
+	limit: usize,
+	said: Arc<Mutex<Option<Instant>>>,
+}
+
+impl<A> Capped<A> {
+	/// `limit` 0: no limit.
+	pub fn new(inner: A, limit: usize) -> Self {
+		let limit = if limit == 0 { tokio::sync::Semaphore::MAX_PERMITS } else { limit };
+		Capped { inner, open: Arc::new(tokio::sync::Semaphore::new(limit)), limit, said: Arc::default() }
+	}
+}
+
+impl<A, I, S> Accept<I, S> for Capped<A>
+where
+	A: Accept<I, S>,
+	A::Future: Send + 'static,
+	A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+	A::Service: Send + 'static,
+{
+	type Stream = Held<A::Stream>;
+	type Service = A::Service;
+	type Future = BoxFuture<io::Result<(Self::Stream, Self::Service)>>;
+
+	fn accept(&self, stream: I, service: S) -> Self::Future {
+		let Ok(permit) = self.open.clone().try_acquire_owned() else {
+			let mut said = self.said.lock().unwrap_or_else(|e| e.into_inner());
+			if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+				*said = Some(Instant::now());
+				warn!(event = "api.connections_full", limit = self.limit,
+					"the control API has as many connections open as RPROXY_API_MAX_CONNECTIONS; new ones are closed");
+			}
+			drop(stream);
+			return Box::pin(std::future::ready(Err(io::Error::other("the control API has too many connections"))));
+		};
+		let accepted = self.inner.accept(stream, service);
+		Box::pin(async move {
+			let (stream, service) = accepted.await?;
+			Ok((Held { inner: stream, _permit: permit }, service))
+		})
+	}
+}
+
+/// A connection of `Capped`, counted until it is dropped.
+pub struct Held<S> {
+	inner: S,
+	_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Held<S> {
+	fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+		Pin::new(&mut self.inner).poll_read(cx, buf)
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Held<S> {
+	fn poll_write(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+		Pin::new(&mut self.inner).poll_write(cx, buf)
+	}
+
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		Pin::new(&mut self.inner).poll_flush(cx)
+	}
+
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		Pin::new(&mut self.inner).poll_shutdown(cx)
+	}
+
+	fn poll_write_vectored(
+		mut self: Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		bufs: &[io::IoSlice<'_>],
+	) -> std::task::Poll<io::Result<usize>> {
+		Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+	}
+
+	fn is_write_vectored(&self) -> bool {
+		self.inner.is_write_vectored()
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Token expiry
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,9 +705,7 @@ impl Lockout {
 // ---------------------------------------------------------------------------
 // Metrics
 
-fn label(s: &str) -> String {
-	s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
-}
+use crate::core::prom::label;
 
 /// The hardening lines of `GET /metrics`.
 pub fn metrics(tokens: &crate::control::auth::Tokens) -> String {

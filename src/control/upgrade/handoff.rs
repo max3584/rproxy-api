@@ -276,6 +276,16 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The old process is draining after a handoff (`/readyz`: `draining`).
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
+/// The old process of the handoff that started this one is still draining (#358): its
+/// last counters come to this process (`Adopted::follow`), so no new handoff starts until
+/// it has ended.
+static PARENT_DRAINING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the old process of the last handoff is still draining.
+pub fn parent_draining() -> bool {
+	PARENT_DRAINING.load(Ordering::Acquire)
+}
+
 pub fn active() -> bool {
 	ACTIVE.load(Ordering::Acquire)
 }
@@ -370,6 +380,12 @@ impl Upgrader {
 	pub fn start(self: &Arc<Self>, exe: Option<PathBuf>, reason: &'static str) -> Result<(), String> {
 		if crate::core::shutdown::active() {
 			return Err("rproxy is shutting down".into());
+		}
+		if parent_draining() {
+			return Err(
+				"the process this one took over from is still draining its connections; a new live upgrade can start once it has ended (handoff.counters)"
+					.into(),
+			);
 		}
 		if ACTIVE.swap(true, Ordering::AcqRel) {
 			return Err("a live upgrade is already in progress".into());
@@ -865,6 +881,7 @@ impl State {
 				admin: true,
 				owner: Some(owner),
 				may_use_ports: &|_, _| true,
+				limits: None,
 			};
 			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
@@ -892,6 +909,15 @@ impl Adopted {
 	/// Waits for the old process's final counters (it sends them after its
 	/// drain) and adds what it counted after the snapshot.
 	pub async fn follow(self, registry: Arc<Registry>) {
+		/// Lets new handoffs start again however `follow` ends.
+		struct Drained;
+		impl Drop for Drained {
+			fn drop(&mut self) {
+				PARENT_DRAINING.store(false, Ordering::Release);
+			}
+		}
+		PARENT_DRAINING.store(true, Ordering::Release);
+		let _drained = Drained;
 		let channel = self.channel;
 		let finals = tokio::task::spawn_blocking(move || -> Option<Vec<Counters>> {
 			let mut body = vec![];

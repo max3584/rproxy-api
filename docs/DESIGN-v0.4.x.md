@@ -433,3 +433,19 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 試験：単体（`balance`：spillover・round_robin・least_conn・down と full・作り直しで数を渡す・8 スレッドで上限を超えない、`backend`：転送先の飛ばし方と `admit`、`handoff`：前の版の状態を読む）、`tests/target_caps.rs`（TCP の spillover と断り・接続の失敗で数が戻る・PATCH で数を渡す・UDP のアイドルで戻る・HTTP の spillover と 503・検証と `features`）。
 - レビューで直したもの：up の宛先がすべていっぱいなら down の宛先を試さずに断る（`http` と同じ。`Pool::order` はそのとき down の宛先を入れず、`Pool::all_full` が真。up の宛先がないときに down の宛先を試すのは今までどおり）。宛先が 1 つのルールは `max_connections` があっても `Pool.reported` にしない（`Pool::shown` で `stats.targets` と `rproxy_target_connections`・`rproxy_target_full` だけを出し、`target.down`・`all_targets_down`・`rproxy_target_up` は前の版と同じく出さない）。`tls.routes` の宛先は `stats.tls_routes`（`RouteTargetsStatus`）と `route` のラベル。PATCH で外した宛先の数は、接続が残っている間 `Pool.retired`（アドレスと `Weak`）に持ち、後の PATCH で戻せば数える。TCP の前の確かめは `limits` の `admit` より前（`limits` のトークンを使わない）。宛先を試してから分かった断り（確かめの後にいっぱいになった・`tls.routes`）は `stats.total_connections` に残す（カウンタは減らさない。`rproxy_connections_total` が戻らないように）。`Stats.limited` は 4 つのまま、`target_full` は別の項目（前からの数の並びを変えない）。`l7_http2/request` が CI で 12〜20% 遅く出た原因は `Server` が 280 から 288 バイトに大きくなったこと（項目を足しただけの試しのブランチで同じ差が出た。musl の割り当ての大きさの区分が変わる）で、`weight` と `max` を u32 で並べて大きさを前と同じにした。いっぱいの候補は接続の待ち時間（`FAILOVER_CONNECT_TIMEOUT`）を決める「ほかに試せる宛先」に数えない。`retry` で次を待つ間は転送先の数を放す。`sticky` の転送先が一時いっぱいならクッキーを付け替えない。
 - 試験（レビューで足したもの）：`tests/target_caps.rs`（`a_udp_session_stays_on_its_target_through_a_patch`：PATCH の後も UDP のセッションが渡った宛先に残る、1 つの宛先は up / down を報告しない）、`tests/tls.rs`（`a_tls_route_target_takes_its_max_connections_and_a_patch_keeps_the_count`）、`tests/dtls.rs`（`dtls_sessions_count_against_the_target_cap`）、`scripts/test-dpdk.sh`（DPDK の道の `target_full`）、単体（`order` と `order_slow` を宛先 64 まで・いろいろな上限で比べる、2 回の PATCH で数を渡す）。
+
+## 19. 制御 API の上限（v0.4.20、#358）
+
+点検（2026-11-05）で、`rules:write` のトークンがプロセスの資源と `/metrics` を壊せるところを閉じる。形は `features.control_limits`、使い方は docs/API.md の「制御 API の上限」。
+
+- 決めたこと：
+  - 上限はトークンの頼むものだけに効かせる。設定ファイル・DB・引き継ぎから戻すルールは数えるが断らない（管理者の書いたもの・前に通ったものを起動で落とさない）。増やさない変更はいつでも通す（上限を下げた後に片付けられるように）。
+  - 既定：ルール 10000・組 1000・待ち受けのソケットはファイル記述子の上限から 1024（制御 API・DB・DNS・ファイルの分）を除いた半分（もう半分は接続）。トークンの `max_rules`・`max_rulesets` は既定なし（今のトークンファイルの動きを変えない）。
+  - `listen_freebind` と 1024 ポートを超える範囲は `admin` だけ（`RPROXY_MAX_RANGE_PORTS_NON_ADMIN`）。範囲は `RPROXY_MAX_RANGE_PORTS`（既定 20000）がプロセスの上限として前からある。
+  - 名前は例に挙がった `[A-Za-z0-9._:-]{1,253}` ではなく、「制御文字・空白・`"`・`\`・`` ` ``・`{`・`}` を含まない 1〜512 バイト」にした：rproxy-gateway の名前は `/` を含み、`grpc:<名前空間 63>/<名前 253>/r…` で 253 を超えうる。日本語の名前も今の設定で使える。`/metrics` はどのラベルも `\`・`"`・改行をエスケープする（`core::prom::label`）ので、名前の制限は二重の守り。
+  - ファイルの大きさ：証明書・鍵・秘密を 1 MiB にすると大きな CA の束に足りないことがあるので 4 MiB、`users_file` は 16 MiB。
+  - 組の `PUT` の本文は 32 MiB のまま（rproxy-gateway の大きな組を断らない）。代わりに本文を読む `PUT` を同時に 2 つまで・本文は 60 秒以内。
+  - `drain_secs` は断らずに 3600 秒に切り詰める（前に通った呼び出しを壊さない）。
+  - DB に届かないあいだの削除の記録（`Unwritten.removed_*`）は、捨てると照合が行からルールを戻してしまう（行が正）ので、件数を超えたら捨てずに削除を `503 busy` で断る（「全部を読み直す」印より安全）。
+  - 引き継ぎ：古いプロセスの drain の間は新しい引き継ぎを断る（その古いプロセスの最後の数がこのプロセスに届くので、続けて引き継ぐと数が失われる）。
+- 試験：`tests/control_limits.rs`、単体は `core::quota`・`core::supervise`・`core::prom`・`net::files`。

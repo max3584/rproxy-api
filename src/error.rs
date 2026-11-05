@@ -77,6 +77,26 @@ impl ApiError {
 		Self::new(StatusCode::NOT_FOUND, "not_found", message)
 	}
 
+	/// A limit of the process or of the token (#358: rules, listening sockets, rule sets).
+	pub fn limit(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "limit", message)
+	}
+
+	/// The control API is busy with other requests of the kind (#358): try again.
+	pub fn busy(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", message)
+	}
+
+	/// A body larger than the endpoint takes.
+	pub fn too_large(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", message)
+	}
+
+	/// A body that did not arrive in time.
+	pub fn timeout(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::REQUEST_TIMEOUT, "timeout", message)
+	}
+
 	pub fn already_exists(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::CONFLICT, "already_exists", message)
 	}

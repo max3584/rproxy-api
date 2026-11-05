@@ -247,6 +247,9 @@ struct LockWatch {
 	reported: bool,
 }
 
+/// Deletions of rows that may wait for the database (`Store::check_backlog`, #358).
+pub const MAX_UNWRITTEN_REMOVALS: usize = 10_000;
+
 /// Writes that are on their way or did not go through (written again by
 /// `reconcile`): by whom. Recorded before the write is queued, cleared once it
 /// went through (by the last write queued for the key: `latest`).
@@ -858,6 +861,18 @@ impl Store {
 		}
 	}
 
+	/// Refuses a deletion through the API while `MAX_UNWRITTEN_REMOVALS` deletions of rows
+	/// wait for the database (#358): what is kept of them stays bounded while it is down.
+	pub fn check_backlog(&self) -> Result<(), crate::error::ApiError> {
+		let u = self.unwritten.lock().unwrap_or_else(|e| e.into_inner());
+		if u.removed_rules.len() + u.removed_sets.len() >= MAX_UNWRITTEN_REMOVALS {
+			return Err(crate::error::ApiError::busy(format!(
+				"{MAX_UNWRITTEN_REMOVALS} deletions wait for the database (rproxy_rules) already; try again once it is back"
+			)));
+		}
+		Ok(())
+	}
+
 	/// Queues the deletion of the row of an `api` rule that is out of the
 	/// registry now (with the change under `changing`). None: nothing to delete
 	/// (no database; or a newer `api` rule has the key, and its own change writes
@@ -972,15 +987,19 @@ impl Store {
 			return;
 		}
 		let me = Arc::downgrade(self);
-		tokio::spawn(async move {
-			loop {
-				tokio::time::sleep(PING).await;
-				let Some(store) = me.upgrade() else { return };
-				if !store.queue.as_ref().is_some_and(|q| q.idle()) {
-					continue;
-				}
-				if matches!(store.submit(Job::Ping).await, Err(JobError::Closed)) {
-					return;
+		// started again if it panics (#358)
+		crate::core::supervise::spawn("persist.keepalive", move || {
+			let me = me.clone();
+			async move {
+				loop {
+					tokio::time::sleep(PING).await;
+					let Some(store) = me.upgrade() else { return };
+					if !store.queue.as_ref().is_some_and(|q| q.idle()) {
+						continue;
+					}
+					if matches!(store.submit(Job::Ping).await, Err(JobError::Closed)) {
+						return;
+					}
 				}
 			}
 		});
@@ -998,27 +1017,31 @@ impl Store {
 		self.spawn_keepalive();
 		let me = Arc::downgrade(self);
 		let registry = Arc::downgrade(registry);
-		tokio::spawn(async move {
-			let mut last = Instant::now();
-			loop {
-				tokio::time::sleep(RETRY).await;
-				let (Some(store), Some(registry)) = (me.upgrade(), registry.upgrade()) else { return };
-				let due = every.is_some_and(|e| last.elapsed() >= e);
-				if store.holds_lock() && !due {
-					continue;
-				}
-				match store.reconcile(&registry).await {
-					Ok(r) if r.skipped == Some("released") => return,
-					Ok(r) => {
-						if r.skipped.is_none() {
-							last = Instant::now();
-						}
-						if r.written + r.created + r.replaced + r.deleted > 0 {
-							info!(event = "persist.reconcile", written = r.written, created = r.created, replaced = r.replaced,
-								deleted = r.deleted, skipped = r.skipped.unwrap_or(""));
-						}
+		// started again if it panics (#358)
+		crate::core::supervise::spawn("persist.reconcile", move || {
+			let (me, registry) = (me.clone(), registry.clone());
+			async move {
+				let mut last = Instant::now();
+				loop {
+					tokio::time::sleep(RETRY).await;
+					let (Some(store), Some(registry)) = (me.upgrade(), registry.upgrade()) else { return };
+					let due = every.is_some_and(|e| last.elapsed() >= e);
+					if store.holds_lock() && !due {
+						continue;
 					}
-					Err(e) => debug!(event = "persist.reconcile", error = %e),
+					match store.reconcile(&registry).await {
+						Ok(r) if r.skipped == Some("released") => return,
+						Ok(r) => {
+							if r.skipped.is_none() {
+								last = Instant::now();
+							}
+							if r.written + r.created + r.replaced + r.deleted > 0 {
+								info!(event = "persist.reconcile", written = r.written, created = r.created, replaced = r.replaced,
+									deleted = r.deleted, skipped = r.skipped.unwrap_or(""));
+							}
+						}
+						Err(e) => debug!(event = "persist.reconcile", error = %e),
+					}
 				}
 			}
 		});
