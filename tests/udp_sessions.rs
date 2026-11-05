@@ -2,15 +2,18 @@
 //! without `limits.max_connections`, a rule takes at most that many sessions (each a
 //! socket to the backend until `udp_idle`), so spoofed sources cannot open them
 //! without end. The cap is for the whole process, so it is set by this file's
-//! only test.
+//! only test. Sessions not replied to by their backend end after 5 s and are the
+//! ones that make room at the cap (#354).
 
 mod common;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde_json::json;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use common::*;
 
@@ -24,11 +27,57 @@ async fn new_session(port: u16) -> (UdpSocket, bool) {
 	(sock, answered)
 }
 
+/// A backend that never answers; the source ports it hears from.
+async fn silent_backend() -> (SocketAddr, mpsc::UnboundedReceiver<u16>) {
+	let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let addr = sock.local_addr().unwrap();
+	let (tx, rx) = mpsc::unbounded_channel();
+	tokio::spawn(async move {
+		let mut buf = [0u8; 64];
+		while let Ok((_, from)) = sock.recv_from(&mut buf).await {
+			let _ = tx.send(from.port());
+		}
+	});
+	(addr, rx)
+}
+
 #[tokio::test]
 async fn udp_sessions_have_a_default_cap() {
 	assert_eq!(rproxy_api::l4::udp::max_sessions(), rproxy_api::l4::udp::DEFAULT_MAX_SESSIONS);
 	rproxy_api::l4::udp::set_max_sessions(3);
 	let h = harness().await;
+
+	// #354: at the cap, the oldest session its backend never answered makes room (spoofed sources are
+	// never answered); and such sessions end after 5 s, not udp_idle
+	let (silent, mut heard) = silent_backend().await;
+	let port = free_udp_port();
+	let (status, v) = h.post(rule("udp", port, silent)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	let mut socks = vec![];
+	let mut ports = std::collections::HashSet::new();
+	for i in 0..5 {
+		let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		sock.send_to(b"x", ("127.0.0.1", port)).await.unwrap();
+		let from = tokio::time::timeout(Duration::from_secs(2), heard.recv()).await.expect("each session reaches the backend").unwrap();
+		assert!(ports.insert(from), "session {i} has its own backend socket");
+		socks.push(sock);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let (_, v) = h.get(&path).await;
+	assert_eq!(v["stats"]["limited"], 0, "none refused: {v}");
+	assert!(v["connections"].as_u64().unwrap() <= 3, "the oldest made room: {v}");
+	let started = std::time::Instant::now();
+	loop {
+		let (_, v) = h.get(&path).await;
+		if v["connections"] == 0 {
+			break;
+		}
+		assert!(started.elapsed() < Duration::from_secs(8), "unreplied sessions end after 5 s: {v}");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert_eq!(h.delete(&path[7..]).await, StatusCode::NO_CONTENT);
+
 	let backend = udp_backend("U:").await;
 	let port = free_udp_port();
 	let mut body = rule("udp", port, backend);

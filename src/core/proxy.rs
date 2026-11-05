@@ -175,6 +175,8 @@ pub struct Runtime {
 	/// The rule's `connect_timeout` in ms (0: none); PATCH changes it for the next connection.
 	pub connect_timeout_ms: std::sync::atomic::AtomicU64,
 	pub udp_idle: watch::Receiver<Duration>,
+	/// UDP sessions not replied to yet, evicted first at the caps (#354).
+	pub udp_unreplied: crate::l4::udp::Unreplied,
 	pub stats: Stats,
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
 	/// datagrams (whose sources may be spoofed) must not flood the log.

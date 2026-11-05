@@ -452,6 +452,20 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 		.unwrap_or_else(|| "unknown panic".into())
 }
 
+/// A udp rule's `proxy_protocol.from` with public ranges (#354): UDP sources are not
+/// proven, so anyone who can spoof an address in them can name any client in a header
+/// (and pass `allow_from`, `limits` and the logs as that client). Allowed, with a warning.
+fn warn_public_proxy_from(spec: &RuleSpec) {
+	if spec.key.protocol != Protocol::Udp {
+		return;
+	}
+	let public = spec.proxy_protocol.as_ref().map(|pp| pp.public_from()).unwrap_or_default();
+	if !public.is_empty() {
+		warn!(event = "rule.proxy_protocol_public", rule = %spec.key, from = ?public,
+			"proxy_protocol.from of a udp rule has public ranges: spoofed datagrams from them can name any client");
+	}
+}
+
 /// Two rules clash when they share a protocol and ports on an address of either
 /// (`listen_addr` or `extra_listen_addrs`), or on a wildcard that covers it.
 pub(crate) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
@@ -1157,6 +1171,7 @@ impl Registry {
 			listen_freebind: spec.listen_freebind,
 			connect_timeout_ms: crate::core::proxy::timeout_ms(spec.connect_timeout).into(),
 			udp_idle: idle_rx,
+			udp_unreplied: Default::default(),
 			stats: Stats::default(),
 			denied_log: Default::default(),
 			limits: Default::default(),
@@ -1169,6 +1184,7 @@ impl Registry {
 
 		rt.limits.set(spec.limits.as_ref());
 		rt.bandwidth.set(spec.bandwidth.as_ref());
+		warn_public_proxy_from(&spec);
 
 		// bind everything first so a failure leaves nothing half-open
 		let bound = spec.listen_ips().into_iter().map(|ip| Ok((ip, bind_all(&spec, ip)?))).collect::<Result<Vec<_>, ApiError>>()?;
@@ -1549,6 +1565,9 @@ impl Registry {
 					|| r.spec.health_check != spec.health_check;
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
+				if r.spec.proxy_protocol != spec.proxy_protocol {
+					warn_public_proxy_from(&spec);
+				}
 				r.rt.proxy_protocol.set(spec.proxy_protocol.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				r.rt.set_connect_timeout(spec.connect_timeout);

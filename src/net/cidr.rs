@@ -47,6 +47,14 @@ impl Cidr {
 		let ip = canonical(ip);
 		ip.is_ipv4() == self.net.is_ipv4() && mask(ip, self.prefix) == self.net
 	}
+
+	/// Whether the range reaches beyond private, loopback, link-local and shared (CGNAT)
+	/// addresses: a source from the internet there could be anyone's, spoofed too.
+	pub fn is_public(&self) -> bool {
+		const PRIVATE: [&str; 9] =
+			["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"];
+		!PRIVATE.iter().filter_map(|b| b.parse::<Cidr>().ok()).any(|b| self.prefix >= b.prefix && b.contains(self.net))
+	}
 }
 
 impl FromStr for Cidr {
@@ -97,6 +105,16 @@ mod tests {
 
 	fn c(s: &str) -> Cidr {
 		s.parse().unwrap()
+	}
+
+	#[test]
+	fn public_ranges() {
+		for private in ["10.1.2.0/24", "172.20.0.1", "192.168.0.0/16", "127.0.0.1", "100.64.1.0/24", "fd00::/8", "::1", "fe80::1/64"] {
+			assert!(!c(private).is_public(), "{private}");
+		}
+		for public in ["203.0.113.0/24", "8.8.8.8", "10.0.0.0/7", "172.0.0.0/8", "2001:db8::/32", "::ffff:198.51.100.1"] {
+			assert!(c(public).is_public(), "{public}");
+		}
 	}
 
 	#[test]

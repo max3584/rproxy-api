@@ -5,6 +5,7 @@ use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
@@ -19,11 +20,18 @@ pub struct SessionConn {
 	listener: Arc<Listener>,
 	client: SocketAddr,
 	local: Option<Local>,
+	/// Datagrams taken from the queue.
+	received: AtomicU64,
 }
 
 impl SessionConn {
 	pub fn new(from_client: mpsc::Receiver<Vec<u8>>, listener: Arc<Listener>, client: SocketAddr, local: Option<Local>) -> Self {
-		SessionConn { from_client: Mutex::new(from_client), listener, client, local }
+		SessionConn { from_client: Mutex::new(from_client), listener, client, local, received: AtomicU64::new(0) }
+	}
+
+	/// Datagrams of the client read so far (a client that answers the HelloVerifyRequest has sent two).
+	pub fn datagrams(&self) -> u64 {
+		self.received.load(Ordering::Relaxed)
 	}
 }
 
@@ -41,6 +49,7 @@ impl Conn for SessionConn {
 		let mut from_client = self.from_client.lock().await;
 		let datagram = loop {
 			let d = from_client.recv().await.ok_or_else(closed)?;
+			self.received.fetch_add(1, Ordering::Relaxed);
 			if hellos_are_safe(&d) {
 				break d;
 			}
@@ -79,6 +88,18 @@ impl Conn for SessionConn {
 	fn as_any(&self) -> &(dyn Any + Send + Sync) {
 		self
 	}
+}
+
+/// Whether a datagram may start a DTLS session (terminate, #354): its first record is a
+/// handshake record of epoch 0 holding a ClientHello, which the `dtls` crate can read
+/// safely (`hellos_are_safe`). Anything else from an address without a session (an
+/// application record, an alert, garbage, a stray record from a spoofed source) is dropped
+/// without a session, a backend socket or a DTLS connection being made for it.
+pub fn opens_handshake(d: &[u8]) -> bool {
+	const HANDSHAKE: u8 = 22;
+	const CLIENT_HELLO: u8 = 1;
+	// record header (13), then the handshake header (12)
+	d.len() >= 13 + 12 && d[0] == HANDSHAKE && d[1] == 0xfe && d[3..5] == [0, 0] && d[13] == CLIENT_HELLO && hellos_are_safe(d)
 }
 
 /// Whether the ClientHellos in this datagram are safe to hand to the `dtls`
@@ -260,6 +281,28 @@ mod tests {
 		}
 		std::panic::set_hook(hook);
 		assert!(refused > 100 && passed > 100, "{refused} refused, {passed} passed");
+	}
+
+	#[test]
+	fn only_a_client_hello_opens() {
+		assert!(opens_handshake(&record(&[])));
+		assert!(opens_handshake(&record(&[0, 0x17, 0, 0])));
+		// a truncated extension the crate would panic on
+		assert!(!opens_handshake(&record(&[0, 0x17, 0])));
+		// epoch 1, an application record, an alert, too short, not DTLS
+		let mut r = record(&[]);
+		r[4] = 1;
+		assert!(!opens_handshake(&r));
+		assert!(!opens_handshake(&[23, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 9, 9]));
+		assert!(!opens_handshake(&[21, 0xfe, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 40]));
+		assert!(!opens_handshake(&record(&[])[..20]));
+		let mut r = record(&[]);
+		r[1] = 0x03;
+		assert!(!opens_handshake(&r));
+		// another handshake message (a Finished in the clear)
+		let mut r = record(&[]);
+		r[13] = 20;
+		assert!(!opens_handshake(&r));
 	}
 
 	#[test]

@@ -2,6 +2,7 @@
 
 pub mod balance;
 pub mod bandwidth;
+pub mod budget;
 pub mod limits;
 pub mod outlier;
 pub mod proxy;
