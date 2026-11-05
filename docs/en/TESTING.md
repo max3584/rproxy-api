@@ -184,6 +184,7 @@ Checked with both one intermediate CA (3 tiers) and two intermediate CAs (4 tier
 | `dtls_client_certificates_can_be_required` | Client certificates can be made mandatory |
 | `dtls_can_be_re_encrypted_towards_the_backend` | Re-encrypts toward the target with DTLS |
 | `dtls_needs_a_pkcs8_key` | A key that is not PKCS#8 is `tls_config` |
+| `dtls_sessions_start_with_a_client_hello_and_need_a_second` | A new source's datagram that is not a ClientHello makes no session; a source that never answers the HelloVerifyRequest (a spoofed one) is given up after 5 s (#354) |
 
 ## Integration tests: data integrity (`tests/integrity.rs`, #134)
 

@@ -177,3 +177,71 @@ async fn dtls_needs_a_pkcs8_key() {
 	let (status, v) = h.post(dtls_rule(free_udp_port(), udp_backend("").await, tls)).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("tls_config")), "{v}");
 }
+
+/// A real client's first ClientHello, caught on a socket that never answers.
+async fn first_client_hello(pki: &Pki) -> Vec<u8> {
+	let catcher = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let port = catcher.local_addr().unwrap().port();
+	let config = Config {
+		roots_cas: pki.roots(),
+		server_name: "media.test".to_string(),
+		extended_master_secret: ExtendedMasterSecretType::Require,
+		..Default::default()
+	};
+	let client = tokio::spawn(async move {
+		let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		sock.connect(("127.0.0.1", port)).await.unwrap();
+		let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sock);
+		DTLSConn::new(conn, config, true, None).await.err()
+	});
+	let mut buf = vec![0u8; 2048];
+	let n = tokio::time::timeout(Duration::from_secs(3), catcher.recv(&mut buf)).await.unwrap().unwrap();
+	client.abort();
+	buf.truncate(n);
+	buf
+}
+
+// #354: only a ClientHello starts a session, and a source that never answers the HelloVerifyRequest (a spoofed one)
+// is given up after 5 s instead of the handshake timeout
+#[tokio::test]
+async fn dtls_sessions_start_with_a_client_hello_and_need_a_second() {
+	let pki = Pki::new("dtls-hello");
+	let cert = pki.server("front", &["media.test"]);
+	let h = harness().await;
+	let port = free_udp_port();
+	let tls = json!({"mode": "terminate", "certificates": [{"cert_file": cert.cert_file, "key_file": cert.key_file}]});
+	let (status, v) = h.post(dtls_rule(port, udp_backend("P:").await, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	let mut buf = vec![0u8; 2048];
+
+	// an application record from a new source: dropped, nothing answers
+	let stray = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	stray.connect(("127.0.0.1", port)).await.unwrap();
+	stray.send(&[23, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 1, 0, 2, 9, 9]).await.unwrap();
+	assert!(tokio::time::timeout(Duration::from_millis(300), stray.recv(&mut buf)).await.is_err());
+	wait_for(&h, &path, |v| v["stats"]["dropped"] == 1).await;
+
+	// one ClientHello: answered with a HelloVerifyRequest, then nothing more comes
+	let hello = first_client_hello(&pki).await;
+	let once = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	once.connect(("127.0.0.1", port)).await.unwrap();
+	once.send(&hello).await.unwrap();
+	let n = tokio::time::timeout(Duration::from_secs(2), once.recv(&mut buf)).await.unwrap().unwrap();
+	assert!(n > 13 && buf[0] == 22 && buf[13] == 3, "a HelloVerifyRequest: {:?}", &buf[..n.min(16)]);
+	let started = std::time::Instant::now();
+	loop {
+		let (_, v) = h.get(&path).await;
+		if v["stats"]["dropped"] == 2 {
+			break;
+		}
+		assert!(started.elapsed() < Duration::from_secs(8), "the session is given up after 5 s: {v}");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert!(started.elapsed() >= Duration::from_secs(3), "not before its time");
+	assert_eq!(h.get(&path).await.1["stats"]["tls_failures"], 0);
+
+	// a real client goes through as before
+	let c = dtls_client(&pki, port, "media.test", None).await.unwrap();
+	assert_eq!(dtls_roundtrip(&c, "a").await, "P:a");
+}

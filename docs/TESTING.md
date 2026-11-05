@@ -184,6 +184,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `dtls_client_certificates_can_be_required` | クライアント証明書を必須にできる |
 | `dtls_can_be_re_encrypted_towards_the_backend` | 転送先へ DTLS で再暗号化する |
 | `dtls_needs_a_pkcs8_key` | PKCS#8 でない鍵は `tls_config` |
+| `dtls_sessions_start_with_a_client_hello_and_need_a_second` | 新しい送信元の ClientHello でないデータグラムはセッションを作らない、HelloVerifyRequest に答えない送信元（偽った送信元）は 5 秒であきらめる（#354） |
 
 ## 結合テスト：データの完全性（`tests/integrity.rs`、#134）
 
