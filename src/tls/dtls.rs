@@ -338,6 +338,54 @@ mod tests {
 		assert!(refused > 100 && passed > 100, "{refused} refused, {passed} passed");
 	}
 
+	// #354: in a real handshake with the dtls crate on both sides, the cookie of the server's HelloVerifyRequest
+	// is caught on the way out and the client's second ClientHello brings it back
+	#[tokio::test]
+	async fn a_real_client_is_verified_by_its_cookie() {
+		use dtls::config::{Config, ExtendedMasterSecretType};
+		use dtls::conn::DTLSConn;
+		let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+		std_sock.set_nonblocking(true).unwrap();
+		let reader = tokio::net::UdpSocket::from_std(std_sock.try_clone().unwrap()).unwrap();
+		let listener = Arc::new(Listener::new(tokio::net::UdpSocket::from_std(std_sock).unwrap()));
+		let server_addr = listener.local_addr().unwrap();
+		let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client_sock.connect(server_addr).await.unwrap();
+		let client_addr = client_sock.local_addr().unwrap();
+		// the shared listener's datagrams into the session's queue, as `serve` does
+		let (tx, rx) = mpsc::channel(64);
+		tokio::spawn(async move {
+			let mut buf = vec![0u8; 2048];
+			while let Ok((n, _)) = reader.recv_from(&mut buf).await {
+				if tx.send(buf[..n].to_vec()).await.is_err() {
+					break;
+				}
+			}
+		});
+		let session = Arc::new(SessionConn::new(rx, listener, client_addr, None));
+		let cert = dtls::crypto::Certificate::generate_self_signed(vec!["localhost".to_owned()]).unwrap();
+		let server_config =
+			Config { certificates: vec![cert], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() };
+		let client_config = Config {
+			insecure_skip_verify: true,
+			server_name: "localhost".into(),
+			extended_master_secret: ExtendedMasterSecretType::Require,
+			..Default::default()
+		};
+		assert!(!session.verified());
+		let server_conn: Arc<dyn Conn + Send + Sync> = session.clone();
+		let client_conn: Arc<dyn Conn + Send + Sync> = Arc::new(client_sock);
+		let (server, client) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+			tokio::join!(DTLSConn::new(server_conn, server_config, false, None), DTLSConn::new(client_conn, client_config, true, None))
+		})
+		.await
+		.unwrap();
+		let (server, client) = (server.unwrap(), client.unwrap());
+		assert!(session.verified(), "the second ClientHello carried the HelloVerifyRequest's cookie");
+		let _ = client.close().await;
+		let _ = server.close().await;
+	}
+
 	#[test]
 	fn cookies_are_read() {
 		// a ClientHello with a cookie: the test record's cookie length byte is at body offset 35

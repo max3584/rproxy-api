@@ -603,11 +603,18 @@ mod tests {
 		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		socket.connect(closed).await.unwrap();
 		socket.send(b"x").await.unwrap();
-		// the ICMP error arrives soon after
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-		let mut kinds = vec![];
-		send_connected(&socket, None, &[b"y".to_vec()], |e| kinds.push(e.kind())).await;
-		assert_eq!(kinds, [io::ErrorKind::ConnectionRefused]);
+		// the ICMP error arrives some time after: send until a send reports it
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		loop {
+			let mut kinds = vec![];
+			send_connected(&socket, None, &[b"y".to_vec()], |e| kinds.push(e.kind())).await;
+			if !kinds.is_empty() {
+				assert_eq!(kinds, [io::ErrorKind::ConnectionRefused]);
+				break;
+			}
+			assert!(std::time::Instant::now() < deadline, "no ECONNREFUSED on a send");
+			tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		}
 	}
 
 	/// A reply to 127.0.0.1 from a wildcard socket would leave from 127.0.0.1 (the

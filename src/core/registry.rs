@@ -2621,9 +2621,14 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_session_budget_in_use Descriptors held by UDP sessions (and connections) of the process, of rproxy_session_budget_limit.");
 	let _ = writeln!(out, "# TYPE rproxy_session_budget_in_use gauge");
 	let _ = writeln!(out, "rproxy_session_budget_in_use {}", crate::core::budget::in_use());
-	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors connections and sessions may hold: RLIMIT_NOFILE less a reserve of 1024.");
+	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors connections and sessions may hold: RLIMIT_NOFILE less a reserve of 1024 (0: no limit).");
 	let _ = writeln!(out, "# TYPE rproxy_session_budget_limit gauge");
-	let _ = writeln!(out, "rproxy_session_budget_limit {}", crate::core::budget::limit());
+	// 0: no limit (an unlimited RLIMIT_NOFILE)
+	let budget = match crate::core::budget::limit() {
+		u64::MAX => 0,
+		n => n,
+	};
+	let _ = writeln!(out, "rproxy_session_budget_limit {budget}");
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
 	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
 	for line in durations {
