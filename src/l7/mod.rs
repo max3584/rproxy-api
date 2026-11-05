@@ -416,6 +416,9 @@ pub enum MiddlewareSpec {
 		percent: Option<u8>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		fraction: Option<FractionSpec>,
+		/// Copies sent at once (#356, default `mirror::MAX_IN_FLIGHT`); more are not sent.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		max_in_flight: Option<u32>,
 	},
 	/// The Host sent to the backend (#228).
 	ReplaceHost {
@@ -630,7 +633,10 @@ impl MiddlewareSpec {
 			MiddlewareSpec::Geoip(g) => g.validate(&format!("middleware {name}")),
 			MiddlewareSpec::Cors(c) => c.validate(&format!("middleware {name}")),
 			MiddlewareSpec::Cache(c) => c.validate(&format!("middleware {name}")),
-			MiddlewareSpec::Mirror { service, percent, fraction } => {
+			MiddlewareSpec::Mirror { service, percent, fraction, max_in_flight } => {
+				if max_in_flight.is_some_and(|n| n == 0 || n > crate::l7::mirror::MAX_IN_FLIGHT_LIMIT) {
+					return bad(format!("max_in_flight must be 1-{}", crate::l7::mirror::MAX_IN_FLIGHT_LIMIT));
+				}
 				if !services.contains_key(service) {
 					return bad(format!("service {service:?} is not defined"));
 				}

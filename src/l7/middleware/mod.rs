@@ -332,14 +332,15 @@ impl Middleware {
 		if let MiddlewareSpec::ForwardAuth { .. } = spec {
 			return forward_auth(label, spec, services);
 		}
-		if let MiddlewareSpec::Mirror { service, percent, fraction } = spec {
+		if let MiddlewareSpec::Mirror { service, percent, fraction, max_in_flight } = spec {
 			let service = services.get(service).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {service:?} is not defined")))?;
 			let share = match (percent, fraction) {
 				(Some(p), _) => Share::new(u32::from(*p), 100),
 				(None, Some(f)) => Share::new(f.numerator, f.denominator),
 				(None, None) => Share::new(1, 1),
 			};
-			return Ok(Middleware::Mirror { name: label.to_string(), service, share, slots: Default::default() });
+			let slots = Arc::new(crate::l7::mirror::Slots::new(max_in_flight.map_or(crate::l7::mirror::MAX_IN_FLIGHT, |n| n as usize)));
+			return Ok(Middleware::Mirror { name: label.to_string(), service, share, slots });
 		}
 		let MiddlewareSpec::Errors { status, service, path } = spec else {
 			return Middleware::compile(label, spec);

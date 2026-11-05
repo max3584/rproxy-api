@@ -599,9 +599,10 @@ where
 		.timer(TokioTimer::new())
 		.max_header_list_size(MAX_HEADER_SECTION)
 		// what one stream may hold for a client that does not read, and how many streams one
-		// connection may have, each a request to a backend (#356; hyper's 400 KB and 200)
+		// connection may have, each a request to a backend (#356; hyper's 400 KB and 200;
+		// `http2_max_streams`, 128 by default)
 		.max_send_buf_size(H2_SEND_BUFFER)
-		.max_concurrent_streams(H2_MAX_STREAMS)
+		.max_concurrent_streams(limits.http2_max_streams)
 		.keep_alive_interval(limits.http2_ping_interval)
 		.keep_alive_timeout(limits.http2_ping_timeout);
 	let served = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
@@ -656,8 +657,6 @@ async fn drain(mut body: Body) {
 
 /// HTTP/2: bytes a stream may have waiting to be sent (#356).
 const H2_SEND_BUFFER: usize = 128 * 1024;
-/// HTTP/2: streams at once on one connection (#356).
-const H2_MAX_STREAMS: u32 = 100;
 
 /// How long a connection past a time limit may take to close after GOAWAY when no
 /// request is in progress (requests in progress are always let finish).
@@ -1222,6 +1221,9 @@ impl Conn {
 			warn!(event = "http.error", rule = %self.rt.key, route = route_name, status = 504, error = "request timed out in the middlewares");
 			answer = Some(error_response(StatusCode::GATEWAY_TIMEOUT));
 			answered_by = Some(("request_timeout", ""));
+			// not the backend's doing: a `circuit_breaker` before does not count it as a failure
+			// (a probe's ticket dropped unrecorded keeps the breaker open for another round)
+			sent.tickets.clear();
 		}
 		// a middleware that refused the request (an error status; not redirects or answers like `respond` 200)
 		if log {

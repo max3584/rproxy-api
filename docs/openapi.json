@@ -1702,7 +1702,7 @@
           },
           "mirror_dropped": {
             "type": "integer",
-            "description": "copies of mirror middlewares not sent, with 64 of that mirror being sent already (#356, v0.4.20)"
+            "description": "copies of mirror middlewares not sent, with max_in_flight of that mirror being sent already (#356, v0.4.20)"
           },
           "cache": {
             "type": "object",
@@ -2319,7 +2319,7 @@
               },
               "http_stream_limits": {
                 "type": "boolean",
-                "description": "Limits on what one client can hold of an http rule (v0.4.20, #356): global.http.timeouts.write_stall (default 60s) and upgraded_idle (default 1h); an upgraded connection (WebSocket) keeps its place in the rule's limits; timeouts.request covers the middlewares; stats.http.mirror_dropped and rproxy_http_mirror_dropped_total"
+                "description": "Limits on what one client can hold of an http rule (v0.4.20, #356): global.http.timeouts.write_stall (default 60s), upgraded_idle (default 1h) and http2_max_streams (default 128); mirror's max_in_flight (default 64); an upgraded connection (WebSocket) keeps its place in the rule's limits; timeouts.request covers the middlewares; stats.http.mirror_dropped and rproxy_http_mirror_dropped_total"
               }
             }
           },

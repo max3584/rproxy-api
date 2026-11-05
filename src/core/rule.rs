@@ -236,7 +236,7 @@ pub struct Features {
 	/// (`global.cache_max_memory` in `GET /config/global`, live); `rproxy_http_cache_memory_bytes` (#349)
 	pub cache_process_memory: bool,
 	/// Limits on what one client can hold of an `http` rule (#356): `global.http.timeouts`'s
-	/// `write_stall` and `upgraded_idle`, upgraded connections in the rule's `limits`,
+	/// `write_stall`, `upgraded_idle` and `http2_max_streams`, `mirror`'s `max_in_flight`, upgraded connections in the rule's `limits`,
 	/// `timeouts.request` over the middlewares, `stats.http.mirror_dropped`
 	pub http_stream_limits: bool,
 }

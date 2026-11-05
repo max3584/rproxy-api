@@ -54,7 +54,16 @@ pub struct HttpTimeoutsSpec {
 	/// v0.4.20 (#356): an upgraded connection (WebSocket) with no byte either way for this long.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub upgraded_idle: Option<String>,
+	/// v0.4.20 (#356): streams at once on one HTTP/2 client connection (1-`MAX_HTTP2_STREAMS`).
+	/// Not a time, but kept with the connection's limits (set and put in force the same way).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http2_max_streams: Option<u32>,
 }
+
+/// `http2_max_streams` by default (nginx's `http2_max_concurrent_streams`; hyper's is 200).
+pub const DEFAULT_HTTP2_STREAMS: u32 = 128;
+/// The most `http2_max_streams` may be.
+pub const MAX_HTTP2_STREAMS: u32 = 10_000;
 
 /// The limits in force; `None` is no limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +87,8 @@ pub struct HttpTimeouts {
 	pub write_stall: Option<Duration>,
 	/// An upgraded connection (WebSocket, `101`) with nothing relayed either way (#356).
 	pub upgraded_idle: Option<Duration>,
+	/// Streams at once on one HTTP/2 client connection (#356).
+	pub http2_max_streams: u32,
 }
 
 impl Default for HttpTimeouts {
@@ -92,6 +103,7 @@ impl Default for HttpTimeouts {
 			http2_ping_timeout: Duration::from_secs(20),
 			write_stall: Some(Duration::from_secs(60)),
 			upgraded_idle: Some(Duration::from_secs(3600)),
+			http2_max_streams: DEFAULT_HTTP2_STREAMS,
 		}
 	}
 }
@@ -121,6 +133,9 @@ impl HttpTimeoutsSpec {
 				}
 			}
 		}
+		if self.http2_max_streams.is_some_and(|n| n == 0 || n > MAX_HTTP2_STREAMS) {
+			return Err(format!("global.http.timeouts.http2_max_streams: 1-{MAX_HTTP2_STREAMS}"));
+		}
 		Ok(())
 	}
 
@@ -141,6 +156,7 @@ impl HttpTimeoutsSpec {
 			http2_ping_timeout: get(&self.http2_ping_timeout, Some(d.http2_ping_timeout)).unwrap_or(d.http2_ping_timeout),
 			write_stall: get(&self.write_stall, d.write_stall),
 			upgraded_idle: get(&self.upgraded_idle, d.upgraded_idle),
+			http2_max_streams: self.http2_max_streams.unwrap_or(d.http2_max_streams),
 		}
 	}
 }
@@ -699,6 +715,9 @@ mod tests {
 		let t = HttpTimeoutsSpec { write_stall: Some("0s".into()), upgraded_idle: Some("5m".into()), ..Default::default() }.resolve();
 		assert_eq!((t.write_stall, t.upgraded_idle), (None, Some(Duration::from_secs(300))));
 		assert!(HttpTimeoutsSpec { upgraded_idle: Some("later".into()), ..Default::default() }.check().is_err());
+		assert_eq!(HttpTimeouts::default().http2_max_streams, 128);
+		assert_eq!(HttpTimeoutsSpec { http2_max_streams: Some(500), ..Default::default() }.resolve().http2_max_streams, 500);
+		assert!(HttpTimeoutsSpec { http2_max_streams: Some(0), ..Default::default() }.check().is_err());
 	}
 
 	#[tokio::test]

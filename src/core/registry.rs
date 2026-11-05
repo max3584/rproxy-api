@@ -2613,6 +2613,9 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_limit_bytes RPROXY_CACHE_MAX_MEMORY in force: bytes all cache middlewares may keep together (0: no limit).");
 	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_limit_bytes gauge");
 	let _ = writeln!(out, "rproxy_http_cache_memory_limit_bytes {limit}");
+	let _ = writeln!(out, "# HELP rproxy_http_compress_skipped_total Responses compress middlewares sent as they were because as many were being compressed (#356).");
+	let _ = writeln!(out, "# TYPE rproxy_http_compress_skipped_total counter");
+	let _ = writeln!(out, "rproxy_http_compress_skipped_total {}", crate::l7::compress::skipped());
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
 	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
 	for line in durations {

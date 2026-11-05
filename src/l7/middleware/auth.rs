@@ -319,7 +319,16 @@ pub struct BasicAuth {
 	pub user_header: Option<HeaderName>,
 	/// sha256(user:password) of recent successes, for the current users file.
 	cache: Mutex<(usize, HashMap<[u8; 32], String>)>,
+	/// bcrypt checks going on, by sha256(user:password) and the users file (#356): requests
+	/// with the same credentials at once share one check (a cold cache does not queue them all).
+	checking: Mutex<HashMap<[u8; 32], Checking>>,
 }
+
+/// The result of a bcrypt check several requests wait for (None: `Busy`).
+type Checking = Arc<tokio::sync::OnceCell<Option<bool>>>;
+
+/// Checks going on remembered at once; past it, those nobody waits for are forgotten.
+const CHECKING_MAX: usize = 4096;
 
 /// What `basic_auth` decided.
 pub enum BasicVerdict {
@@ -393,6 +402,7 @@ impl BasicAuth {
 			keep_authorization,
 			user_header,
 			cache: Mutex::default(),
+			checking: Mutex::default(),
 		})
 	}
 
@@ -417,7 +427,7 @@ impl BasicAuth {
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
 			Hash::Apr1 { salt, hash } => constant_time_eq(apr1(password.as_bytes(), salt.as_bytes()).as_bytes(), hash.as_bytes()),
-			Hash::Bcrypt(h) => match bcrypt_verify(password, h).await {
+			Hash::Bcrypt(h) => match self.bcrypt_once(&key, generation, password, h).await {
 				Some(ok) => ok,
 				None => return BasicVerdict::Busy,
 			},
@@ -434,6 +444,27 @@ impl BasicAuth {
 		}
 		c.1.insert(key, user.clone());
 		BasicVerdict::Allow(user)
+	}
+
+	/// `bcrypt_verify`, once for the requests with the same credentials at the same time.
+	async fn bcrypt_once(&self, key: &[u8; 32], generation: usize, password: String, hash: String) -> Option<bool> {
+		let mut h = Sha256::new();
+		h.update(key);
+		h.update(generation.to_le_bytes());
+		let flight: [u8; 32] = h.finalize().into();
+		let cell: Checking = {
+			let mut m = self.checking.lock().unwrap_or_else(|e| e.into_inner());
+			if m.len() >= CHECKING_MAX {
+				m.retain(|_, c| Arc::strong_count(c) > 1);
+			}
+			m.entry(flight).or_default().clone()
+		};
+		let result = *cell.get_or_init(|| bcrypt_verify(password, hash)).await;
+		let mut m = self.checking.lock().unwrap_or_else(|e| e.into_inner());
+		if m.get(&flight).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+			m.remove(&flight);
+		}
+		result
 	}
 
 	pub fn challenge(&self) -> HeaderValue {

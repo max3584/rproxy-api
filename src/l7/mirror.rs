@@ -23,24 +23,32 @@ use super::server::{Body, BoxError};
 /// Frames a mirror may be behind before it is cut off.
 pub const QUEUE: usize = 64;
 
-/// Copies one `mirror` sends at once (#356); more are not sent (`mirror_dropped`).
+/// Copies one `mirror` sends at once by default (#356, `max_in_flight`); more are not sent
+/// (`mirror_dropped`).
 pub const MAX_IN_FLIGHT: usize = 64;
+/// The most `max_in_flight` may be.
+pub const MAX_IN_FLIGHT_LIMIT: u32 = 10_000;
 
 /// A copy's whole exchange (the request, its body and the answer, which is dropped).
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The copies of one `mirror` middleware being sent.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Slots {
 	busy: AtomicUsize,
+	max: usize,
 }
 
 impl Slots {
-	/// A place for one more copy, unless `MAX_IN_FLIGHT` are being sent.
+	pub fn new(max: usize) -> Slots {
+		Slots { busy: AtomicUsize::new(0), max }
+	}
+
+	/// A place for one more copy, unless `max` are being sent.
 	pub fn take(self: &Arc<Self>) -> Option<Slot> {
 		let mut n = self.busy.load(Ordering::Relaxed);
 		loop {
-			if n >= MAX_IN_FLIGHT {
+			if n >= self.max {
 				return None;
 			}
 			match self.busy.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
@@ -224,10 +232,13 @@ mod tests {
 
 	#[test]
 	fn a_mirror_sends_so_many_copies_at_once() {
-		let slots = Arc::new(Slots::default());
+		let slots = Arc::new(Slots::new(MAX_IN_FLIGHT));
 		let held: Vec<Slot> = (0..MAX_IN_FLIGHT).map(|_| slots.take().unwrap()).collect();
 		assert!(slots.take().is_none());
 		drop(held);
 		assert!(slots.take().is_some());
+		let two = Arc::new(Slots::new(2));
+		let (_a, _b) = (two.take().unwrap(), two.take().unwrap());
+		assert!(two.take().is_none(), "max_in_flight");
 	}
 }

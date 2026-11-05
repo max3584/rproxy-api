@@ -495,8 +495,9 @@ fn empty() -> Body {
 trait Stream2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream2 for T {}
 
-/// The most `call` reads of an answer (#356): the LAPI's first decisions stream can be large.
-pub(super) const MAX_ANSWER: usize = 64 << 20;
+/// The most `call` reads of an answer (#356): the LAPI's first decisions stream can be large
+/// (blocklists of millions of addresses are some hundred MiB of JSON).
+pub(super) const MAX_ANSWER: usize = 512 << 20;
 
 /// One HTTP/1.1 request to the LAPI or AppSec; returns the status and body.
 pub(super) async fn call(

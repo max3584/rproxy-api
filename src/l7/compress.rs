@@ -1,8 +1,8 @@
 //! The `compress` middleware (#63): responses compressed with br, zstd or gzip as
 //! the client accepts, while they stream (each chunk is flushed, so server-sent
 //! and long responses are not held back). The windows are small (256 KiB) and at most
-//! `MAX_ENCODERS` responses of the process are compressed at once; more are sent as they
-//! are (#356).
+//! `MAX_ENCODERS` responses of the process are compressed at once, half of them for responses
+//! of unknown length; more are sent as they are and counted (`skipped`, #356).
 
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -27,16 +27,27 @@ pub const MAX_ENCODERS: usize = 256;
 const WINDOW_LOG: u32 = 18;
 
 static ENCODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Responses sent as they are because `MAX_ENCODERS` were being compressed (`/metrics`).
+static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Responses not compressed for want of a place (`rproxy_http_compress_skipped_total`).
+pub fn skipped() -> u64 {
+	SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A place among `MAX_ENCODERS`.
 struct Slot;
 
 impl Slot {
-	fn take() -> Option<Slot> {
+	/// A response of unknown length (a stream that may last) gets a place only while fewer
+	/// than half are taken, so long streams cannot hold them all.
+	fn take(sized: bool) -> Option<Slot> {
 		use std::sync::atomic::Ordering::Relaxed;
+		let max = if sized { MAX_ENCODERS } else { MAX_ENCODERS / 2 };
 		let mut n = ENCODERS.load(Relaxed);
 		loop {
-			if n >= MAX_ENCODERS {
+			if n >= max {
+				SKIPPED.fetch_add(1, Relaxed);
 				return None;
 			}
 			match ENCODERS.compare_exchange_weak(n, n + 1, Relaxed, Relaxed) {
@@ -159,9 +170,9 @@ pub fn compressible(status: StatusCode, headers: &HeaderMap, min_size: u64, head
 }
 
 /// Compresses the body of `resp` with `encoding` and fixes its headers; as it is when
-/// `MAX_ENCODERS` responses are being compressed.
+/// `MAX_ENCODERS` responses are being compressed (half of them for one of unknown length).
 pub fn compress(resp: Response<Body>, encoding: Encoding) -> Response<Body> {
-	let Some(slot) = Slot::take() else { return resp };
+	let Some(slot) = Slot::take(resp.headers().contains_key(header::CONTENT_LENGTH)) else { return resp };
 	let (mut parts, body) = resp.into_parts();
 	let h = &mut parts.headers;
 	h.remove(header::CONTENT_LENGTH);
