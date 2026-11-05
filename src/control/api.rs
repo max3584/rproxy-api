@@ -490,6 +490,9 @@ async fn create(
 	body: Bytes,
 ) -> AppResult<impl IntoResponse> {
 	let req: RuleRequest = parse_body(&body)?;
+	if let Some(h) = &req.http {
+		h.check_names()?;
+	}
 	if crate::config::plan::dry_run(&query)? {
 		check_ports(&principal, req.listen_port, req.listen_port_end)?;
 		check_limits(&state, &principal, &req).await?;
@@ -521,11 +524,9 @@ async fn create(
 }
 
 /// The limits of #358 for a new rule (the process's are checked again as it goes into
-/// the table): what only `admin` may ask for, and the token's `max_rules`.
+/// the table): who may ask for `listen_freebind`, and the token's `max_rules`.
 async fn check_limits(state: &AppState, principal: &Principal, req: &RuleRequest) -> AppResult<()> {
-	if !principal.has(Scope::Admin) {
-		crate::core::quota::check_non_admin(req.listen_freebind, req.listen_port, req.listen_port_end)?;
-	}
+	crate::core::quota::check_freebind(req.listen_freebind, principal.may_freebind(false))?;
 	if principal.max_rules.is_some() {
 		let usage = state.registry.usage(&principal.name).await;
 		crate::core::quota::check_token("rules", usage.owned + 1, 1, principal.max_rules)?;
@@ -622,6 +623,9 @@ async fn update(
 ) -> AppResult<impl IntoResponse> {
 	let key = parse_key(&protocol, &addr, &port)?;
 	let req: UpdateRequest = parse_body(&body)?;
+	if let Some(h) = &req.http {
+		h.check_names()?;
+	}
 	if crate::config::plan::dry_run(&query)? {
 		check_update_scope(&state, &principal, &key, &req).await?;
 		drop(super::rule_files::check_update(&state.registry, &principal, &key, &req).await?);
@@ -664,7 +668,7 @@ async fn delete(
 			_ => None,
 		};
 		if let Some(store) = &stored {
-			store.check_backlog()?;
+			store.check_backlog(principal.has(Scope::Admin))?;
 		}
 		let result = async {
 			check_rule_ports(&state, &principal, &key).await?;
@@ -707,12 +711,23 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	let mut text = state.registry.metrics().await;
 	text.push_str(&crate::control::hardening::metrics(&state.tokens));
 	text.push_str(&super::upgrade::metrics());
+	text.push_str(&crate::core::supervise::metrics());
 	([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn drains_are_cut_to_an_hour() {
+		let q = |v: &str| HashMap::from([("drain_secs".to_string(), v.to_string())]);
+		assert_eq!(drain_query(&HashMap::new()).unwrap(), None);
+		assert_eq!(drain_query(&q("0")).unwrap(), None);
+		assert_eq!(drain_query(&q("30")).unwrap(), Some(Duration::from_secs(30)));
+		assert_eq!(drain_query(&q("86400")).unwrap(), Some(MAX_DRAIN));
+		assert!(drain_query(&q("x")).is_err());
+	}
 
 	/// Every route of the router, with its methods, is in docs/openapi.json and
 	/// the document lists nothing else.

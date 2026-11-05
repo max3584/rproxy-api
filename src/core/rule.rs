@@ -236,9 +236,9 @@ pub struct Features {
 	/// (`global.cache_max_memory` in `GET /config/global`, live); `rproxy_http_cache_memory_bytes` (#349)
 	pub cache_process_memory: bool,
 	/// The control API's limits (#358): `max_rules` / `max_rulesets` of the token file,
-	/// `RPROXY_MAX_RULES` / `_LISTENERS` / `_RULESETS` (`409 limit`), `listen_freebind` and
-	/// ranges over `RPROXY_MAX_RANGE_PORTS_NON_ADMIN` only for `admin`, route, middleware and
-	/// service names without control characters, white space, `"`, `\` and the like
+	/// `RPROXY_MAX_RULES` / `_LISTENERS` / `_RULESETS` (`409 limit`), `listen_freebind` for
+	/// `admin`, `allow_freebind` and (rule sets) `allow_rulesets` tokens, route, middleware and
+	/// service names the API is sent without control characters, white space, `"`, `\` and the like
 	pub control_limits: bool,
 }
 

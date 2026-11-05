@@ -163,6 +163,32 @@ async fn persist_tokens_store_their_sets() {
 /// Restoring: a stored set comes back with its generation, etag and owner; a
 /// rule whose key is taken already is left out, the rest of the set applies.
 #[tokio::test]
+async fn stored_sets_keep_names_the_api_refuses() {
+	let h = harness().await;
+	let port = free_port();
+	let member = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "http": {
+		"routes": [{"name": "a b", "match": "PathPrefix(`/`)", "middlewares": ["m"]}],
+		"middlewares": {"m": {"respond": {"status": 204}}},
+	}});
+	let store = Arc::new(Store::memory("node-a"));
+	store.memory_put_set(StoredSet {
+		name: "ci/old".into(),
+		generation: 1,
+		etag: "g1-0".into(),
+		owner: "ci".into(),
+		rules: vec![serde_json::from_value(member).unwrap()],
+		spec_version: 1,
+		updated_by: "ci".into(),
+		updated_at: 1,
+	});
+	h.registry.set_persist(store.clone());
+	assert_eq!(h.registry.restore_rulesets(store.load_sets().await.unwrap()).await, 1);
+	let (_, v) = h.get("/rulesets/ci/old").await;
+	assert_eq!(v["rules"].as_array().unwrap().len(), 1, "the member is restored (#358): {v}");
+	assert_eq!(reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn stored_sets_are_restored() {
 	let dir = workdir("restore");
 	let h = harness_with(Tokens::from_file(token_file(&dir)).unwrap()).await;

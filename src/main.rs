@@ -128,12 +128,12 @@ struct Options {
 	/// Rule sets the control API may make the process have (0: no limit)
 	#[arg(long, env = "RPROXY_MAX_RULESETS", default_value_t = rproxy_api::core::quota::DEFAULT_MAX_RULESETS)]
 	max_rulesets: usize,
-	/// Largest port range a token without the admin scope may open (0: up to RPROXY_MAX_RANGE_PORTS)
-	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS_NON_ADMIN", default_value_t = rproxy_api::core::quota::DEFAULT_NON_ADMIN_RANGE_PORTS)]
-	max_range_ports_non_admin: usize,
 	/// TCP connections the control API keeps open at a time (0: no limit; #358)
 	#[arg(long, env = "RPROXY_API_MAX_CONNECTIONS", default_value_t = rproxy_api::control::hardening::DEFAULT_API_MAX_CONNECTIONS)]
 	api_max_connections: usize,
+	/// TCP connections one source address (IPv6: /64) keeps open to the control API (0: no limit; loopback is not limited)
+	#[arg(long, env = "RPROXY_API_MAX_CONNECTIONS_PER_SOURCE", default_value_t = rproxy_api::control::hardening::DEFAULT_API_MAX_PER_SOURCE)]
+	api_max_connections_per_source: usize,
 	/// Sessions one udp rule may have when its `limits` set no `max_connections` (0: no limit)
 	#[arg(long, env = "RPROXY_UDP_MAX_SESSIONS", default_value_t = rproxy_api::l4::udp::DEFAULT_MAX_SESSIONS)]
 	udp_max_sessions: u64,
@@ -1009,7 +1009,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		note_api_cert(&registry, cert);
 	}
 	let nofile = raise_nofile_limit();
-	rproxy_api::core::quota::set(opts.max_rules, opts.max_listeners, opts.max_rulesets, opts.max_range_ports_non_admin, nofile);
+	rproxy_api::core::quota::set(opts.max_rules, opts.max_listeners, opts.max_rulesets, nofile);
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
 		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), max_rules = opts.max_rules,
@@ -1202,7 +1202,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			tls: tls.clone(),
 			files: tls_files.clone(),
 			handles: handles.clone(),
-			max_connections: opts.api_max_connections,
+			max_connections: (opts.api_max_connections, opts.api_max_connections_per_source),
 		};
 		// the rules keep running while a listener that cannot start is retried
 		if let Err(e) = listener.start().await {
@@ -1259,7 +1259,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			info!(event = "handoff.sockets", unused = left.len(), "closed inherited sockets no rule or listener took");
 		}
 		let adopted = r.ready(&registry).await?;
-		tokio::spawn(adopted.follow(registry.clone()));
+		tokio::spawn(adopted.follow(registry.clone(), upgrader.config().drain));
 	}
 	updater.spawn(Some(upgrader.clone()));
 	upgrade::notify::notify("READY=1");
@@ -1686,8 +1686,8 @@ struct ApiListener {
 	/// the TLS files when the API is served over TLS
 	files: Option<ApiTlsFiles>,
 	handles: Arc<Mutex<Vec<Handle>>>,
-	/// `RPROXY_API_MAX_CONNECTIONS` (#358).
-	max_connections: usize,
+	/// `RPROXY_API_MAX_CONNECTIONS` and `_PER_SOURCE` (#358).
+	max_connections: (usize, usize),
 }
 
 impl ApiListener {
@@ -1715,7 +1715,7 @@ impl ApiListener {
 		let app = self.app.clone().into_make_service_with_connect_info::<SocketAddr>();
 		let handle = Handle::new();
 		let addr = self.addr;
-		let cap = self.max_connections;
+		let (cap, per_source) = self.max_connections;
 		// a client that sends no request (or nothing more on a kept-alive connection) is
 		// closed after API_HEADER_TIMEOUT (#358)
 		let timeouts = |b: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>| {
@@ -1730,7 +1730,7 @@ impl ApiListener {
 				// requests carry the client certificate's names (#167)
 				let mut server = axum_server::from_tcp(listener)
 					.map_err(|e| e.to_string())?
-					.acceptor(hardening::Capped::new(ClientCertAcceptor::new(tls), cap))
+					.acceptor(hardening::Capped::new(ClientCertAcceptor::new(tls), cap, per_source))
 					.handle(handle.clone());
 				timeouts(server.http_builder());
 				tokio::spawn(async move {
@@ -1742,7 +1742,7 @@ impl ApiListener {
 			None => {
 				let mut server = axum_server::from_tcp(listener)
 					.map_err(|e| e.to_string())?
-					.acceptor(hardening::Capped::new(axum_server::accept::DefaultAcceptor::new(), cap))
+					.acceptor(hardening::Capped::new(axum_server::accept::DefaultAcceptor::new(), cap, per_source))
 					.handle(handle.clone());
 				timeouts(server.http_builder());
 				tokio::spawn(async move {

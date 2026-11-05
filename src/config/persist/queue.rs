@@ -214,6 +214,9 @@ pub trait PersistQueue: Send + Sync {
 /// What runs the jobs of a `LocalQueue`, one at a time.
 pub trait Worker: Send + 'static {
 	fn run(&mut self, job: Job) -> JobFuture<'_>;
+
+	/// After a job panicked: let go of what it may have left half way (the connection, #358).
+	fn reset(&mut self) {}
 }
 
 type Item = (Job, oneshot::Sender<JobResult>);
@@ -242,7 +245,9 @@ impl LocalQueue {
 					Ok(result) => result,
 					Err(p) => {
 						let error = crate::core::supervise::panic_message(p.as_ref());
-						tracing::error!(event = "degraded", part = "persist", error = %error, "a database job panicked; the next ones run");
+						tracing::error!(event = "degraded", part = "persist", error = %error, "a database job panicked; the next ones run on a new connection");
+						crate::core::supervise::count_restart("persist");
+						worker.reset();
 						Err(JobError::Failed(format!("the job panicked: {error}")))
 					}
 				};

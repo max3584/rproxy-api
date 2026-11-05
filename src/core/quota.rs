@@ -1,6 +1,5 @@
 //! How much the control API may make (#358): rules, listening sockets and rule sets of
-//! the process, rules and rule sets of one token, and the settings only `admin` tokens may
-//! use (`listen_freebind`, large port ranges). The rules of the settings file and those
+//! the process, rules and rule sets of one token, and who may ask for `listen_freebind`. The rules of the settings file and those
 //! restored from the database or a live upgrade are counted but never refused: the limits
 //! are for what tokens ask for.
 
@@ -13,8 +12,6 @@ use crate::error::ApiError;
 pub const DEFAULT_MAX_RULES: usize = 10_000;
 /// `RPROXY_MAX_RULESETS`: rule sets of the process.
 pub const DEFAULT_MAX_RULESETS: usize = 1_000;
-/// `RPROXY_MAX_RANGE_PORTS_NON_ADMIN`: the largest port range a token without `admin` may open.
-pub const DEFAULT_NON_ADMIN_RANGE_PORTS: usize = 1_024;
 /// File descriptors kept out of `RPROXY_MAX_LISTENERS`'s automatic value for everything
 /// else besides the connections (the control API, the database, DNS, files).
 pub const RESERVED_FDS: u64 = 1_024;
@@ -26,7 +23,6 @@ const MIN_LISTENERS: usize = 256;
 static MAX_RULES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RULES);
 static MAX_LISTENERS: AtomicUsize = AtomicUsize::new(FALLBACK_LISTENERS);
 static MAX_RULESETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RULESETS);
-static NON_ADMIN_RANGE_PORTS: AtomicUsize = AtomicUsize::new(DEFAULT_NON_ADMIN_RANGE_PORTS);
 
 /// `RPROXY_MAX_LISTENERS`'s automatic value (`0`): half of what the file limit leaves after
 /// `RESERVED_FDS` (the other half for connections), at least `MIN_LISTENERS`.
@@ -39,12 +35,11 @@ pub fn auto_listeners(nofile: Option<u64>) -> usize {
 
 /// The limits of the process (at startup). `0` in any of them: no limit (`listeners`: the
 /// automatic value from `nofile`).
-pub fn set(rules: usize, listeners: usize, rulesets: usize, non_admin_range_ports: usize, nofile: Option<u64>) {
+pub fn set(rules: usize, listeners: usize, rulesets: usize, nofile: Option<u64>) {
 	let none = |n: usize| if n == 0 { usize::MAX } else { n };
 	MAX_RULES.store(none(rules), Ordering::Relaxed);
 	MAX_LISTENERS.store(if listeners == 0 { auto_listeners(nofile) } else { listeners }, Ordering::Relaxed);
 	MAX_RULESETS.store(none(rulesets), Ordering::Relaxed);
-	NON_ADMIN_RANGE_PORTS.store(none(non_admin_range_ports), Ordering::Relaxed);
 }
 
 pub fn max_rules() -> usize {
@@ -94,19 +89,14 @@ pub fn check_rulesets(sets: usize) -> Result<(), ApiError> {
 	Ok(())
 }
 
-/// What only an `admin` token may ask for in a rule: `listen_freebind` (binding addresses
-/// that are not on the host) and port ranges of more than
-/// `RPROXY_MAX_RANGE_PORTS_NON_ADMIN` ports.
-pub fn check_non_admin(listen_freebind: bool, first: u16, last: Option<u16>) -> Result<(), ApiError> {
-	if listen_freebind {
-		return Err(ApiError::forbidden("listen_freebind needs a token with the admin scope"));
-	}
-	let ports = usize::from(last.unwrap_or(first).saturating_sub(first)) + 1;
-	let max = NON_ADMIN_RANGE_PORTS.load(Ordering::Relaxed);
-	if ports > max {
-		return Err(ApiError::forbidden(format!(
-			"a range of more than {max} ports needs a token with the admin scope (RPROXY_MAX_RANGE_PORTS_NON_ADMIN)"
-		)));
+/// `listen_freebind` (binding addresses that are not on the host) for a token that may not
+/// ask for it (`allowed`: `admin`, `allow_freebind: true` of the token file, or a rule set's
+/// `PUT` by a token limited by `allow_rulesets`, such as rproxy-gateway's).
+pub fn check_freebind(listen_freebind: bool, allowed: bool) -> Result<(), ApiError> {
+	if listen_freebind && !allowed {
+		return Err(ApiError::forbidden(
+			"listen_freebind needs a token with the admin scope or allow_freebind: true (a rule set's PUT also by a token with allow_rulesets)",
+		));
 	}
 	Ok(())
 }
@@ -143,9 +133,9 @@ mod tests {
 	}
 
 	#[test]
-	fn freebind_and_large_ranges_need_admin() {
-		assert!(check_non_admin(true, 80, None).is_err());
-		assert!(check_non_admin(false, 1000, Some(1000 + DEFAULT_NON_ADMIN_RANGE_PORTS as u16 - 1)).is_ok());
-		assert!(check_non_admin(false, 1000, Some(1000 + DEFAULT_NON_ADMIN_RANGE_PORTS as u16)).is_err());
+	fn freebind_needs_permission() {
+		assert!(check_freebind(true, false).is_err());
+		assert!(check_freebind(true, true).is_ok());
+		assert!(check_freebind(false, false).is_ok());
 	}
 }

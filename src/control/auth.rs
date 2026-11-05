@@ -68,6 +68,8 @@ pub struct Principal {
 	pub max_rules: Option<usize>,
 	/// Rule sets the token may own (`max_rulesets`, #358).
 	pub max_rulesets: Option<usize>,
+	/// `allow_freebind: true` of the token file (#358).
+	allow_freebind: bool,
 }
 
 impl Principal {
@@ -83,7 +85,15 @@ impl Principal {
 			certs: None,
 			max_rules: None,
 			max_rulesets: None,
+			allow_freebind: false,
 		}
+	}
+
+	/// Whether the token may ask for `listen_freebind` (#358): `admin`, `allow_freebind: true`,
+	/// or (`in_ruleset`) a rule set's `PUT` by a token limited by `allow_rulesets` — what
+	/// rproxy-gateway's token is, which sets it for Gateways with `spec.addresses`.
+	pub fn may_freebind(&self, in_ruleset: bool) -> bool {
+		self.has(Scope::Admin) || self.allow_freebind || (in_ruleset && self.rulesets.is_some())
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -170,6 +180,9 @@ struct TokenEntry {
 	/// Rule sets this token may own (#358).
 	#[serde(default)]
 	max_rulesets: Option<usize>,
+	/// Rules with `listen_freebind` without `admin` (#358).
+	#[serde(default)]
+	allow_freebind: bool,
 	#[serde(default)]
 	expires: Option<String>,
 }
@@ -278,6 +291,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					certs: e.allow_certs,
 					max_rules: e.max_rules,
 					max_rulesets: e.max_rulesets,
+					allow_freebind: e.allow_freebind,
 				},
 				expires,
 			});
@@ -301,6 +315,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					certs: None,
 					max_rules: None,
 					max_rulesets: None,
+					allow_freebind: false,
 				},
 				expires: None,
 			})

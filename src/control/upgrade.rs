@@ -288,7 +288,12 @@ pub async fn upgrade(State(state): State<Arc<AppState>>, transport: Option<Exten
 /// `GET /admin/update`: the self-update state (`admin`).
 pub async fn update_status() -> Response {
 	match installed() {
-		Some(u) => Json(u.updater.status()).into_response(),
+		Some(u) => {
+			let mut v = serde_json::to_value(u.updater.status()).unwrap_or_default();
+			// a live upgrade waits while the old process of the last one drains (#358)
+			v["parent_draining"] = json!(handoff::parent_draining());
+			Json(v).into_response()
+		}
 		None => Json(json!({
 			"mode": "off",
 			"current": {"version": env!("CARGO_PKG_VERSION"), "sha256": build_sha256()},

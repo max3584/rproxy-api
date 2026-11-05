@@ -1451,7 +1451,12 @@ impl Converter<'_> {
 		if g(self.static_, &["metrics"]).is_some() {
 			self.note("metrics", "rproxy serves Prometheus metrics at GET /metrics of its control API");
 		}
-		let rules = self.output_rules();
+		let mut rules = self.output_rules();
+		for rule in &mut rules {
+			for (what, old, new) in safe_names(rule) {
+				self.note(&format!("{what} {old}"), &format!("renamed {new}: rproxy's names have no white space, control characters, quotes, \\, `, {{ or }}"));
+			}
+		}
 		let mut doc = map([("version", 1.into())]);
 		let glob = self.global_spec();
 		if !glob.is_empty() {
@@ -1460,6 +1465,140 @@ impl Converter<'_> {
 		doc.insert("rules", rules);
 		Ok(Value::Map(doc))
 	}
+}
+
+/// Whether rproxy takes `name` as a route, middleware or service name (rproxy-api's
+/// `l7::check_name`, #358): 1 to 512 bytes without control characters, white space, `"`,
+/// `\`, `` ` ``, `{` or `}`.
+pub fn name_ok(name: &str) -> bool {
+	!name.is_empty()
+		&& name.len() <= 512
+		&& !name.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}'))
+}
+
+/// `name` with what rproxy does not take replaced by `_` (and cut to 512 bytes).
+fn safe_name(name: &str) -> String {
+	let mut out: String =
+		name.chars().map(|c| if c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}') { '_' } else { c }).collect();
+	if out.is_empty() {
+		out.push('_');
+	}
+	while out.len() > 512 {
+		out.pop();
+	}
+	out
+}
+
+/// Renames the routes, middlewares and services of a rule's `http` that rproxy would refuse
+/// (Traefik's file provider takes any key), and every reference to them; what was renamed
+/// as (kind, old name, new name).
+fn safe_names(rule: &mut Value) -> Vec<(&'static str, String, String)> {
+	let Some(Value::Map(http)) = (match rule {
+		Value::Map(r) => r.get_mut("http"),
+		_ => None,
+	}) else {
+		return vec![];
+	};
+	let mut renamed = vec![];
+	let plan = |kind: &'static str, names: Vec<String>, renamed: &mut Vec<(&'static str, String, String)>| {
+		let mut map = std::collections::HashMap::new();
+		for n in names.iter().filter(|n| !name_ok(n)) {
+			let mut new = safe_name(n);
+			while names.contains(&new) || map.values().any(|v| v == &new) {
+				new.push('_');
+			}
+			renamed.push((kind, n.clone(), new.clone()));
+			map.insert(n.clone(), new);
+		}
+		map
+	};
+	let keys = |m: Option<&Value>| match m {
+		Some(Value::Map(m)) => m.keys().cloned().collect::<Vec<_>>(),
+		_ => vec![],
+	};
+	let services = plan("service", keys(http.get("services")), &mut renamed);
+	let middlewares = plan("middleware", keys(http.get("middlewares")), &mut renamed);
+	let route_names: Vec<String> = match http.get("routes") {
+		Some(Value::List(l)) => l.iter().filter_map(|r| match r {
+			Value::Map(r) => match r.get("name") {
+				Some(Value::Str(n)) => Some(n.clone()),
+				_ => None,
+			},
+			_ => None,
+		}).collect(),
+		_ => vec![],
+	};
+	let routes = plan("route", route_names, &mut renamed);
+	if renamed.is_empty() {
+		return renamed;
+	}
+	fn rename(v: &mut Value, map: &std::collections::HashMap<String, String>) {
+		if let Value::Str(s) = v {
+			if let Some(n) = map.get(s.as_str()) {
+				*s = n.clone();
+			}
+		}
+	}
+	fn rename_list(v: Option<&mut Value>, map: &std::collections::HashMap<String, String>) {
+		if let Some(Value::List(l)) = v {
+			l.iter_mut().for_each(|v| rename(v, map));
+		}
+	}
+	/// `service` fields anywhere under a middleware (errors, mirror, forward_auth …).
+	fn rename_services(v: &mut Value, map: &std::collections::HashMap<String, String>) {
+		match v {
+			Value::Map(m) => {
+				for (k, v) in m.iter_mut() {
+					if k == "service" {
+						rename(v, map);
+					} else {
+						rename_services(v, map);
+					}
+				}
+			}
+			Value::List(l) => l.iter_mut().for_each(|v| rename_services(v, map)),
+			_ => {}
+		}
+	}
+	if let Some(Value::List(l)) = http.get_mut("routes") {
+		for r in l {
+			if let Value::Map(r) = r {
+				if let Some(n) = r.get_mut("name") {
+					rename(n, &routes);
+				}
+				rename_list(r.get_mut("middlewares"), &middlewares);
+				if let Some(s) = r.get_mut("service") {
+					rename(s, &services);
+				}
+			}
+		}
+	}
+	if let Some(Value::Map(m)) = http.get_mut("services") {
+		m.rename_keys(|k| services.get(k).cloned());
+		for (_, svc) in m.iter_mut() {
+			if let Value::Map(svc) = svc {
+				if let Some(Value::List(servers)) = svc.get_mut("servers") {
+					for s in servers {
+						if let Value::Map(s) = s {
+							rename_list(s.get_mut("middlewares"), &middlewares);
+						}
+					}
+				}
+			}
+		}
+	}
+	if let Some(Value::Map(m)) = http.get_mut("middlewares") {
+		m.rename_keys(|k| middlewares.get(k).cloned());
+		for (_, mw) in m.iter_mut() {
+			rename_services(mw, &services);
+		}
+	}
+	if let Some(Value::Map(d)) = http.get_mut("default") {
+		if let Some(s) = d.get_mut("service") {
+			rename(s, &services);
+		}
+	}
+	renamed
 }
 
 /// `source_ip` for a Traefik service's `proxyProtocol.version`.
@@ -1547,4 +1686,38 @@ pub fn check_capabilities(doc: &Value, capabilities: Option<&Value>, notes: &mut
 		);
 	}
 	missing
+}
+
+#[cfg(test)]
+mod name_tests {
+	use super::*;
+
+	#[test]
+	fn names_rproxy_refuses_are_renamed_with_their_references() {
+		let mut rule = Value::Map(map([(
+			"http",
+			Value::Map(map([
+				(
+					"routes",
+					Value::List(vec![Value::Map(map([
+						("name", "my router".into()),
+						("middlewares", Value::List(vec!["auth {x}".into(), "ok".into()])),
+						("service", "web app".into()),
+					]))]),
+				),
+				("middlewares", Value::Map(map([("auth {x}", Value::Map(Map::new())), ("ok", Value::Map(Map::new()))]))),
+				("services", Value::Map(map([("web app", Value::Map(Map::new()))]))),
+			])),
+		)]));
+		let renamed = safe_names(&mut rule);
+		assert_eq!(renamed.len(), 3, "{renamed:?}");
+		let http = g(&rule, &["http"]).unwrap();
+		let route = &as_list(g(http, &["routes"]))[0];
+		assert_eq!(py_str_opt(g(route, &["name"])), "my_router");
+		assert_eq!(py_str_opt(g(route, &["service"])), "web_app");
+		assert_eq!(as_list(g(route, &["middlewares"])).iter().map(py_str).collect::<Vec<_>>(), ["auth__x_", "ok"]);
+		assert!(g(http, &["middlewares", "auth__x_"]).is_some());
+		assert!(g(http, &["services", "web_app"]).is_some());
+		assert!(name_ok("grpc:ns/name/r0") && !name_ok("a b"));
+	}
 }

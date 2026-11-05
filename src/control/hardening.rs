@@ -344,27 +344,84 @@ pub const DEFAULT_API_MAX_CONNECTIONS: usize = 512;
 /// a kept-alive HTTP/1.1 connection (hyper's `header_read_timeout`, #358).
 pub const API_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// An acceptor that takes a connection only while fewer than its limit are open: one
-/// more is closed right away (`api.connections_full`, at most once a minute in the log).
+/// `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE`: TCP connections one source address keeps at a time.
+pub const DEFAULT_API_MAX_PER_SOURCE: usize = 64;
+
+/// Connections `Capped` closed for a limit (`rproxy_api_connections_refused_total`).
+static API_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn api_connections_refused() -> u64 {
+	API_REFUSED.load(Ordering::Relaxed)
+}
+
+/// An acceptor that takes a connection only while fewer than `limit` are open and its
+/// source has fewer than `per_source` (IPv6 by /64, as `Lockout`): one more is closed right
+/// away (`api.connections_full`, at most once a minute in the log). Loopback is never
+/// refused (local health checks and the UI on the host; `/healthz`, `/readyz`).
 #[derive(Clone)]
 pub struct Capped<A> {
 	inner: A,
-	open: Arc<tokio::sync::Semaphore>,
+	state: Arc<CapState>,
+}
+
+struct CapState {
 	limit: usize,
-	said: Arc<Mutex<Option<Instant>>>,
+	per_source: usize,
+	open: Mutex<(usize, HashMap<IpAddr, usize>)>,
+	said: Mutex<Option<Instant>>,
 }
 
 impl<A> Capped<A> {
-	/// `limit` 0: no limit.
-	pub fn new(inner: A, limit: usize) -> Self {
-		let limit = if limit == 0 { tokio::sync::Semaphore::MAX_PERMITS } else { limit };
-		Capped { inner, open: Arc::new(tokio::sync::Semaphore::new(limit)), limit, said: Arc::default() }
+	/// `limit` / `per_source` 0: no limit.
+	pub fn new(inner: A, limit: usize, per_source: usize) -> Self {
+		let none = |n: usize| if n == 0 { usize::MAX } else { n };
+		let state = CapState { limit: none(limit), per_source: none(per_source), open: Mutex::default(), said: Mutex::default() };
+		Capped { inner, state: Arc::new(state) }
 	}
 }
 
-impl<A, I, S> Accept<I, S> for Capped<A>
+impl CapState {
+	/// Counts a connection from `ip`; false when a limit is reached.
+	fn take(&self, ip: IpAddr) -> bool {
+		let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+		let (total, by_source) = &mut *open;
+		let loopback = crate::l7::access::canonical(ip).is_loopback();
+		let source = by_source.get(&source_key(ip)).copied().unwrap_or(0);
+		if !loopback && (*total >= self.limit || source >= self.per_source) {
+			return false;
+		}
+		*total += 1;
+		*by_source.entry(source_key(ip)).or_default() += 1;
+		true
+	}
+
+	fn give_back(&self, ip: IpAddr) {
+		let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+		let (total, by_source) = &mut *open;
+		*total = total.saturating_sub(1);
+		let key = source_key(ip);
+		if let Some(n) = by_source.get_mut(&key) {
+			*n -= 1;
+			if *n == 0 {
+				by_source.remove(&key);
+			}
+		}
+	}
+
+	fn refused(&self, ip: IpAddr) {
+		API_REFUSED.fetch_add(1, Ordering::Relaxed);
+		let mut said = self.said.lock().unwrap_or_else(|e| e.into_inner());
+		if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+			*said = Some(Instant::now());
+			warn!(event = "api.connections_full", client = %ip, limit = self.limit, per_source = self.per_source,
+				"the control API has as many connections open as RPROXY_API_MAX_CONNECTIONS (or this source as RPROXY_API_MAX_CONNECTIONS_PER_SOURCE); new ones are closed");
+		}
+	}
+}
+
+impl<A, S> Accept<tokio::net::TcpStream, S> for Capped<A>
 where
-	A: Accept<I, S>,
+	A: Accept<tokio::net::TcpStream, S>,
 	A::Future: Send + 'static,
 	A::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	A::Service: Send + 'static,
@@ -373,29 +430,38 @@ where
 	type Service = A::Service;
 	type Future = BoxFuture<io::Result<(Self::Stream, Self::Service)>>;
 
-	fn accept(&self, stream: I, service: S) -> Self::Future {
-		let Ok(permit) = self.open.clone().try_acquire_owned() else {
-			let mut said = self.said.lock().unwrap_or_else(|e| e.into_inner());
-			if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-				*said = Some(Instant::now());
-				warn!(event = "api.connections_full", limit = self.limit,
-					"the control API has as many connections open as RPROXY_API_MAX_CONNECTIONS; new ones are closed");
-			}
+	fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+		let ip = stream.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+		if !self.state.take(ip) {
+			self.state.refused(ip);
 			drop(stream);
 			return Box::pin(std::future::ready(Err(io::Error::other("the control API has too many connections"))));
-		};
+		}
+		let counted = Counted { state: self.state.clone(), ip };
 		let accepted = self.inner.accept(stream, service);
 		Box::pin(async move {
 			let (stream, service) = accepted.await?;
-			Ok((Held { inner: stream, _permit: permit }, service))
+			Ok((Held { inner: stream, _counted: counted }, service))
 		})
+	}
+}
+
+/// Gives a connection's place back when dropped.
+struct Counted {
+	state: Arc<CapState>,
+	ip: IpAddr,
+}
+
+impl Drop for Counted {
+	fn drop(&mut self) {
+		self.state.give_back(self.ip);
 	}
 }
 
 /// A connection of `Capped`, counted until it is dropped.
 pub struct Held<S> {
 	inner: S,
-	_permit: tokio::sync::OwnedSemaphorePermit,
+	_counted: Counted,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Held<S> {
@@ -727,12 +793,35 @@ pub fn metrics(tokens: &crate::control::auth::Tokens) -> String {
 		let _ = writeln!(out, "# TYPE rproxy_api_locked_sources gauge");
 		let _ = writeln!(out, "rproxy_api_locked_sources {}", lockout.locked_sources());
 	}
+	let _ = writeln!(out, "# HELP rproxy_api_connections_refused_total TCP connections of the control API closed for RPROXY_API_MAX_CONNECTIONS or _PER_SOURCE.");
+	let _ = writeln!(out, "# TYPE rproxy_api_connections_refused_total counter");
+	let _ = writeln!(out, "rproxy_api_connections_refused_total {}", api_connections_refused());
 	out
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn connections_are_capped_in_all_and_per_source_but_not_from_loopback() {
+		let cap = Capped::new((), 3, 2);
+		let s = &cap.state;
+		let a: IpAddr = "192.0.2.1".parse().unwrap();
+		let b: IpAddr = "2001:db8::1".parse().unwrap();
+		let b2: IpAddr = "2001:db8::2".parse().unwrap();
+		let lo: IpAddr = "127.0.0.1".parse().unwrap();
+		assert!(s.take(a) && s.take(a));
+		assert!(!s.take(a), "per source");
+		assert!(s.take(b));
+		assert!(!s.take(b2), "in all (and the same /64)");
+		assert!(s.take(lo) && s.take(lo), "loopback is never refused");
+		s.give_back(a);
+		s.give_back(lo);
+		s.give_back(lo);
+		assert!(s.take(b2));
+		assert!(!s.take(b), "the /64 has 2");
+	}
 
 	#[test]
 	fn options_are_checked() {

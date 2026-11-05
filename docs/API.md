@@ -27,6 +27,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           allow_certs: [ci-]                # v0.4.2（#240）：PUT / DELETE / 読む・ルールで使える保存した証明書の名前の先頭（省略ですべて）
           max_rules: 200                    # v0.4.20（#358）：持てるルールの数（自分の組のルールも数える。省略でプロセスの上限だけ）
           max_rulesets: 10                  # v0.4.20（#358）：持てるルールの組の数
+          allow_freebind: true              # v0.4.20（#358）：admin でなくても listen_freebind のルールを作れる（既定 false）
           expires: 2027-03-31               # この日（UTC）まで有効
           persist: true                     # v0.4（#144）：作ったルールを rproxy_rules に保存する（既定 false）
       ```
@@ -1215,18 +1216,18 @@ http:
 `rules:write` のトークンが、プロセスの資源（ファイル記述子・メモリ）や `/metrics` を使い切ったり壊したりできないように。設定ファイルのルールと、DB・引き継ぎから戻すルールは数えるが断らない（上限はトークンの頼むものだけ）。どれも、増やさない変更（削除・数の変わらない変更）はいつでも通る（上限を下げた後に片付けられるように）。
 
 - ルールの数：`RPROXY_MAX_RULES`（既定 10000、`0` でなし）。超える作成・組の `PUT` は `409 limit`。
-- 待ち受けのソケットの数：`RPROXY_MAX_LISTENERS`（既定 `0` = 自動：ファイル記述子の上限から 1024 を除いた半分、256 以上。上限が分からなければ 16384。ユニットの `LimitNOFILE=65536` では 32256）。ルールのソケットは、アドレス（`extra_listen_addrs` も）× ポートの数、`http3` なら 2 倍。作成・組の `PUT`・ソケットの増える `PATCH`（アドレスを足す、`http3` を有効にする）が超えると `409 limit`。
+- 待ち受けのソケットの数：`RPROXY_MAX_LISTENERS`（既定 `0` = 自動：ファイル記述子の上限から 1024 を除いた半分、256 以上なので、上限が 1024 のときも 256。上限が分からなければ 16384。ユニットの `LimitNOFILE=65536` では 32256）。ルールのソケットは、アドレス（`extra_listen_addrs` も）× ポートの数、`http3` なら 2 倍。作成・組の `PUT`・ソケットの増える `PATCH`（アドレスを足す、`http3` を有効にする）が超えると `409 limit`。
 - ルールの組の数：`RPROXY_MAX_RULESETS`（既定 1000、`0` でなし）。
 - トークンごと：トークンファイルの `max_rules`（自分の作ったルールと自分の組のルール）・`max_rulesets`（自分の組）。省略で上限なし（プロセスの上限だけ）。超えると `409 limit`。
-- `admin` だけのもの：`listen_freebind: true`（ホストにないアドレスを bind する）と、`RPROXY_MAX_RANGE_PORTS_NON_ADMIN`（既定 1024、`0` で `RPROXY_MAX_RANGE_PORTS` まで）を超えるポートの範囲。ほかのトークンは `403 forbidden`（組の `PUT` も）。
-- ルート・ミドルウェア・サービスの名前：1〜512 バイトで、制御文字・空白・`"`・`\`・`` ` ``・`{`・`}` を含まない（`400 invalid`）。ほかの文字（日本語などの文字・数字・`/ : . _ - @ +` など）は使える。rproxy-gateway の名前（`grpc:<名前空間>/<ルート>/r0/b1/f2.3` など）と Traefik の変換の名前は通る。`/metrics` のラベルの値は `\`・`"`・改行をエスケープする（どのラベルも）。
+- `listen_freebind: true`（ホストにないアドレスを bind する）を頼めるのは、`admin`、トークンファイルで `allow_freebind: true` のトークン、組の `PUT` では `allow_rulesets` のあるトークンも（rproxy-gateway のトークンはこれで、`spec.addresses` のある Gateway に付ける。トークンを変えずに動き続ける）。ほかは `403 forbidden`。組の `PUT` で確かめるのは新しいルールと変わるルールだけ（組にすでにあって変わらないルールは見ない）。ポートの範囲の大きさはトークンで分けない（プロセスの `RPROXY_MAX_RANGE_PORTS` と待ち受けのソケットの上限）。
+- ルート・ミドルウェア・サービスの名前：API に送るもの（`POST` / `PATCH /rules`・`PUT /rulesets`、dry run も）は 1〜512 バイトで、制御文字・空白・`"`・`\`・`` ` ``・`{`・`}` を含まない（`400 invalid`）。ほかの文字（日本語などの文字・数字・`/ : . _ - @ +` など）は使える。rproxy-gateway の名前（`grpc:<名前空間>/<ルート>/r0/b1/f2.3` など）は通り、Traefik の変換は通らない名前を `_` に置き換える（注記つき）。設定ファイルのルールと、DB・引き継ぎから戻すルール・組は確かめない（前から動いているものはそのまま動く）。ルートの名前を変えると、その数（`stats.http.routes`・`/metrics`）は 0 から数え直す。`/metrics` のラベルの値は `\`・`"`・改行をエスケープする（どのラベルも）。
 - ルールが指すファイルの大きさ：証明書・CA・鍵・秘密は 4 MiB まで、`basic_auth` の `users_file` は 16 MiB まで（開いたファイルの大きさを確かめ、読むのもそこまで）。超えると `400`（理由はログの `config.file`）。API の作成・変更でファイルを読むあいだ、tokio のワーカーはほかのタスクを渡してから読む。
-- 制御 API の TCP の接続：アドレスごとに `RPROXY_API_MAX_CONNECTIONS`（既定 512、`0` でなし）まで。超えた接続はすぐ閉じる（`api.connections_full` を 1 分に 1 回まで）。リクエストのヘッダは 30 秒以内に（HTTP/1.1 の keep-alive の次のリクエストを待つのも 30 秒まで）、HTTP/2 は 60 秒ごとに PING（20 秒で答えがなければ閉じる）。
-- `DELETE` の `drain_secs` は 3600 秒まで。
-- DB（`rproxy_rules`）に届かないあいだに消したルール・組の行の削除は 10000 件まで覚える。超えたら、その DB に保存されたルール・組の `DELETE` は `503 busy`（DB が戻って書けたら通る）。
+- 制御 API の TCP の接続：待ち受けのアドレスごとに `RPROXY_API_MAX_CONNECTIONS`（既定 512、`0` でなし）まで、1 つの送信元（IPv6 は /64）からは `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE`（既定 64、`0` でなし）まで。loopback（同じホストのヘルスチェック・UI、`/healthz`・`/readyz`）はどちらでも断らない。超えた接続はすぐ閉じる（`api.connections_full` を 1 分に 1 回まで、`/metrics` の `rproxy_api_connections_refused_total`）。リクエストのヘッダは 30 秒以内に（HTTP/1.1 の keep-alive の次のリクエストを待つのも 30 秒まで）、HTTP/2 は 60 秒ごとに PING（20 秒で答えがなければ閉じる）。
+- `DELETE` の `drain_secs` は 3600 秒まで（使った値はログの `rule.delete` の `drain_secs`）。
+- DB（`rproxy_rules`）に届かないあいだに消したルール・組の行の削除は 10000 件まで覚える。超えたら、その DB に保存されたルール・組の `DELETE` は `503 busy`。DB が戻って書けたら通る。DB が戻らないまま消す必要があるときは `admin` のトークンで消す（上限を超えて覚える）。
 - `http` の変更（`PATCH`・組）でなくなったルート・ミドルウェアの数（`stats.http.routes`・`/metrics`）は消す。`tls` を変えたら、使われなくなった証明書を捨てる（ACME にも知らせる）。
-- 背景のタスク（設定ファイル・トークン・証明書の監視、ACME、GeoIP の読み直し、DB の係・ping・照合）は panic しても `degraded`（`part`）をログに出して、1 秒から倍々で 1 分まで待って動かし直す。DB の係で panic した仕事はその仕事だけが失敗する。
-- 引き継ぎ（#174）：引き継いだ古いプロセスがまだ drain しているあいだは、新しい引き継ぎを始めない（`409 upgrading`、SIGUSR2・自動更新も。古いプロセスの最後の数がこのプロセスに届くため）。
+- 背景のタスク（設定ファイル・トークン・証明書の監視、ACME、GeoIP の読み直し、DB の係・ping・照合）は panic しても `degraded`（`part`）をログに出して、1 秒から倍々で 1 分まで待って動かし直す（5 分以上動いた後の panic は 1 秒から）。`/metrics` の `rproxy_task_restarts_total{part}`。DB の係で panic した仕事はその仕事だけが失敗し、DB の接続は開き直す。
+- 引き継ぎ（#174）：引き継いだ古いプロセスがまだ drain しているあいだは、新しい引き継ぎを始めない（`409 upgrading`、SIGUSR2・自動更新も。古いプロセスの最後の数がこのプロセスに届くため）。待つのは長くても古いプロセスの drain（`RPROXY_HANDOFF_DRAIN`）と 60 秒まで。`GET /admin/update` の `parent_draining`。自動更新はこの断りでその版を悪い版にしない（次の確認でまた試す）。
 
 ## エンドポイント
 

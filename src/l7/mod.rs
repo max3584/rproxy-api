@@ -788,7 +788,11 @@ pub fn check_name(what: &str, name: &str) -> Result<(), ApiError> {
 
 impl HttpSpec {
 	/// Checks the settings on their own (names, references, expressions).
-	pub fn validate(&self) -> Result<(), ApiError> {
+	/// The names of routes, middlewares and services (`check_name`, #358), for what the
+	/// control API is sent (`POST` / `PATCH /rules`, `PUT /rulesets`): rules of the settings
+	/// file and those restored (the database, a live upgrade) are not held to it, so a rule
+	/// that ran before keeps running (`/metrics` escapes every label anyway).
+	pub fn check_names(&self) -> Result<(), ApiError> {
 		for name in self.services.keys() {
 			check_name("service", name)?;
 		}
@@ -798,6 +802,10 @@ impl HttpSpec {
 		for r in self.routes.iter().filter(|r| !r.name.is_empty()) {
 			check_name("route", &r.name)?;
 		}
+		Ok(())
+	}
+
+	pub fn validate(&self) -> Result<(), ApiError> {
 		for (name, svc) in &self.services {
 			if svc.servers.is_empty() {
 				return Err(invalid(format!("service {name}: servers is empty")));

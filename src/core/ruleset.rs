@@ -557,11 +557,12 @@ pub struct PutOptions<'a> {
 }
 
 /// What `PutOptions::limits` checks besides the process's limits: the token's
-/// `max_rules` and `max_rulesets`.
+/// `max_rules` and `max_rulesets`, and whether it may ask for `listen_freebind`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SetLimits {
 	pub max_rules: Option<usize>,
 	pub max_rulesets: Option<usize>,
+	pub freebind: bool,
 }
 
 /// A rule as it is now, for planning a PUT.
@@ -595,8 +596,9 @@ fn port_range(spec: &RuleSpec) -> (u16, u16) {
 }
 
 impl Registry {
-	/// The limits of #358 for a PUT of the control API: what only `admin` may ask for in a
-	/// rule, the rules, listening sockets and rule sets of the process, and the token's.
+	/// The limits of #358 for a PUT of the control API: `listen_freebind` in the rules it
+	/// creates or changes (one the set has already is not looked at again), the rules,
+	/// listening sockets and rule sets of the process, and the token's.
 	fn check_set_limits(
 		&self,
 		name: &str,
@@ -607,19 +609,15 @@ impl Registry {
 		limits: SetLimits,
 	) -> Result<(), SetError> {
 		use crate::core::quota;
-		if !opts.admin {
-			let problems: Vec<_> = specs
-				.iter()
-				.filter_map(|(i, spec)| {
-					let (first, last) = port_range(spec);
-					quota::check_non_admin(spec.listen_freebind, first, Some(last)).err().map(|e| finding(*i, spec.key.to_string(), e))
-				})
-				.collect();
-			if !problems.is_empty() {
-				return Err(SetError::of(problems));
-			}
-		}
 		let ours = |c: &Current| c.spec.ruleset.as_deref() == Some(name);
+		let problems: Vec<_> = specs
+			.iter()
+			.filter(|(_, spec)| current.get(&spec.key).filter(|c| ours(c)).is_none_or(|c| c.spec != *spec))
+			.filter_map(|(i, spec)| quota::check_freebind(spec.listen_freebind, limits.freebind).err().map(|e| finding(*i, spec.key.to_string(), e)))
+			.collect();
+		if !problems.is_empty() {
+			return Err(SetError::of(problems));
+		}
 		let kept = current.values().filter(|c| !ours(c));
 		let rules_after = kept.clone().count() + specs.len();
 		let sockets_before: usize = current.values().map(|c| quota::sockets(&c.spec)).sum();

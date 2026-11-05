@@ -12,6 +12,30 @@ use tracing::error;
 
 const MAX_PAUSE: Duration = Duration::from_secs(60);
 
+/// A task that ran this long before it panicked starts again after the first pause.
+const STABLE: Duration = Duration::from_secs(300);
+
+/// Restarts by `part` (`rproxy_task_restarts_total`).
+static RESTARTS: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Counts a restart of `part` (a supervised task, or a database job that panicked).
+pub fn count_restart(part: &'static str) {
+	*RESTARTS.lock().unwrap_or_else(|e| e.into_inner()).entry(part).or_default() += 1;
+}
+
+/// The `GET /metrics` lines.
+pub fn metrics() -> String {
+	use std::fmt::Write as _;
+	let restarts = RESTARTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+	let mut out = String::new();
+	let _ = writeln!(out, "# HELP rproxy_task_restarts_total Background tasks started again after a panic, by part.");
+	let _ = writeln!(out, "# TYPE rproxy_task_restarts_total counter");
+	for (part, n) in restarts {
+		let _ = writeln!(out, "rproxy_task_restarts_total{{part=\"{}\"}} {n}", crate::core::prom::label(part));
+	}
+	out
+}
+
 /// What a panic said.
 pub fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 	match (p.downcast_ref::<&str>(), p.downcast_ref::<String>()) {
@@ -37,9 +61,14 @@ where
 {
 	let mut pause = first;
 	loop {
+		let started = tokio::time::Instant::now();
 		match AssertUnwindSafe(make()).catch_unwind().await {
 			Ok(()) => return,
 			Err(p) => {
+				count_restart(part);
+				if started.elapsed() >= STABLE {
+					pause = first;
+				}
 				error!(event = "degraded", part, error = %panic_message(p.as_ref()), restart_secs = pause.as_secs_f64(),
 					"a background task panicked; it is started again");
 				tokio::time::sleep(pause).await;
@@ -73,5 +102,6 @@ mod tests {
 		)
 		.await;
 		assert_eq!(runs.load(Ordering::SeqCst), 3);
+		assert!(metrics().contains("rproxy_task_restarts_total{part=\"test\"} 2"), "{}", metrics());
 	}
 }

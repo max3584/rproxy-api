@@ -122,8 +122,8 @@ async fn files_larger_than_the_limit_are_refused() {
 	fs::remove_dir_all(dir).unwrap();
 }
 
-/// `listen_freebind` and large ranges need `admin`; a token's `max_rules` and
-/// `max_rulesets` count its rules (its sets' too) and its sets.
+/// `listen_freebind` needs `admin` or `allow_freebind` (a set's `PUT` also `allow_rulesets`);
+/// a token's `max_rules` and `max_rulesets` count its rules (its sets' too) and its sets.
 #[tokio::test]
 async fn tokens_are_held_to_their_limits() {
 	let dir = workdir("tokens");
@@ -131,9 +131,10 @@ async fn tokens_are_held_to_their_limits() {
 	fs::write(
 		&file,
 		format!(
-			"tokens:\n  - {{name: admin, sha256: {}, scopes: [admin]}}\n  - {{name: ctl, sha256: {}, scopes: [rules:write, rules:read], max_rules: 2, max_rulesets: 1}}\n",
+			"tokens:\n  - {{name: admin, sha256: {}, scopes: [admin]}}\n  - {{name: ctl, sha256: {}, scopes: [rules:write, rules:read], max_rules: 2, max_rulesets: 1}}\n  - {{name: fb, sha256: {}, scopes: [rules:write, rules:read], allow_freebind: true}}\n",
 			sha("admin"),
-			sha("ctl")
+			sha("ctl"),
+			sha("fb")
 		),
 	)
 	.unwrap();
@@ -145,18 +146,15 @@ async fn tokens_are_held_to_their_limits() {
 
 	let mut freebind = rule("tcp", free_port(), a);
 	freebind["listen_freebind"] = json!(true);
-	let r = call("ctl", Method::POST, "/rules".into(), freebind).await.unwrap();
+	let r = call("ctl", Method::POST, "/rules".into(), freebind.clone()).await.unwrap();
 	assert_eq!(r.status(), StatusCode::FORBIDDEN);
-	assert!(r.text().await.unwrap().contains("admin"));
-	let base = free_tcp_block(1);
-	let mut range = rule("tcp", base, a);
-	range["listen_port_end"] = json!(base + rproxy_api::core::quota::DEFAULT_NON_ADMIN_RANGE_PORTS as u16);
-	range["remote_port"] = json!(1000);
-	let r = call("ctl", Method::POST, "/rules".into(), range.clone()).await.unwrap();
+	assert!(r.text().await.unwrap().contains("allow_freebind"));
+	// a token without allow_rulesets: not through a rule set either
+	let r = call("ctl", Method::PUT, "/rulesets/free".into(), json!({"generation": 1, "rules": [freebind.clone()]})).await.unwrap();
 	assert_eq!(r.status(), StatusCode::FORBIDDEN);
-	// the same set of rules through a rule set
-	let r = call("ctl", Method::PUT, "/rulesets/wide".into(), json!({"generation": 1, "rules": [range]})).await.unwrap();
-	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	// allow_freebind: true
+	let r = call("fb", Method::POST, "/rules".into(), freebind).await.unwrap();
+	assert_eq!(r.status(), StatusCode::CREATED);
 
 	// max_rules: 2, one of them in a set
 	let r = call("ctl", Method::POST, "/rules".into(), rule("tcp", free_port(), a)).await.unwrap();
@@ -179,4 +177,76 @@ async fn tokens_are_held_to_their_limits() {
 	let r = call("admin", Method::POST, "/rules".into(), rule("tcp", free_port(), a)).await.unwrap();
 	assert_eq!(r.status(), StatusCode::CREATED);
 	fs::remove_dir_all(dir).unwrap();
+}
+
+/// rproxy-gateway's token (`allow_rulesets`, not `admin`) sets `listen_freebind` for Gateways
+/// with `spec.addresses`: its sets go through, the same `PUT` again too.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_gateway_token_puts_sets_with_freebind() {
+	let dir = workdir("gateway");
+	let file = dir.join("tokens.yaml");
+	fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: gw, sha256: {}, scopes: [rules:read, rules:write, acme:write], allow_rulesets: [k8s/]}}\n",
+			sha("gw")
+		),
+	)
+	.unwrap();
+	let h = harness_with(rproxy_api::control::auth::Tokens::from_file(file).unwrap()).await;
+	let a = tcp_backend("G:").await;
+	let mut member = rule("tcp", free_port(), a);
+	member["listen_addr"] = json!("203.0.113.80");
+	member["listen_freebind"] = json!(true);
+	let put = |generation: u64| {
+		h.http
+			.put(format!("{}/rulesets/k8s/default/gw", h.base))
+			.bearer_auth("gw")
+			.json(&json!({"generation": generation, "rules": [member.clone()]}))
+			.send()
+	};
+	let r = put(1).await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+	let r = put(1).await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK, "a PUT that changes nothing: {}", r.text().await.unwrap());
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// Names are held to the rule only for what the API is sent: a set restored (from the
+/// database or a live upgrade: `put_ruleset` without `limits`) with a name the API would
+/// refuse runs.
+#[tokio::test]
+async fn restored_sets_keep_names_the_api_refuses() {
+	let h = harness().await;
+	let port = free_port();
+	let body = json!({"generation": 1, "rules": [http_rule(port, answering("a b", "m"))]});
+	let r = h.http.put(format!("{}/rulesets/old", h.base)).json(&body).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+	let req: rproxy_api::core::ruleset::RulesetRequest = serde_json::from_value(body).unwrap();
+	let opts = rproxy_api::core::ruleset::PutOptions {
+		if_match: None,
+		dry_run: false,
+		by: "ci",
+		admin: true,
+		owner: Some("ci"),
+		may_use_ports: &|_, _| true,
+		limits: None,
+	};
+	let applied = h.registry.put_ruleset("old", req, opts).await;
+	assert!(applied.is_ok(), "{:?}", applied.err().map(|e| e.error.message));
+	assert_eq!(reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+/// A rule set's `PUT` body over 32 MiB is `413 too_large`.
+#[tokio::test]
+async fn rule_set_bodies_over_the_limit_are_refused() {
+	let h = harness().await;
+	let body = vec![b' '; rproxy_api::core::ruleset::MAX_BODY + 1];
+	let r = h.http.put(format!("{}/rulesets/big", h.base)).header("content-type", "application/json").body(body).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+	let v: Value = r.json().await.unwrap();
+	assert_eq!(v["code"], "too_large", "{v}");
+	let r = h.http.put(format!("{}/rulesets/bad", h.base)).body("{").send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 }

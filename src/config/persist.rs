@@ -423,38 +423,44 @@ impl Store {
 		let lock_on_connect = lock.clone();
 		// one connection: it holds this node's lock and runs every job; kept open
 		// (pinged, `spawn_background`) so that it keeps the lock
-		let pool = MySqlPoolOptions::new()
-			.max_connections(1)
-			.acquire_timeout(Duration::from_secs(2))
-			.idle_timeout(None)
-			.max_lifetime(None)
-			.after_connect(move |conn, _| {
-				let limit = limit.clone();
-				let lock = lock_on_connect.clone();
-				Box::pin(async move {
-					use sqlx::Executor;
-					// row locks (InnoDB) and metadata locks (DDL of the table) are waited
-					// for STATEMENT_SECS at most, on MariaDB and MySQL
-					conn.execute(sqlx::AssertSqlSafe(format!(
-						"SET SESSION innodb_lock_wait_timeout = {STATEMENT_SECS}, lock_wait_timeout = {STATEMENT_SECS}, \
-						 wait_timeout = {IDLE_SECS}"
-					)))
-					.await?;
-					// MariaDB's; MySQL has no such limit for writes (max_execution_time is for SELECT only)
-					match conn.execute(sqlx::AssertSqlSafe(format!("SET SESSION max_statement_time = {STATEMENT_SECS}"))).await {
-						Ok(_) => limit.store(true, Ordering::Relaxed),
-						Err(e) => warn!(event = "degraded", part = "db", error = %e,
-							"writes to rproxy_rules are bounded only by the lock waits (MySQL): a write of a killed process may still run after the restart has read the rows"),
-					}
-					// a new connection (also after the old one broke) takes the lock at once
-					// if it is free, so the lock is held all the time
-					let _ = sqlx::query("SELECT GET_LOCK(?, 0)").bind(&lock).execute(&mut *conn).await;
-					Ok(())
+		let url = url.to_string();
+		let connect = move || {
+			let limit = limit.clone();
+			let lock_on_connect = lock_on_connect.clone();
+			MySqlPoolOptions::new()
+				.max_connections(1)
+				.acquire_timeout(Duration::from_secs(2))
+				.idle_timeout(None)
+				.max_lifetime(None)
+				.after_connect(move |conn, _| {
+					let limit = limit.clone();
+					let lock = lock_on_connect.clone();
+					Box::pin(async move {
+						use sqlx::Executor;
+						// row locks (InnoDB) and metadata locks (DDL of the table) are waited
+						// for STATEMENT_SECS at most, on MariaDB and MySQL
+						conn.execute(sqlx::AssertSqlSafe(format!(
+							"SET SESSION innodb_lock_wait_timeout = {STATEMENT_SECS}, lock_wait_timeout = {STATEMENT_SECS}, \
+							 wait_timeout = {IDLE_SECS}"
+						)))
+						.await?;
+						// MariaDB's; MySQL has no such limit for writes (max_execution_time is for SELECT only)
+						match conn.execute(sqlx::AssertSqlSafe(format!("SET SESSION max_statement_time = {STATEMENT_SECS}"))).await {
+							Ok(_) => limit.store(true, Ordering::Relaxed),
+							Err(e) => warn!(event = "degraded", part = "db", error = %e,
+								"writes to rproxy_rules are bounded only by the lock waits (MySQL): a write of a killed process may still run after the restart has read the rows"),
+						}
+						// a new connection (also after the old one broke) takes the lock at once
+						// if it is free, so the lock is held all the time
+						let _ = sqlx::query("SELECT GET_LOCK(?, 0)").bind(&lock).execute(&mut *conn).await;
+						Ok(())
+					})
 				})
-			})
-			.connect_lazy(url)
-			.map_err(|e| format!("database: {e}"))?;
-		let worker = DbWorker { pool, node: node.clone(), lock, statement_limit };
+				.connect_lazy(&url)
+				.map_err(|e| format!("database: {e}"))
+		};
+		let pool = connect()?;
+		let worker = DbWorker { pool, connect: Box::new(connect), node: node.clone(), lock, statement_limit };
 		Ok(Store::with(node, Some(Arc::new(LocalQueue::start(QUEUE_CAPACITY, worker))), None))
 	}
 
@@ -863,11 +869,12 @@ impl Store {
 
 	/// Refuses a deletion through the API while `MAX_UNWRITTEN_REMOVALS` deletions of rows
 	/// wait for the database (#358): what is kept of them stays bounded while it is down.
-	pub fn check_backlog(&self) -> Result<(), crate::error::ApiError> {
+	/// An `admin` token's deletion goes through anyway (the way out while it stays down).
+	pub fn check_backlog(&self, admin: bool) -> Result<(), crate::error::ApiError> {
 		let u = self.unwritten.lock().unwrap_or_else(|e| e.into_inner());
-		if u.removed_rules.len() + u.removed_sets.len() >= MAX_UNWRITTEN_REMOVALS {
+		if !admin && u.removed_rules.len() + u.removed_sets.len() >= MAX_UNWRITTEN_REMOVALS {
 			return Err(crate::error::ApiError::busy(format!(
-				"{MAX_UNWRITTEN_REMOVALS} deletions wait for the database (rproxy_rules) already; try again once it is back"
+				"{MAX_UNWRITTEN_REMOVALS} deletions wait for the database (rproxy_rules) already; try again once it is back (or with an admin token)"
 			)));
 		}
 		Ok(())
@@ -1517,6 +1524,9 @@ impl Store {
 /// one) and this node's lock on it.
 struct DbWorker {
 	pool: MySqlPool,
+	/// A new pool (connected when first used): after a job panicked, the connection it
+	/// may have left half way is let go (#358).
+	connect: Box<dyn Fn() -> Result<MySqlPool, String> + Send + Sync>,
 	node: String,
 	lock: String,
 	/// Whether the session has `max_statement_time` (MariaDB).
@@ -1780,6 +1790,16 @@ impl DbWorker {
 }
 
 impl Worker for DbWorker {
+	fn reset(&mut self) {
+		match (self.connect)() {
+			Ok(pool) => {
+				let old = std::mem::replace(&mut self.pool, pool);
+				tokio::spawn(async move { old.close().await });
+			}
+			Err(e) => warn!(event = "degraded", part = "db", error = %e, "could not open the database again after a job panicked"),
+		}
+	}
+
 	fn run(&mut self, job: Job) -> JobFuture<'_> {
 		Box::pin(async move {
 			let deadline = match &job {
@@ -2191,6 +2211,21 @@ mod tests {
 		assert_eq!(after_looks(&[ended[0].clone(), ended[1].clone(), looked("Sleep", 4, third_at)]), Startup::Refuse);
 		// still unsure at the third look: not refused
 		assert_eq!(after_looks(&[ended[0].clone(), ended[1].clone(), looked("Query", 30, third_at), looked("Sleep", 1, third_at + 20)]), Startup::Proceed);
+	}
+
+	/// Deletions waiting for the database are bounded; `admin` goes through (#358).
+	#[tokio::test]
+	async fn the_backlog_of_deletions_is_bounded() {
+		let store = Store::memory("n1");
+		assert!(store.check_backlog(false).is_ok());
+		{
+			let mut u = store.unwritten.lock().unwrap();
+			for i in 0..MAX_UNWRITTEN_REMOVALS {
+				u.removed_sets.insert(format!("s{i}"), "ci".into());
+			}
+		}
+		assert_eq!(store.check_backlog(false).unwrap_err().code, "busy");
+		assert!(store.check_backlog(true).is_ok());
 	}
 
 	/// What a live upgrade hands over reads back.

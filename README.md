@@ -93,11 +93,11 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
-| `RPROXY_MAX_RANGE_PORTS_NON_ADMIN` | `--max-range-ports-non-admin` | `1024` | `admin` でないトークンが開けるポート範囲の上限（`0` で `RPROXY_MAX_RANGE_PORTS` まで。`listen_freebind` も `admin` だけ。#358） |
 | `RPROXY_MAX_RULES` | `--max-rules` | `10000` | 制御 API で作れるプロセスのルールの数（`0` でなし。超えると `409 limit`。設定ファイル・DB から戻すルールは数えるが断らない。#358） |
 | `RPROXY_MAX_LISTENERS` | `--max-listeners` | `0`（自動） | 制御 API で開ける待ち受けのソケットの合計（アドレス × ポート、`http3` は 2 倍）。`0` はファイル記述子の上限から 1024 を除いた半分（256 以上。#358） |
 | `RPROXY_MAX_RULESETS` | `--max-rulesets` | `1000` | ルールの組の数（`0` でなし。#358） |
 | `RPROXY_API_MAX_CONNECTIONS` | `--api-max-connections` | `512` | 制御 API の TCP の接続の数（アドレスごと。`0` でなし。超えた接続はすぐ閉じる。#358） |
+| `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE` | `--api-max-connections-per-source` | `64` | 1 つの送信元（IPv6 は /64）からの制御 API の TCP の接続の数（`0` でなし。loopback は数えない。#358） |
 | `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | udp のルールのセッションの既定の上限（ルールの `limits.max_connections` があればそちら。`0` でなし。#332：偽った送信元でセッションと転送先へのソケットを増やせないように）。超えた新しいセッションのデータグラムは捨て、`stats.limited`・`conn.limited`（`reason: max_connections`）。多くのクライアントを受けるルールは `limits.max_connections` を付けるか、これを上げる（ファイルの数の上限 `LimitNOFILE` も） |
 | `RPROXY_CACHE_MAX_MEMORY` | `--cache-max-memory` | `536870912`（512 MiB） | すべての `cache` ミドルウェアが持つ量（答えと記録）の合計の上限（バイト。`0` でなし。#349）。ミドルウェアごとの `max_memory` とは別に、ルールを何本作っても 1 つのプロセスのメモリを使い切れないように。入らない答えは同じ `cache` の古いものから捨てて持ち、それでも入らなければ持たない（docs/API.md の「応答のキャッシュ」）。与えなければ `PATCH /config/global` の `cache_max_memory` で稼働中に変えられる。`/metrics` の `rproxy_http_cache_memory_bytes` |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |

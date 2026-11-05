@@ -45,7 +45,17 @@ const BODY_TIME: Duration = Duration::from_secs(60);
 async fn read_body(body: Body) -> Result<Bytes, ApiError> {
 	match tokio::time::timeout(BODY_TIME, axum::body::to_bytes(body, ruleset::MAX_BODY)).await {
 		Ok(Ok(bytes)) => Ok(bytes),
-		Ok(Err(e)) => Err(ApiError::too_large(format!("the body could not be read (at most {} bytes): {e}", ruleset::MAX_BODY))),
+		Ok(Err(e)) => {
+			let e = e.into_inner();
+			let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
+			while let Some(c) = cause {
+				if c.is::<http_body_util::LengthLimitError>() {
+					return Err(ApiError::too_large(format!("the body is larger than {} bytes", ruleset::MAX_BODY)));
+				}
+				cause = c.source();
+			}
+			Err(ApiError::invalid(format!("the body could not be read: {e}")))
+		}
 		Err(_) => Err(ApiError::timeout(format!("the body did not arrive within {} s", BODY_TIME.as_secs()))),
 	}
 }
@@ -106,6 +116,10 @@ pub async fn put(
 		e
 	};
 	for (i, r) in req.rules.iter().enumerate() {
+		// names only for what the API is sent (#358): restored sets keep theirs
+		if let Some(h) = &r.http {
+			h.check_names().map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e }).map_err(refused)?;
+		}
 		super::acme_api::check_rule_scope(&principal, Some(r), None)
 			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })
 			.map_err(refused)?;
@@ -116,7 +130,11 @@ pub async fn put(
 	super::api::to_the_end(async move {
 		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 		let admin = principal.has(crate::control::auth::Scope::Admin);
-		let limits = Some(ruleset::SetLimits { max_rules: principal.max_rules, max_rulesets: principal.max_rulesets });
+		let limits = Some(ruleset::SetLimits {
+			max_rules: principal.max_rules,
+			max_rulesets: principal.max_rulesets,
+			freebind: principal.may_freebind(true),
+		});
 		let opts = PutOptions {
 			if_match: if_match.as_deref(),
 			dry_run,
@@ -188,7 +206,7 @@ pub async fn delete(
 		// refused if a live upgrade started meanwhile (#305)
 		let change = super::api::changing(&state).await?;
 		if let Some(store) = &store {
-			store.check_backlog()?;
+			store.check_backlog(principal.has(crate::control::auth::Scope::Admin))?;
 		}
 		let result = state.registry.take_ruleset(&name, if_match.as_deref(), &may_use_ports, (&principal.name, admin)).await;
 		audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
