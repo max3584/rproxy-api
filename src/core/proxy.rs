@@ -270,14 +270,14 @@ impl Runtime {
 	}
 
 	/// A client refused by the rule's `geoip`: counted in `stats.denied`, logged as
-	/// `conn.denied` with `reason: geoip` and what is known of it. UDP (`throttled`)
-	/// lines go through `denied_log`, like the other refused datagrams.
+	/// `conn.denied` with `reason: geoip` and what is known of it, through `denied_log`
+	/// (#357: TCP too; `throttled` is the UDP form of the line, with `sni`).
 	pub fn geoip_denied(&self, client: SocketAddr, info: &crate::net::geoip::Info, transport: Option<&str>, throttled: bool) {
 		self.stats.denied();
 		let (country, asn) = (info.country_str(), info.asn);
 		if !throttled {
-			tracing::info!(event = "conn.denied", rule = %self.key, client = %client, reason = "geoip", country, asn, transport,
-				proxy_peer = crate::net::proxy_in::peer_field());
+			crate::logging::throttled!(self.denied_log, client.ip(), info, event = "conn.denied", rule = %self.key, client = %client, reason = "geoip",
+				country, asn, transport, proxy_peer = crate::net::proxy_in::peer_field());
 			return;
 		}
 		match self.denied_log.check(&client.ip()) {

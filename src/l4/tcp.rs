@@ -20,6 +20,7 @@ use crate::core::rule::SourceIp;
 use crate::net::proxy_in::{self, peer_field};
 use crate::net::source::{self, TlsInfo};
 use crate::l4::relay;
+use crate::logging::{clip, tcp_errors, throttled};
 use crate::l4::starttls::{self, Outcome};
 use crate::tls::config::{StartTls, TlsMode, TlsRuntime};
 
@@ -35,6 +36,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 /// Accepts connections on one port of the rule; `offset` is its place in a range.
 /// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
 pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
+	let mut accept_log = crate::logging::Every::new(Duration::from_secs(10));
 	loop {
 		tokio::select! {
 			biased;
@@ -46,7 +48,9 @@ pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: C
 				}
 				Err(e) => {
 					// e.g. EMFILE: back off instead of spinning
-					warn!(event = "accept.error", rule = %rt.key, error = %e);
+					if let Some(suppressed) = accept_log.check() {
+						warn!(event = "accept.error", rule = %rt.key, error = %e, suppressed);
+					}
 					tokio::time::sleep(Duration::from_millis(100)).await;
 				}
 			}
@@ -167,7 +171,8 @@ impl Detail {
 /// Refusal that is not an error: allow_from or `unmatched: reject`.
 fn denied(rt: &Runtime, client: SocketAddr, why: &str, sni: Option<&str>) -> io::Error {
 	rt.stats.denied();
-	info!(event = "conn.denied", rule = %rt.key, client = %client, reason = why, sni = sni.unwrap_or(""), proxy_peer = peer_field());
+	throttled!(rt.denied_log, client.ip(), info, event = "conn.denied", rule = %rt.key, client = %client, reason = why,
+		sni = %clip(sni.unwrap_or("")), proxy_peer = peer_field());
 	io::Error::new(io::ErrorKind::PermissionDenied, "denied")
 }
 
@@ -175,15 +180,15 @@ fn denied(rt: &Runtime, client: SocketAddr, why: &str, sni: Option<&str>) -> io:
 /// (none while `required`, a broken or too long one, or too slow).
 fn header_refused(rt: &Runtime, peer: SocketAddr, why: &io::Error) {
 	rt.stats.denied();
-	warn!(event = "conn.denied", rule = %rt.key, client = %peer, reason = "proxy_protocol", error = %why);
+	throttled!(rt.denied_log, peer.ip(), warn, event = "conn.denied", rule = %rt.key, client = %peer, reason = "proxy_protocol", error = %why);
 }
 
 /// A connection from outside `proxy_protocol.from` that starts like a PROXY header: a
 /// front end missing from `from`, or someone claiming another address.
 fn untrusted_header(rt: &Runtime, client: SocketAddr, version: proxy_in::Version) -> io::Error {
 	rt.stats.denied();
-	warn!(event = "conn.denied", rule = %rt.key, client = %client, reason = "proxy_protocol_untrusted", version = version.as_str(),
-		"a PROXY header from a peer outside proxy_protocol.from");
+	throttled!(rt.denied_log, client.ip(), warn, event = "conn.denied", rule = %rt.key, client = %client, reason = "proxy_protocol_untrusted",
+		version = version.as_str(), "a PROXY header from a peer outside proxy_protocol.from");
 	io::Error::new(io::ErrorKind::PermissionDenied, "denied")
 }
 
@@ -285,7 +290,8 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 			},
 			Err(e) => {
 				rt.stats.tls_failed();
-				warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field(), "reading the ClientHello");
+				throttled!(tcp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field(),
+					"reading the ClientHello");
 				return;
 			}
 		}
@@ -341,7 +347,7 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
-		Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, target = %target,
+		Err(e) => throttled!(tcp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, target = %target,
 			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 	}
 }
@@ -402,7 +408,7 @@ async fn relay_hello(
 	detail.lease = lease;
 	detail.connected = Some(Instant::now());
 	detail.tls = Some(TlsInfo { server_name: name.clone(), ..Default::default() });
-	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = name.as_deref().unwrap_or(""), passthrough,
+	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr, sni = %clip(name.as_deref().unwrap_or("")), passthrough,
 		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());
 	send_proxy_header(rt.source_ip_for(target), &mut out, client, local, None).await?;
 	out.write_all(&hello).await?;
@@ -608,7 +614,7 @@ async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt
 		Ok(reason) => info!(event = "conn.close", rule = %rt.key, client = %client, target = "http",
 			rx_bytes = rx.load(Ordering::Relaxed), tx_bytes = tx.load(Ordering::Relaxed), duration_ms = elapsed_ms, reason,
 			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
-		Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, target = "http",
+		Err(e) => throttled!(tcp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, target = "http",
 			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 	}
 }

@@ -36,7 +36,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 
 結合テストは loopback 上で実際にソケットを開く。制御 API、転送先のエコーサーバ、クライアントがすべて本物で、名前解決だけを差し替えている（`tests/common/mod.rs`）。
 
-SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP の `conn.denied` と間引き（`tests/access.rs`）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`token.expiring` / `token.expired`（`tests/api_hardening.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
+SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本物と同じ JSON の形で集めて確かめる（`tests/common/logs.rs`。`logs::capture()` のあと `logs::wait_for` で、ルールやパスで自分の行を選ぶ）：UDP・TCP の `conn.denied` と間引き（`tests/access.rs`。`Throttle` の掃除・60 秒で忘れる・IPv6 の /64・制御 API の別の枠と、長い項目を切るのは `src/logging.rs` と `src/l7/access.rs` の単体テスト、v0.4.20）、L4 の `crowdsec` の `conn.denied`・`http.access` の `refused_by`（`tests/crowdsec.rs`）、制御 API の 401 / 403 と変更の `audit`（`tests/api.rs`）、`token.expiring` / `token.expired`（`tests/api_hardening.rs`）、`http.access` の `refused_by`・`user`・`auth_error`（`tests/http.rs`・`tests/http_auth.rs`）。
 
 ## 単体テスト（`src/`）
 

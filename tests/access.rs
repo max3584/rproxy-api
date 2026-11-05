@@ -290,3 +290,30 @@ async fn refused_udp_datagrams_are_logged_without_flooding_the_log() {
 	let v = logs::wait_for("the line after the flood", |v| mine(v) && v["suppressed"].as_u64() > Some(0)).await;
 	assert!(v["suppressed"].as_u64().unwrap() >= 5, "{v}");
 }
+
+/// Refused TCP connections are thinned out per source too (#357): the first 20
+/// lines from a client are still written at info (CrowdSec's `rproxy-conn-denied`
+/// overflows at 10), then one a second.
+#[tokio::test]
+async fn refused_tcp_connections_are_logged_without_flooding_the_log() {
+	logs::capture();
+	let h = harness().await;
+	let port = free_port();
+	let mut body = rule("tcp", port, tcp_backend("T:").await);
+	body["allow_from"] = json!(["192.0.2.0/24"]);
+	assert_eq!(h.post(body).await.0, StatusCode::CREATED);
+	let key = format!("tcp/127.0.0.1:{port}");
+	let mine = |v: &Value| v["event"] == "conn.denied" && v["rule"] == key.as_str();
+
+	for _ in 0..40 {
+		let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		let _ = c.read(&mut [0u8; 1]).await;
+	}
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	wait_for(&h, &path, |v| v["stats"]["denied"] == 40).await;
+	let logged = logs::lines(mine);
+	assert!((20..=30).contains(&logged.len()), "{} lines for 40 connections", logged.len());
+	let v = &logged[0];
+	assert_eq!((v["level"].as_str(), v["reason"].as_str(), v["suppressed"].as_u64()), (Some("INFO"), Some("allow_from"), Some(0)), "{v}");
+	assert!(v["client"].as_str().unwrap().starts_with("127.0.0.1:"), "IP:port, as the CrowdSec parser reads it: {v}");
+}

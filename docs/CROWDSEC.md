@@ -67,7 +67,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`・`rproxy_auth_error` | `refused_by`（断ったミドルウェアの種類。`basic_auth`・`ip_allow` など）・`auth_error`（`basic_auth` が断った理由。`bad_password` など）。v0.3.20 から |
 | `evt.StrTime` | `timestamp` |
 
-**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full`（v0.4.19、#341））、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`、`target_full` は `http` も）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
+**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full`（v0.4.19、#341））、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`、`target_full` は `http` も）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。TCP の `conn.denied` も v0.4.20 から送信元（IPv6 は /64）ごとに間引くが、続けて 20 行までは出すので、`max3584/rproxy-conn-denied`（10 行で溢れる）はそのまま働く（docs/API.md の「ログの間引きと長さ」）。
 
 ## 3. rproxy から止める（bouncer）
 

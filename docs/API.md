@@ -31,7 +31,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 
     - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`certs:read`（`GET /certs`。v0.4.2）、`certs:write`（`PUT` / `DELETE /certs/{name}`。v0.4.2）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
-    - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行にする。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
+    - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元（IPv6 は /64）ごとに続けて 20 行まで、その後は 1 秒に 1 行にする（全体でも続けて 200 行、その後は 1 秒に 50 行。データの経路の行とは別の枠。v0.4.20、「ログの間引きと長さ」）。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
   - SIGHUP を受けるとトークンファイルを読み直す。
   - SIGHUP がなくても、`--tokens-check-secs` / `RPROXY_TOKENS_CHECK_SECS`（既定 10 秒、`0` なら SIGHUP のときだけ）ごとにファイルの大きさ・更新時刻・inode・権限を確かめ、変わっていれば読み直す（v0.4.2、#253、`features.tokens_reload`）。パスはシンボリックリンクをたどって確かめるので、Kubernetes の Secret のボリューム（`..data` のリンクの差し替え）の更新も見つける。消したトークンは次の確認から通らない。処理中のリクエストと一時停止（lockout）の状態はそのまま。
@@ -143,7 +143,7 @@ tokens:
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
 | `starttls_required` | bool | | 既定 `true`。`false` にすると、SMTP で STARTTLS をしないクライアントも平文のまま通す（IMAP / POP3 では常に必須として扱う）。`starttls` なしで `false` を指定すると `invalid` |
-| `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS より前に切断する（`proxy_protocol` のルールでは、`from` の前段からの接続はヘッダを読んでから、ヘッダのクライアントで判定する）。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない）。断った数は `stats.denied`（UDP はデータグラムごと）、ログは `conn.denied`（`reason: allow_from`。UDP は送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行。送信元を偽った大量のデータグラムに備えて、全体でも続けて 200 行、その後は 1 秒に 50 行まで。`suppressed` はその前に省いた行の数。v0.3.20 から。それより前の UDP は `debug` でだけ出ていた） |
+| `allow_from` | string の配列 | | 接続を受け付ける送信元。CIDR（`172.16.0.0/16`、`fd00::/8`）または単一の IP。省略または空ならすべて受け付ける。最大 64 件。範囲外からの TCP 接続は、TLS より前に切断する（`proxy_protocol` のルールでは、`from` の前段からの接続はヘッダを読んでから、ヘッダのクライアントで判定する）。UDP は範囲外の送信元のデータグラムを捨てる（セッションを作らない）。断った数は `stats.denied`（UDP はデータグラムごと）、ログは `conn.denied`（`reason: allow_from`。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行（UDP は v0.3.20 から。それより前の UDP は `debug` でだけ出ていた。TCP は v0.4.20 から）。多くの送信元からの大量の接続・データグラムに備えて、全体でも上限がある。`suppressed` はその前に省いた行の数。「ログの間引きと長さ」） |
 | `proxy_protocol` | object | | 前段（ロードバランサ・別の rproxy・Kubernetes の Gateway など）が付ける PROXY protocol v1 / v2 のヘッダを読み、そのクライアントのアドレスを使う（v0.4.13、#296、`features.proxy_protocol_in`）。`{"from": [<CIDR>, ...], "required"?: bool}`：`from`（必須、空にできない。最大 64 件、`/0` は `invalid`）はヘッダを信じる TCP の接続元、`required`（既定 `true`）は `from` からの接続がヘッダを付けてこなければ断る。`from` の外からヘッダで始まる接続は断る。`udp` のルールでは v2 の DGRAM のヘッダをデータグラムごとに読んで外す（v0.4.16、#312、`features.proxy_protocol_in_udp`）。一覧では `required` も出す。PATCH で付けると置き換え（`{}` で外す、省けば今のまま）、次の接続（`udp` は次のデータグラム）から効く。下の「PROXY protocol を受け取る」 |
 | `crowdsec` | bool | | 既定 `false`（v0.3.2）。`true` にすると、CrowdSec の判定（`global.crowdsec`、scope `Ip` / `Range`）に入っている送信元を、`allow_from` と同じく受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで判定）に切断する。UDP はそのデータグラムを捨てる（開いているセッションのものも）。LAPI から一度も判定を取れていない間は通す。`global.crowdsec` がないと `invalid`。`http` のルールでも使えるが、見るのは接続元の IP（前段のプロキシの後ろでは `crowdsec` ミドルウェアを使う）。一覧では `false` のとき省く。断った数は `stats.denied`、ログは `conn.denied`（`reason: crowdsec`。UDP は `allow_from` と同じく間引く） |
 
@@ -1207,6 +1207,20 @@ http:
 - `forward_auth`・`mirror`・`errors` のページへの問い合わせは、いっぱいの転送先を選ばないが、数には入れない。
 - DPDK の道（UDP）も同じく数えて飛ばす。
 - 前の版に戻すとき：v0.4.18 以前は `max_connections` を知らないので、それを書いたルールは読めない（API で作ったルールの DB からの復元・設定ファイル・引き継ぎで誤りになる）。戻す前に外す。
+
+### ログの間引きと長さ（v0.4.20、#357）
+
+攻撃でログがあふれない・大きくなりすぎないようにする。設定はない。
+
+- 間引く行：`conn.denied`（TCP・UDP。v0.4.19 までは UDP だけ）・`conn.limited`・`conn.error`（TCP の ClientHello を読めない・ハンドシェイクの失敗・転送の失敗、UDP の転送先がない・転送先へのソケットを開けない・DTLS の転送先への失敗）・`tls.error`（DTLS）・`audit` の 401 / 403 / 429。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行。出した行の `suppressed` は、その送信元でその前に省いた行の数。省いた行は `debug` で `throttled: true` を付けて出す。`event` と項目は今までと同じ（CrowdSec のパーサー・シナリオはそのまま。送信元ごとの最初の 20 行は出るので、`max3584/rproxy-conn-denied`（10 行で溢れる）も今までどおり見つける）。
+- 送信元：IPv4 はアドレス、IPv6 は /64 ごと（1 台が /64 の中のアドレスを使い分けても 1 つと数える。IPv4-mapped は IPv4 として）。
+- 全体の上限：多くの送信元からいちどに来ても、TCP の行は全体で続けて 2,000 行・その後は 1 秒に 500 行、UDP の行（送信元を偽れる）は続けて 200 行・その後は 1 秒に 50 行、制御 API の `audit` は続けて 200 行・その後は 1 秒に 50 行まで。それぞれ別の枠なので、データの経路への攻撃で制御 API の監査の行は消えない（逆も）。
+- 覚える送信元はそれぞれ 4,096 まで。表は 1 秒に 1 回まで掃除し、落ち着いた送信元は忘れる。省いた行のある送信元も、60 秒来なければ忘れ、そのとき忘れた数と省いた行の数を 1 行（`event: "log.suppressed"`、`throttle`（`tcp` / `udp` / `audit`）・`sources`・`suppressed`）に出す。表がいっぱいのときに来た新しい送信元の行は、全体の上限だけで出す（新しい送信元の `conn.denied` が出なくなることはない）。
+- `accept.error`（TCP の待ち受けが接続を受けられない。`EMFILE` など）は待ち受けごとに 10 秒に 1 行（`suppressed`）。
+- 長さ：クライアントが決める項目（`http.access` の `host`・`path`・`raw_path`・`query`・`user_agent`・`sni`、`conn.open`・`conn.denied`・`conn.error` の `sni`）は 2,048 バイトで切り、後ろに `...[truncated]` を付ける。メインのログ・`global.access_log` とも。
+- 書き出しを待つ行は 8,192 行まで（v0.4.19 までは 128,000 行）。書き込みが追いつかないときはそれを超えた行を捨てる（転送は止めない）。
+- 大きさでのローテーションはしない（日ごとのまま。使っている tracing-appender にない）。大きさで区切るなら標準出力に出して journald に任せるか、logrotate の `size` / `maxsize` を使う。上の間引きと長さの上限で、1 日のファイルの大きさは攻撃の量でなく上限で決まる。
+- 省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`。
 
 ## エンドポイント
 

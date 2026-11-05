@@ -1158,9 +1158,9 @@ impl Registry {
 			connect_timeout_ms: crate::core::proxy::timeout_ms(spec.connect_timeout).into(),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
-			denied_log: Default::default(),
+			denied_log: crate::logging::Throttle::for_protocol(key.protocol),
 			limits: Default::default(),
-			limited_log: Default::default(),
+			limited_log: crate::logging::Throttle::for_protocol(key.protocol),
 			bandwidth: Default::default(),
 			stop: kill.child_token(),
 			kill,
@@ -2343,7 +2343,7 @@ impl Registry {
 		let _ = writeln!(out, "# HELP rproxy_process_start_time_seconds Start time of the process in Unix seconds (kept over a handoff).");
 		let _ = writeln!(out, "# TYPE rproxy_process_start_time_seconds gauge");
 		let _ = writeln!(out, "rproxy_process_start_time_seconds {}", crate::core::bandwidth::process_start());
-		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals under attack do not flood the log (UDP conn.denied, control API audit).");
+		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals and errors under attack do not flood the log (conn.denied, conn.limited, conn.error, tls.error, accept.error, control API audit).");
 		let _ = writeln!(out, "# TYPE rproxy_log_suppressed_total counter");
 		let _ = writeln!(out, "rproxy_log_suppressed_total {}", crate::logging::suppressed_total());
 		// offload-verify builds only (tests, #260): mismatches of the kernel fast paths
