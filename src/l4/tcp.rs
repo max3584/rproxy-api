@@ -346,9 +346,9 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 		Err(e) if TargetFull::is(&e) => crate::core::limits::refused(&rt, client, crate::core::limits::Reason::TargetFull, "tcp"),
 		Ok(()) => info!(event = "conn.close", rule = %rt.key, client = %client, target = %target,
 			rx_bytes = detail.rx, tx_bytes = detail.tx, duration_ms = elapsed_ms, reason = detail.reason,
-			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
+			sni = %clip(info.server_name.as_deref().unwrap_or("")), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 		Err(e) => throttled!(tcp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, target = %target,
-			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
+			error = %e, duration_ms = elapsed_ms, sni = %clip(info.server_name.as_deref().unwrap_or("")), proxy_peer = peer_field()),
 	}
 }
 
@@ -544,7 +544,7 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 		if let Some(acme) = crate::acme::challenge::tls_alpn_config(&start.client_hello()) {
 			let mut session = start.into_stream(acme).await?;
 			let _ = tokio::io::AsyncWriteExt::shutdown(&mut session).await;
-			info!(event = "acme.answer", challenge = "tls-alpn-01", rule = %rt.key, client = %client, sni = name.as_deref().unwrap_or(""),
+			info!(event = "acme.answer", challenge = "tls-alpn-01", rule = %rt.key, client = %client, sni = %clip(name.as_deref().unwrap_or("")),
 				proxy_peer = peer_field());
 			return Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
 		}
@@ -613,9 +613,9 @@ async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt
 		Err(e) if is_denied(&e) => {}
 		Ok(reason) => info!(event = "conn.close", rule = %rt.key, client = %client, target = "http",
 			rx_bytes = rx.load(Ordering::Relaxed), tx_bytes = tx.load(Ordering::Relaxed), duration_ms = elapsed_ms, reason,
-			sni = info.server_name.as_deref().unwrap_or(""), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
+			sni = %clip(info.server_name.as_deref().unwrap_or("")), client_cn = info.client_cn.as_deref().unwrap_or(""), proxy_peer = peer_field()),
 		Err(e) => throttled!(tcp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, target = "http",
-			error = %e, duration_ms = elapsed_ms, sni = info.server_name.as_deref().unwrap_or(""), proxy_peer = peer_field()),
+			error = %e, duration_ms = elapsed_ms, sni = %clip(info.server_name.as_deref().unwrap_or("")), proxy_peer = peer_field()),
 	}
 }
 
@@ -655,7 +655,7 @@ async fn terminate(
 	detail.lease = lease;
 	detail.connected = Some(Instant::now());
 	info!(event = "conn.open", rule = %rt.key, listen = %local, client = %client, target = %addr,
-		sni = info.server_name.as_deref().unwrap_or(""), alpn = info.alpn.as_deref().unwrap_or(""),
+		sni = %clip(info.server_name.as_deref().unwrap_or("")), alpn = info.alpn.as_deref().unwrap_or(""),
 		tls_version = info.version.as_deref().unwrap_or(""), tls_cipher = info.cipher.as_deref().unwrap_or(""),
 		client_cn = info.client_cn.as_deref().unwrap_or(""), client_verify = info.client_verify(), starttls = tls.starttls.map(|p| p.as_str()).unwrap_or(""),
 		country = detail.country(), asn = detail.asn(), proxy_peer = peer_field());

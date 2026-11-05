@@ -52,6 +52,8 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 
 ### Fields produced by the parser
 
+**HTTP (`event: http.access`)** has `path`, `query`, `user_agent` and `host` cut to 2,048 bytes since v0.4.20 (followed by `...[truncated]`). Padding that pushes an attack past 2 KiB hides it from HTTP scenarios that read the log (`http-cve` and others); to stop requests by their content use AppSec (`crowdsec: {appsec: true}` in section 3; rproxy's `crowdsec` middleware sends the request itself).
+
 **HTTP (`event: http.access`)** is treated as a CrowdSec HTTP access log (`log_type: http_access-log`, `service: http`). `crowdsecurity/http-logs` (s02) and existing scenarios such as `base-http-scenarios` and `http-cve` work as-is.
 
 | CrowdSec field | rproxy log |
@@ -67,7 +69,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`, `rproxy_auth_error` | `refused_by` (the kind of middleware that refused: `basic_auth`, `ip_allow`, …), `auth_error` (why `basic_auth` refused: `bad_password`, …). Since v0.3.20 |
 | `evt.StrTime` | `timestamp` |
 
-**L4 (`event: conn.open` / `conn.denied` / `conn.limited`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (for `conn.denied` `allow_from` / `geoip` / `crowdsec` (also TLS `unmatched`); for `conn.limited` `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full` (v0.4.19, #341)), `rproxy_rule`, `rproxy_transport` (`tcp` / `udp` of `conn.limited`; also `http` for `target_full`). UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams). TCP `conn.denied` is thinned out per source (IPv6 per /64) too since v0.4.20, but 20 lines in a row are written, so `max3584/rproxy-conn-denied` (overflowing at 10) works as before ("Log thinning and length" in docs/en/API.md).
+**L4 (`event: conn.open` / `conn.denied` / `conn.limited`)** is `log_type: rproxy_conn` (`service: rproxy`). Fields: `evt.Meta.source_ip` (the IP part of `client`), `rproxy_event`, `rproxy_reason` (for `conn.denied` `allow_from` / `geoip` / `crowdsec` (also TLS `unmatched`); for `conn.limited` `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full` (v0.4.19, #341)), `rproxy_rule`, `rproxy_transport` (`tcp` / `udp` of `conn.limited`; also `http` for `target_full`). UDP `conn.denied` lines appear at the default log level since v0.3.20 (thinned out per source, so fewer than the datagrams). TCP `conn.denied` is thinned out per source too since v0.4.20 (an IPv6 /64 together at most five times one source), but 20 lines in a row are written, so `max3584/rproxy-conn-denied` (overflowing at 10) works as before ("Log thinning and length" in docs/en/API.md).
 
 ## 3. Blocking from rproxy (bouncer)
 

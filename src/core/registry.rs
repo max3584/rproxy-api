@@ -2346,6 +2346,9 @@ impl Registry {
 		let _ = writeln!(out, "# HELP rproxy_log_suppressed_total Log lines left out so that refusals and errors under attack do not flood the log (conn.denied, conn.limited, conn.error, tls.error, accept.error, control API audit).");
 		let _ = writeln!(out, "# TYPE rproxy_log_suppressed_total counter");
 		let _ = writeln!(out, "rproxy_log_suppressed_total {}", crate::logging::suppressed_total());
+		let _ = writeln!(out, "# HELP rproxy_log_dropped_total Log lines dropped because writing them fell behind (more than 8192 waiting; main log and access log files).");
+		let _ = writeln!(out, "# TYPE rproxy_log_dropped_total counter");
+		let _ = writeln!(out, "rproxy_log_dropped_total {}", crate::logging::dropped_total());
 		// offload-verify builds only (tests, #260): mismatches of the kernel fast paths
 		#[cfg(all(feature = "offload-verify", target_os = "linux"))]
 		{

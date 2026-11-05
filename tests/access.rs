@@ -311,7 +311,7 @@ async fn refused_tcp_connections_are_logged_without_flooding_the_log() {
 	}
 	let path = format!("/rules/tcp/127.0.0.1/{port}");
 	wait_for(&h, &path, |v| v["stats"]["denied"] == 40).await;
-	let logged = logs::lines(mine);
+	let logged = logs::lines(|v| mine(v) && v["level"] == "INFO");
 	assert!((20..=30).contains(&logged.len()), "{} lines for 40 connections", logged.len());
 	let v = &logged[0];
 	assert_eq!((v["level"].as_str(), v["reason"].as_str(), v["suppressed"].as_u64()), (Some("INFO"), Some("allow_from"), Some(0)), "{v}");

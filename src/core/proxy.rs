@@ -276,7 +276,9 @@ impl Runtime {
 		self.stats.denied();
 		let (country, asn) = (info.country_str(), info.asn);
 		if !throttled {
-			crate::logging::throttled!(self.denied_log, client.ip(), info, event = "conn.denied", rule = %self.key, client = %client, reason = "geoip",
+			// HTTP/3: a QUIC Initial's source may be spoofed, so not under the TCP rule's bound
+			let log = if transport == Some("quic") { crate::logging::quic_denied() } else { &self.denied_log };
+			crate::logging::throttled!(log, client.ip(), info, event = "conn.denied", rule = %self.key, client = %client, reason = "geoip",
 				country, asn, transport, proxy_peer = crate::net::proxy_in::peer_field());
 			return;
 		}

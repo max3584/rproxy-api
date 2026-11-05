@@ -365,16 +365,16 @@ pub struct AccessEntry {
 }
 
 impl AccessEntry {
-	/// The entry with what the client chose (`host`, `path`, `raw_path`, `query`,
+	/// The entry with what the client chose (`method`, `host`, `path`, `raw_path`, `query`,
 	/// `user_agent`, `sni`) cut to `logging::MAX_FIELD` bytes (#357); copied only
 	/// when something is that long.
 	fn bounded(&self) -> std::borrow::Cow<'_, AccessEntry> {
 		let long = |s: &String| s.len() > crate::logging::MAX_FIELD;
-		if ![&self.host, &self.path, &self.raw_path, &self.query, &self.user_agent, &self.sni].into_iter().any(long) {
+		if ![&self.method, &self.host, &self.path, &self.raw_path, &self.query, &self.user_agent, &self.sni].into_iter().any(long) {
 			return std::borrow::Cow::Borrowed(self);
 		}
 		let mut e = self.clone();
-		for s in [&mut e.host, &mut e.path, &mut e.raw_path, &mut e.query, &mut e.user_agent, &mut e.sni] {
+		for s in [&mut e.method, &mut e.host, &mut e.path, &mut e.raw_path, &mut e.query, &mut e.user_agent, &mut e.sni] {
 			crate::logging::clip_in_place(s);
 		}
 		std::borrow::Cow::Owned(e)
