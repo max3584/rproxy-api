@@ -5,7 +5,7 @@ use std::any::Any;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
@@ -20,18 +20,28 @@ pub struct SessionConn {
 	listener: Arc<Listener>,
 	client: SocketAddr,
 	local: Option<Local>,
-	/// Datagrams taken from the queue.
-	received: AtomicU64,
+	/// The cookie of the HelloVerifyRequest the `dtls` crate sent (#354).
+	cookie: std::sync::Mutex<Option<Vec<u8>>>,
+	/// A ClientHello came back with that cookie: the client is at its address.
+	verified: AtomicBool,
 }
 
 impl SessionConn {
 	pub fn new(from_client: mpsc::Receiver<Vec<u8>>, listener: Arc<Listener>, client: SocketAddr, local: Option<Local>) -> Self {
-		SessionConn { from_client: Mutex::new(from_client), listener, client, local, received: AtomicU64::new(0) }
+		SessionConn {
+			from_client: Mutex::new(from_client),
+			listener,
+			client,
+			local,
+			cookie: std::sync::Mutex::new(None),
+			verified: AtomicBool::new(false),
+		}
 	}
 
-	/// Datagrams of the client read so far (a client that answers the HelloVerifyRequest has sent two).
-	pub fn datagrams(&self) -> u64 {
-		self.received.load(Ordering::Relaxed)
+	/// Whether the client answered the HelloVerifyRequest with its cookie (return routability:
+	/// a spoofed source never sees the cookie).
+	pub fn verified(&self) -> bool {
+		self.verified.load(Ordering::Relaxed)
 	}
 }
 
@@ -49,7 +59,12 @@ impl Conn for SessionConn {
 		let mut from_client = self.from_client.lock().await;
 		let datagram = loop {
 			let d = from_client.recv().await.ok_or_else(closed)?;
-			self.received.fetch_add(1, Ordering::Relaxed);
+			if !self.verified() {
+				let cookie = self.cookie.lock().unwrap_or_else(|e| e.into_inner());
+				if cookie.as_deref().is_some_and(|c| handshake(&d, CLIENT_HELLO).and_then(hello_cookie) == Some(c)) {
+					self.verified.store(true, Ordering::Relaxed);
+				}
+			}
 			if hellos_are_safe(&d) {
 				break d;
 			}
@@ -65,6 +80,11 @@ impl Conn for SessionConn {
 	}
 
 	async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+		if !self.verified() {
+			if let Some(cookie) = handshake(buf, HELLO_VERIFY_REQUEST).and_then(verify_request_cookie) {
+				*self.cookie.lock().unwrap_or_else(|e| e.into_inner()) = Some(cookie.to_vec());
+			}
+		}
 		Ok(self.listener.send_to(buf, self.client, self.local).await?)
 	}
 
@@ -90,14 +110,51 @@ impl Conn for SessionConn {
 	}
 }
 
+const HANDSHAKE: u8 = 22;
+const CLIENT_HELLO: u8 = 1;
+const HELLO_VERIFY_REQUEST: u8 = 3;
+
+/// The body of the first handshake message of type `kind` in an epoch 0 record of `d`, whole.
+fn handshake(mut d: &[u8], kind: u8) -> Option<&[u8]> {
+	while d.len() >= 13 {
+		let len = u16::from_be_bytes([d[11], d[12]]) as usize;
+		let record = d.get(13..13 + len)?;
+		if d[0] == HANDSHAKE && d[3..5] == [0, 0] {
+			let mut m = record;
+			while m.len() >= 12 {
+				let length = u32::from_be_bytes([0, m[1], m[2], m[3]]) as usize;
+				let body = m.get(12..12 + length)?;
+				if m[0] == kind {
+					return Some(body);
+				}
+				m = &m[12 + length..];
+			}
+		}
+		d = &d[13 + len..];
+	}
+	None
+}
+
+/// The cookie of a HelloVerifyRequest body: version(2), cookie<0..255>.
+fn verify_request_cookie(b: &[u8]) -> Option<&[u8]> {
+	let len = *b.get(2)? as usize;
+	b.get(3..3 + len).filter(|c| !c.is_empty())
+}
+
+/// The cookie of a ClientHello body: version(2), random(32), session_id<0..32>, cookie<0..255>.
+fn hello_cookie(b: &[u8]) -> Option<&[u8]> {
+	let sid = *b.get(34)? as usize;
+	let at = 35 + sid;
+	let len = *b.get(at)? as usize;
+	b.get(at + 1..at + 1 + len)
+}
+
 /// Whether a datagram may start a DTLS session (terminate, #354): its first record is a
 /// handshake record of epoch 0 holding a ClientHello, which the `dtls` crate can read
 /// safely (`hellos_are_safe`). Anything else from an address without a session (an
 /// application record, an alert, garbage, a stray record from a spoofed source) is dropped
 /// without a session, a backend socket or a DTLS connection being made for it.
 pub fn opens_handshake(d: &[u8]) -> bool {
-	const HANDSHAKE: u8 = 22;
-	const CLIENT_HELLO: u8 = 1;
 	// record header (13), then the handshake header (12)
 	d.len() >= 13 + 12 && d[0] == HANDSHAKE && d[1] == 0xfe && d[3..5] == [0, 0] && d[13] == CLIENT_HELLO && hellos_are_safe(d)
 }
@@ -109,8 +166,6 @@ pub fn opens_handshake(d: &[u8]) -> bool {
 /// walked the way the crate walks them. Anything else passes: what the crate
 /// cannot parse it refuses with an error.
 pub fn hellos_are_safe(mut d: &[u8]) -> bool {
-	const HANDSHAKE: u8 = 22;
-	const CLIENT_HELLO: u8 = 1;
 	// records: type(1) version(2) epoch(2) sequence(6) length(2) fragment
 	while d.len() >= 13 {
 		let len = u16::from_be_bytes([d[11], d[12]]) as usize;
@@ -281,6 +336,34 @@ mod tests {
 		}
 		std::panic::set_hook(hook);
 		assert!(refused > 100 && passed > 100, "{refused} refused, {passed} passed");
+	}
+
+	#[test]
+	fn cookies_are_read() {
+		// a ClientHello with a cookie: the test record's cookie length byte is at body offset 35
+		let mut r = record(&[]);
+		assert_eq!(handshake(&r, CLIENT_HELLO).and_then(hello_cookie), Some(&[][..]));
+		let body_at = 13 + 12;
+		r[body_at + 35] = 2;
+		r.splice(body_at + 36..body_at + 36, [7u8, 8]);
+		// lengths: the record's, the message's and the fragment's
+		for at in [11usize, 13 + 1, 13 + 9] {
+			let (hi, lo) = if at == 11 { (at, at + 1) } else { (at + 1, at + 2) };
+			let v = u16::from_be_bytes([r[hi], r[lo]]) + 2;
+			r[hi..=lo].copy_from_slice(&v.to_be_bytes());
+		}
+		assert_eq!(handshake(&r, CLIENT_HELLO).and_then(hello_cookie), Some(&[7u8, 8][..]));
+		assert!(hellos_are_safe(&r));
+		// a HelloVerifyRequest: version, cookie
+		let mut hvr = vec![22, 0xfe, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12 + 6, 3, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 6];
+		hvr.extend([0xfe, 0xff, 3, 1, 2, 3]);
+		assert_eq!(handshake(&hvr, HELLO_VERIFY_REQUEST).and_then(verify_request_cookie), Some(&[1u8, 2, 3][..]));
+		assert_eq!(handshake(&hvr, CLIENT_HELLO), None);
+		// cut short: nothing
+		assert_eq!(handshake(&hvr[..hvr.len() - 1], HELLO_VERIFY_REQUEST), None);
+		// epoch 1: not read
+		hvr[4] = 1;
+		assert_eq!(handshake(&hvr, HELLO_VERIFY_REQUEST), None);
 	}
 
 	#[test]

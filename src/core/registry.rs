@@ -2617,6 +2617,13 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_limit_bytes RPROXY_CACHE_MAX_MEMORY in force: bytes all cache middlewares may keep together (0: no limit).");
 	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_limit_bytes gauge");
 	let _ = writeln!(out, "rproxy_http_cache_memory_limit_bytes {limit}");
+	// the process's descriptors for connections and sessions (#354)
+	let _ = writeln!(out, "# HELP rproxy_session_budget_in_use Descriptors held by UDP sessions (and connections) of the process, of rproxy_session_budget_limit.");
+	let _ = writeln!(out, "# TYPE rproxy_session_budget_in_use gauge");
+	let _ = writeln!(out, "rproxy_session_budget_in_use {}", crate::core::budget::in_use());
+	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors connections and sessions may hold: RLIMIT_NOFILE less a reserve of 1024.");
+	let _ = writeln!(out, "# TYPE rproxy_session_budget_limit gauge");
+	let _ = writeln!(out, "rproxy_session_budget_limit {}", crate::core::budget::limit());
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
 	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
 	for line in durations {

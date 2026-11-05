@@ -185,6 +185,7 @@ Checked with both one intermediate CA (3 tiers) and two intermediate CAs (4 tier
 | `dtls_can_be_re_encrypted_towards_the_backend` | Re-encrypts toward the target with DTLS |
 | `dtls_needs_a_pkcs8_key` | A key that is not PKCS#8 is `tls_config` |
 | `dtls_sessions_start_with_a_client_hello_and_need_a_second` | A new source's datagram that is not a ClientHello makes no session; a source that never answers the HelloVerifyRequest (a spoofed one) is given up after 5 s (#354) |
+| `a_closing_dtls_backend_ends_the_session` | The session ends when the DTLS connection to the backend closes (#354; it used to spin on the read errors) |
 
 ## Integration tests: data integrity (`tests/integrity.rs`, #134)
 
@@ -551,7 +552,7 @@ Test files not covered by the sections above (see the description at the top of 
 | `tests/listen.rs` | One rule listening on several addresses (`extra_listen_addrs`, #99; UDP sessions of a removed address end, #354); listening on addresses not on the host yet (`listen_freebind`, v0.4.3; the real path is `scripts/test-freebind.sh`) |
 | `tests/udp_shards.rs` | Reading a UDP port with several `SO_REUSEPORT` sockets (#194): no session opened twice, the reply source (#137), counters add up |
 | `tests/udp_source.rs` | UDP replies on wildcard listeners leave from the address the client sent to (#137; to 127.0.0.2) |
-| `tests/udp_sessions.rs` | The default cap of a udp rule's sessions (#332, `RPROXY_UDP_MAX_SESSIONS`): new sessions beyond it refused, taken again once idle ones end, a rule's `limits.max_connections` first, 0 for none, at the cap the oldest session its backend never answered makes room instead of a refusal, and such sessions end after 5 s (#354) (the cap is process-wide, so only this file's one test changes it) |
+| `tests/udp_sessions.rs` | The default cap of a udp rule's sessions (#332, `RPROXY_UDP_MAX_SESSIONS`): new sessions beyond it refused, taken again once idle ones end, a rule's `limits.max_connections` first, 0 for none, at the cap the oldest session not established (no backend reply, or no second datagram from the client) makes room instead of a refusal (single-datagram sources go even when the backend answers, a client that sent a second stays), and such sessions end after 5 s (#354) (the cap is process-wide, so only this file's one test changes it) |
 | `tests/udp_sni.rs` | UDP `tls.mode: sni` (#130) with real QUIC (quinn) and DTLS clients and backends; the slots of sessions waiting for the rest of their name are bounded per source prefix (#332) |
 | `tests/http.rs` | L7 routing of `http` rules |
 | `tests/http3.rs` | HTTP/3 with `http3: true` (#56), with a quinn + h3 client |

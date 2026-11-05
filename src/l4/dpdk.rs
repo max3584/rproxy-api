@@ -520,10 +520,12 @@ impl Rule for RtRule {
 		}
 		let limiter = rt.limits.get();
 		// the default cap first, as on the kernel's path: a refused datagram spends nothing of the source's `limits`
-		let Some(counted) = crate::l4::udp::count_session(rt, limiter.as_deref(), || false) else {
+		// no eviction here: the DPDK engine's session table only caps (docs/API.md)
+		let (counted, over) = crate::l4::udp::count_session(rt, limiter.as_deref());
+		if over {
 			limits::refused(rt, SocketAddr::V4(client), Reason::MaxConnections, "udp");
 			return None;
-		};
+		}
 		let permit = match limiter.as_ref().map(|l| l.admit(ip)) {
 			None => None,
 			Some(Ok(p)) => Some(p),

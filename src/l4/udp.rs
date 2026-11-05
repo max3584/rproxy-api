@@ -30,9 +30,11 @@ use crate::tls::config::{TlsMode, TlsRuntime};
 use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
 
 const SESSION_QUEUE: usize = 1024;
-/// About the bytes of datagrams one session's queue holds (#354): a datagram waits only
+/// The bytes of datagrams one session's queue is sized for (#354): a datagram waits only
 /// while the queue holds fewer than this many bytes' worth of datagrams of its size, so
-/// large datagrams queue less deep (the count of 1024 alone allowed 64 MiB).
+/// large datagrams queue less deep. The datagram at place k of the queue is then smaller
+/// than this / k, so the queue holds at most about 4.5 times this (9 MiB; the count of
+/// 1024 alone allowed 64 MiB), with no count of bytes kept on the way of each datagram.
 const SESSION_QUEUE_BYTES: usize = 2 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A session that has not seen a reply from its backend (DTLS terminate: has not finished
@@ -120,9 +122,8 @@ fn lock(sessions: &Sessions) -> std::sync::MutexGuard<'_, Table> {
 }
 
 /// Queues a client's datagram for its session; false when the queue is full: 1024
-/// datagrams, or about `SESSION_QUEUE_BYTES` (a datagram queues only behind fewer than
-/// that many bytes' worth of datagrams of its own size). One atomic load: no count of
-/// bytes is kept on the way of each datagram.
+/// datagrams, or `SESSION_QUEUE_BYTES` worth of datagrams of its own size waiting ahead
+/// of it. One atomic load (`capacity`).
 fn enqueue(tx: &mpsc::Sender<Vec<u8>>, data: &[u8]) -> bool {
 	let waiting = SESSION_QUEUE - tx.capacity();
 	waiting < (SESSION_QUEUE_BYTES / data.len().max(1)).min(SESSION_QUEUE) && tx.try_send(data.to_vec()).is_ok()
@@ -174,16 +175,38 @@ struct Waiting {
 	stop: CancellationToken,
 }
 
+/// Every rule's sessions not replied to yet, oldest first: the process's descriptors
+/// (`core::budget`) are shared by all rules, so the oldest of all makes room there.
+static ALL_UNREPLIED: Unreplied = Unreplied { order: Mutex::new(VecDeque::new()) };
+
 impl Unreplied {
+	/// A new session, in its rule's queue and in the process's (`ALL_UNREPLIED`).
 	fn track(&self, stop: CancellationToken) -> Mark {
 		let state = Arc::new(Waiting { done: AtomicBool::new(false), evicted: AtomicBool::new(false), stop });
+		self.push(state.clone());
+		ALL_UNREPLIED.push(state.clone());
+		Mark(state)
+	}
+
+	fn push(&self, state: Arc<Waiting>) {
 		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
 		// done ones are skipped when evicting, and cleared out now and then (amortised)
 		if order.len() >= 64 && order.len().is_power_of_two() {
 			order.retain(|w| !w.done.load(Ordering::Relaxed));
 		}
-		order.push_back(state.clone());
-		Mark(state)
+		order.push_back(state);
+	}
+
+	/// Whether there may be one to evict (a quick look before spending a source's `limits`).
+	fn any(&self) -> bool {
+		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+		while let Some(w) = order.front() {
+			if !w.done.load(Ordering::Relaxed) {
+				return true;
+			}
+			order.pop_front();
+		}
+		false
 	}
 
 	/// Ends the oldest session that has not seen a reply; false when there is none.
@@ -366,22 +389,21 @@ impl Drop for Counted {
 	}
 }
 
-/// Counts a new session of the rule; None over the default cap (`MAX_SESSIONS`), which a
-/// rule's own `limits.max_connections` replaces. `evict`: what makes room at the cap (the
-/// oldest session not replied to yet, #354); None refuses.
-pub(crate) fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>, evict: impl FnOnce() -> bool) -> Option<Counted> {
+/// Counts a new session of the rule, and whether it is over the default cap
+/// (`MAX_SESSIONS`), which a rule's own `limits.max_connections` replaces.
+pub(crate) fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>) -> (Counted, bool) {
 	let before = rt.stats.udp_sessions.fetch_add(1, Ordering::Relaxed);
 	let counted = Counted(rt.clone());
 	let max = MAX_SESSIONS.load(Ordering::Relaxed);
-	(max == 0 || before < max || limiter.is_some_and(|l| l.max_connections().is_some()) || evict()).then_some(counted)
+	(counted, !(max == 0 || before < max || limiter.is_some_and(|l| l.max_connections().is_some())))
 }
 
 /// The descriptor of a new session's backend socket from the process's budget; when it is
-/// all taken, the rule's oldest session not replied to gives its up (counted over by one
-/// until that session has ended, a moment later; the budget keeps a reserve). None: the
-/// rule has none to give.
-fn session_ticket(rt: &Runtime) -> Option<Ticket> {
-	Ticket::take(1).or_else(|| rt.udp_unreplied.evict_oldest().then(|| Ticket::force(1)))
+/// all taken, the oldest session of any rule not replied to gives its up (`Ticket::force`:
+/// counted over until that session has ended, a moment later, within half the budget's
+/// reserve). None: none to give.
+fn session_ticket() -> Option<Ticket> {
+	Ticket::take(1).or_else(|| if ALL_UNREPLIED.evict_oldest() { Ticket::force(1) } else { None })
 }
 
 /// Serves one socket of one port of the rule; `offset` is the port's place in a
@@ -514,15 +536,13 @@ fn open(
 		debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "not a DTLS ClientHello");
 		return None;
 	}
-	// the default cap first: a refused datagram spends nothing of the source's `limits`
-	let Some(counted) = count_session(rt, limiter, || rt.udp_unreplied.evict_oldest()) else {
+	// the default cap first: a datagram refused there spends nothing of the source's `limits`;
+	// at the cap, room is made only when there is a session to evict
+	let (counted, over) = count_session(rt, limiter);
+	if over && !rt.udp_unreplied.any() {
 		limits::refused(rt, client, Reason::MaxConnections, "udp");
 		return None;
-	};
-	let Some(ticket) = session_ticket(rt) else {
-		limits::refused(rt, client, Reason::MaxConnections, "udp");
-		return None;
-	};
+	}
 	let permit = match limiter.map(|l| l.admit(client.ip())) {
 		None => None,
 		Some(Ok(p)) => Some(p),
@@ -530,6 +550,15 @@ fn open(
 			limits::refused(rt, client, reason, "udp");
 			return None;
 		}
+	};
+	// within the source's own limits: only now does an older session make room (#354)
+	if over && !rt.udp_unreplied.evict_oldest() {
+		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		return None;
+	}
+	let Some(ticket) = session_ticket() else {
+		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		return None;
 	};
 	let mark = rt.udp_unreplied.track(shard.ended.child_token());
 	let admitted = Admitted { _permit: permit, _counted: counted, _ticket: ticket, mark };
@@ -587,36 +616,53 @@ async fn run_session(
 	}
 }
 
-/// When a plain session ends without datagrams (#354): `UNREPLIED_TIMEOUT` after the
-/// client's last datagram until the backend has replied, then `udp_idle` after the last
-/// datagram either way, but the backend's count only once the client has sent more than
-/// one: a spoofed source's one datagram that a backend keeps answering (a stream sent
-/// to whoever asked) does not keep the session, and the flow to the victim, going.
+/// When a plain session ends without datagrams (#354). It is established once the backend
+/// has replied and the client has sent more than one datagram: a spoofed source sends one
+/// and never hears the reply, however readily the backend (DNS, a game server, QUIC)
+/// answers it. Until then it ends `UNREPLIED_TIMEOUT` after the client's last datagram,
+/// the backend's datagrams do not keep it, and it stays one to evict at the caps
+/// (`Unreplied`). Established, `udp_idle` after the last datagram either way.
 struct Quiet {
 	idle: Duration,
-	replied: bool,
+	/// The backend has replied.
+	answered: bool,
 	/// Datagrams from the client.
 	from_client: u64,
 	last: tokio::time::Instant,
 }
 
 impl Quiet {
-	fn deadline(&self) -> tokio::time::Instant {
-		self.last + if self.replied { self.idle } else { self.idle.min(UNREPLIED_TIMEOUT) }
+	/// A session's clock, established already when an earlier run of it was (`Mark::is_replied`).
+	fn new(idle: Duration, mark: &Mark, first: usize) -> Self {
+		let established = mark.is_replied();
+		Quiet { idle, answered: established, from_client: if established { first.max(2) } else { first } as u64, last: tokio::time::Instant::now() }
 	}
 
-	fn client(&mut self, datagrams: usize) {
+	fn established(&self) -> bool {
+		self.answered && self.from_client > 1
+	}
+
+	fn deadline(&self) -> tokio::time::Instant {
+		self.last + if self.established() { self.idle } else { self.idle.min(UNREPLIED_TIMEOUT) }
+	}
+
+	fn client(&mut self, datagrams: usize, mark: &Mark) {
 		self.from_client += datagrams as u64;
 		self.last = tokio::time::Instant::now();
+		self.settle(mark);
 	}
 
 	fn backend(&mut self, mark: &Mark) {
-		if !self.replied {
-			self.replied = true;
-			mark.replied();
-		}
-		if self.from_client > 1 {
+		self.answered = true;
+		if self.established() {
 			self.last = tokio::time::Instant::now();
+		}
+		self.settle(mark);
+	}
+
+	fn settle(&self, mark: &Mark) {
+		if self.established() {
+			mark.replied();
 		}
 	}
 }
@@ -723,7 +769,7 @@ async fn session(
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	// the datagrams held while reading the server name, in order
 	let mut first = first;
-	let mut quiet = Quiet { idle, replied: mark.is_replied(), from_client: first.len() as u64, last: tokio::time::Instant::now() };
+	let mut quiet = Quiet::new(idle, mark, first.len());
 	// ECONNREFUSED from the backend: an ICMP port unreachable, seen on a send or a read
 	let mut refused: Option<std::io::Error> = None;
 	rx_bytes += forward(rt, &upstream, &header, client, &mut first, &mut up, &mut refused).await;
@@ -746,7 +792,7 @@ async fn session(
 				if received == 0 {
 					break "closed";
 				}
-				quiet.client(received);
+				quiet.client(received, mark);
 				if !by_name {
 					rx_bytes += forward(rt, &upstream, &header, client, &mut inbox, &mut up, &mut refused).await;
 					inbox.clear();
@@ -1170,10 +1216,11 @@ impl Upstream {
 		}
 	}
 
-	async fn recv(&self, buf: &mut [u8]) -> Result<usize, String> {
+	/// Err: the error, and whether it is a plain backend's ICMP port unreachable.
+	async fn recv(&self, buf: &mut [u8]) -> Result<usize, (String, Option<std::io::Error>)> {
 		match self {
-			Upstream::Plain(s) => s.recv(buf).await.map_err(|e| e.to_string()),
-			Upstream::Dtls(c) => c.read(buf, None).await.map_err(|e| e.to_string()),
+			Upstream::Plain(s) => s.recv(buf).await.map_err(|e| (e.to_string(), (e.kind() == std::io::ErrorKind::ConnectionRefused).then_some(e))),
+			Upstream::Dtls(c) => c.read(buf, None).await.map_err(|e| (e.to_string(), None)),
 		}
 	}
 }
@@ -1181,9 +1228,9 @@ impl Upstream {
 /// A UDP session whose client speaks DTLS to rproxy. Until the handshake is through it
 /// is a session not replied to (`Unreplied`, evicted first at the cap), takes one of the
 /// port's slots of sessions that wait for more datagrams (`SniSlots`: at most 64 per source
-/// prefix, the prefix's oldest given up past that, #354), and ends when the client sends
-/// nothing more than its first ClientHello within `UNREPLIED_TIMEOUT` (a spoofed source
-/// never sees the HelloVerifyRequest, so never sends the second).
+/// prefix, the prefix's oldest given up past that, #354), and ends unless a ClientHello with
+/// the cookie of the crate's HelloVerifyRequest comes back within `UNREPLIED_TIMEOUT`
+/// (`SessionConn::verified`: a spoofed source never sees the cookie).
 async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &Shard, rt: Arc<Runtime>, tls: Arc<TlsRuntime>, admitted: Admitted) {
 	let (client, local) = (peer.client(), peer.local);
 	let (offset, mark) = (shard.offset, &admitted.mark);
@@ -1196,7 +1243,7 @@ async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &
 	let slot = shard.sniffing.take(client.ip());
 	let unanswered = async {
 		tokio::time::sleep(UNREPLIED_TIMEOUT).await;
-		if session_conn.datagrams() > 1 {
+		if session_conn.verified() {
 			std::future::pending::<()>().await;
 		}
 	};
@@ -1209,7 +1256,7 @@ async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &
 		}
 		_ = unanswered => {
 			rt.stats.dropped();
-			debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "no second ClientHello");
+			debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "no ClientHello with the cookie of the HelloVerifyRequest");
 			return;
 		}
 		r = tokio::time::timeout(HANDSHAKE_TIMEOUT, DTLSConn::new(conn, tls.dtls_server_config(), false, None)) => r,
@@ -1252,7 +1299,7 @@ async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &
 			None
 		}
 	});
-	let Some((chosen, _lease)) = chosen else {
+	let Some((chosen, lease)) = chosen else {
 		if full {
 			limits::refused(&rt, client, Reason::TargetFull, "udp");
 		} else {
@@ -1330,10 +1377,13 @@ async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &
 				}
 				// a plain backend's ICMP port unreachable comes once; a DTLS backend that closed
 				// (or failed) fails every read from now on: the session ends (#354)
-				Err(e) => {
+				Err((e, refused)) => {
 					debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
 					if matches!(upstream, Upstream::Dtls(_)) {
 						break "backend closed";
+					}
+					if let Some(refused) = refused {
+						target_refused(&rt, lease.as_ref(), &refused);
 					}
 				}
 			},
@@ -1463,34 +1513,65 @@ mod tests {
 		assert!(!enqueue(&tx, &small));
 	}
 
-	// #354: unreplied, a session ends UNREPLIED_TIMEOUT after the client's last datagram; replied, after udp_idle,
-	// and the backend's datagrams count only once the client has sent more than one
+	// #354: until established (a reply, and more than one datagram from the client) a session ends UNREPLIED_TIMEOUT
+	// after the client's last datagram, the backend's datagrams do not keep it and it stays one to evict; established,
+	// udp_idle after the last datagram either way
 	#[tokio::test(start_paused = true)]
 	async fn quiet_sessions_end() {
 		let idle = Duration::from_secs(30);
 		let unreplied = Unreplied::default();
 		let mark = unreplied.track(CancellationToken::new());
 		let start = tokio::time::Instant::now();
-		let mut quiet = Quiet { idle, replied: false, from_client: 1, last: start };
+		let mut quiet = Quiet::new(idle, &mark, 1);
 		assert_eq!(quiet.deadline(), start + UNREPLIED_TIMEOUT);
 		tokio::time::advance(Duration::from_secs(2)).await;
-		// a reply to a single datagram: udp_idle from that datagram, however much more the backend sends
+		// a reply to a single datagram (a spoofed query a backend answers): still unreplied, however much it sends
 		quiet.backend(&mark);
-		assert_eq!(quiet.deadline(), start + idle);
-		assert_eq!(unreplied.waiting(), 0, "replied: not one to evict");
-		tokio::time::advance(Duration::from_secs(20)).await;
+		tokio::time::advance(Duration::from_secs(2)).await;
 		quiet.backend(&mark);
-		assert_eq!(quiet.deadline(), start + idle);
-		// the client's second datagram: both ways from now on
-		quiet.client(1);
+		assert_eq!(quiet.deadline(), start + UNREPLIED_TIMEOUT);
+		assert_eq!(unreplied.waiting(), 1, "still one to evict");
+		// the client's second datagram: established, both ways from now on
+		quiet.client(1, &mark);
 		let now = tokio::time::Instant::now();
 		assert_eq!(quiet.deadline(), now + idle);
+		assert_eq!(unreplied.waiting(), 0, "established: not one to evict");
 		tokio::time::advance(Duration::from_secs(20)).await;
 		quiet.backend(&mark);
 		assert_eq!(quiet.deadline(), tokio::time::Instant::now() + idle);
+		// a later run of the same session (a new QUIC connection) starts established
+		assert!(Quiet::new(idle, &mark, 1).established());
+		// two datagrams before any reply: established with the first reply
+		let other = unreplied.track(CancellationToken::new());
+		let mut quiet = Quiet::new(idle, &other, 2);
+		assert!(!quiet.established());
+		quiet.backend(&other);
+		assert!(quiet.established() && unreplied.waiting() == 0);
 		// a short udp_idle stays as short unreplied
-		let quiet = Quiet { idle: Duration::from_secs(1), replied: false, from_client: 1, last: start };
-		assert_eq!(quiet.deadline(), start + Duration::from_secs(1));
+		let third = unreplied.track(CancellationToken::new());
+		let quiet = Quiet::new(Duration::from_secs(1), &third, 1);
+		assert_eq!(quiet.deadline(), tokio::time::Instant::now() + Duration::from_secs(1));
+	}
+
+	// #354: what a new QUIC connection from the same socket holds while its name is read is bounded in bytes too
+	#[tokio::test]
+	async fn a_renamed_probe_holds_at_most_sni_max_bytes() {
+		use crate::tls::udp_sni::quic::Version;
+		use crate::tls::udp_sni::tests::{crypto_frame, initial, tls_hello};
+		let hello = tls_hello("other.example", &["h3"]);
+		// the first bytes of a ClientHello, padded to 15 000 bytes: the name never comes
+		let mut frames = crypto_frame(0, &hello[..10]);
+		frames.resize(15_000, 0);
+		let (mut probe, mut dcid) = (None, Some(vec![1u8; 8]));
+		for pn in 0..4 {
+			let step = renamed(&mut probe, &mut dcid, Some("first.example"), initial(Version::V1, &[2u8; 8], pn, &frames, b""));
+			assert!(matches!(step, Step::Hold), "datagram {pn} held");
+		}
+		match renamed(&mut probe, &mut dcid, Some("first.example"), initial(Version::V1, &[2u8; 8], 4, &frames, b"")) {
+			Step::Forward(held) => assert_eq!(held.len(), 5, "past SNI_MAX_BYTES: given up and sent on"),
+			_ => panic!("still held past SNI_MAX_BYTES"),
+		}
+		assert!(probe.is_none());
 	}
 
 	#[tokio::test]

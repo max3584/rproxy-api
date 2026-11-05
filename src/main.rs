@@ -995,7 +995,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	let nofile = raise_nofile_limit();
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
-		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0));
+		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), session_budget = rproxy_api::core::budget::limit());
 
 	// #144: rules of persist: true tokens, in rproxy_rules
 	if rproxy_api::core::rule::Features::CURRENT.persistence {

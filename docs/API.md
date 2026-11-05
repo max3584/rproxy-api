@@ -138,7 +138,7 @@ tokens:
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
 | `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くと今までどおり（ほかに宛先があれば 5 秒、なければ OS の既定（Linux は約 2 分））。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md。TLS を終端しない `tls.routes[]` には route ごとの `source_ip` も書ける（下の「`tls.routes[]` の `source_ip`」） |
-| `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。転送先から返事のないセッションは 5 秒（下の「UDP の送信元の偽装への備え」）。TCP では無視する |
+| `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。確立していない（転送先の返事とクライアントの 2 つ目のデータグラムのない）セッションは 5 秒（下の「UDP の送信元の偽装への備え」）。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
@@ -215,7 +215,7 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
 
 `tls.client_auth.mode: optional_no_verify` は、クライアント証明書を求めるが、送られなくても、検証に通らなくても接続を受ける（Gateway API の `AllowInsecureFallback`）。`tcp` の `terminate`（`http` のルールと HTTP/3 を含む）と `udp` の DTLS の終端で使える。`GET /capabilities` の `features.client_auth_modes` に `optional_no_verify` があれば使える。
 
-`udp` の DTLS の終端は、ClientHello を断片に分けずに 1 つのレコードで送るクライアントを受ける（v0.4.11 から）。断片に分かれた ClientHello と、拡張の欄が途中で切れた ClientHello は捨てる（`debug` の `udp.drop`）。rproxy が使う DTLS のライブラリ（`dtls` 0.17.2）は、拡張が途中で切れた ClientHello を読むとそのセッションの処理が panic で止まるため（#287）。DTLS 1.2 の ClientHello はふつう 1 つのデータグラムに収まる。名前で振り分ける `sni` は rproxy の自前の読み取りなので、断片に分かれていても扱える。v0.4.20 から、新しい送信元の最初のデータグラムが ClientHello でなければセッションを作らず、5 秒のうちに 2 つ目の ClientHello が来なければ終える（「UDP の送信元の偽装への備え」、#354）。
+`udp` の DTLS の終端は、ClientHello を断片に分けずに 1 つのレコードで送るクライアントを受ける（v0.4.11 から）。断片に分かれた ClientHello と、拡張の欄が途中で切れた ClientHello は捨てる（`debug` の `udp.drop`）。rproxy が使う DTLS のライブラリ（`dtls` 0.17.2）は、拡張が途中で切れた ClientHello を読むとそのセッションの処理が panic で止まるため（#287）。DTLS 1.2 の ClientHello はふつう 1 つのデータグラムに収まる。名前で振り分ける `sni` は rproxy の自前の読み取りなので、断片に分かれていても扱える。v0.4.20 から、新しい送信元の最初のデータグラムが ClientHello でなければセッションを作らず、5 秒のうちに HelloVerifyRequest の cookie を持つ ClientHello が戻らなければ終える（「UDP の送信元の偽装への備え」、#354）。
 
 ```json
 "client_auth": {"mode": "optional_no_verify", "ca_file": "/etc/rproxy/clients-root.pem"}
@@ -820,18 +820,17 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 UDP の送信元は偽れるので、1 つのデータグラムで作れるもの（セッション・転送先へのソケット・DTLS の接続）が積み上がらないようにしている。設定の形は変わらない（既定の動きが変わる）。
 
-- **返事のないセッション**：転送先から返事が来ていないセッション（DTLS の終端ではハンドシェイクが終わっていないもの）は、クライアントの最後のデータグラムから 5 秒で終わる（conntrack の unreplied と同じ考え。`udp_idle_secs` がそれより短ければそちら）。返事が来たら `udp_idle_secs`。
-- **転送先だけの通信**：クライアントが 1 つしかデータグラムを送っていないセッションは、転送先から何が届いても延びない（そのデータグラムから `udp_idle_secs` で終わる）。クライアントが 2 つ目を送ってからは、どちらの向きでも延びる。偽った送信元の 1 つの要求に転送先が送り続けても、そのアドレスへの流れがずっと続かないように。
-- **上限で古いものから**：ルールのセッションが既定の上限（`RPROXY_UDP_MAX_SESSIONS`）に達したときや、プロセス全体のファイルの数の枠（下）が埋まったときは、新しいセッションを断る代わりに、返事のないセッションのいちばん古いものを終える（`conn.close` の `reason: evicted`）。返事のあるセッションは終えない。返事のないものがなければ今までどおり断る（`limits.max_connections` を付けたルールは、その上限で断る）。
-- **プロセス全体の枠**：UDP のセッション（転送先へのソケット 1 つ）は、プロセスのファイルの数の上限（`RLIMIT_NOFILE`。起動時にハードの上限まで上げる）から 1024（制御 API・DB・名前解決・ファイルの分）を除いた枠の中で作る。埋まったら上と同じく古い返事のないものを終え、なければ断る（`stats.limited`・`conn.limited` の `reason: max_connections`）。
-- **DTLS の終端**：新しい送信元の最初のデータグラムが ClientHello（epoch 0 のハンドシェイクのレコード）でなければ、セッションを作らずに捨てる。ハンドシェイクの間は、1 つのポートで「名前を読む」セッションと同じ枠（1 ポート 4096、1 つのプレフィックス（IPv4 /24・IPv6 /48）は 64 まで。超えたらそのプレフィックスのいちばん古いものをあきらめる）を使い、5 秒のうちに 2 つ目の ClientHello（HelloVerifyRequest への答え。偽った送信元には届かない）が来なければ終える。DTLS の設定はルールの TLS と一緒に 1 回だけ組み立てる。HelloVerifyRequest を rproxy が状態を持たずに答える（cookie を確かめてから DTLS の接続を作る）のは、使っている `dtls` クレート（0.17）ではできない（ライブラリが自分の cookie とハンドシェイクの番号を決めるため）。
+- **確立していないセッション**：転送先から返事があり、かつクライアントが 2 つ以上データグラムを送ったセッションを「確立した」とみなす（偽った送信元は 1 つ送るだけで返事を受け取れない。DNS・ゲーム・QUIC の転送先がその 1 つに答えても確立しない）。確立していないセッションは、クライアントの最後のデータグラムから 5 秒で終わり（conntrack の unreplied と同じ考え。`udp_idle_secs` がそれより短ければそちら）、転送先からの通信では延びず、上限で終える対象になる。確立したら `udp_idle_secs`（どちらの向きの通信でも延びる）。1 つの問い合わせに 1 つ答える使い方（DNS など）はもともと 5 秒より短く終わる。
+- **上限で古いものから**：ルールのセッションが既定の上限（`RPROXY_UDP_MAX_SESSIONS`）に達したときは、新しいセッションが送信元ごとの `limits` に通った後で、そのルールの確立していないいちばん古いセッションを終えて受ける（`conn.close` の `reason: evicted`）。確立したセッションは終えない。終えられるものがなければ今までどおり断る（`limits.max_connections` を付けたルールは、その上限で断る）。
+- **プロセス全体の枠**：UDP のセッション（転送先へのソケット 1 つ）は、プロセスのファイルの数の上限（`RLIMIT_NOFILE`。起動時にハードの上限まで上げる）から 1024（制御 API・DB・名前解決・ファイルの分）を除いた枠の中で作る（起動の `start` の行の `session_budget`、`/metrics` の `rproxy_session_budget_limit`・`rproxy_session_budget_in_use`）。埋まったら、どのルールのものでも確立していないいちばん古いセッションを終えて受け（終わるまでのあいだ枠を超えるのは 512 まで）、なければ断る（`stats.limited`・`conn.limited` の `reason: max_connections`）。
+- **DTLS の終端**：新しい送信元の最初のデータグラムが ClientHello（epoch 0 のハンドシェイクのレコード）でなければ、セッションを作らずに捨てる。ハンドシェイクの間は、1 つのポートで「名前を読む」セッションと同じ枠（1 ポート 4096、1 つのプレフィックス（IPv4 /24・IPv6 /48）は 64 まで。超えたらそのプレフィックスのいちばん古いものをあきらめる）を使い、ハンドシェイクが終わるまでは確立していないセッションとして上限で終える対象になる。5 秒のうちに、DTLS のライブラリが送った HelloVerifyRequest の cookie を持つ ClientHello が戻ってこなければ終える（偽った送信元には cookie が届かない）。DTLS の設定はルールの TLS と一緒に 1 回だけ組み立てる。HelloVerifyRequest を rproxy が状態を持たずに答える（cookie を確かめてから DTLS の接続を作る）のは、使っている `dtls` クレート（0.17）ではできない（ライブラリが自分の cookie とハンドシェイクの番号を決めるため）。ライブラリはセッションごとに証明書の鍵を複製する。
 - **DTLS の転送先が閉じたとき**：転送先への DTLS が閉じる・失敗すると、そのセッションを終える（`reason: backend closed`。前は読み出しの誤りを繰り返して CPU を使い続けた）。
 - **QUIC の名前読み**：1 つのセッションで見る Initial は 16 まで（前は 64）、鍵は最初の Initial の接続 ID から 1 回だけ導き、違う接続 ID の Initial は読まない（RFC 9000 §12.2）。同じソケットからの別の名前の新しい接続を読む間に持つデータグラムは、数（16）に加えてバイト（64 KiB）でも上限がある。
-- **セッションのキュー**：1 つのセッションに渡す前のデータグラムは、数（1024）に加えて、大きさでも上限がある（そのデータグラムと同じ大きさで約 2 MiB 分より多く並んでいれば捨てる）。
+- **セッションのキュー**：1 つのセッションに渡す前のデータグラムは、数（1024）に加えて、大きさでも上限がある（そのデータグラムと同じ大きさで 2 MiB 分より多く並んでいれば捨てる。1 つのキューは多くて約 9 MiB。前は 64 MiB まで）。
 - **ICMP**：転送先からの ICMP port unreachable（`ECONNREFUSED`）は、読み出しだけでなく送信で返ってきたときも、その宛先の失敗として数える（`outlier_detection`）。
 - **`extra_listen_addrs` を外したとき**：外したアドレスで開いていた UDP のセッションも終える（TCP の接続はそのまま）。
 - **`proxy_protocol.from` が公開のアドレス**：`udp` のルールの `from` に私用・ループバック・リンクローカル・CGNAT（100.64.0.0/10）の外のアドレスが含まれると、作成・変更のときに `rule.proxy_protocol_public`（`warn`）を出す（断らない）。
-- DPDK の道（`global.performance.dpdk`）のセッションも、既定の上限（`RPROXY_UDP_MAX_SESSIONS`）を数える。
+- DPDK の道（`global.performance.dpdk`）のセッションも、既定の上限（`RPROXY_UDP_MAX_SESSIONS`）を数える。DPDK のセッションの表には 5 秒の時間切れも古いものを終えることもない（上限で断るだけ）。
 
 ### GeoIP（#168）
 

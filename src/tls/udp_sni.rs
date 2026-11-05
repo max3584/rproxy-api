@@ -587,11 +587,20 @@ pub mod quic {
 			if !initial {
 				return Some(None);
 			}
-			let (v, id, keys) = self.conn.get_or_insert_with(|| (version, dcid.to_vec(), client_initial_keys(version, dcid)));
-			if *v != version || id.as_slice() != dcid {
-				return Some(None);
-			}
-			let Some(frames) = unprotect_with(keys, packet, pn_offset) else { return Some(None) };
+			let frames = match &self.conn {
+				Some((v, id, keys)) if *v == version && id.as_slice() == dcid => unprotect_with(keys, packet, pn_offset),
+				Some(_) => return Some(None),
+				// the connection is pinned by the first Initial that opens (garbage in front does not pin it)
+				None => {
+					let keys = client_initial_keys(version, dcid);
+					let frames = unprotect_with(&keys, packet, pn_offset);
+					if frames.is_some() {
+						self.conn = Some((version, dcid.to_vec(), keys));
+					}
+					frames
+				}
+			};
+			let Some(frames) = frames else { return Some(None) };
 			Some(self.frames(&frames))
 		}
 
@@ -673,7 +682,7 @@ fn u24(b: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::quic::{client_initial_keys, header_mask, unprotect, varint, Version, V1, V2};
 	use super::*;
 
@@ -685,7 +694,7 @@ mod tests {
 	const DCID: &str = "8394c8f03e515708";
 
 	/// The ClientHello (a handshake message, no record layer) that rustls sends for `name`.
-	fn tls_hello(name: &str, alpn: &[&str]) -> Vec<u8> {
+	pub(crate) fn tls_hello(name: &str, alpn: &[&str]) -> Vec<u8> {
 		let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
@@ -777,7 +786,7 @@ mod tests {
 		}
 	}
 
-	fn crypto_frame(offset: usize, data: &[u8]) -> Vec<u8> {
+	pub(crate) fn crypto_frame(offset: usize, data: &[u8]) -> Vec<u8> {
 		let mut f = vec![0x06];
 		put_varint(&mut f, offset as u64);
 		put_varint(&mut f, data.len() as u64);
@@ -786,7 +795,7 @@ mod tests {
 	}
 
 	/// A protected client Initial carrying `frames` (padded to at least 1200 bytes).
-	fn initial(version: Version, dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
+	pub(crate) fn initial(version: Version, dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
 		initial_keyed(version, dcid, dcid, pn, frames, token)
 	}
 

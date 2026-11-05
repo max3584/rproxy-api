@@ -1,7 +1,7 @@
 //! Address ranges for `allow_from`.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use crate::error::ApiError;
@@ -51,9 +51,15 @@ impl Cidr {
 	/// Whether the range reaches beyond private, loopback, link-local and shared (CGNAT)
 	/// addresses: a source from the internet there could be anyone's, spoofed too.
 	pub fn is_public(&self) -> bool {
-		const PRIVATE: [&str; 9] =
-			["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"];
-		!PRIVATE.iter().filter_map(|b| b.parse::<Cidr>().ok()).any(|b| self.prefix >= b.prefix && b.contains(self.net))
+		const fn v4(a: u8, b: u8, prefix: u8) -> Cidr {
+			Cidr { net: IpAddr::V4(Ipv4Addr::new(a, b, 0, 0)), prefix }
+		}
+		const fn v6(first: u16, prefix: u8) -> Cidr {
+			Cidr { net: IpAddr::V6(Ipv6Addr::new(first, 0, 0, 0, 0, 0, 0, if first == 0 { 1 } else { 0 })), prefix }
+		}
+		const PRIVATE: [Cidr; 9] =
+			[v4(10, 0, 8), v4(172, 16, 12), v4(192, 168, 16), v4(127, 0, 8), v4(169, 254, 16), v4(100, 64, 10), v6(0, 128), v6(0xfc00, 7), v6(0xfe80, 10)];
+		!PRIVATE.iter().any(|b| self.prefix >= b.prefix && b.contains(self.net))
 	}
 }
 

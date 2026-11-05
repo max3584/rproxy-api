@@ -78,6 +78,26 @@ async fn udp_sessions_have_a_default_cap() {
 	}
 	assert_eq!(h.delete(&path[7..]).await, StatusCode::NO_CONTENT);
 
+	// #354: a backend that answers (DNS, a game server) does not establish a session whose source sent one datagram
+	// (a spoofed one never sees the answer): those make room at the cap, a client that sent a second stays
+	let port = free_udp_port();
+	let (status, v) = h.post(rule("udp", port, udp_backend("E:").await)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let path = format!("/rules/udp/127.0.0.1/{port}");
+	let real = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	real.connect(("127.0.0.1", port)).await.unwrap();
+	assert_eq!(udp_roundtrip(&real, "1").await, "E:1");
+	assert_eq!(udp_roundtrip(&real, "2").await, "E:2");
+	for i in 0..6 {
+		let (_sock, answered) = new_session(port).await;
+		assert!(answered, "single query {i}: room made by an older single query");
+	}
+	assert_eq!(udp_roundtrip(&real, "3").await, "E:3");
+	let (_, v) = h.get(&path).await;
+	assert_eq!(v["stats"]["limited"], 0, "{v}");
+	assert_eq!(v["stats"]["total_connections"], 7, "the two-way client's session stayed (no new one for it): {v}");
+	assert_eq!(h.delete(&path[7..]).await, StatusCode::NO_CONTENT);
+
 	let backend = udp_backend("U:").await;
 	let port = free_udp_port();
 	let mut body = rule("udp", port, backend);
@@ -90,6 +110,8 @@ async fn udp_sessions_have_a_default_cap() {
 	for _ in 0..3 {
 		let (sock, answered) = new_session(port).await;
 		assert!(answered, "within the cap");
+		// a second datagram: established (#354), not one to evict
+		assert_eq!(udp_roundtrip(&sock, "2").await, "U:2");
 		open.push(sock);
 	}
 	let (_, answered) = new_session(port).await;

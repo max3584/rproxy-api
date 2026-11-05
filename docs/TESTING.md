@@ -185,6 +185,7 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `dtls_can_be_re_encrypted_towards_the_backend` | 転送先へ DTLS で再暗号化する |
 | `dtls_needs_a_pkcs8_key` | PKCS#8 でない鍵は `tls_config` |
 | `dtls_sessions_start_with_a_client_hello_and_need_a_second` | 新しい送信元の ClientHello でないデータグラムはセッションを作らない、HelloVerifyRequest に答えない送信元（偽った送信元）は 5 秒であきらめる（#354） |
+| `a_closing_dtls_backend_ends_the_session` | 転送先への DTLS が閉じたらセッションを終える（#354。前は読み出しの誤りで回り続けた） |
 
 ## 結合テスト：データの完全性（`tests/integrity.rs`、#134）
 
@@ -551,7 +552,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99。外したアドレスの UDP のセッションは終わる、#354）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |
-| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし、上限では転送先の返事のないいちばん古いセッションが空けて断らない・返事のないセッションは 5 秒で終わる（#354）（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
+| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし、上限では確立していない（転送先の返事とクライアントの 2 つ目のない）いちばん古いセッションが空けて断らない（転送先が答えても 1 つしか送らない送信元は終える、2 つ目を送ったクライアントは残る）・確立していないセッションは 5 秒で終わる（#354）（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
 | `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先。名前の続きを待つセッションの枠が送信元のプレフィックスごとに限られる（#332） |
 | `tests/http.rs` | `http` のルールの L7 のルーティング |
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント |

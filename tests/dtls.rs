@@ -245,3 +245,43 @@ async fn dtls_sessions_start_with_a_client_hello_and_need_a_second() {
 	let c = dtls_client(&pki, port, "media.test", None).await.unwrap();
 	assert_eq!(dtls_roundtrip(&c, "a").await, "P:a");
 }
+
+// #354: a DTLS backend that closes ends the session (it used to spin on the failed reads until udp_idle)
+#[tokio::test]
+async fn a_closing_dtls_backend_ends_the_session() {
+	let pki = Pki::new("dtls-close");
+	let front = pki.server("front", &["front.test"]);
+	let back = pki.server("back", &["back.test"]);
+	// answers once, then closes
+	let listener = dtls::listener::listen(
+		"127.0.0.1:0",
+		Config { certificates: vec![back.dtls()], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() },
+	)
+	.await
+	.unwrap();
+	let backend = listener.addr().await.unwrap();
+	tokio::spawn(async move {
+		while let Ok((conn, _)) = listener.accept().await {
+			tokio::spawn(async move {
+				let mut buf = vec![0u8; 1500];
+				if let Ok(n) = conn.recv(&mut buf).await {
+					let _ = conn.send(&[b"D:", &buf[..n]].concat()).await;
+				}
+				let _ = conn.close().await;
+			});
+		}
+	});
+	let h = harness().await;
+	let port = free_udp_port();
+	let tls = json!({
+		"mode": "terminate",
+		"certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}],
+		"upstream": {"tls": true, "server_name": "back.test", "ca_file": pki.ca_file},
+	});
+	let (status, v) = h.post(dtls_rule(port, backend, tls)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let c = dtls_client(&pki, port, "front.test", None).await.unwrap();
+	assert_eq!(dtls_roundtrip(&c, "x").await, "D:x");
+	// udp_idle is 30 s: only the backend's close ends it this soon
+	wait_for(&h, &format!("/rules/udp/127.0.0.1/{port}"), |v| v["connections"] == 0 && v["stats"]["total_connections"] == 1).await;
+}

@@ -68,11 +68,11 @@ impl Ticket {
 		take_within(n, limit())
 	}
 
-	/// `n` descriptors over the budget: for one that is being given back (a session evicted
-	/// for this one ends a moment later).
-	pub fn force(n: u64) -> Ticket {
-		IN_USE.fetch_add(n, Ordering::Relaxed);
-		Ticket { n }
+	/// `n` descriptors over the budget, for ones being given back (a session evicted for
+	/// this one ends a moment later), but never into more than half of `RESERVE`: what
+	/// is in flight at once stays bounded. None past that.
+	pub fn force(n: u64) -> Option<Ticket> {
+		take_within(n, limit().saturating_add(RESERVE / 2))
 	}
 }
 
@@ -116,5 +116,7 @@ mod tests {
 		let c = take_within(3, base + 4).unwrap();
 		drop((b, c));
 		assert!(in_use() <= base + 4);
+		// `force` is bounded the same way, at half the reserve past the limit
+		assert!(take_within(RESERVE, base + RESERVE / 2).is_none());
 	}
 }

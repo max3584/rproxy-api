@@ -595,6 +595,21 @@ mod sys {
 mod tests {
 	use super::*;
 
+	// #354: an ICMP port unreachable of an earlier datagram comes back on the next send too: the caller sees
+	// ECONNREFUSED there (and fails the target)
+	#[tokio::test]
+	async fn a_refused_send_is_reported() {
+		let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		socket.connect(closed).await.unwrap();
+		socket.send(b"x").await.unwrap();
+		// the ICMP error arrives soon after
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		let mut kinds = vec![];
+		send_connected(&socket, None, &[b"y".to_vec()], |e| kinds.push(e.kind())).await;
+		assert_eq!(kinds, [io::ErrorKind::ConnectionRefused]);
+	}
+
 	/// A reply to 127.0.0.1 from a wildcard socket would leave from 127.0.0.1 (the
 	/// route to it); with packet info it leaves from 127.0.0.2, where it was sent.
 	#[tokio::test]
