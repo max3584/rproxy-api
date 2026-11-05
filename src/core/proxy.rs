@@ -174,6 +174,9 @@ pub struct Runtime {
 	pub listen_freebind: bool,
 	/// The rule's `connect_timeout` in ms (0: none); PATCH changes it for the next connection.
 	pub connect_timeout_ms: std::sync::atomic::AtomicU64,
+	/// The relay deadline of a tcp connection in ms (`idle_timeout`, #353; 0: none), read when
+	/// the connection starts; PATCH changes it for the next connection.
+	pub idle_timeout_ms: std::sync::atomic::AtomicU64,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
@@ -202,6 +205,13 @@ pub fn timeout_ms(d: Option<Duration>) -> u64 {
 	d.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1))
 }
 
+/// `idle_timeout` as kept in `Runtime::idle_timeout_ms`: left out is the default
+/// (`l4::idle::DEFAULT_IDLE_TIMEOUT`), zero is no limit (0).
+pub fn idle_timeout_ms(d: Option<Duration>) -> u64 {
+	let d = d.unwrap_or(crate::l4::idle::DEFAULT_IDLE_TIMEOUT);
+	if d.is_zero() { 0 } else { timeout_ms(Some(d)) }
+}
+
 impl Runtime {
 	/// The rule's `connect_timeout`, if it has one.
 	pub fn connect_timeout(&self) -> Option<Duration> {
@@ -213,6 +223,19 @@ impl Runtime {
 
 	pub fn set_connect_timeout(&self, d: Option<Duration>) {
 		self.connect_timeout_ms.store(timeout_ms(d), std::sync::atomic::Ordering::Relaxed);
+	}
+
+	/// How long a relayed tcp connection may move nothing (`idle_timeout`; `None`: no limit).
+	pub fn idle_timeout(&self) -> Option<Duration> {
+		match self.idle_timeout_ms.load(std::sync::atomic::Ordering::Relaxed) {
+			0 => None,
+			ms => Some(Duration::from_millis(ms)),
+		}
+	}
+
+	/// The rule's `idle_timeout` (`None`: the default, zero: no limit).
+	pub fn set_idle_timeout(&self, d: Option<Duration>) {
+		self.idle_timeout_ms.store(idle_timeout_ms(d), std::sync::atomic::Ordering::Relaxed);
 	}
 
 	pub fn bind_as(&self, client: SocketAddr) -> Option<SocketAddr> {

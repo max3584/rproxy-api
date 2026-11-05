@@ -1156,6 +1156,7 @@ impl Registry {
 			listen: RwLock::new(spec.listen_ips()),
 			listen_freebind: spec.listen_freebind,
 			connect_timeout_ms: crate::core::proxy::timeout_ms(spec.connect_timeout).into(),
+			idle_timeout_ms: crate::core::proxy::idle_timeout_ms(spec.idle_timeout).into(),
 			udp_idle: idle_rx,
 			stats: Stats::default(),
 			denied_log: Default::default(),
@@ -1407,6 +1408,9 @@ impl Registry {
 		if let Some(t) = &req.connect_timeout {
 			spec.connect_timeout = crate::core::rule::validate_connect_timeout(Some(t), key.protocol, is_http)?;
 		}
+		if let Some(t) = &req.idle_timeout {
+			spec.idle_timeout = crate::core::rule::validate_idle_timeout(Some(t), key.protocol, is_http)?;
+		}
 		let tls_changed = req.tls.is_some();
 		if let Some(tls) = req.tls {
 			tlsconf::validate_range(key.protocol, &tls, req.starttls, spec.port_count)?;
@@ -1552,6 +1556,7 @@ impl Registry {
 				r.rt.proxy_protocol.set(spec.proxy_protocol.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				r.rt.set_connect_timeout(spec.connect_timeout);
+				r.rt.set_idle_timeout(spec.idle_timeout);
 				// from the next connection / read on; what the limits count is kept
 				if r.spec.limits != spec.limits {
 					r.rt.limits.set(spec.limits.as_ref());
