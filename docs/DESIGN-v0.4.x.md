@@ -445,7 +445,7 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 
 既定の値はオーナーの決定（2026-11-05 の点検）。
 
-- しくみ：`l4/idle.rs`。中継は読み書きでバイトを運ぶたびに `Progress` に印を付ける（load と store だけ。タイマーには触らない）。`expired` が `idle_timeout` の 1/8（10 ms〜1 分）ごとに起きて比べ、運ばない時間が上限を超えたら終わる。`tcp.rs` の `finish`（TLS の終端・STARTTLS・`bandwidth`、splice のないとき）は両側を `Tracked` で包み、`finish_plain` の splice の道（`splice::relay`）はユーザー空間のコピーを `Tracked` で、splice は 1 回ごとに印を付ける。EOF（FIN）を読んだら半分閉じの印で、そこから `half_close_timeout`。数えるのは接続のバイトだけ（keepalive のプローブはカーネルの中で答えるので見えない。アプリケーションの ping のない DB のプールなどは 1 時間で切れる）。
+- しくみ：`l4/idle.rs`。中継は読み書きでバイトを運ぶたびに `Progress` に印を付ける（load と store だけ。タイマーには触らない）。`expired`（手で書いた Future の `Expiry`）が上限の 1/8（10 ms〜1 分）ごとに起きて比べ、運ばない時間が上限を超えたら終わる。半分閉じは poll のたびに見る（`within` が中継の直後に poll するので、FIN を読んだのと同じ起床で短い上限に切り替わり、タイマーは増えない）。効いている上限がないあいだ（`idle_timeout: 0s` で半分閉じの前）はタイマーを持たない。`tcp.rs` の `finish`（TLS の終端・STARTTLS・`bandwidth`、splice のないとき）は両側を `Tracked` で包み、`finish_plain` の splice の道（`splice::relay`）はユーザー空間のコピーを `Tracked` で、splice は 1 回ごとに印を付ける。EOF（FIN）を読んだら半分閉じの印で、そこから `half_close_timeout`。数えるのは接続のバイトだけ（keepalive のプローブはカーネルの中で答えるので見えない。アプリケーションの ping のない DB のプールなどは 1 時間で切れる）。
 - 書けないまま（相手が読まない）は、読み込みも止まる（バッファ・パイプ・ソケットのバッファがいっぱい）ので「運ばない」になり、同じ時間切れで閉じる（別の時間は持たない）。
 - 時間切れは両側をリセット（SO_LINGER 0）して閉じる（データの完全性 #134：途中で切ったものを完全に終わったように見せない）。ログは `conn.close` の `reason: idle_timeout` / `half_close_timeout`（よくある終わり方なので `conn.error` の警告にしない）。
 - `http` のルールは `global.http.timeouts`（`idle_timeout` は `invalid`。WebSocket の upgrade の中継にも掛けない）。
@@ -457,5 +457,5 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - #359 の残り：STARTTLS の転送先の返事は 1 つの返事で 128 行・64 KiB まで（`starttls::read_reply`）、STARTTLS の前のやり取りは全体で 5 分まで（`DIALOGUE_TIMEOUT`。前は 32 回 × 60 秒で 32 分）。宛先を外したときの戻すタイマーは `Ejection` ごとに 1 つ（`outlier::after`。すべての宛先が down で接続のたびに外し直しても、タスクは増えずに 1 つが期限を追う）。ClientHello のバイトは送ったら捨てる（`relay_hello`、`Prefixed` は渡し終えたら）。`terminate` の passthrough の route のための ClientHello の読み込みは `rt.kill` で止まり、accept の誤りの後の 100 ms の待ちは `stop` で止まる。
 - TLS のハンドシェイクの同時の数のプロセス全体の上限は設けない（決定）：ハンドシェイクは 10 秒（`http` は `tls_handshake`）で切れ、CPU はワーカーのスレッドの数までで、送信元ごとはルールの `limits` で絞れる。全体の上限は、攻撃のあいだほかのルールの正しい接続まで待たせる。
 - PATCH で `limits`・`bandwidth` を変えたとき、前からの接続は古い表を持ったまま（`Permit` が古い表を指す）。`idle_timeout` で長くても 1 時間で終わるので、ここでは変えない。
-- 戻すタイマーは、待っていたタスクが期限の後にもう一度外れていないか見てから `target.up` を出す（その間の外し直しでは出さない）。`connect_timeout` を省いたときの 5 秒 / 30 秒は、試せるアドレスの数で選ぶ（両方のアドレスを持つ名前は 2 つ）。
+- 戻すタイマーは、待っていたタスクが期限の後にもう一度外れていないか見てから `target.up` を出す（その間の外し直しでは出さない）。`connect_timeout` を省いたときは、後に試せるアドレスが残っていれば 5 秒、最後のアドレスは 30 秒（両方のアドレスを持つ名前は 2 つと数える）。
 - 試験：単体（`l4::idle`：進めば延びる・半分閉じで短くなる・どちらか一方だけ・`Tracked`、`starttls`：長い返事・全体の期限、`outlier::one_timer_per_ejection`、`net::source` の keepalive）、`tests/tcp_deadlines.rs`（平文と TLS の終端で黙った接続が閉じ、両側が RST を受け `conn.close` の `reason` が出る・進む接続は閉じない・読まない転送先で書けない接続が閉じる・splice に移った後に黙れば閉じ、splice で運び続ければ閉じない・半分閉じの後の `half_close_timeout` と `0s`・PATCH・検証・`features`）。

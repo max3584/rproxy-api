@@ -5,7 +5,7 @@
 //! idle_timeout`; a connection that keeps moving is not ended. `half_close_timeout` after a
 //! side has finished sending. The shape: both on tcp rules only.
 //!
-//! The splice counter is process-wide, so the splice cases are one test function.
+//! The splice counter is process-wide: the tests that may splice take `SPLICING` in turn.
 
 mod common;
 
@@ -19,6 +19,9 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+
+/// Held by the tests whose connections may splice, so `spliced_bytes` moves for one only.
+static SPLICING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A backend that answers nothing and hands each accepted connection to the test.
 async fn silent_backend() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<TcpStream>) {
@@ -101,6 +104,7 @@ async fn echo<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, msg: &str) {
 
 #[tokio::test]
 async fn idle_timeout_ends_quiet_and_stalled_connections() {
+	let _splicing = SPLICING.lock().await;
 	logs::capture();
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
@@ -221,6 +225,7 @@ async fn idle_timeout_ends_quiet_and_stalled_connections() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn idle_timeout_on_the_splice_path() {
+	let _splicing = SPLICING.lock().await;
 	logs::capture();
 	let h = harness().await;
 	let sink = sink_backend().await;
@@ -262,6 +267,7 @@ async fn idle_timeout_on_the_splice_path() {
 /// is cut after it (`reason: half_close_timeout`); `0s` leaves only `idle_timeout`.
 #[tokio::test]
 async fn half_close_timeout_after_the_client_finished_sending() {
+	let _splicing = SPLICING.lock().await;
 	logs::capture();
 	let h = harness().await;
 	let (quiet, mut accepted) = silent_backend().await;
@@ -273,14 +279,20 @@ async fn half_close_timeout_after_the_client_finished_sending() {
 	assert_eq!(v["half_close_timeout"], "1s", "{v}");
 	let mut c = plain(port).await;
 	c.write_all(b"request").await.unwrap();
-	c.shutdown().await.unwrap();
 	let mut b = accepted.recv().await.unwrap();
-	let mut got = Vec::new();
-	b.read_to_end(&mut got).await.unwrap();
-	assert_eq!(got, b"request", "the half-close was passed on");
+	let mut got = [0u8; 7];
+	b.read_exact(&mut got).await.unwrap();
+	// the FIN comes while the relay is running (not with its first read): the limit must
+	// start from it, not from the next look at idle_timeout (1h: a minute apart)
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	c.shutdown().await.unwrap();
 	let t0 = Instant::now();
+	let mut rest = Vec::new();
+	b.read_to_end(&mut rest).await.unwrap();
+	assert!(rest.is_empty(), "the half-close was passed on");
 	reset(&mut c, Duration::from_secs(5)).await;
-	assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+	let took = t0.elapsed();
+	assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(3), "{took:?}");
 	close_reason(port, "half_close_timeout").await;
 
 	// `0s`: a backend that takes long to answer after the half-close (an RPC or backup tool,

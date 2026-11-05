@@ -83,27 +83,27 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
-	// a full target (#341) is not one to fall back on; every address counts (a dual-stack
-	// name has two to try)
-	let fallback = target
-		.candidates
-		.iter()
-		.filter(usable)
-		.filter(|c| !c.member.as_ref().is_some_and(|m| m.is_full()))
-		.map(|c| c.addrs.iter().filter(|a| source::usable(**a, bind_as)).count())
-		.sum::<usize>()
-		> 1;
-	for c in target.candidates.iter().filter(usable) {
+	// the addresses still to try after this one decide the wait without `connect_timeout`: 5 s
+	// when there are, 30 s for the last (#353). Each address counts (a dual-stack name has two);
+	// a full target (#341) is not one to fall back on
+	let addrs_of = |c: &crate::core::proxy::Candidate| c.addrs.iter().filter(|a| source::usable(**a, bind_as)).count();
+	let counted: Vec<bool> = target.candidates.iter().filter(usable).map(|c| !c.member.as_ref().is_some_and(|m| m.is_full())).collect();
+	let mut left: usize = target.candidates.iter().filter(usable).zip(&counted).filter(|(_, n)| **n).map(|(c, _)| addrs_of(c)).sum();
+	for (c, &in_left) in target.candidates.iter().filter(usable).zip(&counted) {
 		let Ok(lease) = c.lease() else {
+			if in_left {
+				left = left.saturating_sub(addrs_of(c));
+			}
 			full = true;
 			continue;
 		};
 		tried = true;
 		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
 			let attempt = source::connect_tcp(*addr, bind_as);
-			// the rule's connect_timeout (v0.4.3); without it, 5 s when another target can be
-			// tried, else 30 s (#353)
-			let limit = rt.connect_timeout().unwrap_or(if fallback { FAILOVER_CONNECT_TIMEOUT } else { DEFAULT_CONNECT_TIMEOUT });
+			left = left.saturating_sub(1);
+			// the rule's connect_timeout (v0.4.3); without it, 5 s when another address can be
+			// tried, else 30 s
+			let limit = rt.connect_timeout().unwrap_or(if left > 0 { FAILOVER_CONNECT_TIMEOUT } else { DEFAULT_CONNECT_TIMEOUT });
 			let result = tokio::time::timeout(limit, attempt)
 				.await
 				.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")));

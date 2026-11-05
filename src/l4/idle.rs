@@ -106,27 +106,78 @@ fn tick(limit: Duration) -> Duration {
 /// Returns when nothing has moved for the limit in force (`Deadlines::limit`: the
 /// idle one, or once a side has half-closed the shorter of both). Never returns while
 /// progress is made, nor without a limit.
-pub async fn expired(progress: &Progress, deadlines: Deadlines) -> Expired {
-	let mut seen = progress.seen();
-	let mut since = Instant::now();
-	loop {
-		let (sleep, due) = match deadlines.limit(progress.is_half_closed()) {
-			Some((limit, which)) => {
-				let left = (since + limit).saturating_duration_since(Instant::now());
-				if left.is_zero() {
-					return which;
-				}
-				(left.min(tick(limit)), true)
-			}
-			// no limit until a half-close: look now and then whether one came
-			None => (deadlines.half_close.map_or(Duration::from_secs(60), tick), false),
+pub fn expired(progress: &Progress, deadlines: Deadlines) -> Expiry<'_> {
+	Expiry { progress, deadlines, seen: progress.seen(), since: Instant::now(), half: false, started: false, sleep: None }
+}
+
+/// The future of `expired`. It looks at the half-close on every poll: `within` polls it
+/// right after the relay, in the same wake as the read of the FIN, so the shorter limit
+/// starts at once without a timer of its own. Without a limit in force it holds no timer.
+pub struct Expiry<'a> {
+	progress: &'a Progress,
+	deadlines: Deadlines,
+	/// `Progress::moved` when last looked at, and since when it has not changed.
+	seen: u64,
+	since: Instant,
+	/// The half-close has been seen.
+	half: bool,
+	started: bool,
+	/// Wakes at the next look (at most a tick away) while a limit is in force.
+	sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Expiry<'_> {
+	/// Sets the next wake for the limit in force (none without one), from `since`.
+	fn arm(&mut self, now: Instant) -> Option<Expired> {
+		let Some((limit, which)) = self.deadlines.limit(self.half) else {
+			self.sleep = None;
+			return None;
 		};
-		tokio::time::sleep(sleep).await;
-		let current = progress.seen();
-		if current != seen || !due {
-			seen = current;
-			// moved somewhere in the last tick: counted from now, at most a tick late
-			since = Instant::now();
+		let left = (self.since + limit).saturating_duration_since(now);
+		if left.is_zero() {
+			return Some(which);
+		}
+		let at = now + left.min(tick(limit));
+		match self.sleep.as_mut() {
+			Some(s) => s.as_mut().reset(at),
+			None => self.sleep = Some(Box::pin(tokio::time::sleep_until(at))),
+		}
+		None
+	}
+}
+
+impl std::future::Future for Expiry<'_> {
+	type Output = Expired;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Expired> {
+		let this = self.get_mut();
+		if !this.started || (!this.half && this.progress.is_half_closed()) {
+			this.started = true;
+			if this.progress.is_half_closed() {
+				// the half-close moved it too: counted from now
+				this.half = true;
+				this.seen = this.progress.seen();
+				this.since = Instant::now();
+			}
+			if let Some(which) = this.arm(Instant::now()) {
+				return Poll::Ready(which);
+			}
+		}
+		loop {
+			let Some(sleep) = this.sleep.as_mut() else { return Poll::Pending };
+			if sleep.as_mut().poll(cx).is_pending() {
+				return Poll::Pending;
+			}
+			let now = Instant::now();
+			let current = this.progress.seen();
+			if current != this.seen {
+				this.seen = current;
+				// moved somewhere since the last look: counted from now, at most a tick late
+				this.since = now;
+			}
+			if let Some(which) = this.arm(now) {
+				return Poll::Ready(which);
+			}
 		}
 	}
 }
@@ -223,11 +274,13 @@ mod tests {
 		tokio::pin!(watch);
 		tokio::select! {
 			_ = &mut watch => panic!("ended too soon"),
-			_ = tokio::time::sleep(Duration::from_secs(600)) => p.half_closed(),
+			_ = tokio::time::sleep(Duration::from_secs(610)) => p.half_closed(),
 		}
 		assert_eq!(watch.await, Expired::HalfClose);
-		let after = start.elapsed() - Duration::from_secs(600);
-		assert!(after >= DEFAULT_HALF_CLOSE_TIMEOUT && after <= DEFAULT_HALF_CLOSE_TIMEOUT + Duration::from_secs(60), "{after:?}");
+		let after = start.elapsed() - Duration::from_secs(610);
+		// from the half-close, not from the next look at idle_timeout (a tick of 1 h is 60 s)
+		let bound = DEFAULT_HALF_CLOSE_TIMEOUT + tick(DEFAULT_HALF_CLOSE_TIMEOUT);
+		assert!(after >= DEFAULT_HALF_CLOSE_TIMEOUT && after <= bound, "{after:?}");
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -251,7 +304,7 @@ mod tests {
 		}
 		assert_eq!(watch.await, Expired::HalfClose);
 		let after = start.elapsed() - Duration::from_secs(7200);
-		assert!(after >= Duration::from_secs(30) && after <= Duration::from_secs(60) + tick(Duration::from_secs(30)), "{after:?}");
+		assert!(after >= Duration::from_secs(30) && after <= Duration::from_secs(30) + tick(Duration::from_secs(30)), "{after:?}");
 		// an idle_timeout shorter than half_close_timeout stays in force after a half-close
 		let d = Deadlines { idle: Some(Duration::from_secs(5)), half_close: Some(Duration::from_secs(60)) };
 		assert_eq!(d.limit(true), Some((Duration::from_secs(5), Expired::Idle)));
