@@ -40,9 +40,16 @@ const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
 /// a few more for streams of extensions it does not know, which are read and dropped.
 const MAX_UNI_STREAMS: u32 = 8;
 /// QUIC's own idle timeout (a connection without any packet: the peer is gone) follows
-/// `global.http.timeouts.idle`, at most this (also when `idle` is unlimited: a client that
-/// wants more keeps the connection with PINGs, and `idle` still closes it without requests).
+/// `global.http.timeouts.idle`, from `MIN_QUIC_IDLE` to `MAX_QUIC_IDLE` (also when `idle` is
+/// unlimited: a client that wants more keeps the connection with PINGs, and `idle` still
+/// closes it without requests). A short `idle` must not cut a request whose backend is slow:
+/// `idle` only counts time without requests, QUIC's counts time without packets.
+const MIN_QUIC_IDLE: Duration = Duration::from_secs(30);
 const MAX_QUIC_IDLE: Duration = Duration::from_secs(600);
+/// The proxy PINGs a connection that has been quiet this long (at most half of QUIC's idle
+/// timeout), so a request waiting on a slow backend keeps it, also with a client whose own
+/// idle timeout is shorter. A peer that is gone does not answer, and the idle timeout ends it.
+const MAX_KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// QUIC handshakes of one rule in progress at a time; more are refused (#355). Only clients
 /// whose address is validated (Retry) get this far.
 const MAX_HANDSHAKES: usize = 512;
@@ -159,13 +166,14 @@ fn transport(idle: Option<Duration>) -> Arc<quinn::TransportConfig> {
 	t.receive_window(quinn::VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
 		.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW))
 		.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_UNI_STREAMS))
-		.max_idle_timeout(quinn::IdleTimeout::try_from(quic_idle(idle)).ok());
+		.max_idle_timeout(quinn::IdleTimeout::try_from(quic_idle(idle)).ok())
+		.keep_alive_interval(Some((quic_idle(idle) / 2).min(MAX_KEEP_ALIVE)));
 	Arc::new(t)
 }
 
-/// QUIC's idle timeout for `global.http.timeouts.idle` (`MAX_QUIC_IDLE`).
+/// QUIC's idle timeout for `global.http.timeouts.idle` (`MIN_QUIC_IDLE`, `MAX_QUIC_IDLE`).
 fn quic_idle(idle: Option<Duration>) -> Duration {
-	idle.map_or(MAX_QUIC_IDLE, |i| i.min(MAX_QUIC_IDLE))
+	idle.map_or(MAX_QUIC_IDLE, |i| i.clamp(MIN_QUIC_IDLE, MAX_QUIC_IDLE))
 }
 
 /// A QUIC handshake counted in `H3State.handshakes` until it ends.
@@ -215,6 +223,15 @@ async fn serve(endpoint: quinn::Endpoint, base: Arc<quinn::ServerConfig>, rt: Ar
 			},
 		};
 		let client = incoming.remote_address();
+		// an address not validated yet gets a Retry first (#355): a spoofed source never gets
+		// further, so it cannot use up `limits` or the handshakes, make the proxy send much, or
+		// show up in the `denied` counts and logs
+		if !incoming.remote_address_validated() {
+			if let Err(e) = incoming.retry() {
+				e.into_incoming().refuse();
+			}
+			continue;
+		}
 		let ip = canonical(client.ip());
 		if !rt.allowed(ip) {
 			denied(&rt, client, "allow_from");
@@ -229,14 +246,6 @@ async fn serve(endpoint: quinn::Endpoint, base: Arc<quinn::ServerConfig>, rt: Ar
 		if rt.crowdsec_blocks(ip) {
 			denied(&rt, client, "crowdsec");
 			incoming.refuse();
-			continue;
-		}
-		// an address not validated yet gets a Retry first (#355): a spoofed source never gets
-		// further, so it cannot use up `limits` or the handshakes, or make the proxy send much
-		if !incoming.remote_address_validated() {
-			if let Err(e) = incoming.retry() {
-				e.into_incoming().refuse();
-			}
 			continue;
 		}
 		let Some(handshake) = Handshake::begin(&rt) else {
@@ -432,9 +441,12 @@ async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<R
 	let (mut send, mut recv) = stream.split();
 	// h3 does not compare the DATA with Content-Length (RFC 9114 4.1.2): the body reader does
 	let Ok(length) = content_length(req.headers()) else {
-		warn!(event = "http.error", rule = %rt.key, error = "invalid content-length", transport = "quic", "bad request");
+		warn!(event = "http.error", rule = %rt.key, client = %client, error = "invalid content-length", transport = "quic", status = 400u16, "bad request");
 		recv.stop_sending(h3::error::Code::H3_MESSAGE_ERROR);
-		send.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+		let resp = Response::builder().status(hyper::StatusCode::BAD_REQUEST).body(()).expect("a 400");
+		if send.send_response(resp).await.is_err() || send.finish().await.is_err() {
+			send.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+		}
 		return;
 	};
 	// request_body_idle: not for gRPC, and only until the response head goes out (#320)
@@ -495,9 +507,13 @@ fn request_body(
 		let mut left = length;
 		// why reading stopped before the end of the stream, to tell the client
 		let mut stop = None;
+		// a read of the stream in progress: one given up keeps the stream inside h3-quinn,
+		// whose stop_sending then panics; dropping the stream stops it (code 0) instead
+		let reading = std::sync::atomic::AtomicBool::new(false);
 		let read = async {
 			loop {
 				std::future::poll_fn(|cx| gate.poll_allow(&rt.bandwidth, cx)).await;
+				reading.store(true, Ordering::Relaxed);
 				let data = match idle.filter(|_| !responded.get()) {
 					Some(limit) => {
 						let read = recv.recv_data();
@@ -510,6 +526,9 @@ fn request_body(
 					}
 					None => Some(recv.recv_data().await),
 				};
+				if data.is_some() {
+					reading.store(false, Ordering::Relaxed);
+				}
 				let Some(data) = data else {
 					stop = Some(h3::error::Code::H3_REQUEST_CANCELLED);
 					let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
@@ -537,7 +556,10 @@ fn request_body(
 							let _ = tx.send(Err(length_mismatch("shorter"))).await;
 							return;
 						}
-						match recv.recv_trailers().await {
+						reading.store(true, Ordering::Relaxed);
+						let trailers = recv.recv_trailers().await;
+						reading.store(false, Ordering::Relaxed);
+						match trailers {
 							Ok(Some(trailers)) => {
 								let _ = tx.send(Ok(Frame::trailers(trailers))).await;
 							}
@@ -552,22 +574,29 @@ fn request_body(
 				};
 				let failed = frame.is_err();
 				// the handler dropped the body (answered without reading it)
-				if tx.send(frame).await.is_err() || failed {
+				if tx.send(frame).await.is_err() {
+					stop = Some(h3::error::Code::H3_NO_ERROR);
+					return;
+				}
+				if failed {
 					return;
 				}
 			}
 		};
 		tokio::select! {
+			// the end of the stream first: a body read to its end is not stopped
+			biased;
+			_ = read => {}
 			// the rule stopped: the body did not end, so do not let it look complete
 			_ = kill.cancelled() => {
 				let _ = tx.try_send(Err(BoxError::new(std::io::Error::other("rule stopped"))));
 			}
-			// the handler dropped the body (answered without reading all of it): the client
-			// need not send the rest (RFC 9114 4.1)
+			// the handler dropped the body before its end (answered without reading it, or the
+			// request ended otherwise): the client need not send the rest (RFC 9114 4.1). Told
+			// with H3_NO_ERROR, or code 0 when the stream is dropped in the middle of a read
 			_ = tx.closed() => stop = Some(h3::error::Code::H3_NO_ERROR),
-			_ = read => {}
 		}
-		if let Some(code) = stop {
+		if let Some(code) = stop.filter(|_| !reading.load(Ordering::Relaxed)) {
 			recv.stop_sending(code);
 		}
 	});
@@ -654,7 +683,7 @@ mod tests {
 	#[test]
 	fn quic_idle_follows_the_idle_timeout() {
 		assert_eq!(quic_idle(Some(Duration::from_secs(180))), Duration::from_secs(180));
-		assert_eq!(quic_idle(Some(Duration::from_secs(5))), Duration::from_secs(5));
+		assert_eq!(quic_idle(Some(Duration::from_secs(5))), MIN_QUIC_IDLE, "a short idle does not cut slow requests");
 		assert_eq!(quic_idle(Some(Duration::from_secs(86_400))), MAX_QUIC_IDLE);
 		assert_eq!(quic_idle(None), MAX_QUIC_IDLE, "idle unlimited: a peer that is gone is still let go");
 	}

@@ -324,9 +324,18 @@ async fn http3_bodies_must_match_their_content_length() {
 	let (status, body) = h3_post_length(&mut send, "3", b"abc").await.unwrap();
 	let v: Value = serde_json::from_slice(&body).unwrap();
 	assert_eq!((status, v["body"].as_str()), (200, Some("abc")), "{v}");
-	for (length, body) in [("5", &b"0123456789"[..]), ("10", &b"abc"[..]), ("x", &b"abc"[..]), ("01x", &b""[..])] {
+	// leading zeros are still a number (RFC 9110 8.6: 1*DIGIT)
+	let (status, body) = h3_post_length(&mut send, "05", b"01234").await.unwrap();
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!((status, v["body"].as_str()), (200, Some("01234")), "{v}");
+	for (length, body) in [("5", &b"0123456789"[..]), ("10", &b"abc"[..])] {
 		let answer = h3_post_length(&mut send, length, body).await;
 		assert!(answer.as_ref().is_none_or(|(status, _)| *status != 200), "content-length {length}: {answer:?}");
+	}
+	// not a number: a 400 without asking the backend
+	for length in ["x", "01x", "-1"] {
+		let answer = h3_post_length(&mut send, length, b"").await;
+		assert_eq!(answer.as_ref().map(|(status, _)| *status), Some(400), "content-length {length}: {answer:?}");
 	}
 	// the connection is still good for the next request
 	let (status, _) = h3_post_length(&mut send, "2", b"ok").await.unwrap();
@@ -482,9 +491,33 @@ async fn http3_unread_bodies_are_stopped() {
 	let mut stream = send.send_request(req).await.unwrap();
 	stream.send_data(Bytes::from_static(b"part")).await.unwrap();
 	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 401);
-	// told when the answer goes out (H3_NO_ERROR, RFC 9114 4.1), not only once it sends more
-	// (quinn's code 0 when a reader drops the stream)
+	// told as soon as the handler lets the body go, not only once the client sends more
 	tokio::time::sleep(Duration::from_millis(500)).await;
 	let r = stream.send_data(Bytes::from_static(b"more")).await;
-	assert!(format!("{r:?}").contains("H3_NO_ERROR"), "{r:?}");
+	assert!(r.is_err(), "{r:?}");
+}
+
+/// #355: QUIC's idle timeout is not shorter than 30 s, and the proxy PINGs quiet connections:
+/// a short `global.http.timeouts.idle` (which counts time without requests) does not cut a
+/// request whose backend takes longer than it.
+#[tokio::test]
+async fn http3_slow_backends_outlast_a_short_idle() {
+	let pki = Pki::new("h3-idle");
+	let cert = pki.server("front", &["a.test"]);
+	let spec: rproxy_api::l7::timeouts::HttpTimeoutsSpec = serde_json::from_value(json!({"idle": "1s"})).unwrap();
+	spec.check().unwrap();
+	let global = rproxy_api::l7::access::HttpGlobal::default().with_timeouts(spec.resolve());
+	let h = harness_with_global(rproxy_api::control::auth::Tokens::disabled(), global).await;
+	let app = axum::Router::new().fallback(|| async {
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		"late"
+	});
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let slow = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, slow)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let (status, v) = h3_request(&mut send, "GET", "https://a.test/slow", b"").await;
+	assert_eq!((status, v.as_str()), (StatusCode::OK, Some("late")));
 }
