@@ -1700,6 +1700,10 @@
           "blocked": {
             "type": "integer"
           },
+          "mirror_dropped": {
+            "type": "integer",
+            "description": "copies of mirror middlewares not sent, with 64 of that mirror being sent already (#356, v0.4.20)"
+          },
           "cache": {
             "type": "object",
             "description": "cache (#340, v0.4.19): requests by result",
@@ -1744,6 +1748,14 @@
                 },
                 "blocked": {
                   "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                },
+                "mirror_dropped": {
+                  "type": "object",
+                  "description": "by mirror middleware name (#356)",
                   "properties": {},
                   "additionalProperties": {
                     "type": "integer"
@@ -2304,6 +2316,10 @@
               "cache_process_memory": {
                 "type": "boolean",
                 "description": "All cache middlewares of the process together keep at most RPROXY_CACHE_MAX_MEMORY (default 512 MiB, 0: no limit): an answer that does not fit drops the oldest of its own cache, or is not kept; cache_max_memory in GET / PATCH /config/global (live, the environment wins); rproxy_http_cache_memory_bytes and rproxy_http_cache_memory_limit_bytes in /metrics (v0.4.19, #349)"
+              },
+              "http_stream_limits": {
+                "type": "boolean",
+                "description": "Limits on what one client can hold of an http rule (v0.4.20, #356): global.http.timeouts.write_stall (default 60s) and upgraded_idle (default 1h); an upgraded connection (WebSocket) keeps its place in the rule's limits; timeouts.request covers the middlewares; stats.http.mirror_dropped and rproxy_http_mirror_dropped_total"
               }
             }
           },

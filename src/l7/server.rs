@@ -438,6 +438,8 @@ pub(super) struct Conn {
 	/// The front end that sent the connection's PROXY header (`proxy_protocol`, #296);
 	/// `client` is then the address it named. For the access log.
 	proxy_peer: Option<SocketAddr>,
+	/// Upgraded connections (WebSocket) relayed for this one; `serve` waits for them (#356).
+	tunnels: tokio_util::task::TaskTracker,
 }
 
 const X_FORWARDED_CLIENT_CERT: &str = "x-forwarded-client-cert";
@@ -527,7 +529,16 @@ impl Conn {
 	}
 
 	pub(super) fn new(rt: Arc<Runtime>, client: SocketAddr, local: SocketAddr, tls: Option<TlsInfo>, h3: bool) -> Self {
-		Conn { rt, client, local, https: tls.is_some(), tls, h3, proxy_peer: crate::net::proxy_in::current_peer() }
+		Conn {
+			rt,
+			client,
+			local,
+			https: tls.is_some(),
+			tls,
+			h3,
+			proxy_peer: crate::net::proxy_in::current_peer(),
+			tunnels: tokio_util::task::TaskTracker::new(),
+		}
 	}
 }
 
@@ -549,6 +560,11 @@ where
 	let limits = rt.global.timeouts();
 	let conn = Arc::new(Conn::new(rt, client, local, tls, false));
 	let stop = conn.rt.stop.clone();
+	// upgraded connections (WebSocket) of this connection: it ends with them (#356), so the
+	// rule's `limits` keep counting it and `conn.close` comes when the last one ends
+	let tunnels = conn.tunnels.clone();
+	let stall = super::timeouts::Stall::new();
+	let stream = super::timeouts::Stalling::new(stream, stall.clone());
 	let activity = super::timeouts::Activity::new();
 	let requests = activity.clone();
 	let service = hyper::service::service_fn(move |req: Request<Incoming>| {
@@ -582,6 +598,10 @@ where
 		.http2()
 		.timer(TokioTimer::new())
 		.max_header_list_size(MAX_HEADER_SECTION)
+		// what one stream may hold for a client that does not read, and how many streams one
+		// connection may have, each a request to a backend (#356; hyper's 400 KB and 200)
+		.max_send_buf_size(H2_SEND_BUFFER)
+		.max_concurrent_streams(H2_MAX_STREAMS)
 		.keep_alive_interval(limits.http2_ping_interval)
 		.keep_alive_timeout(limits.http2_ping_timeout);
 	let served = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
@@ -589,20 +609,55 @@ where
 	// the rule stops accepting (DELETE with drain, a live upgrade's drain): finish
 	// the requests in flight, then close instead of keeping the connection idle;
 	// a connection past a time limit (#320) is closed the same way, with a short grace
-	tokio::select! {
-		r = served.as_mut() => return r.map(|()| "closed").map_err(io::Error::other),
-		_ = stop.cancelled() => served.as_mut().graceful_shutdown(),
+	let result = tokio::select! {
+		r = served.as_mut() => r.map(|()| "closed").map_err(io::Error::other),
+		_ = stop.cancelled() => {
+			served.as_mut().graceful_shutdown();
+			tokio::select! {
+				r = served.as_mut() => r.map(|()| "closed").map_err(io::Error::other),
+				() = stall.expired(limits.write_stall) => Ok("write_stall"),
+			}
+		}
+		// the client takes nothing of what is written (#356): nothing more can be sent, not even GOAWAY
+		() = stall.expired(limits.write_stall) => Ok("write_stall"),
 		why = activity.expired(&rx, &limits) => {
 			served.as_mut().graceful_shutdown();
 			// a request that began meanwhile (within GOAWAY's last stream) is let finish
 			if tokio::time::timeout(EXPIRED_GRACE, served.as_mut()).await.is_err() && activity.in_progress() {
-				let _ = served.as_mut().await;
+				tokio::select! {
+					_ = served.as_mut() => {}
+					() = stall.expired(limits.write_stall) => {}
+				}
 			}
-			return Ok(why);
+			Ok(why)
+		}
+	};
+	tunnels.close();
+	tunnels.wait().await;
+	result
+}
+
+/// What `drain` reads of a body at most, and for how long.
+const DRAIN_MAX: usize = 64 * 1024;
+const DRAIN_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Reads a body to its end, keeping nothing, so its connection can be used again; a body
+/// past `DRAIN_MAX` or `DRAIN_TIME` is dropped instead (its connection is not used again).
+async fn drain(mut body: Body) {
+	let until = tokio::time::Instant::now() + DRAIN_TIME;
+	let mut read = 0;
+	while let Ok(Some(Ok(frame))) = tokio::time::timeout_at(until, body.frame()).await {
+		read += frame.data_ref().map_or(0, Bytes::len);
+		if read > DRAIN_MAX {
+			return;
 		}
 	}
-	served.await.map(|()| "closed").map_err(io::Error::other)
 }
+
+/// HTTP/2: bytes a stream may have waiting to be sent (#356).
+const H2_SEND_BUFFER: usize = 128 * 1024;
+/// HTTP/2: streams at once on one connection (#356).
+const H2_MAX_STREAMS: u32 = 100;
 
 /// How long a connection past a time limit may take to close after GOAWAY when no
 /// request is in progress (requests in progress are always let finish).
@@ -995,153 +1050,178 @@ impl Conn {
 			answer = Some(error_response(StatusCode::BAD_REQUEST));
 			answered_by = Some((why, ""));
 		}
-		// sign-in callbacks and logout of `oidc`, whichever route matched
-		if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
-			answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
-			answered_by = Some(("oidc", o.name.as_str()));
-		}
-		for (i, m) in chain.iter().enumerate() {
-			if answer.is_some() {
-				break;
+		// timeouts.request (#227) covers the middlewares too (#356): reading a body, asking an
+		// auth server or an OIDC provider, waiting for a cache's lead
+		let chain_run = async {
+			// sign-in callbacks and logout of `oidc`, whichever route matched
+			if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
+				answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
+				answered_by = Some(("oidc", o.name.as_str()));
 			}
-			ran += 1;
-			let resp = match m.as_ref() {
-				Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
-					BasicVerdict::Allow(user) => {
-						if log {
-							entry.user = user.clone();
-						}
-						if !b.keep_authorization {
-							parts.headers.remove(header::AUTHORIZATION);
-						}
-						if let Some(h) = &b.user_header {
-							parts.headers.remove(h);
-							if let Ok(v) = HeaderValue::from_str(&user) {
-								parts.headers.insert(h.clone(), v);
-							}
-						}
-						None
-					}
-					BasicVerdict::Deny(why) => {
-						if log {
-							entry.auth_error = why.to_string();
-						}
-						let mut resp = error_response(StatusCode::UNAUTHORIZED);
-						resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
-						Some(resp)
-					}
-					BasicVerdict::Unavailable => {
-						if log {
-							entry.auth_error = "unavailable".into();
-						}
-						Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
-					}
-				},
-				Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
-					AuthOutcome::Allow(add) => {
-						response_headers.extend(add.into_iter().map(|h| (i, h)));
-						None
-					}
-					AuthOutcome::Deny(resp) => Some(resp),
-				},
-				Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
-					oidc::Outcome::Pass { session, set_cookie } => {
-						o.pass_identity(&mut parts.headers, &session);
-						set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
-						None
-					}
-					answer => Some(oidc_response(answer)),
-				},
-				Middleware::Crowdsec { name, appsec, block_on_error } => {
-					self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
+			for (i, m) in chain.iter().enumerate() {
+				if answer.is_some() {
+					break;
 				}
-				// the client as global.trusted_proxies decided; refused like ip_allow
-				Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
-					Ok(_) => None,
-					Err(info) => {
-						if log && entry.country.is_empty() {
-							entry.country = info.country_str().unwrap_or("").to_string();
-							entry.asn = info.asn;
-						}
-						Some(error_response(StatusCode::FORBIDDEN))
-					}
-				},
-				Middleware::Buffering { max } => {
-					let taken = std::mem::replace(&mut body, empty_body());
-					match resilience::buffer(&parts.headers, taken, *max).await {
-						Ok(bytes) => {
-							body = full_body(bytes.clone());
-							replay = Some(bytes);
+				ran += 1;
+				let resp = match m.as_ref() {
+					Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
+						BasicVerdict::Allow(user) => {
+							if log {
+								entry.user = user.clone();
+							}
+							if !b.keep_authorization {
+								parts.headers.remove(header::AUTHORIZATION);
+							}
+							if let Some(h) = &b.user_header {
+								parts.headers.remove(h);
+								if let Ok(v) = HeaderValue::from_str(&user) {
+									parts.headers.insert(h.clone(), v);
+								}
+							}
 							None
 						}
-						Err(true) => Some(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
-						Err(false) => Some(error_response(StatusCode::BAD_REQUEST)),
-					}
-				}
-				Middleware::Retry(policy) => {
-					retry = Some(policy.clone());
-					None
-				}
-				Middleware::Mirror { name, service: to, share } => {
-					if share.take() {
-						mirrors.push(mirror::Copy {
-							name: name.clone(),
-							service: to.clone(),
-							method: parts.method.clone(),
-							uri: parts.uri.clone(),
-							headers: parts.headers.clone(),
-							client_ip,
-							host: host.clone(),
-							forwarded: false,
-							trusted: snapshot.trusts(canonical(self.client.ip())),
-						});
-					}
-					None
-				}
-				Middleware::CircuitBreaker(breaker) => match breaker.admit() {
-					Some(ticket) => {
-						sent.tickets.push((i, ticket));
-						None
-					}
-					None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
-				},
-				Middleware::Cache(c) => {
-					// the client certificate is a credential, and part of the key (#340)
-					let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
-						let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
-						(t.client_cert, format!("{} {xfcc}", t.client_verify()))
-					});
-					let mut ask = cache::Ask {
-						host: &host,
-						route: route_name,
-						https: self.https,
-						port: self.local.port(),
-						cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
-						body_empty: false,
-					};
-					// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
-					// for only when the head would let the cache answer
-					if c.admits(&parts, &ask) {
-						ask.body_empty = cache::settle(&mut body).await;
-					}
-					match c.request(&mut parts, &ask).await {
-						Ok((resp, outcome)) => {
-							sent.cached = Some((c.name.clone(), outcome));
+						BasicVerdict::Deny(why) => {
+							if log {
+								entry.auth_error = why.to_string();
+							}
+							let mut resp = error_response(StatusCode::UNAUTHORIZED);
+							resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
 							Some(resp)
 						}
-						Err(pending) => {
-							sent.caches.push((i, pending));
+						BasicVerdict::Unavailable => {
+							if log {
+								entry.auth_error = "unavailable".into();
+							}
+							Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
+						}
+						BasicVerdict::Busy => {
+							if log {
+								entry.auth_error = "busy".into();
+							}
+							let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE);
+							resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+							Some(resp)
+						}
+					},
+					Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
+						AuthOutcome::Allow(add) => {
+							response_headers.extend(add.into_iter().map(|h| (i, h)));
 							None
 						}
+						AuthOutcome::Deny(resp) => Some(resp),
+					},
+					Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
+						oidc::Outcome::Pass { session, set_cookie } => {
+							o.pass_identity(&mut parts.headers, &session);
+							set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
+							None
+						}
+						answer => Some(oidc_response(answer)),
+					},
+					Middleware::Crowdsec { name, appsec, block_on_error } => {
+						self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 					}
+					// the client as global.trusted_proxies decided; refused like ip_allow
+					Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
+						Ok(_) => None,
+						Err(info) => {
+							if log && entry.country.is_empty() {
+								entry.country = info.country_str().unwrap_or("").to_string();
+								entry.asn = info.asn;
+							}
+							Some(error_response(StatusCode::FORBIDDEN))
+						}
+					},
+					Middleware::Buffering { max } => {
+						let taken = std::mem::replace(&mut body, empty_body());
+						match resilience::buffer(&parts.headers, taken, *max).await {
+							Ok(bytes) => {
+								body = full_body(bytes.clone());
+								replay = Some(bytes);
+								None
+							}
+							Err(true) => Some(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
+							Err(false) => Some(error_response(StatusCode::BAD_REQUEST)),
+						}
+					}
+					Middleware::Retry(policy) => {
+						retry = Some(policy.clone());
+						None
+					}
+					Middleware::Mirror { name, service: to, share, slots } => {
+						if let Some(slot) = share.take().then(|| self.mirror_slot(slots, route_name, name)).flatten() {
+							mirrors.push(mirror::Copy {
+								name: name.clone(),
+								service: to.clone(),
+								method: parts.method.clone(),
+								uri: parts.uri.clone(),
+								headers: parts.headers.clone(),
+								client_ip,
+								host: host.clone(),
+								forwarded: false,
+								trusted: snapshot.trusts(canonical(self.client.ip())),
+								slot,
+							});
+						}
+						None
+					}
+					Middleware::CircuitBreaker(breaker) => match breaker.admit() {
+						Some(ticket) => {
+							sent.tickets.push((i, ticket));
+							None
+						}
+						None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+					},
+					Middleware::Cache(c) => {
+						// the client certificate is a credential, and part of the key (#340)
+						let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
+							let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
+							(t.client_cert, format!("{} {xfcc}", t.client_verify()))
+						});
+						let mut ask = cache::Ask {
+							host: &host,
+							route: route_name,
+							https: self.https,
+							port: self.local.port(),
+							cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
+							body_empty: false,
+						};
+						// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
+						// for only when the head would let the cache answer
+						if c.admits(&parts, &ask) {
+							ask.body_empty = cache::settle(&mut body).await;
+						}
+						match c.request(&mut parts, &ask).await {
+							Ok((resp, outcome)) => {
+								sent.cached = Some((c.name.clone(), outcome));
+								Some(resp)
+							}
+							Err(pending) => {
+								sent.caches.push((i, pending));
+								None
+							}
+						}
+					}
+					m => m.on_request(&mut parts, &ctx),
+				};
+				if let Some(resp) = resp {
+					answer = Some(resp);
+					answered_by = Some((m.kind(), names.get(i).map_or("", String::as_str)));
+					break;
 				}
-				m => m.on_request(&mut parts, &ctx),
-			};
-			if let Some(resp) = resp {
-				answer = Some(resp);
-				answered_by = Some((m.kind(), names.get(i).map_or("", String::as_str)));
-				break;
 			}
+		};
+		let in_time = match deadline {
+			Some(at) => tokio::time::timeout_at(at, chain_run).await.is_ok(),
+			None => {
+				chain_run.await;
+				true
+			}
+		};
+		if !in_time {
+			warn!(event = "http.error", rule = %self.rt.key, route = route_name, status = 504, error = "request timed out in the middlewares");
+			answer = Some(error_response(StatusCode::GATEWAY_TIMEOUT));
+			answered_by = Some(("request_timeout", ""));
 		}
 		// a middleware that refused the request (an error status; not redirects or answers like `respond` 200)
 		if log {
@@ -1377,8 +1457,8 @@ impl Conn {
 		match self.send(router, &fa.service, index, req, fa.limit).await {
 			Ok(resp) if fa.allows(resp.status().as_u16()) => {
 				let (answer, body) = resp.into_parts();
-				// read the rest so the connection can be used again
-				let _ = body.collect().await;
+				// read the rest so the connection can be used again: a little, for a moment (#356)
+				drain(body).await;
 				fa.copy_answer(&answer.headers, parts);
 				AuthOutcome::Allow(vec![])
 			}
@@ -1683,8 +1763,8 @@ impl Conn {
 					}
 					continue;
 				}
-				if let Middleware::Mirror { name, service: to, share } = m.as_ref() {
-					if !mirrored && share.take() {
+				if let Middleware::Mirror { name, service: to, share, slots } = m.as_ref() {
+					if let Some(slot) = (!mirrored && share.take()).then(|| self.mirror_slot(slots, route, name)).flatten() {
 						let mut headers = p.headers.clone();
 						if let Some(h) = &original_host {
 							headers.insert(header::HOST, h.clone());
@@ -1699,6 +1779,7 @@ impl Conn {
 							host: host.to_string(),
 							forwarded: true,
 							trusted: false,
+							slot,
 						});
 					}
 					continue;
@@ -1784,20 +1865,30 @@ impl Conn {
 				let backend_upgrade = hyper::upgrade::on(&mut resp);
 				let rt = self.rt.clone();
 				let client_read = if self.https { crate::l4::relay::TLS_READ_SIZE } else { crate::l4::relay::BUFFER_SIZE };
-				// an upgraded connection keeps its in_flight places until it ends
+				let idle = rt.global.timeouts().upgraded_idle;
+				// an upgraded connection keeps its in_flight places until it ends, and its client
+				// connection (the rule's `limits`) through `tunnels` (#356)
 				let holds = std::mem::take(holds);
-				self.rt.tracker.spawn(async move {
+				self.rt.tracker.spawn(self.tunnels.track_future(async move {
 					let _holds = holds;
-					let relay = async {
-						let (client, backend) = tokio::try_join!(client_upgrade, backend_upgrade).ok()?;
-						let (mut client, mut backend) = (TokioIo::new(client), TokioIo::new(backend));
-						crate::l4::relay::bidirectional_reading(&mut client, &mut backend, client_read, crate::l4::relay::BUFFER_SIZE).await.ok()
+					let (client, backend) = tokio::select! {
+						_ = rt.kill.cancelled() => return,
+						r = async { tokio::try_join!(client_upgrade, backend_upgrade) } => match r {
+							Ok(both) => both,
+							Err(_) => return,
+						},
 					};
+					let (mut client, moved) = super::timeouts::Counted::new(TokioIo::new(client));
+					let mut backend = TokioIo::new(backend);
+					let relay = crate::l4::relay::bidirectional_reading(&mut client, &mut backend, client_read, crate::l4::relay::BUFFER_SIZE);
 					tokio::select! {
 						_ = rt.kill.cancelled() => {}
 						_ = relay => {}
+						() = super::timeouts::quiet(&moved, idle) => {
+							debug!(event = "http.upgraded", rule = %rt.key, reason = "upgraded_idle", "nothing relayed; closed");
+						}
 					}
-				});
+				}));
 				return resp;
 			}
 		}
@@ -1811,6 +1902,17 @@ impl Conn {
 		resp
 	}
 
+	/// A place for a copy of a `mirror` (#356); none when it has `mirror::MAX_IN_FLIGHT` being
+	/// sent: then the copy is not sent, and counted.
+	fn mirror_slot(&self, slots: &Arc<mirror::Slots>, route: &str, name: &str) -> Option<mirror::Slot> {
+		let slot = slots.take();
+		if slot.is_none() {
+			self.rt.http_stats.mirror_dropped(route, name);
+			debug!(event = "http.mirror", rule = %self.rt.key, middleware = %name, error = "too many copies being sent; not sent");
+		}
+		slot
+	}
+
 	/// A copy of the request for `mirror` (#232), sent on its own; its answer is dropped.
 	fn mirror(&self, router: Arc<Router>, copy: mirror::Copy, body: Body) {
 		let conn = Conn {
@@ -1821,12 +1923,16 @@ impl Conn {
 			tls: self.tls.clone(),
 			h3: self.h3,
 			proxy_peer: self.proxy_peer,
+			tunnels: self.tunnels.clone(),
 		};
 		self.rt.tracker.spawn(async move {
 			let kill = conn.rt.kill.clone();
+			let name = copy.name.clone();
 			tokio::select! {
 				_ = kill.cancelled() => {}
-				_ = conn.send_mirror(&router, copy, body) => {}
+				r = tokio::time::timeout(mirror::TIMEOUT, conn.send_mirror(&router, copy, body)) => if r.is_err() {
+					debug!(event = "http.mirror", rule = %conn.rt.key, middleware = %name, error = "timed out");
+				}
 			}
 		});
 	}
@@ -1867,8 +1973,10 @@ impl Conn {
 		match self.send(router, service, index, req, None).await {
 			Ok(resp) => {
 				let status = resp.status().as_u16();
-				// read to the end so the connection can be used again
-				let _ = tokio::time::timeout(service.response, resp.into_body().collect()).await;
+				// read to the end (frame by frame, nothing kept) so the connection can be used
+				// again; `mirror::TIMEOUT` bounds the whole exchange
+				let mut body = resp.into_body();
+				while let Some(Ok(_)) = body.frame().await {}
 				debug!(event = "http.mirror", rule = %self.rt.key, middleware = %copy.name, service = %service.name, backend = %server.addr(), status);
 			}
 			Err(Failure::Status(status, error)) => {

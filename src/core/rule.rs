@@ -235,6 +235,10 @@ pub struct Features {
 	/// All `cache` middlewares of the process together keep at most `RPROXY_CACHE_MAX_MEMORY`
 	/// (`global.cache_max_memory` in `GET /config/global`, live); `rproxy_http_cache_memory_bytes` (#349)
 	pub cache_process_memory: bool,
+	/// Limits on what one client can hold of an `http` rule (#356): `global.http.timeouts`'s
+	/// `write_stall` and `upgraded_idle`, upgraded connections in the rule's `limits`,
+	/// `timeouts.request` over the middlewares, `stats.http.mirror_dropped`
+	pub http_stream_limits: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -305,6 +309,7 @@ impl Features {
 		global_api: true,
 		target_max_connections: true,
 		cache_process_memory: true,
+		http_stream_limits: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -358,6 +363,7 @@ impl Features {
 		global_api: true,
 		target_max_connections: true,
 		cache_process_memory: true,
+		http_stream_limits: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

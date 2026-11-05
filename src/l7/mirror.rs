@@ -1,9 +1,13 @@
 //! Request mirroring (#232, the Gateway API's RequestMirror): the request body is
 //! copied as it streams to the mirrors (`tee`). A mirror that falls behind is cut
 //! off (its body ends with an error); the request to the backend never waits.
+//! Each `mirror` sends at most `MAX_IN_FLIGHT` copies at once (more are not sent, and
+//! counted), and a copy's exchange ends after `TIMEOUT` (#356).
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -19,6 +23,43 @@ use super::server::{Body, BoxError};
 /// Frames a mirror may be behind before it is cut off.
 pub const QUEUE: usize = 64;
 
+/// Copies one `mirror` sends at once (#356); more are not sent (`mirror_dropped`).
+pub const MAX_IN_FLIGHT: usize = 64;
+
+/// A copy's whole exchange (the request, its body and the answer, which is dropped).
+pub const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The copies of one `mirror` middleware being sent.
+#[derive(Debug, Default)]
+pub struct Slots {
+	busy: AtomicUsize,
+}
+
+impl Slots {
+	/// A place for one more copy, unless `MAX_IN_FLIGHT` are being sent.
+	pub fn take(self: &Arc<Self>) -> Option<Slot> {
+		let mut n = self.busy.load(Ordering::Relaxed);
+		loop {
+			if n >= MAX_IN_FLIGHT {
+				return None;
+			}
+			match self.busy.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+				Ok(_) => return Some(Slot(self.clone())),
+				Err(now) => n = now,
+			}
+		}
+	}
+}
+
+/// One copy being sent; dropping it frees the place.
+pub struct Slot(Arc<Slots>);
+
+impl Drop for Slot {
+	fn drop(&mut self) {
+		self.0.busy.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
 /// A copy to send: the request as it was at the `mirror` middleware.
 pub struct Copy {
 	pub name: String,
@@ -33,6 +74,8 @@ pub struct Copy {
 	pub forwarded: bool,
 	/// Whether the peer was a trusted proxy for the request (its snapshot of `global`, #342).
 	pub trusted: bool,
+	/// Its place among the middleware's copies being sent.
+	pub slot: Slot,
 }
 
 enum Item {
@@ -177,5 +220,14 @@ mod tests {
 		assert_eq!(main.collect().await.unwrap().to_bytes().len(), QUEUE + 10, "the backend's body never waits");
 		let err = copies.into_iter().next().unwrap().collect().await.unwrap_err();
 		assert!(err.to_string().contains("fell behind"));
+	}
+
+	#[test]
+	fn a_mirror_sends_so_many_copies_at_once() {
+		let slots = Arc::new(Slots::default());
+		let held: Vec<Slot> = (0..MAX_IN_FLIGHT).map(|_| slots.take().unwrap()).collect();
+		assert!(slots.take().is_none());
+		drop(held);
+		assert!(slots.take().is_some());
 	}
 }

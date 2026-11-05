@@ -1,6 +1,8 @@
 //! The `compress` middleware (#63): responses compressed with br, zstd or gzip as
 //! the client accepts, while they stream (each chunk is flushed, so server-sent
-//! and long responses are not held back).
+//! and long responses are not held back). The windows are small (256 KiB) and at most
+//! `MAX_ENCODERS` responses of the process are compressed at once; more are sent as they
+//! are (#356).
 
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -17,6 +19,39 @@ use super::server::Body;
 
 /// Responses smaller than this (by Content-Length) are sent as they are.
 pub const DEFAULT_MIN_SIZE: u64 = 1024;
+
+/// Responses of the whole process compressed at once (#356): each encoder keeps its window
+/// and tables (a few hundred KiB to about 1 MiB) until the response ends.
+pub const MAX_ENCODERS: usize = 256;
+/// log2 of the window of br and zstd (256 KiB; br's default is 4 MiB, zstd's up to 8 MiB).
+const WINDOW_LOG: u32 = 18;
+
+static ENCODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A place among `MAX_ENCODERS`.
+struct Slot;
+
+impl Slot {
+	fn take() -> Option<Slot> {
+		use std::sync::atomic::Ordering::Relaxed;
+		let mut n = ENCODERS.load(Relaxed);
+		loop {
+			if n >= MAX_ENCODERS {
+				return None;
+			}
+			match ENCODERS.compare_exchange_weak(n, n + 1, Relaxed, Relaxed) {
+				Ok(_) => return Some(Slot),
+				Err(now) => n = now,
+			}
+		}
+	}
+}
+
+impl Drop for Slot {
+	fn drop(&mut self) {
+		ENCODERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
@@ -123,8 +158,10 @@ pub fn compressible(status: StatusCode, headers: &HeaderMap, min_size: u64, head
 	}
 }
 
-/// Compresses the body of `resp` with `encoding` and fixes its headers.
+/// Compresses the body of `resp` with `encoding` and fixes its headers; as it is when
+/// `MAX_ENCODERS` responses are being compressed.
 pub fn compress(resp: Response<Body>, encoding: Encoding) -> Response<Body> {
+	let Some(slot) = Slot::take() else { return resp };
 	let (mut parts, body) = resp.into_parts();
 	let h = &mut parts.headers;
 	h.remove(header::CONTENT_LENGTH);
@@ -137,7 +174,7 @@ pub fn compress(resp: Response<Body>, encoding: Encoding) -> Response<Body> {
 		}
 	}
 	let encoder = Encoder::new(encoding);
-	Response::from_parts(parts, Compressed { inner: body, encoder: Some(encoder), trailers: None }.boxed())
+	Response::from_parts(parts, Compressed { inner: body, encoder: Some((encoder, slot)), trailers: None }.boxed())
 }
 
 enum Encoder {
@@ -150,10 +187,14 @@ impl Encoder {
 	fn new(e: Encoding) -> Encoder {
 		match e {
 			Encoding::Gzip => Encoder::Gzip(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(5))),
-			Encoding::Br => Encoder::Br(Box::new(brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22))),
+			Encoding::Br => Encoder::Br(Box::new(brotli::CompressorWriter::new(Vec::new(), 4096, 5, WINDOW_LOG))),
 			// level 3 is zstd's default; creating the context only fails without memory
 			Encoding::Zstd => match zstd::stream::write::Encoder::new(Vec::new(), 3) {
-				Ok(z) => Encoder::Zstd(z),
+				Ok(mut z) => {
+					// a window the size of the response would be up to 8 MiB at level 3
+					let _ = z.window_log(WINDOW_LOG);
+					Encoder::Zstd(z)
+				}
 				Err(_) => Encoder::Gzip(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(5))),
 			},
 		}
@@ -192,8 +233,8 @@ impl Encoder {
 
 struct Compressed {
 	inner: Body,
-	/// None once the stream has ended.
-	encoder: Option<Encoder>,
+	/// None once the stream has ended (its place among `MAX_ENCODERS` is given back then).
+	encoder: Option<(Encoder, Slot)>,
 	/// Trailers of the original body, sent after the last compressed bytes.
 	trailers: Option<HeaderMap>,
 }
@@ -205,7 +246,7 @@ impl hyper::body::Body for Compressed {
 	fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, super::server::BoxError>>> {
 		let this = self.get_mut();
 		loop {
-			let Some(encoder) = this.encoder.as_mut() else {
+			let Some((encoder, _)) = this.encoder.as_mut() else {
 				return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
 			};
 			let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
@@ -213,7 +254,7 @@ impl hyper::body::Body for Compressed {
 				Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
 				Poll::Ready(Some(Ok(frame))) => frame,
 				Poll::Ready(None) => {
-					let done = this.encoder.take().map(Encoder::finish);
+					let done = this.encoder.take().map(|(e, _)| e.finish());
 					return match done {
 						Some(Ok(rest)) if !rest.is_empty() => Poll::Ready(Some(Ok(Frame::data(rest)))),
 						// an error, not the end: the client must not take a cut stream for a complete one
@@ -310,5 +351,19 @@ mod tests {
 			};
 			assert_eq!(back, text, "{e:?}");
 		}
+	}
+
+	#[test]
+	fn the_zstd_window_is_small() {
+		let text = "a small window is enough for a stream. ".repeat(40_000);
+		let mut enc = Encoder::new(Encoding::Zstd);
+		let mut out = enc.write(text.as_bytes()).unwrap().to_vec();
+		out.extend_from_slice(&enc.finish().unwrap());
+		// a decoder that takes no window past 2^WINDOW_LOG still reads it
+		let mut d = zstd::stream::read::Decoder::new(&out[..]).unwrap();
+		d.window_log_max(WINDOW_LOG).unwrap();
+		let mut back = String::new();
+		d.read_to_string(&mut back).unwrap();
+		assert_eq!(back.len(), text.len());
 	}
 }

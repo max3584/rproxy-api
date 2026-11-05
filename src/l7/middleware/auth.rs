@@ -329,6 +329,50 @@ pub enum BasicVerdict {
 	Deny(&'static str),
 	/// The users file could not be read.
 	Unavailable,
+	/// As many bcrypt checks as there are CPUs are running and many more wait (#356): 503.
+	Busy,
+}
+
+/// bcrypt checks of the whole process at once: one per CPU (#356). More wait, up to
+/// `BCRYPT_WAITING` per CPU for at most `BCRYPT_WAIT`; past that `Busy`.
+static BCRYPT: std::sync::LazyLock<(tokio::sync::Semaphore, usize)> = std::sync::LazyLock::new(|| {
+	let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+	(tokio::sync::Semaphore::new(cpus), cpus)
+});
+const BCRYPT_WAITING: usize = 8;
+const BCRYPT_WAIT: Duration = Duration::from_secs(1);
+static BCRYPT_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One request waiting for a bcrypt check.
+struct Waiting;
+
+impl Drop for Waiting {
+	fn drop(&mut self) {
+		BCRYPT_WAITERS.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+/// bcrypt on the blocking pool, at most one per CPU; None when too many wait.
+async fn bcrypt_verify(password: String, hash: String) -> Option<bool> {
+	let (slots, cpus) = &*BCRYPT;
+	let permit = match slots.try_acquire() {
+		Ok(p) => p,
+		Err(_) => {
+			if BCRYPT_WAITERS.fetch_add(1, Ordering::Relaxed) >= cpus * BCRYPT_WAITING {
+				BCRYPT_WAITERS.fetch_sub(1, Ordering::Relaxed);
+				return None;
+			}
+			let _waiting = Waiting;
+			tokio::time::timeout(BCRYPT_WAIT, slots.acquire()).await.ok()?.ok()?
+		}
+	};
+	// the place is held until bcrypt is done, also when the request is gone meanwhile
+	tokio::task::spawn_blocking(move || {
+		let _permit = permit;
+		bcrypt::verify(password, &hash).unwrap_or(false)
+	})
+	.await
+	.ok()
 }
 
 impl BasicAuth {
@@ -352,7 +396,7 @@ impl BasicAuth {
 		})
 	}
 
-	/// Checks `Authorization: Basic`. bcrypt runs on the blocking pool.
+	/// Checks `Authorization: Basic`. bcrypt runs on the blocking pool, one per CPU at once.
 	pub async fn check(&self, headers: &HeaderMap) -> BasicVerdict {
 		let Some(users) = self.users.get() else { return BasicVerdict::Unavailable };
 		let Some((user, password)) = basic_credentials(headers) else { return BasicVerdict::Deny("no_credentials") };
@@ -373,7 +417,10 @@ impl BasicAuth {
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
 			Hash::Apr1 { salt, hash } => constant_time_eq(apr1(password.as_bytes(), salt.as_bytes()).as_bytes(), hash.as_bytes()),
-			Hash::Bcrypt(h) => tokio::task::spawn_blocking(move || bcrypt::verify(password, &h).unwrap_or(false)).await.unwrap_or(false),
+			Hash::Bcrypt(h) => match bcrypt_verify(password, h).await {
+				Some(ok) => ok,
+				None => return BasicVerdict::Busy,
+			},
 		};
 		if !known {
 			return BasicVerdict::Deny("unknown_user");
