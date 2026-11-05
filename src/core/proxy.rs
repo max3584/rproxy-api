@@ -177,6 +177,8 @@ pub struct Runtime {
 	/// The relay deadline of a tcp connection in ms (`idle_timeout`, #353; 0: none), read when
 	/// the connection starts; PATCH changes it for the next connection.
 	pub idle_timeout_ms: std::sync::atomic::AtomicU64,
+	/// `half_close_timeout` in ms, as `idle_timeout_ms` (0: none).
+	pub half_close_timeout_ms: std::sync::atomic::AtomicU64,
 	pub udp_idle: watch::Receiver<Duration>,
 	pub stats: Stats,
 	/// `conn.denied` lines of UDP datagrams, by client address: a flood of refused
@@ -205,10 +207,10 @@ pub fn timeout_ms(d: Option<Duration>) -> u64 {
 	d.map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1))
 }
 
-/// `idle_timeout` as kept in `Runtime::idle_timeout_ms`: left out is the default
-/// (`l4::idle::DEFAULT_IDLE_TIMEOUT`), zero is no limit (0).
-pub fn idle_timeout_ms(d: Option<Duration>) -> u64 {
-	let d = d.unwrap_or(crate::l4::idle::DEFAULT_IDLE_TIMEOUT);
+/// `idle_timeout` / `half_close_timeout` as kept in `Runtime`: left out is `default`,
+/// zero is no limit (0).
+pub fn relay_timeout_ms(d: Option<Duration>, default: Duration) -> u64 {
+	let d = d.unwrap_or(default);
 	if d.is_zero() { 0 } else { timeout_ms(Some(d)) }
 }
 
@@ -225,17 +227,21 @@ impl Runtime {
 		self.connect_timeout_ms.store(timeout_ms(d), std::sync::atomic::Ordering::Relaxed);
 	}
 
-	/// How long a relayed tcp connection may move nothing (`idle_timeout`; `None`: no limit).
-	pub fn idle_timeout(&self) -> Option<Duration> {
-		match self.idle_timeout_ms.load(std::sync::atomic::Ordering::Relaxed) {
+	/// The deadlines of a relayed tcp connection starting now (`idle_timeout`,
+	/// `half_close_timeout`; `None`: no limit).
+	pub fn relay_deadlines(&self) -> crate::l4::idle::Deadlines {
+		let get = |ms: &std::sync::atomic::AtomicU64| match ms.load(std::sync::atomic::Ordering::Relaxed) {
 			0 => None,
 			ms => Some(Duration::from_millis(ms)),
-		}
+		};
+		crate::l4::idle::Deadlines { idle: get(&self.idle_timeout_ms), half_close: get(&self.half_close_timeout_ms) }
 	}
 
-	/// The rule's `idle_timeout` (`None`: the default, zero: no limit).
-	pub fn set_idle_timeout(&self, d: Option<Duration>) {
-		self.idle_timeout_ms.store(idle_timeout_ms(d), std::sync::atomic::Ordering::Relaxed);
+	/// The rule's `idle_timeout` and `half_close_timeout` (`None`: the default, zero: no limit).
+	pub fn set_relay_timeouts(&self, idle: Option<Duration>, half_close: Option<Duration>) {
+		use crate::l4::idle::{DEFAULT_HALF_CLOSE_TIMEOUT, DEFAULT_IDLE_TIMEOUT};
+		self.idle_timeout_ms.store(relay_timeout_ms(idle, DEFAULT_IDLE_TIMEOUT), std::sync::atomic::Ordering::Relaxed);
+		self.half_close_timeout_ms.store(relay_timeout_ms(half_close, DEFAULT_HALF_CLOSE_TIMEOUT), std::sync::atomic::Ordering::Relaxed);
 	}
 
 	pub fn bind_as(&self, client: SocketAddr) -> Option<SocketAddr> {

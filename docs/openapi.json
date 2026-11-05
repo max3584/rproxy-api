@@ -1522,7 +1522,11 @@
           },
           "idle_timeout": {
             "type": "string",
-            "description": "How long a relayed connection may move nothing either way before both sides are reset (tcp without http; 0s for no limit, else at least 1s; #353, features.tcp_idle_timeout). Left out: 1h. Once one side has half-closed, 1 min (or idle_timeout if shorter) of no progress."
+            "description": "How long a relayed connection may move nothing either way before both sides are reset (tcp without http; 0s for no limit, else at least 1s; #353, features.tcp_idle_timeout). Left out: 1h. Only bytes of the connection count (not TCP keepalive probes)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Once one side has half-closed, how long the other direction may move nothing before both sides are reset (tcp without http; 0s: none, only idle_timeout; else at least 1s; #353, features.tcp_idle_timeout). Left out: 1m. idle_timeout applies if shorter."
           },
           "proxy_protocol": {
             "$ref": "#/components/schemas/ProxyProtocolIn"
@@ -1613,6 +1617,10 @@
           "idle_timeout": {
             "type": "string",
             "description": "Replaces idle_timeout when present (0s: no limit; left out keeps it)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Replaces half_close_timeout when present (0s: only idle_timeout; left out keeps it)."
           },
           "proxy_protocol": {
             "allOf": [
@@ -1964,6 +1972,10 @@
           "idle_timeout": {
             "type": "string",
             "description": "Left out when not set (the default, 1h)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Left out when not set (the default, 1m)."
           },
           "proxy_protocol": {
             "allOf": [
@@ -2319,7 +2331,7 @@
               },
               "tcp_idle_timeout": {
                 "type": "boolean",
-                "description": "idle_timeout of an L4 tcp rule (default 1h, 0s none), 1 min after a half-close, TCP keepalive on both sockets and a 30 s connect timeout by default (#353)"
+                "description": "idle_timeout (default 1h) and half_close_timeout (default 1m) of an L4 tcp rule (0s none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)"
               }
             }
           },

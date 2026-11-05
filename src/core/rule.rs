@@ -235,8 +235,8 @@ pub struct Features {
 	/// All `cache` middlewares of the process together keep at most `RPROXY_CACHE_MAX_MEMORY`
 	/// (`global.cache_max_memory` in `GET /config/global`, live); `rproxy_http_cache_memory_bytes` (#349)
 	pub cache_process_memory: bool,
-	/// `idle_timeout` of an L4 tcp rule (default 1h, `0s` none), 1 min after a half-close,
-	/// TCP keepalive on both sockets and a 30 s connect timeout by default (#353)
+	/// `idle_timeout` (default 1h) and `half_close_timeout` (default 1 min) of an L4 tcp rule
+	/// (`0s` none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)
 	pub tcp_idle_timeout: bool,
 }
 
@@ -431,6 +431,7 @@ impl Features {
 			("listen_freebind (IP_FREEBIND: Linux)", spec.listen_freebind, self.listen_freebind),
 			("connect_timeout", spec.connect_timeout.is_some(), self.connect_timeout),
 			("idle_timeout", spec.idle_timeout.is_some(), self.tcp_idle_timeout),
+			("half_close_timeout", spec.half_close_timeout.is_some(), self.tcp_idle_timeout),
 			("proxy_protocol", spec.proxy_protocol.is_some(), self.proxy_protocol_in),
 			("proxy_protocol of a udp rule", spec.proxy_protocol.is_some() && spec.key.protocol == Protocol::Udp, self.proxy_protocol_in_udp),
 			("labels", !spec.labels.is_empty(), self.labels),
@@ -526,6 +527,10 @@ pub struct RuleRequest {
 	/// Left out: 1h; `0s`: no limit.
 	#[serde(default)]
 	pub idle_timeout: Option<String>,
+	/// After one side has finished sending (a half-close), how long the other may move
+	/// nothing (tcp, not http; #353). Left out: 1 min; `0s`: only `idle_timeout`.
+	#[serde(default)]
+	pub half_close_timeout: Option<String>,
 	#[serde(default)]
 	pub source_ip: SourceIp,
 	pub udp_idle_secs: Option<u64>,
@@ -596,6 +601,8 @@ pub struct RuleSpec {
 	pub connect_timeout: Option<Duration>,
 	/// `idle_timeout` (tcp rules without http): `None` left out (the default), zero no limit.
 	pub idle_timeout: Option<Duration>,
+	/// `half_close_timeout`, as `idle_timeout`.
+	pub half_close_timeout: Option<Duration>,
 	pub source_ip: SourceIp,
 	pub udp_idle: Duration,
 	pub tls: TlsSpec,
@@ -814,22 +821,23 @@ pub fn validate_connect_timeout(v: Option<&str>, protocol: Protocol, http: bool)
 	Ok(Some(d))
 }
 
-/// The shortest `idle_timeout` other than `0s` (none).
-pub const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The shortest `idle_timeout` / `half_close_timeout` other than `0s` (none).
+pub const MIN_RELAY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// `idle_timeout`: `0s` (no limit) or a duration of at least 1s of a tcp rule without `http`
-/// (#353; `http` rules have `global.http.timeouts`). Left out is the default (`None`).
-pub fn validate_idle_timeout(v: Option<&str>, protocol: Protocol, http: bool) -> Result<Option<Duration>, ApiError> {
+/// `idle_timeout` / `half_close_timeout` (`what`): `0s` (no limit) or a duration of at least
+/// 1s of a tcp rule without `http` (#353; `http` rules have `global.http.timeouts`). Left out
+/// is the default (`None`).
+pub fn validate_relay_timeout(what: &str, v: Option<&str>, protocol: Protocol, http: bool) -> Result<Option<Duration>, ApiError> {
 	let Some(s) = v else { return Ok(None) };
-	let d = crate::l7::parse_duration(s.trim()).map_err(|e| ApiError::invalid(format!("idle_timeout: {e}")))?;
+	let d = crate::l7::parse_duration(s.trim()).map_err(|e| ApiError::invalid(format!("{what}: {e}")))?;
 	if protocol != Protocol::Tcp {
-		return Err(ApiError::invalid("idle_timeout is for tcp rules (udp has udp_idle_secs)"));
+		return Err(ApiError::invalid(format!("{what} is for tcp rules (udp has udp_idle_secs)")));
 	}
 	if http {
-		return Err(ApiError::invalid("idle_timeout of a rule is not used with http; use global.http.timeouts"));
+		return Err(ApiError::invalid(format!("{what} of a rule is not used with http; use global.http.timeouts")));
 	}
-	if !d.is_zero() && d < MIN_IDLE_TIMEOUT {
-		return Err(ApiError::invalid("idle_timeout must be 0s (no limit) or at least 1s"));
+	if !d.is_zero() && d < MIN_RELAY_TIMEOUT {
+		return Err(ApiError::invalid(format!("{what} must be 0s (no limit) or at least 1s")));
 	}
 	Ok(Some(d))
 }
@@ -882,7 +890,9 @@ impl RuleRequest {
 			h.validate(self.protocol)?;
 		}
 		let connect_timeout = validate_connect_timeout(self.connect_timeout.as_deref(), self.protocol, self.http.is_some())?;
-		let idle_timeout = validate_idle_timeout(self.idle_timeout.as_deref(), self.protocol, self.http.is_some())?;
+		let idle_timeout = validate_relay_timeout("idle_timeout", self.idle_timeout.as_deref(), self.protocol, self.http.is_some())?;
+		let half_close_timeout =
+			validate_relay_timeout("half_close_timeout", self.half_close_timeout.as_deref(), self.protocol, self.http.is_some())?;
 		let allow_from = cidr::parse_list(&self.allow_from)?;
 		let proxy_protocol = crate::net::proxy_in::validate(self.proxy_protocol)?;
 		let tls = self.tls.unwrap_or_default();
@@ -949,6 +959,7 @@ impl RuleRequest {
 			health_check: self.health_check,
 			connect_timeout,
 			idle_timeout,
+			half_close_timeout,
 			source_ip: self.source_ip,
 			udp_idle,
 			tls,
@@ -992,6 +1003,8 @@ pub struct UpdateRequest {
 	pub connect_timeout: Option<String>,
 	/// Replaces `idle_timeout` when present (`0s`: no limit; left out keeps it).
 	pub idle_timeout: Option<String>,
+	/// Replaces `half_close_timeout` when present (`0s`: only `idle_timeout`; left out keeps it).
+	pub half_close_timeout: Option<String>,
 	pub udp_idle_secs: Option<u64>,
 	pub source_ip: Option<SourceIp>,
 	/// Cannot change; accepted only if it matches (like `source_ip`).
@@ -1090,6 +1103,9 @@ pub struct RuleView {
 	/// Shown when set (left out: the default, 1h).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub idle_timeout: Option<String>,
+	/// Shown when set (left out: the default, 1 min).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub half_close_timeout: Option<String>,
 	pub source_ip: &'static str,
 	pub udp_idle_secs: u64,
 	pub tls: TlsSpec,
@@ -1163,6 +1179,9 @@ pub fn patched_request(mut body: RuleRequest, req: UpdateRequest) -> RuleRequest
 	if req.idle_timeout.is_some() {
 		body.idle_timeout = req.idle_timeout;
 	}
+	if req.half_close_timeout.is_some() {
+		body.half_close_timeout = req.half_close_timeout;
+	}
 	if req.udp_idle_secs.is_some() {
 		body.udp_idle_secs = req.udp_idle_secs;
 	}
@@ -1232,6 +1251,7 @@ impl RuleView {
 			health_check: req.health_check.clone(),
 			connect_timeout: req.connect_timeout.clone(),
 			idle_timeout: req.idle_timeout.clone(),
+			half_close_timeout: req.half_close_timeout.clone(),
 			source_ip: req.source_ip.as_str(),
 			udp_idle_secs: req.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS),
 			tls: req.tls.clone().unwrap_or_default(),
@@ -1280,6 +1300,7 @@ impl RuleView {
 			health_check: spec.health_check.clone(),
 			connect_timeout: spec.connect_timeout.map(show_duration),
 			idle_timeout: spec.idle_timeout.map(show_duration),
+			half_close_timeout: spec.half_close_timeout.map(show_duration),
 			source_ip: spec.source_ip.as_str(),
 			udp_idle_secs: spec.udp_idle.as_secs(),
 			tls: spec.tls.clone(),
@@ -1359,6 +1380,7 @@ mod tests {
 			health_check: None,
 			connect_timeout: None,
 			idle_timeout: None,
+			half_close_timeout: None,
 			source_ip: SourceIp::Proxy,
 			udp_idle_secs: None,
 			tls: None,

@@ -290,7 +290,10 @@ pub struct Ejection {
 	until_unix: AtomicU64,
 	ejections: AtomicU64,
 	counts: Mutex<Counts>,
-	/// A task of `after` is waiting for the end of the ejection (at most one, #359).
+	/// A task of `after` is waiting for the end of the ejection (at most one, #359). Set
+	/// by the `after` that spawns it and kept while it waits: later calls see it and leave
+	/// the waiting to that task, which reads `until` again each time it wakes. Only the task
+	/// clears it, when it ends, and then looks once more for an ejection that came meanwhile.
 	timer: AtomicBool,
 }
 
@@ -449,8 +452,9 @@ pub fn after(ejection: &Arc<Ejection>, back: impl FnOnce() + Send + 'static) {
 				}
 				return;
 			}
-			drop(e);
-			if until != 0 {
+			// not when ejected again meanwhile (that ejection's `after` takes the timer)
+			if until != 0 && !e.is_ejected() {
+				drop(e);
 				back();
 			}
 			return;

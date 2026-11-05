@@ -1,8 +1,10 @@
 //! Deadlines of a relayed TCP connection (#353): the rule's `idle_timeout` (no
 //! byte moved either way for that long; default 1 h, `0s` none) and, once one
-//! side has ended its sending (a half-close), `HALF_CLOSE_TIMEOUT` of no progress
-//! for the other. A writer that takes nothing (the peer does not read) makes no
-//! progress either, so a stalled connection ends by the same deadline.
+//! side has ended its sending (a half-close), its `half_close_timeout` (default
+//! 1 min, `0s` none: then only `idle_timeout`) of no progress for the other. A
+//! writer that takes nothing (the peer does not read) makes no progress either,
+//! so a stalled connection ends by the same deadline. Only bytes of the
+//! connection count: TCP keepalive probes are not seen here.
 //!
 //! The relay marks what it moves in a `Progress` (a plain store per read or write
 //! that moved bytes, no timer touched); `expired` wakes now and then and compares,
@@ -20,8 +22,31 @@ use tokio::time::Instant;
 
 /// The rule's `idle_timeout` when it has none.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
-/// After one side has half-closed: the other may go this long without progress.
-pub const HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// The rule's `half_close_timeout` when it has none: after one side has half-closed,
+/// the other may go this long without progress.
+pub const DEFAULT_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The deadlines of one connection (`None`: no limit), read from the rule when it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Deadlines {
+	pub idle: Option<Duration>,
+	pub half_close: Option<Duration>,
+}
+
+impl Deadlines {
+	/// The limit in force, and which one it is.
+	fn limit(&self, half_closed: bool) -> Option<(Duration, Expired)> {
+		let idle = self.idle.map(|d| (d, Expired::Idle));
+		if !half_closed {
+			return idle;
+		}
+		match (idle, self.half_close) {
+			(Some((i, _)), Some(h)) if i <= h => idle,
+			(_, Some(h)) => Some((h, Expired::HalfClose)),
+			(idle, None) => idle,
+		}
+	}
+}
 
 /// What a relay moved, for `expired`.
 #[derive(Debug, Default)]
@@ -41,7 +66,7 @@ impl Progress {
 	}
 
 	/// A side ended its sending; counts as progress (the other side gets the whole
-	/// `HALF_CLOSE_TIMEOUT` from here).
+	/// `half_close_timeout` from here).
 	pub fn half_closed(&self) {
 		self.half_closed.store(true, Ordering::Relaxed);
 		self.moved();
@@ -78,22 +103,27 @@ fn tick(limit: Duration) -> Duration {
 	(limit / 8).clamp(Duration::from_millis(10), Duration::from_secs(60))
 }
 
-/// Returns when nothing has moved for `idle` (or for `HALF_CLOSE_TIMEOUT`, if
-/// shorter, once a side has half-closed). Never returns while progress is made.
-pub async fn expired(progress: &Progress, idle: Duration) -> Expired {
-	let half = HALF_CLOSE_TIMEOUT.min(idle);
+/// Returns when nothing has moved for the limit in force (`Deadlines::limit`: the
+/// idle one, or once a side has half-closed the shorter of both). Never returns while
+/// progress is made, nor without a limit.
+pub async fn expired(progress: &Progress, deadlines: Deadlines) -> Expired {
 	let mut seen = progress.seen();
 	let mut since = Instant::now();
 	loop {
-		let (limit, which) = if progress.is_half_closed() { (half, Expired::HalfClose) } else { (idle, Expired::Idle) };
-		let now = Instant::now();
-		let left = (since + limit).saturating_duration_since(now);
-		if left.is_zero() {
-			return which;
-		}
-		tokio::time::sleep(left.min(tick(limit))).await;
+		let (sleep, due) = match deadlines.limit(progress.is_half_closed()) {
+			Some((limit, which)) => {
+				let left = (since + limit).saturating_duration_since(Instant::now());
+				if left.is_zero() {
+					return which;
+				}
+				(left.min(tick(limit)), true)
+			}
+			// no limit until a half-close: look now and then whether one came
+			None => (deadlines.half_close.map_or(Duration::from_secs(60), tick), false),
+		};
+		tokio::time::sleep(sleep).await;
 		let current = progress.seen();
-		if current != seen {
+		if current != seen || !due {
 			seen = current;
 			// moved somewhere in the last tick: counted from now, at most a tick late
 			since = Instant::now();
@@ -101,15 +131,15 @@ pub async fn expired(progress: &Progress, idle: Duration) -> Expired {
 	}
 }
 
-/// Runs `relay` until it ends, or until `expired` (with `idle`; `None`: no deadline).
-pub async fn within<T>(idle: Option<Duration>, progress: &Progress, relay: impl std::future::Future<Output = T>) -> Result<T, Expired> {
-	match idle {
-		None => Ok(relay.await),
-		Some(idle) => tokio::select! {
-			biased;
-			r = relay => Ok(r),
-			e = expired(progress, idle) => Err(e),
-		},
+/// Runs `relay` until it ends, or until `expired` (none without any limit).
+pub async fn within<T>(deadlines: Deadlines, progress: &Progress, relay: impl std::future::Future<Output = T>) -> Result<T, Expired> {
+	if deadlines == Deadlines::default() {
+		return Ok(relay.await);
+	}
+	tokio::select! {
+		biased;
+		r = relay => Ok(r),
+		e = expired(progress, deadlines) => Err(e),
 	}
 }
 
@@ -171,7 +201,7 @@ mod tests {
 	async fn idle_ends_only_without_progress() {
 		let p = Progress::default();
 		let start = Instant::now();
-		let watch = expired(&p, Duration::from_secs(80));
+		let watch = expired(&p, Deadlines { idle: Some(Duration::from_secs(80)), half_close: Some(DEFAULT_HALF_CLOSE_TIMEOUT) });
 		tokio::pin!(watch);
 		// progress every 30 s keeps it going
 		for _ in 0..10 {
@@ -189,7 +219,7 @@ mod tests {
 	async fn a_half_close_shortens_it() {
 		let p = Progress::default();
 		let start = Instant::now();
-		let watch = expired(&p, DEFAULT_IDLE_TIMEOUT);
+		let watch = expired(&p, Deadlines { idle: Some(DEFAULT_IDLE_TIMEOUT), half_close: Some(DEFAULT_HALF_CLOSE_TIMEOUT) });
 		tokio::pin!(watch);
 		tokio::select! {
 			_ = &mut watch => panic!("ended too soon"),
@@ -197,7 +227,34 @@ mod tests {
 		}
 		assert_eq!(watch.await, Expired::HalfClose);
 		let after = start.elapsed() - Duration::from_secs(600);
-		assert!(after >= HALF_CLOSE_TIMEOUT && after <= HALF_CLOSE_TIMEOUT + Duration::from_secs(60), "{after:?}");
+		assert!(after >= DEFAULT_HALF_CLOSE_TIMEOUT && after <= DEFAULT_HALF_CLOSE_TIMEOUT + Duration::from_secs(60), "{after:?}");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn each_limit_alone() {
+		// half_close_timeout 0s: after a half-close only idle_timeout applies
+		let p = Progress::default();
+		let start = Instant::now();
+		p.half_closed();
+		let d = Deadlines { idle: Some(Duration::from_secs(600)), half_close: None };
+		assert_eq!(expired(&p, d).await, Expired::Idle);
+		assert!(start.elapsed() >= Duration::from_secs(600));
+		// idle_timeout 0s: no limit until a half-close, then half_close_timeout
+		let p = Progress::default();
+		let d = Deadlines { idle: None, half_close: Some(Duration::from_secs(30)) };
+		let start = Instant::now();
+		let watch = expired(&p, d);
+		tokio::pin!(watch);
+		tokio::select! {
+			_ = &mut watch => panic!("ended without a half-close"),
+			_ = tokio::time::sleep(Duration::from_secs(7200)) => p.half_closed(),
+		}
+		assert_eq!(watch.await, Expired::HalfClose);
+		let after = start.elapsed() - Duration::from_secs(7200);
+		assert!(after >= Duration::from_secs(30) && after <= Duration::from_secs(60) + tick(Duration::from_secs(30)), "{after:?}");
+		// an idle_timeout shorter than half_close_timeout stays in force after a half-close
+		let d = Deadlines { idle: Some(Duration::from_secs(5)), half_close: Some(Duration::from_secs(60)) };
+		assert_eq!(d.limit(true), Some((Duration::from_secs(5), Expired::Idle)));
 	}
 
 	#[tokio::test]

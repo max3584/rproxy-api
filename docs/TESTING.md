@@ -547,7 +547,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/check_config.rs` | `rproxy-api --check-config`（#140。ほかの人が読める鍵は誤り、`global.files.owner_check: off` なら通る）：起動・再読み込みと同じ道筋で設定ファイルを確かめ、何も開かず、終了コード・テキスト・JSON で答える。API なら断るファイル（#319）は警告（`files_the_api_may_not_name_are_warnings`） |
 | `tests/startup.rs` | 本物のバイナリの起動：設定の誤りは止まり、環境の問題（権限・使用中のポート）は制限つきで動き続けて、直れば戻る。制御 API の TLS と SIGHUP の読み直し、`GET /readyz` |
 | `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き。`connect_timeout`（v0.4.3。SYN を捨てる宛先） |
-| `tests/tcp_deadlines.rs` | L4 の TCP の中継の時間切れ（#353）：`idle_timeout` で黙った接続が閉じる（平文の splice の道と TLS の終端）、運んでいる接続は閉じない、読まない転送先で書けない接続も閉じる。PATCH（`0s`・省けば今のまま）、検証（`udp`・`http`・`1s` 未満）、`features.tcp_idle_timeout`。半分閉じた後の 1 分は単体（`l4::idle`） |
+| `tests/tcp_deadlines.rs` | L4 の TCP の中継の時間切れ（#353）：`idle_timeout` で黙った接続が閉じる（平文の splice の道と TLS の終端）、運んでいる接続は閉じない、読まない転送先で書けない接続も閉じる。PATCH（`0s`・省けば今のまま）、検証（`udp`・`http`・`1s` 未満）、`features.tcp_idle_timeout`。両側の RST と `conn.close` の `reason`、splice に移った後の時間切れと splice で運び続ける接続、`half_close_timeout`（と `0s`） |
 | `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |

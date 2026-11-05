@@ -83,8 +83,16 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
-	// a full target (#341) is not one to fall back on
-	let fallback = target.candidates.iter().filter(usable).filter(|c| !c.member.as_ref().is_some_and(|m| m.is_full())).count() > 1;
+	// a full target (#341) is not one to fall back on; every address counts (a dual-stack
+	// name has two to try)
+	let fallback = target
+		.candidates
+		.iter()
+		.filter(usable)
+		.filter(|c| !c.member.as_ref().is_some_and(|m| m.is_full()))
+		.map(|c| c.addrs.iter().filter(|a| source::usable(**a, bind_as)).count())
+		.sum::<usize>()
+		> 1;
 	for c in target.candidates.iter().filter(usable) {
 		let Ok(lease) = c.lease() else {
 			full = true;
@@ -436,7 +444,7 @@ async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &m
 		let first = detail.first.clone();
 		let progress = Progress::default();
 		let relay = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip(), first.as_deref(), &progress);
-		let outcome = idle::within(rt.idle_timeout(), &progress, relay).await;
+		let outcome = idle::within(rt.relay_deadlines(), &progress, relay).await;
 		detail.rx += rx.into_inner();
 		detail.tx += tx.into_inner();
 		let result = match outcome {
@@ -516,7 +524,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 /// `reads` is how much is read at a time from `a` and from `b`
 /// (`relay::TLS_READ_SIZE` for TLS streams). Reads wait for the rule's
 /// `bandwidth` (`Shaped`; nothing but a relaxed load per read without one).
-/// The rule's `idle_timeout` (and `idle::HALF_CLOSE_TIMEOUT` once a side has
+/// The rule's `idle_timeout` (and its `half_close_timeout` once a side has
 /// half-closed) ends a relay that moves nothing, with both sides reset (#353).
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 	rt: &Runtime,
@@ -537,7 +545,7 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	let mut b = crate::core::outlier::Watched::new(&mut b, first.as_deref(), true);
 	let mut client = Shaped::new(Counted::new(&mut a, &rt.stats.rx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Up));
 	let mut backend = Shaped::new(Counted::new(&mut b, &rt.stats.tx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Down));
-	let outcome = idle::within(rt.idle_timeout(), &progress, relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1)).await;
+	let outcome = idle::within(rt.relay_deadlines(), &progress, relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1)).await;
 	detail.rx += client.into_inner().count;
 	detail.tx += backend.into_inner().count;
 	let result = match outcome {
