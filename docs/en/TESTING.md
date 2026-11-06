@@ -280,6 +280,10 @@ Checks the shapes of the v0.4 settings (docs/en/DESIGN-v0.4.md) as a whole. In v
 | `check_config_validates_the_v0_4_shapes`, `a_0_3_settings_file_still_passes` | `--check-config` reports wrong v0.4 shapes as errors; every v0.4 setting runs, so nothing is warned about. A 0.3 settings file passes without warnings |
 | `v0_4_flags_are_checked_at_startup` | Wrong flags / environment variables (`--tls-client-auth` without a CA, `--tls-client-ca` without `--tls-cert`, `--token-warn-days 0`, ...) stop the startup |
 
+## Integration tests: limits of the control API (`tests/control_limits.rs`, #358)
+
+Route and middleware names (line feeds, quotes, white space and too long names are `400`; rproxy-gateway's names and Japanese pass and show in `/metrics`), the counts of routes a `PATCH` takes away leave `stats.http` and `/metrics`, the size limit of `users_file` (16 MiB), `listen_freebind` (`403` from `POST /rules` and rule sets' `PUT` for tokens with neither `admin` nor `allow_freebind`; a set of a rproxy-gateway-like `allow_rulesets` token passes, and so does a `PUT` that changes nothing), the body limit of rule sets' `PUT` (`413 too_large`), sets with names the API refuses run when restored (`put_ruleset` without `limits`, the way of a live upgrade; the database's restore is `stored_sets_keep_names_the_api_refuses` in `tests/ruleset_persist.rs`), a token's `max_rules` (its sets' rules count too, a set changed in place keeps its count) and `max_rulesets` (`409 limit`). The process's limits (`RPROXY_MAX_RULES` and the like) are process-wide values, so unit tests check them (`core::quota`), the restart of background tasks (`core::supervise`, `rproxy_task_restarts_total`), the file sizes (`net::files`), the connection caps (in all, per source, loopback; `control::hardening`), the `drain_secs` cut (`control::api`), the backlog of deletions for an unreachable database (`config::persist`), handoffs while the old process drains (`control::upgrade::handoff`) and the Traefik converter's renames (`convert` of `rproxy-traefik`).
+
 ## Integration tests: control API hardening (`tests/api_hardening.rs`, #167)
 
 | Test | What it checks |

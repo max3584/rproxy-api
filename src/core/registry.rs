@@ -42,6 +42,15 @@ pub struct Config {
 
 type Resolver = (CancellationToken, JoinHandle<()>);
 
+/// `Registry::usage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+	pub rules: usize,
+	pub sockets: usize,
+	/// The token's rules.
+	pub owned: usize,
+}
+
 /// The cause in `conditions` of a restored rule that does not validate (#327).
 pub(crate) const INVALID: &str = "restore_invalid";
 
@@ -1031,7 +1040,8 @@ impl Registry {
 	}
 
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
-		let (tls, http) = self.build_parts(spec)?;
+		// certificates, keys and secret files are read from disk (#358)
+		let (tls, http) = crate::net::files::blocking(|| self.build_parts(spec))?;
 		// with several targets, one that cannot be resolved yet is retried in the
 		// background; the rule fails only when none can be
 		let wanted = spec.members();
@@ -1260,6 +1270,12 @@ impl Registry {
 		}
 		if let Some((_, e)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
 			return Err(ApiError::already_exists(overlap_message(&spec, e.spec())));
+		}
+		// a token's new rule: within the limits of the process (#358)
+		if by.is_some() {
+			let added = crate::core::quota::sockets(&spec);
+			let sockets: usize = rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum();
+			crate::core::quota::check_process(rules.len() + 1, 1, sockets + added, added)?;
 		}
 		let key = spec.key;
 		let entry = Entry::Running(self.start(spec, prepared)?);
@@ -1492,6 +1508,18 @@ impl Registry {
 		rules.get(key).map(|e| (e.spec().clone(), matches!(e, Entry::Running(_)), self.view_of(e)))
 	}
 
+	/// The rules and their listening sockets (`quota::sockets`) now, and the rules of the
+	/// token `by` (its own and those of its rule sets), for the limits of #358.
+	pub async fn usage(&self, by: &str) -> Usage {
+		let rules = self.rules.lock().await;
+		let owner = crate::net::protected::Owner::Token(by.to_string());
+		Usage {
+			rules: rules.len(),
+			sockets: rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum(),
+			owned: rules.values().filter(|e| self.owner_of(e.spec()) == owner).count(),
+		}
+	}
+
 	/// Every rule's spec, and whether it is running.
 	pub(crate) async fn specs(&self) -> Vec<(RuleSpec, bool)> {
 		self.rules.lock().await.values().map(|e| (e.spec().clone(), matches!(e, Entry::Running(_)))).collect()
@@ -1516,7 +1544,7 @@ impl Registry {
 				return Err(ApiError::already_exists(overlap_message(spec, e.spec())));
 			}
 		}
-		self.build_parts(spec).map(|_| ())
+		crate::net::files::blocking(|| self.build_parts(spec)).map(|_| ())
 	}
 
 	/// Puts a changed spec into effect on an existing rule, keeping its
@@ -1603,6 +1631,9 @@ impl Registry {
 				}
 				if http_changed {
 					*r.rt.http.write().unwrap() = prepared.http;
+					if let Some(h) = &spec.http {
+						r.rt.http_stats.retain(h);
+					}
 				}
 				if tls_changed {
 					*r.rt.tls.write().unwrap() = prepared.tls;
@@ -1639,6 +1670,11 @@ impl Registry {
 			}
 		}
 		let view = self.view_of(entry);
+		drop(rules);
+		// certificates no rule uses any more are let go, and ACME learns the new ones (#358)
+		if tls_changed {
+			self.gc_certs().await;
+		}
 		info!(event = "rule.update", rule = %key, target = %format!("{}:{}", view.remote_addr, view.remote_port),
 			udp_idle_secs = view.udp_idle_secs, tls = ?view.tls.mode, resolved = ?view.resolved,
 			labels = %crate::core::ruleset::labels_text(&view.labels), ruleset = view.ruleset.as_deref().unwrap_or(""));
@@ -2390,7 +2426,7 @@ impl Registry {
 	/// Seconds until each certificate a rule uses expires (negative once
 	/// expired), and the control API's.
 	fn cert_metrics(&self, out: &mut String, rules: &HashMap<Key, Entry>) {
-		let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+		let esc = crate::core::prom::label;
 		let now = tlsconf::unix_now();
 		let mut samples = vec![];
 		for (key, entry) in rules {
@@ -2433,7 +2469,7 @@ fn target_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	for key in keys {
 		let Some(Entry::Running(r)) = rules.get(key) else { continue };
 		let pool = r.rt.pool();
-		let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
+		let esc = crate::core::prom::label;
 		let mut one = |route: Option<&str>, t: crate::core::balance::TargetStatus, reported: bool| {
 			let target = crate::core::balance::TargetSpec { addr: t.addr.clone(), port: t.port, weight: None, backup: false, max_connections: None }.remote();
 			let labels = format!("protocol=\"{}\",listen=\"{}\",target=\"{}\"", key.protocol, key.listen, esc(&target));
@@ -2506,7 +2542,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 			continue;
 		}
 		for (route, c) in r.rt.http_stats.snapshot() {
-			let route = route.replace('\\', "\\\\").replace('"', "\\\"");
+			let route = crate::core::prom::label(&route);
 			let labels = format!("protocol=\"{}\",listen=\"{}\",route=\"{route}\"", key.protocol, key.listen);
 			for (class, n) in CLASSES.iter().zip(c.by_class) {
 				if n > 0 {
@@ -2521,7 +2557,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 			durations.push(format!("rproxy_http_request_duration_seconds_sum{{{labels}}} {}", c.duration_sum));
 			durations.push(format!("rproxy_http_request_duration_seconds_count{{{labels}}} {total}"));
 		}
-		let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+		let esc = crate::core::prom::label;
 		for ((route, middleware), n) in r.rt.http_stats.limited_snapshot() {
 			limited.push(format!(
 				"rproxy_http_limited_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",

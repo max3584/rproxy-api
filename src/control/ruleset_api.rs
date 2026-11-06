@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +30,47 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 	Json(state.registry.list_rulesets().await)
+}
+
+/// Says once per token that it may set `listen_freebind` only because of its `allow_rulesets`
+/// (#358): `allow_freebind: true` in the token file says it on purpose.
+fn freebind_by_rulesets(token: &str) {
+	static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+	let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+	if said.iter().any(|t| t == token) {
+		return;
+	}
+	said.push(token.to_string());
+	tracing::warn!(event = "token.freebind", token,
+		"this token sets listen_freebind in rule sets only because it has allow_rulesets; give it allow_freebind: true in the token file to say so");
+}
+
+/// Bodies of `PUT /rulesets/{name}` read and parsed at a time (#358): each may be
+/// `ruleset::MAX_BODY`, and the changes run one at a time anyway.
+static PUT_BODIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// How long a `PUT` waits for its turn to send the body (`503 busy` after).
+const PUT_WAIT: Duration = Duration::from_secs(30);
+/// How long the body may take to arrive (`408 timeout` after): a slow client does not
+/// keep the others waiting.
+const BODY_TIME: Duration = Duration::from_secs(60);
+
+/// The body of a `PUT`, at most `ruleset::MAX_BODY` bytes, within `BODY_TIME`.
+async fn read_body(body: Body) -> Result<Bytes, ApiError> {
+	match tokio::time::timeout(BODY_TIME, axum::body::to_bytes(body, ruleset::MAX_BODY)).await {
+		Ok(Ok(bytes)) => Ok(bytes),
+		Ok(Err(e)) => {
+			let e = e.into_inner();
+			let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
+			while let Some(c) = cause {
+				if c.is::<http_body_util::LengthLimitError>() {
+					return Err(ApiError::too_large(format!("the body is larger than {} bytes", ruleset::MAX_BODY)));
+				}
+				cause = c.source();
+			}
+			Err(ApiError::invalid(format!("the body could not be read: {e}")))
+		}
+		Err(_) => Err(ApiError::timeout(format!("the body did not arrive within {} s", BODY_TIME.as_secs()))),
+	}
 }
 
 /// The etag as an `ETag` header (a quoted string).
@@ -67,11 +108,18 @@ pub async fn put(
 	Path(name): Path<String>,
 	Query(query): Query<HashMap<String, String>>,
 	headers: HeaderMap,
-	body: Bytes,
+	body: Body,
 ) -> Result<Response, SetError> {
 	ruleset::validate_name(&name)?;
 	let dry_run = crate::config::plan::dry_run(&query)?;
+	// at most `PUT_BODIES` bodies (up to `ruleset::MAX_BODY` each) are read and parsed at a time (#358)
+	let permit = match tokio::time::timeout(PUT_WAIT, PUT_BODIES.acquire()).await {
+		Ok(Ok(permit)) => permit,
+		_ => return Err(ApiError::busy("other rule sets are being sent; try again in a moment").into()),
+	};
+	let body = read_body(body).await?;
 	let req: RulesetRequest = serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("invalid body: {e}")))?;
+	drop((body, permit));
 	req.validate_shape()?;
 	// refusals of the token are audited as those of PUT /rules (#319)
 	let refused = |e: ApiError| {
@@ -81,6 +129,10 @@ pub async fn put(
 		e
 	};
 	for (i, r) in req.rules.iter().enumerate() {
+		// names only for what the API is sent (#358): restored sets keep theirs
+		if let Some(h) = &r.http {
+			h.check_names().map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e }).map_err(refused)?;
+		}
 		super::acme_api::check_rule_scope(&principal, Some(r), None)
 			.map_err(|e| ApiError { message: format!("rules[{i}]: {}", e.message), ..e })
 			.map_err(refused)?;
@@ -91,8 +143,23 @@ pub async fn put(
 	super::api::to_the_end(async move {
 		let may_use_ports = |first: u16, last: u16| principal.may_use_ports(first, last);
 		let admin = principal.has(crate::control::auth::Scope::Admin);
-		let opts =
-			PutOptions { if_match: if_match.as_deref(), dry_run, by: &principal.name, admin, owner: None, may_use_ports: &may_use_ports };
+		if principal.freebind_by_rulesets_only() && req.rules.iter().any(|r| r.listen_freebind) {
+			freebind_by_rulesets(&principal.name);
+		}
+		let limits = Some(ruleset::SetLimits {
+			max_rules: principal.max_rules,
+			max_rulesets: principal.max_rulesets,
+			freebind: principal.may_freebind(true),
+		});
+		let opts = PutOptions {
+			if_match: if_match.as_deref(),
+			dry_run,
+			by: &principal.name,
+			admin,
+			owner: None,
+			may_use_ports: &may_use_ports,
+			limits,
+		};
 		// the periodic check of the stored rules and sets waits for none of the changes (persist::Store::reconcile)
 		// refused if a live upgrade started meanwhile (#305)
 		let _change = if dry_run { None } else { super::api::changing(&state).await? };
@@ -144,13 +211,7 @@ pub async fn delete(
 	Query(query): Query<HashMap<String, String>>,
 	headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-	let drain = match query.get("drain_secs") {
-		Some(s) => {
-			let secs: u64 = s.parse().map_err(|_| ApiError::invalid(format!("invalid drain_secs: {s}")))?;
-			(secs > 0).then(|| Duration::from_secs(secs))
-		}
-		None => None,
-	};
+	let drain = super::api::drain_query(&query)?;
 	principal.may_use_ruleset(&name)?;
 	let if_match = if_match(&headers)?.map(str::to_owned);
 	// a change runs to its end even if the client goes away (#144)
@@ -160,6 +221,9 @@ pub async fn delete(
 		let store = set_store(&state, &principal, &name);
 		// refused if a live upgrade started meanwhile (#305)
 		let change = super::api::changing(&state).await?;
+		if let Some(store) = &store {
+			store.check_backlog(principal.has(crate::control::auth::Scope::Admin))?;
+		}
 		let result = state.registry.take_ruleset(&name, if_match.as_deref(), &may_use_ports, (&principal.name, admin)).await;
 		audit(&principal, &client, "ruleset.delete", &name, result.as_ref().map(|_| ()).map_err(|e| e.code));
 		let taken = result?;

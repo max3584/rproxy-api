@@ -151,16 +151,36 @@ pub fn problem(path: &Path, link: Option<&std::fs::Metadata>, meta: &std::fs::Me
 	None
 }
 
+/// The largest certificate, CA bundle, key or secret file rproxy reads (#358): a large CA
+/// bundle is a few hundred KiB.
+pub const MAX_FILE: u64 = 4 << 20;
+
+/// The largest `users_file` (htpasswd) rproxy reads (#358): some 100 000 users.
+pub const MAX_USERS_FILE: u64 = 16 << 20;
+
 /// Reads a file, after the checks of `owner_check`. Only regular files, whatever the owner
 /// check (#333): the file is opened without waiting (`O_NONBLOCK`), so a FIFO or a device
 /// cannot hold the thread in `open` or in an endless read, and refused before anything is read.
+/// At most `MAX_FILE` bytes (#358).
 /// It still reads from disk: in async code, `read_async` does it on a blocking thread.
 pub fn read(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
+	read_at_most(path, kind, MAX_FILE)
+}
+
+/// `read`, refusing a file of more than `max` bytes (`InvalidData`): the size is checked on
+/// the opened file before reading, and the read stops after `max` bytes (a file that grows
+/// meanwhile).
+pub fn read_at_most(path: impl AsRef<Path>, kind: Kind, max: u64) -> io::Result<Vec<u8>> {
 	use std::os::unix::fs::OpenOptionsExt;
 	let path = path.as_ref();
-	let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
-	if !file.metadata()?.is_file() {
+	let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
+	let meta = file.metadata()?;
+	if !meta.is_file() {
 		return Err(io::Error::new(io::ErrorKind::PermissionDenied, Refused(format!("{} is not a regular file", path.display()))));
+	}
+	let too_large = || io::Error::new(io::ErrorKind::InvalidData, format!("{} is larger than {max} bytes", path.display()));
+	if meta.len() > max {
+		return Err(too_large());
 	}
 	// procfs, sysfs, devices: never a certificate, key or secret (#319), whatever the owner check
 	if crate::net::protected::opened_on_kernel_fs(&file) {
@@ -179,8 +199,11 @@ pub fn read(path: impl AsRef<Path>, kind: Kind) -> io::Result<Vec<u8>> {
 			return Err(io::Error::new(io::ErrorKind::PermissionDenied, Refused(why)));
 		}
 	}
-	let mut out = vec![];
-	file.read_to_end(&mut out)?;
+	let mut out = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+	file.take(max + 1).read_to_end(&mut out)?;
+	if out.len() as u64 > max {
+		return Err(too_large());
+	}
 	Ok(out)
 }
 
@@ -284,7 +307,23 @@ pub fn private_umask() {
 
 /// `read` as text.
 pub fn read_to_string(path: impl AsRef<Path>, kind: Kind) -> io::Result<String> {
-	String::from_utf8(read(path, kind)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+	read_to_string_at_most(path, kind, MAX_FILE)
+}
+
+/// `read_at_most` as text.
+pub fn read_to_string_at_most(path: impl AsRef<Path>, kind: Kind, max: u64) -> io::Result<String> {
+	String::from_utf8(read_at_most(path, kind, max)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Runs `f`, which reads files or does other blocking work, from async code (#358): on a
+/// multi-threaded runtime the worker thread hands its other tasks over first
+/// (`block_in_place`), so the control API and the data plane on it are not held up by a
+/// slow disk; elsewhere (a current-thread runtime, no runtime) it just runs.
+pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
+	match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+		Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+		_ => f(),
+	}
 }
 
 #[cfg(test)]
@@ -352,6 +391,26 @@ mod tests {
 		let (refused, message) = result.unwrap_err();
 		assert!(refused && message.contains("not a regular file"), "{message}");
 		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn files_larger_than_the_limit_are_refused() {
+		let dir = std::env::temp_dir().join(format!("rproxy-files-size-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let f = dir.join("cert.pem");
+		std::fs::write(&f, b"12345678").unwrap();
+		std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+		assert_eq!(read_at_most(&f, Kind::Public, 8).unwrap(), b"12345678");
+		let e = read_at_most(&f, Kind::Public, 7).unwrap_err();
+		assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+		assert!(!is_refused(&e));
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn blocking_work_runs_on_any_runtime() {
+		assert_eq!(blocking(|| 1), 1);
+		assert_eq!(tokio::task::spawn_blocking(|| blocking(|| 2)).await.unwrap(), 2);
 	}
 
 	#[tokio::test]

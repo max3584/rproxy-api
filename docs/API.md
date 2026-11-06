@@ -25,6 +25,9 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
           allow_listen_ports: 20000-29999   # 作成・変更・削除できる待ち受けポート（範囲ルールは全体が収まること）
           allow_rulesets: [ci/]             # v0.4：PUT / DELETE できるルールの組の名前の先頭（省略ですべて）
           allow_certs: [ci-]                # v0.4.2（#240）：PUT / DELETE / 読む・ルールで使える保存した証明書の名前の先頭（省略ですべて）
+          max_rules: 200                    # v0.4.20（#358）：持てるルールの数（自分の組のルールも数える。省略でプロセスの上限だけ）
+          max_rulesets: 10                  # v0.4.20（#358）：持てるルールの組の数
+          allow_freebind: true              # v0.4.20（#358）：admin でなくても listen_freebind のルールを作れる（既定 false）
           expires: 2027-03-31               # この日（UTC）まで有効
           persist: true                     # v0.4（#144）：作ったルールを rproxy_rules に保存する（既定 false）
       ```
@@ -774,7 +777,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 **ルールの組（ruleset）**：`PUT /rulesets/{name}` に「その組のルールの全体」を毎回まとめて送ると、rproxy が今のルールとの差を当てる（宣言的。途中で落ちても次の PUT で揃う）。
 
 - 名前は `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?`（例 `k8s/default/web-gateway`）。パスの `/` はそのまま書く（`PUT /rulesets/k8s/default/web-gateway`）。
-- 本文は `{"generation": <整数>, "rules": [<POST /rules と同じルール>...]}`（ルールは 10,000 個まで、本文は 32 MiB まで）。同じキーのルールを 2 つ書くと `400 invalid`。
+- 本文は `{"generation": <整数>, "rules": [<POST /rules と同じルール>...]}`（ルールは 10,000 個まで、本文は 32 MiB まで）。本文を読んで解析する `PUT` は同時に 2 つまで（ほかは 30 秒まで順番を待ち、待てなければ `503 busy`）、本文は 60 秒以内に届かなければ `408 timeout`（v0.4.20、#358）。同じキーのルールを 2 つ書くと `400 invalid`。
 - 順番：まず全部を確かめ、どれかが通らなければ**何も変えない**。
   0. 持ち主（セキュリティレビュー M3）：組はそれを作ったトークン（`owner`）のもので、ほかのトークンは `admin` でなければ `PUT` / `DELETE` できない（`403 forbidden`）。トークンの `allow_rulesets`（名前の先頭の一覧）の外の名前も `403`。rproxy の再起動のあと先に組を作られないように、コントローラのトークンには `allow_rulesets: [k8s/]` のように付け、ほかの `rules:write` のトークンには付けない名前にする。`generation` は 2^53 - 1 まで（`400 invalid`。JSON のクライアントが正しく読める数）。
   1. `If-Match`（あれば）：今の etag と違う、または組がまだないと `412 precondition_failed`。`*` は「組があれば」。ETag ヘッダの引用符つきの値でも、本文の `etag` の値そのままでもよい（`W/`・カンマ区切りも受ける）。
@@ -1247,6 +1250,24 @@ http:
 - DPDK の道（UDP）も同じく数えて飛ばす。
 - 前の版に戻すとき：v0.4.18 以前は `max_connections` を知らないので、それを書いたルールは読めない（API で作ったルールの DB からの復元・設定ファイル・引き継ぎで誤りになる）。戻す前に外す。
 
+### 制御 API の上限（v0.4.20、#358、`features.control_limits`）
+
+`rules:write` のトークンが、プロセスの資源（ファイル記述子・メモリ）や `/metrics` を使い切ったり壊したりできないように。設定ファイルのルールと、DB・引き継ぎから戻すルールは数えるが断らない（上限はトークンの頼むものだけ）。どれも、増やさない変更（削除・数の変わらない変更）はいつでも通る（上限を下げた後に片付けられるように）。
+
+- ルールの数：`RPROXY_MAX_RULES`（既定 10000、`0` でなし）。超える作成・組の `PUT` は `409 limit`。
+- 待ち受けのソケットの数：`RPROXY_MAX_LISTENERS`（既定 `0` = 自動：ファイル記述子の上限から 1024 を除いた半分、256 以上なので、上限が 1024 のときも 256。上限が分からなければ 16384。ユニットの `LimitNOFILE=65536` では 32256）。ルールのソケットは、アドレス（`extra_listen_addrs` も）× ポートの数、`http3` なら 2 倍。作成・組の `PUT`・ソケットの増える `PATCH`（アドレスを足す、`http3` を有効にする）が超えると `409 limit`。
+- ルールの組の数：`RPROXY_MAX_RULESETS`（既定 1000、`0` でなし）。
+- トークンごと：トークンファイルの `max_rules`（自分の作ったルールと自分の組のルール）・`max_rulesets`（自分の組）。省略で上限なし（プロセスの上限だけ）。超えると `409 limit`。
+- `listen_freebind: true`（ホストにないアドレスを bind する）を頼めるのは、`admin`、トークンファイルで `allow_freebind: true` のトークン、組の `PUT` では `allow_rulesets` のあるトークンも（rproxy-gateway のトークンはこれで、`spec.addresses` のある Gateway に付ける。トークンを変えずに動き続ける。そのときはログに `token.freebind` を 1 回出すので、`allow_freebind: true` を書いておく）。`allow_rulesets` は名前の先頭なので、`[k]` のような短い先頭はほとんど絞らないまま freebind も許す（空の先頭は書けない）。ほかは `403 forbidden`。組の `PUT` で確かめるのは新しいルールと変わるルールだけ（組にすでにあって変わらないルールは見ない）。ポートの範囲の大きさはトークンで分けない（プロセスの `RPROXY_MAX_RANGE_PORTS` と待ち受けのソケットの上限）。
+- ルート・ミドルウェア・サービスの名前：API に送るもの（`POST` / `PATCH /rules`・`PUT /rulesets`、dry run も）は 1〜512 バイトで、制御文字・空白・`"`・`\`・`` ` ``・`{`・`}` を含まない（`400 invalid`）。ほかの文字（日本語などの文字・数字・`/ : . _ - @ +` など）は使える。rproxy-gateway の名前（`grpc:<名前空間>/<ルート>/r0/b1/f2.3` など）は通り、Traefik の変換は通らない名前を `_` に置き換える（注記つき）。設定ファイルのルールと、DB・引き継ぎから戻すルール・組は確かめない（前から動いているものはそのまま動く）。ルートの名前を変えると、その数（`stats.http.routes`・`/metrics`）は 0 から数え直す。前からの名前で戻した組は動き続けるが、持ち主が次に組全体を `PUT` すると、その名前を直すまで `400` になる。`/metrics` のラベルの値は `\`・`"`・改行をエスケープする（どのラベルも）。
+- ルールが指すファイルの大きさ：証明書・CA・鍵・秘密は 4 MiB まで、`basic_auth` の `users_file` は 16 MiB まで（開いたファイルの大きさを確かめ、読むのもそこまで）。超えると `400`（理由はログの `config.file`）。API の作成・変更でファイルを読むあいだ、tokio のワーカーはほかのタスクを渡してから読む。
+- 制御 API の TCP の接続：待ち受けのアドレスごとに `RPROXY_API_MAX_CONNECTIONS`（既定 512、`0` でなし）まで、1 つの送信元（IPv6 は /64）からは `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE`（既定 64、`0` でなし）まで。loopback（同じホストのヘルスチェック・UI、`/healthz`・`/readyz`）はどちらでも断らない。Kubernetes の kubelet の probe はノード・Pod の網から来るので loopback ではなく、上限に数える。外からの接続を 127.0.0.1 に中継するもの（同じホストのリバースプロキシなど）を前に置くと、その接続は上限を通り抜ける（送信元は前段で絞る）。超えた接続はすぐ閉じる（`api.connections_full` を 1 分に 1 回まで、`/metrics` の `rproxy_api_connections_refused_total`）。リクエストのヘッダは 30 秒以内に（HTTP/1.1 の keep-alive の次のリクエストを待つのも 30 秒まで）、HTTP/2 は 60 秒ごとに PING（20 秒で答えがなければ閉じる）。
+- `DELETE` の `drain_secs` は 3600 秒まで（使った値はログの `rule.delete` の `drain_secs`）。
+- DB（`rproxy_rules`）に届かないあいだに消したルール・組の行の削除は 10000 件まで覚える。超えたら、その DB に保存されたルール・組の `DELETE` は `503 busy`。DB が戻って書けたら通る。DB が戻らないまま消す必要があるときは `admin` のトークンで消す（上限を超えて覚える）。
+- `http` の変更（`PATCH`・組）でなくなったルート・ミドルウェアの数（`stats.http.routes`・`/metrics`）は消す。`tls` を変えたら、使われなくなった証明書を捨てる（ACME にも知らせる）。
+- 背景のタスク（設定ファイル・トークン・証明書の監視、ACME、GeoIP の読み直し、DB の係・ping・照合）は panic しても `degraded`（`part`）をログに出して、1 秒から倍々で 1 分まで待って動かし直す（5 分以上動いた後の panic は 1 秒から）。`/metrics` の `rproxy_task_restarts_total{part}`。DB の係で panic した仕事はその仕事だけが失敗し、DB の接続は開き直す。
+- 引き継ぎ（#174）：引き継いだ古いプロセスがまだ drain しているあいだは、新しい引き継ぎを始めない（`409 upgrading`、SIGUSR2・自動更新も。古いプロセスの最後の数がこのプロセスに届くため）。待つのは長くても古いプロセスの drain（`RPROXY_HANDOFF_DRAIN`）と 60 秒まで。`GET /admin/update` の `parent_draining`。自動更新はこの断りでその版を悪い版にしない（次の確認でまた試す）。
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -1261,7 +1282,7 @@ http:
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている TCP の接続はそのまま。UDP のセッションは終える、#354）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
-| `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する |
+| `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する（v0.4.20 から 3600 秒まで。長い値は 3600 秒に切り詰める。組の `DELETE` も同じ） |
 | `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
@@ -1318,6 +1339,10 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `file_not_allowed` | 403 | v0.4.17（#319）：`allow_certs` のあるトークンがルールにファイルのパスを書いた |
 | `secret_reuse` | 409 | v0.4.17（#319）：OIDC の client secret のファイルを、同じ issuer・client の client secret のほかにも使っている |
 | `file_in_use` | 409 | v0.4.18（#323）：ほかの持ち主（ほかのトークン・ほかのトークンの組・設定ファイル・作ったトークンの分からない戻したルール）のルールが指す鍵・秘密のファイルを、`admin` でないトークンが指した |
+| `limit` | 409 | v0.4.20（#358）：プロセスの上限（`RPROXY_MAX_RULES`・`RPROXY_MAX_LISTENERS`・`RPROXY_MAX_RULESETS`）かトークンの `max_rules`・`max_rulesets` を超える |
+| `busy` | 503 | v0.4.20（#358）：ほかの組の `PUT` の本文を読んでいる／DB に書けていない削除が多すぎる。少し待って送り直す |
+| `too_large` | 413 | v0.4.20（#358）：組の `PUT` の本文が 32 MiB を超える |
+| `timeout` | 408 | v0.4.20（#358）：組の `PUT` の本文が 60 秒以内に届かなかった |
 | `internal` | 500 | その他 |
 
 ## API・設定ファイル・UI（DB）の関係

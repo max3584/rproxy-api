@@ -409,15 +409,23 @@ impl Geoip {
 		let Some(interval) = self.spec.interval() else { return };
 		let geoip = Arc::downgrade(self);
 		let stop = self.stop.clone();
-		tokio::spawn(async move {
-			loop {
-				tokio::select! {
-					_ = stop.cancelled() => return,
-					_ = tokio::time::sleep(interval) => {}
+		// started again if it panics (#358)
+		crate::core::supervise::spawn("geoip", move || {
+			let (geoip, stop) = (geoip.clone(), stop.clone());
+			async move {
+				loop {
+					tokio::select! {
+						_ = stop.cancelled() => return,
+						_ = tokio::time::sleep(interval) => {}
+					}
+					let Some(g) = geoip.upgrade() else { return };
+					// reading a database of tens of MB is blocking work; a panic there comes back as an error
+					if let Err(e) = tokio::task::spawn_blocking(move || g.refresh(false)).await {
+						if e.is_panic() {
+							std::panic::resume_unwind(e.into_panic());
+						}
+					}
 				}
-				let Some(g) = geoip.upgrade() else { return };
-				// reading a database of tens of MB is blocking work
-				let _ = tokio::task::spawn_blocking(move || g.refresh(false)).await;
 			}
 		});
 	}

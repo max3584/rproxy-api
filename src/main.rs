@@ -15,12 +15,13 @@ use tracing::{error, info, warn};
 
 use rproxy_api::control::api::{self, AppState};
 use rproxy_api::control::auth::Tokens;
-use rproxy_api::control::hardening::{ApiTlsError, ApiTlsFiles, ClientCertAcceptor, TokenExpiry};
+use rproxy_api::control::hardening::{self, ApiTlsError, ApiTlsFiles, ClientCertAcceptor, TokenExpiry};
 use rproxy_api::l7::access::{AccessLogError, HttpGlobal};
 use rproxy_api::l7::middleware::crowdsec::{Bouncer, CrowdsecError};
 use rproxy_api::config::{ConfigDoc, LoadError};
 use rproxy_api::config::reload::ConfigReloader;
 use rproxy_api::core::registry::{Config, ConfigStatus, Registry};
+use rproxy_api::core::supervise;
 use rproxy_api::tls::config::CertRole;
 use rproxy_api::{config::db, core::resolve, logging, net::source};
 
@@ -118,6 +119,21 @@ struct Options {
 	/// Largest port range (listen_port..listen_port_end) one rule may open
 	#[arg(long, env = "RPROXY_MAX_RANGE_PORTS", default_value_t = rproxy_api::core::rule::DEFAULT_MAX_RANGE_PORTS)]
 	max_range_ports: u16,
+	/// Rules the control API may make the process have (0: no limit; #358)
+	#[arg(long, env = "RPROXY_MAX_RULES", default_value_t = rproxy_api::core::quota::DEFAULT_MAX_RULES)]
+	max_rules: usize,
+	/// Listening sockets the rules may open together through the control API (0: half of the file limit after 1024 kept for the rest)
+	#[arg(long, env = "RPROXY_MAX_LISTENERS", default_value_t = 0)]
+	max_listeners: usize,
+	/// Rule sets the control API may make the process have (0: no limit)
+	#[arg(long, env = "RPROXY_MAX_RULESETS", default_value_t = rproxy_api::core::quota::DEFAULT_MAX_RULESETS)]
+	max_rulesets: usize,
+	/// TCP connections the control API keeps open at a time (0: no limit; #358)
+	#[arg(long, env = "RPROXY_API_MAX_CONNECTIONS", default_value_t = rproxy_api::control::hardening::DEFAULT_API_MAX_CONNECTIONS)]
+	api_max_connections: usize,
+	/// TCP connections one source address (IPv6: /64) keeps open to the control API (0: no limit; loopback is not limited)
+	#[arg(long, env = "RPROXY_API_MAX_CONNECTIONS_PER_SOURCE", default_value_t = rproxy_api::control::hardening::DEFAULT_API_MAX_PER_SOURCE)]
+	api_max_connections_per_source: usize,
 	/// Sessions one udp rule may have when its `limits` set no `max_connections` (0: no limit)
 	#[arg(long, env = "RPROXY_UDP_MAX_SESSIONS", default_value_t = rproxy_api::l4::udp::DEFAULT_MAX_SESSIONS)]
 	udp_max_sessions: u64,
@@ -993,9 +1009,11 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		note_api_cert(&registry, cert);
 	}
 	let nofile = raise_nofile_limit();
+	rproxy_api::core::quota::set(opts.max_rules, opts.max_listeners, opts.max_rulesets, nofile);
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
-		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), session_budget = match rproxy_api::core::budget::limit() {
+		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), max_rules = opts.max_rules,
+		max_listeners = rproxy_api::core::quota::max_listeners(), max_rulesets = opts.max_rulesets, session_budget = match rproxy_api::core::budget::limit() {
 			u64::MAX => 0,
 			n => n,
 		});
@@ -1187,6 +1205,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			tls: tls.clone(),
 			files: tls_files.clone(),
 			handles: handles.clone(),
+			max_connections: (opts.api_max_connections, opts.api_max_connections_per_source),
 		};
 		// the rules keep running while a listener that cannot start is retried
 		if let Err(e) = listener.start().await {
@@ -1216,22 +1235,24 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 
 	if opts.cert_check_secs > 0 || opts.cert_expiry_check_secs > 0 {
 		let every = |secs: u64| (secs > 0).then(|| Duration::from_secs(secs));
-		tokio::spawn(watch_certificates(
-			every(opts.cert_check_secs),
-			every(opts.cert_expiry_check_secs),
-			registry.clone(),
-			tls.clone(),
-			tls_files.clone(),
-			stop.clone(),
-		));
+		let (changed, expiry) = (every(opts.cert_check_secs), every(opts.cert_expiry_check_secs));
+		let (registry, tls, tls_files, stop) = (registry.clone(), tls.clone(), tls_files.clone(), stop.clone());
+		// started again if it panics (#358)
+		supervise::spawn("watch.certificates", move || {
+			watch_certificates(changed, expiry, registry.clone(), tls.clone(), tls_files.clone(), stop.clone())
+		});
 	}
 	let tokens_every = (opts.tokens_check_secs > 0).then(|| Duration::from_secs(opts.tokens_check_secs));
-	tokio::spawn(watch_tokens(tokens.clone(), token_expiry.clone(), tokens_every, stop.clone()));
+	{
+		let (tokens, token_expiry, stop) = (tokens.clone(), token_expiry.clone(), stop.clone());
+		supervise::spawn("watch.tokens", move || watch_tokens(tokens.clone(), token_expiry.clone(), tokens_every, stop.clone()));
+	}
 
 	let config_hup = Arc::new(Notify::new());
 	if let Some(reloader) = reloader {
 		let every = (opts.config_check_secs > 0).then(|| Duration::from_secs(opts.config_check_secs));
-		tokio::spawn(watch_config(every, reloader, config_hup.clone(), stop.clone()));
+		let (hup, stop) = (config_hup.clone(), stop.clone());
+		supervise::spawn("watch.config", move || watch_config(every, reloader.clone(), hup.clone(), stop.clone()));
 	}
 
 	// the startup is done: a new process of a live upgrade takes over now
@@ -1241,7 +1262,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			info!(event = "handoff.sockets", unused = left.len(), "closed inherited sockets no rule or listener took");
 		}
 		let adopted = r.ready(&registry).await?;
-		tokio::spawn(adopted.follow(registry.clone()));
+		tokio::spawn(adopted.follow(registry.clone(), upgrader.config().drain));
 	}
 	updater.spawn(Some(upgrader.clone()));
 	upgrade::notify::notify("READY=1");
@@ -1668,6 +1689,8 @@ struct ApiListener {
 	/// the TLS files when the API is served over TLS
 	files: Option<ApiTlsFiles>,
 	handles: Arc<Mutex<Vec<Handle>>>,
+	/// `RPROXY_API_MAX_CONNECTIONS` and `_PER_SOURCE` (#358).
+	max_connections: (usize, usize),
 }
 
 impl ApiListener {
@@ -1695,13 +1718,24 @@ impl ApiListener {
 		let app = self.app.clone().into_make_service_with_connect_info::<SocketAddr>();
 		let handle = Handle::new();
 		let addr = self.addr;
+		let (cap, per_source) = self.max_connections;
+		// a client that sends no request (or nothing more on a kept-alive connection) is
+		// closed after API_HEADER_TIMEOUT (#358)
+		let timeouts = |b: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>| {
+			b.http1().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(hardening::API_HEADER_TIMEOUT);
+			b.http2()
+				.timer(hyper_util::rt::TokioTimer::new())
+				.keep_alive_interval(Some(Duration::from_secs(60)))
+				.keep_alive_timeout(Duration::from_secs(20));
+		};
 		match tls {
 			Some(tls) => {
 				// requests carry the client certificate's names (#167)
-				let server = axum_server::from_tcp(listener)
+				let mut server = axum_server::from_tcp(listener)
 					.map_err(|e| e.to_string())?
-					.acceptor(ClientCertAcceptor::new(tls))
+					.acceptor(hardening::Capped::new(ClientCertAcceptor::new(tls), cap, per_source))
 					.handle(handle.clone());
+				timeouts(server.http_builder());
 				tokio::spawn(async move {
 					if let Err(e) = server.serve(app).await {
 						error!(event = "api.stopped", addr = %addr, error = %e);
@@ -1709,7 +1743,11 @@ impl ApiListener {
 				});
 			}
 			None => {
-				let server = axum_server::from_tcp(listener).map_err(|e| e.to_string())?.handle(handle.clone());
+				let mut server = axum_server::from_tcp(listener)
+					.map_err(|e| e.to_string())?
+					.acceptor(hardening::Capped::new(axum_server::accept::DefaultAcceptor::new(), cap, per_source))
+					.handle(handle.clone());
+				timeouts(server.http_builder());
 				tokio::spawn(async move {
 					if let Err(e) = server.serve(app).await {
 						error!(event = "api.stopped", addr = %addr, error = %e);
