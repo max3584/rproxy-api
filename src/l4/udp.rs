@@ -558,7 +558,7 @@ fn open(
 		return None;
 	}
 	let Some(ticket) = session_ticket() else {
-		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		limits::refused(rt, client, Reason::FdBudget, "udp");
 		return None;
 	};
 	let mark = rt.udp_unreplied.track(shard.ended.child_token());

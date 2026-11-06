@@ -38,6 +38,9 @@ pub struct Stats {
 	/// Refused because every target was full (#341, `limits::Reason::TargetFull`). Last, so
 	/// the counters of before keep their places.
 	pub target_full: AtomicU64,
+	/// Refused because the process's descriptor budget was full (#373,
+	/// `limits::Reason::FdBudget`). After `target_full` for the same reason.
+	pub fd_budget: AtomicU64,
 }
 
 impl Stats {
@@ -68,16 +71,19 @@ impl Stats {
 		self.limited_counter(reason).fetch_add(1, Ordering::Relaxed);
 	}
 
-	/// The counter of `reason` (`target_full` apart from `limited`).
+	/// The counter of `reason` (`target_full` and `fd_budget` apart from `limited`).
 	pub fn limited_counter(&self, reason: crate::core::limits::Reason) -> &AtomicU64 {
 		match reason {
 			crate::core::limits::Reason::TargetFull => &self.target_full,
+			crate::core::limits::Reason::FdBudget => &self.fd_budget,
 			r => &self.limited[r.index()],
 		}
 	}
 
 	pub fn limited_total(&self) -> u64 {
-		self.limited.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>() + self.target_full.load(Ordering::Relaxed)
+		self.limited.iter().map(|n| n.load(Ordering::Relaxed)).sum::<u64>()
+			+ self.target_full.load(Ordering::Relaxed)
+			+ self.fd_budget.load(Ordering::Relaxed)
 	}
 
 	/// A UDP datagram over `bandwidth`.

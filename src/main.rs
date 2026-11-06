@@ -354,27 +354,8 @@ fn acme_helper(opts: &Options) -> ExitCode {
 }
 
 /// Port ranges open one socket per port; lift the soft file limit to the hard one.
-#[cfg(unix)]
 fn raise_nofile_limit() -> Option<u64> {
-	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-	// SAFETY: plain syscalls on a local struct
-	unsafe {
-		if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
-			return None;
-		}
-		if lim.rlim_cur < lim.rlim_max {
-			lim.rlim_cur = lim.rlim_max;
-			libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-			libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
-		}
-	}
-	#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 everywhere
-	Some(lim.rlim_cur as u64)
-}
-
-#[cfg(not(unix))]
-fn raise_nofile_limit() -> Option<u64> {
-	None
+	rproxy_api::core::budget::raise_nofile_limit()
 }
 
 /// The v0.4 options (docs/DESIGN-v0.4.md): mistakes and settings that would

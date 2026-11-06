@@ -1,13 +1,17 @@
 //! The process-wide budget of file descriptors for connections and sessions (#354).
 //!
-//! Each UDP session opens a backend socket and each TCP connection two sockets; without a
+//! Each UDP session opens a backend socket, each TCP relay two sockets (and, while it
+//! splices, a pipe of two more), an `http` connection its own socket and each connection
+//! to a server one more (#373); without a
 //! cap for the whole process, a flood (of spoofed UDP sources, for one) could take every
 //! descriptor and leave none for the control API, the database, name resolution or the
 //! certificate files. The budget is `RLIMIT_NOFILE` (soft, after `main` lifts it to the hard
 //! limit) less `RESERVE` and less the listening sockets the rules may open
 //! (`RPROXY_MAX_LISTENERS`, #370), so that the two caps together leave `RESERVE`. `main`
 //! sets it once at startup (`init`); otherwise it is worked out the first time it is used.
-//! A `Ticket` holds its descriptors until it is dropped.
+//! A `Ticket` holds its descriptors until it is dropped. Taking one is a single CAS (`take`),
+//! giving it back one `fetch_sub`: what a connection pays for the budget (#369). HTTP/3
+//! takes none: its connections share the rule's one UDP socket.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +28,13 @@ static IN_USE: AtomicU64 = AtomicU64::new(0);
 /// Descriptors the data plane may hold at once.
 pub fn limit() -> u64 {
 	*LIMIT.get_or_init(|| from_nofile(nofile(), crate::core::quota::max_listeners() as u64))
+}
+
+/// Sets the budget to `limit` descriptors, once, as `init` does: for tests that need a small
+/// budget in their own process (`tests/fd_budget.rs`). Returns the budget in force.
+#[doc(hidden)]
+pub fn init_exact(limit: u64) -> u64 {
+	*LIMIT.get_or_init(|| limit)
 }
 
 /// Sets the budget from the file limit `main` read and the listener cap
@@ -55,6 +66,31 @@ fn from_nofile(nofile: Option<u64>, listeners: u64) -> u64 {
 		Some(n) => n.saturating_sub(RESERVE).saturating_sub(listeners).max(FLOOR),
 		None => FLOOR,
 	}
+}
+
+/// Lifts the soft file limit to the hard one (`main` at startup, and the test harness so that
+/// tests get the budget the service would); returns the soft limit then in force.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> Option<u64> {
+	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+	// SAFETY: plain syscalls on a local struct
+	unsafe {
+		if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+			return None;
+		}
+		if lim.rlim_cur < lim.rlim_max {
+			lim.rlim_cur = lim.rlim_max;
+			libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+			libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+		}
+	}
+	#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 everywhere
+	Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() -> Option<u64> {
+	None
 }
 
 #[cfg(unix)]
@@ -94,14 +130,29 @@ impl Ticket {
 	pub fn force(n: u64) -> Option<Ticket> {
 		take_within(n, limit().saturating_add(RESERVE / 2))
 	}
+
+	/// Gives back what the ticket holds beyond `n` (an `http` connection keeps one of the
+	/// two a TCP connection takes when accepted; its servers' connections take their own).
+	pub fn keep(&mut self, n: u64) {
+		if n < self.n {
+			IN_USE.fetch_sub(self.n - n, Ordering::Relaxed);
+			self.n = n;
+		}
+	}
 }
 
 fn take_within(n: u64, limit: u64) -> Option<Ticket> {
-	let mut used = IN_USE.load(Ordering::Relaxed);
+	// not `then_some`: a Ticket made and dropped would give back what it never took
+	if reserve(&IN_USE, n, limit) { Some(Ticket { n }) } else { None }
+}
+
+/// Adds `n` to `counter` if that stays within `limit` (one CAS when uncontended).
+fn reserve(counter: &AtomicU64, n: u64, limit: u64) -> bool {
+	let mut used = counter.load(Ordering::Relaxed);
 	loop {
-		let next = used.checked_add(n).filter(|&next| next <= limit)?;
-		match IN_USE.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-			Ok(_) => return Some(Ticket { n }),
+		let Some(next) = used.checked_add(n).filter(|&next| next <= limit) else { return false };
+		match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+			Ok(_) => return true,
 			Err(now) => used = now,
 		}
 	}
@@ -158,16 +209,30 @@ mod tests {
 
 	#[test]
 	fn tickets_are_bounded_and_given_back() {
-		// the counter is the process's: measure against what is held now
-		let base = in_use();
-		let a = take_within(3, base + 4).unwrap();
-		assert!(take_within(2, base + 4).is_none(), "no room for 2 more");
-		let b = take_within(1, base + 4).unwrap();
-		drop(a);
-		let c = take_within(3, base + 4).unwrap();
-		drop((b, c));
-		assert!(in_use() <= base + 4);
+		// a counter of its own: other tests (UDP sessions, splice pipes) take from the process's
+		let counter = AtomicU64::new(0);
+		assert!(reserve(&counter, 3, 4));
+		assert!(!reserve(&counter, 2, 4), "no room for 2 more");
+		assert!(reserve(&counter, 1, 4));
+		assert_eq!(counter.load(Ordering::Relaxed), 4);
+		counter.fetch_sub(3, Ordering::Relaxed);
+		assert!(reserve(&counter, 3, 4));
+		assert!(!reserve(&counter, 1, 4));
 		// `force` is bounded the same way, at half the reserve past the limit
-		assert!(take_within(RESERVE, base + RESERVE / 2).is_none());
+		assert!(!reserve(&counter, RESERVE, RESERVE / 2));
+		assert!(!reserve(&AtomicU64::new(u64::MAX), 1, u64::MAX), "never wraps");
+	}
+
+	/// #373: an `http` connection keeps one of the two it took when accepted.
+	#[test]
+	fn a_ticket_keeps_part_of_what_it_took() {
+		// other tests take tickets too: look at the ticket, not at the process's counter
+		let mut t = take_within(2, u64::MAX).unwrap();
+		t.keep(1);
+		assert_eq!(t.n, 1);
+		t.keep(5);
+		assert_eq!(t.n, 1, "keeping more takes nothing more");
+		t.keep(0);
+		assert_eq!(t.n, 0);
 	}
 }

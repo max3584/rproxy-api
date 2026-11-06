@@ -94,7 +94,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
 | `RPROXY_MAX_RULES` | `--max-rules` | `10000` | 制御 API で作れるプロセスのルールの数（`0` でなし。超えると `409 limit`。設定ファイル・DB から戻すルールは数えるが断らない。#358） |
-| `RPROXY_MAX_LISTENERS` | `--max-listeners` | `0`（自動） | 制御 API で開ける待ち受けのソケットの合計（アドレス × ポート、`http3` は 2 倍）。`0` はファイル記述子の上限から 1024 を除いた半分（256 以上。#358）。接続とセッションの枠は、上限から 1024 とこの数を除いた残り（#370） |
+| `RPROXY_MAX_LISTENERS` | `--max-listeners` | `0`（自動） | 制御 API で開ける待ち受けのソケットの合計（アドレス × ポート、`http3` は 2 倍）。`0` はファイル記述子の上限から 1024 を除いた半分（256 以上。#358）。接続とセッションの枠は、上限から 1024 とこの数を除いた残り（#370。#373 から TCP・`http` の接続も） |
 | `RPROXY_MAX_RULESETS` | `--max-rulesets` | `1000` | ルールの組の数（`0` でなし。#358） |
 | `RPROXY_API_MAX_CONNECTIONS` | `--api-max-connections` | `512` | 制御 API の TCP の接続の数（アドレスごと。`0` でなし。超えた接続はすぐ閉じる。#358） |
 | `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE` | `--api-max-connections-per-source` | `64` | 1 つの送信元（IPv6 は /64）からの制御 API の TCP の接続の数（`0` でなし。loopback は数えない。#358） |
@@ -355,7 +355,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn`。ルールの `proxy_protocol` でヘッダを受けた接続は、`client` がヘッダのクライアント、`proxy_peer` が前段（`conn.denied`・`conn.limited`・`conn.error`・`http.access` も同じ）。`http` のルールの接続を時間の上限（`global.http.timeouts`、v0.4.17）で閉じたときは `reason` が `first_byte_timeout`・`request_headers_timeout`・`idle`（docs/API.md の「HTTP の転送の扱い」）。L4 の `tcp` のルールの中継を時間切れ（`idle_timeout`、v0.4.20）で閉じたときは `idle_timeout`・`half_close_timeout`（両側をリセット。docs/API.md の「中継の時間切れと keepalive」） |
 | `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`・`proxy_protocol`（`from` の前段のヘッダがない・壊れている、`error`）・`proxy_protocol_untrusted`（`from` の外からのヘッダ、`version`）。`client`（`IP:ポート`）、`sni`。送信元ごとに間引く（`suppressed`：その前に省いた行の数。TCP は v0.4.20 から）。HTTP/3 は `transport: quic` |
-| `conn.limited` | ルールの `limits`（#165）で断った接続（UDP はデータグラム）：`reason` は `max_connections`・`source_connections`・`new_connections`・`packets`、`transport` は `tcp`・`udp`、`client`。宛先がすべて `max_connections`（#341）で断った接続・データグラム・リクエストも `reason: target_full`（`transport` は `http` も）。送信元ごとに間引く（`suppressed`） |
+| `conn.limited` | ルールの `limits`（#165）で断った接続（UDP はデータグラム）：`reason` は `max_connections`・`source_connections`・`new_connections`・`packets`、`transport` は `tcp`・`udp`、`client`。宛先がすべて `max_connections`（#341）で断った接続・データグラム・リクエストも `reason: target_full`（`transport` は `http` も）。プロセスのファイルの数の枠（#373、docs/API.md の「プロセス全体の枠」）が埋まって断った接続・UDP のセッション・`http` の転送先への接続は `reason: fd_budget`。送信元ごとに間引く（`suppressed`） |
 | `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗。`conn.error`・`tls.error` は送信元ごとに、`accept.error` は待ち受けごとに 10 秒に 1 行に間引く（`suppressed`、v0.4.20） |
 | `log.suppressed` | 間引いた行のある送信元を 60 秒来ないので忘れた・表がいっぱいで行を出せなかった（`throttle`、`sources`、省いた行の数 `suppressed`、`overflow`。v0.4.20、docs/API.md の「ログの間引きと長さ」） |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |
