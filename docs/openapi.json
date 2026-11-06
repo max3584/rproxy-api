@@ -1518,7 +1518,15 @@
           },
           "connect_timeout": {
             "type": "string",
-            "description": "How long a connection to a target may take before the next target is tried (tcp without http; 100ms-10m; v0.4.3, features.connect_timeout). Left out: 5s with other targets to fall back on, else the OS's."
+            "description": "How long a connection to a target may take before the next target is tried (tcp without http; 100ms-10m; v0.4.3, features.connect_timeout). Left out: 5s with other targets to fall back on, else 30s (v0.4.20)."
+          },
+          "idle_timeout": {
+            "type": "string",
+            "description": "How long a relayed connection may move nothing either way before both sides are reset (tcp without http; 0s for no limit, else at least 1s; #353, features.tcp_idle_timeout). Left out: 1h. Only bytes of the connection count (not TCP keepalive probes)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Once one side has half-closed, how long the other direction may move nothing before both sides are reset (tcp without http; 0s: none, only idle_timeout; else at least 1s; #353, features.tcp_idle_timeout). Left out: 1m. idle_timeout applies if shorter."
           },
           "proxy_protocol": {
             "$ref": "#/components/schemas/ProxyProtocolIn"
@@ -1605,6 +1613,14 @@
           "connect_timeout": {
             "type": "string",
             "description": "Replaces connect_timeout when present (0s removes it; left out keeps it)."
+          },
+          "idle_timeout": {
+            "type": "string",
+            "description": "Replaces idle_timeout when present (0s: no limit; left out keeps it)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Replaces half_close_timeout when present (0s: only idle_timeout; left out keeps it)."
           },
           "proxy_protocol": {
             "allOf": [
@@ -1952,6 +1968,14 @@
           "connect_timeout": {
             "type": "string",
             "description": "Left out when not set."
+          },
+          "idle_timeout": {
+            "type": "string",
+            "description": "Left out when not set (the default, 1h)."
+          },
+          "half_close_timeout": {
+            "type": "string",
+            "description": "Left out when not set (the default, 1m)."
           },
           "proxy_protocol": {
             "allOf": [
@@ -2304,6 +2328,10 @@
               "cache_process_memory": {
                 "type": "boolean",
                 "description": "All cache middlewares of the process together keep at most RPROXY_CACHE_MAX_MEMORY (default 512 MiB, 0: no limit): an answer that does not fit drops the oldest of its own cache, or is not kept; cache_max_memory in GET / PATCH /config/global (live, the environment wins); rproxy_http_cache_memory_bytes and rproxy_http_cache_memory_limit_bytes in /metrics (v0.4.19, #349)"
+              },
+              "tcp_idle_timeout": {
+                "type": "boolean",
+                "description": "idle_timeout (default 1h) and half_close_timeout (default 1m) of an L4 tcp rule (0s none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)"
               }
             }
           },

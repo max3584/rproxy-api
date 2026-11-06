@@ -240,6 +240,20 @@ pub fn nodelay(stream: &TcpStream) {
 	}
 }
 
+/// SO_KEEPALIVE on a relayed TCP connection (#353), so a peer that vanished (a host gone, a
+/// NAT entry dropped) is found even while the connection is idle with no deadline
+/// (`idle_timeout: 0s`): the kernel's probes (`net.ipv4.tcp_keepalive_*`, by default after
+/// 2 h, 9 probes 75 s apart). TCP_USER_TIMEOUT is left to the kernel: with keepalive on it
+/// would end a connection after the first unanswered probe (or, set above the probing
+/// time, make retransmissions to a gone peer wait longer than `tcp_retries2`); a peer that
+/// does not read is ended by the relay's `idle_timeout`. Like `nodelay`, a failure is
+/// only logged.
+pub fn keepalive(stream: &TcpStream) {
+	if let Err(e) = socket2::SockRef::from(stream).set_keepalive(true) {
+		tracing::debug!(event = "tcp.keepalive", error = %e);
+	}
+}
+
 /// Connects to `target`, optionally presenting `bind_as` (the client) as the source
 /// address, with TCP_NODELAY set (`nodelay`).
 pub async fn connect_tcp(target: SocketAddr, bind_as: Option<SocketAddr>) -> io::Result<TcpStream> {
@@ -252,6 +266,7 @@ pub async fn connect_tcp(target: SocketAddr, bind_as: Option<SocketAddr>) -> io:
 		}
 	};
 	nodelay(&stream);
+	keepalive(&stream);
 	Ok(stream)
 }
 
@@ -284,6 +299,7 @@ mod tests {
 		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let stream = connect_tcp(listener.local_addr().unwrap(), None).await.unwrap();
 		assert!(stream.nodelay().unwrap(), "TCP_NODELAY on connections to backends (#176)");
+		assert!(socket2::SockRef::from(&stream).keepalive().unwrap(), "SO_KEEPALIVE on connections to backends (#353)");
 	}
 
 	#[test]

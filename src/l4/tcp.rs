@@ -19,6 +19,7 @@ use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
 use crate::net::proxy_in::{self, peer_field};
 use crate::net::source::{self, TlsInfo};
+use crate::l4::idle::{self, Progress, Tracked};
 use crate::l4::relay;
 use crate::logging::{clip, tcp_errors, throttled};
 use crate::l4::starttls::{self, Outcome};
@@ -29,6 +30,9 @@ const PLAIN: (usize, usize) = (relay::BUFFER_SIZE, relay::BUFFER_SIZE);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// With other targets to fall back on, a target that does not answer is given up after this.
 const FAILOVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Without `connect_timeout` and with no other target, instead of the kernel's SYN retries
+/// (about 127 s on Linux; #353).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
@@ -44,14 +48,18 @@ pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: C
 			accepted = listener.accept() => match accepted {
 				Ok((inbound, peer)) => {
 					source::nodelay(&inbound);
+					source::keepalive(&inbound);
 					rt.tracker.spawn(handle(inbound, peer, rt.clone(), offset));
 				}
 				Err(e) => {
-					// e.g. EMFILE: back off instead of spinning
+					// e.g. EMFILE: back off instead of spinning (and still stop at once)
 					if let Some(suppressed) = accept_log.check() {
 						warn!(event = "accept.error", rule = %rt.key, error = %e, suppressed);
 					}
-					tokio::time::sleep(Duration::from_millis(100)).await;
+					tokio::select! {
+						_ = stop.cancelled() => break,
+						_ = tokio::time::sleep(Duration::from_millis(100)) => {}
+					}
 				}
 			}
 		}
@@ -79,25 +87,30 @@ async fn connect(rt: &Runtime, client: SocketAddr, target: &Target) -> io::Resul
 	// transparent: only backends of the client's address family (an IPv6 client
 	// of a rule that also listens on IPv4 goes to an IPv6 target)
 	let usable = |c: &&crate::core::proxy::Candidate| c.addrs.iter().any(|a| source::usable(*a, bind_as));
+	// the addresses still to try after this one decide the wait without `connect_timeout`: 5 s
+	// when there are, 30 s for the last (#353). Each address counts (a dual-stack name has two);
 	// a full target (#341) is not one to fall back on
-	let fallback = target.candidates.iter().filter(usable).filter(|c| !c.member.as_ref().is_some_and(|m| m.is_full())).count() > 1;
-	for c in target.candidates.iter().filter(usable) {
+	let addrs_of = |c: &crate::core::proxy::Candidate| c.addrs.iter().filter(|a| source::usable(**a, bind_as)).count();
+	let counted: Vec<bool> = target.candidates.iter().filter(usable).map(|c| !c.member.as_ref().is_some_and(|m| m.is_full())).collect();
+	let mut left: usize = target.candidates.iter().filter(usable).zip(&counted).filter(|(_, n)| **n).map(|(c, _)| addrs_of(c)).sum();
+	for (c, &in_left) in target.candidates.iter().filter(usable).zip(&counted) {
 		let Ok(lease) = c.lease() else {
+			if in_left {
+				left = left.saturating_sub(addrs_of(c));
+			}
 			full = true;
 			continue;
 		};
 		tried = true;
 		for addr in c.addrs.iter().filter(|a| source::usable(**a, bind_as)) {
 			let attempt = source::connect_tcp(*addr, bind_as);
-			// the rule's connect_timeout (v0.4.3); without it, 5 s when another target can be tried
-			let limit = rt.connect_timeout().or(fallback.then_some(FAILOVER_CONNECT_TIMEOUT));
-			let result = if let Some(limit) = limit {
-				tokio::time::timeout(limit, attempt)
-					.await
-					.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")))
-			} else {
-				attempt.await
-			};
+			left = left.saturating_sub(1);
+			// the rule's connect_timeout (v0.4.3); without it, 5 s when another address can be
+			// tried, else 30 s
+			let limit = rt.connect_timeout().unwrap_or(if left > 0 { FAILOVER_CONNECT_TIMEOUT } else { DEFAULT_CONNECT_TIMEOUT });
+			let result = tokio::time::timeout(limit, attempt)
+				.await
+				.unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")));
 			match result {
 				Ok(stream) => {
 					// with `short_lived`, the connection is judged when it ends (`Pool::ended`)
@@ -156,6 +169,9 @@ struct Detail {
 	/// From a peer outside `proxy_protocol.from` on a rule with `proxy_protocol`, where the
 	/// server may speak first: looked at again for a PROXY header once the backend answers.
 	untrusted: bool,
+	/// Ended by a deadline of the relay (`idle_timeout`, after a half-close): the client's
+	/// connection is reset too, as a cut-off one.
+	cut: bool,
 }
 
 impl Detail {
@@ -282,7 +298,11 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	let mut prefix = Vec::new();
 	let mut pass = None;
 	if tls.mode() == TlsMode::Terminate && tls.starttls.is_none() && rt.has_passthrough() {
-		match crate::tls::sni::read_client_hello(&mut inbound).await {
+		let read = tokio::select! {
+			_ = rt.kill.cancelled() => return,
+			r = crate::tls::sni::read_client_hello(&mut inbound) => r,
+		};
+		match read {
 			Ok((name, hello)) => match rt.select(name.as_deref(), offset) {
 				Some(target) if target.passthrough => pass = Some((name, hello, target)),
 				// no match with `unmatched: reject` is refused by the TLS handshake below
@@ -334,7 +354,7 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 	let elapsed_ms = started.elapsed().as_millis() as u64;
 	let info = detail.tls.unwrap_or_default();
 	let target = detail.target.map(|t| t.to_string()).unwrap_or_default();
-	if matches!(&result, Err(e) if !is_denied(e) && !TargetFull::is(e)) {
+	if detail.cut || matches!(&result, Err(e) if !is_denied(e) && !TargetFull::is(e)) {
 		// the relay failed (a side reset, or could not be written): end the client's
 		// connection with a reset too, not a clean close it would take for a complete one
 		reset_on_close(&inbound);
@@ -414,6 +434,8 @@ async fn relay_hello(
 	out.write_all(&hello).await?;
 	detail.rx += hello.len() as u64;
 	rt.stats.add_rx(hello.len() as u64);
+	// not kept for the life of the connection (#359)
+	drop(hello);
 	finish_plain(rt, client, inbound, &mut out, detail).await
 }
 
@@ -426,9 +448,19 @@ async fn finish_plain(rt: &Runtime, client: SocketAddr, a: &mut TcpStream, b: &m
 		let (rx, tx) = (AtomicU64::new(0), AtomicU64::new(0));
 		let totals = crate::l4::splice::Totals { rx: &rx, tx: &tx, rx_total: &rt.stats.rx_bytes, tx_total: &rt.stats.tx_bytes };
 		let first = detail.first.clone();
-		let result = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip(), first.as_deref()).await;
+		let progress = Progress::default();
+		let relay = crate::l4::splice::relay(a, b, totals, &rt.bandwidth, client.ip(), first.as_deref(), &progress);
+		let outcome = idle::within(rt.relay_deadlines(), &progress, relay).await;
 		detail.rx += rx.into_inner();
 		detail.tx += tx.into_inner();
+		let result = match outcome {
+			Ok(result) => result,
+			Err(expired) => {
+				cut_off(detail, expired);
+				reset_on_close(b);
+				return Ok(());
+			}
+		};
 		if result.is_err() {
 			reset_on_close(b);
 		}
@@ -465,6 +497,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Prefixed<S> {
 			let n = (this.prefix.len() - this.pos).min(buf.remaining());
 			buf.put_slice(&this.prefix[this.pos..this.pos + n]);
 			this.pos += n;
+			if this.pos == this.prefix.len() {
+				// all given out: not kept for the life of the connection (#359)
+				this.prefix = Vec::new();
+				this.pos = 0;
+			}
 			return std::task::Poll::Ready(Ok(()));
 		}
 		std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -493,6 +530,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 /// `reads` is how much is read at a time from `a` and from `b`
 /// (`relay::TLS_READ_SIZE` for TLS streams). Reads wait for the rule's
 /// `bandwidth` (`Shaped`; nothing but a relaxed load per read without one).
+/// The rule's `idle_timeout` (and its `half_close_timeout` once a side has
+/// half-closed) ends a relay that moves nothing, with both sides reset (#353).
 async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 	rt: &Runtime,
 	client_addr: SocketAddr,
@@ -505,13 +544,25 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	use crate::core::bandwidth::{Dir, Gate, Shaped};
 	let ip = client_addr.ip();
 	let first = detail.first.clone();
-	let mut a = crate::core::outlier::Watched::new(a, first.as_deref(), false);
-	let mut b = crate::core::outlier::Watched::new(b, first.as_deref(), true);
+	let progress = Progress::default();
+	let mut a = Tracked::new(a, &progress);
+	let mut b = Tracked::new(b, &progress);
+	let mut a = crate::core::outlier::Watched::new(&mut a, first.as_deref(), false);
+	let mut b = crate::core::outlier::Watched::new(&mut b, first.as_deref(), true);
 	let mut client = Shaped::new(Counted::new(&mut a, &rt.stats.rx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Up));
 	let mut backend = Shaped::new(Counted::new(&mut b, &rt.stats.tx_bytes), &rt.bandwidth, Gate::new(ip, Dir::Down));
-	let result = relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1).await;
+	let outcome = idle::within(rt.relay_deadlines(), &progress, relay::bidirectional_reading(&mut client, &mut backend, reads.0, reads.1)).await;
 	detail.rx += client.into_inner().count;
 	detail.tx += backend.into_inner().count;
+	let result = match outcome {
+		Ok(result) => result,
+		Err(expired) => {
+			cut_off(detail, expired);
+			// SAFETY: as below
+			reset_on_close(&unsafe { BorrowedFd::borrow_raw(b_fd) });
+			return Ok(());
+		}
+	};
 	if result.is_err() {
 		// SAFETY: `b` (which owns `b_fd`) is borrowed for this whole call, so the fd is open
 		reset_on_close(&unsafe { BorrowedFd::borrow_raw(b_fd) });
@@ -519,6 +570,13 @@ async fn finish<A: AsyncRead + AsyncWrite + Unpin + ?Sized, B: AsyncRead + Async
 	result?;
 	detail.reason = "closed";
 	Ok(())
+}
+
+/// A relay ended by one of its deadlines: logged as `conn.close` with the reason, and
+/// both sides reset (not closed as if complete).
+fn cut_off(detail: &mut Detail, expired: idle::Expired) {
+	detail.reason = expired.reason();
+	detail.cut = true;
 }
 
 /// Makes closing the socket reset the connection (RST, SO_LINGER 0) instead of

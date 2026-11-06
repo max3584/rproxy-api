@@ -42,6 +42,7 @@ use tokio::net::TcpStream;
 
 use crate::core::bandwidth::{Bandwidth, Dir, Gate, Shaped};
 use crate::core::proxy::Counted;
+use crate::l4::idle::{Progress, Tracked};
 use crate::l4::relay::{self, Copy, Handover, Step};
 
 const DEFAULT_ENABLED: bool = true;
@@ -220,6 +221,8 @@ fn splice(from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
 /// `totals.rx_total`, from `b` in `tx` and `tx_total`, as they move. `bw` is the
 /// rule's bandwidth limit and `client` the client's address (its source);
 /// `first` notes which side ended first (`outlier_detection.short_lived`, #170).
+/// What moves (and a side's end) is marked in `progress`, for the relay's deadlines
+/// (`l4::idle`, #353), on both the user-space copy and splice.
 pub async fn relay(
 	a: &mut TcpStream,
 	b: &mut TcpStream,
@@ -227,6 +230,7 @@ pub async fn relay(
 	bw: &Bandwidth,
 	client: std::net::IpAddr,
 	first: Option<&crate::core::outlier::FirstEnd>,
+	progress: &Progress,
 ) -> io::Result<()> {
 	let (mut ar, mut aw) = a.split();
 	let (mut br, mut bw_half) = b.split();
@@ -240,8 +244,8 @@ pub async fn relay(
 		}
 	};
 	tokio::try_join!(
-		async { ended(false)(direction(&mut ar, &mut bw_half, totals.rx, totals.rx_total, bw, Gate::new(client, Dir::Up)).await) },
-		async { ended(true)(direction(&mut br, &mut aw, totals.tx, totals.tx_total, bw, Gate::new(client, Dir::Down)).await) }
+		async { ended(false)(direction(&mut ar, &mut bw_half, totals.rx, totals.rx_total, bw, Gate::new(client, Dir::Up), progress).await) },
+		async { ended(true)(direction(&mut br, &mut aw, totals.tx, totals.tx_total, bw, Gate::new(client, Dir::Down), progress).await) }
 	)?;
 	Ok(())
 }
@@ -261,6 +265,7 @@ async fn direction(
 	total: &AtomicU64,
 	bw: &Bandwidth,
 	mut gate: Gate,
+	progress: &Progress,
 ) -> io::Result<()> {
 	let Settings { after, full_reads, .. } = *settings();
 	let mut can_splice = true;
@@ -268,9 +273,11 @@ async fn direction(
 		// user space, until the reader ends or the transfer is a bulk one; shaped
 		// (and never handed over) while the rule has a bandwidth limit
 		let handover = (can_splice && !bw.is_on()).then_some(Handover { full_reads, after });
-		let mut reader = Shaped::new(Counted::new(&mut *r, total), bw, gate);
+		let mut tracked = Tracked::new(&mut *r, progress);
+		let mut reader = Shaped::new(Counted::new(&mut tracked, total), bw, gate);
+		let mut writer = Tracked::new(&mut *w, progress);
 		let mut copy = Copy::new(relay::BUFFER_SIZE).with_handover(handover);
-		let step = poll_fn(|cx| copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut *w))).await;
+		let step = poll_fn(|cx| copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer))).await;
 		drop(copy);
 		let (counted, g) = reader.into_parts();
 		count.fetch_add(counted.count, Ordering::Relaxed);
@@ -279,7 +286,7 @@ async fn direction(
 			Step::Done(_) => return w.shutdown().await,
 			Step::Handover(_) => {}
 		}
-		match spliced(r.as_ref(), w.as_ref(), count, total, bw).await? {
+		match spliced(r.as_ref(), w.as_ref(), count, total, bw, progress).await? {
 			Spliced::Ended => return Ok(()),
 			// this pair cannot be spliced: the user-space copy to the end
 			Spliced::Unsupported => can_splice = false,
@@ -297,7 +304,14 @@ enum Spliced {
 
 /// Moves `src` to `dst` through a pipe until `src` ends, then passes the FIN on;
 /// stops (with the pipe empty) when the rule gets a bandwidth limit.
-async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &AtomicU64, bw: &Bandwidth) -> io::Result<Spliced> {
+async fn spliced(
+	src: &TcpStream,
+	dst: &TcpStream,
+	count: &AtomicU64,
+	total: &AtomicU64,
+	bw: &Bandwidth,
+	progress: &Progress,
+) -> io::Result<Spliced> {
 	let (src_fd, dst_fd) = (src.as_raw_fd(), dst.as_raw_fd());
 	// declared before `pipe` so the pipe is given back before this ends (and may empty the pool)
 	let _splicing = Splicing::start();
@@ -318,7 +332,10 @@ async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &At
 		};
 		// the pipe is empty, so EAGAIN is the socket's and clears its readiness
 		let n = match src.try_io(Interest::READABLE, || splice(src_fd, p.write_fd(), SPLICE_LEN)) {
-			Ok(0) => break,
+			Ok(0) => {
+				progress.half_closed();
+				break;
+			}
 			Ok(n) => n,
 			Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
 				// nothing to read and the pipe empty: give it back while waiting
@@ -330,6 +347,7 @@ async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &At
 			Err(e) => return Err(e),
 		};
 		p.pending += n;
+		progress.moved();
 		count.fetch_add(n as u64, Ordering::Relaxed);
 		total.fetch_add(n as u64, Ordering::Relaxed);
 		while p.pending > 0 {
@@ -339,6 +357,7 @@ async fn spliced(src: &TcpStream, dst: &TcpStream, count: &AtomicU64, total: &At
 				Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
 				Ok(m) => {
 					p.pending -= m;
+					progress.moved();
 					SPLICED_BYTES.fetch_add(m as u64, Ordering::Relaxed);
 				}
 				Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -375,7 +394,8 @@ mod tests {
 		let sent = data.clone();
 		let bw = Bandwidth::default();
 		let totals = Totals { rx: &rx, tx: &tx, rx_total: &rt, tx_total: &tt };
-		let relay = relay(&mut a, &mut b, totals, &bw, "127.0.0.1".parse().unwrap(), None);
+		let progress = Progress::default();
+		let relay = relay(&mut a, &mut b, totals, &bw, "127.0.0.1".parse().unwrap(), None, &progress);
 		let peers = async {
 			let up = async {
 				client.write_all(&sent).await.unwrap();
