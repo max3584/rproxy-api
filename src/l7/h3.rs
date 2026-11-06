@@ -3,7 +3,7 @@
 //! go through the same router, middlewares and backends as HTTP/1.1 and HTTP/2.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::server::{Body, BoxError, Conn};
+use crate::core::bandwidth::{Dir, Gate};
 use crate::core::proxy::Runtime;
 use crate::net::source::TlsInfo;
 
@@ -27,7 +28,34 @@ pub struct H3State {
 	error: RwLock<Option<String>>,
 	/// Stops the endpoint (when `http3` is turned off, or the rule stops).
 	stop: Mutex<Option<CancellationToken>>,
+	/// QUIC handshakes in progress on all the rule's addresses (`MAX_HANDSHAKES`).
+	handshakes: AtomicUsize,
 }
+
+/// What one QUIC connection may make the proxy buffer of what the client sends (#355; quinn's
+/// default is no limit for the connection, 1.25 MB for each of 100 streams).
+const CONNECTION_RECEIVE_WINDOW: u32 = 4 << 20;
+const STREAM_RECEIVE_WINDOW: u32 = 1 << 20;
+/// HTTP/3 needs 3 unidirectional streams of the client (control, QPACK encoder and decoder);
+/// a few more for streams of extensions it does not know, which are read and dropped.
+const MAX_UNI_STREAMS: u32 = 8;
+/// QUIC's own idle timeout (a connection without any packet: the peer is gone) follows
+/// `global.http.timeouts.idle`, from `MIN_QUIC_IDLE` to `MAX_QUIC_IDLE` (also when `idle` is
+/// unlimited: a client that wants more keeps the connection with PINGs, and `idle` still
+/// closes it without requests). A short `idle` must not cut a request whose backend is slow:
+/// `idle` only counts time without requests, QUIC's counts time without packets.
+const MIN_QUIC_IDLE: Duration = Duration::from_secs(30);
+const MAX_QUIC_IDLE: Duration = Duration::from_secs(600);
+/// The proxy PINGs a connection that has been quiet this long (at most half of QUIC's idle
+/// timeout), so a request waiting on a slow backend keeps it, also with a client whose own
+/// idle timeout is shorter. A peer that is gone does not answer, and the idle timeout ends it.
+const MAX_KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// QUIC handshakes of one rule in progress at a time; more are refused (#355). Only clients
+/// whose address is validated (Retry) get this far.
+const MAX_HANDSHAKES: usize = 512;
+/// Connection attempts quinn holds before the rule's task looks at them.
+const MAX_INCOMING: usize = 4096;
+const INCOMING_BUFFER_TOTAL: u64 = 16 << 20;
 
 /// `stats.http.http3` of a rule view.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -64,11 +92,11 @@ pub fn start(rt: &Arc<Runtime>) {
 			Some(Err(e)) => return Err(e.clone()),
 			None => return Err("HTTP/3 needs tls.mode terminate".to_string()),
 		};
-		quinn_config(config)
+		base_config(config)
 	})();
 	let mut endpoints = vec![];
 	let mut errors = vec![];
-	match server {
+	match &server {
 		Ok(server) => {
 			for ip in ips {
 				let addr = SocketAddr::new(ip, port);
@@ -82,7 +110,7 @@ pub fn start(rt: &Arc<Runtime>) {
 				}
 			}
 		}
-		Err(e) => errors.push(e),
+		Err(e) => errors.push(e.clone()),
 	}
 	let error = (!errors.is_empty()).then(|| errors.join("; "));
 	if let Some(e) = &error {
@@ -95,9 +123,11 @@ pub fn start(rt: &Arc<Runtime>) {
 	let token = rt.stop.child_token();
 	*rt.h3.stop.lock().unwrap() = Some(token.clone());
 	rt.h3.port.store(port, Ordering::Relaxed);
+	let Ok(base) = server else { return };
+	let base = Arc::new(base);
 	for (addr, endpoint) in endpoints {
 		info!(event = "http3.listening", rule = %rt.key, addr = %addr);
-		rt.tracker.spawn(serve(endpoint, rt.clone(), token.clone()));
+		rt.tracker.spawn(serve(endpoint, base.clone(), rt.clone(), token.clone()));
 	}
 }
 
@@ -110,9 +140,59 @@ pub fn stop(rt: &Runtime) {
 	}
 }
 
-fn quinn_config(tls: Arc<rustls::ServerConfig>) -> Result<quinn::ServerConfig, String> {
+/// The endpoint's QUIC settings: the key of its Retry tokens, and how many connection
+/// attempts it holds. The settings of each connection are made from it (`quinn_config`).
+fn base_config(tls: Arc<rustls::ServerConfig>) -> Result<quinn::ServerConfig, String> {
 	let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| format!("QUIC: {e}"))?;
-	Ok(quinn::ServerConfig::with_crypto(Arc::new(crypto)))
+	let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+	server.max_incoming(MAX_INCOMING).incoming_buffer_size_total(INCOMING_BUFFER_TOTAL);
+	server.transport_config(transport(None));
+	Ok(server)
+}
+
+/// The settings of a new connection: the certificates in use and `global.http.timeouts.idle`,
+/// with the Retry token key of the endpoint (a token it gave stays good for the connection).
+fn quinn_config(base: &quinn::ServerConfig, tls: Arc<rustls::ServerConfig>, idle: Option<Duration>) -> Result<quinn::ServerConfig, String> {
+	let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).map_err(|e| format!("QUIC: {e}"))?;
+	let mut server = base.clone();
+	server.crypto = Arc::new(crypto);
+	server.transport_config(transport(idle));
+	Ok(server)
+}
+
+/// Flow control and limits of a QUIC connection (#355).
+fn transport(idle: Option<Duration>) -> Arc<quinn::TransportConfig> {
+	let mut t = quinn::TransportConfig::default();
+	t.receive_window(quinn::VarInt::from_u32(CONNECTION_RECEIVE_WINDOW))
+		.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW))
+		.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_UNI_STREAMS))
+		.max_idle_timeout(quinn::IdleTimeout::try_from(quic_idle(idle)).ok())
+		.keep_alive_interval(Some((quic_idle(idle) / 2).min(MAX_KEEP_ALIVE)));
+	Arc::new(t)
+}
+
+/// QUIC's idle timeout for `global.http.timeouts.idle` (`MIN_QUIC_IDLE`, `MAX_QUIC_IDLE`).
+fn quic_idle(idle: Option<Duration>) -> Duration {
+	idle.map_or(MAX_QUIC_IDLE, |i| i.clamp(MIN_QUIC_IDLE, MAX_QUIC_IDLE))
+}
+
+/// A QUIC handshake counted in `H3State.handshakes` until it ends.
+struct Handshake(Arc<Runtime>);
+
+impl Handshake {
+	fn begin(rt: &Arc<Runtime>) -> Option<Handshake> {
+		if rt.h3.handshakes.fetch_add(1, Ordering::Relaxed) >= MAX_HANDSHAKES {
+			rt.h3.handshakes.fetch_sub(1, Ordering::Relaxed);
+			return None;
+		}
+		Some(Handshake(rt.clone()))
+	}
+}
+
+impl Drop for Handshake {
+	fn drop(&mut self) {
+		self.0.h3.handshakes.fetch_sub(1, Ordering::Relaxed);
+	}
 }
 
 /// IPv4-mapped IPv6 clients as IPv4, like `allow_from`.
@@ -128,9 +208,10 @@ fn denied(rt: &Runtime, client: SocketAddr, why: &str) {
 	crate::logging::throttled!(crate::logging::quic_denied(), client.ip(), info, event = "conn.denied", rule = %rt.key, client = %client, reason = why, transport = "quic");
 }
 
-async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationToken) {
-	// the QUIC settings of the certificates in use; renewed ones are picked up per connection
-	let mut current: Option<(Arc<rustls::ServerConfig>, Arc<quinn::ServerConfig>)> = None;
+async fn serve(endpoint: quinn::Endpoint, base: Arc<quinn::ServerConfig>, rt: Arc<Runtime>, token: CancellationToken) {
+	// the QUIC settings of the certificates and `idle` in use; renewed ones are picked up per connection
+	type Current = (Arc<rustls::ServerConfig>, Option<Duration>, Arc<quinn::ServerConfig>);
+	let mut current: Option<Current> = None;
 	let local = endpoint.local_addr().unwrap_or(rt.key.listen);
 	loop {
 		let incoming = tokio::select! {
@@ -142,6 +223,15 @@ async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationT
 			},
 		};
 		let client = incoming.remote_address();
+		// an address not validated yet gets a Retry first (#355): a spoofed source never gets
+		// further, so it cannot use up `limits` or the handshakes, make the proxy send much, or
+		// show up in the `denied` counts and logs
+		if !incoming.remote_address_validated() {
+			if let Err(e) = incoming.retry() {
+				e.into_incoming().refuse();
+			}
+			continue;
+		}
 		let ip = canonical(client.ip());
 		if !rt.allowed(ip) {
 			denied(&rt, client, "allow_from");
@@ -158,23 +248,39 @@ async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationT
 			incoming.refuse();
 			continue;
 		}
+		let Some(handshake) = Handshake::begin(&rt) else {
+			busy(&rt, client);
+			incoming.refuse();
+			continue;
+		};
+		// `limits` (#165): one QUIC connection counts as one connection, held until it ends
+		let permit = match rt.limits.get().map(|l| l.admit(client.ip())) {
+			None => None,
+			Some(Ok(permit)) => Some(permit),
+			Some(Err(reason)) => {
+				crate::core::limits::refused(&rt, client, reason, "quic");
+				incoming.refuse();
+				continue;
+			}
+		};
 		let tls = rt.tls();
 		let Some(Ok(config)) = tls.quic_config.clone() else {
 			incoming.refuse();
 			continue;
 		};
+		let idle = rt.global.timeouts().idle;
 		let server = match &current {
-			Some((tls, server)) if Arc::ptr_eq(tls, &config) => server.clone(),
-			_ => match quinn_config(config.clone()) {
+			Some((tls, i, server)) if Arc::ptr_eq(tls, &config) && *i == idle => server.clone(),
+			_ => match quinn_config(&base, config.clone(), idle) {
 				Ok(server) => {
 					let server = Arc::new(server);
-					current = Some((config, server.clone()));
+					current = Some((config, idle, server.clone()));
 					server
 				}
 				Err(e) => {
 					warn!(event = "http3.error", rule = %rt.key, error = %e, "keeping the previous certificates");
 					match &current {
-						Some((_, server)) => server.clone(),
+						Some((_, _, server)) => server.clone(),
 						None => {
 							incoming.refuse();
 							continue;
@@ -185,7 +291,7 @@ async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationT
 		};
 		match incoming.accept_with(server) {
 			Ok(connecting) => {
-				rt.tracker.spawn(connection(connecting, client, local, rt.clone()));
+				rt.tracker.spawn(connection(connecting, client, local, rt.clone(), handshake, permit));
 			}
 			Err(e) => warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, transport = "quic"),
 		}
@@ -202,12 +308,27 @@ async fn serve(endpoint: quinn::Endpoint, rt: Arc<Runtime>, token: CancellationT
 	let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
 }
 
-async fn connection(connecting: quinn::Connecting, client: SocketAddr, local: SocketAddr, rt: Arc<Runtime>) {
+/// Too many QUIC handshakes in progress: refused, counted as a failed handshake.
+fn busy(rt: &Runtime, client: SocketAddr) {
+	rt.stats.tls_failed();
+	if let Some(suppressed) = rt.limited_log.check(&client.ip()) {
+		info!(event = "conn.limited", rule = %rt.key, client = %client, reason = "quic_handshakes", transport = "quic", suppressed);
+	}
+}
+
+async fn connection(
+	connecting: quinn::Connecting,
+	client: SocketAddr,
+	local: SocketAddr,
+	rt: Arc<Runtime>,
+	handshake: Handshake,
+	_permit: Option<crate::core::limits::Permit>,
+) {
 	let started = Instant::now();
 	rt.stats.opened();
 	let result = tokio::select! {
 		_ = rt.kill.cancelled() => Ok("stopped"),
-		r = run(connecting, client, local, &rt) => r,
+		r = run(connecting, handshake, client, local, &rt) => r,
 	};
 	rt.stats.closed();
 	let duration_ms = started.elapsed().as_millis() as u64;
@@ -217,14 +338,21 @@ async fn connection(connecting: quinn::Connecting, client: SocketAddr, local: So
 	}
 }
 
-async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAddr, rt: &Arc<Runtime>) -> Result<&'static str, String> {
+async fn run(
+	connecting: quinn::Connecting,
+	handshake: Handshake,
+	client: SocketAddr,
+	local: SocketAddr,
+	rt: &Arc<Runtime>,
+) -> Result<&'static str, String> {
 	// global.http.timeouts (#320)
 	let limits = rt.global.timeouts();
-	let handshake = match limits.tls_handshake {
+	let done = match limits.tls_handshake {
 		Some(limit) => tokio::time::timeout(limit, connecting).await.ok(),
 		None => Some(connecting.await),
 	};
-	let conn = match handshake {
+	drop(handshake);
+	let conn = match done {
 		Some(Ok(c)) => c,
 		Some(Err(e)) => {
 			rt.stats.tls_failed();
@@ -289,7 +417,7 @@ async fn run(connecting: quinn::Connecting, client: SocketAddr, local: SocketAdd
 						None => Some(resolver.resolve_request().await),
 					};
 					match resolved {
-						Some(Ok((req, stream))) => request(handler, req, stream, rt2, limits.request_body_idle).await,
+						Some(Ok((req, stream))) => request(handler, req, stream, rt2, client.ip(), limits.request_body_idle).await,
 						Some(Err(e)) => warn!(event = "http.error", rule = %rt2.key, error = %e, transport = "quic", "bad request"),
 						None => warn!(event = "http.error", rule = %rt2.key, error = "request headers timed out", transport = "quic", "bad request"),
 					}
@@ -309,14 +437,25 @@ async fn conn_close(h3: &mut h3::server::Connection<h3_quinn::Connection, Bytes>
 	let _ = tokio::time::timeout(Duration::from_secs(1), h3.shutdown(0)).await;
 }
 
-async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<Runtime>, body_idle: Option<Duration>) {
-	let (mut send, recv) = stream.split();
+async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<Runtime>, client: IpAddr, body_idle: Option<Duration>) {
+	let (mut send, mut recv) = stream.split();
+	// h3 does not compare the DATA with Content-Length (RFC 9114 4.1.2): the body reader does
+	let Ok(length) = content_length(req.headers()) else {
+		warn!(event = "http.error", rule = %rt.key, client = %client, error = "invalid content-length", transport = "quic", status = 400u16, "bad request");
+		recv.stop_sending(h3::error::Code::H3_MESSAGE_ERROR);
+		let resp = Response::builder().status(hyper::StatusCode::BAD_REQUEST).body(()).expect("a 400");
+		if send.send_response(resp).await.is_err() || send.finish().await.is_err() {
+			send.stop_stream(h3::error::Code::H3_MESSAGE_ERROR);
+		}
+		return;
+	};
 	// request_body_idle: not for gRPC, and only until the response head goes out (#320)
 	let body_idle = body_idle.filter(|_| !super::timeouts::is_grpc(req.headers()));
 	let responded = super::timeouts::Responded::default();
-	let resp = handler.handle(req.map(|_| request_body(recv, rt.clone(), body_idle, responded.clone()))).await;
+	let body = request_body(recv, rt.clone(), client, length, body_idle, responded.clone());
+	let resp = handler.handle(req.map(|_| body)).await;
 	responded.set();
-	if let Err(e) = respond(&mut send, resp, &rt).await {
+	if let Err(e) = respond(&mut send, resp, &rt, client).await {
 		warn!(event = "http.error", rule = %rt.key, error = %e, transport = "quic", "response cut short");
 		// reset the stream: dropping it would finish it (quinn), and the client would
 		// take a response cut short for a complete one
@@ -324,11 +463,39 @@ async fn request(handler: Arc<Conn>, req: Request<()>, stream: Stream, rt: Arc<R
 	}
 }
 
+/// The request's Content-Length: none, or the one value of all its fields (an error when
+/// they cannot be read or do not agree).
+fn content_length(headers: &hyper::HeaderMap) -> Result<Option<u64>, ()> {
+	let mut length = None;
+	for v in headers.get_all(hyper::header::CONTENT_LENGTH) {
+		let n = v
+			.to_str()
+			.ok()
+			.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+			.and_then(|s| s.parse::<u64>().ok())
+			.ok_or(())?;
+		if length.is_some_and(|l| l != n) {
+			return Err(());
+		}
+		length = Some(n);
+	}
+	Ok(length)
+}
+
+/// A request body that does not match its Content-Length (RFC 9114 4.1.2: malformed).
+fn length_mismatch(what: &str) -> BoxError {
+	BoxError::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("request body {what} than its content-length")))
+}
+
 /// The request body, read from the QUIC stream by a task as the backend takes it
-/// (one frame ahead). A client silent for `idle` while it is read ends it with an error.
+/// (one frame ahead). A client silent for `idle` while it is read ends it with an error,
+/// and so does a body longer or shorter than `length` (its Content-Length). The rule's
+/// `bandwidth` paces the reads (the client's flow control window then fills).
 fn request_body(
 	mut recv: h3::server::RequestStream<h3_quinn::RecvStream, Bytes>,
 	rt: Arc<Runtime>,
+	client: IpAddr,
+	length: Option<u64>,
 	idle: Option<Duration>,
 	responded: super::timeouts::Responded,
 ) -> Body {
@@ -336,8 +503,17 @@ fn request_body(
 	let kill = rt.kill.clone();
 	let tracker = rt.tracker.clone();
 	tracker.spawn(async move {
+		let mut gate = Gate::new(client, Dir::Up);
+		let mut left = length;
+		// why reading stopped before the end of the stream, to tell the client
+		let mut stop = None;
+		// a read of the stream in progress: one given up keeps the stream inside h3-quinn,
+		// whose stop_sending then panics; dropping the stream stops it (code 0) instead
+		let reading = std::sync::atomic::AtomicBool::new(false);
 		let read = async {
 			loop {
+				std::future::poll_fn(|cx| gate.poll_allow(&rt.bandwidth, cx)).await;
+				reading.store(true, Ordering::Relaxed);
 				let data = match idle.filter(|_| !responded.get()) {
 					Some(limit) => {
 						let read = recv.recv_data();
@@ -350,19 +526,40 @@ fn request_body(
 					}
 					None => Some(recv.recv_data().await),
 				};
+				if data.is_some() {
+					reading.store(false, Ordering::Relaxed);
+				}
 				let Some(data) = data else {
-					recv.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+					stop = Some(h3::error::Code::H3_REQUEST_CANCELLED);
 					let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
 					return;
 				};
 				let frame = match data {
 					Ok(Some(mut data)) => {
 						let bytes = data.copy_to_bytes(data.remaining());
-						rt.stats.add_rx(bytes.len() as u64);
+						let n = bytes.len() as u64;
+						rt.stats.add_rx(n);
+						gate.spend(&rt.bandwidth, bytes.len());
+						if let Some(l) = left {
+							if n > l {
+								// nothing of a body longer than it said goes on
+								stop = Some(h3::error::Code::H3_MESSAGE_ERROR);
+								let _ = tx.send(Err(length_mismatch("longer"))).await;
+								return;
+							}
+							left = Some(l - n);
+						}
 						Ok(Frame::data(bytes))
 					}
 					Ok(None) => {
-						match recv.recv_trailers().await {
+						if left.is_some_and(|l| l > 0) {
+							let _ = tx.send(Err(length_mismatch("shorter"))).await;
+							return;
+						}
+						reading.store(true, Ordering::Relaxed);
+						let trailers = recv.recv_trailers().await;
+						reading.store(false, Ordering::Relaxed);
+						match trailers {
 							Ok(Some(trailers)) => {
 								let _ = tx.send(Ok(Frame::trailers(trailers))).await;
 							}
@@ -377,17 +574,30 @@ fn request_body(
 				};
 				let failed = frame.is_err();
 				// the handler dropped the body (answered without reading it)
-				if tx.send(frame).await.is_err() || failed {
+				if tx.send(frame).await.is_err() {
+					stop = Some(h3::error::Code::H3_NO_ERROR);
+					return;
+				}
+				if failed {
 					return;
 				}
 			}
 		};
 		tokio::select! {
+			// the end of the stream first: a body read to its end is not stopped
+			biased;
+			_ = read => {}
 			// the rule stopped: the body did not end, so do not let it look complete
 			_ = kill.cancelled() => {
 				let _ = tx.try_send(Err(BoxError::new(std::io::Error::other("rule stopped"))));
 			}
-			_ = read => {}
+			// the handler dropped the body before its end (answered without reading it, or the
+			// request ended otherwise): the client need not send the rest (RFC 9114 4.1). Told
+			// with H3_NO_ERROR, or code 0 when the stream is dropped in the middle of a read
+			_ = tx.closed() => stop = Some(h3::error::Code::H3_NO_ERROR),
+		}
+		if let Some(code) = stop.filter(|_| !reading.load(Ordering::Relaxed)) {
+			recv.stop_sending(code);
 		}
 	});
 	BodyExt::boxed(ChannelBody(rx))
@@ -417,7 +627,10 @@ async fn respond(
 	send: &mut h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
 	resp: Response<Body>,
 	rt: &Runtime,
+	client: IpAddr,
 ) -> Result<(), BoxError> {
+	// the rule's `bandwidth` paces the response body (the headers are not counted)
+	let mut gate = Gate::new(client, Dir::Down);
 	let (mut parts, mut body) = resp.into_parts();
 	// connection-specific headers are not allowed in HTTP/3 (RFC 9114 4.2)
 	for name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"] {
@@ -427,9 +640,14 @@ async fn respond(
 	while let Some(frame) = body.frame().await {
 		let frame = frame?;
 		match frame.into_data() {
-			Ok(data) => {
-				rt.stats.add_tx(data.len() as u64);
-				send.send_data(data).await.map_err(BoxError::new)?;
+			Ok(mut data) => {
+				while !data.is_empty() {
+					let allow = std::future::poll_fn(|cx| gate.poll_allow(&rt.bandwidth, cx)).await;
+					let part = data.split_to(allow.map_or(data.len(), |a| a.min(data.len())));
+					rt.stats.add_tx(part.len() as u64);
+					gate.spend(&rt.bandwidth, part.len());
+					send.send_data(part).await.map_err(BoxError::new)?;
+				}
 			}
 			Err(frame) => {
 				if let Ok(trailers) = frame.into_trailers() {
@@ -439,4 +657,34 @@ async fn respond(
 		}
 	}
 	send.finish().await.map_err(BoxError::new)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn content_length_is_one_number() {
+		let headers = |values: &[&str]| {
+			let mut h = hyper::HeaderMap::new();
+			for v in values {
+				h.append(hyper::header::CONTENT_LENGTH, v.parse().unwrap());
+			}
+			h
+		};
+		assert_eq!(content_length(&headers(&[])), Ok(None));
+		assert_eq!(content_length(&headers(&["12"])), Ok(Some(12)));
+		assert_eq!(content_length(&headers(&["12", "12"])), Ok(Some(12)));
+		for bad in [&["12", "13"][..], &["-1"], &["+1"], &["1 "], &["0x10"], &[""], &["99999999999999999999999"]] {
+			assert_eq!(content_length(&headers(bad)), Err(()), "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn quic_idle_follows_the_idle_timeout() {
+		assert_eq!(quic_idle(Some(Duration::from_secs(180))), Duration::from_secs(180));
+		assert_eq!(quic_idle(Some(Duration::from_secs(5))), MIN_QUIC_IDLE, "a short idle does not cut slow requests");
+		assert_eq!(quic_idle(Some(Duration::from_secs(86_400))), MAX_QUIC_IDLE);
+		assert_eq!(quic_idle(None), MAX_QUIC_IDLE, "idle unlimited: a peer that is gone is still let go");
+	}
 }

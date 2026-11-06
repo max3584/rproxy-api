@@ -36,6 +36,18 @@ const APPSEC_TIMEOUT: Duration = Duration::from_secs(3);
 /// Request bodies up to this size (by Content-Length) are sent to AppSec;
 /// larger ones, and those without a length, are checked by their headers only.
 pub const APPSEC_MAX_BODY: u64 = 1024 * 1024;
+/// How long reading the request body for AppSec may take in all (#355): at least this, and
+/// more for a larger body (`APPSEC_BODY_RATE`), so that a client cannot hold the buffer for
+/// ever with a body that trickles in. A client that stops sending is ended sooner by the
+/// body's own `global.http.timeouts.request_body_idle` (the silence between two reads).
+const APPSEC_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The slowest upload the total time allows: 8 KiB/s (1 MiB in 128 s).
+const APPSEC_BODY_RATE: u64 = 8 * 1024;
+
+/// The time `check_appsec` may take to read a body of `n` bytes.
+fn appsec_body_timeout(n: u64) -> Duration {
+	APPSEC_BODY_TIMEOUT.max(Duration::from_secs(n.div_ceil(APPSEC_BODY_RATE)))
+}
 
 /// Why the bouncer cannot be set up.
 #[derive(Debug)]
@@ -414,7 +426,9 @@ impl Bouncer {
 	}
 
 	/// Asks AppSec about a request. The body is read (and put back) when it has
-	/// a Content-Length of at most `APPSEC_MAX_BODY`.
+	/// a Content-Length of at most `APPSEC_MAX_BODY`: never more than that length, and for
+	/// at most `appsec_body_timeout` (#355). When it cannot be read, the body put back
+	/// fails too, so a request let through on the error does not go on with a body cut short.
 	pub async fn check_appsec(&self, parts: &Parts, body: &mut Body, client: IpAddr, host: &str) -> Verdict {
 		let Some(appsec) = &self.appsec else { return Verdict::Error("no global.crowdsec.appsec_url".into()) };
 		let key = self.key();
@@ -425,12 +439,22 @@ impl Bouncer {
 		let mut sent = Bytes::new();
 		if let Some(n) = length.filter(|n| *n > 0 && *n <= APPSEC_MAX_BODY) {
 			let taken = std::mem::replace(body, empty());
-			match taken.collect().await {
-				Ok(collected) => {
+			// a body longer than its Content-Length is an error, not a bigger buffer
+			let read = http_body_util::Limited::new(taken, n as usize).collect();
+			let limit = appsec_body_timeout(n);
+			let error = match tokio::time::timeout(limit, read).await {
+				Ok(Ok(collected)) => {
 					sent = collected.to_bytes();
 					*body = Full::new(sent.clone()).map_err(|never| match never {}).boxed();
+					None
 				}
-				Err(e) => return Verdict::Error(format!("reading the request body ({n} bytes): {e}")),
+				Ok(Err(e)) => Some(e.to_string()),
+				Err(_) => Some(format!("timed out after {}s", limit.as_secs())),
+			};
+			if let Some(e) = error {
+				let e = format!("reading the request body ({n} bytes): {e}");
+				*body = Failed(e.clone()).boxed();
+				return Verdict::Error(e);
 			}
 		}
 		let mut headers = HeaderMap::new();
@@ -490,6 +514,26 @@ pub fn check_refs(spec: &HttpSpec, bouncer: Option<&Arc<Bouncer>>) -> Result<(),
 
 fn empty() -> Body {
 	Full::new(Bytes::new()).map_err(|never| match never {}).boxed()
+}
+
+/// A request body that could not be read: its error, in place of the rest. It stays failed
+/// (never a clean end, however often it is asked).
+struct Failed(String);
+
+impl hyper::body::Body for Failed {
+	type Data = Bytes;
+	type Error = crate::l7::server::BoxError;
+
+	fn poll_frame(
+		self: std::pin::Pin<&mut Self>,
+		_: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+		std::task::Poll::Ready(Some(Err(crate::l7::server::BoxError::new(std::io::Error::other(self.0.clone())))))
+	}
+
+	fn is_end_stream(&self) -> bool {
+		false
+	}
 }
 
 trait Stream2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -619,5 +663,67 @@ mod tests {
 		b.reload_key().unwrap();
 		assert_eq!(b.key(), "other");
 		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// A Bouncer whose AppSec is at `appsec` (nothing needs to answer for these tests).
+	fn appsec_bouncer(tag: &str) -> Arc<Bouncer> {
+		crate::net::files::private_umask();
+		let dir = std::env::temp_dir().join(format!("rproxy-cs-unit-{tag}-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let key = dir.join("key");
+		std::fs::write(&key, "k").unwrap();
+		Bouncer::new(&CrowdsecGlobal {
+			lapi_url: "http://127.0.0.1:9".into(),
+			api_key_file: key.to_str().unwrap().into(),
+			appsec_url: Some("http://127.0.0.1:9".into()),
+			update_interval: None,
+		})
+		.unwrap()
+	}
+
+	fn post(length: &str) -> Parts {
+		Request::post("/x").header(header::CONTENT_LENGTH, length).body(()).unwrap().into_parts().0
+	}
+
+	/// #355: the body is read no further than its Content-Length, and a body that cannot be
+	/// read is put back as one that fails (not as an empty or shortened one).
+	#[tokio::test]
+	async fn appsec_reads_no_more_than_the_content_length() {
+		let b = appsec_bouncer("limited");
+		let mut body: Body = Full::new(Bytes::from_static(b"0123456789")).map_err(|never| match never {}).boxed();
+		let Verdict::Error(e) = b.check_appsec(&post("5"), &mut body, ip("192.0.2.1"), "a.test").await else { panic!("not an error") };
+		assert!(e.contains("reading the request body (5 bytes)"), "{e}");
+		assert!(body.collect().await.is_err(), "the body put back fails");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn appsec_gives_up_on_a_slow_body() {
+		let b = appsec_bouncer("slow");
+		let mut body: Body = Silent.boxed();
+		let Verdict::Error(e) = b.check_appsec(&post("100"), &mut body, ip("192.0.2.1"), "a.test").await else { panic!("not an error") };
+		assert!(e.contains("timed out after 30s"), "{e}");
+		assert!(body.frame().await.unwrap().is_err(), "the body put back fails");
+		assert!(body.frame().await.unwrap().is_err(), "and stays failed");
+	}
+
+	#[test]
+	fn appsec_body_time_grows_with_the_body() {
+		assert_eq!(appsec_body_timeout(1), APPSEC_BODY_TIMEOUT);
+		assert_eq!(appsec_body_timeout(APPSEC_MAX_BODY), Duration::from_secs(128));
+	}
+
+	/// A body whose client sends nothing more.
+	struct Silent;
+
+	impl hyper::body::Body for Silent {
+		type Data = Bytes;
+		type Error = crate::l7::server::BoxError;
+
+		fn poll_frame(
+			self: std::pin::Pin<&mut Self>,
+			_: &mut std::task::Context<'_>,
+		) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+			std::task::Poll::Pending
+		}
 	}
 }
