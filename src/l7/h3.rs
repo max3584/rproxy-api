@@ -53,6 +53,9 @@ const MAX_KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// QUIC handshakes of one rule in progress at a time; more are refused (#355). Only clients
 /// whose address is validated (Retry) get this far.
 const MAX_HANDSHAKES: usize = 512;
+/// How long a request body that has all of its Content-Length waits for the end of its
+/// stream after the handler is done with it, before the client is told to stop sending.
+const BODY_END_GRACE: Duration = Duration::from_secs(5);
 /// Connection attempts quinn holds before the rule's task looks at them.
 const MAX_INCOMING: usize = 4096;
 const INCOMING_BUFFER_TOTAL: u64 = 16 << 20;
@@ -505,97 +508,118 @@ fn request_body(
 	tracker.spawn(async move {
 		let mut gate = Gate::new(client, Dir::Up);
 		let mut left = length;
-		// why reading stopped before the end of the stream, to tell the client
-		let mut stop = None;
 		// a read of the stream in progress: one given up keeps the stream inside h3-quinn,
 		// whose stop_sending then panics; dropping the stream stops it (code 0) instead
 		let reading = std::sync::atomic::AtomicBool::new(false);
-		let read = async {
-			loop {
-				std::future::poll_fn(|cx| gate.poll_allow(&rt.bandwidth, cx)).await;
-				reading.store(true, Ordering::Relaxed);
-				let data = match idle.filter(|_| !responded.get()) {
-					Some(limit) => {
-						let read = recv.recv_data();
-						tokio::pin!(read);
-						tokio::select! {
-							d = &mut read => Some(d),
-							// once the response is under way the exchange may be bidirectional: keep waiting
-							_ = tokio::time::sleep(limit) => if responded.get() { Some(read.await) } else { None },
-						}
-					}
-					None => Some(recv.recv_data().await),
-				};
-				if data.is_some() {
-					reading.store(false, Ordering::Relaxed);
-				}
-				let Some(data) = data else {
-					stop = Some(h3::error::Code::H3_REQUEST_CANCELLED);
-					let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
-					return;
-				};
-				let frame = match data {
-					Ok(Some(mut data)) => {
-						let bytes = data.copy_to_bytes(data.remaining());
-						let n = bytes.len() as u64;
-						rt.stats.add_rx(n);
-						gate.spend(&rt.bandwidth, bytes.len());
-						if let Some(l) = left {
-							if n > l {
-								// nothing of a body longer than it said goes on
-								stop = Some(h3::error::Code::H3_MESSAGE_ERROR);
-								let _ = tx.send(Err(length_mismatch("longer"))).await;
-								return;
+		// all of Content-Length has come: only the end of the stream (or trailers) is left
+		let complete = std::sync::atomic::AtomicBool::new(length == Some(0));
+		// why reading stopped before the end of the stream, to tell the client
+		let stop = {
+			let read = async {
+				loop {
+					std::future::poll_fn(|cx| gate.poll_allow(&rt.bandwidth, cx)).await;
+					reading.store(true, Ordering::Relaxed);
+					let data = match idle.filter(|_| !responded.get()) {
+						Some(limit) => {
+							let read = recv.recv_data();
+							tokio::pin!(read);
+							tokio::select! {
+								d = &mut read => Some(d),
+								// once the response is under way the exchange may be bidirectional: keep waiting
+								_ = tokio::time::sleep(limit) => if responded.get() { Some(read.await) } else { None },
 							}
-							left = Some(l - n);
 						}
-						Ok(Frame::data(bytes))
-					}
-					Ok(None) => {
-						if left.is_some_and(|l| l > 0) {
-							let _ = tx.send(Err(length_mismatch("shorter"))).await;
-							return;
-						}
-						reading.store(true, Ordering::Relaxed);
-						let trailers = recv.recv_trailers().await;
+						None => Some(recv.recv_data().await),
+					};
+					if data.is_some() {
 						reading.store(false, Ordering::Relaxed);
-						match trailers {
-							Ok(Some(trailers)) => {
-								let _ = tx.send(Ok(Frame::trailers(trailers))).await;
-							}
-							Ok(None) => {}
-							Err(e) => {
-								let _ = tx.send(Err(BoxError::new(e))).await;
-							}
-						}
-						return;
 					}
-					Err(e) => Err(BoxError::new(e)),
-				};
-				let failed = frame.is_err();
-				// the handler dropped the body (answered without reading it)
-				if tx.send(frame).await.is_err() {
-					stop = Some(h3::error::Code::H3_NO_ERROR);
-					return;
+					let Some(data) = data else {
+						let _ = tx.send(Err(super::timeouts::body_timed_out())).await;
+						return Some(h3::error::Code::H3_REQUEST_CANCELLED);
+					};
+					let frame = match data {
+						Ok(Some(mut data)) => {
+							let bytes = data.copy_to_bytes(data.remaining());
+							let n = bytes.len() as u64;
+							rt.stats.add_rx(n);
+							gate.spend(&rt.bandwidth, bytes.len());
+							if let Some(l) = left {
+								if n > l {
+									// nothing of a body longer than it said goes on
+									let _ = tx.send(Err(length_mismatch("longer"))).await;
+									return Some(h3::error::Code::H3_MESSAGE_ERROR);
+								}
+								left = Some(l - n);
+								if l == n {
+									complete.store(true, Ordering::Relaxed);
+								}
+							}
+							Ok(Frame::data(bytes))
+						}
+						Ok(None) => {
+							if left.is_some_and(|l| l > 0) {
+								let _ = tx.send(Err(length_mismatch("shorter"))).await;
+								return None;
+							}
+							reading.store(true, Ordering::Relaxed);
+							let trailers = recv.recv_trailers().await;
+							reading.store(false, Ordering::Relaxed);
+							match trailers {
+								Ok(Some(trailers)) => {
+									let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+								}
+								Ok(None) => {}
+								Err(e) => {
+									let _ = tx.send(Err(BoxError::new(e))).await;
+								}
+							}
+							return None;
+						}
+						Err(e) => Err(BoxError::new(e)),
+					};
+					let failed = frame.is_err();
+					// the handler dropped the body (answered without reading it); one that has all
+					// of its Content-Length (also with this frame) reads on to its end, which the
+					// grace below bounds
+					if tx.send(frame).await.is_err() && !complete.load(Ordering::Relaxed) {
+						return Some(h3::error::Code::H3_NO_ERROR);
+					}
+					if failed {
+						return None;
+					}
 				}
-				if failed {
-					return;
+			};
+			tokio::pin!(read);
+			tokio::select! {
+				// the end of the stream first: a body read to its end is not stopped
+				biased;
+				stop = &mut read => stop,
+				// the rule stopped: the body did not end, so do not let it look complete
+				_ = kill.cancelled() => {
+					let _ = tx.try_send(Err(BoxError::new(std::io::Error::other("rule stopped"))));
+					None
 				}
+				// the handler dropped the body before its end (answered without reading it, or the
+				// request ended otherwise): the client need not send the rest (RFC 9114 4.1). Told
+				// with H3_NO_ERROR, or code 0 when the stream is dropped in the middle of a read.
+				// A body with all of its Content-Length is not stopped: its end may still be on the
+				// way (a lost packet, a busy client), and a client told to stop would see its
+				// request fail although the response is complete. After `BODY_END_GRACE` without
+				// the end it is stopped all the same: the reader is then in the middle of a read,
+				// so the stream is usually just dropped (quinn's code 0), not told H3_NO_ERROR
+				_ = tx.closed() => if complete.load(Ordering::Relaxed) {
+					tokio::select! {
+						biased;
+						stop = &mut read => stop,
+						_ = kill.cancelled() => None,
+						_ = tokio::time::sleep(BODY_END_GRACE) => Some(h3::error::Code::H3_NO_ERROR),
+					}
+				} else {
+					Some(h3::error::Code::H3_NO_ERROR)
+				},
 			}
 		};
-		tokio::select! {
-			// the end of the stream first: a body read to its end is not stopped
-			biased;
-			_ = read => {}
-			// the rule stopped: the body did not end, so do not let it look complete
-			_ = kill.cancelled() => {
-				let _ = tx.try_send(Err(BoxError::new(std::io::Error::other("rule stopped"))));
-			}
-			// the handler dropped the body before its end (answered without reading it, or the
-			// request ended otherwise): the client need not send the rest (RFC 9114 4.1). Told
-			// with H3_NO_ERROR, or code 0 when the stream is dropped in the middle of a read
-			_ = tx.closed() => stop = Some(h3::error::Code::H3_NO_ERROR),
-		}
 		if let Some(code) = stop.filter(|_| !reading.load(Ordering::Relaxed)) {
 			recv.stop_sending(code);
 		}

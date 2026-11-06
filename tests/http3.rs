@@ -521,3 +521,54 @@ async fn http3_slow_backends_outlast_a_short_idle() {
 	let (status, v) = h3_request(&mut send, "GET", "https://a.test/slow", b"").await;
 	assert_eq!((status, v.as_str()), (StatusCode::OK, Some("late")));
 }
+
+/// A body that has all of its Content-Length is not stopped when the handler is done with it
+/// before the end of the stream arrives: a client whose FIN comes a little later (a lost
+/// packet, a busy client) finishes its request without an error.
+#[tokio::test]
+async fn http3_complete_bodies_wait_for_a_late_end() {
+	let pki = Pki::new("h3-late-fin");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, backend("A").await)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let req = hyper::Request::post("https://a.test/upload").header("content-length", "3").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.send_data(Bytes::from_static(b"abc")).await.unwrap();
+	// the backend answers once it has the 3 bytes, before the client ends its stream
+	let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response()).await.expect("an answer").unwrap();
+	assert_eq!(resp.status().as_u16(), 200);
+	let mut out = vec![];
+	while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+		out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+	}
+	let v: Value = serde_json::from_slice(&out).unwrap();
+	assert_eq!(v["body"].as_str(), Some("abc"), "{v}");
+	// the proxy is done with the request; its end comes now
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let r = stream.finish().await;
+	assert!(r.is_ok(), "{r:?}");
+}
+
+/// The wait for the end of a complete body is bounded: a client that never ends its stream is
+/// told to stop after 5 s (`BODY_END_GRACE`).
+#[tokio::test]
+async fn http3_complete_bodies_without_an_end_are_stopped() {
+	let pki = Pki::new("h3-no-fin");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, backend("A").await)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let req = hyper::Request::post("https://a.test/upload").header("content-length", "3").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.send_data(Bytes::from_static(b"abc")).await.unwrap();
+	let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response()).await.expect("an answer").unwrap();
+	assert_eq!(resp.status().as_u16(), 200);
+	while let Some(_chunk) = stream.recv_data().await.unwrap() {}
+	// past the grace the stream is stopped, and ending it now fails
+	tokio::time::sleep(Duration::from_secs(7)).await;
+	let r = stream.finish().await;
+	assert!(r.is_err(), "{r:?}");
+}
