@@ -204,6 +204,7 @@ The rproxy-api part of two gaps found after rproxy-gateway v0.4.4 (fleet pods ho
 - `0.0.0.0` / `::` and a specific address on the same port: still refused with `409 already_exists` (no `SO_REUSEADDR`-like "the narrower one wins": where traffic goes would depend on which addresses are present, and the clash would be hidden). The error now names the other rule's set and why.
 - `connect_timeout` changes in place by PATCH (from the next connection). `listen_freebind` cannot change (the sockets are opened again: re-created).
 - Handoff and storage: only added to the rule's shape (in the `GET /rules` shape and `rproxy_rules.spec`; an older patch ignores the unknown key).
+- `connect_timeout` in the `options` of the UI's database (`forward_rules`, `config/db.rs`) is read from v0.4.21 (#379, UI #184). `Options` refuses rows with unknown keys, so that an older rproxy is not handed such a row, the UI writes it only for an rproxy that returns `features.db_connect_timeout` (the `connect_timeout` flag dates from v0.4.3 and does not tell whether it is read from the database).
 - Tests: `scripts/test-freebind.sh` (real path in network namespaces; CI's transparent job), `tests/listen.rs`, `tests/targets.rs` (a target that drops SYNs).
 
 ## 9. Receiving PROXY protocol (v0.4.13, #296)

@@ -580,7 +580,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 
 | テスト | 確かめること |
 |---|---|
-| `loads_every_schema_version` | `src_port_end` / `options` 列（`allow_from` を含む）を含む現在のテーブル（壊れた `options` の行は飛ばす）、その前のテーブル、`source_ip` / `udp_idle_secs` もない古いテーブルのどれからも読める |
+| `loads_every_schema_version` | `src_port_end` / `options` 列（`allow_from` を含む）を含む現在のテーブル（壊れた `options` の行は飛ばす）、その前のテーブル、`source_ip` / `udp_idle_secs` もない古いテーブルのどれからも読める。`options` の `idle_timeout`・`half_close_timeout`（`0s`）と `connect_timeout`（#379）も戻る |
 
 ## transparent の実経路（`scripts/test-transparent.sh`）
 

@@ -1065,6 +1065,7 @@ Listens on an address that another host holds now and that comes to this host la
 - It applies with one target or several (in place of the 5 s with several), and to the targets of `tls.routes`.
 - Too short, and a busy or distant target counts as down. Within one cluster, `1s`-`3s` is a reasonable value (the first SYN retry is after 1 s).
 - `http` rules keep the services' `timeouts.connect` (5 s by default).
+- Rules restored from the UI's database (`forward_rules`) read `connect_timeout` from the `options` column as well (the same string as the API; v0.4.21, #379, UI #184, `features.db_connect_timeout`). Up to v0.4.20 it was not read, and a row with it in `options` was not restored (an unknown key).
 
 ### Relay deadlines and keepalive (v0.4.20, #353, `features.tcp_idle_timeout`)
 
@@ -1402,4 +1403,4 @@ From v0.4 (#144), this node's rows of rproxy's table `rproxy_rules` are restored
 Rows of `forward_rules` are split per node on the UI's side (the `target` column, UI PR #103; a per-node DB view shows each rproxy only its rows), so rproxy does not filter `forward_rules`. Of `rproxy_rules`, rproxy reads only its own `node`'s rows.
 
 The table definition is managed in `db/` of the UI repository. The columns rproxy reads are `protocol`, `src_addr`, `src_port`, `src_port_end`, `dist_addr`, `dist_port`, `source_ip`, `udp_idle_secs`, `options`. If `options.targets` (multiple destinations) is present, `dist_addr` / `dist_port` are not used. Rows with `options.enabled` set to `false` (rules paused in the UI) are not created at startup (counted in the `restore.paused` log).
-`options` is JSON: `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}` (`allow_from`, `http` and `crowdsec` can be omitted). If an old table lacks these columns, default values are used. The v0.4 `labels`, `limits`, `bandwidth`, `geoip` and `outlier_detection`, `proxy_protocol` (v0.4.13), and `idle_timeout` and `half_close_timeout` (v0.4.20), are read in the API's shape as well (optional; "v0.4 settings" above).
+`options` is JSON: `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}` (`allow_from`, `http` and `crowdsec` can be omitted). If an old table lacks these columns, default values are used. The v0.4 `labels`, `limits`, `bandwidth`, `geoip` and `outlier_detection`, `proxy_protocol` (v0.4.13), `idle_timeout` and `half_close_timeout` (v0.4.20), and `connect_timeout` (v0.4.21, `features.db_connect_timeout`; an older rproxy does not restore a row with this key), are read in the API's shape as well (optional; "v0.4 settings" above).
