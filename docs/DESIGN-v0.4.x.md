@@ -204,6 +204,7 @@ rproxy-gateway の v0.4.4（fleet の Pod が VIP を持つ）の後に分かっ
 - `0.0.0.0` / `::` と同じポートの特定のアドレス：今までどおり `409 already_exists` で断る（`SO_REUSEADDR` で狭いほうが勝つ形にはしない。届く先がアドレスの有無で変わり、取り合いが見えなくなる）。誤りの文に、重なる相手のルールの組と理由を足した。
 - `connect_timeout` は PATCH でその場で変えられる（次の接続から）。`listen_freebind` は変えられない（ソケットを開き直すので作り直し）。
 - 引き継ぎ・保存：ルールの形に足すだけ（`GET /rules` の形・`rproxy_rules.spec` に入る。古いパッチは知らない項目を無視して読む）。
+- UI の DB（`forward_rules`、`config/db.rs`）の `options` の `connect_timeout` は v0.4.21 から読む（#379、UI #184）。`Options` は知らないキーの行を断るので、それより前の rproxy にこの行を戻させないよう、UI は `features.db_connect_timeout` を返す rproxy にだけ書く（`connect_timeout` の印は v0.4.3 からあり、DB から読むかは見分けられない）。
 - 試験：`scripts/test-freebind.sh`（名前空間の実経路。CI の transparent のジョブ）、`tests/listen.rs`、`tests/targets.rs`（SYN を捨てる宛先）。
 
 ## 9. PROXY protocol を受け取る（v0.4.13、#296）
