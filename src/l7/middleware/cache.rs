@@ -22,7 +22,8 @@
 //!   `Upgrade` or a body (also HTTP/2 and HTTP/3 DATA frames without a length: `settle`);
 //!   answers with `Set-Cookie`, `Cache-Control: no-store / private / no-cache`, `Vary: *`,
 //!   `Content-Range`, `text/event-stream`, a status outside `status`, a body over `max_body`
-//!   or still coming after `COLLECT_LIMIT`, trailers, or a body that broke off. The route's
+//!   or still coming after `COLLECT_LIMIT`, trailers, a body that broke off, or one the
+//!   process's `Budget` has no room for while it is read (#356: then it streams). The route's
 //!   checks keep it out of the way of authentication (`HttpSpec::check_cache_route`).
 //! - The answer's `Vary` (and `Accept-Encoding` for an encoded body) is kept with it: a
 //!   request with other values of those headers does not get it.
@@ -109,6 +110,9 @@ pub const DEFAULT_PROCESS_MAX_MEMORY: u64 = 512 << 20;
 pub struct Budget {
 	limit: AtomicU64,
 	used: AtomicU64,
+	/// Bytes of answers being read to be kept (#356), at most `limit` too (apart from `used`: a
+	/// budget full of answers still lets new ones be read to replace them).
+	reading: AtomicU64,
 	/// Every cache's store, to drop the answers past `stale_on_error` that caches not asked
 	/// lately still hold when the budget is full.
 	stores: Mutex<Vec<Weak<Mutex<Store>>>>,
@@ -130,7 +134,28 @@ pub fn memory() -> (u64, u64) {
 
 impl Budget {
 	const fn new(limit: u64) -> Budget {
-		Budget { limit: AtomicU64::new(limit), used: AtomicU64::new(0), stores: Mutex::new(Vec::new()) }
+		Budget { limit: AtomicU64::new(limit), used: AtomicU64::new(0), reading: AtomicU64::new(0), stores: Mutex::new(Vec::new()) }
+	}
+
+	/// Counts `n` more bytes of answers being read, when they fit under the limit.
+	fn reserve_reading(&self, n: u64) -> bool {
+		// no limit (0): no limit on reading either
+		let limit = match self.limit.load(Ordering::Relaxed) {
+			0 => u64::MAX,
+			l => l,
+		};
+		let mut u = self.reading.load(Ordering::Relaxed);
+		loop {
+			let Some(t) = u.checked_add(n).filter(|t| *t <= limit) else { return false };
+			match self.reading.compare_exchange_weak(u, t, Ordering::Relaxed, Ordering::Relaxed) {
+				Ok(_) => return true,
+				Err(now) => u = now,
+			}
+		}
+	}
+
+	fn release_reading(&self, n: u64) {
+		self.reading.fetch_sub(n, Ordering::Relaxed);
 	}
 
 	/// Counts `n` bytes in when they fit.
@@ -611,6 +636,8 @@ pub struct Cache {
 	pub name: String,
 	settings: Settings,
 	store: Arc<Mutex<Store>>,
+	/// The process's budget (also the store's), which answers being read count in too.
+	budget: &'static Budget,
 	/// The next `Entry.seq`.
 	next: std::sync::atomic::AtomicU64,
 }
@@ -704,7 +731,11 @@ impl Cache {
 		let settings = Settings::of(spec, what)?;
 		let store = Arc::new(Mutex::new(Store::new(budget)));
 		budget.register(&store);
-		Ok(Cache { name: name.to_string(), settings, store, next: Default::default() })
+		Ok(Cache { name: name.to_string(), settings, store, budget, next: Default::default() })
+	}
+
+	fn budget(&self) -> &'static Budget {
+		self.budget
 	}
 
 	/// Answers kept (those past `stale_on_error` are dropped first) and the bytes they take (`/metrics`).
@@ -855,7 +886,7 @@ impl Cache {
 				return (self.mark(resp, Outcome::Miss), Outcome::Miss);
 			}
 			let (parts, body) = resp.into_parts();
-			return match collect(body, self.settings.max_body).await {
+			return match collect(body, self.settings.max_body, self.budget()).await {
 				Ok(bytes) => {
 					let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &p.headers));
 					lead.finish(Done::Error(e.clone()), None, Mark::Nothing);
@@ -882,7 +913,7 @@ impl Cache {
 			}
 		}
 		let (parts, body) = resp.into_parts();
-		match collect(body, self.settings.max_body).await {
+		match collect(body, self.settings.max_body, self.budget()).await {
 			Ok(bytes) => {
 				let e = Arc::new(self.entry(&key, parts.status, parts.headers, bytes, &p.headers));
 				if e.size <= self.settings.max_memory {
@@ -893,8 +924,13 @@ impl Cache {
 				}
 				(self.answer(&e, &p.headers, p.head, Outcome::Miss), Outcome::Miss)
 			}
-			Err((body, too_big)) => {
-				let mark = if too_big { strike(&parts.headers) } else { Mark::Reset };
+			Err((body, stop)) => {
+				let mark = match stop {
+					Stop::TooBig => strike(&parts.headers),
+					Stop::Other => Mark::Reset,
+					// not the answer's doing: the next lead may keep it
+					Stop::NoRoom => Mark::Nothing,
+				};
 				lead.finish(Done::Uncacheable, None, mark);
 				(self.mark(Response::from_parts(parts, body), Outcome::Miss), Outcome::Miss)
 			}
@@ -1131,19 +1167,58 @@ fn empty() -> Body {
 	Empty::new().map_err(|never| match never {}).boxed()
 }
 
-/// Reads a body of at most `max` bytes within `COLLECT_LIMIT`. Otherwise (larger, slower,
-/// trailers, an error) gives back a body that sends what was read and then the rest as it
-/// comes, the error included; and whether it was too large (`true`) rather than slow or broken.
-async fn collect(mut body: Body, max: u64) -> Result<Bytes, (Body, bool)> {
+/// Why `collect` gave the body back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+	/// Larger than `max_body`.
+	TooBig,
+	/// The process's budget has no room for what is being read (#356).
+	NoRoom,
+	/// Slower than `COLLECT_LIMIT`, trailers, or an error.
+	Other,
+}
+
+/// Bytes being read by `collect`, counted in the process's budget (`Budget::reading`) until dropped (#356).
+struct Reading {
+	budget: &'static Budget,
+	held: u64,
+}
+
+impl Reading {
+	/// Counts up to `n` bytes; false when the budget has no room for them.
+	fn grow_to(&mut self, n: u64) -> bool {
+		if n <= self.held {
+			return true;
+		}
+		if !self.budget.reserve_reading(n - self.held) {
+			return false;
+		}
+		self.held = n;
+		true
+	}
+}
+
+impl Drop for Reading {
+	fn drop(&mut self) {
+		self.budget.release_reading(self.held);
+	}
+}
+
+/// Reads a body of at most `max` bytes within `COLLECT_LIMIT`, counting what it reads in
+/// `budget` meanwhile (#356: many answers being read at once are memory too). Otherwise
+/// (larger, slower, no room in the budget, trailers, an error) gives back a body that sends
+/// what was read and then the rest as it comes, the error included; and why it stopped.
+async fn collect(mut body: Body, max: u64, budget: &'static Budget) -> Result<Bytes, (Body, Stop)> {
 	use hyper::body::Body as _;
 	if body.size_hint().lower() > max {
-		return Err((body, true));
+		return Err((body, Stop::TooBig));
 	}
 	let until = Instant::now() + COLLECT_LIMIT;
+	let mut reading = Reading { budget, held: 0 };
 	let mut buf = BytesMut::new();
 	loop {
 		let Ok(frame) = tokio::time::timeout_at(until, body.frame()).await else {
-			return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), false));
+			return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), Stop::Other));
 		};
 		match frame {
 			None => return Ok(buf.freeze()),
@@ -1151,12 +1226,17 @@ async fn collect(mut body: Body, max: u64) -> Result<Bytes, (Body, bool)> {
 				Ok(data) => {
 					buf.extend_from_slice(&data);
 					if buf.len() as u64 > max {
-						return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), true));
+						return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), Stop::TooBig));
+					}
+					if !reading.grow_to(buf.capacity() as u64) {
+						return Err((Resumed { read: Some(buf.freeze()), next: None, rest: Some(body) }.boxed(), Stop::NoRoom));
 					}
 				}
-				Err(frame) => return Err((Resumed { read: Some(buf.freeze()), next: Some(Ok(frame)), rest: Some(body) }.boxed(), false)),
+				Err(frame) => {
+					return Err((Resumed { read: Some(buf.freeze()), next: Some(Ok(frame)), rest: Some(body) }.boxed(), Stop::Other))
+				}
 			},
-			Some(Err(e)) => return Err((Resumed { read: Some(buf.freeze()), next: Some(Err(e)), rest: None }.boxed(), false)),
+			Some(Err(e)) => return Err((Resumed { read: Some(buf.freeze()), next: Some(Err(e)), rest: None }.boxed(), Stop::Other)),
 		}
 	}
 }
@@ -1810,5 +1890,22 @@ mod tests {
 		for h in ["Connection", "transfer-encoding", "Content-Length", "age", "set-cookie"] {
 			assert!(bad(&format!("{{ttl: 1s, header: {h}}}")).contains("header"), "{h}");
 		}
+	}
+
+	/// Answers being read count in the budget too (#356): past it, the answer streams and is not kept.
+	#[tokio::test(start_paused = true)]
+	async fn answers_being_read_count_in_the_budget() {
+		let budget: &'static Budget = Box::leak(Box::new(Budget::new(3000)));
+		let c = cache_in("{ttl: 60s, max_body: 100000}", budget);
+		// someone else is reading most of what may be read
+		assert!(budget.reserve_reading(2500));
+		let (r, o) = fill(&c, &mut req("GET", "/big", &[]), resp(200, &[], Box::leak("x".repeat(900).into_boxed_str()))).await;
+		assert_eq!((o, text(r).await.len()), (Outcome::Miss, 900), "streamed whole");
+		assert!(ask(&c, &mut req("GET", "/big", &[])).await.is_err(), "not kept");
+		budget.release_reading(2500);
+		let (_, o) = fill(&c, &mut req("GET", "/big", &[]), resp(200, &[], Box::leak("x".repeat(900).into_boxed_str()))).await;
+		assert_eq!(o, Outcome::Miss);
+		assert_eq!(ask(&c, &mut req("GET", "/big", &[])).await.ok().unwrap().1, Outcome::Hit);
+		assert_eq!(budget.reading.load(Ordering::Relaxed), 0, "given back");
 	}
 }

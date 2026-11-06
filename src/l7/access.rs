@@ -410,6 +410,8 @@ pub struct HttpStats {
 	blocked: Mutex<BTreeMap<(String, String), u64>>,
 	/// Requests at `cache` middlewares by (route, middleware), by `cache::Outcome` (#340).
 	cache: Mutex<BTreeMap<(String, String), [u64; 4]>>,
+	/// Copies `mirror` did not send, with as many being sent already, by (route, middleware) (#356).
+	mirror_dropped: Mutex<BTreeMap<(String, String), u64>>,
 }
 
 impl HttpStats {
@@ -442,6 +444,15 @@ impl HttpStats {
 
 	pub fn blocked_snapshot(&self) -> BTreeMap<(String, String), u64> {
 		self.blocked.lock().unwrap().clone()
+	}
+
+	pub fn mirror_dropped(&self, route: &str, middleware: &str) {
+		let route = if route.is_empty() { NO_ROUTE } else { route };
+		*self.mirror_dropped.lock().unwrap_or_else(|e| e.into_inner()).entry((route.to_string(), middleware.to_string())).or_default() += 1;
+	}
+
+	pub fn mirror_dropped_snapshot(&self) -> BTreeMap<(String, String), u64> {
+		self.mirror_dropped.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	pub fn cache(&self, route: &str, middleware: &str, outcome: super::middleware::cache::Outcome) {
@@ -483,6 +494,9 @@ pub struct HttpCounters {
 	/// (route, middleware, [hit, miss, stale, bypass]) of `cache` (#340); left out before v0.4.19.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub cache: Vec<(String, String, [u64; 4])>,
+	/// (route, middleware, count) of copies `mirror` did not send (#356); left out before v0.4.20.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub mirror_dropped: Vec<(String, String, u64)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -495,7 +509,7 @@ pub struct RouteCountersData {
 
 impl HttpCounters {
 	pub fn is_empty(&self) -> bool {
-		self.routes.is_empty() && self.limited.is_empty() && self.blocked.is_empty() && self.cache.is_empty()
+		self.routes.is_empty() && self.limited.is_empty() && self.blocked.is_empty() && self.cache.is_empty() && self.mirror_dropped.is_empty()
 	}
 
 	/// `self - before`, never below zero.
@@ -530,7 +544,13 @@ impl HttpCounters {
 				(r.clone(), m.clone(), std::array::from_fn(|i| sub(n[i], old[i])))
 			})
 			.collect();
-		HttpCounters { routes, limited: minus(&self.limited, &before.limited), blocked: minus(&self.blocked, &before.blocked), cache }
+		HttpCounters {
+			routes,
+			limited: minus(&self.limited, &before.limited),
+			blocked: minus(&self.blocked, &before.blocked),
+			cache,
+			mirror_dropped: minus(&self.mirror_dropped, &before.mirror_dropped),
+		}
 	}
 }
 
@@ -545,6 +565,7 @@ impl HttpStats {
 			limited: self.limited_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
 			blocked: self.blocked_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
 			cache: self.cache_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
+			mirror_dropped: self.mirror_dropped_snapshot().into_iter().map(|((r, m), n)| (r, m, n)).collect(),
 		}
 	}
 
@@ -562,7 +583,7 @@ impl HttpStats {
 			mine.duration_sum += r.duration_sum;
 		}
 		drop(routes);
-		for (map, list) in [(&self.limited, &c.limited), (&self.blocked, &c.blocked)] {
+		for (map, list) in [(&self.limited, &c.limited), (&self.blocked, &c.blocked), (&self.mirror_dropped, &c.mirror_dropped)] {
 			let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
 			for (r, m, n) in list {
 				*map.entry((r.clone(), m.clone())).or_default() += n;
@@ -592,6 +613,9 @@ pub struct HttpStatsView {
 	/// Requests at `cache` middlewares (#340); left out without one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache: Option<CacheCounts>,
+	/// Copies `mirror` did not send because as many were being sent already (#356).
+	#[serde(skip_serializing_if = "is_zero")]
+	pub mirror_dropped: u64,
 	pub routes: BTreeMap<String, RouteStatsView>,
 	/// Servers of the services with `health_check`, and whether each is up.
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -614,6 +638,9 @@ pub struct RouteStatsView {
 	/// Each `cache` middleware of the route (#340).
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub cache: BTreeMap<String, CacheCounts>,
+	/// Copies not sent by each `mirror` of the route (#356).
+	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
+	pub mirror_dropped: BTreeMap<String, u64>,
 }
 
 /// Requests at a `cache` middleware (#340): answered from memory (`hit`), from the backend
@@ -667,6 +694,10 @@ impl HttpStatsView {
 		for ((route, middleware), n) in stats.blocked_snapshot() {
 			view.blocked += n;
 			view.routes.entry(route).or_default().blocked.insert(middleware, n);
+		}
+		for ((route, middleware), n) in stats.mirror_dropped_snapshot() {
+			view.mirror_dropped += n;
+			view.routes.entry(route).or_default().mirror_dropped.insert(middleware, n);
 		}
 		for ((route, middleware), n) in stats.cache_snapshot() {
 			let c = CacheCounts::of(n);

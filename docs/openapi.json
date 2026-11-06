@@ -1720,6 +1720,10 @@
           "blocked": {
             "type": "integer"
           },
+          "mirror_dropped": {
+            "type": "integer",
+            "description": "copies of mirror middlewares not sent, with max_in_flight of that mirror being sent already (#356, v0.4.20)"
+          },
           "cache": {
             "type": "object",
             "description": "cache (#340, v0.4.19): requests by result",
@@ -1764,6 +1768,14 @@
                 },
                 "blocked": {
                   "type": "object",
+                  "properties": {},
+                  "additionalProperties": {
+                    "type": "integer"
+                  }
+                },
+                "mirror_dropped": {
+                  "type": "object",
+                  "description": "by mirror middleware name (#356)",
                   "properties": {},
                   "additionalProperties": {
                     "type": "integer"
@@ -2340,6 +2352,10 @@
               "control_limits": {
                 "type": "boolean",
                 "description": "The control API's limits: max_rules / max_rulesets of a token, RPROXY_MAX_RULES / RPROXY_MAX_LISTENERS / RPROXY_MAX_RULESETS (409 limit), listen_freebind only for admin, allow_freebind and (rule sets) allow_rulesets tokens (403), RPROXY_API_MAX_CONNECTIONS / _PER_SOURCE, route / middleware / service names sent to the API of 1-512 bytes without control characters, white space, \", \\, `, { or } (v0.4.20, #358)"
+              },
+              "http_stream_limits": {
+                "type": "boolean",
+                "description": "Limits on what one client can hold of an http rule (v0.4.20, #356): global.http.timeouts.write_stall (default 60s), upgraded_idle (default 1h) and http2_max_streams (default 128); mirror's max_in_flight (default 64); an upgraded connection (WebSocket) keeps its place in the rule's limits; timeouts.request covers the middlewares; stats.http.mirror_dropped and rproxy_http_mirror_dropped_total"
               }
             }
           },

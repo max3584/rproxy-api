@@ -327,7 +327,16 @@ pub struct BasicAuth {
 	pub user_header: Option<HeaderName>,
 	/// sha256(user:password) of recent successes, for the current users file.
 	cache: Mutex<(usize, HashMap<[u8; 32], String>)>,
+	/// bcrypt checks going on, by sha256(user:password) and the users file (#356): requests
+	/// with the same credentials at once share one check (a cold cache does not queue them all).
+	checking: Mutex<HashMap<[u8; 32], Checking>>,
 }
+
+/// The result of a bcrypt check several requests wait for (None: `Busy`).
+type Checking = Arc<tokio::sync::OnceCell<Option<bool>>>;
+
+/// Checks going on remembered at once; past it, those nobody waits for are forgotten.
+const CHECKING_MAX: usize = 4096;
 
 /// What `basic_auth` decided.
 pub enum BasicVerdict {
@@ -337,6 +346,50 @@ pub enum BasicVerdict {
 	Deny(&'static str),
 	/// The users file could not be read.
 	Unavailable,
+	/// As many bcrypt checks as there are CPUs are running and many more wait (#356): 503.
+	Busy,
+}
+
+/// bcrypt checks of the whole process at once: one per CPU (#356). More wait, up to
+/// `BCRYPT_WAITING` per CPU for at most `BCRYPT_WAIT`; past that `Busy`.
+static BCRYPT: std::sync::LazyLock<(tokio::sync::Semaphore, usize)> = std::sync::LazyLock::new(|| {
+	let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+	(tokio::sync::Semaphore::new(cpus), cpus)
+});
+const BCRYPT_WAITING: usize = 8;
+const BCRYPT_WAIT: Duration = Duration::from_secs(1);
+static BCRYPT_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One request waiting for a bcrypt check.
+struct Waiting;
+
+impl Drop for Waiting {
+	fn drop(&mut self) {
+		BCRYPT_WAITERS.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+/// bcrypt on the blocking pool, at most one per CPU; None when too many wait.
+async fn bcrypt_verify(password: String, hash: String) -> Option<bool> {
+	let (slots, cpus) = &*BCRYPT;
+	let permit = match slots.try_acquire() {
+		Ok(p) => p,
+		Err(_) => {
+			if BCRYPT_WAITERS.fetch_add(1, Ordering::Relaxed) >= cpus * BCRYPT_WAITING {
+				BCRYPT_WAITERS.fetch_sub(1, Ordering::Relaxed);
+				return None;
+			}
+			let _waiting = Waiting;
+			tokio::time::timeout(BCRYPT_WAIT, slots.acquire()).await.ok()?.ok()?
+		}
+	};
+	// the place is held until bcrypt is done, also when the request is gone meanwhile
+	tokio::task::spawn_blocking(move || {
+		let _permit = permit;
+		bcrypt::verify(password, &hash).unwrap_or(false)
+	})
+	.await
+	.ok()
 }
 
 impl BasicAuth {
@@ -357,10 +410,11 @@ impl BasicAuth {
 			keep_authorization,
 			user_header,
 			cache: Mutex::default(),
+			checking: Mutex::default(),
 		})
 	}
 
-	/// Checks `Authorization: Basic`. bcrypt runs on the blocking pool.
+	/// Checks `Authorization: Basic`. bcrypt runs on the blocking pool, one per CPU at once.
 	pub async fn check(&self, headers: &HeaderMap) -> BasicVerdict {
 		let Some(users) = self.users.get() else { return BasicVerdict::Unavailable };
 		let Some((user, password)) = basic_credentials(headers) else { return BasicVerdict::Deny("no_credentials") };
@@ -381,7 +435,10 @@ impl BasicAuth {
 		let ok = match hash {
 			Hash::Sha1(expected) => constant_time_eq(&Sha1::digest(password.as_bytes()), &expected),
 			Hash::Apr1 { salt, hash } => constant_time_eq(apr1(password.as_bytes(), salt.as_bytes()).as_bytes(), hash.as_bytes()),
-			Hash::Bcrypt(h) => tokio::task::spawn_blocking(move || bcrypt::verify(password, &h).unwrap_or(false)).await.unwrap_or(false),
+			Hash::Bcrypt(h) => match self.bcrypt_once(&key, generation, password, h).await {
+				Some(ok) => ok,
+				None => return BasicVerdict::Busy,
+			},
 		};
 		if !known {
 			return BasicVerdict::Deny("unknown_user");
@@ -395,6 +452,27 @@ impl BasicAuth {
 		}
 		c.1.insert(key, user.clone());
 		BasicVerdict::Allow(user)
+	}
+
+	/// `bcrypt_verify`, once for the requests with the same credentials at the same time.
+	async fn bcrypt_once(&self, key: &[u8; 32], generation: usize, password: String, hash: String) -> Option<bool> {
+		let mut h = Sha256::new();
+		h.update(key);
+		h.update(generation.to_le_bytes());
+		let flight: [u8; 32] = h.finalize().into();
+		let cell: Checking = {
+			let mut m = self.checking.lock().unwrap_or_else(|e| e.into_inner());
+			if m.len() >= CHECKING_MAX {
+				m.retain(|_, c| Arc::strong_count(c) > 1);
+			}
+			m.entry(flight).or_default().clone()
+		};
+		let result = *cell.get_or_init(|| bcrypt_verify(password, hash)).await;
+		let mut m = self.checking.lock().unwrap_or_else(|e| e.into_inner());
+		if m.get(&flight).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+			m.remove(&flight);
+		}
+		result
 	}
 
 	pub fn challenge(&self) -> HeaderValue {

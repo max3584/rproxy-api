@@ -243,6 +243,10 @@ pub struct Features {
 	/// `admin`, `allow_freebind` and (rule sets) `allow_rulesets` tokens, route, middleware and
 	/// service names the API is sent without control characters, white space, `"`, `\` and the like
 	pub control_limits: bool,
+	/// Limits on what one client can hold of an `http` rule (#356): `global.http.timeouts`'s
+	/// `write_stall`, `upgraded_idle` and `http2_max_streams`, `mirror`'s `max_in_flight`, upgraded connections in the rule's `limits`,
+	/// `timeouts.request` over the middlewares, `stats.http.mirror_dropped`
+	pub http_stream_limits: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -315,6 +319,7 @@ impl Features {
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
 		control_limits: true,
+		http_stream_limits: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -370,6 +375,7 @@ impl Features {
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
 		control_limits: true,
+		http_stream_limits: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

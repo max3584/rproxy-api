@@ -1,7 +1,9 @@
 //! Time limits of client connections of `http` rules (#320 M1, `global.http.timeouts`):
 //! the TLS handshake, the first byte, the first request's headers, connections
 //! without requests (HTTP/2, HTTP/3; HTTP/1.1 waits for the next request with
-//! `request_headers`), HTTP/2 PING, and the time between two reads of a request body.
+//! `request_headers`), HTTP/2 PING, the time between two reads of a request body, a
+//! write to a client that does not read (`write_stall`) and an upgraded connection with
+//! nothing relayed (`upgraded_idle`, #356).
 //! A long upload or download is never cut for its length, only for silence.
 
 use std::future::Future;
@@ -14,6 +16,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Notify;
 use tokio::time::{Instant, Sleep};
 
 use super::server::BoxError;
@@ -44,7 +48,22 @@ pub struct HttpTimeoutsSpec {
 	pub http2_ping_interval: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub http2_ping_timeout: Option<String>,
+	/// v0.4.20 (#356): a write to the client that takes nothing for this long.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub write_stall: Option<String>,
+	/// v0.4.20 (#356): an upgraded connection (WebSocket) with no byte either way for this long.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub upgraded_idle: Option<String>,
+	/// v0.4.20 (#356): streams at once on one HTTP/2 client connection (1-`MAX_HTTP2_STREAMS`).
+	/// Not a time, but kept with the connection's limits (set and put in force the same way).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http2_max_streams: Option<u32>,
 }
+
+/// `http2_max_streams` by default (nginx's `http2_max_concurrent_streams`; hyper's is 200).
+pub const DEFAULT_HTTP2_STREAMS: u32 = 128;
+/// The most `http2_max_streams` may be.
+pub const MAX_HTTP2_STREAMS: u32 = 10_000;
 
 /// The limits in force; `None` is no limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +82,13 @@ pub struct HttpTimeouts {
 	/// HTTP/2 PING every this much without reads, and how long its answer may take.
 	pub http2_ping_interval: Option<Duration>,
 	pub http2_ping_timeout: Duration,
+	/// A write to the client (HTTP/1.1, HTTP/2) that has taken nothing for this long closes
+	/// the connection: a client that stops reading its responses (#356).
+	pub write_stall: Option<Duration>,
+	/// An upgraded connection (WebSocket, `101`) with nothing relayed either way (#356).
+	pub upgraded_idle: Option<Duration>,
+	/// Streams at once on one HTTP/2 client connection (#356).
+	pub http2_max_streams: u32,
 }
 
 impl Default for HttpTimeouts {
@@ -75,12 +101,15 @@ impl Default for HttpTimeouts {
 			request_body_idle: Some(Duration::from_secs(60)),
 			http2_ping_interval: Some(Duration::from_secs(60)),
 			http2_ping_timeout: Duration::from_secs(20),
+			write_stall: Some(Duration::from_secs(60)),
+			upgraded_idle: Some(Duration::from_secs(3600)),
+			http2_max_streams: DEFAULT_HTTP2_STREAMS,
 		}
 	}
 }
 
 impl HttpTimeoutsSpec {
-	fn fields(&self) -> [(&'static str, &Option<String>); 7] {
+	fn fields(&self) -> [(&'static str, &Option<String>); 9] {
 		[
 			("tls_handshake", &self.tls_handshake),
 			("first_byte", &self.first_byte),
@@ -89,6 +118,8 @@ impl HttpTimeoutsSpec {
 			("request_body_idle", &self.request_body_idle),
 			("http2_ping_interval", &self.http2_ping_interval),
 			("http2_ping_timeout", &self.http2_ping_timeout),
+			("write_stall", &self.write_stall),
+			("upgraded_idle", &self.upgraded_idle),
 		]
 	}
 
@@ -101,6 +132,9 @@ impl HttpTimeoutsSpec {
 					return Err("global.http.timeouts.http2_ping_timeout: 0s is not a time to wait".into());
 				}
 			}
+		}
+		if self.http2_max_streams.is_some_and(|n| n == 0 || n > MAX_HTTP2_STREAMS) {
+			return Err(format!("global.http.timeouts.http2_max_streams: 1-{MAX_HTTP2_STREAMS}"));
 		}
 		Ok(())
 	}
@@ -120,6 +154,9 @@ impl HttpTimeoutsSpec {
 			request_body_idle: get(&self.request_body_idle, d.request_body_idle),
 			http2_ping_interval: get(&self.http2_ping_interval, d.http2_ping_interval),
 			http2_ping_timeout: get(&self.http2_ping_timeout, Some(d.http2_ping_timeout)).unwrap_or(d.http2_ping_timeout),
+			write_stall: get(&self.write_stall, d.write_stall),
+			upgraded_idle: get(&self.upgraded_idle, d.upgraded_idle),
+			http2_max_streams: self.http2_max_streams.unwrap_or(d.http2_max_streams),
 		}
 	}
 }
@@ -388,6 +425,170 @@ where
 	}
 }
 
+/// When the writes to a client began to wait (#356, `write_stall`): set by `Stalling` when a
+/// write or flush cannot go on, cleared when one goes on again.
+pub struct Stall {
+	started: Instant,
+	/// Milliseconds from `started` + 1 when the wait began; 0 while writes go on.
+	since: AtomicU64,
+	began: Notify,
+}
+
+impl Stall {
+	pub fn new() -> Arc<Stall> {
+		Arc::new(Stall { started: Instant::now(), since: AtomicU64::new(0), began: Notify::new() })
+	}
+
+	fn begin(&self) {
+		self.since.store(self.started.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+		self.began.notify_one();
+	}
+
+	fn end(&self) {
+		self.since.store(0, Ordering::Relaxed);
+	}
+
+	/// Returns once a write has waited for `limit` without taking anything; never without a limit.
+	pub async fn expired(&self, limit: Option<Duration>) {
+		let Some(limit) = limit else { return std::future::pending().await };
+		loop {
+			match self.since.load(Ordering::Relaxed) {
+				0 => self.began.notified().await,
+				ms => {
+					let at = self.started + Duration::from_millis(ms - 1) + limit;
+					if Instant::now() >= at {
+						return;
+					}
+					tokio::time::sleep_until(at).await;
+				}
+			}
+		}
+	}
+}
+
+/// A client connection whose writes are watched by a `Stall`. Only the changes between
+/// going on and waiting touch it (not every write).
+pub struct Stalling<S> {
+	inner: S,
+	stall: Arc<Stall>,
+	waiting: bool,
+}
+
+impl<S> Stalling<S> {
+	pub fn new(inner: S, stall: Arc<Stall>) -> Self {
+		Stalling { inner, stall, waiting: false }
+	}
+
+	fn watch<T>(&mut self, poll: Poll<T>) -> Poll<T> {
+		match (&poll, self.waiting) {
+			(Poll::Pending, false) => {
+				self.waiting = true;
+				self.stall.begin();
+			}
+			(Poll::Ready(_), true) => {
+				self.waiting = false;
+				self.stall.end();
+			}
+			_ => {}
+		}
+		poll
+	}
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Stalling<S> {
+	fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+		Pin::new(&mut self.inner).poll_read(cx, buf)
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Stalling<S> {
+	fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+		let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+		self.watch(poll)
+	}
+
+	fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+		let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+		self.watch(poll)
+	}
+
+	fn is_write_vectored(&self) -> bool {
+		self.inner.is_write_vectored()
+	}
+
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		let poll = Pin::new(&mut self.inner).poll_flush(cx);
+		self.watch(poll)
+	}
+
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
+		self.watch(poll)
+	}
+}
+
+/// One side of an upgraded connection (#356, `upgraded_idle`): counts the reads and writes
+/// that move bytes, for `quiet`.
+pub struct Counted<S> {
+	inner: S,
+	moved: Arc<AtomicU64>,
+}
+
+impl<S> Counted<S> {
+	pub fn new(inner: S) -> (Self, Arc<AtomicU64>) {
+		let moved = Arc::new(AtomicU64::new(0));
+		(Counted { inner, moved: moved.clone() }, moved)
+	}
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
+	fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+		let before = buf.filled().len();
+		let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+		if buf.filled().len() > before {
+			self.moved.fetch_add(1, Ordering::Relaxed);
+		}
+		poll
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
+	fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+		let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+		if matches!(poll, Poll::Ready(Ok(n)) if n > 0) {
+			self.moved.fetch_add(1, Ordering::Relaxed);
+		}
+		poll
+	}
+
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		Pin::new(&mut self.inner).poll_flush(cx)
+	}
+
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		Pin::new(&mut self.inner).poll_shutdown(cx)
+	}
+}
+
+/// Returns once `moved` has not changed for `idle` (looked at every quarter of it, so it is
+/// noticed within 1.25 × `idle`); never without a limit.
+pub async fn quiet(moved: &AtomicU64, idle: Option<Duration>) {
+	let Some(idle) = idle else { return std::future::pending().await };
+	let step = (idle / 4).max(Duration::from_millis(10));
+	let mut seen = moved.load(Ordering::Relaxed);
+	let mut since = Instant::now();
+	loop {
+		tokio::time::sleep(step).await;
+		let now = moved.load(Ordering::Relaxed);
+		if now != seen {
+			seen = now;
+			since = Instant::now();
+		} else if since.elapsed() >= idle {
+			return;
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -505,5 +706,59 @@ mod tests {
 		let busy = a.begin();
 		assert!(tokio::time::timeout(MS(300), a.expired(&AtomicU64::new(3), &t)).await.is_err());
 		drop(busy);
+	}
+
+	#[test]
+	fn write_stall_and_upgraded_idle_have_defaults() {
+		let t = HttpTimeouts::default();
+		assert_eq!((t.write_stall, t.upgraded_idle), (Some(Duration::from_secs(60)), Some(Duration::from_secs(3600))));
+		let t = HttpTimeoutsSpec { write_stall: Some("0s".into()), upgraded_idle: Some("5m".into()), ..Default::default() }.resolve();
+		assert_eq!((t.write_stall, t.upgraded_idle), (None, Some(Duration::from_secs(300))));
+		assert!(HttpTimeoutsSpec { upgraded_idle: Some("later".into()), ..Default::default() }.check().is_err());
+		assert_eq!(HttpTimeouts::default().http2_max_streams, 128);
+		assert_eq!(HttpTimeoutsSpec { http2_max_streams: Some(500), ..Default::default() }.resolve().http2_max_streams, 500);
+		assert!(HttpTimeoutsSpec { http2_max_streams: Some(0), ..Default::default() }.check().is_err());
+	}
+
+	#[tokio::test]
+	async fn a_write_that_waits_too_long_is_noticed() {
+		let stall = Stall::new();
+		// nothing waits: never
+		assert!(tokio::time::timeout(MS(200), stall.expired(Some(MS(50)))).await.is_err());
+		stall.begin();
+		tokio::time::sleep(MS(30)).await;
+		stall.end();
+		assert!(tokio::time::timeout(MS(200), stall.expired(Some(MS(50)))).await.is_err(), "it went on in time");
+		let watch = stall.expired(Some(MS(100)));
+		tokio::pin!(watch);
+		assert!(tokio::time::timeout(MS(50), watch.as_mut()).await.is_err());
+		stall.begin();
+		let started = std::time::Instant::now();
+		watch.await;
+		assert!(started.elapsed() >= MS(90), "{:?}", started.elapsed());
+		assert!(tokio::time::timeout(MS(200), stall.expired(None)).await.is_err(), "no limit");
+	}
+
+	#[tokio::test]
+	async fn quiet_waits_for_no_bytes_either_way() {
+		let (mut a, b) = tokio::io::duplex(64);
+		let (mut counted, moved) = Counted::new(b);
+		let watch = quiet(&moved, Some(MS(200)));
+		tokio::pin!(watch);
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		for _ in 0..4 {
+			tokio::select! {
+				() = &mut watch => panic!("not quiet"),
+				_ = async {
+					tokio::time::sleep(MS(100)).await;
+					a.write_all(b"x").await.unwrap();
+					let mut one = [0u8; 1];
+					counted.read_exact(&mut one).await.unwrap();
+				} => {}
+			}
+		}
+		let started = std::time::Instant::now();
+		watch.await;
+		assert!(started.elapsed() >= MS(150) && started.elapsed() < MS(400), "{:?}", started.elapsed());
 	}
 }
