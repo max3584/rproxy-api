@@ -344,7 +344,16 @@ impl Unreplied {
 		} else {
 			most > first && t.evict_in(heaviest)
 		};
-		evicted || oldest.evict()
+		if evicted || oldest.evict() {
+			return true;
+		}
+		// lost to a session finishing meanwhile: the next oldest, as long as there is one
+		while let Some(w) = t.oldest().cloned() {
+			if w.evict() {
+				return true;
+			}
+		}
+		false
 	}
 
 	#[cfg(test)]
@@ -359,7 +368,10 @@ struct Mark(Arc<Waiting>);
 impl Mark {
 	/// The backend answered (DTLS: the handshake is through): not one to evict any more.
 	fn replied(&self) {
-		self.0.finish();
+		// established sessions call this for each datagram: a load, no read-modify-write
+		if !self.0.is_done() {
+			self.0.finish();
+		}
 	}
 
 	fn is_replied(&self) -> bool {
