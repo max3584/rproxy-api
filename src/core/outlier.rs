@@ -10,7 +10,7 @@
 //! (`target.up`, `reason: outlier`).
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -290,6 +290,11 @@ pub struct Ejection {
 	until_unix: AtomicU64,
 	ejections: AtomicU64,
 	counts: Mutex<Counts>,
+	/// A task of `after` is waiting for the end of the ejection (at most one, #359). Set
+	/// by the `after` that spawns it and kept while it waits: later calls see it and leave
+	/// the waiting to that task, which reads `until` again each time it wakes. Only the task
+	/// clears it, when it ends, and then looks once more for an ejection that came meanwhile.
+	timer: AtomicBool,
 }
 
 impl std::fmt::Debug for Ejection {
@@ -415,17 +420,44 @@ impl Ejection {
 	}
 }
 
-/// Runs `back` once the ejection that ends at `until` is over, unless another
-/// one replaced it or `ejection` is gone (the rule changed or was deleted).
-pub fn after(ejection: &Arc<Ejection>, until: u64, length: Duration, back: impl FnOnce() + Send + 'static) {
+/// Runs `back` once the current ejection of `ejection` is over, unless it was cleared
+/// (`Ejection::clear`) or `ejection` is gone (the rule changed or was deleted). One task
+/// per `Ejection` (#359): while one waits, a call for an ejection started over (a target
+/// tried and failing again while every target is out) only moves its deadline, and its
+/// `back` is dropped (the waiting task's, for the same target, runs).
+pub fn after(ejection: &Arc<Ejection>, back: impl FnOnce() + Send + 'static) {
 	if tokio::runtime::Handle::try_current().is_err() {
+		return;
+	}
+	if ejection.timer.swap(true, Ordering::AcqRel) {
 		return;
 	}
 	let ejection = Arc::downgrade(ejection);
 	tokio::spawn(async move {
-		tokio::time::sleep(length).await;
-		if ejection.upgrade().is_some_and(|e| e.ends_at(until)) {
-			back();
+		loop {
+			let Some(e) = ejection.upgrade() else { return };
+			let until = e.until.load(Ordering::Relaxed);
+			let now = now_ms();
+			if until != 0 && now < until {
+				drop(e);
+				tokio::time::sleep(Duration::from_millis(until - now)).await;
+				continue;
+			}
+			e.timer.store(false, Ordering::Release);
+			// an ejection started between the load and the store saw the timer still there
+			let again = e.until.load(Ordering::Relaxed);
+			if again != until {
+				if again != 0 && !e.timer.swap(true, Ordering::AcqRel) {
+					continue;
+				}
+				return;
+			}
+			// not when ejected again meanwhile (that ejection's `after` takes the timer)
+			if until != 0 && !e.is_ejected() {
+				drop(e);
+				back();
+			}
+			return;
 		}
 	});
 }
@@ -537,6 +569,38 @@ mod tests {
 		assert_eq!(e.ejections(), 3);
 		e.clear();
 		assert!(!e.is_ejected());
+	}
+
+	#[tokio::test]
+	async fn one_timer_per_ejection() {
+		// #359: a target failing again and again while ejected (every target is down) does
+		// not pile up timer tasks; the one there follows the deadline and calls back once
+		let e = Arc::new(Ejection::default());
+		let cfg = Ejecting { time: Duration::from_millis(150), max_time: Duration::from_millis(150), max_percent: 100 };
+		let backs = Arc::new(AtomicU64::new(0));
+		for _ in 0..50 {
+			e.eject(&cfg);
+			let backs = backs.clone();
+			after(&e, move || {
+				backs.fetch_add(1, Ordering::Relaxed);
+			});
+			assert!(e.timer.load(Ordering::Relaxed));
+			tokio::time::sleep(Duration::from_millis(2)).await;
+		}
+		assert_eq!(backs.load(Ordering::Relaxed), 0, "still ejected");
+		tokio::time::sleep(Duration::from_millis(400)).await;
+		assert_eq!(backs.load(Ordering::Relaxed), 1);
+		assert!(!e.timer.load(Ordering::Relaxed) && !e.is_ejected());
+		// cleared while waiting: no call back
+		e.eject(&cfg);
+		let b = backs.clone();
+		after(&e, move || {
+			b.fetch_add(1, Ordering::Relaxed);
+		});
+		e.clear();
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert_eq!(backs.load(Ordering::Relaxed), 1);
+		assert!(!e.timer.load(Ordering::Relaxed));
 	}
 
 	#[test]
