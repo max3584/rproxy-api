@@ -579,8 +579,10 @@ fn request_body(
 						Err(e) => Err(BoxError::new(e)),
 					};
 					let failed = frame.is_err();
-					// the handler dropped the body (answered without reading it)
-					if tx.send(frame).await.is_err() {
+					// the handler dropped the body (answered without reading it); one that has all
+					// of its Content-Length (also with this frame) reads on to its end, which the
+					// grace below bounds
+					if tx.send(frame).await.is_err() && !complete.load(Ordering::Relaxed) {
 						return Some(h3::error::Code::H3_NO_ERROR);
 					}
 					if failed {
@@ -603,7 +605,9 @@ fn request_body(
 				// with H3_NO_ERROR, or code 0 when the stream is dropped in the middle of a read.
 				// A body with all of its Content-Length is not stopped: its end may still be on the
 				// way (a lost packet, a busy client), and a client told to stop would see its
-				// request fail although the response is complete
+				// request fail although the response is complete. After `BODY_END_GRACE` without
+				// the end it is stopped all the same: the reader is then in the middle of a read,
+				// so the stream is usually just dropped (quinn's code 0), not told H3_NO_ERROR
 				_ = tx.closed() => if complete.load(Ordering::Relaxed) {
 					tokio::select! {
 						biased;

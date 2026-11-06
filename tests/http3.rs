@@ -550,3 +550,25 @@ async fn http3_complete_bodies_wait_for_a_late_end() {
 	let r = stream.finish().await;
 	assert!(r.is_ok(), "{r:?}");
 }
+
+/// The wait for the end of a complete body is bounded: a client that never ends its stream is
+/// told to stop after 5 s (`BODY_END_GRACE`).
+#[tokio::test]
+async fn http3_complete_bodies_without_an_end_are_stopped() {
+	let pki = Pki::new("h3-no-fin");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, backend("A").await)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let req = hyper::Request::post("https://a.test/upload").header("content-length", "3").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.send_data(Bytes::from_static(b"abc")).await.unwrap();
+	let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response()).await.expect("an answer").unwrap();
+	assert_eq!(resp.status().as_u16(), 200);
+	while let Some(_chunk) = stream.recv_data().await.unwrap() {}
+	// past the grace the stream is stopped, and ending it now fails
+	tokio::time::sleep(Duration::from_secs(7)).await;
+	let r = stream.finish().await;
+	assert!(r.is_err(), "{r:?}");
+}
