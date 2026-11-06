@@ -294,3 +294,230 @@ async fn http3_gets_are_cached_unless_they_carry_a_body() {
 	assert_eq!(x_cache(&mut send, b"").await, "HIT");
 	assert_eq!(x_cache(&mut send, b"body").await, "BYPASS");
 }
+
+/// One request with `content-length: length` and `body`; the status, or None when the stream
+/// was reset (the client may also see its own sending fail).
+async fn h3_post_length(send: &mut H3Send, length: &str, body: &'static [u8]) -> Option<(u16, Bytes)> {
+	let req = hyper::Request::post("https://a.test/upload").header("content-length", length).body(()).unwrap();
+	let mut stream = send.send_request(req).await.ok()?;
+	let _ = stream.send_data(Bytes::from_static(body)).await;
+	let _ = stream.finish().await;
+	let resp = tokio::time::timeout(Duration::from_secs(5), stream.recv_response()).await.expect("an answer").ok()?;
+	let mut out = vec![];
+	while let Ok(Some(mut chunk)) = stream.recv_data().await {
+		out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+	}
+	Some((resp.status().as_u16(), out.into()))
+}
+
+/// #355: h3 does not compare the DATA frames with Content-Length; the proxy does, and a body
+/// longer or shorter than it said does not reach the backend as a complete one.
+#[tokio::test]
+async fn http3_bodies_must_match_their_content_length() {
+	let pki = Pki::new("h3-length");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, backend("A").await)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+
+	let (status, body) = h3_post_length(&mut send, "3", b"abc").await.unwrap();
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!((status, v["body"].as_str()), (200, Some("abc")), "{v}");
+	// leading zeros are still a number (RFC 9110 8.6: 1*DIGIT)
+	let (status, body) = h3_post_length(&mut send, "05", b"01234").await.unwrap();
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!((status, v["body"].as_str()), (200, Some("01234")), "{v}");
+	for (length, body) in [("5", &b"0123456789"[..]), ("10", &b"abc"[..])] {
+		let answer = h3_post_length(&mut send, length, body).await;
+		assert!(answer.as_ref().is_none_or(|(status, _)| *status != 200), "content-length {length}: {answer:?}");
+	}
+	// not a number: a 400 without asking the backend
+	for length in ["x", "01x", "-1"] {
+		let answer = h3_post_length(&mut send, length, b"").await;
+		assert_eq!(answer.as_ref().map(|(status, _)| *status), Some(400), "content-length {length}: {answer:?}");
+	}
+	// the connection is still good for the next request
+	let (status, _) = h3_post_length(&mut send, "2", b"ok").await.unwrap();
+	assert_eq!(status, 200);
+}
+
+/// #355: one QUIC connection is one connection of the rule's `limits`, held until it ends.
+#[tokio::test]
+async fn http3_connections_count_in_limits() {
+	let pki = Pki::new("h3-limits");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let mut rule = h3_rule(port, &cert, backend("A").await);
+	rule["limits"] = json!({"max_connections": 1});
+	assert_eq!(h.post(rule).await.0, StatusCode::CREATED);
+
+	let (mut send, ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	assert_eq!(h3_request(&mut send, "GET", "https://a.test/", b"").await.0, StatusCode::OK);
+	assert!(h3_connect(&pki, port, "a.test").await.is_err(), "a second connection is over max_connections");
+	let (_, v) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
+	assert!(v["stats"]["limited"].as_u64().unwrap() >= 1, "{v}");
+
+	// the first one ends: its place is free again
+	drop(send);
+	ep.close(0u32.into(), b"bye");
+	let mut free = false;
+	for _ in 0..50 {
+		if let Ok((mut send, _ep)) = h3_connect(&pki, port, "a.test").await {
+			assert_eq!(h3_request(&mut send, "GET", "https://a.test/", b"").await.0, StatusCode::OK);
+			free = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert!(free, "the place was not given back");
+}
+
+/// #355: a client whose address is not validated gets a Retry before the handshake; it
+/// then connects as usual. The packets go through a relay that looks at them.
+#[tokio::test]
+async fn http3_validates_addresses_with_retry() {
+	let pki = Pki::new("h3-retry");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, backend("A").await)).await.0, StatusCode::CREATED);
+
+	let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let relay_port = relay.local_addr().unwrap().port();
+	let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	upstream.connect(("127.0.0.1", port)).await.unwrap();
+	let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let seen = retries.clone();
+	tokio::spawn(async move {
+		let (mut a, mut b) = (vec![0u8; 65536], vec![0u8; 65536]);
+		let mut client = None;
+		loop {
+			tokio::select! {
+				r = relay.recv_from(&mut a) => {
+					let (n, from) = r.unwrap();
+					client = Some(from);
+					let _ = upstream.send(&a[..n]).await;
+				}
+				r = upstream.recv(&mut b) => {
+					let n = r.unwrap();
+					// QUIC v1 long header, packet type Retry (RFC 9000 17.2.5)
+					if n > 5 && b[0] & 0xc0 == 0xc0 && (b[0] >> 4) & 0x3 == 0x3 && b[1..5] == [0, 0, 0, 1] {
+						seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+					}
+					if let Some(c) = client {
+						let _ = relay.send_to(&b[..n], c).await;
+					}
+				}
+			}
+		}
+	});
+	let (mut send, _ep) = h3_connect(&pki, relay_port, "a.test").await.unwrap();
+	assert_eq!(h3_request(&mut send, "GET", "https://a.test/", b"").await.0, StatusCode::OK);
+	assert_eq!(retries.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// A backend answering a GET with 1 MiB, and a POST with the length of its body.
+async fn sized_backend() -> SocketAddr {
+	let app = axum::Router::new().fallback(|method: axum::http::Method, body: axum::body::Bytes| async move {
+		if method == axum::http::Method::GET { vec![b'x'; 1 << 20] } else { body.len().to_string().into_bytes() }
+	});
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	addr
+}
+
+/// #355: the rule's `bandwidth` paces HTTP/3 bodies too, both ways.
+#[tokio::test]
+async fn http3_bodies_follow_bandwidth() {
+	let pki = Pki::new("h3-bandwidth");
+	let cert = pki.server("front", &["a.test"]);
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let mut rule = h3_rule(port, &cert, sized_backend().await);
+	rule["bandwidth"] = json!({"download": "4Mbps", "upload": "4Mbps"});
+	assert_eq!(h.post(rule).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+
+	// 1 MiB at 500 kB/s
+	let started = std::time::Instant::now();
+	let req = hyper::Request::get("https://a.test/big").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.finish().await.unwrap();
+	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 200);
+	let mut n = 0;
+	while let Some(chunk) = stream.recv_data().await.unwrap() {
+		n += chunk.remaining();
+	}
+	let took = started.elapsed();
+	assert_eq!(n, 1 << 20);
+	assert!(took >= Duration::from_millis(1600), "download {took:?}");
+
+	let started = std::time::Instant::now();
+	let req = hyper::Request::post("https://a.test/up").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	for _ in 0..16 {
+		stream.send_data(Bytes::from(vec![b'y'; 64 << 10])).await.unwrap();
+	}
+	stream.finish().await.unwrap();
+	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 200);
+	let mut out = vec![];
+	while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+		out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+	}
+	let took = started.elapsed();
+	assert_eq!(out, (1 << 20).to_string().into_bytes());
+	assert!(took >= Duration::from_millis(1600), "upload {took:?}");
+}
+
+/// #355: a request answered without reading its body (here by basic_auth) tells the client
+/// to stop sending it, also when the client sends nothing more for a while.
+#[tokio::test]
+async fn http3_unread_bodies_are_stopped() {
+	let pki = Pki::new("h3-stop");
+	let cert = pki.server("front", &["a.test"]);
+	let users = std::path::Path::new(&cert.cert_file).with_file_name("users");
+	std::fs::write(&users, format!("alice:{}\n", bcrypt::hash("pw", 4).unwrap())).unwrap();
+	let h = harness().await;
+	let port = free_tcp_udp_port();
+	let mut rule = h3_rule(port, &cert, backend("A").await);
+	rule["http"]["routes"][0]["middlewares"] = json!(["auth"]);
+	rule["http"]["middlewares"] = json!({"auth": {"basic_auth": {"users_file": users}}});
+	assert_eq!(h.post(rule).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let req = hyper::Request::post("https://a.test/upload").body(()).unwrap();
+	let mut stream = send.send_request(req).await.unwrap();
+	stream.send_data(Bytes::from_static(b"part")).await.unwrap();
+	assert_eq!(stream.recv_response().await.unwrap().status().as_u16(), 401);
+	// told as soon as the handler lets the body go, not only once the client sends more
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let r = stream.send_data(Bytes::from_static(b"more")).await;
+	assert!(r.is_err(), "{r:?}");
+}
+
+/// #355: QUIC's idle timeout is not shorter than 30 s, and the proxy PINGs quiet connections:
+/// a short `global.http.timeouts.idle` (which counts time without requests) does not cut a
+/// request whose backend takes longer than it.
+#[tokio::test]
+async fn http3_slow_backends_outlast_a_short_idle() {
+	let pki = Pki::new("h3-idle");
+	let cert = pki.server("front", &["a.test"]);
+	let spec: rproxy_api::l7::timeouts::HttpTimeoutsSpec = serde_json::from_value(json!({"idle": "1s"})).unwrap();
+	spec.check().unwrap();
+	let global = rproxy_api::l7::access::HttpGlobal::default().with_timeouts(spec.resolve());
+	let h = harness_with_global(rproxy_api::control::auth::Tokens::disabled(), global).await;
+	let app = axum::Router::new().fallback(|| async {
+		tokio::time::sleep(Duration::from_secs(3)).await;
+		"late"
+	});
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let slow = listener.local_addr().unwrap();
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	let port = free_tcp_udp_port();
+	assert_eq!(h.post(h3_rule(port, &cert, slow)).await.0, StatusCode::CREATED);
+	let (mut send, _ep) = h3_connect(&pki, port, "a.test").await.unwrap();
+	let (status, v) = h3_request(&mut send, "GET", "https://a.test/slow", b"").await;
+	assert_eq!((status, v.as_str()), (StatusCode::OK, Some("late")));
+}

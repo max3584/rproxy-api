@@ -493,3 +493,68 @@ async fn rules_may_not_name_the_key_file() {
 	assert!(!v["error"].as_str().unwrap().contains("cs-key-SECRET"), "{v}");
 	b.stop();
 }
+
+/// A backend answering with its tag; the paths of the requests whose body arrived whole.
+async fn tagged_backend(tag: &'static str, whole: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+	let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+		let whole = whole.clone();
+		async move {
+			let path = req.uri().path().to_string();
+			if axum::body::to_bytes(req.into_body(), 1 << 20).await.is_ok() {
+				whole.lock().unwrap().push(path);
+			}
+			tag
+		}
+	});
+	serve(app).await
+}
+
+/// #355: a body AppSec could not read (here: the client stops sending, and
+/// `request_body_idle` ends it) is let through by `on_error: allow` as a failed body: the
+/// backend sees the request cut short or not at all, never a complete one, and the server is not blamed
+/// for it (outlier_detection keeps it).
+#[tokio::test]
+async fn appsec_lets_a_failed_body_through_as_failed() {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	let lapi = Shared::default();
+	lapi.lock().unwrap().key = "appsec-key".into();
+	let lapi_addr = fake_lapi(lapi.clone()).await;
+	let appsec = fake_appsec(Seen::default()).await;
+	let key = key_file("appsec-failed", "appsec-key");
+	let b = bouncer(&format!("http://{lapi_addr}"), &key, Some(format!("http://{appsec}")));
+	let spec: rproxy_api::l7::timeouts::HttpTimeoutsSpec = serde_json::from_value(json!({"request_body_idle": "300ms"})).unwrap();
+	spec.check().unwrap();
+	let global = HttpGlobal::without_file(&["127.0.0.0/8".to_string()]).with_crowdsec(Some(b.clone())).with_timeouts(spec.resolve());
+	let h = harness_with_global(Tokens::disabled(), global).await;
+	let whole = Arc::new(Mutex::new(vec![]));
+	let (a, other) = (tagged_backend("A", whole.clone()).await, tagged_backend("B", whole.clone()).await);
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"routes": [{"name": "all", "match": "PathPrefix(`/`)", "service": "s", "middlewares": ["waf"]}],
+				"services": {"s": {"servers": [{"url": format!("http://{a}")}, {"url": format!("http://{other}")}], "balance": "failover",
+					"outlier_detection": {"consecutive_gateway_failures": 1, "consecutive_5xx": 1, "max_ejected_percent": 50}}},
+				"middlewares": {"waf": {"crowdsec": {"appsec": true, "on_error": "allow"}}},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	eventually("the first pull", || async { b.synced() }).await;
+
+	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	tcp.write_all(b"POST /up HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Forwarded-For: 192.0.2.5\r\nContent-Length: 100\r\n\r\n0123456789")
+		.await
+		.unwrap();
+	let mut answer = vec![0u8; 1024];
+	let n = tokio::time::timeout(Duration::from_secs(10), tcp.read(&mut answer)).await.unwrap().unwrap();
+	let answer = String::from_utf8_lossy(&answer[..n]).to_string();
+	assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+	// the first server was not ejected for the client's failure
+	let (status, body) = send(port, reqwest::Method::POST, "/next", "192.0.2.5", "fine").await;
+	assert_eq!((status, body.as_str()), (StatusCode::OK, "A"));
+	assert_eq!(*whole.lock().unwrap(), vec!["/next".to_string()], "no backend got /up whole");
+	b.stop();
+}
