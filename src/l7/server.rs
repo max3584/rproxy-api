@@ -1356,6 +1356,10 @@ impl Conn {
 					Some(page) => {
 						let (mut parts, body) = page.into_parts();
 						parts.status = resp.status();
+						// a 503 for the descriptor budget stays one for a `circuit_breaker` before (#373)
+						if let Some(mark) = resp.extensions().get::<BudgetRefused>() {
+							parts.extensions.insert(*mark);
+						}
 						Response::from_parts(parts, body)
 					}
 					None => resp,
@@ -1492,7 +1496,7 @@ impl Conn {
 					"the auth server did not answer");
 				AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }))
 			}
-			Err(Failure::Budget) => AuthOutcome::Deny(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+			Err(Failure::Budget) => AuthOutcome::Deny(budget_response()),
 		}
 	}
 
@@ -1578,7 +1582,7 @@ impl Conn {
 				failed(&error);
 				return AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }));
 			}
-			Err(Failure::Budget) => return AuthOutcome::Deny(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+			Err(Failure::Budget) => return AuthOutcome::Deny(budget_response()),
 		};
 		let (head, body) = resp.into_parts();
 		let collected = match http_body_util::Limited::new(body, ext_authz::MAX_RESPONSE).collect().await {

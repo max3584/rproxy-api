@@ -111,7 +111,7 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	let h = harness().await;
 	let echo = tcp_backend("E:").await;
 	let web = closing_backend().await;
-	let (tcp_port, http_port) = (free_port(), free_port());
+	let (tcp_port, http_port, auth_port) = (free_port(), free_port(), free_port());
 	let (status, v) = h.post(rule("tcp", tcp_port, echo)).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	let (status, v) = h
@@ -121,6 +121,14 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 				"middlewares": {"cb": {"circuit_breaker": {"failure_percent": 50, "window": "10s", "recovery": "1m"}}},
 				"services": {"s": {"servers": [{"url": format!("http://{web}")}],
 					"outlier_detection": {"consecutive_5xx": 1, "consecutive_gateway_failures": 1, "ejection_time": "1m", "max_ejected_percent": 100}}}}}))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// a breaker before forward_auth: the auth server's connection is refused for the budget too
+	let (status, v) = h
+		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": auth_port,
+			"http": {"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{web}"), "middlewares": ["cb", "fa"]}],
+				"middlewares": {"cb": {"circuit_breaker": {"failure_percent": 50, "window": "10s", "recovery": "1m"}},
+					"fa": {"forward_auth": {"address": format!("http://{web}/verify")}}}}}))
 		.await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	assert_eq!(budget::in_use(), 0, "health checks and listeners take none");
@@ -153,7 +161,8 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	assert!(closed_at_once(http_port).await, "no room for 2");
 	drop(a);
 	in_use_becomes(1).await;
-	let mut y = TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+	// through forward_auth: its connection and the server's, each closed after the answer
+	let mut y = TcpStream::connect(("127.0.0.1", auth_port)).await.unwrap();
 	assert_eq!(request(&mut y).await, Some(200));
 	in_use_becomes(2).await;
 	let b = tcp_served(tcp_port).await.expect("a relay in the 2 left");
@@ -161,11 +170,14 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	// no room for a connection to the server: 503, and the client's connection stays
 	assert_eq!(request(&mut x).await, Some(503));
 	assert_eq!(request(&mut y).await, Some(503));
-	// past the breaker's 10 requests at least
+	// past the breakers' 10 requests at least
 	for _ in 0..12 {
 		assert_eq!(request(&mut x).await, Some(503));
+		assert_eq!(request(&mut y).await, Some(503), "forward_auth cannot reach its server");
 	}
-	assert_eq!(fd_budget_refused(&metrics(&h).await, http_port), 16, "2 connections + fourteen 503s");
+	let m = metrics(&h).await;
+	assert_eq!(fd_budget_refused(&m, http_port), 15, "2 connections + thirteen 503s");
+	assert_eq!(fd_budget_refused(&m, auth_port), 13, "thirteen 503s");
 	// a full budget is not the server's doing: neither outlier_detection nor the breaker counts it
 	let (_, r) = h.get(&format!("/rules/tcp/127.0.0.1/{http_port}")).await;
 	let server = &r["stats"]["http"]["services"]["s"][0];
@@ -176,6 +188,8 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	drop(b);
 	in_use_becomes(2).await;
 	assert_eq!(request(&mut x).await, Some(200), "the breaker stayed closed");
+	in_use_becomes(2).await;
+	assert_eq!(request(&mut y).await, Some(200), "the breaker before forward_auth stayed closed");
 	drop((x, y));
 	in_use_becomes(0).await;
 	let a = tcp_served(tcp_port).await.expect("served again");

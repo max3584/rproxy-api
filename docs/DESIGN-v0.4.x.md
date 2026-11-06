@@ -502,7 +502,7 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - splice のパイプ：`splice::Pipe::open` が新しいパイプを作るときに `Ticket::take(2)` を `PipeFds` に入れる（プールにあるあいだも持つ。プールは 8 本まで）。取れなければ EMFILE と同じく、その向きはユーザー空間のコピー。
 - HTTP/3 は QUIC の接続ごとに取らない（1 つの UDP のソケット）。転送先への接続は上の `connect` で取る。
 - UDP のセッションを枠で断ったときの `reason` も `fd_budget`（ルールの上限の `max_connections` と区別できるように。UDP の枠（#354・#370）はまだ出していないので、出す版から `fd_budget`）。
-- 受け身のヘルスチェック・`circuit_breaker`：枠で断った 503 は転送先のせいではないので、`send` は `Failure::Budget` を `outlier_detection` に渡さず、503 の応答に `BudgetRefused` の印を付けて `circuit_breaker` も数えない（数えると、枠が埋まったときにすべての転送先が外れる。レビューの M1）。
+- 受け身のヘルスチェック・`circuit_breaker`：枠で断った 503 は転送先のせいではないので、`send` は `Failure::Budget` を `outlier_detection` に渡さず、503 の応答（`forward_auth`・gRPC の `forward_auth` の断りも）に `BudgetRefused` の印を付けて `circuit_breaker` も数えない（`errors` がエラーページに替えても印を移す。数えると、枠が埋まったときにすべての転送先が外れる。レビューの M1）。
 - 中継あたりの数：splice している中継は、向きごとのパイプでさらに 2 本（4 つ）まで持つ。
 - 結合テストは `main` を通らないので、`tests/common` の harness が `budget::raise_nofile_limit`（`main` と共有）でソフトの上限をハードの上限まで上げる（ソフトが 1024 だと枠が 256 になり、多くの接続を開くテストが断られる）。
 - 数：`Stats.fd_budget`（`target_full` と同じく `limited` の配列の外。引き継ぎの `Counters.fd_budget` は `#[serde(default)]` で足すだけ）。`/metrics` の `rproxy_session_budget_in_use`・`_limit` の説明を TCP・`http` を含むものに直した。
