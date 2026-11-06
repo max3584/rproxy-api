@@ -1410,21 +1410,30 @@ const FROM_HOSTILE: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 4);
 
 /// A DTLS echo server: `tag` + each datagram. Not `dtls::listener`: it never
 /// forgets a peer address, and rproxy's upstream ports come round again under
-/// the load, so a new session would land in a finished connection.
+/// the load, so a new session would land in a finished connection. Nor in one still
+/// waiting for its handshake: a client that sent only a ClientHello (an attack) and
+/// went away leaves one for 15 s while rproxy lets its session (and the port) go
+/// after 5 s. The crate keeps the random of the first ClientHello, so a new client
+/// there would get a ServerKeyExchange signed over another random. A first
+/// ClientHello (no cookie) with a new random starts a new connection.
 async fn dtls_backend(issued: &Issued, tag: &'static str) -> SocketAddr {
 	let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
 	let addr = sock.local_addr().unwrap();
 	let config =
 		DtlsConfig { certificates: vec![issued.dtls()], extended_master_secret: ExtendedMasterSecretType::Require, ..Default::default() };
 	tokio::spawn(async move {
-		let mut peers: HashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
+		// each peer's connection, and the random of the ClientHello that opened it
+		let mut peers: HashMap<SocketAddr, (Feed, Option<Vec<u8>>)> = HashMap::new();
 		let mut buf = vec![0u8; 65536];
 		while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-			// a peer whose connection ended starts a new one
-			let tx = peers.entry(peer).or_insert_with(|| tokio::sync::mpsc::channel(1).0);
-			if tx.is_closed() {
+			let random = first_hello_random(&buf[..n]);
+			let (tx, opened_by) = peers.entry(peer).or_insert_with(|| (tokio::sync::mpsc::channel(1).0, None));
+			// a peer whose connection ended starts a new one, and so does a new client
+			if tx.is_closed() || random.as_ref().is_some_and(|r| opened_by.as_ref() != Some(r)) {
 				let (new_tx, rx) = tokio::sync::mpsc::channel(64);
+				// the old connection, if any, sees its peer gone and ends
 				*tx = new_tx;
+				*opened_by = random;
 				let pc = Arc::new(PeerConn { sock: sock.clone(), peer, rx: tokio::sync::Mutex::new(rx) });
 				let config = config.clone();
 				tokio::spawn(async move {
@@ -1446,6 +1455,17 @@ async fn dtls_backend(issued: &Issued, tag: &'static str) -> SocketAddr {
 		}
 	});
 	addr
+}
+
+/// What feeds one connection of `dtls_backend` its datagrams.
+type Feed = tokio::sync::mpsc::Sender<Vec<u8>>;
+
+/// The random of a first ClientHello (epoch 0, no cookie, the fragment at offset 0).
+fn first_hello_random(d: &[u8]) -> Option<Vec<u8>> {
+	// record header 13 bytes, handshake header 12, client_version 2, random 32, session_id
+	let first = d.len() > 60 && d[0] == 0x16 && d[3..5] == [0, 0] && d[13] == 1 && d[19..22] == [0, 0, 0];
+	let cookie = first.then(|| d.get(60 + d[59] as usize)).flatten();
+	(cookie == Some(&0)).then(|| d[27..59].to_vec())
 }
 
 /// One peer of `dtls_backend`'s socket.
@@ -1501,6 +1521,10 @@ impl Conn for PeerConn {
 
 async fn dtls_echo(pki: &Pki, port: u16, name: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
 	let sock = UdpSocket::bind((FROM_DTLS, 0)).await.map_err(err("bind"))?;
+	dtls_echo_on(sock, pki, port, name, msg).await
+}
+
+async fn dtls_echo_on(sock: UdpSocket, pki: &Pki, port: u16, name: &str, msg: &[u8]) -> Result<Vec<u8>, String> {
 	sock.connect(("127.0.0.1", port)).await.map_err(err("connect"))?;
 	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sock);
 	let config = DtlsConfig {
@@ -1571,6 +1595,27 @@ async fn burst(port: u16, datagrams: Vec<Vec<u8>>, r: &mut Rng) -> Result<(), St
 	let mut buf = vec![0u8; 65536];
 	let _ = tokio::time::timeout(Duration::from_millis(r.range(0, 300) as u64), sock.recv(&mut buf)).await;
 	Ok(())
+}
+
+/// A client that sent only a ClientHello and went away leaves `dtls_backend` a
+/// connection waiting for the rest; a new client from the same address (rproxy's
+/// upstream port, free again once the abandoned session ended) is a new connection.
+#[tokio::test]
+async fn dtls_backend_takes_a_new_hello_as_a_new_connection() {
+	let pki = Pki::new("hostile-dtls-backend");
+	let behind = pki.server("behind", &["d.test"]);
+	let dtls = dtls_backend(&behind, "D:").await;
+	let hello = captured_dtls_hello(&pki, "d.test").await;
+	let sock = UdpSocket::bind((FROM_DTLS, 0)).await.unwrap();
+	let from = sock.local_addr().unwrap();
+	sock.send_to(&hello, dtls).await.unwrap();
+	let mut buf = vec![0u8; 65536];
+	// the HelloVerifyRequest: the backend holds a connection for `from` now
+	tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf)).await.unwrap().unwrap();
+	drop(sock);
+	let sock = UdpSocket::bind(from).await.unwrap();
+	let got = dtls_echo_on(sock, &pki, dtls.port(), "d.test", b"again").await.unwrap();
+	assert_eq!(got, b"D:again");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
