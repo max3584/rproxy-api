@@ -52,6 +52,8 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 
 ### パーサーが作る項目
 
+**HTTP（`event: http.access`）** の `path`・`query`・`user_agent`・`host` は v0.4.20 から 2,048 バイトで切る（後ろに `...[truncated]`）。詰め物で攻撃の部分を 2 KiB より後ろへ押しやると、ログを読む HTTP のシナリオ（`http-cve` など）には見えない。リクエストの中身で止めるなら AppSec（「3.」の `crowdsec: {appsec: true}`。rproxy の `crowdsec` ミドルウェアがリクエストそのものを送る）を使う。
+
 **HTTP（`event: http.access`）** は、CrowdSec の HTTP のアクセスログ（`log_type: http_access-log`、`service: http`）として扱います。`crowdsecurity/http-logs`（s02）と、`base-http-scenarios`・`http-cve` などの既存のシナリオがそのまま使えます。
 
 | CrowdSec の項目 | rproxy のログ |
@@ -67,7 +69,7 @@ sudo cscli explain --log "$(tail -n 1 /var/log/rproxy/rproxy.*.log)" --type rpro
 | `evt.Meta.rproxy_refused_by`・`rproxy_auth_error` | `refused_by`（断ったミドルウェアの種類。`basic_auth`・`ip_allow` など）・`auth_error`（`basic_auth` が断った理由。`bad_password` など）。v0.3.20 から |
 | `evt.StrTime` | `timestamp` |
 
-**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full`（v0.4.19、#341））、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`、`target_full` は `http` も）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。
+**L4（`event: conn.open` / `conn.denied` / `conn.limited`）** は `log_type: rproxy_conn`（`service: rproxy`）。`evt.Meta.source_ip`（`client` の IP の部分）、`rproxy_event`、`rproxy_reason`（`conn.denied` は `allow_from` / `geoip` / `crowdsec`（TLS の `unmatched` も）、`conn.limited` は `max_connections` / `source_connections` / `new_connections` / `packets` / `target_full`（v0.4.19、#341））、`rproxy_rule`、`rproxy_transport`（`conn.limited` の `tcp` / `udp`、`target_full` は `http` も）。UDP の `conn.denied` は v0.3.20 から既定のログレベルで出る（送信元ごとに間引くので、データグラムの数より少ない）。TCP の `conn.denied` も v0.4.20 から送信元ごとに間引くが（IPv6 は同じ /64 を合わせてその 5 倍まで）、続けて 20 行までは出すので、`max3584/rproxy-conn-denied`（10 行で溢れる）はそのまま働く（docs/API.md の「ログの間引きと長さ」）。
 
 ## 3. rproxy から止める（bouncer）
 
