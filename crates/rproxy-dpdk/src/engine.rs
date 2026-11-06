@@ -58,8 +58,17 @@ pub trait Rule: Send + Sync + 'static {
 	/// limits. Counts and logs refusals itself.
 	fn admit(&self, client: SocketAddrV4) -> bool;
 	/// A new session: session limits, then the target (IPv4 only). None drops
-	/// the datagram (counted and logged by the rule).
+	/// the datagram (counted and logged by the rule). Nothing is given up for
+	/// it yet: that waits for `start`, once it has a port.
 	fn open(&self, client: SocketAddrV4, listen: SocketAddrV4, offset: u16) -> Option<(SocketAddrV4, Self::Session)>;
+	/// The new session has its port: the rule may now end another of its
+	/// sessions to make room at its cap (#366; a session refused for want of a
+	/// port must not have cost another network its session). False drops the
+	/// session (counted and logged by the rule; `close` is not called).
+	/// Sessions dropped before this (no route, no port) go through `close`.
+	fn start(&self, _s: &mut Self::Session, _client: SocketAddrV4, _listen: SocketAddrV4, _target: SocketAddrV4) -> bool {
+		true
+	}
 	/// `len` payload bytes from the client to the target; false drops them (bandwidth).
 	fn up(&self, s: &mut Self::Session, len: usize) -> bool;
 	/// `len` payload bytes from the target to the client.
@@ -192,8 +201,8 @@ impl<R: Rule> Session<R> {
 struct PrefixPorts {
 	held: usize,
 	/// The slots and ids of its latest sessions not established when they
-	/// opened, oldest first (at most its share; ended and established ones are
-	/// skipped when one is looked for).
+	/// opened, oldest first (at most its share and twice `held`; ended and
+	/// established ones are skipped when one is looked for).
 	waiting: VecDeque<(u16, u64)>,
 }
 
@@ -206,13 +215,18 @@ struct Local<R: Rule> {
 	/// Slots taken, and by client prefix (taken after a slot's lock, never before).
 	held: AtomicUsize,
 	prefixes: Mutex<HashMap<u32, PrefixPorts>>,
+	/// The NAT ports one prefix may hold while half of them are taken.
+	share: usize,
 }
 
 impl<R: Rule> Local<R> {
-	/// The NAT ports one prefix may hold while half of them are taken.
 	fn share(&self) -> usize {
-		(self.slots.len() / NAT_PREFIX_SHARE).max(NAT_PREFIX_MIN).min(self.slots.len())
+		self.share
 	}
+}
+
+fn share_of(slots: usize, min: usize) -> usize {
+	(slots / NAT_PREFIX_SHARE).max(min).min(slots)
 }
 
 fn prefix_of(ip: Ipv4Addr) -> u32 {
@@ -232,7 +246,8 @@ pub struct Engine<R: Rule> {
 	rules: Mutex<Arc<Table<R>>>,
 	version: AtomicU64,
 	fwd: Vec<Mutex<Fwd>>,
-	/// Client-side entries of sessions ended while another shard was held (`open`), for the sweep to clear.
+	/// Client-side entries of sessions ended while another shard was held (`open`), for the next `open`
+	/// (before it takes a shard) or the sweep to clear: a couple per `open` in flight at most.
 	stale: Mutex<Vec<(FwdKey, usize, u16)>>,
 	next_id: AtomicU64,
 	neighbors: Mutex<HashMap<Ipv4Addr, Mac>>,
@@ -270,6 +285,7 @@ impl<R: Rule> Engine<R> {
 					cursor: AtomicUsize::new(0),
 					held: AtomicUsize::new(0),
 					prefixes: Mutex::default(),
+					share: share_of(slots, NAT_PREFIX_MIN),
 				});
 			}
 		}
@@ -287,6 +303,16 @@ impl<R: Rule> Engine<R> {
 			arp_pending: Mutex::default(),
 			counters: Counters::default(),
 		}
+	}
+
+	/// With a smaller least share of the NAT ports for one prefix than
+	/// `NAT_PREFIX_MIN` (the fuzz target's small range: the share binds there too).
+	#[doc(hidden)]
+	pub fn with_prefix_min(mut self, min: usize) -> Self {
+		for l in &mut self.locals {
+			l.share = share_of(l.slots.len(), min.max(1));
+		}
+		self
 	}
 
 	pub fn ports(&self) -> &[PortCfg] {
@@ -533,6 +559,10 @@ impl<R: Rule> Engine<R> {
 	#[allow(clippy::too_many_arguments)]
 	fn open(&self, port: usize, li: usize, rule: &Arc<R>, offset: u16, u: &Udp4, now: Instant, shard: &Mutex<Fwd>) -> Option<(usize, u16)> {
 		let key = FwdKey { listen: u.dst, client: u.src };
+		// what earlier opens left (one entry each at most), before this one holds a shard
+		if !lock(&self.stale).is_empty() {
+			self.clear_stale();
+		}
 		let mut map = lock(shard);
 		if let Some(at) = map.get(&key) {
 			return Some(*at);
@@ -553,18 +583,19 @@ impl<R: Rule> Engine<R> {
 		};
 		let prefix = prefix_of(*u.src.ip());
 		let held = shard_of(&key);
-		if !self.prefix_room(src_li, prefix, held, &mut map) {
+		let Ok(freed) = self.prefix_room(src_li, prefix, held, &mut map) else {
 			self.counters.nat_prefix_full.fetch_add(1, Ordering::Relaxed);
 			rule.dropped();
 			rule.close(state, u.src, target, "no free port");
 			return None;
-		}
+		};
 		let rules = lock(&self.rules).clone();
 		let local = &self.locals[src_li];
 		let start = local.cursor.fetch_add(1, Ordering::Relaxed);
-		let mut state = Some(state);
-		for i in 0..NAT_TRIES {
-			let n = (start.wrapping_mul(7919).wrapping_add(i)) % local.slots.len();
+		// the port its prefix just gave up first, then ports from the cursor
+		let probes = freed.into_iter().chain((0..NAT_TRIES).map(|i| (start.wrapping_mul(7919).wrapping_add(i)) % local.slots.len()));
+		let mut state = state;
+		for n in probes {
 			let nat = self.nat_lo + n as u16;
 			if rules.contains_key(&SocketAddrV4::new(local.ip, nat)) {
 				continue;
@@ -577,22 +608,16 @@ impl<R: Rule> Engine<R> {
 			if slot.is_some() {
 				continue;
 			}
-			let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-			local.held.fetch_add(1, Ordering::Relaxed);
-			{
-				let mut prefixes = lock(&local.prefixes);
-				let ports = prefixes.entry(prefix).or_default();
-				ports.held += 1;
-				if ports.waiting.len() >= local.share() {
-					ports.waiting.pop_front();
-				}
-				ports.waiting.push_back((n as u16, id));
+			// the port is ours: only now may the rule make room for it
+			if !rule.start(&mut state, u.src, u.dst, target) {
+				return None;
 			}
+			let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 			*slot = Some(Session {
 				key,
 				rule: rule.clone(),
 				offset,
-				state: state.take()?,
+				state,
 				target,
 				egress,
 				hop,
@@ -606,47 +631,83 @@ impl<R: Rule> Engine<R> {
 				again: false,
 				established: false,
 			});
+			local.held.fetch_add(1, Ordering::Relaxed);
+			{
+				let mut prefixes = lock(&local.prefixes);
+				let ports = prefixes.entry(prefix).or_default();
+				ports.held += 1;
+				// ended and established ones are skipped when one is looked for; keep it near what the prefix holds
+				while ports.waiting.len() >= local.share().min(2 * ports.held) {
+					ports.waiting.pop_front();
+				}
+				ports.waiting.push_back((n as u16, id));
+			}
 			map.insert(key, (src_li, nat));
 			return Some((src_li, nat));
 		}
 		self.counters.nat_full.fetch_add(1, Ordering::Relaxed);
 		rule.dropped();
-		if let Some(state) = state {
-			rule.close(state, u.src, target, "no free port");
-		}
+		rule.close(state, u.src, target, "no free port");
 		None
 	}
 
 	/// Whether a new session of `prefix` may take a port of `li`: below its
 	/// share, or fewer than half the ports taken; else its oldest session not
-	/// established gives its port up (`map`: the client-side shard `open` holds).
-	fn prefix_room(&self, li: usize, prefix: u32, shard: usize, map: &mut Fwd) -> bool {
+	/// established gives its port up (Ok with that slot; `map`: the client-side
+	/// shard `open` holds). Err: none to give up.
+	fn prefix_room(&self, li: usize, prefix: u32, shard: usize, map: &mut Fwd) -> Result<Option<usize>, ()> {
 		let local = &self.locals[li];
 		loop {
 			let (n, id) = {
 				let mut prefixes = lock(&local.prefixes);
-				let Some(ports) = prefixes.get_mut(&prefix) else { return true };
+				let Some(ports) = prefixes.get_mut(&prefix) else { return Ok(None) };
 				if ports.held < local.share() || local.held.load(Ordering::Relaxed) < local.slots.len() / 2 {
-					return true;
+					return Ok(None);
 				}
-				match ports.waiting.pop_front() {
-					Some(next) => next,
-					None => return false,
-				}
+				ports.waiting.pop_front().ok_or(())?
 			};
 			let n = usize::from(n);
 			let mut slot = lock(&local.slots[n]);
 			if slot.as_ref().is_some_and(|s| s.id == id && !s.established) {
 				self.end(li, n, &mut slot, "evicted", Some((shard, map)));
-				return true;
+				return Ok(Some(n));
 			}
 		}
 	}
 
+	/// Clears the client-side entries `end` left for later (`stale`), holding no shard.
+	fn clear_stale(&self) {
+		let stale = std::mem::take(&mut *lock(&self.stale));
+		for (key, li, nat) in stale {
+			let mut map = lock(&self.fwd[shard_of(&key)]);
+			if map.get(&key) == Some(&(li, nat)) {
+				map.remove(&key);
+			}
+		}
+	}
+
+	/// Whether the counts agree with the slots (`held`, and its sum over the
+	/// prefixes): for the fuzz target and tests, while nothing else runs.
+	#[doc(hidden)]
+	pub fn check_counts(&self) -> Result<(), String> {
+		for local in &self.locals {
+			let taken = local.slots.iter().filter(|s| lock(s).is_some()).count();
+			let held = local.held.load(Ordering::Relaxed);
+			let by_prefix: usize = lock(&local.prefixes).values().map(|p| p.held).sum();
+			if taken != held || held != by_prefix {
+				return Err(format!("{}: {taken} slots taken, held {held}, by prefix {by_prefix}", local.ip));
+			}
+			if lock(&local.prefixes).values().any(|p| p.held == 0 || p.waiting.len() > 2 * p.held) {
+				return Err(format!("{}: a prefix holds none, or waits on more than twice what it holds", local.ip));
+			}
+		}
+		Ok(())
+	}
+
 	/// Ends the session in slot `n` of `li` and gives its port back. `held`: the
 	/// client-side shard the caller holds (its index and map), if any; an entry
-	/// in another shard is left for the sweep to clear, so that no two shards
-	/// are held at once.
+	/// in another shard is left for the next `open` or the sweep to clear
+	/// (`stale`), so that no two shards are held at once.
 	fn end(&self, li: usize, n: usize, slot: &mut Option<Session<R>>, reason: &'static str, held: Option<(usize, &mut Fwd)>) {
 		let Some(s) = slot.take() else { return };
 		let at = (li, self.nat_lo + n as u16);
@@ -673,6 +734,11 @@ impl<R: Rule> Engine<R> {
 				ports.held -= 1;
 				if ports.held == 0 {
 					prefixes.remove(&prefix);
+				} else {
+					// bounded by what it holds: the oldest go first (most likely ended)
+					while ports.waiting.len() > 2 * ports.held {
+						ports.waiting.pop_front();
+					}
 				}
 			}
 		}
@@ -684,13 +750,7 @@ impl<R: Rule> Engine<R> {
 	/// sessions off targets that went down, and picks up neighbors' new MACs.
 	/// Returns the sessions still open.
 	pub fn sweep(&self, now: Instant) -> usize {
-		let stale = std::mem::take(&mut *lock(&self.stale));
-		for (key, li, nat) in stale {
-			let mut map = lock(&self.fwd[shard_of(&key)]);
-			if map.get(&key) == Some(&(li, nat)) {
-				map.remove(&key);
-			}
-		}
+		self.clear_stale();
 		let mut open = 0;
 		for (li, local) in self.locals.iter().enumerate() {
 			for (n, slot) in local.slots.iter().enumerate() {
@@ -743,6 +803,8 @@ pub(crate) mod tests {
 		/// Every session not established counts as evicted (`Rule::evicted`).
 		pub evict: AtomicBool,
 		pub established: AtomicU64,
+		/// Sessions that got their port (`Rule::start`).
+		pub started: AtomicU64,
 	}
 
 	impl TestRule {
@@ -757,6 +819,7 @@ pub(crate) mod tests {
 				idle: Duration::from_secs(30),
 				evict: AtomicBool::new(false),
 				established: AtomicU64::new(0),
+				started: AtomicU64::new(0),
 			})
 		}
 	}
@@ -798,6 +861,10 @@ pub(crate) mod tests {
 		}
 		fn established(&self, _: &mut (u64, u64)) {
 			self.established.fetch_add(1, Ordering::Relaxed);
+		}
+		fn start(&self, _: &mut (u64, u64), _: SocketAddrV4, _: SocketAddrV4, _: SocketAddrV4) -> bool {
+			self.started.fetch_add(1, Ordering::Relaxed);
+			true
 		}
 		fn evicted(&self, _: &(u64, u64)) -> bool {
 			self.evict.load(Ordering::Relaxed)
@@ -1023,8 +1090,10 @@ pub(crate) mod tests {
 		nat_of(&e, a, now);
 		assert_eq!(answer(&e, nat_a, now), Verdict::Send(0), "a is established");
 		nat_of(&e, b, now);
-		// both ports taken: no room for c
+		// both ports taken: no room for c, and the rule is not asked to make room at its cap (#366)
+		assert_eq!(rule.started.load(Ordering::Relaxed), 2);
 		assert_eq!(run(&e, &mut from(c, b"x"), now).0, Verdict::Drop);
+		assert_eq!(rule.started.load(Ordering::Relaxed), 2);
 		rule.evict.store(true, Ordering::Relaxed);
 		assert_eq!(nat_of(&e, a, now), nat_a, "established: not evicted");
 		// b's port goes to c (the rule evicted b)
@@ -1079,12 +1148,66 @@ pub(crate) mod tests {
 			nat_of(&established, flood(i), now);
 			assert_eq!(answer(&established, nat, now), Verdict::Send(0));
 		}
+		let started = rule.started.load(Ordering::Relaxed);
 		assert_eq!(run(&established, &mut from(flood(500), b"x"), now).0, Verdict::Drop);
 		assert_eq!(established.counters.nat_prefix_full.load(Ordering::Relaxed), 1);
+		assert_eq!(rule.started.load(Ordering::Relaxed), started, "refused for its prefix: the rule made no room for it");
 		assert_eq!(*rule.closed.lock().unwrap(), ["no free port"]);
 		assert_eq!(run(&established, &mut from(other(0), b"x"), now).0, Verdict::Send(0), "other networks still get ports");
+		established.check_counts().unwrap();
+		e.check_counts().unwrap();
 		// the prefixes' table empties as their sessions end
 		established.sweep(now + Duration::from_secs(60));
+		established.check_counts().unwrap();
 		assert!(lock(&established.locals[0].prefixes).is_empty());
+	}
+
+	// #366: a rule that refuses in `start` (nothing to evict at its cap) leaves no session and no count behind
+	#[test]
+	fn a_session_refused_at_start_takes_no_port() {
+		struct Refusing(Arc<TestRule>);
+		impl Rule for Refusing {
+			type Session = (u64, u64);
+			fn phase(&self) -> Phase {
+				Phase::Open
+			}
+			fn admit(&self, c: SocketAddrV4) -> bool {
+				self.0.admit(c)
+			}
+			fn open(&self, c: SocketAddrV4, l: SocketAddrV4, o: u16) -> Option<(SocketAddrV4, (u64, u64))> {
+				self.0.open(c, l, o)
+			}
+			fn start(&self, _: &mut (u64, u64), _: SocketAddrV4, _: SocketAddrV4, _: SocketAddrV4) -> bool {
+				false
+			}
+			fn up(&self, s: &mut (u64, u64), len: usize) -> bool {
+				self.0.up(s, len)
+			}
+			fn down(&self, s: &mut (u64, u64), len: usize) -> bool {
+				self.0.down(s, len)
+			}
+			fn dropped(&self) {}
+			fn idle(&self) -> Duration {
+				self.0.idle
+			}
+			fn retarget(&self, _: &mut (u64, u64), _: u16, _: SocketAddrV4) -> Option<SocketAddrV4> {
+				None
+			}
+			fn close(&self, s: (u64, u64), c: SocketAddrV4, t: SocketAddrV4, reason: &'static str) {
+				self.0.close(s, c, t, reason)
+			}
+		}
+		let e: Engine<Refusing> = Engine::new(vec![PortCfg { mac: OURS, addrs: vec![("10.0.0.10".parse().unwrap(), 24)], gateway: None }]);
+		let inner = TestRule::new("10.0.0.20:6000");
+		e.register("10.0.0.10".parse().unwrap(), 5000, 1, Arc::new(Refusing(inner.clone()))).unwrap();
+		let now = Instant::now();
+		let mut w = e.worker();
+		e.refresh(&mut w);
+		let mut f = packet::udp_frame(CLIENT_MAC, OURS, sa("192.0.2.1:1"), sa("10.0.0.10:5000"), b"x", true);
+		assert_eq!(e.process(&w, 0, &mut f, now, &mut |_, _| {}), Verdict::Drop);
+		assert!(inner.closed.lock().unwrap().is_empty(), "refused by the rule itself: no close");
+		e.check_counts().unwrap();
+		assert_eq!(e.sweep(now), 0);
+		assert!(lock(&e.fwd[0]).is_empty() && e.fwd.iter().all(|m| lock(m).is_empty()));
 	}
 }
