@@ -238,6 +238,11 @@ pub struct Features {
 	/// `idle_timeout` (default 1h) and `half_close_timeout` (default 1 min) of an L4 tcp rule
 	/// (`0s` none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)
 	pub tcp_idle_timeout: bool,
+	/// The control API's limits (#358): `max_rules` / `max_rulesets` of the token file,
+	/// `RPROXY_MAX_RULES` / `_LISTENERS` / `_RULESETS` (`409 limit`), `listen_freebind` for
+	/// `admin`, `allow_freebind` and (rule sets) `allow_rulesets` tokens, route, middleware and
+	/// service names the API is sent without control characters, white space, `"`, `\` and the like
+	pub control_limits: bool,
 	/// Limits on what one client can hold of an `http` rule (#356): `global.http.timeouts`'s
 	/// `write_stall`, `upgraded_idle` and `http2_max_streams`, `mirror`'s `max_in_flight`, upgraded connections in the rule's `limits`,
 	/// `timeouts.request` over the middlewares, `stats.http.mirror_dropped`
@@ -313,6 +318,7 @@ impl Features {
 		target_max_connections: true,
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
+		control_limits: true,
 		http_stream_limits: true,
 	};
 
@@ -368,6 +374,7 @@ impl Features {
 		target_max_connections: true,
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
+		control_limits: true,
 		http_stream_limits: true,
 	};
 

@@ -460,7 +460,23 @@ The defaults are the owner's decision (the 2026-11-05 review).
 - The timer that brings a target back checks once more that it is not ejected before `target.up` (none for an ejection started meanwhile). When `connect_timeout` is left out, an address with others still to try after it gets 5 s and the last one 30 s (a dual-stack name counts as two).
 - Tests: unit (`l4::idle`: progress extends it, a half-close shortens it, each limit alone, `Tracked`; `starttls`: a long reply, the overall deadline; `outlier::one_timer_per_ejection`; keepalive in `net::source`), `tests/tcp_deadlines.rs` (quiet connections end, plain and through TLS termination, both sides get an RST and `conn.close` has the `reason`; a moving one does not; one that cannot write to a backend that does not read ends; quiet after moving on to splice ends, moving on through splice does not; `half_close_timeout` after a half-close and `0s`; PATCH, validation, `features`).
 
-## 20. What one client can hold of L7 (v0.4.20, #356)
+## 20. Limits of the control API (v0.4.20, #358)
+
+The review of 2026-11-05 found places where a `rules:write` token could break the process's resources and `/metrics`. The shape is `features.control_limits`; usage is in "Limits of the control API" of docs/en/API.md.
+
+- Decisions:
+  - The limits apply to what tokens ask for only. Rules of the settings file, the database and a live upgrade are counted but never refused (what the administrator wrote or what passed before does not fail at startup). A change that adds nothing always goes through (so a process over a lowered limit can be cleaned up).
+  - Defaults: 10000 rules, 1000 rule sets, and listening sockets at half of the file descriptor limit after 1024 (for the control API, the database, DNS and files; the other half is for connections). A token's `max_rules` and `max_rulesets` have no default (token files keep working as before).
+  - `listen_freebind` is for `admin`, `allow_freebind: true`, and in rule sets' `PUT` tokens with `allow_rulesets` (changed in review: rproxy-gateway's token is not `admin` and sets it for Gateways with `spec.addresses`; admin-only would freeze its sets after the update). A set's `PUT` checks only the rules it creates or changes. Making large port ranges admin-only was dropped (UI tokens are not admin, and the webrtc-media profile uses 50000-60000); the process's `RPROXY_MAX_RANGE_PORTS` and the socket limit stay.
+  - Names are not the suggested `[A-Za-z0-9._:-]{1,253}` but "1 to 512 bytes without control characters, white space, `"`, `\`, `` ` ``, `{` or `}`": rproxy-gateway's names contain `/` and can pass 253 (`grpc:<namespace 63>/<name 253>/r…`), and Japanese names work in today's settings. Only what the API is sent is checked (changed in review: sets restored from the database or a live upgrade are not dropped; the settings file stays as before). `/metrics` escapes `\`, `"` and line feeds in every label (`core::prom::label`), so the names' limit is a second line.
+  - File sizes: 1 MiB for certificates, keys and secrets may be too little for a large CA bundle, so 4 MiB; `users_file` 16 MiB.
+  - A rule set's `PUT` body stays at 32 MiB (large sets of rproxy-gateway are not refused); instead at most 2 `PUT`s read their bodies at a time, within 60 seconds.
+  - `drain_secs` is cut to 3600 seconds rather than refused (calls that passed before keep working).
+  - The record of deletions while the database cannot be reached (`Unwritten.removed_*`) cannot be dropped: the reconciliation would bring the rules back from the rows (the rows win). So past its size deletions are refused with `503 busy` instead (safer than a "read everything again" flag).
+  - Live upgrades: a new handoff is refused while the old process drains (its last counters come to this process; handing off again would lose them).
+- Tests: `tests/control_limits.rs`; unit tests in `core::quota`, `core::supervise`, `core::prom`, `net::files`.
+
+## 21. What one client can hold of L7 (v0.4.20, #356)
 
 The L7 MEDIUM / LOW findings of the review (2026-11-05). The only new shape is three items of `global.http.timeouts` (`write_stall`, `upgraded_idle`, `http2_max_streams`) and `mirror`'s `max_in_flight`; the rest are fixed limits (`features.http_stream_limits`). Defaults that change (`write_stall`, `upgraded_idle`, HTTP/2 streams and send buffer, the limits of `mirror`, `compress`, bcrypt and OIDC) go under "Changed" in the release notes.
 

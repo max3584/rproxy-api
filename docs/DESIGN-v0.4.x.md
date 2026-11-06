@@ -460,7 +460,23 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 戻すタイマーは、待っていたタスクが期限の後にもう一度外れていないか見てから `target.up` を出す（その間の外し直しでは出さない）。`connect_timeout` を省いたときは、後に試せるアドレスが残っていれば 5 秒、最後のアドレスは 30 秒（両方のアドレスを持つ名前は 2 つと数える）。
 - 試験：単体（`l4::idle`：進めば延びる・半分閉じで短くなる・どちらか一方だけ・`Tracked`、`starttls`：長い返事・全体の期限、`outlier::one_timer_per_ejection`、`net::source` の keepalive）、`tests/tcp_deadlines.rs`（平文と TLS の終端で黙った接続が閉じ、両側が RST を受け `conn.close` の `reason` が出る・進む接続は閉じない・読まない転送先で書けない接続が閉じる・splice に移った後に黙れば閉じ、splice で運び続ければ閉じない・半分閉じの後の `half_close_timeout` と `0s`・PATCH・検証・`features`）。
 
-## 20. L7 で 1 つのクライアントが持てるもの（v0.4.20、#356）
+## 20. 制御 API の上限（v0.4.20、#358）
+
+点検（2026-11-05）で、`rules:write` のトークンがプロセスの資源と `/metrics` を壊せるところを閉じる。形は `features.control_limits`、使い方は docs/API.md の「制御 API の上限」。
+
+- 決めたこと：
+  - 上限はトークンの頼むものだけに効かせる。設定ファイル・DB・引き継ぎから戻すルールは数えるが断らない（管理者の書いたもの・前に通ったものを起動で落とさない）。増やさない変更はいつでも通す（上限を下げた後に片付けられるように）。
+  - 既定：ルール 10000・組 1000・待ち受けのソケットはファイル記述子の上限から 1024（制御 API・DB・DNS・ファイルの分）を除いた半分（もう半分は接続）。トークンの `max_rules`・`max_rulesets` は既定なし（今のトークンファイルの動きを変えない）。
+  - `listen_freebind` は `admin`・`allow_freebind: true`・組の `PUT` では `allow_rulesets` のあるトークン（レビューで変えた：rproxy-gateway のトークンは admin でなく、`spec.addresses` の Gateway に付けるので、admin だけにすると更新の後に組が止まる）。組の `PUT` は新しいルール・変わるルールだけ確かめる。大きなポートの範囲を admin だけにする案はやめた（UI のトークンは admin でなく、webrtc-media のプロファイルが 50000-60000 を使う）。プロセスの `RPROXY_MAX_RANGE_PORTS` とソケットの上限に任せる。
+  - 名前は例に挙がった `[A-Za-z0-9._:-]{1,253}` ではなく、「制御文字・空白・`"`・`\`・`` ` ``・`{`・`}` を含まない 1〜512 バイト」にした：rproxy-gateway の名前は `/` を含み、`grpc:<名前空間 63>/<名前 253>/r…` で 253 を超えうる。日本語の名前も今の設定で使える。名前は API に送るものだけ確かめる（レビューで変えた：DB・引き継ぎで戻す組を落とさない。設定ファイルも前のまま）。`/metrics` はどのラベルも `\`・`"`・改行をエスケープする（`core::prom::label`）ので、名前の制限は二重の守り。
+  - ファイルの大きさ：証明書・鍵・秘密を 1 MiB にすると大きな CA の束に足りないことがあるので 4 MiB、`users_file` は 16 MiB。
+  - 組の `PUT` の本文は 32 MiB のまま（rproxy-gateway の大きな組を断らない）。代わりに本文を読む `PUT` を同時に 2 つまで・本文は 60 秒以内。
+  - `drain_secs` は断らずに 3600 秒に切り詰める（前に通った呼び出しを壊さない）。
+  - DB に届かないあいだの削除の記録（`Unwritten.removed_*`）は、捨てると照合が行からルールを戻してしまう（行が正）ので、件数を超えたら捨てずに削除を `503 busy` で断る（「全部を読み直す」印より安全）。
+  - 引き継ぎ：古いプロセスの drain の間は新しい引き継ぎを断る（その古いプロセスの最後の数がこのプロセスに届くので、続けて引き継ぐと数が失われる）。
+- 試験：`tests/control_limits.rs`、単体は `core::quota`・`core::supervise`・`core::prom`・`net::files`。
+
+## 21. L7 で 1 つのクライアントが持てるもの（v0.4.20、#356）
 
 点検（2026-11-05）の L7 の MEDIUM / LOW。形は `global.http.timeouts` に 3 つ（`write_stall`・`upgraded_idle`・`http2_max_streams`）と `mirror` の `max_in_flight` を足すだけで、ほかは決まった上限（`features.http_stream_limits`）。既定が変わるもの（`write_stall`・`upgraded_idle`・HTTP/2 のストリームの数と送りのバッファ・`mirror`・`compress`・bcrypt・OIDC の上限）は、リリースノートの「変更」に書く。
 

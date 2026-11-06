@@ -73,6 +73,15 @@ impl Map {
 		self.0.iter_mut().map(|(k, v)| (&*k, v))
 	}
 
+	/// Renames the keys `f` gives a new name for, in place.
+	pub fn rename_keys(&mut self, f: impl Fn(&str) -> Option<String>) {
+		for (k, _) in &mut self.0 {
+			if let Some(new) = f(k) {
+				*k = new;
+			}
+		}
+	}
+
 	pub fn keys(&self) -> impl Iterator<Item = &String> {
 		self.0.iter().map(|(k, _)| k)
 	}

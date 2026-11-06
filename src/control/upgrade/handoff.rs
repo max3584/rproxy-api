@@ -276,6 +276,25 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The old process is draining after a handoff (`/readyz`: `draining`).
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
+/// Until when the old process of the handoff that started this one may still drain (#358):
+/// its last counters come to this process (`Adopted::follow`), so no new handoff starts
+/// before it has ended — at the latest its drain and `PARENT_MARGIN` after the handoff
+/// (it is killed then), whatever `follow` hears.
+static PARENT_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// What `PARENT_UNTIL` adds to the old process's drain.
+pub const PARENT_MARGIN: Duration = Duration::from_secs(60);
+
+/// Whether the old process of the last handoff is still draining.
+pub fn parent_draining() -> bool {
+	PARENT_UNTIL.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| std::time::Instant::now() < t)
+}
+
+/// The old process drains for at most `drain` from now (None: it has ended).
+pub fn set_parent_draining(drain: Option<Duration>) {
+	*PARENT_UNTIL.lock().unwrap_or_else(|e| e.into_inner()) = drain.map(|d| std::time::Instant::now() + d + PARENT_MARGIN);
+}
+
 pub fn active() -> bool {
 	ACTIVE.load(Ordering::Acquire)
 }
@@ -370,6 +389,12 @@ impl Upgrader {
 	pub fn start(self: &Arc<Self>, exe: Option<PathBuf>, reason: &'static str) -> Result<(), String> {
 		if crate::core::shutdown::active() {
 			return Err("rproxy is shutting down".into());
+		}
+		if parent_draining() {
+			return Err(
+				"the process this one took over from is still draining its connections; a new live upgrade can start once it has ended (handoff.counters)"
+					.into(),
+			);
 		}
 		if ACTIVE.swap(true, Ordering::AcqRel) {
 			return Err("a live upgrade is already in progress".into());
@@ -865,6 +890,7 @@ impl State {
 				admin: true,
 				owner: Some(owner),
 				may_use_ports: &|_, _| true,
+				limits: None,
 			};
 			if let Err(e) = registry.put_ruleset(&set.name, req, opts).await {
 				warn!(event = "handoff.ruleset", ruleset = %set.name, error = %e.error.message, "a rule set from the old process could not be applied");
@@ -891,7 +917,25 @@ async fn add_counters(registry: &Registry, counters: &[Counters], f: impl Fn(&Co
 impl Adopted {
 	/// Waits for the old process's final counters (it sends them after its
 	/// drain) and adds what it counted after the snapshot.
-	pub async fn follow(self, registry: Arc<Registry>) {
+	/// `drain`: how long the old process drains at most (`--handoff-drain`); no new handoff
+	/// starts meanwhile (`parent_draining`, #358).
+	pub fn follow(self, registry: Arc<Registry>, drain: Duration) -> impl std::future::Future<Output = ()> + Send {
+		/// Lets new handoffs start again however `follow` ends.
+		struct Drained;
+		impl Drop for Drained {
+			fn drop(&mut self) {
+				set_parent_draining(None);
+			}
+		}
+		set_parent_draining(Some(drain));
+		let drained = Drained;
+		async move {
+			let _drained = drained;
+			self.follow_counters(registry).await
+		}
+	}
+
+	async fn follow_counters(self, registry: Arc<Registry>) {
 		let channel = self.channel;
 		let finals = tokio::task::spawn_blocking(move || -> Option<Vec<Counters>> {
 			let mut body = vec![];
@@ -924,6 +968,19 @@ impl Adopted {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A handoff waits for the old process of the last one, at most its drain and the margin (#358).
+	#[test]
+	fn the_parent_drains_for_a_bounded_time() {
+		assert!(!parent_draining());
+		set_parent_draining(Some(Duration::ZERO));
+		assert!(parent_draining(), "the margin");
+		*PARENT_UNTIL.lock().unwrap() = Some(std::time::Instant::now());
+		assert!(!parent_draining(), "past it");
+		set_parent_draining(Some(Duration::from_secs(3600)));
+		set_parent_draining(None);
+		assert!(!parent_draining());
+	}
 
 	#[test]
 	fn versions_within_the_minor() {
