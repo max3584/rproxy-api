@@ -718,11 +718,11 @@ impl Service {
 				max_ejected_percent = cfg.ejecting.max_percent);
 			return;
 		}
-		let (length, until) = server.ejection.eject(&cfg.ejecting);
+		let (length, _) = server.ejection.eject(&cfg.ejecting);
 		warn!(event = "target.down", rule = %rule, service = %self.name, server = %server.url, reason = "outlier", cause,
 			ejection_secs = length.as_secs_f64(), ejections = server.ejection.ejections());
 		let (service, url) = (Arc::downgrade(self), server.url.clone());
-		crate::core::outlier::after(&server.ejection, until, length, move || {
+		crate::core::outlier::after(&server.ejection, move || {
 			let Some(service) = service.upgrade() else { return };
 			info!(event = "target.up", rule = %rule, service = %service.name, server = %url, reason = "outlier");
 		});

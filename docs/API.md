@@ -136,7 +136,9 @@ tokens:
 | `targets` | object の配列 | | 宛先を複数にする（v0.3.3、`remote_addr` / `remote_port` の代わり。どちらか一方）。`{"addr", "port", "weight"?, "backup"?}`：`addr` は IP かホスト名（それぞれ再解決する）、`weight` は 1 以上（既定 1）、`backup: true` はほかの宛先がすべて down のときだけ使う（全部を backup にはできない）。最大 64 件。ポート範囲では各宛先の `port` も範囲の分ずれる。下の「複数の宛先」 |
 | `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
-| `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くと今までどおり（ほかに宛先があれば 5 秒、なければ OS の既定（Linux は約 2 分））。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
+| `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くとほかに宛先があれば 5 秒、なければ 30 秒（v0.4.20 から。前は OS の既定で、Linux は約 2 分）。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
+| `idle_timeout` | string | | 中継している接続が、どちらの向きにも何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`conn.close` の `reason: idle_timeout`）。相手が読まずに書けないままの接続も同じ。数えるのは接続のバイトだけで、TCP の keepalive のプローブは数えない。省くと `1h`、`0s` で上限なし、ほかは `1s` 以上。`tcp` のルールだけ（`udp` は `udp_idle_secs`、`http` のルールは `invalid` で `global.http.timeouts`）。PATCH で付けると置き換え（`0s` で上限なし、省けば今のまま）、次の接続から効く。表示は付けたときだけ |
+| `half_close_timeout` | string | | 片側が送り終えた（半分閉じた）後、残りの向きが何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`reason: half_close_timeout`）。`idle_timeout` が短ければそちら。省くと `1m`、`0s` でなし（`idle_timeout` だけ）、ほかは `1s` 以上。形・PATCH・表示は `idle_timeout` と同じ |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md。TLS を終端しない `tls.routes[]` には route ごとの `source_ip` も書ける（下の「`tls.routes[]` の `source_ip`」） |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
@@ -1035,11 +1037,25 @@ VIP のように、今は別のホストが持っていて後からこのホス�
 
 ### 宛先への接続の時間（v0.4.3、`features.connect_timeout`）
 
-L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノードの宛先は SYN に答えないので、断られる（RST）のと違い、接続は OS の再送（Linux で約 2 分）か、ほかに宛先があるときの 5 秒まで待つ。`connect_timeout` でこれを短くすると、そのあいだに来た接続も早く次の宛先に移り、宛先は `outlier_detection` で外れる（既定は 1 回で 10 秒）。
+L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノードの宛先は SYN に答えないので、断られる（RST）のと違い、接続はほかに宛先があるときの 5 秒か、ないときの 30 秒（v0.4.20 から。前は OS の再送で Linux は約 2 分）まで待つ。`connect_timeout` でこれを短くすると、そのあいだに来た接続も早く次の宛先に移り、宛先は `outlier_detection` で外れる（既定は 1 回で 10 秒）。
 
 - 宛先が 1 つ・複数のどちらでも効く（複数のときは 5 秒の代わり）。`tls.routes` の宛先も同じ。
 - 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
 - `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
+
+### 中継の時間切れと keepalive（v0.4.20、#353、`features.tcp_idle_timeout`）
+
+L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTLS）には、何も運ばない接続の時間切れがある。前はなかったので、何も送らない接続・片側だけ閉じた接続・消えた相手（NAT の表から落ちた）の接続が、fd・`limits` の数・宛先の接続数をいつまでも持っていた。
+
+- `idle_timeout`（上の表、既定 `1h`）：どちらの向きにも 1 バイトも運ばない（読めない・書けない）時間がこれを超えたら、両側をリセット（RST）して閉じる。途中で切ったものを完全に終わったように見せないため（データの完全性）。相手が読まないので書けないまま（転送先が止まっている）も、運べていないので同じく閉じる。運んでいるあいだは延びる（splice の道も同じ）。判定はおよそ `idle_timeout` の 1/8（最大 1 分）ごとで、その分遅れることがある。
+- 片側が送り終えた（FIN、半分閉じ）後：残りの向きが `half_close_timeout`（既定 1 分。`idle_timeout` が短ければそれ）何も運ばなければ閉じる。運んでいれば続く（送り終えた後に長いダウンロードを受ける使い方はそのまま）。送り終えてから最初の返事まで長く待つもの（`nc -N`、要求を送って `shutdown(SHUT_WR)` してから答えを待つ RPC・バックアップの道具）は `half_close_timeout: "0s"`（`idle_timeout` だけになる）か長めの値にする。
+- `0s`：その上限なし。v0.4.19 までと同じにするには `idle_timeout: "0s"` と `half_close_timeout: "0s"`。
+- 時間を延ばすのは接続のバイト（アプリケーションのデータ）だけ。TCP の keepalive のプローブはカーネルの中で答えるので数えない：アプリケーションの ping を送らず `SO_KEEPALIVE` だけで生かしている接続（DB のコネクションプールなど）は、1 時間黙ると切れる。長く黙る接続（DB のプール・SSH・MQTT などで keepalive が 1 時間より長いもの）は、長めの値か `0s` にする。
+- UI の DB（`forward_rules`）から戻したルールは、`idle_timeout` / `half_close_timeout` の列がないので既定（`1h` / `1m`）になり、UI が項目を持つまでそこでは `0s` にできない（API・設定ファイルのルールと `rproxy_rules` は持てる）。
+- ログは `conn.close` の `reason` が `idle_timeout` / `half_close_timeout`（警告の `conn.error` ではない）。
+- 両側のソケット（受け付けた接続・宛先への接続）に `SO_KEEPALIVE`（`http` のルールの受け付けた接続と、`http` のサービスの転送先への接続にも付く）。間隔はカーネルの設定（`net.ipv4.tcp_keepalive_time` など、既定は 2 時間後から 75 秒ごとに 9 回）で、`idle_timeout: 0s` の接続でも消えた相手に気づける。`TCP_USER_TIMEOUT` は付けない（keepalive と一緒だと最初の応答のないプローブで切れる。長くすると消えた相手への再送をカーネルの既定（`tcp_retries2`、約 15 分）より長く待つ。読まない相手は `idle_timeout` で閉じる）。
+- `http` のルールは今までどおり `global.http.timeouts`（二重には掛けない）。
+- TLS のハンドシェイクの同時の数には、プロセス全体の上限を設けない（#359 で決めた）：ハンドシェイクは 10 秒（`http` は `global.http.timeouts.tls_handshake`）で切れ、CPU はワーカーのスレッドの数までしか使わず、送信元ごとの数・速さはルールの `limits` で絞れる。全体の上限は、ほかのルールの正しい接続まで待たせることになる。
 
 ### PROXY protocol を受け取る（v0.4.13、#296、`features.proxy_protocol_in`）
 
