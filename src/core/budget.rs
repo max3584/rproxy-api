@@ -68,6 +68,31 @@ fn from_nofile(nofile: Option<u64>, listeners: u64) -> u64 {
 	}
 }
 
+/// Lifts the soft file limit to the hard one (`main` at startup, and the test harness so that
+/// tests get the budget the service would); returns the soft limit then in force.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> Option<u64> {
+	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+	// SAFETY: plain syscalls on a local struct
+	unsafe {
+		if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+			return None;
+		}
+		if lim.rlim_cur < lim.rlim_max {
+			lim.rlim_cur = lim.rlim_max;
+			libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+			libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+		}
+	}
+	#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 everywhere
+	Some(lim.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() -> Option<u64> {
+	None
+}
+
 #[cfg(unix)]
 fn nofile() -> Option<u64> {
 	let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -117,11 +142,17 @@ impl Ticket {
 }
 
 fn take_within(n: u64, limit: u64) -> Option<Ticket> {
-	let mut used = IN_USE.load(Ordering::Relaxed);
+	// not `then_some`: a Ticket made and dropped would give back what it never took
+	if reserve(&IN_USE, n, limit) { Some(Ticket { n }) } else { None }
+}
+
+/// Adds `n` to `counter` if that stays within `limit` (one CAS when uncontended).
+fn reserve(counter: &AtomicU64, n: u64, limit: u64) -> bool {
+	let mut used = counter.load(Ordering::Relaxed);
 	loop {
-		let next = used.checked_add(n).filter(|&next| next <= limit)?;
-		match IN_USE.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-			Ok(_) => return Some(Ticket { n }),
+		let Some(next) = used.checked_add(n).filter(|&next| next <= limit) else { return false };
+		match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+			Ok(_) => return true,
 			Err(now) => used = now,
 		}
 	}
@@ -178,17 +209,18 @@ mod tests {
 
 	#[test]
 	fn tickets_are_bounded_and_given_back() {
-		// the counter is the process's: measure against what is held now
-		let base = in_use();
-		let a = take_within(3, base + 4).unwrap();
-		assert!(take_within(2, base + 4).is_none(), "no room for 2 more");
-		let b = take_within(1, base + 4).unwrap();
-		drop(a);
-		let c = take_within(3, base + 4).unwrap();
-		drop((b, c));
-		assert!(in_use() <= base + 4);
+		// a counter of its own: other tests (UDP sessions, splice pipes) take from the process's
+		let counter = AtomicU64::new(0);
+		assert!(reserve(&counter, 3, 4));
+		assert!(!reserve(&counter, 2, 4), "no room for 2 more");
+		assert!(reserve(&counter, 1, 4));
+		assert_eq!(counter.load(Ordering::Relaxed), 4);
+		counter.fetch_sub(3, Ordering::Relaxed);
+		assert!(reserve(&counter, 3, 4));
+		assert!(!reserve(&counter, 1, 4));
 		// `force` is bounded the same way, at half the reserve past the limit
-		assert!(take_within(RESERVE, base + RESERVE / 2).is_none());
+		assert!(!reserve(&counter, RESERVE, RESERVE / 2));
+		assert!(!reserve(&AtomicU64::new(u64::MAX), 1, u64::MAX), "never wraps");
 	}
 
 	/// #373: an `http` connection keeps one of the two it took when accepted.

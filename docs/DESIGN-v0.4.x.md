@@ -501,8 +501,11 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - `http` の接続：受け付けたときにはまだ `http` のルールかを読んでいない（`Runtime.http` の RwLock を読むと atomic が増える）ので 2 つ取り、`handle_http` に入るところで `Ticket::keep(1)`（`fetch_sub` 1 回）で 1 つ返す。そのため `http` の接続は、受け付けるときに 2 つ空いていることが要る。転送先への接続は `server.rs` の `connect`（`Conn::connect`。転送・`forward_auth`・`mirror`・エラーページが通る）が `Ticket::take(1)` を取り、`Dialer::dial` がそれを `TcpStream` と一緒に `backend::Budgeted` に入れる（TLS はその上）。チケットはソケットと同じだけ生きる（使い回す接続・HTTP/2 の接続・Upgrade した接続も）。取れなければ `Failure::Budget`：`forward` は 503 を返して試し直さず（ほかの転送先も 1 つ要る）、`http.error` は出さない（`refused` が間引いて出す）。ヘルスチェックは取らない（`dial` に `None`）。
 - splice のパイプ：`splice::Pipe::open` が新しいパイプを作るときに `Ticket::take(2)` を `PipeFds` に入れる（プールにあるあいだも持つ。プールは 8 本まで）。取れなければ EMFILE と同じく、その向きはユーザー空間のコピー。
 - HTTP/3 は QUIC の接続ごとに取らない（1 つの UDP のソケット）。転送先への接続は上の `connect` で取る。
-- UDP のセッションを枠で断ったときの `reason` は `max_connections` から `fd_budget` に変えた（ルールの上限と区別できるように）。
+- UDP のセッションを枠で断ったときの `reason` も `fd_budget`（ルールの上限の `max_connections` と区別できるように。UDP の枠（#354・#370）はまだ出していないので、出す版から `fd_budget`）。
+- 受け身のヘルスチェック・`circuit_breaker`：枠で断った 503 は転送先のせいではないので、`send` は `Failure::Budget` を `outlier_detection` に渡さず、503 の応答に `BudgetRefused` の印を付けて `circuit_breaker` も数えない（数えると、枠が埋まったときにすべての転送先が外れる。レビューの M1）。
+- 中継あたりの数：splice している中継は、向きごとのパイプでさらに 2 本（4 つ）まで持つ。
+- 結合テストは `main` を通らないので、`tests/common` の harness が `budget::raise_nofile_limit`（`main` と共有）でソフトの上限をハードの上限まで上げる（ソフトが 1024 だと枠が 256 になり、多くの接続を開くテストが断られる）。
 - 数：`Stats.fd_budget`（`target_full` と同じく `limited` の配列の外。引き継ぎの `Counters.fd_budget` は `#[serde(default)]` で足すだけ）。`/metrics` の `rproxy_session_budget_in_use`・`_limit` の説明を TCP・`http` を含むものに直した。
 - 接続ごとの費用：L4 の TCP は CAS 1 回と drop の `fetch_sub` 1 回、`http` は加えて `keep` の `fetch_sub` 1 回。`Ticket` は 8 バイトで、接続のタスクの future に入るだけ（`Runtime`・`Stats` の接続ごとに触る項目の並びは変えていない）。`Budgeted` は読み書きを `TcpStream` にそのまま渡す（`poll_write_vectored`・`is_write_vectored` も）。
 - CrowdSec の `rproxy-conn-limited` は `reason: fd_budget` を数えない（プロセス全体の混み具合で、そのクライアントのせいとは限らない）。
-- 試験：`tests/fd_budget.rs`（`budget::init_exact` で枠を 4 にする。枠がプロセスで 1 つなので別のテストのバイナリで 1 つのテスト）、単体は `core::budget`（`keep`）・`control::upgrade::handoff`（`Counters.fd_budget`）。
+- 試験：`tests/fd_budget.rs`（`budget::init_exact` で枠を 4 にする。枠がプロセスで 1 つなので別のテストのバイナリで 1 つのテスト）、単体は `core::budget`（`keep`、CAS の `reserve` は自分の数で試す：ほかの単体テストもプロセスの数を使うので）・`control::upgrade::handoff`（`Counters.fd_budget`）。

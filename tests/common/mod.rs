@@ -91,6 +91,8 @@ pub fn assert_offload_verified() {
 pub async fn harness_with_global(tokens: Tokens, http: rproxy_api::l7::access::HttpGlobal) -> Harness {
 	// keys and secrets written by tests must pass the owner check (net::files)
 	rproxy_api::net::files::private_umask();
+	// as `main` does, before anything reads the descriptor budget (#373: TCP takes from it too)
+	rproxy_api::core::budget::raise_nofile_limit();
 	offload_from_env();
 	let names: Names = Arc::default();
 	let registry = Registry::new(Config {

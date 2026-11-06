@@ -116,7 +116,11 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	let (status, v) = h
 		.post(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": http_port,
-			"http": {"routes": [{"name": "all", "match": "PathPrefix(`/`)", "to": format!("http://{web}")}]}}))
+			// passive health and a breaker that would hold the server down for a while (#373 review M1)
+			"http": {"routes": [{"name": "all", "match": "PathPrefix(`/`)", "service": "s", "middlewares": ["cb"]}],
+				"middlewares": {"cb": {"circuit_breaker": {"failure_percent": 50, "window": "10s", "recovery": "1m"}}},
+				"services": {"s": {"servers": [{"url": format!("http://{web}")}],
+					"outlier_detection": {"consecutive_5xx": 1, "consecutive_gateway_failures": 1, "ejection_time": "1m", "max_ejected_percent": 100}}}}}))
 		.await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	assert_eq!(budget::in_use(), 0, "health checks and listeners take none");
@@ -157,12 +161,21 @@ async fn connections_over_the_descriptor_budget_are_refused() {
 	// no room for a connection to the server: 503, and the client's connection stays
 	assert_eq!(request(&mut x).await, Some(503));
 	assert_eq!(request(&mut y).await, Some(503));
-	assert_eq!(fd_budget_refused(&metrics(&h).await, http_port), 4, "2 connections + two 503s");
+	// past the breaker's 10 requests at least
+	for _ in 0..12 {
+		assert_eq!(request(&mut x).await, Some(503));
+	}
+	assert_eq!(fd_budget_refused(&metrics(&h).await, http_port), 16, "2 connections + fourteen 503s");
+	// a full budget is not the server's doing: neither outlier_detection nor the breaker counts it
+	let (_, r) = h.get(&format!("/rules/tcp/127.0.0.1/{http_port}")).await;
+	let server = &r["stats"]["http"]["services"]["s"][0];
+	assert_eq!(server["up"], true, "{r}");
+	assert!(server.get("ejected").is_none(), "{r}");
 
 	// room again once the relay ends
 	drop(b);
 	in_use_becomes(2).await;
-	assert_eq!(request(&mut x).await, Some(200));
+	assert_eq!(request(&mut x).await, Some(200), "the breaker stayed closed");
 	drop((x, y));
 	in_use_becomes(0).await;
 	let a = tcp_served(tcp_port).await.expect("served again");
