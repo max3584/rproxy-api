@@ -12,6 +12,13 @@ const MAX_LINE: usize = 4096;
 const MAX_PLAIN_COMMANDS: usize = 32;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole plain-text dialogue with the client, up to STARTTLS (#359): without it,
+/// `MAX_PLAIN_COMMANDS` commands of `COMMAND_TIMEOUT` each could hold a connection 32 min.
+pub const DIALOGUE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The most lines (and bytes, with the line ends) of one reply of the mail server (#359).
+/// An EHLO reply has a line per extension, usually under 20.
+const MAX_REPLY_LINES: usize = 128;
+const MAX_REPLY_BYTES: usize = 64 * 1024;
 
 /// Reads CRLF-terminated lines and keeps whatever follows the last line.
 #[derive(Default)]
@@ -69,13 +76,19 @@ fn verb(line: &str) -> String {
 	line.split_whitespace().next().unwrap_or("").to_ascii_uppercase()
 }
 
-/// Talks to the client until it asks for STARTTLS.
+/// Talks to the client until it asks for STARTTLS, for at most `DIALOGUE_TIMEOUT`.
 pub async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
 	proto: StartTls,
 	client: &mut S,
 	hostname: &str,
 	required: bool,
 ) -> io::Result<Outcome> {
+	tokio::time::timeout(DIALOGUE_TIMEOUT, talk(proto, client, hostname, required))
+		.await
+		.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no STARTTLS within 5 min"))?
+}
+
+async fn talk<S: AsyncRead + AsyncWrite + Unpin>(proto: StartTls, client: &mut S, hostname: &str, required: bool) -> io::Result<Outcome> {
 	let mut lines = Lines::default();
 	let greeting = match proto {
 		StartTls::Smtp => format!("220 {hostname} ESMTP rproxy\r\n"),
@@ -190,6 +203,7 @@ pub async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
 /// Reads one complete reply from the server (SMTP multi-line replies end with "NNN ").
 async fn read_reply<R: AsyncRead + Unpin>(proto: StartTls, lines: &mut Lines, r: &mut R) -> io::Result<Vec<String>> {
 	let mut reply = vec![];
+	let mut bytes = 0;
 	loop {
 		let line = lines
 			.next(r)
@@ -199,6 +213,10 @@ async fn read_reply<R: AsyncRead + Unpin>(proto: StartTls, lines: &mut Lines, r:
 			StartTls::Smtp => line.as_bytes().get(3) != Some(&b'-'),
 			StartTls::Imap | StartTls::Pop3 => true,
 		};
+		bytes += line.len() + 2;
+		if reply.len() >= MAX_REPLY_LINES || bytes > MAX_REPLY_BYTES {
+			return Err(io::Error::new(io::ErrorKind::InvalidData, "reply of the mail server too long"));
+		}
 		reply.push(line);
 		if last {
 			return Ok(reply);
@@ -371,6 +389,43 @@ mod tests {
 		let mut sent = vec![0u8; 8];
 		server.read_exact(&mut sent).await.unwrap();
 		assert_eq!(&sent, b"EHLO c\r\n");
+	}
+
+	#[tokio::test]
+	async fn an_endless_reply_of_the_server_is_refused() {
+		// #359: the lines of one reply are capped, not gathered without end
+		let (mut up_side, mut server) = duplex(1 << 20);
+		let flood = tokio::spawn(async move {
+			for _ in 0..10_000 {
+				if server.write_all(b"220-hello\r\n").await.is_err() {
+					return;
+				}
+			}
+		});
+		let err = skip_greeting(StartTls::Smtp, &mut up_side).await.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+		drop(up_side);
+		flood.await.unwrap();
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_dialogue_has_an_overall_deadline() {
+		// #359: a NOOP every 50 s keeps under COMMAND_TIMEOUT, but not under DIALOGUE_TIMEOUT
+		let (mut ours, mut theirs) = duplex(1 << 16);
+		let client = tokio::spawn(async move {
+			for _ in 0..MAX_PLAIN_COMMANDS - 1 {
+				if theirs.write_all(b"NOOP\r\n").await.is_err() {
+					return;
+				}
+				tokio::time::sleep(Duration::from_secs(50)).await;
+			}
+		});
+		let start = tokio::time::Instant::now();
+		let err = serve_client(StartTls::Smtp, &mut ours, "mx", true).await.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(start.elapsed(), DIALOGUE_TIMEOUT);
+		drop(ours);
+		client.abort();
 	}
 
 	#[tokio::test]
