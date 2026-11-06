@@ -64,12 +64,41 @@ pub struct Principal {
 	/// Name prefixes of the stored certificates (#240) the token may put,
 	/// delete, read and use in rules (`allow_certs`; None: any).
 	certs: Option<Vec<String>>,
+	/// Rules the token may have (its own and those of its rule sets; `max_rules`, #358).
+	pub max_rules: Option<usize>,
+	/// Rule sets the token may own (`max_rulesets`, #358).
+	pub max_rulesets: Option<usize>,
+	/// `allow_freebind: true` of the token file (#358).
+	allow_freebind: bool,
 }
 
 impl Principal {
 	/// Without a token file every request is allowed.
 	fn anonymous() -> Self {
-		Principal { name: String::new(), scopes: vec![Scope::Admin], ports: None, persist: false, auth: "", rulesets: None, certs: None }
+		Principal {
+			name: String::new(),
+			scopes: vec![Scope::Admin],
+			ports: None,
+			persist: false,
+			auth: "",
+			rulesets: None,
+			certs: None,
+			max_rules: None,
+			max_rulesets: None,
+			allow_freebind: false,
+		}
+	}
+
+	/// Whether the token may ask for `listen_freebind` (#358): `admin`, `allow_freebind: true`,
+	/// or (`in_ruleset`) a rule set's `PUT` by a token limited by `allow_rulesets` — what
+	/// rproxy-gateway's token is, which sets it for Gateways with `spec.addresses`.
+	pub fn may_freebind(&self, in_ruleset: bool) -> bool {
+		self.has(Scope::Admin) || self.allow_freebind || (in_ruleset && self.rulesets.is_some())
+	}
+
+	/// `may_freebind(true)` holds only because of `allow_rulesets` (logged once, #358).
+	pub fn freebind_by_rulesets_only(&self) -> bool {
+		!self.has(Scope::Admin) && !self.allow_freebind && self.rulesets.is_some()
 	}
 
 	pub fn has(&self, scope: Scope) -> bool {
@@ -150,6 +179,15 @@ struct TokenEntry {
 	/// Name prefixes of the stored certificates this token may use (#240, v0.4.2).
 	#[serde(default)]
 	allow_certs: Option<Vec<String>>,
+	/// Rules this token may have (#358; default: only the process's limit).
+	#[serde(default)]
+	max_rules: Option<usize>,
+	/// Rule sets this token may own (#358).
+	#[serde(default)]
+	max_rulesets: Option<usize>,
+	/// Rules with `listen_freebind` without `admin` (#358).
+	#[serde(default)]
+	allow_freebind: bool,
 	#[serde(default)]
 	expires: Option<String>,
 }
@@ -256,6 +294,9 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					auth,
 					rulesets: e.allow_rulesets,
 					certs: e.allow_certs,
+					max_rules: e.max_rules,
+					max_rulesets: e.max_rulesets,
+					allow_freebind: e.allow_freebind,
 				},
 				expires,
 			});
@@ -277,6 +318,9 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					auth: "token",
 					rulesets: None,
 					certs: None,
+					max_rules: None,
+					max_rulesets: None,
+					allow_freebind: false,
 				},
 				expires: None,
 			})

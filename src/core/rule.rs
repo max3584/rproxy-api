@@ -238,6 +238,11 @@ pub struct Features {
 	/// `idle_timeout` (default 1h) and `half_close_timeout` (default 1 min) of an L4 tcp rule
 	/// (`0s` none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)
 	pub tcp_idle_timeout: bool,
+	/// The control API's limits (#358): `max_rules` / `max_rulesets` of the token file,
+	/// `RPROXY_MAX_RULES` / `_LISTENERS` / `_RULESETS` (`409 limit`), `listen_freebind` for
+	/// `admin`, `allow_freebind` and (rule sets) `allow_rulesets` tokens, route, middleware and
+	/// service names the API is sent without control characters, white space, `"`, `\` and the like
+	pub control_limits: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -309,6 +314,7 @@ impl Features {
 		target_max_connections: true,
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
+		control_limits: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -363,6 +369,7 @@ impl Features {
 		target_max_connections: true,
 		cache_process_memory: true,
 		tcp_idle_timeout: true,
+		control_limits: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
