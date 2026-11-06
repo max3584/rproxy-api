@@ -452,7 +452,7 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - `TCP_USER_TIMEOUT` は付けない：keepalive と一緒だと（Linux は `user_timeout` を過ぎてプローブを 1 つでも送っていれば切る）最初の応答のないプローブで切れ、keepalive より長くすると消えた相手への再送をカーネルの既定（`tcp_retries2`、約 15 分）より長く待たせる。読まない相手は `idle_timeout` で閉じる。keepalive の間隔をルールで決める形は足さない（カーネルの設定を運用で変えられる）。
 - `half_close_timeout` をルールごとにしたのは、送り終えてから最初の返事まで長く待つもの（`nc -N`、`shutdown(SHUT_WR)` してから待つ RPC・バックアップの道具）が `idle_timeout` を外さずに外せるように（レビュー）。`0s` で `idle_timeout` だけ。
 - PATCH の `idle_timeout` / `half_close_timeout` は次の接続から（接続の始めに 1 回読む）。省けば今のまま、`0s` で上限なし（既定に戻すには `1h` / `1m`）。`http` のルールでは `invalid`（L4 のルールは PATCH で `http` にできないので、付いたまま `http` になることはない）。
-- UI の DB（`forward_rules`、`config/db.rs`）から戻したルールは既定になる（列がない）。UI が項目を持つまで `0s` にできない。
+- UI の DB（`forward_rules`、`config/db.rs`）から戻したルールは、`options` 列の `idle_timeout`・`half_close_timeout` を読む（UI #181。なければ既定）。
 - 引き継ぎ・保存：ルールの形に足すだけ（`GET /rules` の形・`rproxy_rules.spec`。付けたときだけ出すので、付けていないルールの形は前と同じ）。
 - #359 の残り：STARTTLS の転送先の返事は 1 つの返事で 128 行・64 KiB まで（`starttls::read_reply`）、STARTTLS の前のやり取りは全体で 5 分まで（`DIALOGUE_TIMEOUT`。前は 32 回 × 60 秒で 32 分）。宛先を外したときの戻すタイマーは `Ejection` ごとに 1 つ（`outlier::after`。すべての宛先が down で接続のたびに外し直しても、タスクは増えずに 1 つが期限を追う）。ClientHello のバイトは送ったら捨てる（`relay_hello`、`Prefixed` は渡し終えたら）。`terminate` の passthrough の route のための ClientHello の読み込みは `rt.kill` で止まり、accept の誤りの後の 100 ms の待ちは `stop` で止まる。
 - TLS のハンドシェイクの同時の数のプロセス全体の上限は設けない（決定）：ハンドシェイクは 10 秒（`http` は `tls_handshake`）で切れ、CPU はワーカーのスレッドの数までで、送信元ごとはルールの `limits` で絞れる。全体の上限は、攻撃のあいだほかのルールの正しい接続まで待たせる。
