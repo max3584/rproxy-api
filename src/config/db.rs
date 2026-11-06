@@ -70,6 +70,8 @@ struct Options {
 	/// The relay deadlines of a tcp rule (#353, the UI's #181): `0s` none, left out the default.
 	idle_timeout: Option<String>,
 	half_close_timeout: Option<String>,
+	/// How long a connection to a target may take (v0.4.3; read here from #379, the UI's #184): `0s` none.
+	connect_timeout: Option<String>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -150,6 +152,7 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		req.proxy_protocol = options.proxy_protocol;
 		req.idle_timeout = options.idle_timeout;
 		req.half_close_timeout = options.half_close_timeout;
+		req.connect_timeout = options.connect_timeout;
 	}
 	Ok(Some(req))
 }
@@ -207,7 +210,7 @@ pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::core::rule::{validate_relay_timeout, Protocol};
+	use crate::core::rule::{validate_connect_timeout, validate_relay_timeout, Protocol};
 
 	/// The `options` column of 0.3 rows still reads, and the v0.4 keys read in the API's shape.
 	#[test]
@@ -234,6 +237,12 @@ mod tests {
 		assert_eq!(idle, Some(Duration::ZERO));
 		let half = validate_relay_timeout("half_close_timeout", relay.half_close_timeout.as_deref(), Protocol::Tcp, false).unwrap();
 		assert_eq!(half, Some(Duration::from_secs(300)));
+		// connect_timeout (v0.4.3) survives a restore from the UI's table (#379, the UI's #184); `0s` is none
+		let connect: Options = serde_json::from_str(r#"{"connect_timeout": "1500ms"}"#).unwrap();
+		let d = validate_connect_timeout(connect.connect_timeout.as_deref(), Protocol::Tcp, false).unwrap();
+		assert_eq!(d, Some(Duration::from_millis(1500)));
+		let none: Options = serde_json::from_str(r#"{"connect_timeout": "0s"}"#).unwrap();
+		assert_eq!(validate_connect_timeout(none.connect_timeout.as_deref(), Protocol::Tcp, false).unwrap(), None);
 		assert!(serde_json::from_str::<Options>(r#"{"limitz": {}}"#).is_err(), "unknown keys are still refused");
 	}
 }

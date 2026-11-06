@@ -853,7 +853,7 @@ UDP の送信元は偽れるので、1 つのデータグラムで作れるも�
   - TCP・`http` の接続も同じ枠を使う（v0.4.20、#373）：受け付けた接続は、すぐに 2 つ（受けたソケットと転送先へのソケット）を取る。`http` のルールの接続はそのうち 1 つを返して 1 つを持ち、転送先への接続（`forward_auth`・`mirror`・エラーページも）は開くたびに 1 つを取って、そのソケットが閉じるまで持つ（使い回す接続・Upgrade した接続も）。平文の TCP の中継が splice で使うパイプも 1 本につき 2 つ取り、取れなければその向きはユーザー空間のコピーで運ぶ。HTTP/3 は QUIC の接続ごとには取らない（ルールの 1 つの UDP のソケットを共有する）。ヘルスチェックの接続も取らない（転送先ごとに 1 つで、枠が埋まっても転送先を down にしないため）。
   - 取れなければ、受け付けた接続は何も送らずにすぐ閉じる（`allow_from` などより前。ログの `client` は接続元のアドレス）。`http` の転送先への接続が取れなければ、そのリクエストは 503（ほかの転送先も試さない）で、クライアントの接続はそのまま。この 503 は転送先のせいではないので、`outlier_detection` と `circuit_breaker` には数えない。どちらも `stats.limited`・`/metrics` の `rproxy_rule_limited_total{reason="fd_budget"}` に数え、`conn.limited`（`reason: fd_budget`、`transport` は `tcp` / `udp` / `http`）を送信元ごとに間引いて出す。制御 API の接続はこの枠に入らない（埋まっても答える）。
   - 枠の数は上のとおり（ユニットの `LimitNOFILE=65536` では 32256）なので、TCP の中継なら同時に約 16000 本。ただし splice（平文の TCP の大きな転送）をしている中継は、向きごとのパイプでさらに 2 本（4 つ）まで持つので、大きな転送が多いと少なくなる。足りなければ `LimitNOFILE` を上げる。
-- **DTLS の終端**：新しい送信元の最初のデータグラムが ClientHello（epoch 0 のハンドシェイクのレコード）でなければ、セッションを作らずに捨てる。ハンドシェイクの間は、1 つのポートで「名前を読む」セッションと同じ枠（1 ポート 4096、1 つのプレフィックス（IPv4 /24・IPv6 /48）は 64 まで。超えたらそのプレフィックスのいちばん古いものをあきらめる）を使い、ハンドシェイクが終わるまでは確立していないセッションとして上限で終える対象になる。5 秒のうちに、DTLS のライブラリが送った HelloVerifyRequest の cookie を持つ ClientHello が戻ってこなければ終える（偽った送信元には cookie が届かない）。DTLS の設定はルールの TLS と一緒に 1 回だけ組み立てる。HelloVerifyRequest を rproxy が状態を持たずに答える（cookie を確かめてから DTLS の接続を作る）のは、使っている `dtls` クレート（0.17）ではできない（ライブラリが自分の cookie とハンドシェイクの番号を決めるため）。ライブラリはセッションごとに証明書の鍵を複製する。
+- **DTLS の終端**：新しい送信元の最初のデータグラムが ClientHello（epoch 0 のハンドシェイクのレコード）でなければ、セッションを作らずに捨てる。ハンドシェイクの間は、1 つのポートで「名前を読む」セッションと同じ枠（1 ポート 4096、1 つのプレフィックス（IPv4 /24・IPv6 /48）は 64 まで。超えたらそのプレフィックスのいちばん古いものをあきらめる）を使い、ハンドシェイクが終わるまでは確立していないセッションとして上限で終える対象になる。5 秒のうちに、DTLS のライブラリが送った HelloVerifyRequest の cookie を持つ ClientHello が戻ってこなければ終える（偽った送信元には cookie が届かない）。DTLS の設定はルールの TLS と一緒に 1 回だけ組み立てる。HelloVerifyRequest を rproxy が状態を持たずに答える（cookie を確かめてから DTLS の接続を作る）のは、使っている `dtls` クレート（0.17）ではできない（ライブラリが自分の cookie とハンドシェイクの番号を決めるため。#383）。ライブラリはセッションごとに証明書の鍵を複製する。
 - **DTLS の転送先が閉じたとき**：転送先への DTLS が閉じる・失敗すると、そのセッションを終える（`reason: backend closed`。前は読み出しの誤りを繰り返して CPU を使い続けた）。
 - **QUIC の名前読み**：1 つのセッションで見る Initial は 16 まで（前は 64）、鍵は最初の Initial の接続 ID から 1 回だけ導き、違う接続 ID の Initial は読まない（RFC 9000 §12.2）。同じソケットからの別の名前の新しい接続を読む間に持つデータグラムは、数（16）に加えてバイト（64 KiB）でも上限がある。
 - **セッションのキュー**：1 つのセッションに渡す前のデータグラムは、数（1024）に加えて、大きさでも上限がある（そのデータグラムと同じ大きさで 2 MiB 分より多く並んでいれば捨てる。1 つのキューは多くて約 9 MiB。前は 64 MiB まで）。
@@ -1067,6 +1067,7 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - 宛先が 1 つ・複数のどちらでも効く（複数のときは 5 秒の代わり）。`tls.routes` の宛先も同じ。
 - 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
 - `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
+- UI の DB（`forward_rules`）から戻したルールも、`options` 列の `connect_timeout`（API と同じ文字列）を読む（v0.4.21、#379、UI #184、`features.db_connect_timeout`）。v0.4.20 までは読まず、`options` に書いた行は知らないキーとして戻らなかった。
 
 ### 中継の時間切れと keepalive（v0.4.20、#353、`features.tcp_idle_timeout`）
 
@@ -1404,4 +1405,4 @@ v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自
 `forward_rules` のノードでの振り分けは UI 側でする（`target` 列、UI PR #103。ノードごとの DB のビューがその rproxy の行だけを見せる）ので、rproxy は `forward_rules` を絞り込まない。`rproxy_rules` は rproxy が自分の `node` の行だけを読む。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
-`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）、`idle_timeout`・`half_close_timeout`（v0.4.20）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
+`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）、`idle_timeout`・`half_close_timeout`（v0.4.20）、`connect_timeout`（v0.4.21、`features.db_connect_timeout`。それより前の rproxy はこのキーのある行を戻さない）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
