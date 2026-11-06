@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::core::balance::{Lease, TargetFull};
+use crate::core::budget::Ticket;
 use crate::l7::server::{self as http, Metered};
 use crate::core::proxy::{Counted, Runtime, Target};
 use crate::core::rule::SourceIp;
@@ -47,9 +48,15 @@ pub async fn serve(listener: TcpListener, rt: Arc<Runtime>, offset: u16, stop: C
 			_ = stop.cancelled() => break,
 			accepted = listener.accept() => match accepted {
 				Ok((inbound, peer)) => {
+					// the process's descriptors (#373): the connection and the one to the backend,
+					// taken before anything else; without them it is closed at once
+					let Some(ticket) = Ticket::take(2) else {
+						crate::core::limits::refused(&rt, peer, crate::core::limits::Reason::FdBudget, "tcp");
+						continue;
+					};
 					source::nodelay(&inbound);
 					source::keepalive(&inbound);
-					rt.tracker.spawn(handle(inbound, peer, rt.clone(), offset));
+					rt.tracker.spawn(handle(inbound, peer, rt.clone(), offset, ticket));
 				}
 				Err(e) => {
 					// e.g. EMFILE: back off instead of spinning (and still stop at once)
@@ -227,7 +234,8 @@ fn is_denied(e: &io::Error) -> bool {
 /// `from` sends a PROXY header first and the client is who it names: everything after
 /// this (allow_from, geoip, crowdsec, limits, bandwidth, logs, the address passed on to
 /// the backend) uses that client, and the front end is the logs' `proxy_peer`.
-async fn handle(mut inbound: TcpStream, peer: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+/// `ticket` holds the connection's descriptors (#373) until it ends.
+async fn handle(mut inbound: TcpStream, peer: SocketAddr, rt: Arc<Runtime>, offset: u16, ticket: Ticket) {
 	let (client, via, untrusted) = match rt.proxy_protocol() {
 		None => (peer, None, false),
 		Some(pp) if pp.trusts(peer.ip()) => match tokio::select! {
@@ -244,10 +252,10 @@ async fn handle(mut inbound: TcpStream, peer: SocketAddr, rt: Arc<Runtime>, offs
 		},
 		Some(_) => (peer, None, true),
 	};
-	proxy_in::with_peer(via, handle_client(inbound, client, rt, offset, untrusted)).await
+	proxy_in::with_peer(via, handle_client(inbound, client, rt, offset, untrusted, ticket)).await
 }
 
-async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16, untrusted: bool) {
+async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runtime>, offset: u16, untrusted: bool, mut ticket: Ticket) {
 	if !rt.allowed(client.ip()) {
 		denied(&rt, client, "allow_from", None);
 		return;
@@ -317,8 +325,11 @@ async fn handle_client(mut inbound: TcpStream, client: SocketAddr, rt: Arc<Runti
 		}
 	}
 	if pass.is_none() && rt.http_router().is_some() {
-		return handle_http(inbound, prefix, client, rt, offset).await;
+		// the connections to the servers take their own (`l7::server`)
+		ticket.keep(1);
+		return handle_http(inbound, prefix, client, rt, offset, ticket).await;
 	}
+	let _ticket = ticket;
 	let started = Instant::now();
 	rt.stats.opened();
 	let short_lived = !rt.pool().outlier().short_lived.is_zero();
@@ -637,7 +648,7 @@ async fn accept_tls<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// A connection of an `http` rule: TLS (for `terminate`), then HTTP requests
 /// routed one by one (src/l7/server.rs).
-async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt: Arc<Runtime>, offset: u16) {
+async fn handle_http(inbound: TcpStream, prefix: Vec<u8>, client: SocketAddr, rt: Arc<Runtime>, offset: u16, _ticket: Ticket) {
 	let started = Instant::now();
 	rt.stats.opened();
 	let tls = rt.tls();

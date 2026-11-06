@@ -856,6 +856,9 @@ fn upgrade_of(headers: &HeaderMap) -> Option<HeaderValue> {
 enum Failure {
 	/// Could not connect (502) or timed out (504).
 	Status(StatusCode, String),
+	/// No room in the process's descriptor budget for a connection to the server (#373):
+	/// counted and logged already (`limits::refused`, `reason: fd_budget`); a 503, not tried again.
+	Budget,
 }
 
 /// Whether the client's `TE` asks for trailers (passed on to HTTP/2 backends, #233).
@@ -1383,6 +1386,7 @@ impl Conn {
 					"error page not available; the original response is sent");
 				None
 			}
+			Err(Failure::Budget) => None,
 		}
 	}
 
@@ -1473,6 +1477,7 @@ impl Conn {
 					"the auth server did not answer");
 				AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }))
 			}
+			Err(Failure::Budget) => AuthOutcome::Deny(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 		}
 	}
 
@@ -1558,6 +1563,7 @@ impl Conn {
 				failed(&error);
 				return AuthOutcome::Deny(error_response(if status == StatusCode::GATEWAY_TIMEOUT { status } else { StatusCode::BAD_GATEWAY }));
 			}
+			Err(Failure::Budget) => return AuthOutcome::Deny(error_response(StatusCode::SERVICE_UNAVAILABLE)),
 		};
 		let (head, body) = resp.into_parts();
 		let collected = match http_body_util::Limited::new(body, ext_authz::MAX_RESPONSE).collect().await {
@@ -1836,6 +1842,8 @@ impl Conn {
 					}
 				}
 				Ok(resp) => break (resp, index, counted),
+				// counted and logged (throttled) where it was refused; another server needs a descriptor too
+				Err(Failure::Budget) => return error_response(StatusCode::SERVICE_UNAVAILABLE),
 				Err(Failure::Status(status, error)) => {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
 						status = status.as_u16(), error = %error, attempt, attempts);
@@ -1986,6 +1994,7 @@ impl Conn {
 				debug!(event = "http.mirror", rule = %self.rt.key, middleware = %copy.name, service = %service.name, backend = %server.addr(),
 					status = status.as_u16(), error = %error);
 			}
+			Err(Failure::Budget) => {}
 		}
 	}
 
@@ -2163,7 +2172,13 @@ impl Conn {
 
 	async fn connect(&self, router: &Router, service: &Service, index: usize) -> Result<Sender, Failure> {
 		let server = &service.servers[index];
-		let (stream, picked_h2) = tokio::time::timeout(service.connect, router.dialer.dial(server, self.rt.bind_as(self.client), service.tls.as_ref()))
+		// the socket's place in the process's descriptor budget (#373), kept as long as it is open
+		let Some(ticket) = crate::core::budget::Ticket::take(1) else {
+			crate::core::limits::refused(&self.rt, self.client, crate::core::limits::Reason::FdBudget, "http");
+			return Err(Failure::Budget);
+		};
+		let dial = router.dialer.dial(server, self.rt.bind_as(self.client), service.tls.as_ref(), Some(ticket));
+		let (stream, picked_h2) = tokio::time::timeout(service.connect, dial)
 			.await
 			.map_err(|_| Failure::Status(StatusCode::GATEWAY_TIMEOUT, "connect timed out".into()))?
 			.map_err(|e| Failure::Status(StatusCode::BAD_GATEWAY, e))?;

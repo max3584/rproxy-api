@@ -329,10 +329,14 @@ pub enum Reason {
 	Packets,
 	/// Every target (L4 `targets[]`) or server (`http`) is at its `max_connections` (#341).
 	TargetFull,
+	/// The process's descriptors for connections and sessions are all taken (`core::budget`,
+	/// #373): the connection is closed at once (`http`: an upstream connection, a 503).
+	FdBudget,
 }
 
 impl Reason {
-	pub const ALL: [Reason; 5] = [Reason::MaxConnections, Reason::SourceConnections, Reason::NewConnections, Reason::Packets, Reason::TargetFull];
+	pub const ALL: [Reason; 6] =
+		[Reason::MaxConnections, Reason::SourceConnections, Reason::NewConnections, Reason::Packets, Reason::TargetFull, Reason::FdBudget];
 
 	pub fn as_str(self) -> &'static str {
 		match self {
@@ -341,6 +345,7 @@ impl Reason {
 			Reason::NewConnections => "new_connections",
 			Reason::Packets => "packets",
 			Reason::TargetFull => "target_full",
+			Reason::FdBudget => "fd_budget",
 		}
 	}
 

@@ -19,8 +19,10 @@
 //! a small shared pool when the direction waits for more (so an idle connection
 //! holds no pipe, as HAProxy does); a pipe with data left is closed. The pool
 //! is emptied when no direction is splicing any more. A side that cannot be
-//! spliced (EINVAL / ENOSYS) or a pipe that cannot be made (EMFILE) goes back to
-//! the user-space copy for the rest of that direction.
+//! spliced (EINVAL / ENOSYS) or a pipe that cannot be made (EMFILE, or no room in the
+//! process's descriptor budget, `core::budget`, #373) goes back to the user-space copy for
+//! the rest of that direction. A pipe holds its two descriptors of the budget while it is
+//! open, in the pool too.
 //!
 //! A rule with a `bandwidth` limit (#166) is not spliced: the user-space copy
 //! reads at the limit's pace (`bandwidth::Shaped`). A direction checks before
@@ -97,6 +99,8 @@ pub fn configure(s: Settings) -> bool {
 struct PipeFds {
 	read: OwnedFd,
 	write: OwnedFd,
+	/// Its two descriptors of the process's budget (#373).
+	_ticket: crate::core::budget::Ticket,
 }
 
 static POOL: Mutex<Vec<PipeFds>> = Mutex::new(Vec::new());
@@ -165,13 +169,16 @@ impl Pipe {
 		if let Some(fds) = POOL.lock().ok().and_then(|mut p| p.pop()) {
 			return Ok(Pipe { fds: Some(fds), pending: 0 });
 		}
+		// the pipe's descriptors come out of the process's budget (#373): without room, the
+		// direction stays in user space as with EMFILE
+		let ticket = crate::core::budget::Ticket::take(2).ok_or_else(|| io::Error::from_raw_os_error(libc::EMFILE))?;
 		let mut fds = [0 as libc::c_int; 2];
 		// SAFETY: fds has room for the two descriptors pipe2 writes
 		if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
 			return Err(io::Error::last_os_error());
 		}
 		// SAFETY: pipe2 succeeded, so both are new descriptors owned by nobody else
-		let fds = unsafe { PipeFds { read: OwnedFd::from_raw_fd(fds[0]), write: OwnedFd::from_raw_fd(fds[1]) } };
+		let fds = unsafe { PipeFds { read: OwnedFd::from_raw_fd(fds[0]), write: OwnedFd::from_raw_fd(fds[1]), _ticket: ticket } };
 		let size = settings().pipe_size;
 		if size > 0 {
 			// a failure (above pipe-max-size, or the user's pipe pages) keeps the default size

@@ -1,13 +1,17 @@
 //! The process-wide budget of file descriptors for connections and sessions (#354).
 //!
-//! Each UDP session opens a backend socket and each TCP connection two sockets; without a
+//! Each UDP session opens a backend socket, each TCP relay two sockets (and, while it
+//! splices, a pipe of two more), an `http` connection its own socket and each connection
+//! to a server one more (#373); without a
 //! cap for the whole process, a flood (of spoofed UDP sources, for one) could take every
 //! descriptor and leave none for the control API, the database, name resolution or the
 //! certificate files. The budget is `RLIMIT_NOFILE` (soft, after `main` lifts it to the hard
 //! limit) less `RESERVE` and less the listening sockets the rules may open
 //! (`RPROXY_MAX_LISTENERS`, #370), so that the two caps together leave `RESERVE`. `main`
 //! sets it once at startup (`init`); otherwise it is worked out the first time it is used.
-//! A `Ticket` holds its descriptors until it is dropped.
+//! A `Ticket` holds its descriptors until it is dropped. Taking one is a single CAS (`take`),
+//! giving it back one `fetch_sub`: what a connection pays for the budget (#369). HTTP/3
+//! takes none: its connections share the rule's one UDP socket.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +28,13 @@ static IN_USE: AtomicU64 = AtomicU64::new(0);
 /// Descriptors the data plane may hold at once.
 pub fn limit() -> u64 {
 	*LIMIT.get_or_init(|| from_nofile(nofile(), crate::core::quota::max_listeners() as u64))
+}
+
+/// Sets the budget to `limit` descriptors, once, as `init` does: for tests that need a small
+/// budget in their own process (`tests/fd_budget.rs`). Returns the budget in force.
+#[doc(hidden)]
+pub fn init_exact(limit: u64) -> u64 {
+	*LIMIT.get_or_init(|| limit)
 }
 
 /// Sets the budget from the file limit `main` read and the listener cap
@@ -93,6 +104,15 @@ impl Ticket {
 	/// is in flight at once stays bounded. None past that.
 	pub fn force(n: u64) -> Option<Ticket> {
 		take_within(n, limit().saturating_add(RESERVE / 2))
+	}
+
+	/// Gives back what the ticket holds beyond `n` (an `http` connection keeps one of the
+	/// two a TCP connection takes when accepted; its servers' connections take their own).
+	pub fn keep(&mut self, n: u64) {
+		if n < self.n {
+			IN_USE.fetch_sub(self.n - n, Ordering::Relaxed);
+			self.n = n;
+		}
 	}
 }
 
@@ -169,5 +189,18 @@ mod tests {
 		assert!(in_use() <= base + 4);
 		// `force` is bounded the same way, at half the reserve past the limit
 		assert!(take_within(RESERVE, base + RESERVE / 2).is_none());
+	}
+
+	/// #373: an `http` connection keeps one of the two it took when accepted.
+	#[test]
+	fn a_ticket_keeps_part_of_what_it_took() {
+		// other tests take tickets too: look at the ticket, not at the process's counter
+		let mut t = take_within(2, u64::MAX).unwrap();
+		t.keep(1);
+		assert_eq!(t.n, 1);
+		t.keep(5);
+		assert_eq!(t.n, 1, "keeping more takes nothing more");
+		t.keep(0);
+		assert_eq!(t.n, 0);
 	}
 }

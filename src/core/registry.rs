@@ -2343,7 +2343,7 @@ impl Registry {
 			("rproxy_bytes_total", "counter", "Bytes forwarded; rx is client to backend.", vec![]),
 			("rproxy_tls_failures_total", "counter", "Failed TLS / DTLS handshakes and STARTTLS dialogues.", vec![]),
 			("rproxy_udp_dropped_total", "counter", "UDP datagrams rproxy could not pass on (a session queue full, sending failed, or over bandwidth).", vec![]),
-			("rproxy_rule_limited_total", "counter", "Connections (TCP), datagrams (UDP) or requests (http, target_full) refused by the rule's limits (or, UDP, the default cap of sessions), or because every target was at its max_connections (reason target_full), by reason.", vec![]),
+			("rproxy_rule_limited_total", "counter", "Connections (TCP), datagrams (UDP) or requests (http, target_full and fd_budget) refused by the rule's limits (or, UDP, the default cap of sessions), because every target was at its max_connections (reason target_full), or because the process's descriptor budget was full (reason fd_budget), by reason.", vec![]),
 			("rproxy_rule_bandwidth_dropped_total", "counter", "UDP datagrams dropped over the rule's bandwidth.", vec![]),
 		];
 		for (key, entry) in rules.iter() {
@@ -2681,11 +2681,11 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_limit_bytes RPROXY_CACHE_MAX_MEMORY in force: bytes all cache middlewares may keep together (0: no limit).");
 	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_limit_bytes gauge");
 	let _ = writeln!(out, "rproxy_http_cache_memory_limit_bytes {limit}");
-	// the process's descriptors for connections and sessions (#354)
-	let _ = writeln!(out, "# HELP rproxy_session_budget_in_use Descriptors held by UDP sessions (and connections) of the process, of rproxy_session_budget_limit.");
+	// the process's descriptors for connections and sessions (#354, TCP and http #373)
+	let _ = writeln!(out, "# HELP rproxy_session_budget_in_use Descriptors held now of rproxy_session_budget_limit: 2 per TCP connection (1 for an http one), 1 per connection of an http rule to a server, 1 per UDP session, 2 per splice pipe.");
 	let _ = writeln!(out, "# TYPE rproxy_session_budget_in_use gauge");
 	let _ = writeln!(out, "rproxy_session_budget_in_use {}", crate::core::budget::in_use());
-	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors connections and sessions may hold: RLIMIT_NOFILE less a reserve of 1024 (0: no limit).");
+	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors TCP and http connections, their connections to servers and UDP sessions may hold together: RLIMIT_NOFILE less a reserve of 1024 and RPROXY_MAX_LISTENERS (0: no limit). Past it, new ones are refused (rproxy_rule_limited_total reason fd_budget).");
 	let _ = writeln!(out, "# TYPE rproxy_session_budget_limit gauge");
 	// 0: no limit (an unlimited RLIMIT_NOFILE)
 	let budget = match crate::core::budget::limit() {

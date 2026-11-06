@@ -535,8 +535,16 @@ pub struct Dialer {
 impl Dialer {
 	/// A TCP (and TLS for https://) connection to `server`, from `bind` when
 	/// the rule uses `source_ip: transparent`. `tls` is the service's own (#236);
-	/// the second value tells that the server picked HTTP/2 by ALPN.
-	pub async fn dial(&self, server: &Server, bind: Option<SocketAddr>, tls: Option<&ServiceTls>) -> Result<(Box<dyn Stream>, bool), String> {
+	/// the second value tells that the server picked HTTP/2 by ALPN. `ticket`: the
+	/// socket's place in the process's descriptor budget (#373), held as long as the socket
+	/// (a kept connection, an upgraded one); health checks take none.
+	pub async fn dial(
+		&self,
+		server: &Server,
+		bind: Option<SocketAddr>,
+		tls: Option<&ServiceTls>,
+		ticket: Option<crate::core::budget::Ticket>,
+	) -> Result<(Box<dyn Stream>, bool), String> {
 		let addrs = match server.host.parse::<IpAddr>() {
 			Ok(ip) => vec![SocketAddr::new(ip, server.port)],
 			Err(_) => resolve::resolve(&self.lookup, &server.addr()).await.map_err(|e| e.message)?,
@@ -553,6 +561,7 @@ impl Dialer {
 			}
 		}
 		let tcp = tcp.ok_or(last)?; // TCP_NODELAY is set by connect_tcp
+		let tcp = Budgeted { tcp, _ticket: ticket };
 		if !server.https {
 			return Ok((Box::new(tcp), false));
 		}
@@ -565,6 +574,49 @@ impl Dialer {
 		let stream = connector.connect(name, tcp).await.map_err(|e| format!("TLS: {e}"))?;
 		let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
 		Ok((Box::new(stream), h2))
+	}
+}
+
+/// A connection to a server with its place in the descriptor budget (#373), given back when
+/// the socket closes.
+struct Budgeted {
+	tcp: tokio::net::TcpStream,
+	_ticket: Option<crate::core::budget::Ticket>,
+}
+
+impl AsyncRead for Budgeted {
+	fn poll_read(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> std::task::Poll<io::Result<()>> {
+		std::pin::Pin::new(&mut self.get_mut().tcp).poll_read(cx, buf)
+	}
+}
+
+impl AsyncWrite for Budgeted {
+	fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+		std::pin::Pin::new(&mut self.get_mut().tcp).poll_write(cx, buf)
+	}
+
+	fn poll_write_vectored(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		bufs: &[io::IoSlice<'_>],
+	) -> std::task::Poll<io::Result<usize>> {
+		std::pin::Pin::new(&mut self.get_mut().tcp).poll_write_vectored(cx, bufs)
+	}
+
+	fn is_write_vectored(&self) -> bool {
+		self.tcp.is_write_vectored()
+	}
+
+	fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		std::pin::Pin::new(&mut self.get_mut().tcp).poll_flush(cx)
+	}
+
+	fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+		std::pin::Pin::new(&mut self.get_mut().tcp).poll_shutdown(cx)
 	}
 }
 
@@ -764,7 +816,8 @@ async fn probe(service: &Service, server: &Server, dialer: &Dialer, stop: &Cance
 		return (true, String::new());
 	}
 	let check = async {
-		let (stream, picked_h2) = dialer.dial(server, None, service.tls.as_ref()).await?;
+		// health checks are few (one per server) and must not fail for a full budget: none taken
+		let (stream, picked_h2) = dialer.dial(server, None, service.tls.as_ref(), None).await?;
 		let h2 = match service.protocol {
 			UpstreamProtocol::H2 | UpstreamProtocol::H2c => true,
 			UpstreamProtocol::Auto => picked_h2,
