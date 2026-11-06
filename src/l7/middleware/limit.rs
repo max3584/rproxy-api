@@ -11,9 +11,12 @@ use hyper::header::{HeaderMap, HeaderName};
 
 use crate::error::ApiError;
 
-/// At most this many sources are tracked per middleware; beyond it the idle half
-/// is dropped, so clients rotating addresses cannot exhaust memory.
+/// At most this many sources are tracked per middleware; beyond it the buckets that are
+/// full again are dropped (they are like new ones), then if needed the idle half, so
+/// clients rotating addresses cannot exhaust memory. From half of it on (`PRESSURE`), IPv6
+/// clients are counted by /48 instead of /64 (#356): rotating /64s of a /48 does not fill it.
 pub const MAX_KEYS: usize = 100_000;
+const PRESSURE: usize = MAX_KEYS / 2;
 
 /// Whose requests share a bucket.
 #[derive(Debug, Clone)]
@@ -40,6 +43,11 @@ impl Source {
 	/// SHA-256 (100 000 keys of 64 KiB values would be 6 GiB), an IPv6 client as its /64
 	/// (one host usually has a whole /64 and could take a new address for every request).
 	pub fn key(&self, headers: &HeaderMap, client: IpAddr) -> String {
+		self.key_by(headers, client, 64)
+	}
+
+	/// `key` with IPv6 clients by `/v6` (64 or, under pressure, 48).
+	fn key_by(&self, headers: &HeaderMap, client: IpAddr, v6: u8) -> String {
 		match self {
 			Source::Header(name) => match headers.get(name).and_then(|v| v.to_str().ok()) {
 				Some(v) if v.len() <= MAX_KEY_VALUE => format!("h:{v}"),
@@ -49,9 +57,9 @@ impl Source {
 					let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 					format!("s:{hex}")
 				}
-				None => ip_key(client),
+				None => ip_key(client, v6),
 			},
-			Source::Ip => ip_key(client),
+			Source::Ip => ip_key(client, v6),
 		}
 	}
 }
@@ -59,15 +67,15 @@ impl Source {
 /// Header values up to this length are keys as they are; longer ones by their hash.
 pub const MAX_KEY_VALUE: usize = 64;
 
-/// An IPv4 client by its address, an IPv6 one by its /64.
-fn ip_key(client: IpAddr) -> String {
+/// An IPv4 client by its address, an IPv6 one by its /`v6` (64 or 48).
+fn ip_key(client: IpAddr, v6: u8) -> String {
 	match client {
 		IpAddr::V4(a) => a.to_string(),
 		IpAddr::V6(a) => match a.to_ipv4_mapped() {
 			Some(v4) => v4.to_string(),
 			None => {
-				let prefix = u128::from(a) & !((1u128 << 64) - 1);
-				format!("{}/64", std::net::Ipv6Addr::from(prefix))
+				let prefix = u128::from(a) & !((1u128 << (128 - u32::from(v6))) - 1);
+				format!("{}/{v6}", std::net::Ipv6Addr::from(prefix))
 			}
 		},
 	}
@@ -93,6 +101,8 @@ pub struct RateLimiter {
 	rate: f64,
 	burst: f64,
 	buckets: Mutex<Buckets>,
+	/// `PRESSURE` sources or more are tracked: IPv6 clients by /48.
+	pressure: std::sync::atomic::AtomicBool,
 }
 
 impl RateLimiter {
@@ -103,7 +113,14 @@ impl RateLimiter {
 			// as in Traefik: without burst, one request at a time
 			burst: burst.unwrap_or(1).max(1) as f64,
 			buckets: Mutex::new(Buckets { map: HashMap::new(), last_sweep: Instant::now() }),
+			pressure: Default::default(),
 		}
+	}
+
+	/// The bucket's key of a request (`Source::key`; IPv6 clients by /48 under pressure).
+	pub fn key(&self, headers: &HeaderMap, client: IpAddr) -> String {
+		let v6 = if self.pressure.load(std::sync::atomic::Ordering::Relaxed) { 48 } else { 64 };
+		self.source.key_by(headers, client, v6)
 	}
 
 	/// Time for an empty bucket to fill up; an idle bucket that long is like a new one.
@@ -124,17 +141,35 @@ impl RateLimiter {
 			b.last_sweep = now;
 		}
 		if !b.map.contains_key(key) && b.map.len() >= MAX_KEYS {
-			shrink(&mut b.map);
+			self.shrink(&mut b.map, now);
 		}
 		let bucket = b.map.entry(key.to_string()).or_insert(Bucket { tokens: self.burst, at: now });
 		let elapsed = now.saturating_duration_since(bucket.at).as_secs_f64();
 		bucket.tokens = (bucket.tokens + elapsed * self.rate).min(self.burst);
 		bucket.at = now;
-		if bucket.tokens >= 1.0 {
+		let verdict = if bucket.tokens >= 1.0 {
 			bucket.tokens -= 1.0;
 			Ok(())
 		} else {
 			Err(Duration::from_secs_f64((1.0 - bucket.tokens) / self.rate))
+		};
+		let len = b.map.len();
+		let pressure = &self.pressure;
+		if len >= PRESSURE {
+			pressure.store(true, std::sync::atomic::Ordering::Relaxed);
+		} else if len < PRESSURE / 2 {
+			pressure.store(false, std::sync::atomic::Ordering::Relaxed);
+		}
+		verdict
+	}
+
+	/// Makes room: drops the buckets that are full again (as good as new ones, so a client
+	/// being limited keeps its bucket), then, while that is not a quarter, the least recently
+	/// used half.
+	fn shrink(&self, map: &mut HashMap<String, Bucket>, now: Instant) {
+		map.retain(|_, b| b.tokens + now.saturating_duration_since(b.at).as_secs_f64() * self.rate < self.burst);
+		if map.len() >= MAX_KEYS - MAX_KEYS / 4 {
+			shrink(map);
 		}
 	}
 
@@ -337,5 +372,27 @@ mod tests {
 		drop(a);
 		assert_eq!(f.in_use("c"), 1);
 		assert!(f.acquire("c").is_some());
+	}
+
+	#[test]
+	fn full_buckets_go_first_and_ipv6_is_coarser_under_pressure() {
+		let t0 = Instant::now();
+		let l = RateLimiter::new(1, Duration::from_secs(1000), Some(2), Source::Ip);
+		let mut map = HashMap::new();
+		// a limited client (empty bucket) among many new ones whose buckets are full again
+		map.insert("limited".to_string(), Bucket { tokens: 0.0, at: t0 });
+		for i in 0..MAX_KEYS {
+			map.insert(i.to_string(), Bucket { tokens: 2.0, at: t0 });
+		}
+		l.shrink(&mut map, t0);
+		assert!(map.contains_key("limited"), "kept");
+		assert_eq!(map.len(), 1);
+
+		let h = HeaderMap::new();
+		let v6: IpAddr = "2001:db8:1:2:3::4".parse().unwrap();
+		assert_eq!(l.key(&h, v6), "2001:db8:1:2::/64");
+		l.pressure.store(true, std::sync::atomic::Ordering::Relaxed);
+		assert_eq!(l.key(&h, v6), "2001:db8:1::/48");
+		assert_eq!(l.key(&h, "10.0.0.1".parse().unwrap()), "10.0.0.1");
 	}
 }

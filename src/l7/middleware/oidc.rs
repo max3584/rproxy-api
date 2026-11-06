@@ -6,8 +6,8 @@
 //! provider's JWKS (RS256/384/512, PS256, ES256/384), which is cached and
 //! fetched again for an unknown key id.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -43,6 +43,21 @@ const JWKS_REFETCH: Duration = Duration::from_secs(60);
 const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
 /// Browsers drop larger cookies.
 const MAX_COOKIE: usize = 4000;
+/// The most read of an answer of the provider (discovery, JWKS, token; #356).
+const MAX_ANSWER: usize = 1 << 20;
+/// Sign-ins whose state has been used, remembered until they expire (#356); past this
+/// many the oldest is forgotten.
+const MAX_USED_STATES: usize = 65_536;
+/// Calls to the token endpoint at once, per middleware (#356); more wait up to `TOKEN_WAIT`.
+const MAX_TOKEN_CALLS: usize = 16;
+const TOKEN_WAIT: Duration = Duration::from_secs(2);
+/// The error of a call to the token endpoint that found `MAX_TOKEN_CALLS` going on.
+const TOKEN_BUSY: &str = "too many calls to the token endpoint at once";
+/// A refresh's result is given to requests with the same refresh token for this long (#356):
+/// a browser's requests sent before it has the new cookie do not refresh again.
+const REFRESH_SHARED: Duration = Duration::from_secs(10);
+/// Refreshes remembered at once; past this, requests refresh on their own.
+const MAX_REFRESHING: usize = 1024;
 /// Identity headers set for the backend (and removed from what the client sent).
 pub const IDENTITY_HEADERS: [&str; 4] = ["x-forwarded-user", "x-forwarded-email", "x-forwarded-groups", "x-forwarded-sub"];
 
@@ -134,6 +149,41 @@ pub struct Oidc {
 	discovery_failed: RwLock<Option<Instant>>,
 	jwks: RwLock<Jwks>,
 	rng: SystemRandom,
+	used_states: Mutex<UsedStates>,
+	token_calls: tokio::sync::Semaphore,
+	refreshing: Mutex<HashMap<[u8; 32], Refreshing>>,
+}
+
+/// The states of sign-ins already called back (#356): each is used once, so one state
+/// cookie cannot be sent again and again to make calls to the token endpoint.
+#[derive(Default)]
+struct UsedStates {
+	set: HashSet<[u8; 32]>,
+	/// In the order used, with when the sign-in expires.
+	order: VecDeque<([u8; 32], u64)>,
+}
+
+impl UsedStates {
+	/// Whether `state` had not been used; it is from now on.
+	fn spend(&mut self, state: &str, exp: u64, now: u64) -> bool {
+		while self.order.front().is_some_and(|(_, e)| *e < now) || self.order.len() >= MAX_USED_STATES {
+			if let Some((k, _)) = self.order.pop_front() {
+				self.set.remove(&k);
+			}
+		}
+		let key: [u8; 32] = Sha256::digest(state.as_bytes()).into();
+		if !self.set.insert(key) {
+			return false;
+		}
+		self.order.push_back((key, exp));
+		true
+	}
+}
+
+/// A refresh going on or just done, shared by the requests with the same refresh token.
+struct Refreshing {
+	started: Instant,
+	result: Arc<tokio::sync::OnceCell<Result<Session, String>>>,
 }
 
 impl std::fmt::Debug for Oidc {
@@ -189,6 +239,9 @@ impl Oidc {
 			discovery_failed: RwLock::default(),
 			jwks: RwLock::default(),
 			rng: SystemRandom::new(),
+			used_states: Mutex::default(),
+			token_calls: tokio::sync::Semaphore::new(MAX_TOKEN_CALLS),
+			refreshing: Mutex::default(),
 		})
 	}
 
@@ -236,11 +289,13 @@ impl Oidc {
 				return Outcome::Pass { session, set_cookie: None };
 			}
 			if let Some(token) = &session.refresh {
-				match self.refresh(token).await {
+				match self.refresh_shared(token).await {
 					Ok(fresh) => {
 						let set = self.session_cookie(&key, &fresh, https);
 						return Outcome::Pass { session: fresh, set_cookie: set };
 					}
+					// the session is still good for a moment: refreshed by a later request
+					Err(e) if e == TOKEN_BUSY && session.exp > now() => return Outcome::Pass { session, set_cookie: None },
 					Err(e) => info!(event = "oidc.refresh", middleware = %self.name, user = %session.user, error = %e, "signing in again"),
 				}
 			}
@@ -295,6 +350,10 @@ impl Oidc {
 		if pending.exp < now() || q.get("state").map(String::as_str) != Some(pending.state.as_str()) {
 			return respond(StatusCode::BAD_REQUEST, "the sign-in does not match; open the page again");
 		}
+		// once only (#356): a state cookie sent again does not reach the token endpoint again
+		if !self.used_states.lock().unwrap_or_else(|e| e.into_inner()).spend(&pending.state, pending.exp, now()) {
+			return respond(StatusCode::BAD_REQUEST, "this sign-in has been used; open the page again");
+		}
 		if let Some(err) = q.get("error") {
 			warn!(event = "oidc.error", middleware = %self.name, error = %err, description = %q.get("error_description").cloned().unwrap_or_default());
 			return respond(StatusCode::FORBIDDEN, "sign-in was refused by the provider");
@@ -314,6 +373,10 @@ impl Oidc {
 		};
 		let session = match session {
 			Ok(s) => s,
+			Err(e) if e == TOKEN_BUSY => {
+				warn!(event = "oidc.error", middleware = %self.name, error = %e);
+				return respond(StatusCode::SERVICE_UNAVAILABLE, "sign-in is busy; open the page again in a moment");
+			}
 			Err(e) => {
 				warn!(event = "oidc.error", middleware = %self.name, error = %e);
 				return respond(StatusCode::BAD_GATEWAY, "sign-in failed");
@@ -322,9 +385,7 @@ impl Oidc {
 		info!(event = "oidc.login", middleware = %self.name, user = %session.user);
 		let mut cookies: Vec<HeaderValue> = clear_state.into_iter().collect();
 		cookies.extend(self.session_cookie(key, &session, https));
-		// only paths on this site, never another origin
-		let back = if pending.return_to.starts_with('/') && !pending.return_to.starts_with("//") { pending.return_to } else { "/".into() };
-		redirect(&back, cookies)
+		redirect(&local_path(pending.return_to), cookies)
 	}
 
 	/// A GET of the logout path (#333): a page with a button that POSTs to it. Signing out on
@@ -409,7 +470,7 @@ impl Oidc {
 	}
 
 	async fn get_json(&self, url: &str) -> Result<Value, String> {
-		let (status, body) = super::crowdsec::call(&self.tls, Method::GET, url, accept_json(), Bytes::new(), TIMEOUT).await?;
+		let (status, body) = super::crowdsec::call_max(&self.tls, Method::GET, url, accept_json(), Bytes::new(), TIMEOUT, MAX_ANSWER).await?;
 		if !status.is_success() {
 			return Err(format!("{url}: HTTP {status}"));
 		}
@@ -465,14 +526,49 @@ impl Oidc {
 		let basic = STANDARD.encode(format!("{}:{}", encode(&self.client_id), encode(&secret)));
 		headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Basic {basic}")).map_err(|e| e.to_string())?);
 		headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+		// at most MAX_TOKEN_CALLS at once (#356): sign-ins and refreshes cannot pile up calls
+		let Ok(Ok(_permit)) = tokio::time::timeout(TOKEN_WAIT, self.token_calls.acquire()).await else {
+			return Err(TOKEN_BUSY.into());
+		};
 		let (status, body) =
-			super::crowdsec::call(&self.tls, Method::POST, &provider.token, headers, Bytes::from(form(params)), TIMEOUT).await?;
+			super::crowdsec::call_max(&self.tls, Method::POST, &provider.token, headers, Bytes::from(form(params)), TIMEOUT, MAX_ANSWER)
+				.await?;
 		let v: Value = serde_json::from_slice(&body).map_err(|e| format!("token endpoint: {e}"))?;
 		if !status.is_success() {
 			let err = v.get("error").and_then(Value::as_str).unwrap_or("");
 			return Err(format!("token endpoint: HTTP {status} {err}"));
 		}
 		Ok(v)
+	}
+
+	/// `refresh`, once for the requests that carry the same refresh token at about the same
+	/// time (#356): one call to the token endpoint, whose result they all get.
+	async fn refresh_shared(&self, token: &str) -> Result<Session, String> {
+		let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+		let result = {
+			let mut m = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+			// a refresh none waits for any more (all gone) may be left unfinished: forgotten too
+			m.retain(|_, r| r.started.elapsed() < REFRESH_SHARED || (!r.result.initialized() && r.started.elapsed() < 3 * TIMEOUT));
+			match m.get(&key) {
+				Some(r) => Some(r.result.clone()),
+				None if m.len() >= MAX_REFRESHING => None,
+				None => {
+					let result = Arc::new(tokio::sync::OnceCell::new());
+					m.insert(key, Refreshing { started: Instant::now(), result: result.clone() });
+					Some(result)
+				}
+			}
+		};
+		let Some(result) = result else { return self.refresh(token).await };
+		let r = result.get_or_init(|| self.refresh(token)).await.clone();
+		// busy is not a result to share: the next request tries again
+		if r.as_ref().is_err_and(|e| e == TOKEN_BUSY) {
+			let mut m = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+			if m.get(&key).is_some_and(|x| Arc::ptr_eq(&x.result, &result)) {
+				m.remove(&key);
+			}
+		}
+		r
 	}
 
 	async fn refresh(&self, token: &str) -> Result<Session, String> {
@@ -581,6 +677,21 @@ impl Oidc {
 		if !session.groups.is_empty() {
 			set("x-forwarded-groups", &session.groups.join(","));
 		}
+	}
+}
+
+/// Where to send the browser back after signing in: a path on this site only (#356). `//x`
+/// and `/\x` are another origin to browsers (they read `\` as `/`), and control characters
+/// are dropped by them (`/\t/x`): those go to `/`.
+fn local_path(back: String) -> String {
+	let mut chars = back.chars();
+	let local = chars.next() == Some('/')
+		&& !matches!(chars.next(), Some('/' | '\\'))
+		&& !back.chars().any(|c| c == '\\' || c.is_control());
+	if local {
+		back
+	} else {
+		"/".into()
 	}
 }
 
@@ -962,5 +1073,30 @@ mod tests {
 		assert!(!h.contains_key("x-forwarded-groups"), "not from the client");
 		assert_eq!(h[header::COOKIE], "keep=1");
 		std::fs::remove_dir_all(d).unwrap();
+	}
+
+	#[test]
+	fn the_way_back_stays_on_this_site() {
+		for ok in ["/", "/app?x=1", "/a/b#c"] {
+			assert_eq!(local_path(ok.into()), ok);
+		}
+		for bad in ["//evil.example/", "/\\evil.example/", "/a\\b", "/a\tb", "https://evil.example/", "", "evil"] {
+			assert_eq!(local_path(bad.into()), "/", "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn a_state_is_used_once_and_the_set_is_bounded() {
+		let mut used = UsedStates::default();
+		assert!(used.spend("a", 100, 10));
+		assert!(!used.spend("a", 100, 10), "again");
+		assert!(used.spend("b", 100, 10));
+		// expired ones are forgotten
+		assert!(used.spend("c", 300, 200));
+		assert_eq!(used.order.len(), 1);
+		for i in 0..MAX_USED_STATES + 10 {
+			used.spend(&i.to_string(), 1000, 200);
+		}
+		assert!(used.order.len() <= MAX_USED_STATES && used.set.len() == used.order.len());
 	}
 }

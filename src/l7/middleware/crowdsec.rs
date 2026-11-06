@@ -539,7 +539,11 @@ impl hyper::body::Body for Failed {
 trait Stream2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream2 for T {}
 
-/// One HTTP/1.1 request to the LAPI or AppSec (and the OIDC provider); returns the status and body.
+/// The most `call` reads of an answer (#356): the LAPI's first decisions stream can be large
+/// (blocklists of millions of addresses are some hundred MiB of JSON).
+pub(super) const MAX_ANSWER: usize = 512 << 20;
+
+/// One HTTP/1.1 request to the LAPI or AppSec; returns the status and body.
 pub(super) async fn call(
 	tls: &tokio_rustls::TlsConnector,
 	method: Method,
@@ -547,6 +551,19 @@ pub(super) async fn call(
 	headers: HeaderMap,
 	body: Bytes,
 	timeout: Duration,
+) -> Result<(StatusCode, Bytes), String> {
+	call_max(tls, method, url, headers, body, timeout, MAX_ANSWER).await
+}
+
+/// `call` reading at most `max` bytes of the answer (the OIDC provider's are small).
+pub(super) async fn call_max(
+	tls: &tokio_rustls::TlsConnector,
+	method: Method,
+	url: &str,
+	headers: HeaderMap,
+	body: Bytes,
+	timeout: Duration,
+	max: usize,
 ) -> Result<(StatusCode, Bytes), String> {
 	let crate::net::url::HttpUrl { uri, https, host, port } = crate::net::url::parse(url).map_err(|e| format!("{url}: {e}"))?;
 	let authority = uri.authority().ok_or("no host")?.clone();
@@ -572,7 +589,10 @@ pub(super) async fn call(
 		let req = req.body(Full::new(body)).map_err(|e| e.to_string())?;
 		let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
 		let status = resp.status();
-		let bytes = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+		let bytes = crate::l7::resilience::read(resp.into_body().map_err(crate::l7::server::BoxError::new).boxed(), max).await.map_err(|e| match e {
+			Some(e) => e.to_string(),
+			None => format!("{authority}: the answer is larger than {max} bytes"),
+		})?;
 		Ok::<_, String>((status, bytes))
 	};
 	tokio::time::timeout(timeout, work).await.map_err(|_| format!("{authority}: timed out"))?

@@ -2530,6 +2530,7 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let mut durations = vec![];
 	let mut limited = vec![];
 	let mut blocked = vec![];
+	let mut mirror_dropped = vec![];
 	let mut cache = vec![];
 	let mut cache_usage = vec![];
 	let mut up = vec![];
@@ -2570,6 +2571,15 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		for ((route, middleware), n) in r.rt.http_stats.blocked_snapshot() {
 			blocked.push(format!(
 				"rproxy_http_blocked_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",
+				key.protocol,
+				key.listen,
+				esc(&route),
+				esc(&middleware)
+			));
+		}
+		for ((route, middleware), n) in r.rt.http_stats.mirror_dropped_snapshot() {
+			mirror_dropped.push(format!(
+				"rproxy_http_mirror_dropped_total{{protocol=\"{}\",listen=\"{}\",route=\"{}\",middleware=\"{}\"}} {n}",
 				key.protocol,
 				key.listen,
 				esc(&route),
@@ -2640,6 +2650,11 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	for line in blocked {
 		let _ = writeln!(out, "{line}");
 	}
+	let _ = writeln!(out, "# HELP rproxy_http_mirror_dropped_total Copies of mirror middlewares of http rules not sent, with as many being sent already.");
+	let _ = writeln!(out, "# TYPE rproxy_http_mirror_dropped_total counter");
+	for line in mirror_dropped {
+		let _ = writeln!(out, "{line}");
+	}
 	let _ = writeln!(out, "# HELP rproxy_http_cache_total HTTP requests at cache middlewares of http rules by result: hit, miss, stale, bypass.");
 	let _ = writeln!(out, "# TYPE rproxy_http_cache_total counter");
 	for line in cache {
@@ -2675,6 +2690,9 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		n => n,
 	};
 	let _ = writeln!(out, "rproxy_session_budget_limit {budget}");
+	let _ = writeln!(out, "# HELP rproxy_http_compress_skipped_total Responses compress middlewares sent as they were because as many were being compressed (#356).");
+	let _ = writeln!(out, "# TYPE rproxy_http_compress_skipped_total counter");
+	let _ = writeln!(out, "rproxy_http_compress_skipped_total {}", crate::l7::compress::skipped());
 	let _ = writeln!(out, "# HELP rproxy_http_request_duration_seconds Time until the response of http rules ended, by route.");
 	let _ = writeln!(out, "# TYPE rproxy_http_request_duration_seconds histogram");
 	for line in durations {

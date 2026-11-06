@@ -126,7 +126,7 @@ pub enum Middleware {
 	/// CORS (#230).
 	Cors(Box<cors::Cors>),
 	/// A copy of the request to `service` (#232), sent by the server.
-	Mirror { name: String, service: Arc<Service>, share: Share },
+	Mirror { name: String, service: Arc<Service>, share: Share, slots: Arc<crate::l7::mirror::Slots> },
 	/// The Host for the backend (#228).
 	ReplaceHost(HeaderValue),
 	/// Responses from memory (#340, `cache.rs`), run by the server.
@@ -332,14 +332,15 @@ impl Middleware {
 		if let MiddlewareSpec::ForwardAuth { .. } = spec {
 			return forward_auth(label, spec, services);
 		}
-		if let MiddlewareSpec::Mirror { service, percent, fraction } = spec {
+		if let MiddlewareSpec::Mirror { service, percent, fraction, max_in_flight } = spec {
 			let service = services.get(service).cloned().ok_or_else(|| ApiError::invalid(format!("{what}: service {service:?} is not defined")))?;
 			let share = match (percent, fraction) {
 				(Some(p), _) => Share::new(u32::from(*p), 100),
 				(None, Some(f)) => Share::new(f.numerator, f.denominator),
 				(None, None) => Share::new(1, 1),
 			};
-			return Ok(Middleware::Mirror { name: label.to_string(), service, share });
+			let slots = Arc::new(crate::l7::mirror::Slots::new(max_in_flight.map_or(crate::l7::mirror::MAX_IN_FLIGHT, |n| n as usize)));
+			return Ok(Middleware::Mirror { name: label.to_string(), service, share, slots });
 		}
 		let MiddlewareSpec::Errors { status, service, path } = spec else {
 			return Middleware::compile(label, spec);
@@ -388,7 +389,7 @@ impl Middleware {
 				Some(resp)
 			}
 			Middleware::RateLimit { name, limiter } => {
-				let wait = limiter.check(&limiter.source.key(&parts.headers, ctx.client)).err()?;
+				let wait = limiter.check(&limiter.key(&parts.headers, ctx.client)).err()?;
 				let mut resp = limited(name);
 				insert(resp.headers_mut(), header::RETRY_AFTER, &wait.as_secs_f64().ceil().max(1.0).to_string());
 				Some(resp)

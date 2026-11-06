@@ -7,13 +7,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use bytes::{Bytes, BytesMut};
+use http_body_util::BodyExt;
 use hyper::header::{self, HeaderMap};
 use hyper::Method;
 use tracing::{info, warn};
 
-use super::server::Body;
+use super::server::{Body, BoxError};
 
 /// A breaker judges only once the window holds this many responses.
 pub const MIN_REQUESTS: usize = 10;
@@ -28,10 +28,38 @@ pub async fn buffer(headers: &HeaderMap, body: Body, max: u64) -> Result<Bytes, 
 	if declared.is_some_and(|n| n > max) {
 		return Err(true);
 	}
-	match Limited::new(body, usize::try_from(max).unwrap_or(usize::MAX)).collect().await {
-		Ok(c) => Ok(c.to_bytes()),
-		Err(e) => Err(e.is::<http_body_util::LengthLimitError>()),
+	read(body, usize::try_from(max).unwrap_or(usize::MAX)).await.map_err(|e| e.is_none())
+}
+
+/// Reads the data of a body of at most `max` bytes (trailers are dropped). `Err(None)` when it
+/// is larger, `Err(Some(_))` when it broke off. The frames are copied into one buffer (#356):
+/// kept as they came, many small frames would each keep their own allocation (or a larger
+/// buffer they were cut from); a body of one frame is kept as it is.
+pub async fn read(mut body: Body, max: usize) -> Result<Bytes, Option<BoxError>> {
+	use hyper::body::Body as _;
+	if body.size_hint().lower() > max as u64 {
+		return Err(None);
 	}
+	let mut first: Option<Bytes> = None;
+	let mut buf = BytesMut::new();
+	let mut len = 0usize;
+	while let Some(frame) = body.frame().await {
+		let Ok(data) = frame.map_err(Some)?.into_data() else { continue };
+		len = len.saturating_add(data.len());
+		if len > max {
+			return Err(None);
+		}
+		match first.take() {
+			None if buf.is_empty() => first = Some(data),
+			None => buf.extend_from_slice(&data),
+			Some(f) => {
+				buf.reserve(usize::try_from(body.size_hint().lower()).unwrap_or(0).min(max).max(len));
+				buf.extend_from_slice(&f);
+				buf.extend_from_slice(&data);
+			}
+		}
+	}
+	Ok(first.unwrap_or_else(|| buf.freeze()))
 }
 
 /// Methods that may be sent again (RFC 9110 9.2.2).
@@ -234,5 +262,21 @@ mod tests {
 		assert_eq!([p.wait(2), p.wait(3), p.wait(4)], [100, 200, 400].map(Duration::from_millis));
 		assert!(idempotent(&Method::PUT) && !idempotent(&Method::POST));
 		assert!(p.retries(500) && p.retries(503) && !p.retries(501) && !p.retries(200));
+	}
+
+	#[tokio::test]
+	async fn many_small_frames_are_read_into_one_buffer() {
+		use http_body_util::StreamBody;
+		use hyper::body::Frame;
+		let frames = (0..1000).map(|_| Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"x"))));
+		let body = StreamBody::new(futures_util::stream::iter(frames)).boxed();
+		let bytes = read(body, 10_000).await.unwrap();
+		assert_eq!(bytes.len(), 1000);
+		let frames = (0..1000).map(|_| Ok::<_, BoxError>(Frame::data(Bytes::from_static(b"x"))));
+		let body = StreamBody::new(futures_util::stream::iter(frames)).boxed();
+		assert!(read(body, 999).await.unwrap_err().is_none(), "larger");
+		let one = Bytes::from_static(b"whole");
+		let body = http_body_util::Full::new(one.clone()).map_err(|never| match never {}).boxed();
+		assert_eq!(read(body, 10).await.unwrap(), one);
 	}
 }
