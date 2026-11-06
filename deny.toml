@@ -23,6 +23,10 @@ ignore = [
     # which pins crypto-bigint 0.5; the fix is only in 0.7.6 (needs elliptic-curve 0.14) and the named operations
     # (UintRef, BoxedMontyForm) are 0.7 APIs. Remove when dtls moves to elliptic-curve 0.14.
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via dtls 0.17.2 / elliptic-curve 0.13; no 0.5 fix; remove when dtls uses elliptic-curve 0.14" },
+    # pin-utils 0.1.1 (unmaintained, no vulnerability): nix 0.26 uses it for `pin_mut!`, and nix 0.26 comes only
+    # from webrtc-util 0.17.2 (the latest; dtls 0.17.2 for DTLS termination) which requires nix ^0.26.
+    # Remove when webrtc-util moves to a newer nix.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils (unmaintained) via nix 0.26 / webrtc-util 0.17.2 (latest); remove when webrtc-util drops nix 0.26" },
 ]
 
 [licenses]
