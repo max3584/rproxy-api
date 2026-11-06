@@ -91,6 +91,8 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		balance: Default::default(),
 		health_check: None,
 		connect_timeout: None,
+		idle_timeout: None,
+		half_close_timeout: None,
 		source_ip: SourceIp::Proxy,
 		udp_idle_secs: None,
 		tls: None,

@@ -139,7 +139,9 @@ tokens:
 | `targets` | object の配列 | | 宛先を複数にする（v0.3.3、`remote_addr` / `remote_port` の代わり。どちらか一方）。`{"addr", "port", "weight"?, "backup"?}`：`addr` は IP かホスト名（それぞれ再解決する）、`weight` は 1 以上（既定 1）、`backup: true` はほかの宛先がすべて down のときだけ使う（全部を backup にはできない）。最大 64 件。ポート範囲では各宛先の `port` も範囲の分ずれる。下の「複数の宛先」 |
 | `balance` | `"round_robin"` \| `"least_conn"` \| `"failover"` | | `targets` の振り分け方。既定 `round_robin`。一覧では `targets` があるときだけ出す |
 | `health_check` | object | | 宛先の生死を TCP の接続で確かめる（v0.3.3）。`{"interval"?, "timeout"?, "port"?}`：`interval` 既定 `10s`、`timeout` 既定 `3s`、`port` は各宛先のポートの代わりに接続するポート（UDP のルールでは必須）。`remote_addr` だけのルールでも使える。`http` のルールでは使えない（`http.services.<名前>.health_check`） |
-| `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くと今までどおり（ほかに宛先があれば 5 秒、なければ OS の既定（Linux は約 2 分））。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
+| `connect_timeout` | string | | 宛先への TCP の接続にかけてよい時間（`100ms`〜`10m`。v0.4.3、`features.connect_timeout`）。過ぎたら失敗として数え（`outlier_detection` の `connect`）、次の宛先で接続し直す。宛先が 1 つならクライアントの接続を閉じる。省くとほかに宛先があれば 5 秒、なければ 30 秒（v0.4.20 から。前は OS の既定で、Linux は約 2 分）。`tcp` のルールだけ（`udp` と `http` のルールは `invalid`。`http` は `http.services.<名前>.timeouts.connect`）。`tls.routes` の宛先にも効く。PATCH で付けると置き換え（`0s` で外す、省けば今のまま）、次の接続から効く |
+| `idle_timeout` | string | | 中継している接続が、どちらの向きにも何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`conn.close` の `reason: idle_timeout`）。相手が読まずに書けないままの接続も同じ。数えるのは接続のバイトだけで、TCP の keepalive のプローブは数えない。省くと `1h`、`0s` で上限なし、ほかは `1s` 以上。`tcp` のルールだけ（`udp` は `udp_idle_secs`、`http` のルールは `invalid` で `global.http.timeouts`）。PATCH で付けると置き換え（`0s` で上限なし、省けば今のまま）、次の接続から効く。表示は付けたときだけ |
+| `half_close_timeout` | string | | 片側が送り終えた（半分閉じた）後、残りの向きが何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`reason: half_close_timeout`）。`idle_timeout` が短ければそちら。省くと `1m`、`0s` でなし（`idle_timeout` だけ）、ほかは `1s` 以上。形・PATCH・表示は `idle_timeout` と同じ |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md。TLS を終端しない `tls.routes[]` には route ごとの `source_ip` も書ける（下の「`tls.routes[]` の `source_ip`」） |
 | `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
@@ -397,6 +399,13 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
   - 証明書・クライアント認証（`client_auth`）は TCP と同じもの。QUIC は TLS 1.3 だけなので、`tls.options.cipher_suites` に TLS 1.3 の暗号スイートが要る（`TLS13_AES_128_GCM_SHA256` がないと QUIC の初期化に使えない）。証明書の読み直し（SIGHUP、`RPROXY_CERT_CHECK_SECS`）は新しい QUIC 接続から効く。
   - リクエストは HTTP/1.1・HTTP/2 と同じルート・ミドルウェア・転送先に渡る（転送先へはサービスの `protocol` のとおり。既定は HTTP/1.1）。本文は流しながら送る。アクセスログの `protocol` は `HTTP/3.0`。
   - `allow_from` とルールの `crowdsec` は QUIC の接続を受ける前に確かめる（`conn.denied`、`transport: quic`）。
+  - 守り（v0.4.20、#355）：
+    - まだ確かめていないアドレスからの接続には、いつも先に Retry を返す（送信元を偽ったパケットでは先へ進めない。`limits`・処理中のハンドシェイクの枠を使えず、rproxy から大きな応答も返さない。`allow_from`・`geoip`・`crowdsec` の判定と `conn.denied` も Retry の後なので、確かめたアドレスだけが出る）。新しい接続は 1 往復ぶん遅くなる。Retry のトークンの鍵はプロセスの中だけにあり、再起動なしの更新（SIGUSR2）・`http3` の付け外し・ルールの作り直しをまたがない：ちょうど Retry の途中だったクライアントは 1 回失敗し、つなぎ直す（ブラウザは TCP に戻ることもある）。
+    - ルールの `limits` は QUIC の接続ごとに効く（Retry の後、ハンドシェイクの前。1 つの接続を接続の終わりまで 1 つと数える。断ったものは `conn.limited`、`transport: quic`）。`bandwidth` は HTTP/3 の本文に効く（リクエストの本文は読むのを待たせ、QUIC のフロー制御でクライアントを待たせる。応答の本文は送るのを待たせる。ヘッダと QUIC の制御のパケットは数えない）。
+    - ルールごとに処理中の QUIC のハンドシェイクは 512 まで。超えたら断り（`conn.limited`、`reason: quic_handshakes`、`stats.tls_failures` に数える）。
+    - QUIC のフロー制御：接続ごとに受け取る窓 4 MB、ストリームごとに 1 MB（quinn の既定は接続ごとの上限なし・ストリームごと 1.25 MB × 100）。クライアントの単方向のストリームは同時に 8 まで。QUIC のアイドルの時間切れ（パケットがまったく来ない接続）は `global.http.timeouts.idle` と同じ、ただし 30 秒から 10 分まで（`idle` が無制限のときは 10 分。`idle` はリクエストのない時間を数え、QUIC のものはパケットのない時間を数えるので、短い `idle` でも遅い転送先を待つリクエストを切らない）。rproxy は静かな接続に PING を送る（QUIC のアイドルの半分、15 秒まで。クライアントのアイドルの時間切れが短くても、転送先を待つ間に切れない。相手がいなくなれば答えがなく、アイドルの時間切れで終わる）。
+    - リクエストの本文が `Content-Length` より長い・短いときは誤り（RFC 9114 4.1.2。h3 のライブラリは確かめないので rproxy が確かめる）：長い分は転送先に渡さず、本文の誤りとして転送先へのリクエストを失敗させ、クライアントには `H3_MESSAGE_ERROR`。`Content-Length` が数字でない・食い違う複数の値は転送先に渡さずに 400 を返す（`http.error` のログ。先頭の 0 は数字のうち）。
+    - 本文の読み手（転送の処理）が本文を最後まで読まずに手放したら（認証で断ったときなど。ふつうは応答より前）、すぐ本文を読むのをやめてクライアントに `STOP_SENDING` を送る（`H3_NO_ERROR`、読んでいる途中ならストリームを閉じるので quinn のコード 0）。最後まで読んだ本文には送らない。
   - TCP 側（HTTP/1.1・HTTP/2）の応答には `Alt-Svc: h3=":<ポート>"; ma=86400` を付ける（転送先が `Alt-Svc` を返したときはそのまま）。HTTP/3 を受けていないあいだは付けない。
   - UDP のポートを使えない（使用中・権限）、または TLS の設定が QUIC に使えないときは、ルールは TCP だけで動き、`stats.http.http3` に `{"listening": false, "error": "..."}` と出る（ログは `event: degraded`、`part: http3`）。受けているときは `{"listening": true}`。`http3` のないルールには `http3` の項目がない。
   - `PATCH` で `http3` を付け外しすると、UDP の待ち受けを始める・止める（止めると開いている QUIC 接続は切る）。受けられなかったルールは、`http3: true` のまま `http` を PATCH するともう一度試す。ルールを削除すると UDP のポートも閉じる。
@@ -481,7 +490,7 @@ rproxy はクライアントとは HTTP/1.1・HTTP/2・HTTP/3 で、転送先と
   - `headers`: `request` / `response` の `set`（空の値は削除）・`remove`。`frame_deny`（`X-Frame-Options: DENY`）、`content_type_nosniff`、`referrer_policy`、`csp`。`hsts` は HTTPS で受けたときだけ付ける。`cors` は `Origin` が `allow_origins`（`*` も可）にあるとき `Access-Control-Allow-Origin`（`allow_credentials` なら `Access-Control-Allow-Credentials` も）を付け、プリフライト（`OPTIONS` と `Access-Control-Request-Method`）には rproxy が 204 で答える。`Vary: Origin` は許したオリジンでもそうでなくても付ける（v0.4.19、#340。前は許したときだけ。キャッシュがオリジンごとに答えを分けるように）。
   - `rate_limit`: トークンバケット。`period`（既定 `1s`）あたり平均 `average` 件、一度に `burst` 件まで（既定 1。Traefik と同じく、省くと 1 件ずつしか通さない）。超えたら 429 と `Retry-After`（秒）。`source` は `ip`（既定。`global.trusted_proxies` を反映したクライアントの IP。IPv6 は /64 ごと：v0.4.18、#333。1 台のホストがふつう /64 を持ち、リクエストごとにアドレスを替えられるため）か `header:<名前>`（そのヘッダの値ごと。ヘッダがなければクライアントの IP。64 バイトより長い値は SHA-256 で覚える：v0.4.18、#333）。
   - `in_flight`: クライアントの IP ごとに、同時に処理するリクエストを `amount` 件まで（超えたら 429）。応答の本文を送り終えたとき（WebSocket なら接続が終わったとき）に空く。
-  - `crowdsec`: クライアントの IP（`global.trusted_proxies` を反映）が LAPI の判定にあれば 403。`appsec: true` なら、続けて AppSec にリクエストを問い合わせ、403 が返れば 403（`X-Crowdsec-Appsec-Ip` / `-Uri` / `-Host` / `-Verb` / `-Api-Key` / `-User-Agent` / `-Http-Version` と元のヘッダを送る。本文は `Content-Length` が 1 MiB 以下のときだけ送り、それより大きいか長さのない本文はヘッダだけで問い合わせる）。`on_error`（既定 `allow`）は、LAPI から一度も取得できていないときと AppSec に問い合わせできないとき（時間切れ 3 秒、200 / 403 以外の応答）に通すか 403 にするか。
+  - `crowdsec`: クライアントの IP（`global.trusted_proxies` を反映）が LAPI の判定にあれば 403。`appsec: true` なら、続けて AppSec にリクエストを問い合わせ、403 が返れば 403（`X-Crowdsec-Appsec-Ip` / `-Uri` / `-Host` / `-Verb` / `-Api-Key` / `-User-Agent` / `-Http-Version` と元のヘッダを送る。本文は `Content-Length` が 1 MiB 以下のときだけ送り、それより大きいか長さのない本文はヘッダだけで問い合わせる。本文は `Content-Length` より多くは読まず、読むのは全体で 30 秒か 8 KiB/s で読める時間の長い方まで（1 MiB で 128 秒。v0.4.20、#355）。送るのを止めたクライアントはそれより先に `global.http.timeouts.request_body_idle`（読む間の沈黙）で終わる。`bandwidth.upload` の低いルールでは、1 MiB 近い本文は 8 KiB/s より遅いと読み切れない。読めなかったときは AppSec に問い合わせられなかったときと同じく `on_error` に従い、通すときも本文は誤りのまま渡す（途中までの本文を完全なものに見せない。転送先へのリクエストは 400 になり、クライアントの本文の失敗なので `outlier_detection`・`circuit_breaker`・`retry` では転送先の失敗に数えない。v0.4.20 から、ほかのクライアントの本文の失敗（途中で切れた、`request_body_idle`）も同じ））。`on_error`（既定 `allow`）は、LAPI から一度も取得できていないときと AppSec に問い合わせできないとき（時間切れ 3 秒、200 / 403 以外の応答）に通すか 403 にするか。
   - `rate_limit` / `in_flight` の数はルールの `http` を変えると最初からになる。覚えておく送信元は 1 つのミドルウェアで 10 万件まで（超えたら長く使っていない方から半分を忘れる）で、満杯に戻ったバケットは定期的に捨てる。
   - `strip_prefix`: パスが `prefixes` のどれか（先に書いたもの優先）で始まれば取り除き、`X-Forwarded-Prefix` を付ける。`add_prefix`: パスの前に付ける。`replace_path`: パスを置き換え、元のパスを `X-Replaced-Path` に入れる。`replace_path_regex`: 一致したときだけ置き換える（`X-Replaced-Path` も）。クエリは保つ。
 - v0.3.2 で使えるようになったミドルウェア:
@@ -808,11 +817,11 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 
 `features.limits`・`features.bandwidth` は true（形は上の表と docs/DESIGN-v0.4.md の 4・5）。
 
-- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続に効く（HTTP/3 には効かない）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ。udp のルールで `max_connections` がなければ、既定の上限 `RPROXY_UDP_MAX_SESSIONS`（既定 16384、0 でなし。#332）が効く：偽った送信元でも 1 つずつ転送先へのソケットを持つセッションを `udp_idle_secs` まで作れるので。名前を読んでいるセッションも数え、断ったものは `max_connections` と同じく数えて記録する）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
-- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` か宛先の `max_connections`（v0.4.19）のあるルールと、UDP のセッションの既定の上限で断ったことのあるルール。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`、v0.4.19 から宛先がすべていっぱいの `target_full`）・`transport`（`tcp` / `udp`、`target_full` は `http` も）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
+- `limits` は受け付けた直後（`allow_from`・`geoip`・`crowdsec` の後、TLS より前。`proxy_protocol` ではヘッダのクライアントで）に確かめる。超えたら TCP は何も送らずに閉じ、UDP はデータグラムを捨てる（新しいセッションは作らない）。`http` のルールでは TCP の接続と HTTP/3 の QUIC の接続に効く（HTTP/3 は v0.4.20 から。上の「HTTP/3」）。`max_connections` は TCP の接続・UDP のセッションの数（`per_source.max_connections` も同じ。udp のルールで `max_connections` がなければ、既定の上限 `RPROXY_UDP_MAX_SESSIONS`（既定 16384、0 でなし。#332）が効く：偽った送信元でも 1 つずつ転送先へのソケットを持つセッションを `udp_idle_secs` まで作れるので。名前を読んでいるセッションも数え、断ったものは `max_connections` と同じく数えて記録する）、`new_connections` は新しい接続・セッションの速さ、`packets` は UDP のデータグラムの速さ（送信元ごと）。
+- 断った数は `stats.limited`、`/metrics` の `rproxy_rule_limited_total{protocol,listen,reason}`（`limits` か宛先の `max_connections`（v0.4.19）のあるルールと、UDP のセッションの既定の上限で断ったことのあるルール。ほかの指標と同じく `rule` の代わりに `protocol`・`listen` のラベル）。ログは `conn.limited`（`rule`・`client`・`reason`（`max_connections` / `source_connections` / `new_connections` / `packets`、v0.4.19 から宛先がすべていっぱいの `target_full`）・`transport`（`tcp` / `udp` / `quic`（v0.4.20）、`target_full` は `http` も）。送信元ごとに続けて 20 行まで、その後は 1 秒に 1 行、`suppressed` は省いた行の数）。
 - 送信元は `prefix_v4` / `prefix_v6` でまとめ、覚えるのは `max_sources` まで（16 に分けた表ごとに上限の 1/16。いっぱいになったら、接続の残っていない古いものから忘れる。接続の残っている送信元は忘れない（数え直しで制限をすり抜けられないように。セキュリティレビュー L8）。表がそういう送信元でいっぱいのあいだ、新しい送信元は `limits` では断り（`reason: source_connections`）、`bandwidth` では 1 つの共有のバケツを使う）。`max_sources` は 1,000,000 まで。
 - `PATCH` で `limits` を変えると、次の接続・データグラムから効く。ルール全体の接続数は引き継ぎ、送信元ごとの数とバケツは `prefix_v4`・`prefix_v6`・`max_sources` が同じなら引き継ぐ。`{}` で外すと数えるのをやめる（あとで付け直したときは、そこから数える）。
-- `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3 は絞らない。
+- `bandwidth`：TCP（`http` のルールを含む）は読むのを待たせて絞る（捨てない）。L4 は上り（クライアントから読む）・下り（転送先から読む）、`http` のルールはクライアントからの読み込みとクライアントへの書き込み。待っている間は中継のバッファをプールに返す。UDP は超えたデータグラムを捨て、`stats.dropped` と `rproxy_rule_bandwidth_dropped_total{protocol,listen}` に数える。HTTP/3（v0.4.20 から）は本文を絞る（リクエストの本文は読むのを、応答の本文は送るのを待たせる。ヘッダは数えない）。
 - 速さはトークンバケツ（`burst` が大きさ、既定は 100 ms 分）。ルール全体のバケツはルールの全接続、送信元ごとのバケツはその送信元の全接続で分ける。TCP は 4 KiB（`burst` が小さければその大きさ）たまるまで待ってから読む。データグラムや読んだ量が残りより大きければ借りにして、その分あとで待つ（長い目で見て速さを守る）。
 - splice（#184）は帯域の上限のないルールでだけ使う。上限のあるルールの平文の TCP はユーザー空間のコピーで絞る。`PATCH` で上限を付けると、splice している接続も次の splice の前にユーザー空間のコピーに戻り、それからは上限を外しても splice に戻らない。
 - `PATCH` で `bandwidth` を変えると、開いている接続にも次に読むところから効く（バケツは満杯から）。
@@ -1018,11 +1027,25 @@ VIP のように、今は別のホストが持っていて後からこのホス�
 
 ### 宛先への接続の時間（v0.4.3、`features.connect_timeout`）
 
-L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノードの宛先は SYN に答えないので、断られる（RST）のと違い、接続は OS の再送（Linux で約 2 分）か、ほかに宛先があるときの 5 秒まで待つ。`connect_timeout` でこれを短くすると、そのあいだに来た接続も早く次の宛先に移り、宛先は `outlier_detection` で外れる（既定は 1 回で 10 秒）。
+L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノードの宛先は SYN に答えないので、断られる（RST）のと違い、接続はほかに宛先があるときの 5 秒か、ないときの 30 秒（v0.4.20 から。前は OS の再送で Linux は約 2 分）まで待つ。`connect_timeout` でこれを短くすると、そのあいだに来た接続も早く次の宛先に移り、宛先は `outlier_detection` で外れる（既定は 1 回で 10 秒）。
 
 - 宛先が 1 つ・複数のどちらでも効く（複数のときは 5 秒の代わり）。`tls.routes` の宛先も同じ。
 - 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
 - `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
+
+### 中継の時間切れと keepalive（v0.4.20、#353、`features.tcp_idle_timeout`）
+
+L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTLS）には、何も運ばない接続の時間切れがある。前はなかったので、何も送らない接続・片側だけ閉じた接続・消えた相手（NAT の表から落ちた）の接続が、fd・`limits` の数・宛先の接続数をいつまでも持っていた。
+
+- `idle_timeout`（上の表、既定 `1h`）：どちらの向きにも 1 バイトも運ばない（読めない・書けない）時間がこれを超えたら、両側をリセット（RST）して閉じる。途中で切ったものを完全に終わったように見せないため（データの完全性）。相手が読まないので書けないまま（転送先が止まっている）も、運べていないので同じく閉じる。運んでいるあいだは延びる（splice の道も同じ）。判定はおよそ `idle_timeout` の 1/8（最大 1 分）ごとで、その分遅れることがある。
+- 片側が送り終えた（FIN、半分閉じ）後：残りの向きが `half_close_timeout`（既定 1 分。`idle_timeout` が短ければそれ）何も運ばなければ閉じる。運んでいれば続く（送り終えた後に長いダウンロードを受ける使い方はそのまま）。送り終えてから最初の返事まで長く待つもの（`nc -N`、要求を送って `shutdown(SHUT_WR)` してから答えを待つ RPC・バックアップの道具）は `half_close_timeout: "0s"`（`idle_timeout` だけになる）か長めの値にする。
+- `0s`：その上限なし。v0.4.19 までと同じにするには `idle_timeout: "0s"` と `half_close_timeout: "0s"`。
+- 時間を延ばすのは接続のバイト（アプリケーションのデータ）だけ。TCP の keepalive のプローブはカーネルの中で答えるので数えない：アプリケーションの ping を送らず `SO_KEEPALIVE` だけで生かしている接続（DB のコネクションプールなど）は、1 時間黙ると切れる。長く黙る接続（DB のプール・SSH・MQTT などで keepalive が 1 時間より長いもの）は、長めの値か `0s` にする。
+- UI の DB（`forward_rules`）から戻したルールは、`idle_timeout` / `half_close_timeout` の列がないので既定（`1h` / `1m`）になり、UI が項目を持つまでそこでは `0s` にできない（API・設定ファイルのルールと `rproxy_rules` は持てる）。
+- ログは `conn.close` の `reason` が `idle_timeout` / `half_close_timeout`（警告の `conn.error` ではない）。
+- 両側のソケット（受け付けた接続・宛先への接続）に `SO_KEEPALIVE`（`http` のルールの受け付けた接続と、`http` のサービスの転送先への接続にも付く）。間隔はカーネルの設定（`net.ipv4.tcp_keepalive_time` など、既定は 2 時間後から 75 秒ごとに 9 回）で、`idle_timeout: 0s` の接続でも消えた相手に気づける。`TCP_USER_TIMEOUT` は付けない（keepalive と一緒だと最初の応答のないプローブで切れる。長くすると消えた相手への再送をカーネルの既定（`tcp_retries2`、約 15 分）より長く待つ。読まない相手は `idle_timeout` で閉じる）。
+- `http` のルールは今までどおり `global.http.timeouts`（二重には掛けない）。
+- TLS のハンドシェイクの同時の数には、プロセス全体の上限を設けない（#359 で決めた）：ハンドシェイクは 10 秒（`http` は `global.http.timeouts.tls_handshake`）で切れ、CPU はワーカーのスレッドの数までしか使わず、送信元ごとの数・速さはルールの `limits` で絞れる。全体の上限は、ほかのルールの正しい接続まで待たせることになる。
 
 ### PROXY protocol を受け取る（v0.4.13、#296、`features.proxy_protocol_in`）
 

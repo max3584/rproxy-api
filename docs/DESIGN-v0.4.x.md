@@ -434,7 +434,33 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - レビューで直したもの：up の宛先がすべていっぱいなら down の宛先を試さずに断る（`http` と同じ。`Pool::order` はそのとき down の宛先を入れず、`Pool::all_full` が真。up の宛先がないときに down の宛先を試すのは今までどおり）。宛先が 1 つのルールは `max_connections` があっても `Pool.reported` にしない（`Pool::shown` で `stats.targets` と `rproxy_target_connections`・`rproxy_target_full` だけを出し、`target.down`・`all_targets_down`・`rproxy_target_up` は前の版と同じく出さない）。`tls.routes` の宛先は `stats.tls_routes`（`RouteTargetsStatus`）と `route` のラベル。PATCH で外した宛先の数は、接続が残っている間 `Pool.retired`（アドレスと `Weak`）に持ち、後の PATCH で戻せば数える。TCP の前の確かめは `limits` の `admit` より前（`limits` のトークンを使わない）。宛先を試してから分かった断り（確かめの後にいっぱいになった・`tls.routes`）は `stats.total_connections` に残す（カウンタは減らさない。`rproxy_connections_total` が戻らないように）。`Stats.limited` は 4 つのまま、`target_full` は別の項目（前からの数の並びを変えない）。`l7_http2/request` が CI で 12〜20% 遅く出た原因は `Server` が 280 から 288 バイトに大きくなったこと（項目を足しただけの試しのブランチで同じ差が出た。musl の割り当ての大きさの区分が変わる）で、`weight` と `max` を u32 で並べて大きさを前と同じにした。いっぱいの候補は接続の待ち時間（`FAILOVER_CONNECT_TIMEOUT`）を決める「ほかに試せる宛先」に数えない。`retry` で次を待つ間は転送先の数を放す。`sticky` の転送先が一時いっぱいならクッキーを付け替えない。
 - 試験（レビューで足したもの）：`tests/target_caps.rs`（`a_udp_session_stays_on_its_target_through_a_patch`：PATCH の後も UDP のセッションが渡った宛先に残る、1 つの宛先は up / down を報告しない）、`tests/tls.rs`（`a_tls_route_target_takes_its_max_connections_and_a_patch_keeps_the_count`）、`tests/dtls.rs`（`dtls_sessions_count_against_the_target_cap`）、`scripts/test-dpdk.sh`（DPDK の道の `target_full`）、単体（`order` と `order_slow` を宛先 64 まで・いろいろな上限で比べる、2 回の PATCH で数を渡す）。
 
-## 19. 制御 API の上限（v0.4.20、#358）
+## 19. L4 の TCP の中継の時間切れ（v0.4.20、#353・#359）
+
+| 項目 | 形 | `features` | 既定 |
+|---|---|---|---|
+| 何も運ばない接続の時間切れ | L4 の `tcp` のルールの `idle_timeout`（`0s` で上限なし、ほかは `1s` 以上） | `tcp_idle_timeout` | `1h`（**既定が変わる**。v0.4.19 までは上限なし） |
+| 半分閉じた後の時間切れ | `half_close_timeout`（`0s` で `idle_timeout` だけ、ほかは `1s` 以上） | 同上 | 1 分（`idle_timeout` が短ければそれ。**変わる**） |
+| keepalive | なし（両側のソケットに `SO_KEEPALIVE`、間隔はカーネルの設定。`http` のルールの受け付けた接続と転送先への接続にも） | 同上 | 有効（**変わる**） |
+| 宛先への接続の既定の時間 | `connect_timeout` を省いたとき | 同上 | 宛先が 1 つなら 30 秒（**変わる**。前は OS の再送、Linux で約 127 秒）。ほかに宛先があれば今までどおり 5 秒 |
+
+既定の値はオーナーの決定（2026-11-05 の点検）。
+
+- しくみ：`l4/idle.rs`。中継は読み書きでバイトを運ぶたびに `Progress` に印を付ける（load と store だけ。タイマーには触らない）。`expired`（手で書いた Future の `Expiry`）が上限の 1/8（10 ms〜1 分）ごとに起きて比べ、運ばない時間が上限を超えたら終わる。半分閉じは poll のたびに見る（`within` が中継の直後に poll するので、FIN を読んだのと同じ起床で短い上限に切り替わり、タイマーは増えない）。効いている上限がないあいだ（`idle_timeout: 0s` で半分閉じの前）はタイマーを持たない。`tcp.rs` の `finish`（TLS の終端・STARTTLS・`bandwidth`、splice のないとき）は両側を `Tracked` で包み、`finish_plain` の splice の道（`splice::relay`）はユーザー空間のコピーを `Tracked` で、splice は 1 回ごとに印を付ける。EOF（FIN）を読んだら半分閉じの印で、そこから `half_close_timeout`。数えるのは接続のバイトだけ（keepalive のプローブはカーネルの中で答えるので見えない。アプリケーションの ping のない DB のプールなどは 1 時間で切れる）。
+- 書けないまま（相手が読まない）は、読み込みも止まる（バッファ・パイプ・ソケットのバッファがいっぱい）ので「運ばない」になり、同じ時間切れで閉じる（別の時間は持たない）。
+- 時間切れは両側をリセット（SO_LINGER 0）して閉じる（データの完全性 #134：途中で切ったものを完全に終わったように見せない）。ログは `conn.close` の `reason: idle_timeout` / `half_close_timeout`（よくある終わり方なので `conn.error` の警告にしない）。
+- `http` のルールは `global.http.timeouts`（`idle_timeout` は `invalid`。WebSocket の upgrade の中継にも掛けない）。
+- `TCP_USER_TIMEOUT` は付けない：keepalive と一緒だと（Linux は `user_timeout` を過ぎてプローブを 1 つでも送っていれば切る）最初の応答のないプローブで切れ、keepalive より長くすると消えた相手への再送をカーネルの既定（`tcp_retries2`、約 15 分）より長く待たせる。読まない相手は `idle_timeout` で閉じる。keepalive の間隔をルールで決める形は足さない（カーネルの設定を運用で変えられる）。
+- `half_close_timeout` をルールごとにしたのは、送り終えてから最初の返事まで長く待つもの（`nc -N`、`shutdown(SHUT_WR)` してから待つ RPC・バックアップの道具）が `idle_timeout` を外さずに外せるように（レビュー）。`0s` で `idle_timeout` だけ。
+- PATCH の `idle_timeout` / `half_close_timeout` は次の接続から（接続の始めに 1 回読む）。省けば今のまま、`0s` で上限なし（既定に戻すには `1h` / `1m`）。`http` のルールでは `invalid`（L4 のルールは PATCH で `http` にできないので、付いたまま `http` になることはない）。
+- UI の DB（`forward_rules`、`config/db.rs`）から戻したルールは既定になる（列がない）。UI が項目を持つまで `0s` にできない。
+- 引き継ぎ・保存：ルールの形に足すだけ（`GET /rules` の形・`rproxy_rules.spec`。付けたときだけ出すので、付けていないルールの形は前と同じ）。
+- #359 の残り：STARTTLS の転送先の返事は 1 つの返事で 128 行・64 KiB まで（`starttls::read_reply`）、STARTTLS の前のやり取りは全体で 5 分まで（`DIALOGUE_TIMEOUT`。前は 32 回 × 60 秒で 32 分）。宛先を外したときの戻すタイマーは `Ejection` ごとに 1 つ（`outlier::after`。すべての宛先が down で接続のたびに外し直しても、タスクは増えずに 1 つが期限を追う）。ClientHello のバイトは送ったら捨てる（`relay_hello`、`Prefixed` は渡し終えたら）。`terminate` の passthrough の route のための ClientHello の読み込みは `rt.kill` で止まり、accept の誤りの後の 100 ms の待ちは `stop` で止まる。
+- TLS のハンドシェイクの同時の数のプロセス全体の上限は設けない（決定）：ハンドシェイクは 10 秒（`http` は `tls_handshake`）で切れ、CPU はワーカーのスレッドの数までで、送信元ごとはルールの `limits` で絞れる。全体の上限は、攻撃のあいだほかのルールの正しい接続まで待たせる。
+- PATCH で `limits`・`bandwidth` を変えたとき、前からの接続は古い表を持ったまま（`Permit` が古い表を指す）。`idle_timeout` で長くても 1 時間で終わるので、ここでは変えない。
+- 戻すタイマーは、待っていたタスクが期限の後にもう一度外れていないか見てから `target.up` を出す（その間の外し直しでは出さない）。`connect_timeout` を省いたときは、後に試せるアドレスが残っていれば 5 秒、最後のアドレスは 30 秒（両方のアドレスを持つ名前は 2 つと数える）。
+- 試験：単体（`l4::idle`：進めば延びる・半分閉じで短くなる・どちらか一方だけ・`Tracked`、`starttls`：長い返事・全体の期限、`outlier::one_timer_per_ejection`、`net::source` の keepalive）、`tests/tcp_deadlines.rs`（平文と TLS の終端で黙った接続が閉じ、両側が RST を受け `conn.close` の `reason` が出る・進む接続は閉じない・読まない転送先で書けない接続が閉じる・splice に移った後に黙れば閉じ、splice で運び続ければ閉じない・半分閉じの後の `half_close_timeout` と `0s`・PATCH・検証・`features`）。
+
+## 20. 制御 API の上限（v0.4.20、#358）
 
 点検（2026-11-05）で、`rules:write` のトークンがプロセスの資源と `/metrics` を壊せるところを閉じる。形は `features.control_limits`、使い方は docs/API.md の「制御 API の上限」。
 

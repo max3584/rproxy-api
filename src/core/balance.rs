@@ -335,7 +335,7 @@ impl Pool {
 			}
 		}
 		let was_up = member.is_up();
-		let (length, until) = ejection.eject(&cfg.ejecting);
+		let (length, _) = ejection.eject(&cfg.ejecting);
 		if was_up {
 			if self.reported {
 				warn!(event = "target.down", rule = %key, target = %member.spec.remote(), reason = "outlier", cause, error = %error,
@@ -344,7 +344,7 @@ impl Pool {
 			self.notify();
 		}
 		let (weak, events, key, reported) = (Arc::downgrade(member), self.events.clone(), *key, self.reported);
-		outlier::after(ejection, until, length, move || {
+		outlier::after(ejection, move || {
 			let Some(member) = weak.upgrade() else { return };
 			if member.healthy() {
 				if reported {
