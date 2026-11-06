@@ -320,7 +320,8 @@ pub fn shutdown() {
 	let (c, io) = (&d.engine.counters, IO_STATS.get().cloned().unwrap_or_default());
 	let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
 	info!(event = "dpdk.stop", rx = n(&io.rx), tx = n(&io.tx), tx_full = n(&io.tx_full), chained = n(&io.chained), no_mbuf = n(&io.no_mbuf),
-		not_ours = n(&c.not_ours), fragments = n(&c.fragments), malformed = n(&c.malformed), no_neighbor = n(&c.no_neighbor), nat_full = n(&c.nat_full));
+		not_ours = n(&c.not_ours), fragments = n(&c.fragments), malformed = n(&c.malformed), no_neighbor = n(&c.no_neighbor), nat_full = n(&c.nat_full),
+		nat_prefix_full = n(&c.nat_prefix_full));
 }
 
 /// A UDP rule's address taken by the DPDK path (`Registry`'s binding step).
@@ -420,6 +421,8 @@ pub struct RtSession {
 	_permit: Option<Permit>,
 	/// In the rule's `stats.udp_sessions`: the default cap (`udp::MAX_SESSIONS`) as on the kernel's path (#354).
 	_counted: crate::l4::udp::Counted,
+	/// Its place among the rule's sessions not established (`udp::Unreplied`, #366): the one to end at the cap.
+	mark: crate::l4::udp::Mark,
 	up: Gate,
 	down: Gate,
 	rx: u64,
@@ -519,10 +522,11 @@ impl Rule for RtRule {
 			return None;
 		}
 		let limiter = rt.limits.get();
-		// the default cap first, as on the kernel's path: a refused datagram spends nothing of the source's `limits`
-		// no eviction here: the DPDK engine's session table only caps (docs/API.md)
+		// the default cap first, as on the kernel's path: a refused datagram spends nothing of the source's `limits`;
+		// at the cap, a session not established makes room (#366), chosen by prefix as there (`Unreplied::evict_for`);
+		// the forwarder ends it (`Rule::evicted`)
 		let (counted, over) = crate::l4::udp::count_session(rt, limiter.as_deref());
-		if over {
+		if over && !rt.udp_unreplied.any() {
 			limits::refused(rt, SocketAddr::V4(client), Reason::MaxConnections, "udp");
 			return None;
 		}
@@ -534,6 +538,10 @@ impl Rule for RtRule {
 				return None;
 			}
 		};
+		if over && !rt.udp_unreplied.evict_for(ip) {
+			limits::refused(rt, SocketAddr::V4(client), Reason::MaxConnections, "udp");
+			return None;
+		}
 		let (target, lease) = match self.pick(offset, None) {
 			Ok(picked) => picked,
 			Err(true) => {
@@ -546,13 +554,14 @@ impl Rule for RtRule {
 				return None;
 			}
 		};
+		let mark = rt.udp_unreplied.track_without_descriptor(ip);
 		rt.stats.opened();
 		let geo = rt.geo_for_log(ip, None);
 		info!(event = "conn.open", rule = %rt.key, listen = %listen, client = %client, target = %target, sni = "",
 			country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn), path = "dpdk");
 		Some((
 			target,
-			RtSession { lease: Some(lease), _permit: permit, _counted: counted, up: Gate::new(ip, Dir::Up), down: Gate::new(ip, Dir::Down), rx: 0, tx: 0, started: Instant::now() },
+			RtSession { lease: Some(lease), _permit: permit, _counted: counted, mark, up: Gate::new(ip, Dir::Up), down: Gate::new(ip, Dir::Down), rx: 0, tx: 0, started: Instant::now() },
 		))
 	}
 
@@ -611,6 +620,14 @@ impl Rule for RtRule {
 		Some(addr)
 	}
 
+	fn established(&self, s: &mut RtSession) {
+		s.mark.replied();
+	}
+
+	fn evicted(&self, s: &RtSession) -> bool {
+		s.mark.evicted()
+	}
+
 	fn close(&self, s: RtSession, client: SocketAddrV4, target: SocketAddrV4, reason: &'static str) {
 		self.rt.stats.closed();
 		info!(event = "conn.close", rule = %self.rt.key, client = %client, target = %target, rx_bytes = s.rx, tx_bytes = s.tx,
@@ -621,6 +638,12 @@ impl Rule for RtRule {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// #366: the forwarder ends sessions not established when the kernel's path does
+	#[test]
+	fn unreplied_sessions_end_as_on_the_kernel_path() {
+		assert_eq!(rproxy_dpdk::engine::UNREPLIED_TIMEOUT, crate::l4::udp::UNREPLIED_TIMEOUT);
+	}
 
 	#[test]
 	fn eal_arguments() {
