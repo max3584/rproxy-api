@@ -67,6 +67,9 @@ struct Options {
 	outlier_detection: Option<crate::core::outlier::L4OutlierSpec>,
 	/// PROXY headers read from trusted front ends (#296).
 	proxy_protocol: Option<crate::net::proxy_in::ProxyProtocolSpec>,
+	/// The relay deadlines of a tcp rule (#353, the UI's #181): `0s` none, left out the default.
+	idle_timeout: Option<String>,
+	half_close_timeout: Option<String>,
 }
 
 fn port(value: i64, column: &str) -> Result<u16, String> {
@@ -145,6 +148,8 @@ fn to_request(row: &sqlx::mysql::MySqlRow, schema: Schema) -> Result<Option<Rule
 		req.geoip = options.geoip;
 		req.outlier_detection = options.outlier_detection;
 		req.proxy_protocol = options.proxy_protocol;
+		req.idle_timeout = options.idle_timeout;
+		req.half_close_timeout = options.half_close_timeout;
 	}
 	Ok(Some(req))
 }
@@ -202,6 +207,7 @@ pub async fn load_rules(url: &str) -> Result<Vec<RuleRequest>, sqlx::Error> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::core::rule::{validate_relay_timeout, Protocol};
 
 	/// The `options` column of 0.3 rows still reads, and the v0.4 keys read in the API's shape.
 	#[test]
@@ -222,6 +228,12 @@ mod tests {
 		let pp: Options = serde_json::from_str(r#"{"proxy_protocol": {"from": ["10.2.0.0/16"], "required": false}}"#).unwrap();
 		let pp = crate::net::proxy_in::validate(pp.proxy_protocol).unwrap().unwrap();
 		assert!(!pp.required && pp.trusts("10.2.3.4".parse().unwrap()));
+		// idle_timeout / half_close_timeout (#353): `0s` (no limit) survives a restore from the UI's table (#181)
+		let relay: Options = serde_json::from_str(r#"{"idle_timeout": "0s", "half_close_timeout": "5m"}"#).unwrap();
+		let idle = validate_relay_timeout("idle_timeout", relay.idle_timeout.as_deref(), Protocol::Tcp, false).unwrap();
+		assert_eq!(idle, Some(Duration::ZERO));
+		let half = validate_relay_timeout("half_close_timeout", relay.half_close_timeout.as_deref(), Protocol::Tcp, false).unwrap();
+		assert_eq!(half, Some(Duration::from_secs(300)));
 		assert!(serde_json::from_str::<Options>(r#"{"limitz": {}}"#).is_err(), "unknown keys are still refused");
 	}
 }

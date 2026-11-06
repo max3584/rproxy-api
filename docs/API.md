@@ -1073,7 +1073,7 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 - 片側が送り終えた（FIN、半分閉じ）後：残りの向きが `half_close_timeout`（既定 1 分。`idle_timeout` が短ければそれ）何も運ばなければ閉じる。運んでいれば続く（送り終えた後に長いダウンロードを受ける使い方はそのまま）。送り終えてから最初の返事まで長く待つもの（`nc -N`、要求を送って `shutdown(SHUT_WR)` してから答えを待つ RPC・バックアップの道具）は `half_close_timeout: "0s"`（`idle_timeout` だけになる）か長めの値にする。
 - `0s`：その上限なし。v0.4.19 までと同じにするには `idle_timeout: "0s"` と `half_close_timeout: "0s"`。
 - 時間を延ばすのは接続のバイト（アプリケーションのデータ）だけ。TCP の keepalive のプローブはカーネルの中で答えるので数えない：アプリケーションの ping を送らず `SO_KEEPALIVE` だけで生かしている接続（DB のコネクションプールなど）は、1 時間黙ると切れる。長く黙る接続（DB のプール・SSH・MQTT などで keepalive が 1 時間より長いもの）は、長めの値か `0s` にする。
-- UI の DB（`forward_rules`）から戻したルールは、`idle_timeout` / `half_close_timeout` の列がないので既定（`1h` / `1m`）になり、UI が項目を持つまでそこでは `0s` にできない（API・設定ファイルのルールと `rproxy_rules` は持てる）。
+- UI の DB（`forward_rules`）から戻したルールは、`options` 列の `idle_timeout` / `half_close_timeout`（API と同じ文字列、UI #181）を読む。なければ既定（`1h` / `1m`）。
 - ログは `conn.close` の `reason` が `idle_timeout` / `half_close_timeout`（警告の `conn.error` ではない）。
 - 両側のソケット（受け付けた接続・宛先への接続）に `SO_KEEPALIVE`（`http` のルールの受け付けた接続と、`http` のサービスの転送先への接続にも付く）。間隔はカーネルの設定（`net.ipv4.tcp_keepalive_time` など、既定は 2 時間後から 75 秒ごとに 9 回）で、`idle_timeout: 0s` の接続でも消えた相手に気づける。`TCP_USER_TIMEOUT` は付けない（keepalive と一緒だと最初の応答のないプローブで切れる。長くすると消えた相手への再送をカーネルの既定（`tcp_retries2`、約 15 分）より長く待つ。読まない相手は `idle_timeout` で閉じる）。
 - `http` のルールは今までどおり `global.http.timeouts`（二重には掛けない）。
@@ -1401,4 +1401,4 @@ v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自
 `forward_rules` のノードでの振り分けは UI 側でする（`target` 列、UI PR #103。ノードごとの DB のビューがその rproxy の行だけを見せる）ので、rproxy は `forward_rules` を絞り込まない。`rproxy_rules` は rproxy が自分の `node` の行だけを読む。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
-`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
+`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）、`idle_timeout`・`half_close_timeout`（v0.4.20）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。

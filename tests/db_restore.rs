@@ -66,7 +66,7 @@ async fn loads_every_schema_version() {
 		 ('u5', 'tcp', '0.0.0.0', 5432, NULL, 'db1.local', 5432, 'proxy',
 		  '{"targets": [{"addr": "db1.local", "port": 5432, "weight": 2}, {"addr": "db2.local", "port": 5432, "backup": true}], "balance": "failover", "health_check": {"interval": "5s", "port": 5433}}'),
 		 ('u6', 'tcp', '0.0.0.0', 8443, NULL, 'paused.local', 443, 'proxy', '{"enabled": false}'),
-		 ('u7', 'tcp', '0.0.0.0', 8444, NULL, 'on.local', 443, 'proxy', '{"enabled": true}')"#,
+		 ('u7', 'tcp', '0.0.0.0', 8444, NULL, 'on.local', 443, 'proxy', '{"enabled": true, "idle_timeout": "0s", "half_close_timeout": "0s"}')"#,
 	)
 	.await
 	.unwrap();
@@ -74,6 +74,10 @@ async fn loads_every_schema_version() {
 	assert_eq!(rules.len(), 5, "the row with broken options and the paused one (#116) are skipped");
 	assert!(rules.iter().all(|r| r.listen_port != 8443), "paused in the UI: not started");
 	assert_eq!(rules[4].listen_port, 8444, "enabled: true is an ordinary rule");
+	// the relay deadlines (#353): `0s` (no limit) survives a restore from the UI's table (UI #181)
+	assert_eq!((rules[4].idle_timeout.as_deref(), rules[4].half_close_timeout.as_deref()), (Some("0s"), Some("0s")));
+	let spec = rules[4].clone().validate(&Default::default()).unwrap();
+	assert_eq!((spec.idle_timeout, spec.half_close_timeout), (Some(std::time::Duration::ZERO), Some(std::time::Duration::ZERO)));
 	assert_eq!(rules[0].listen_port_end, Some(10099));
 	assert_eq!(rules[1].tls.as_ref().unwrap().mode, TlsMode::Terminate);
 	assert_eq!(rules[1].starttls, None);
