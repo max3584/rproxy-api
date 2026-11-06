@@ -772,10 +772,11 @@ async fn http2_backends_do_not_stall_when_their_streams_are_taken() {
 	// past H2_STREAMS_PER_CONN requests at once, another connection is opened
 	let (b, conns) = h2c_limited(1000).await;
 	let s = h2_setup("sem-h2-conns", json!({"g": {"protocol": "h2c", "servers": [{"url": format!("http://{b}")}]}})).await;
-	let h2 = s.h2().await;
+	// two client connections: one takes at most 100 streams at once (#356)
+	let clients = [s.h2().await, s.h2().await];
 	let mut tasks = vec![];
-	for _ in 0..150 {
-		let mut sender = h2.clone();
+	for i in 0..150 {
+		let mut sender = clients[i % 2].clone();
 		tasks.push(tokio::spawn(async move { h2_send(&mut sender, hyper::Request::get("https://a.test/g/slow").body(empty()).unwrap()).await.0 }));
 	}
 	for t in tasks {
