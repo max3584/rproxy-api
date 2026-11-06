@@ -2693,6 +2693,13 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 		n => n,
 	};
 	let _ = writeln!(out, "rproxy_session_budget_limit {budget}");
+	// the DPDK path's NAT ports refused by client prefix (#366)
+	#[cfg(feature = "dpdk")]
+	if let Some(n) = crate::l4::dpdk::nat_prefix_full() {
+		let _ = writeln!(out, "# HELP rproxy_dpdk_nat_prefix_full_total New UDP sessions the DPDK path refused because their client's /24 held its share of the NAT ports of an address.");
+		let _ = writeln!(out, "# TYPE rproxy_dpdk_nat_prefix_full_total counter");
+		let _ = writeln!(out, "rproxy_dpdk_nat_prefix_full_total {n}");
+	}
 	let _ = writeln!(out, "# HELP rproxy_http_compress_skipped_total Responses compress middlewares sent as they were because as many were being compressed (#356).");
 	let _ = writeln!(out, "# TYPE rproxy_http_compress_skipped_total counter");
 	let _ = writeln!(out, "rproxy_http_compress_skipped_total {}", crate::l7::compress::skipped());

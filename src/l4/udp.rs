@@ -305,10 +305,21 @@ impl Unreplied {
 	/// A new session of `client`, in its rule's queue and in the process's (`ALL_UNREPLIED`).
 	/// When its prefix already holds `unreplied_per_prefix` of the rule's, the oldest of them goes.
 	fn track(&self, client: IpAddr, stop: CancellationToken) -> Mark {
+		self.track_in(client, stop, true)
+	}
+
+	/// A new session of `client` that holds no descriptor (the DPDK path, #366): in its rule's
+	/// queue only. It ends when it is evicted (`Mark::evicted`) or its `Mark` is dropped.
+	#[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+	pub(crate) fn track_without_descriptor(&self, client: IpAddr) -> Mark {
+		self.track_in(client, CancellationToken::new(), false)
+	}
+
+	fn track_in(&self, client: IpAddr, stop: CancellationToken, descriptor: bool) -> Mark {
 		let prefix = limits::source_key(client, SOURCE_PREFIX_V4, SOURCE_PREFIX_V6);
 		let mut rule = self.lock();
-		let mut all = ALL_UNREPLIED.lock();
-		let live = [rule.live(prefix), all.live(prefix)];
+		let mut all = descriptor.then(|| ALL_UNREPLIED.lock());
+		let live = [rule.live(prefix), all.as_mut().map_or_else(Arc::default, |all| all.live(prefix))];
 		if live[0].load(Ordering::Relaxed) >= unreplied_per_prefix() {
 			rule.evict_in(prefix);
 		}
@@ -317,12 +328,14 @@ impl Unreplied {
 		}
 		let state = Arc::new(Waiting { done: AtomicBool::new(false), evicted: AtomicBool::new(false), stop, live });
 		rule.push(prefix, &state.live[0], state.clone());
-		all.push(prefix, &state.live[1], state.clone());
+		if let Some(all) = all.as_mut() {
+			all.push(prefix, &state.live[1], state.clone());
+		}
 		Mark(state)
 	}
 
 	/// Whether there may be one to evict (a quick look before spending a source's `limits`).
-	fn any(&self) -> bool {
+	pub(crate) fn any(&self) -> bool {
 		self.lock().oldest().is_some()
 	}
 
@@ -332,7 +345,7 @@ impl Unreplied {
 	/// own first, then the oldest of all, when they hold as many): a flood from one network evicts its own, and a client
 	/// of another network makes room at the flood's cost, not at that of the others. Three
 	/// counts read, no walk over the prefixes.
-	fn evict_for(&self, client: IpAddr) -> bool {
+	pub(crate) fn evict_for(&self, client: IpAddr) -> bool {
 		let prefix = limits::source_key(client, SOURCE_PREFIX_V4, SOURCE_PREFIX_V6);
 		let mut t = self.lock();
 		let Some(oldest) = t.oldest().cloned() else { return false };
@@ -363,11 +376,11 @@ impl Unreplied {
 }
 
 /// A session's place in its rule's `Unreplied`, and its stop.
-struct Mark(Arc<Waiting>);
+pub(crate) struct Mark(Arc<Waiting>);
 
 impl Mark {
 	/// The backend answered (DTLS: the handshake is through): not one to evict any more.
-	fn replied(&self) {
+	pub(crate) fn replied(&self) {
 		// established sessions call this for each datagram: a load, no read-modify-write
 		if !self.0.is_done() {
 			self.0.finish();
@@ -380,6 +393,12 @@ impl Mark {
 
 	fn stop(&self) -> &CancellationToken {
 		&self.0.stop
+	}
+
+	/// Evicted to make room for a new session (`Unreplied::evict_for`).
+	#[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+	pub(crate) fn evicted(&self) -> bool {
+		self.0.evicted.load(Ordering::Relaxed)
 	}
 
 	/// Why a stopped session ended.
@@ -1696,6 +1715,20 @@ mod tests {
 		assert!(t.order.len() <= 2 * 64 + 1);
 		drop(t);
 		drop(legit);
+	}
+
+	// #366: a session of the DPDK path (no descriptor) is evicted at the rule's cap like the others
+	#[test]
+	fn sessions_without_descriptors_are_evicted_too() {
+		let unreplied = Unreplied::default();
+		let mark = unreplied.track_without_descriptor(v4(0xc000_0201));
+		assert!(!mark.evicted());
+		assert!(unreplied.evict_for(v4(0xc000_0202)));
+		assert!(mark.evicted() && mark.stop().is_cancelled());
+		let established = unreplied.track_without_descriptor(v4(0xc000_0201));
+		established.replied();
+		assert!(!unreplied.evict_for(v4(0xc000_0202)));
+		assert!(!established.evicted());
 	}
 
 	// #354: large datagrams queue less deep than small ones

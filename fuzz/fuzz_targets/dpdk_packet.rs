@@ -5,9 +5,15 @@
 //! received on the one port of a forwarder with a UDP rule. Besides not
 //! panicking: every UDP datagram with right checksums that is passed on keeps
 //! them right (the incremental update of the UDP checksum) and its payload.
+//! A frame of one byte is not sent: it sets whether the rule has evicted its
+//! sessions not established (`Rule::evicted`, bit 0) and refuses new ones at
+//! `start` (bit 1, #366). After each frame the counts of NAT ports agree with
+//! the slots, and each client-side row has its session (`Engine::check_counts`).
 #![no_main]
 
 use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libfuzzer_sys::fuzz_target;
@@ -16,7 +22,7 @@ use rproxy_dpdk::packet::{self, Frame};
 
 const MAX_FRAMES: usize = 64;
 
-struct Fuzz;
+struct Fuzz(AtomicU8);
 
 impl Rule for Fuzz {
 	type Session = ();
@@ -36,13 +42,21 @@ impl Rule for Fuzz {
 		true
 	}
 	fn dropped(&self) {}
+	// longer than UNREPLIED_TIMEOUT (5 s) and shorter than an input's 64 frames 300 ms apart (19 s):
+	// sessions end by both the short and the long timeout
 	fn idle(&self) -> Duration {
-		Duration::from_secs(1)
+		Duration::from_secs(10)
 	}
 	fn retarget(&self, _: &mut (), _: u16, _: SocketAddrV4) -> Option<SocketAddrV4> {
 		None
 	}
 	fn close(&self, _: (), _: SocketAddrV4, _: SocketAddrV4, _: &'static str) {}
+	fn start(&self, _: &mut (), _: SocketAddrV4, _: SocketAddrV4, _: SocketAddrV4) -> bool {
+		self.0.load(Ordering::Relaxed) & 2 == 0
+	}
+	fn evicted(&self, _: &()) -> bool {
+		self.0.load(Ordering::Relaxed) & 1 != 0
+	}
 }
 
 fn frames(mut data: &[u8]) -> Vec<&[u8]> {
@@ -56,17 +70,24 @@ fn frames(mut data: &[u8]) -> Vec<&[u8]> {
 }
 
 fuzz_target!(|data: &[u8]| {
-	// a small NAT range: a new engine per input stays cheap, and running out of ports gets exercised
+	// a small NAT range: a new engine per input stays cheap, and running out of ports gets exercised;
+	// one prefix's share of it is 2 ports (half taken: 16), so the share binds too
 	let engine = Engine::with_nat_ports(vec![PortCfg {
 		mac: [2, 0, 0, 0, 0, 0xaa],
 		addrs: vec![([10, 0, 0, 10].into(), 24), ([192, 0, 2, 1].into(), 32)],
 		gateway: Some([10, 0, 0, 1].into()),
-	}], 32768, 32799);
-	engine.register([10, 0, 0, 10].into(), 5000, 4, std::sync::Arc::new(Fuzz)).unwrap();
+	}], 32768, 32799)
+	.with_prefix_min(2);
+	let rule = Arc::new(Fuzz(AtomicU8::new(0)));
+	engine.register([10, 0, 0, 10].into(), 5000, 4, rule.clone()).unwrap();
 	let mut w = engine.worker();
 	engine.refresh(&mut w);
 	let now = Instant::now();
 	for (i, f) in frames(data).into_iter().enumerate() {
+		if let [flags] = f {
+			rule.0.store(*flags, Ordering::Relaxed);
+			continue;
+		}
 		let mut f = f.to_vec();
 		let before = match packet::parse(&f) {
 			Frame::Udp(u) if packet::checksums_ok(&f, &u) => Some(packet::payload(&f, &u).to_vec()),
@@ -85,5 +106,6 @@ fuzz_target!(|data: &[u8]| {
 		if i % 8 == 7 {
 			engine.sweep(now + Duration::from_millis(i as u64 * 300));
 		}
+		engine.check_counts().unwrap();
 	}
 });
