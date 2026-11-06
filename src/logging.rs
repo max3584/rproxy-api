@@ -145,8 +145,8 @@ impl Global {
 }
 
 /// TCP refusals and errors (the data plane): sources cannot be spoofed, and CrowdSec's
-/// scenarios count these lines, so the bound is wide (a scan from many addresses at
-/// once still shows each source's first lines).
+/// scenarios count these lines, so the bound is wide (new sources' first lines take
+/// its fresh share, 500 then 125 a second; their later lines this bound).
 pub static TCP: Global = Global::new(2000.0, 500.0);
 /// UDP (and QUIC) refusals and errors, whose sources may be spoofed.
 pub static UDP: Global = Global::new(200.0, 50.0);
