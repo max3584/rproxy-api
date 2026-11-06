@@ -63,7 +63,7 @@ pub fn labels_text(labels: &Labels) -> String {
 /// digits, other characters `_`; of keys that end up the same, the first (in
 /// sort order) is kept.
 pub fn label_metrics<'a>(out: &mut String, rules: impl Iterator<Item = (&'a Key, &'a Labels)>) {
-	let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+	let esc = crate::core::prom::label;
 	let mut samples = vec![];
 	for (key, labels) in rules.filter(|(_, l)| !l.is_empty()) {
 		let mut names = HashSet::new();
@@ -551,6 +551,18 @@ pub struct PutOptions<'a> {
 	pub owner: Option<&'a str>,
 	/// The token's `allow_listen_ports`: (first, last) of a rule's ports.
 	pub may_use_ports: &'a (dyn Fn(u16, u16) -> bool + Send + Sync),
+	/// The limits of #358 for a PUT of the control API (`core::quota`); None: a set
+	/// restored from the database or a live upgrade, which is never refused for them.
+	pub limits: Option<SetLimits>,
+}
+
+/// What `PutOptions::limits` checks besides the process's limits: the token's
+/// `max_rules` and `max_rulesets`, and whether it may ask for `listen_freebind`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetLimits {
+	pub max_rules: Option<usize>,
+	pub max_rulesets: Option<usize>,
+	pub freebind: bool,
 }
 
 /// A rule as it is now, for planning a PUT.
@@ -584,6 +596,50 @@ fn port_range(spec: &RuleSpec) -> (u16, u16) {
 }
 
 impl Registry {
+	/// The limits of #358 for a PUT of the control API: `listen_freebind` in the rules it
+	/// creates or changes (one the set has already is not looked at again), the rules,
+	/// listening sockets and rule sets of the process, and the token's.
+	fn check_set_limits(
+		&self,
+		name: &str,
+		current_set: Option<&SetState>,
+		current: &HashMap<Key, Current>,
+		specs: &[(usize, RuleSpec)],
+		opts: &PutOptions<'_>,
+		limits: SetLimits,
+	) -> Result<(), SetError> {
+		use crate::core::quota;
+		let ours = |c: &Current| c.spec.ruleset.as_deref() == Some(name);
+		let problems: Vec<_> = specs
+			.iter()
+			.filter(|(_, spec)| current.get(&spec.key).filter(|c| ours(c)).is_none_or(|c| c.spec != *spec))
+			.filter_map(|(i, spec)| quota::check_freebind(spec.listen_freebind, limits.freebind).err().map(|e| finding(*i, spec.key.to_string(), e)))
+			.collect();
+		if !problems.is_empty() {
+			return Err(SetError::of(problems));
+		}
+		let kept = current.values().filter(|c| !ours(c));
+		let rules_after = kept.clone().count() + specs.len();
+		let sockets_before: usize = current.values().map(|c| quota::sockets(&c.spec)).sum();
+		let sockets_after: usize = kept.map(|c| quota::sockets(&c.spec)).sum::<usize>() + specs.iter().map(|(_, s)| quota::sockets(s)).sum::<usize>();
+		quota::check_process(rules_after, rules_after.saturating_sub(current.len()), sockets_after, sockets_after.saturating_sub(sockets_before))?;
+		let owner = current_set.map(|s| s.owner.as_str()).or(opts.owner).unwrap_or(opts.by);
+		if owner == opts.by {
+			let token = crate::net::protected::Owner::Token(opts.by.to_string());
+			let mine = |c: &&Current| !ours(c) && self.owner_of(&c.spec) == token;
+			let before = current.values().filter(|c| ours(c)).count();
+			let after = current.values().filter(mine).count() + specs.len();
+			quota::check_token("rules", after, specs.len().saturating_sub(before), limits.max_rules)?;
+		}
+		if current_set.is_none() {
+			let sets = self.rulesets.snapshot();
+			quota::check_rulesets(sets.len() + 1)?;
+			let mine = sets.values().filter(|s| s.owner == opts.by).count();
+			quota::check_token("rulesets", mine + 1, 1, limits.max_rulesets)?;
+		}
+		Ok(())
+	}
+
 	/// `GET /rulesets`.
 	pub async fn list_rulesets(&self) -> Vec<RulesetSummary> {
 		let sets = self.rulesets.snapshot();
@@ -802,6 +858,9 @@ impl Registry {
 		if !problems.is_empty() {
 			return Err(SetError::of(problems));
 		}
+		if let Some(limits) = opts.limits {
+			self.check_set_limits(name, current_set.as_ref(), &current, &specs, &opts, limits)?;
+		}
 
 		// 3. what changes; the files of what is created or changed
 		let wanted: HashSet<Key> = specs.iter().map(|(_, s)| s.key).collect();
@@ -823,7 +882,7 @@ impl Registry {
 			};
 			if step.action != "none" {
 				if let Some(spec) = &step.spec {
-					if let Err(e) = self.build_parts(spec) {
+					if let Err(e) = crate::net::files::blocking(|| self.build_parts(spec)) {
 						problems.push(finding(i, spec.key.to_string(), e));
 					}
 				}
@@ -983,6 +1042,7 @@ impl Registry {
 					admin: true,
 					owner: Some(&set.owner),
 					may_use_ports: &everything,
+					limits: None,
 				};
 				match self.put_ruleset(&set.name, req, opts).await {
 					Ok(applied) => {

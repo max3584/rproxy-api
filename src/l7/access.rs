@@ -473,6 +473,18 @@ impl HttpStats {
 		cache.entry((route.to_string(), middleware.to_string())).or_default()[outcome.index()] += 1;
 	}
 
+	/// Forgets the counts of routes and middlewares the rule's `http` no longer has (#358),
+	/// after a change of it: a client of the API that renames them again and again does
+	/// not make the counts (and `GET /metrics`) grow. Requests without a route stay.
+	pub fn retain(&self, spec: &super::HttpSpec) {
+		let route = |r: &str| r == NO_ROUTE || spec.routes.iter().any(|x| x.name == r);
+		let pair = |(r, m): &(String, String)| route(r) && spec.middlewares.contains_key(m);
+		self.routes.lock().unwrap_or_else(|e| e.into_inner()).retain(|r, _| route(r));
+		self.limited.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| pair(k));
+		self.blocked.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| pair(k));
+		self.cache.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| pair(k));
+	}
+
 	pub fn cache_snapshot(&self) -> BTreeMap<(String, String), [u64; 4]> {
 		self.cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}

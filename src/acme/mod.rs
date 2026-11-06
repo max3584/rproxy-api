@@ -513,7 +513,11 @@ impl Acme {
 			}
 		}
 		let me = self.clone();
-		tokio::spawn(async move { me.run().await });
+		// started again if it panics (#358)
+		crate::core::supervise::spawn("acme", move || {
+			let me = me.clone();
+			async move { me.run().await }
+		});
 		failed
 	}
 

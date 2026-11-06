@@ -93,6 +93,11 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_STATIC_RULES` | `--static-rules` | なし | `RPROXY_CONFIG` の 0.2 の名前（ルールの配列の JSON も読める）。両方は指定できない |
 | `RPROXY_DATABASE_URL` | `--database-url` | なし | 起動時にルールを復元する MariaDB/MySQL（`mysql://user:pass@host:port/db`） |
 | `RPROXY_MAX_RANGE_PORTS` | `--max-range-ports` | `20000` | 1 ルールで開けるポート範囲の上限 |
+| `RPROXY_MAX_RULES` | `--max-rules` | `10000` | 制御 API で作れるプロセスのルールの数（`0` でなし。超えると `409 limit`。設定ファイル・DB から戻すルールは数えるが断らない。#358） |
+| `RPROXY_MAX_LISTENERS` | `--max-listeners` | `0`（自動） | 制御 API で開ける待ち受けのソケットの合計（アドレス × ポート、`http3` は 2 倍）。`0` はファイル記述子の上限から 1024 を除いた半分（256 以上。#358） |
+| `RPROXY_MAX_RULESETS` | `--max-rulesets` | `1000` | ルールの組の数（`0` でなし。#358） |
+| `RPROXY_API_MAX_CONNECTIONS` | `--api-max-connections` | `512` | 制御 API の TCP の接続の数（アドレスごと。`0` でなし。超えた接続はすぐ閉じる。#358） |
+| `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE` | `--api-max-connections-per-source` | `64` | 1 つの送信元（IPv6 は /64）からの制御 API の TCP の接続の数（`0` でなし。loopback は数えない。#358） |
 | `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | udp のルールのセッションの既定の上限（ルールの `limits.max_connections` があればそちら。`0` でなし。#332：偽った送信元でセッションと転送先へのソケットを増やせないように）。超えた新しいセッションのデータグラムは捨て、`stats.limited`・`conn.limited`（`reason: max_connections`）。多くのクライアントを受けるルールは `limits.max_connections` を付けるか、これを上げる（ファイルの数の上限 `LimitNOFILE` も） |
 | `RPROXY_CACHE_MAX_MEMORY` | `--cache-max-memory` | `536870912`（512 MiB） | すべての `cache` ミドルウェアが持つ量（答えと記録）の合計の上限（バイト。`0` でなし。#349）。ミドルウェアごとの `max_memory` とは別に、ルールを何本作っても 1 つのプロセスのメモリを使い切れないように。入らない答えは同じ `cache` の古いものから捨てて持ち、それでも入らなければ持たない（docs/API.md の「応答のキャッシュ」）。与えなければ `PATCH /config/global` の `cache_max_memory` で稼働中に変えられる。`/metrics` の `rproxy_http_cache_memory_bytes` |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
@@ -340,6 +345,8 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `shutdown.start` / `shutdown.drain` / `shutdown.now` / `shutdown.done` | `RPROXY_SHUTDOWN_DELAY` / `_DRAIN` のある SIGTERM：始めた（`delay_secs`・`drain_secs`）/ 待ち受けを閉じた（残りの接続・セッションの数 `connections`）/ 2 回目の SIGTERM ですぐ止める / 止めた（切った接続・セッションの数 `cut`） |
 | `degraded` | 環境の問題で一部を止めて起動を続けた（`part`：`api`・`api_tls`・`tokens`・`log`・`global.*` など） |
 | `api.listening` / `api.retry` / `api.stopped` | 制御 API の待ち受けの開始 / 開けないので再試行 / 止まった |
+| `api.connections_full` | 制御 API の TCP の接続が `RPROXY_API_MAX_CONNECTIONS` に達し、新しい接続を閉じた（1 分に 1 回まで、#358） |
+| `token.freebind` | `allow_freebind` のないトークンが、`allow_rulesets` があるので組の `listen_freebind` を通した（トークンごとに 1 回。`allow_freebind: true` を書けば出ない、#358） |
 | `audit` | 制御 API での変更（トークンの名前、`client`、操作、ルール、結果）と、断ったリクエスト：トークンがない・違う（`outcome: unauthorized`、`reason`）、権限不足（`outcome: forbidden`）、一時停止中（`outcome: locked_out`）。認証の方法（`auth`：`token`・`cert`・`token+cert`）。断ったリクエストの行は送信元ごとに間引く（`suppressed`） |
 | `token.expiring` / `token.expired` | 制御 API のトークンの期限が近い（`RPROXY_TOKEN_WARN_DAYS` より近い）/ 切れた（`token`、`expires`、`days_left`）。起動・SIGHUP・1 日 1 回、状態が変わったときに 1 回だけ |
 | `api.lockout` / `api.unlock` | 認証の失敗が続いた送信元（`client`。IPv6 は /64）を止めた（`failures`、`until`）/ 解いた |

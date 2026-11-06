@@ -55,7 +55,11 @@
               "protected_file",
               "file_not_allowed",
               "secret_reuse",
-              "file_in_use"
+              "file_in_use",
+              "limit",
+              "busy",
+              "too_large",
+              "timeout"
             ]
           }
         },
@@ -2332,6 +2336,10 @@
               "tcp_idle_timeout": {
                 "type": "boolean",
                 "description": "idle_timeout (default 1h) and half_close_timeout (default 1m) of an L4 tcp rule (0s none), TCP keepalive on both sockets and a 30 s connect timeout by default (#353)"
+              },
+              "control_limits": {
+                "type": "boolean",
+                "description": "The control API's limits: max_rules / max_rulesets of a token, RPROXY_MAX_RULES / RPROXY_MAX_LISTENERS / RPROXY_MAX_RULESETS (409 limit), listen_freebind only for admin, allow_freebind and (rule sets) allow_rulesets tokens (403), RPROXY_API_MAX_CONNECTIONS / _PER_SOURCE, route / middleware / service names sent to the API of 1-512 bytes without control characters, white space, \", \\, `, { or } (v0.4.20, #358)"
               }
             }
           },
@@ -3663,6 +3671,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "parent_draining": {
+            "type": "boolean",
+            "description": "The old process of the last live upgrade is still draining: a new one waits (at most its drain and 60 s; v0.4.20, #358)"
           }
         }
       },
@@ -3696,7 +3708,11 @@
               "protected_file",
               "file_not_allowed",
               "secret_reuse",
-              "file_in_use"
+              "file_in_use",
+              "limit",
+              "busy",
+              "too_large",
+              "timeout"
             ]
           },
           "errors": {

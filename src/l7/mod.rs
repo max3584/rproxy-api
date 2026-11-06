@@ -764,8 +764,47 @@ fn check_url(url: &str, what: &str) -> Result<(), ApiError> {
 	crate::net::url::parse(url).map(|_| ()).map_err(|e| invalid(format!("{what}: {url:?} {e}")))
 }
 
+/// The longest name of a route, middleware or service (#358): rproxy-gateway's names
+/// (`grpc:<namespace>/<route>/r<i>/b<j>/f<k>.<x>`) stay well within it.
+pub const MAX_NAME: usize = 512;
+
+/// A route, middleware or service name (#358): 1 to `MAX_NAME` bytes without control
+/// characters, white space, `"`, `\`, `` ` ``, `{` or `}`. The names are labels of
+/// `GET /metrics` and fields of the log; letters of any script, digits and the other
+/// punctuation (`/ : . _ - @ +` and so on: rproxy-gateway's and the Traefik converter's
+/// names) are fine.
+pub fn check_name(what: &str, name: &str) -> Result<(), ApiError> {
+	if name.is_empty() {
+		return Err(invalid(format!("{what} {name:?}: a name must not be empty")));
+	}
+	if name.len() > MAX_NAME {
+		return Err(invalid(format!("{what} {:?}…: a name may be at most {MAX_NAME} bytes", name.chars().take(40).collect::<String>())));
+	}
+	if let Some(c) = name.chars().find(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}')) {
+		return Err(invalid(format!("{what} {name:?}: {c:?} is not allowed in a name (no control characters, white space, \", \\, `, {{ or }})")));
+	}
+	Ok(())
+}
+
 impl HttpSpec {
 	/// Checks the settings on their own (names, references, expressions).
+	/// The names of routes, middlewares and services (`check_name`, #358), for what the
+	/// control API is sent (`POST` / `PATCH /rules`, `PUT /rulesets`): rules of the settings
+	/// file and those restored (the database, a live upgrade) are not held to it, so a rule
+	/// that ran before keeps running (`/metrics` escapes every label anyway).
+	pub fn check_names(&self) -> Result<(), ApiError> {
+		for name in self.services.keys() {
+			check_name("service", name)?;
+		}
+		for name in self.middlewares.keys() {
+			check_name("middleware", name)?;
+		}
+		for r in self.routes.iter().filter(|r| !r.name.is_empty()) {
+			check_name("route", &r.name)?;
+		}
+		Ok(())
+	}
+
 	pub fn validate(&self) -> Result<(), ApiError> {
 		for (name, svc) in &self.services {
 			if svc.servers.is_empty() {

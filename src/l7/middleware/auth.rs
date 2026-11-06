@@ -38,6 +38,8 @@ fn fingerprint(path: &Path) -> u64 {
 pub struct SecretFile<T> {
 	path: PathBuf,
 	parse: fn(&str) -> Result<T, String>,
+	/// The largest file read (#358).
+	max: u64,
 	state: Arc<RwLock<Loaded<T>>>,
 	/// A reload runs on a blocking thread (`get`).
 	reloading: Arc<AtomicBool>,
@@ -55,12 +57,17 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 	/// Errors say what is wrong with the file only in the log and in `--check-config`; the
 	/// control API's answer does not (no owner, mode, existence or line of it, #333).
 	pub fn open(path: &str, what: &str, parse: fn(&str) -> Result<T, String>) -> Result<SecretFile<T>, ApiError> {
+		Self::open_at_most(path, what, parse, crate::net::files::MAX_FILE)
+	}
+
+	/// `open` for a file of at most `max` bytes (`users_file`: `MAX_USERS_FILE`, #358).
+	pub fn open_at_most(path: &str, what: &str, parse: fn(&str) -> Result<T, String>, max: u64) -> Result<SecretFile<T>, ApiError> {
 		let shown = path;
 		let path = PathBuf::from(path);
 		let print = fingerprint(&path);
 		let unusable =
 			|e: &dyn std::fmt::Display| ApiError::invalid(crate::net::files::rule_file_error(what, shown, &format!("{shown}: {e}")));
-		let value = match crate::net::files::read_to_string(&path, crate::net::files::Kind::Secret) {
+		let value = match crate::net::files::read_to_string_at_most(&path, crate::net::files::Kind::Secret, max) {
 			Ok(text) => {
 				let value = parse(&text).map_err(|e| unusable(&e))?;
 				crate::net::files::rule_file_ok(shown);
@@ -79,6 +86,7 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 		Ok(SecretFile {
 			path,
 			parse,
+			max,
 			state: Arc::new(RwLock::new(Loaded { value, print, checked: Instant::now(), reported: None })),
 			reloading: Arc::default(),
 		})
@@ -106,10 +114,10 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 						}
 					}
 					let done = Done(self.reloading.clone());
-					let (path, parse, state) = (self.path.clone(), self.parse, self.state.clone());
+					let (path, parse, max, state) = (self.path.clone(), self.parse, self.max, self.state.clone());
 					rt.spawn_blocking(move || {
 						let _done = done;
-						reload(&path, parse, &state, false);
+						reload(&path, parse, max, &state, false);
 					});
 				}
 			}
@@ -121,11 +129,11 @@ impl<T: Send + Sync + 'static> SecretFile<T> {
 	/// Re-reads the file if it changed (or always with `force`, for SIGHUP).
 	/// A file that no longer reads or parses keeps the current value.
 	pub fn reload(&self, force: bool) {
-		reload(&self.path, self.parse, &self.state, force);
+		reload(&self.path, self.parse, self.max, &self.state, force);
 	}
 }
 
-fn reload<T>(path: &Path, parse: fn(&str) -> Result<T, String>, state: &RwLock<Loaded<T>>, force: bool) {
+fn reload<T>(path: &Path, parse: fn(&str) -> Result<T, String>, max: u64, state: &RwLock<Loaded<T>>, force: bool) {
 	let print = fingerprint(path);
 	{
 		let s = state.read().unwrap();
@@ -137,7 +145,7 @@ fn reload<T>(path: &Path, parse: fn(&str) -> Result<T, String>, state: &RwLock<L
 	}
 	// read without holding the lock: requests keep the current value meanwhile
 	let result =
-		crate::net::files::read_to_string(path, crate::net::files::Kind::Secret).map_err(|e| e.to_string()).and_then(|t| parse(&t));
+		crate::net::files::read_to_string_at_most(path, crate::net::files::Kind::Secret, max).map_err(|e| e.to_string()).and_then(|t| parse(&t));
 	let mut s = state.write().unwrap();
 	s.checked = Instant::now();
 	match result {
@@ -344,7 +352,7 @@ impl BasicAuth {
 		}
 		Ok(BasicAuth {
 			name: name.to_string(),
-			users: SecretFile::open(users_file, &what, parse_users)?,
+			users: SecretFile::open_at_most(users_file, &what, parse_users, crate::net::files::MAX_USERS_FILE)?,
 			realm: realm.to_string(),
 			keep_authorization,
 			user_header,
