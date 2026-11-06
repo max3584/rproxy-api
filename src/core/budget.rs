@@ -4,13 +4,16 @@
 //! cap for the whole process, a flood (of spoofed UDP sources, for one) could take every
 //! descriptor and leave none for the control API, the database, name resolution or the
 //! certificate files. The budget is `RLIMIT_NOFILE` (soft, after `main` lifts it to the hard
-//! limit) less `RESERVE`, read the first time it is used. A `Ticket` holds its descriptors
-//! until it is dropped.
+//! limit) less `RESERVE` and less the listening sockets the rules may open
+//! (`RPROXY_MAX_LISTENERS`, #370), so that the two caps together leave `RESERVE`. `main`
+//! sets it once at startup (`init`); otherwise it is worked out the first time it is used.
+//! A `Ticket` holds its descriptors until it is dropped.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Descriptors kept out of the budget: the control API, DB, DNS, files, listeners.
+/// Descriptors kept out of the budget and of `RPROXY_MAX_LISTENERS`: the control API, DB,
+/// DNS, files.
 pub const RESERVE: u64 = 1024;
 /// The budget when the limit cannot be read, or leaves less than this beyond `RESERVE`.
 const FLOOR: u64 = 256;
@@ -20,7 +23,24 @@ static IN_USE: AtomicU64 = AtomicU64::new(0);
 
 /// Descriptors the data plane may hold at once.
 pub fn limit() -> u64 {
-	*LIMIT.get_or_init(|| from_nofile(nofile()))
+	*LIMIT.get_or_init(|| from_nofile(nofile(), crate::core::quota::max_listeners() as u64))
+}
+
+/// Sets the budget from the file limit `main` read and the listener cap
+/// (`core::quota::max_listeners`), once, before the data plane starts. Returns the budget.
+pub fn init(nofile: Option<u64>, listeners: u64) -> u64 {
+	*LIMIT.get_or_init(|| from_nofile(nofile, listeners))
+}
+
+/// How far the budget and the listener cap together go past `RLIMIT_NOFILE` less `RESERVE`
+/// (None when they fit, or the file limit is unknown or unlimited). They go past it only when
+/// `RPROXY_MAX_LISTENERS` is set that high, or the file limit is so low that the floors of
+/// both decide.
+pub fn overcommit(nofile: Option<u64>, listeners: u64, budget: u64) -> Option<u64> {
+	match nofile {
+		None | Some(u64::MAX) => None,
+		Some(n) => listeners.saturating_add(budget).checked_sub(n.saturating_sub(RESERVE)).filter(|&over| over > 0),
+	}
 }
 
 /// Descriptors held now.
@@ -28,11 +48,11 @@ pub fn in_use() -> u64 {
 	IN_USE.load(Ordering::Relaxed)
 }
 
-fn from_nofile(nofile: Option<u64>) -> u64 {
+fn from_nofile(nofile: Option<u64>, listeners: u64) -> u64 {
 	match nofile {
 		// unlimited: no cap of ours
 		Some(u64::MAX) => u64::MAX,
-		Some(n) => n.saturating_sub(RESERVE).max(FLOOR),
+		Some(n) => n.saturating_sub(RESERVE).saturating_sub(listeners).max(FLOOR),
 		None => FLOOR,
 	}
 }
@@ -99,10 +119,41 @@ mod tests {
 
 	#[test]
 	fn the_budget_leaves_the_reserve() {
-		assert_eq!(from_nofile(Some(1_048_576)), 1_048_576 - RESERVE);
-		assert_eq!(from_nofile(Some(1024)), FLOOR);
-		assert_eq!(from_nofile(None), FLOOR);
-		assert_eq!(from_nofile(Some(u64::MAX)), u64::MAX);
+		assert_eq!(from_nofile(Some(1_048_576), 0), 1_048_576 - RESERVE);
+		assert_eq!(from_nofile(Some(1024), 0), FLOOR);
+		assert_eq!(from_nofile(None, 0), FLOOR);
+		assert_eq!(from_nofile(Some(u64::MAX), 0), u64::MAX);
+		assert_eq!(from_nofile(Some(u64::MAX), 1_000), u64::MAX);
+	}
+
+	/// #370: with both caps automatic, listeners and connections share what the file limit
+	/// leaves after `RESERVE` and never go past it together.
+	#[test]
+	fn the_automatic_caps_add_up_to_the_file_limit_less_the_reserve() {
+		for n in [1_536u64, 2_048, 4_096, 65_536, 65_537, 1_048_576] {
+			let listeners = crate::core::quota::auto_listeners(Some(n)) as u64;
+			let budget = from_nofile(Some(n), listeners);
+			assert_eq!(listeners + budget, n - RESERVE, "nofile {n}");
+			assert!(budget >= listeners, "nofile {n}: connections get at least half");
+			assert_eq!(overcommit(Some(n), listeners, budget), None, "nofile {n}");
+		}
+		// the unit's LimitNOFILE=65536
+		assert_eq!(crate::core::quota::auto_listeners(Some(65_536)), 32_256);
+		assert_eq!(from_nofile(Some(65_536), 32_256), 32_256);
+	}
+
+	#[test]
+	fn an_explicit_listener_cap_comes_out_of_the_budget() {
+		assert_eq!(from_nofile(Some(65_536), 1_000), 65_536 - RESERVE - 1_000);
+		assert_eq!(overcommit(Some(65_536), 1_000, 65_536 - RESERVE - 1_000), None);
+		// a cap that leaves less than the floor: the floor, and the warning says by how much
+		assert_eq!(from_nofile(Some(65_536), 65_000), FLOOR);
+		assert_eq!(overcommit(Some(65_536), 65_000, FLOOR), Some(65_000 + FLOOR - (65_536 - RESERVE)));
+		// a file limit too low for both floors
+		assert_eq!(overcommit(Some(1_024), 256, FLOOR), Some(512));
+		// unknown or unlimited: nothing to go past
+		assert_eq!(overcommit(None, 16_384, FLOOR), None);
+		assert_eq!(overcommit(Some(u64::MAX), u64::MAX / 2, u64::MAX), None);
 	}
 
 	#[test]
