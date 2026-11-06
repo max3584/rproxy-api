@@ -248,7 +248,10 @@ pub struct Engine<R: Rule> {
 	fwd: Vec<Mutex<Fwd>>,
 	/// Client-side entries of sessions ended while another shard was held (`open`), for the next `open`
 	/// (before it takes a shard) or the sweep to clear: a couple per `open` in flight at most.
-	stale: Mutex<Vec<(FwdKey, usize, u16)>>,
+	/// With the id of the ended session: a row the slot's new session of the same client holds is kept.
+	stale: Mutex<Vec<(FwdKey, usize, u16, u64)>>,
+	/// Rows in `stale` (an empty one takes no lock).
+	stale_len: AtomicUsize,
 	next_id: AtomicU64,
 	neighbors: Mutex<HashMap<Ipv4Addr, Mac>>,
 	arp_pending: Mutex<HashMap<Ipv4Addr, Instant>>,
@@ -298,6 +301,7 @@ impl<R: Rule> Engine<R> {
 			version: AtomicU64::new(1),
 			fwd: (0..SHARDS).map(|_| Mutex::default()).collect(),
 			stale: Mutex::default(),
+			stale_len: AtomicUsize::new(0),
 			next_id: AtomicU64::new(0),
 			neighbors: Mutex::default(),
 			arp_pending: Mutex::default(),
@@ -560,7 +564,7 @@ impl<R: Rule> Engine<R> {
 	fn open(&self, port: usize, li: usize, rule: &Arc<R>, offset: u16, u: &Udp4, now: Instant, shard: &Mutex<Fwd>) -> Option<(usize, u16)> {
 		let key = FwdKey { listen: u.dst, client: u.src };
 		// what earlier opens left (one entry each at most), before this one holds a shard
-		if !lock(&self.stale).is_empty() {
+		if self.stale_len.load(Ordering::Relaxed) > 0 {
 			self.clear_stale();
 		}
 		let mut map = lock(shard);
@@ -677,12 +681,22 @@ impl<R: Rule> Engine<R> {
 
 	/// Clears the client-side entries `end` left for later (`stale`), holding no shard.
 	fn clear_stale(&self) {
-		let stale = std::mem::take(&mut *lock(&self.stale));
-		for (key, li, nat) in stale {
+		let stale = {
+			let mut stale = lock(&self.stale);
+			self.stale_len.store(0, Ordering::Relaxed);
+			std::mem::take(&mut *stale)
+		};
+		for (key, li, nat, id) in stale {
 			let mut map = lock(&self.fwd[shard_of(&key)]);
-			if map.get(&key) == Some(&(li, nat)) {
-				map.remove(&key);
+			if map.get(&key) != Some(&(li, nat)) {
+				continue;
 			}
+			// the same client may have its session again in the same slot since: that row is its own
+			let n = usize::from(nat - self.nat_lo);
+			if lock(&self.locals[li].slots[n]).as_ref().is_some_and(|s| s.key == key && s.id != id) {
+				continue;
+			}
+			map.remove(&key);
 		}
 	}
 
@@ -701,6 +715,17 @@ impl<R: Rule> Engine<R> {
 				return Err(format!("{}: a prefix holds none, or waits on more than twice what it holds", local.ip));
 			}
 		}
+		// every client-side row points at a slot of the same client, or waits in `stale` to be cleared
+		let stale: Vec<(FwdKey, usize, u16)> = lock(&self.stale).iter().map(|&(k, li, nat, _)| (k, li, nat)).collect();
+		for shard in &self.fwd {
+			for (key, &(li, nat)) in lock(shard).iter() {
+				let n = usize::from(nat - self.nat_lo);
+				let ok = lock(&self.locals[li].slots[n]).as_ref().is_some_and(|s| s.key == *key);
+				if !ok && !stale.contains(&(*key, li, nat)) {
+					return Err(format!("{}: a row for {} at {li}:{nat} without its session", key.listen, key.client));
+				}
+			}
+		}
 		Ok(())
 	}
 
@@ -717,7 +742,11 @@ impl<R: Rule> Engine<R> {
 					map.remove(&s.key);
 				}
 			}
-			Some(_) => lock(&self.stale).push((s.key, at.0, at.1)),
+			Some(_) => {
+				let mut stale = lock(&self.stale);
+				stale.push((s.key, at.0, at.1, s.id));
+				self.stale_len.store(stale.len(), Ordering::Relaxed);
+			}
 			None => {
 				let mut map = lock(&self.fwd[shard_of(&s.key)]);
 				if map.get(&s.key) == Some(&at) {

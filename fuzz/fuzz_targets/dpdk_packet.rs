@@ -8,7 +8,7 @@
 //! A frame of one byte is not sent: it sets whether the rule has evicted its
 //! sessions not established (`Rule::evicted`, bit 0) and refuses new ones at
 //! `start` (bit 1, #366). After each frame the counts of NAT ports agree with
-//! the slots (`Engine::check_counts`).
+//! the slots, and each client-side row has its session (`Engine::check_counts`).
 #![no_main]
 
 use std::net::SocketAddrV4;
@@ -42,8 +42,10 @@ impl Rule for Fuzz {
 		true
 	}
 	fn dropped(&self) {}
+	// longer than UNREPLIED_TIMEOUT (5 s) and shorter than an input's 64 frames 300 ms apart (19 s):
+	// sessions end by both the short and the long timeout
 	fn idle(&self) -> Duration {
-		Duration::from_secs(1)
+		Duration::from_secs(10)
 	}
 	fn retarget(&self, _: &mut (), _: u16, _: SocketAddrV4) -> Option<SocketAddrV4> {
 		None
