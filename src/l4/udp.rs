@@ -25,6 +25,7 @@ use crate::core::proxy::{shifted, Runtime};
 use crate::core::rule::SourceIp;
 use crate::net::proxy_in::{self, peer_field};
 use crate::net::source;
+use crate::logging::{clip, throttled, udp_errors};
 use crate::tls::config::{TlsMode, TlsRuntime};
 use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
 
@@ -445,8 +446,8 @@ async fn session(
 		match rt.select(sni.as_deref(), offset) {
 			None => {
 				rt.stats.denied();
-				info!(event = "conn.denied", rule = %rt.key, client = %client, reason = "unmatched", sni = sni.as_deref().unwrap_or(""),
-					proxy_peer = peer_field());
+				throttled!(rt.denied_log, client.ip(), info, event = "conn.denied", rule = %rt.key, client = %client, reason = "unmatched",
+					sni = %clip(sni.as_deref().unwrap_or("")), proxy_peer = peer_field());
 				// swallow the rest of this client's datagrams until it goes quiet,
 				// rather than reading every one of them again as a new session
 				drain(rt, from_client, idle).await;
@@ -487,7 +488,8 @@ async fn session(
 			return None;
 		}
 		Err(Miss::NoTarget) => {
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", sni = sni.as_deref().unwrap_or(""),
+			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target",
+				sni = %clip(sni.as_deref().unwrap_or("")),
 				proxy_peer = peer_field());
 			remove(sessions, peer, id);
 			return None;
@@ -498,7 +500,7 @@ async fn session(
 	let upstream = match source::udp_upstream(addr, bind_as).await {
 		Ok(s) => s,
 		Err(e) => {
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field());
+			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field());
 			remove(sessions, peer, id);
 			return None;
 		}
@@ -507,7 +509,7 @@ async fn session(
 	rt.stats.opened();
 	let geo = rt.geo_for_log(client.ip(), None);
 	info!(event = "conn.open", rule = %rt.key, listen = %listener.local_for(local), client = %client, target = %addr_or_empty(target),
-		sni = sni.as_deref().unwrap_or(""), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn), proxy_peer = peer_field());
+		sni = %clip(sni.as_deref().unwrap_or("")), country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn), proxy_peer = peer_field());
 	// `bandwidth` (#166): datagrams over the rate are dropped
 	let (mut up, mut down) = (Gate::new(client.ip(), Dir::Up), Gate::new(client.ip(), Dir::Down));
 	let header = proxy_header(source_ip, client, listener.local_for(local));
@@ -985,7 +987,7 @@ async fn dtls_session(
 				_ => "DTLS handshake timed out".to_string(),
 			};
 			rt.stats.tls_failed();
-			warn!(event = "tls.error", rule = %rt.key, client = %client, error = %error, dtls = true);
+			throttled!(udp_errors(), client.ip(), warn, event = "tls.error", rule = %rt.key, client = %client, error = %error, dtls = true);
 			remove(&sessions, peer, id);
 			return;
 		}
@@ -993,7 +995,7 @@ async fn dtls_session(
 	let state = dtls.connection_state().await;
 	if let Err(e) = tls.verify_dtls_client(&state.peer_certificates) {
 		rt.stats.tls_failed();
-		warn!(event = "tls.error", rule = %rt.key, client = %client, error = %e, dtls = true);
+		throttled!(udp_errors(), client.ip(), warn, event = "tls.error", rule = %rt.key, client = %client, error = %e, dtls = true);
 		let _ = dtls.close().await;
 		remove(&sessions, peer, id);
 		return;
@@ -1020,7 +1022,8 @@ async fn dtls_session(
 		if full {
 			limits::refused(&rt, client, Reason::TargetFull, "udp");
 		} else {
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target", dtls = true);
+			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target",
+				dtls = true);
 		}
 		let _ = dtls.close().await;
 		remove(&sessions, peer, id);
@@ -1043,7 +1046,7 @@ async fn dtls_session(
 	let (addr, upstream) = match upstream {
 		Ok(u) => u,
 		Err(e) => {
-			warn!(event = "conn.error", rule = %rt.key, client = %client, error = %e, dtls = true);
+			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = %e, dtls = true);
 			let _ = dtls.close().await;
 			remove(&sessions, peer, id);
 			return;

@@ -87,7 +87,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/admin/upgrade", post(super::upgrade::upgrade))
 		.route("/admin/update", get(super::upgrade::update_status).post(super::upgrade::update_now))
 		.route("/admin/update/bad", axum::routing::delete(super::upgrade::clear_bad))
-		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default())), require_token));
+		.route_layer(middleware::from_fn_with_state((state.clone(), Arc::new(Throttle::default().under(&crate::logging::CONTROL, "audit"))), require_token));
 
 	Router::new()
 		.route("/healthz", get(|| async { "ok" }))

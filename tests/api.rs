@@ -481,5 +481,6 @@ async fn refusals_and_changes_are_audited_with_the_client() {
 	let text = h.http.get(format!("{}/metrics", h.base)).bearer_auth("root-secret").send().await.unwrap().text().await.unwrap();
 	let n: u64 = text.lines().find_map(|l| l.strip_prefix("rproxy_log_suppressed_total ")).unwrap().parse().unwrap();
 	assert!(n >= 3, "{text}");
+	assert!(text.lines().any(|l| l.starts_with("rproxy_log_dropped_total ")), "lines the writer dropped (#357): {text}");
 	std::fs::remove_dir_all(dir).unwrap();
 }

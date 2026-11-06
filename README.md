@@ -333,7 +333,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 
 ## ログ
 
-1 行 1 イベントの JSON。共通の項目は `timestamp`、`level`、`event`、`rule`（`tcp/0.0.0.0:8888` の形）。既定の `RPROXY_LOG_LEVEL=info` で出るもの（`debug` だけのものは最後の行）。SIEM・CrowdSec で拾うなら、まず `audit`・`conn.denied`・`http.access`・`tls.error`・`target.down`・`cert.*`・`crowdsec.error`。各項目は docs/API.md。
+1 行 1 イベントの JSON。クライアントが決める長い項目（パス・クエリ・User-Agent・Host・SNI）は 2,048 バイトで切る（`...[truncated]`、v0.4.20）。共通の項目は `timestamp`、`level`、`event`、`rule`（`tcp/0.0.0.0:8888` の形）。既定の `RPROXY_LOG_LEVEL=info` で出るもの（`debug` だけのものは最後の行）。SIEM・CrowdSec で拾うなら、まず `audit`・`conn.denied`・`http.access`・`tls.error`・`target.down`・`cert.*`・`crowdsec.error`。各項目は docs/API.md。
 
 | `event` | 内容 |
 |---|---|
@@ -354,9 +354,10 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `geoip.reload` | `global.geoip` のデータベースを読んだ・読み直した（`db`：`country` / `asn`、`path`、`build_epoch`）。読めないときは `degraded`（`part: geoip`）で今のものを使い続ける |
 | `static.loaded` / `rule.listen` / `rule.duplicate` | 固定ルールを読み込んだ / 待ち受けのアドレスが変わった / 同じキーのルールを読み飛ばした |
 | `conn.open` / `conn.close` | 接続（UDP はセッション）の開始と終了。`client`、`target`、`rx_bytes`、`tx_bytes`、`duration_ms`、`reason`。TLS を終端したときは `tls_version`・`tls_cipher` など。HTTP/3 の QUIC 接続は `transport: quic`。`global.geoip.log_country` で `country`・`asn`。ルールの `proxy_protocol` でヘッダを受けた接続は、`client` がヘッダのクライアント、`proxy_peer` が前段（`conn.denied`・`conn.limited`・`conn.error`・`http.access` も同じ）。`http` のルールの接続を時間の上限（`global.http.timeouts`、v0.4.17）で閉じたときは `reason` が `first_byte_timeout`・`request_headers_timeout`・`idle`（docs/API.md の「HTTP の転送の扱い」）。L4 の `tcp` のルールの中継を時間切れ（`idle_timeout`、v0.4.20）で閉じたときは `idle_timeout`・`half_close_timeout`（両側をリセット。docs/API.md の「中継の時間切れと keepalive」） |
-| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`・`proxy_protocol`（`from` の前段のヘッダがない・壊れている、`error`）・`proxy_protocol_untrusted`（`from` の外からのヘッダ、`version`）。`client`（`IP:ポート`）、`sni`。UDP は送信元ごとに間引く（`suppressed`：その前に省いた行の数）。HTTP/3 は `transport: quic` |
+| `conn.denied` | 断った接続（UDP はデータグラム）：`reason` は `allow_from`・`geoip`（`country`・`asn`）・`crowdsec`・`unmatched`・`proxy_protocol`（`from` の前段のヘッダがない・壊れている、`error`）・`proxy_protocol_untrusted`（`from` の外からのヘッダ、`version`）。`client`（`IP:ポート`）、`sni`。送信元ごとに間引く（`suppressed`：その前に省いた行の数。TCP は v0.4.20 から）。HTTP/3 は `transport: quic` |
 | `conn.limited` | ルールの `limits`（#165）で断った接続（UDP はデータグラム）：`reason` は `max_connections`・`source_connections`・`new_connections`・`packets`、`transport` は `tcp`・`udp`、`client`。宛先がすべて `max_connections`（#341）で断った接続・データグラム・リクエストも `reason: target_full`（`transport` は `http` も）。送信元ごとに間引く（`suppressed`） |
-| `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗 |
+| `conn.error` / `tls.error` / `accept.error` / `recv.error` | 転送先に接続できない・ClientHello を読めないなどの接続の失敗 / TLS・DTLS のハンドシェイクの失敗 / 受け付け・受信の失敗。`conn.error`・`tls.error` は送信元ごとに、`accept.error` は待ち受けごとに 10 秒に 1 行に間引く（`suppressed`、v0.4.20） |
+| `log.suppressed` | 間引いた行のある送信元を 60 秒来ないので忘れた・表がいっぱいで行を出せなかった（`throttle`、`sources`、省いた行の数 `suppressed`、`overflow`。v0.4.20、docs/API.md の「ログの間引きと長さ」） |
 | `http3.listening` / `http3.error` | `http.http3` のルールが UDP で HTTP/3 を受け始めた / QUIC の証明書を作り直せない |
 | `http.error` | `http` のルールで転送先に接続できない・時間切れ（ルートの `timeouts` を含む）・`retry` の `status` で送り直す（`route`、`service`、`backend`、`status`、`retry` のときは `attempt`）。`http` のルールのリクエストは `http.access`（アクセスログ。`global.access_log` を指定すれば別のファイル。項目は docs/API.md） |
 | `http.access` | `http` のルールのリクエスト（アクセスログ）。断ったミドルウェア（`refused_by`・`middleware`）、`basic_auth` のユーザー（`user`）と断った理由（`auth_error`）、`tls.client_auth` のあるルールではクライアント証明書の `client_cn`・`client_verify`（`SUCCESS` / `FAILED` / `NONE`）を含む。`global.geoip.log_country`（と `geoip` ミドルウェアが断ったとき）は `country`・`asn`。正規化でパスが変わったときは送られたままのパスを `raw_path`（v0.4.17）。`cache` ミドルウェアのあるルートは `cache`（`HIT`・`MISS`・`STALE`・`BYPASS`、v0.4.19） |

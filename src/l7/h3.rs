@@ -205,7 +205,7 @@ fn canonical(ip: IpAddr) -> IpAddr {
 
 fn denied(rt: &Runtime, client: SocketAddr, why: &str) {
 	rt.stats.denied();
-	info!(event = "conn.denied", rule = %rt.key, client = %client, reason = why, transport = "quic");
+	crate::logging::throttled!(crate::logging::quic_denied(), client.ip(), info, event = "conn.denied", rule = %rt.key, client = %client, reason = why, transport = "quic");
 }
 
 async fn serve(endpoint: quinn::Endpoint, base: Arc<quinn::ServerConfig>, rt: Arc<Runtime>, token: CancellationToken) {

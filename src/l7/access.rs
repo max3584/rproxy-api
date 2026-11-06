@@ -56,7 +56,7 @@ impl AccessLog {
 			.max_log_files(keep_files.max(1))
 			.build(dir)
 			.map_err(|e| AccessLogError::Unavailable(format!("cannot write the access log in {}: {e}", dir.display())))?;
-		let (writer, guard) = tracing_appender::non_blocking(appender);
+		let (writer, guard) = crate::logging::non_blocking(appender);
 		Ok(AccessLog(Sink::File { writer: Mutex::new(writer), _guard: guard }))
 	}
 }
@@ -121,6 +121,7 @@ impl Snapshot {
 	}
 
 	pub fn log(&self, entry: &AccessEntry) {
+		let entry = &*entry.bounded();
 		match &*self.sink {
 			Sink::Log => info!(event = "http.access", rule = %entry.rule, route = %entry.route, service = %entry.service,
 				backend = %entry.backend, client = %entry.client, method = %entry.method, host = %entry.host,
@@ -361,6 +362,23 @@ pub struct AccessEntry {
 	/// `HIT`, `MISS`, `STALE` or `BYPASS` on a route with `cache` (#340); left out otherwise.
 	#[serde(skip_serializing_if = "str::is_empty")]
 	pub cache: &'static str,
+}
+
+impl AccessEntry {
+	/// The entry with what the client chose (`method`, `host`, `path`, `raw_path`, `query`,
+	/// `user_agent`, `sni`) cut to `logging::MAX_FIELD` bytes (#357); copied only
+	/// when something is that long.
+	fn bounded(&self) -> std::borrow::Cow<'_, AccessEntry> {
+		let long = |s: &String| s.len() > crate::logging::MAX_FIELD;
+		if ![&self.method, &self.host, &self.path, &self.raw_path, &self.query, &self.user_agent, &self.sni].into_iter().any(long) {
+			return std::borrow::Cow::Borrowed(self);
+		}
+		let mut e = self.clone();
+		for s in [&mut e.method, &mut e.host, &mut e.path, &mut e.raw_path, &mut e.query, &mut e.user_agent, &mut e.sni] {
+			crate::logging::clip_in_place(s);
+		}
+		std::borrow::Cow::Owned(e)
+	}
 }
 
 #[derive(Serialize)]
@@ -806,11 +824,21 @@ mod tests {
 		std::fs::create_dir_all(&dir).unwrap();
 		let g = HttpGlobal::new(&[], Some(&dir.join("access.log")), 3).unwrap();
 		g.log(&AccessEntry { rule: "tcp/0.0.0.0:80".into(), status: 200, path: "/x".into(), ..Default::default() });
+		// what the client chose is cut (#357)
+		let long = "a".repeat(crate::logging::MAX_FIELD * 4);
+		g.log(&AccessEntry { path: format!("/{long}"), query: long.clone(), user_agent: long.clone(), host: long.clone(), ..Default::default() });
 		drop(g); // flushes
 		let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
-		let line: serde_json::Value = serde_json::from_str(std::fs::read_to_string(file).unwrap().trim()).unwrap();
+		let text = std::fs::read_to_string(file).unwrap();
+		let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+		let line = &lines[0];
 		assert_eq!((line["event"].as_str(), line["status"].as_u64(), line["path"].as_str()), (Some("http.access"), Some(200), Some("/x")));
 		assert!(line["timestamp"].as_str().unwrap().contains('T'));
+		for field in ["path", "query", "user_agent", "host"] {
+			let v = lines[1][field].as_str().unwrap();
+			assert_eq!(v.len(), crate::logging::MAX_FIELD + crate::logging::TRUNCATED.len(), "{field}");
+			assert!(v.ends_with(crate::logging::TRUNCATED), "{field}");
+		}
 		std::fs::remove_dir_all(dir).unwrap();
 
 		assert!(matches!(HttpGlobal::new(&[], Some(Path::new("/nonexistent-rproxy/a.log")), 3), Err(AccessLogError::Config(_))));
