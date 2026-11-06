@@ -13,8 +13,9 @@ pub const DEFAULT_MAX_RULES: usize = 10_000;
 /// `RPROXY_MAX_RULESETS`: rule sets of the process.
 pub const DEFAULT_MAX_RULESETS: usize = 1_000;
 /// File descriptors kept out of `RPROXY_MAX_LISTENERS`'s automatic value for everything
-/// else besides the connections (the control API, the database, DNS, files).
-pub const RESERVED_FDS: u64 = 1_024;
+/// else besides the connections (the control API, the database, DNS, files): the same
+/// reserve as the connection budget's (`core::budget`, #370).
+pub const RESERVED_FDS: u64 = crate::core::budget::RESERVE;
 /// `RPROXY_MAX_LISTENERS` when the file limit is not known.
 const FALLBACK_LISTENERS: usize = 16_384;
 /// The automatic value is at least this.
@@ -25,7 +26,9 @@ static MAX_LISTENERS: AtomicUsize = AtomicUsize::new(FALLBACK_LISTENERS);
 static MAX_RULESETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_RULESETS);
 
 /// `RPROXY_MAX_LISTENERS`'s automatic value (`0`): half of what the file limit leaves after
-/// `RESERVED_FDS` (the other half for connections), at least `MIN_LISTENERS`.
+/// `RESERVED_FDS`, at least `MIN_LISTENERS`. The connection budget (`core::budget::init`)
+/// is what is left after the cap, so the two together stay within the file limit less
+/// `RESERVED_FDS` (#370).
 pub fn auto_listeners(nofile: Option<u64>) -> usize {
 	match nofile {
 		Some(n) => usize::try_from(n.saturating_sub(RESERVED_FDS) / 2).unwrap_or(usize::MAX).max(MIN_LISTENERS),

@@ -122,7 +122,7 @@ struct Options {
 	/// Rules the control API may make the process have (0: no limit; #358)
 	#[arg(long, env = "RPROXY_MAX_RULES", default_value_t = rproxy_api::core::quota::DEFAULT_MAX_RULES)]
 	max_rules: usize,
-	/// Listening sockets the rules may open together through the control API (0: half of the file limit after 1024 kept for the rest)
+	/// Listening sockets the rules may open together through the control API (0: half of the file limit after 1024 kept for the rest; connections get what is left after this)
 	#[arg(long, env = "RPROXY_MAX_LISTENERS", default_value_t = 0)]
 	max_listeners: usize,
 	/// Rule sets the control API may make the process have (0: no limit)
@@ -1010,13 +1010,20 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	}
 	let nofile = raise_nofile_limit();
 	rproxy_api::core::quota::set(opts.max_rules, opts.max_listeners, opts.max_rulesets, nofile);
+	// #370: connections and sessions get what the file limit leaves after the reserve and the listeners
+	let max_listeners = rproxy_api::core::quota::max_listeners() as u64;
+	let session_budget = rproxy_api::core::budget::init(nofile, max_listeners);
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
-		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), max_rules = opts.max_rules,
-		max_listeners = rproxy_api::core::quota::max_listeners(), max_rulesets = opts.max_rulesets, session_budget = match rproxy_api::core::budget::limit() {
+		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), fd_reserve = rproxy_api::core::budget::RESERVE,
+		max_rules = opts.max_rules, max_listeners, max_rulesets = opts.max_rulesets, session_budget = match session_budget {
 			u64::MAX => 0,
 			n => n,
 		});
+	if let Some(over) = rproxy_api::core::budget::overcommit(nofile, max_listeners, session_budget) {
+		warn!(event = "degraded", part = "fd_budget", nofile_limit = nofile.unwrap_or(0), max_listeners, session_budget, over,
+			"RPROXY_MAX_LISTENERS and the connection budget together go past the file limit less 1024 kept for the control API, DB and DNS; lower RPROXY_MAX_LISTENERS or raise LimitNOFILE");
+	}
 
 	// #144: rules of persist: true tokens, in rproxy_rules
 	if rproxy_api::core::rule::Features::CURRENT.persistence {
