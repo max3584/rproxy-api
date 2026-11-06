@@ -1064,6 +1064,7 @@ L4 の `tcp` のルールの `connect_timeout`（上の表）。止まったノ�
 - 宛先が 1 つ・複数のどちらでも効く（複数のときは 5 秒の代わり）。`tls.routes` の宛先も同じ。
 - 短すぎると、混んだ宛先・遠い宛先を落ちたとみなす。同じクラスタの中なら `1s`〜`3s` を目安に（SYN の最初の再送が 1 秒後）。
 - `http` のルールは今までどおりサービスの `timeouts.connect`（既定 5 秒）。
+- UI の DB（`forward_rules`）から戻したルールも、`options` 列の `connect_timeout`（API と同じ文字列）を読む（v0.4.21、#379、UI #184、`features.db_connect_timeout`）。v0.4.20 までは読まず、`options` に書いた行は知らないキーとして戻らなかった。
 
 ### 中継の時間切れと keepalive（v0.4.20、#353、`features.tcp_idle_timeout`）
 
@@ -1401,4 +1402,4 @@ v0.4（#144）からは、続けて rproxy のテーブル `rproxy_rules` の自
 `forward_rules` のノードでの振り分けは UI 側でする（`target` 列、UI PR #103。ノードごとの DB のビューがその rproxy の行だけを見せる）ので、rproxy は `forward_rules` を絞り込まない。`rproxy_rules` は rproxy が自分の `node` の行だけを読む。
 
 テーブル定義は UI リポジトリの `db/` で管理する。rproxy が読む列は `protocol`、`src_addr`、`src_port`、`src_port_end`、`dist_addr`、`dist_port`、`source_ip`、`udp_idle_secs`、`options`。`options.targets`（複数の宛先）があれば `dist_addr` / `dist_port` は使わない。`options.enabled` が `false` の行（UI で一時停止したルール）は起動時に作らない（ログ `restore.paused` に数）。
-`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）、`idle_timeout`・`half_close_timeout`（v0.4.20）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
+`options` は JSON で `{"tls": <TLS>, "starttls": "smtp" | "imap" | "pop3" | null, "starttls_required": bool, "allow_from": [<CIDR>, ...], "http": <L7>, "crowdsec": bool}`（`allow_from`・`http`・`crowdsec` は省略できる）。古いテーブルにこれらの列がなければ、既定値で読み込む。v0.4 の `labels`・`limits`・`bandwidth`・`geoip`・`outlier_detection` と `proxy_protocol`（v0.4.13）、`idle_timeout`・`half_close_timeout`（v0.4.20）、`connect_timeout`（v0.4.21、`features.db_connect_timeout`。それより前の rproxy はこのキーのある行を戻さない）も API と同じ形で読む（省略できる。上の「v0.4 の設定」）。
