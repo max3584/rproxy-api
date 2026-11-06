@@ -1013,7 +1013,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	info!(event = "start", version = env!("CARGO_PKG_VERSION"), transparent, transparent_ipv6, auth = tokens.enabled(),
 		tls = opts.tls_cert.is_some(), max_range_ports = opts.max_range_ports, udp_max_sessions = opts.udp_max_sessions,
 		cache_max_memory = opts.cache_max_memory, nofile_limit = nofile.unwrap_or(0), max_rules = opts.max_rules,
-		max_listeners = rproxy_api::core::quota::max_listeners(), max_rulesets = opts.max_rulesets);
+		max_listeners = rproxy_api::core::quota::max_listeners(), max_rulesets = opts.max_rulesets, session_budget = match rproxy_api::core::budget::limit() {
+			u64::MAX => 0,
+			n => n,
+		});
 
 	// #144: rules of persist: true tokens, in rproxy_rules
 	if rproxy_api::core::rule::Features::CURRENT.persistence {

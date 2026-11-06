@@ -1214,6 +1214,17 @@ fn dtls_public_key(key: &dtls::crypto::CryptoPrivateKey) -> Vec<u8> {
 	}
 }
 
+/// The DTLS server settings of a udp `terminate` rule.
+fn dtls_server_config(client_auth: &ClientAuth, certificates: Vec<dtls::crypto::Certificate>) -> dtls::config::Config {
+	use dtls::config::ClientAuthType;
+	let client_auth = match client_auth.mode {
+		ClientAuthMode::None => ClientAuthType::NoClientCert,
+		ClientAuthMode::Optional | ClientAuthMode::OptionalNoVerify => ClientAuthType::RequestClientCert,
+		ClientAuthMode::Required => ClientAuthType::RequireAnyClientCert,
+	};
+	dtls::config::Config { certificates, client_auth, extended_master_secret: dtls::config::ExtendedMasterSecretType::Require, ..Default::default() }
+}
+
 /// Everything needed per connection, rebuilt when the rule changes or on SIGHUP.
 pub struct TlsRuntime {
 	pub spec: TlsSpec,
@@ -1229,7 +1240,8 @@ pub struct TlsRuntime {
 	/// `tls.routes[].upstream`, by the route's place in `spec.routes`: `Some` replaces the rule's
 	/// `upstream` for that route (a connector, or `None` for plain TCP).
 	pub route_upstreams: Vec<Option<RouteUpstream>>,
-	dtls_certs: Vec<dtls::crypto::Certificate>,
+	/// The DTLS server settings, built once with the rule's TLS (#354); each session takes a copy.
+	dtls_server: Option<dtls::config::Config>,
 	dtls_client_verifier: Option<Arc<dyn ClientCertVerifier>>,
 	dtls_upstream_roots: Option<RootCertStore>,
 	dtls_upstream_cert: Option<dtls::crypto::Certificate>,
@@ -1264,7 +1276,7 @@ impl TlsRuntime {
 			quic_config: None,
 			connector: None,
 			route_upstreams: vec![],
-			dtls_certs: vec![],
+			dtls_server: None,
 			dtls_client_verifier: None,
 			dtls_upstream_roots: None,
 			dtls_upstream_cert: None,
@@ -1297,15 +1309,17 @@ impl TlsRuntime {
 					.collect::<Result<_, _>>()?;
 			}
 			Protocol::Udp => {
+				let mut certificates = vec![];
 				for cert in &loaded.servers {
 					let dtls = cert.dtls.clone()?;
 					if !cert.expired(now) {
-						rt.dtls_certs.push(dtls);
+						certificates.push(dtls);
 					}
 				}
-				if rt.dtls_certs.is_empty() {
+				if certificates.is_empty() {
 					return Err(all_expired(spec));
 				}
+				rt.dtls_server = Some(dtls_server_config(&spec.client_auth, certificates));
 				rt.dtls_client_verifier = client_verifier(&spec.client_auth, loaded)?;
 				if spec.upstream.tls {
 					rt.dtls_upstream_roots = Some(match (&spec.upstream.ca_file, &loaded.upstream_ca) {
@@ -1327,22 +1341,12 @@ impl TlsRuntime {
 		self.spec.mode
 	}
 
-	/// DTLS server settings for one client session. the dtls crate proves the
-	/// client holds its key (CertificateVerify); the chain is checked by
-	/// `verify_dtls_client` right after the handshake, before any data flows.
+	/// DTLS server settings for one client session: a copy of those built with the rule's
+	/// TLS (the `dtls` crate takes them by value, and copies the key of each certificate on
+	/// a copy). The crate proves the client holds its key (CertificateVerify); the chain is
+	/// checked by `verify_dtls_client` right after the handshake, before any data flows.
 	pub fn dtls_server_config(&self) -> dtls::config::Config {
-		use dtls::config::ClientAuthType;
-		let client_auth = match self.spec.client_auth.mode {
-			ClientAuthMode::None => ClientAuthType::NoClientCert,
-			ClientAuthMode::Optional | ClientAuthMode::OptionalNoVerify => ClientAuthType::RequestClientCert,
-			ClientAuthMode::Required => ClientAuthType::RequireAnyClientCert,
-		};
-		dtls::config::Config {
-			certificates: self.dtls_certs.clone(),
-			client_auth,
-			extended_master_secret: dtls::config::ExtendedMasterSecretType::Require,
-			..Default::default()
-		}
+		self.dtls_server.clone().unwrap_or_default()
 	}
 
 	/// Whether a client's certificate chain (leaf first) verified: with

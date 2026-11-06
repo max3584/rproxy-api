@@ -418,6 +418,8 @@ pub struct RtRule {
 pub struct RtSession {
 	lease: Option<Lease>,
 	_permit: Option<Permit>,
+	/// In the rule's `stats.udp_sessions`: the default cap (`udp::MAX_SESSIONS`) as on the kernel's path (#354).
+	_counted: crate::l4::udp::Counted,
 	up: Gate,
 	down: Gate,
 	rx: u64,
@@ -516,7 +518,15 @@ impl Rule for RtRule {
 			}
 			return None;
 		}
-		let permit = match rt.limits.get().map(|l| l.admit(ip)) {
+		let limiter = rt.limits.get();
+		// the default cap first, as on the kernel's path: a refused datagram spends nothing of the source's `limits`
+		// no eviction here: the DPDK engine's session table only caps (docs/API.md)
+		let (counted, over) = crate::l4::udp::count_session(rt, limiter.as_deref());
+		if over {
+			limits::refused(rt, SocketAddr::V4(client), Reason::MaxConnections, "udp");
+			return None;
+		}
+		let permit = match limiter.as_ref().map(|l| l.admit(ip)) {
 			None => None,
 			Some(Ok(p)) => Some(p),
 			Some(Err(reason)) => {
@@ -542,7 +552,7 @@ impl Rule for RtRule {
 			country = geo.as_ref().and_then(|g| g.country_str()), asn = geo.and_then(|g| g.asn), path = "dpdk");
 		Some((
 			target,
-			RtSession { lease: Some(lease), _permit: permit, up: Gate::new(ip, Dir::Up), down: Gate::new(ip, Dir::Down), rx: 0, tx: 0, started: Instant::now() },
+			RtSession { lease: Some(lease), _permit: permit, _counted: counted, up: Gate::new(ip, Dir::Up), down: Gate::new(ip, Dir::Down), rx: 0, tx: 0, started: Instant::now() },
 		))
 	}
 

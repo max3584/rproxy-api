@@ -184,6 +184,8 @@ SIEM・CrowdSec が読むログの行は、テストのプロセスの中で本�
 | `dtls_client_certificates_can_be_required` | クライアント証明書を必須にできる |
 | `dtls_can_be_re_encrypted_towards_the_backend` | 転送先へ DTLS で再暗号化する |
 | `dtls_needs_a_pkcs8_key` | PKCS#8 でない鍵は `tls_config` |
+| `dtls_sessions_start_with_a_client_hello_and_need_a_second` | 新しい送信元の ClientHello でないデータグラムはセッションを作らない、HelloVerifyRequest に答えない送信元（偽った送信元）は 5 秒であきらめる（#354） |
+| `a_closing_dtls_backend_ends_the_session` | 転送先への DTLS が閉じたらセッションを終える（#354。前は読み出しの誤りで回り続けた） |
 
 ## 結合テスト：データの完全性（`tests/integrity.rs`、#134）
 
@@ -552,10 +554,10 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/startup.rs` | 本物のバイナリの起動：設定の誤りは止まり、環境の問題（権限・使用中のポート）は制限つきで動き続けて、直れば戻る。制御 API の TLS と SIGHUP の読み直し、`GET /readyz` |
 | `tests/targets.rs` | 複数の宛先（#98）：`targets`・`balance`（round_robin / least_conn / failover）・`backup`・`health_check`（L4 と `http` のサービス）。`outlier_detection` がないときの既定の動き。`connect_timeout`（v0.4.3。SYN を捨てる宛先） |
 | `tests/tcp_deadlines.rs` | L4 の TCP の中継の時間切れ（#353）：`idle_timeout` で黙った接続が閉じる（平文の splice の道と TLS の終端）、運んでいる接続は閉じない、読まない転送先で書けない接続も閉じる。PATCH（`0s`・省けば今のまま）、検証（`udp`・`http`・`1s` 未満）、`features.tcp_idle_timeout`。両側の RST と `conn.close` の `reason`、splice に移った後の時間切れと splice で運び続ける接続、`half_close_timeout`（と `0s`） |
-| `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
+| `tests/listen.rs` | 1 つのルールの複数の待ち受けアドレス（`extra_listen_addrs`、#99。外したアドレスの UDP のセッションは終わる、#354）、まだホストにないアドレスでの待ち受け（`listen_freebind`、v0.4.3。実経路は `scripts/test-freebind.sh`） |
 | `tests/udp_shards.rs` | UDP のポートを `SO_REUSEPORT` の複数のソケットで読む（#194）：セッションが二重にならない、返信の送信元（#137）、数の合計 |
 | `tests/udp_source.rs` | ワイルドカードで待ち受ける UDP の返信が、クライアントが送った宛先のアドレスから出る（#137。127.0.0.2 宛て） |
-| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
+| `tests/udp_sessions.rs` | udp のルールのセッションの既定の上限（#332、`RPROXY_UDP_MAX_SESSIONS`）：超えた新しいセッションを断る、idle で空いたら受ける、ルールの `limits.max_connections` が先、0 でなし、上限では確立していない（転送先の返事とクライアントの 2 つ目のない）いちばん古いセッションが空けて断らない（転送先が答えても 1 つしか送らない送信元は終える、2 つ目を送ったクライアントは残る）・確立していないセッションは 5 秒で終わる（#354）（上限はプロセス全体なので、このファイルの 1 つの試験だけが変える） |
 | `tests/udp_sni.rs` | UDP の `tls.mode: sni`（#130）：本物の QUIC（quinn）・DTLS のクライアントと転送先。名前の続きを待つセッションの枠が送信元のプレフィックスごとに限られる（#332） |
 | `tests/http.rs` | `http` のルールの L7 のルーティング |
 | `tests/http3.rs` | `http3: true` の HTTP/3（#56）、quinn + h3 のクライアント。守り（#355）：未確認のアドレスに Retry（中継で Retry のパケットを見る）、`limits` の `max_connections` を QUIC の接続で数える、`bandwidth` を上り・下りの本文に、`Content-Length` より長い・短い本文は 200 にならない（先頭の 0 は通る、読めない値は 400）、本文を読まずに答えたら `STOP_SENDING`、短い `idle` でも遅い転送先を待つリクエストは切れない。AppSec の本文が読めず `on_error: allow` で通したとき、転送先は本文を完全には受け取らず、`outlier_detection` で外されないのは `tests/crowdsec.rs` の `appsec_lets_a_failed_body_through_as_failed`。`Content-Length` の読み方・QUIC のアイドルは `src/l7/h3.rs`、AppSec の本文の上限と時間切れは `src/l7/middleware/crowdsec.rs` の単体テスト |

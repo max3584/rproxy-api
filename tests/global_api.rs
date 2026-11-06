@@ -275,6 +275,8 @@ async fn udp_sessions_and_http_timeouts_change_for_the_next_session_and_connecti
 	};
 	let a = client().await;
 	assert_eq!(udp_roundtrip(&a, "1").await, "U:1");
+	// a second datagram: established (#354), so not one to evict for the next
+	assert_eq!(udp_roundtrip(&a, "1b").await, "U:1b");
 	let b = client().await;
 	b.send(b"2").await.unwrap();
 	let mut buf = [0u8; 64];
