@@ -311,8 +311,10 @@ pub mod quic {
 	const SALT_V1: [u8; 20] = hex20("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
 	/// RFC 9369 §3.3.1
 	const SALT_V2: [u8; 20] = hex20("0dede3def700a6db819381be6e269dcbf9bd2ed9");
-	/// Datagrams' packets examined for one session (coalesced packets count each).
-	const MAX_PACKETS: usize = 64;
+	/// Datagrams' packets examined for one session (coalesced packets count each). A
+	/// ClientHello takes one or two Initials (with post-quantum key shares, three or four);
+	/// each Initial costs an AEAD open (#354).
+	pub(super) const MAX_PACKETS: usize = 16;
 
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	pub enum Version {
@@ -485,7 +487,11 @@ pub mod quic {
 	/// ends where its Length field says; `pn_offset` is where the packet number
 	/// starts). The frames, or None when it does not decrypt.
 	pub fn unprotect(version: Version, dcid: &[u8], packet: &[u8], pn_offset: usize) -> Option<Vec<u8>> {
-		let keys = client_initial_keys(version, dcid);
+		unprotect_with(&client_initial_keys(version, dcid), packet, pn_offset)
+	}
+
+	/// `unprotect` with keys already derived.
+	fn unprotect_with(keys: &Keys, packet: &[u8], pn_offset: usize) -> Option<Vec<u8>> {
 		let sample = packet.get(pn_offset + 4..pn_offset + 4 + 16)?;
 		let mask = header_mask(&keys.hp, sample)?;
 		let first = packet[0] ^ (mask[0] & 0x0f);
@@ -512,6 +518,11 @@ pub mod quic {
 	#[derive(Default)]
 	pub struct Assembler {
 		crypto: Reassembly,
+		/// The connection being read: the version and Destination Connection ID of the first
+		/// Initial, and its keys, derived once (#354). Initials with another ID (or version)
+		/// coalesced after it, or in later datagrams, belong to another connection and are
+		/// skipped (RFC 9000 §12.2).
+		conn: Option<(Version, Vec<u8>, Keys)>,
 		packets: usize,
 		/// CRYPTO frames taken (`MAX_FRAGMENTS`).
 		fragments: usize,
@@ -576,7 +587,20 @@ pub mod quic {
 			if !initial {
 				return Some(None);
 			}
-			let Some(frames) = unprotect(version, dcid, packet, pn_offset) else { return Some(None) };
+			let frames = match &self.conn {
+				Some((v, id, keys)) if *v == version && id.as_slice() == dcid => unprotect_with(keys, packet, pn_offset),
+				Some(_) => return Some(None),
+				// the connection is pinned by the first Initial that opens (garbage in front does not pin it)
+				None => {
+					let keys = client_initial_keys(version, dcid);
+					let frames = unprotect_with(&keys, packet, pn_offset);
+					if frames.is_some() {
+						self.conn = Some((version, dcid.to_vec(), keys));
+					}
+					frames
+				}
+			};
+			let Some(frames) = frames else { return Some(None) };
 			Some(self.frames(&frames))
 		}
 
@@ -658,7 +682,7 @@ fn u24(b: &[u8]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::quic::{client_initial_keys, header_mask, unprotect, varint, Version, V1, V2};
 	use super::*;
 
@@ -670,7 +694,7 @@ mod tests {
 	const DCID: &str = "8394c8f03e515708";
 
 	/// The ClientHello (a handshake message, no record layer) that rustls sends for `name`.
-	fn tls_hello(name: &str, alpn: &[&str]) -> Vec<u8> {
+	pub(crate) fn tls_hello(name: &str, alpn: &[&str]) -> Vec<u8> {
 		let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
 			.with_safe_default_protocol_versions()
 			.unwrap()
@@ -762,7 +786,7 @@ mod tests {
 		}
 	}
 
-	fn crypto_frame(offset: usize, data: &[u8]) -> Vec<u8> {
+	pub(crate) fn crypto_frame(offset: usize, data: &[u8]) -> Vec<u8> {
 		let mut f = vec![0x06];
 		put_varint(&mut f, offset as u64);
 		put_varint(&mut f, data.len() as u64);
@@ -771,7 +795,7 @@ mod tests {
 	}
 
 	/// A protected client Initial carrying `frames` (padded to at least 1200 bytes).
-	fn initial(version: Version, dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
+	pub(crate) fn initial(version: Version, dcid: &[u8], pn: u32, frames: &[u8], token: &[u8]) -> Vec<u8> {
 		initial_keyed(version, dcid, dcid, pn, frames, token)
 	}
 
@@ -864,6 +888,37 @@ mod tests {
 		datagram.extend_from_slice(&initial(Version::V1, &dcid, 1, &crypto_frame(30, b), b""));
 		datagram.extend_from_slice(&[0x40, 1, 2, 3, 4]);
 		assert_eq!(Sniffer::default().push(&datagram), Sniff::Done(Some("mixed.example".into())));
+	}
+
+	// #354: the first Initial's connection is the one read; coalesced Initials of another connection
+	// ID (RFC 9000 §12.2), in the same datagram or a later one, are skipped, keys and all
+	#[test]
+	fn quic_initials_of_another_connection_id_are_skipped() {
+		let hello = tls_hello("first.example", &["h3"]);
+		let other = tls_hello("other.example", &["h3"]);
+		let (a, b) = hello.split_at(30);
+		let mut datagram = initial(Version::V1, &[1u8; 8], 0, &crypto_frame(0, a), b"");
+		// a whole ClientHello of another connection: not read
+		datagram.extend_from_slice(&initial(Version::V1, &[2u8; 8], 0, &crypto_frame(0, &other), b""));
+		let mut sniffer = Sniffer::default();
+		assert_eq!(sniffer.push(&datagram), Sniff::NeedMore);
+		assert_eq!(sniffer.push(&initial(Version::V1, &[3u8; 8], 1, &crypto_frame(0, &other), b"")), Sniff::NeedMore);
+		assert_eq!(sniffer.push(&initial(Version::V1, &[1u8; 8], 1, &crypto_frame(30, b), b"")), Sniff::Done(Some("first.example".into())));
+	}
+
+	// #354: at most MAX_PACKETS long-header packets are looked at for one session
+	#[test]
+	fn quic_packets_are_bounded() {
+		let dcid = [4u8; 8];
+		let mut sniffer = Sniffer::default();
+		// Initials with nothing in them but PADDING
+		let empty = initial(Version::V1, &dcid, 0, &[0u8; 32], b"");
+		let mut datagram = vec![];
+		for _ in 0..quic::MAX_PACKETS {
+			datagram.extend_from_slice(&empty);
+		}
+		assert_eq!(sniffer.push(&datagram), Sniff::NeedMore);
+		assert_eq!(sniffer.push(&empty), Sniff::Done(None));
 	}
 
 	#[test]

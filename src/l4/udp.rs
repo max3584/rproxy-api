@@ -19,6 +19,7 @@ use webrtc_util::conn::Conn;
 
 use crate::core::balance::{Lease, Member};
 use crate::core::bandwidth::{Bandwidth, Dir, Gate};
+use crate::core::budget::Ticket;
 use crate::core::limits::{self, Limiter, Permit, Reason};
 use crate::tls::dtls::SessionConn;
 use crate::core::proxy::{shifted, Runtime};
@@ -30,7 +31,17 @@ use crate::tls::config::{TlsMode, TlsRuntime};
 use crate::net::udpsock::{Batch, Listener, Local, Meta, RecvBuf, BATCH};
 
 const SESSION_QUEUE: usize = 1024;
+/// The bytes of datagrams one session's queue is sized for (#354): a datagram waits only
+/// while the queue holds fewer than this many bytes' worth of datagrams of its size, so
+/// large datagrams queue less deep. The datagram at place k of the queue is then smaller
+/// than this / k, so the queue holds at most about 4.5 times this (9 MiB; the count of
+/// 1024 alone allowed 64 MiB), with no count of bytes kept on the way of each datagram.
+const SESSION_QUEUE_BYTES: usize = 2 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A session that has not seen a reply from its backend (DTLS terminate: has not finished
+/// its handshake) ends after this without datagrams (conntrack's unreplied, #354): a spoofed
+/// source sends one datagram and is never heard from again. `udp_idle` once replied.
+pub const UNREPLIED_TIMEOUT: Duration = Duration::from_secs(5);
 /// `tls.mode: sni`: how long, and how many datagrams / bytes, a new session's
 /// first datagrams are held while the server name is read (DTLS / QUIC).
 const SNI_WAIT: Duration = Duration::from_secs(3);
@@ -101,7 +112,151 @@ impl std::hash::Hash for Peer {
 	}
 }
 
-type Sessions = Arc<Mutex<HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>>>;
+/// A shard's sessions: the id of each (a newer session of the same peer replaces it) and its queue.
+type Table = HashMap<Peer, (u64, mpsc::Sender<Vec<u8>>)>;
+type Sessions = Arc<Mutex<Table>>;
+
+/// The table of a shard, whatever a panic left it in: a session's entry is put in and
+/// taken out whole under the lock, so a poisoned table is still consistent (#354).
+fn lock(sessions: &Sessions) -> std::sync::MutexGuard<'_, Table> {
+	sessions.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Queues a client's datagram for its session; false when the queue is full: 1024
+/// datagrams, or `SESSION_QUEUE_BYTES` worth of datagrams of its own size waiting ahead
+/// of it. One atomic load (`capacity`).
+fn enqueue(tx: &mpsc::Sender<Vec<u8>>, data: &[u8]) -> bool {
+	let waiting = SESSION_QUEUE - tx.capacity();
+	waiting < (SESSION_QUEUE_BYTES / data.len().max(1)).min(SESSION_QUEUE) && tx.try_send(data.to_vec()).is_ok()
+}
+
+/// What the sessions of one socket share.
+struct Shard {
+	listener: Arc<Listener>,
+	sessions: Sessions,
+	sniffing: Arc<SniSlots>,
+	/// The port's place in a range.
+	offset: u16,
+	/// Ends the shard's sessions: the rule's `kill`, or its address taken off the rule
+	/// (`extra_listen_addrs`), which ends `serve` but not the rule.
+	ended: CancellationToken,
+}
+
+/// Takes a session out of its shard's table when it ends, however it ends (a panic too).
+struct Registered {
+	sessions: Sessions,
+	peer: Peer,
+	id: u64,
+}
+
+impl Drop for Registered {
+	fn drop(&mut self) {
+		let mut map = lock(&self.sessions);
+		if map.get(&self.peer).is_some_and(|(current, _)| *current == self.id) {
+			map.remove(&self.peer);
+		}
+	}
+}
+
+/// A rule's UDP sessions that have not seen a reply from their backend yet (DTLS terminate:
+/// not through the handshake), oldest first (#354). When the rule's default cap
+/// (`MAX_SESSIONS`) or the process's descriptors (`core::budget`) are taken, the oldest of
+/// them makes room for the new session instead of the new one being refused: a flood from
+/// spoofed sources then pushes out only its own kind, and sessions that are answered stay.
+#[derive(Default)]
+pub struct Unreplied {
+	order: Mutex<VecDeque<Arc<Waiting>>>,
+}
+
+struct Waiting {
+	/// Replied, ended or evicted: no longer one to evict.
+	done: AtomicBool,
+	evicted: AtomicBool,
+	/// The session's own stop (a child of its shard's `ended`).
+	stop: CancellationToken,
+}
+
+/// Every rule's sessions not replied to yet, oldest first: the process's descriptors
+/// (`core::budget`) are shared by all rules, so the oldest of all makes room there.
+static ALL_UNREPLIED: Unreplied = Unreplied { order: Mutex::new(VecDeque::new()) };
+
+impl Unreplied {
+	/// A new session, in its rule's queue and in the process's (`ALL_UNREPLIED`).
+	fn track(&self, stop: CancellationToken) -> Mark {
+		let state = Arc::new(Waiting { done: AtomicBool::new(false), evicted: AtomicBool::new(false), stop });
+		self.push(state.clone());
+		ALL_UNREPLIED.push(state.clone());
+		Mark(state)
+	}
+
+	fn push(&self, state: Arc<Waiting>) {
+		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+		// done ones are skipped when evicting, and cleared out now and then (amortised)
+		if order.len() >= 64 && order.len().is_power_of_two() {
+			order.retain(|w| !w.done.load(Ordering::Relaxed));
+		}
+		order.push_back(state);
+	}
+
+	/// Whether there may be one to evict (a quick look before spending a source's `limits`).
+	fn any(&self) -> bool {
+		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+		while let Some(w) = order.front() {
+			if !w.done.load(Ordering::Relaxed) {
+				return true;
+			}
+			order.pop_front();
+		}
+		false
+	}
+
+	/// Ends the oldest session that has not seen a reply; false when there is none.
+	fn evict_oldest(&self) -> bool {
+		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+		while let Some(w) = order.pop_front() {
+			if !w.done.swap(true, Ordering::Relaxed) {
+				w.evicted.store(true, Ordering::Relaxed);
+				w.stop.cancel();
+				return true;
+			}
+		}
+		false
+	}
+
+	#[cfg(test)]
+	fn waiting(&self) -> usize {
+		self.order.lock().unwrap().iter().filter(|w| !w.done.load(Ordering::Relaxed)).count()
+	}
+}
+
+/// A session's place in its rule's `Unreplied`, and its stop.
+struct Mark(Arc<Waiting>);
+
+impl Mark {
+	/// The backend answered (DTLS: the handshake is through): not one to evict any more.
+	fn replied(&self) {
+		self.0.done.store(true, Ordering::Relaxed);
+	}
+
+	fn is_replied(&self) -> bool {
+		self.0.done.load(Ordering::Relaxed)
+	}
+
+	fn stop(&self) -> &CancellationToken {
+		&self.0.stop
+	}
+
+	/// Why a stopped session ended.
+	fn stopped(&self) -> &'static str {
+		if self.0.evicted.load(Ordering::Relaxed) { "evicted" } else { "stopped" }
+	}
+}
+
+impl Drop for Mark {
+	fn drop(&mut self) {
+		self.0.done.store(true, Ordering::Relaxed);
+	}
+}
 
 /// What the shards of one port share: the sessions reading their server name
 /// (`SNI_MAX_PENDING` is for the port, not for each shard), and the size of each
@@ -217,14 +372,17 @@ impl Drop for SniSlot {
 	}
 }
 
-/// A session counted in its rule's `stats.udp_sessions` (the default cap, `MAX_SESSIONS`), and in
-/// its `limits` (`Permit`), until it ends.
+/// A session counted in its rule's `stats.udp_sessions` (the default cap, `MAX_SESSIONS`), in
+/// its `limits` (`Permit`) and in the process's descriptors (`core::budget`, its backend
+/// socket), until it ends; and its place among the sessions not replied to yet.
 struct Admitted {
 	_permit: Option<Permit>,
 	_counted: Counted,
+	_ticket: Ticket,
+	mark: Mark,
 }
 
-struct Counted(Arc<Runtime>);
+pub(crate) struct Counted(Arc<Runtime>);
 
 impl Drop for Counted {
 	fn drop(&mut self) {
@@ -232,26 +390,41 @@ impl Drop for Counted {
 	}
 }
 
-/// Counts a new session of the rule; None over the default cap (`MAX_SESSIONS`), which a
-/// rule's own `limits.max_connections` replaces.
-fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>) -> Option<Counted> {
+/// Counts a new session of the rule, and whether it is over the default cap
+/// (`MAX_SESSIONS`), which a rule's own `limits.max_connections` replaces.
+pub(crate) fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>) -> (Counted, bool) {
 	let before = rt.stats.udp_sessions.fetch_add(1, Ordering::Relaxed);
 	let counted = Counted(rt.clone());
 	let max = MAX_SESSIONS.load(Ordering::Relaxed);
-	(max == 0 || before < max || limiter.is_some_and(|l| l.max_connections().is_some())).then_some(counted)
+	(counted, !(max == 0 || before < max || limiter.is_some_and(|l| l.max_connections().is_some())))
+}
+
+/// The descriptor of a new session's backend socket from the process's budget; when it is
+/// all taken, the oldest session of any rule not replied to gives its up (`Ticket::force`:
+/// counted over until that session has ended, a moment later, within half the budget's
+/// reserve). None: none to give.
+fn session_ticket() -> Option<Ticket> {
+	Ticket::take(1).or_else(|| if ALL_UNREPLIED.evict_oldest() { Ticket::force(1) } else { None })
 }
 
 /// Serves one socket of one port of the rule; `offset` is the port's place in a
 /// range. A port has one socket per shard (`SO_REUSEPORT`, #194), each with its
 /// own sessions: the kernel sends a client's datagrams to the same socket, so
 /// the shards share no table and take no lock of each other.
-/// `stop` ends it: the rule's `stop`, or the address being taken off the rule.
+/// `stop` ends it: the rule's `stop`, or the address being taken off the rule, which
+/// also ends the address's sessions (#354).
 /// In a graceful shutdown (`core::shutdown::draining`), `stop` only ends new
 /// sessions: the open ones go on (their datagrams come in here) until the
 /// rule's `kill`.
 pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset: u16, stop: CancellationToken) {
-	let socket = Arc::new(Listener::new(socket));
-	let sessions: Sessions = Arc::default();
+	let shard = Arc::new(Shard {
+		listener: Arc::new(Listener::new(socket)),
+		sessions: Arc::default(),
+		sniffing: port.sniffing.clone(),
+		offset,
+		ended: rt.kill.child_token(),
+	});
+	let socket = shard.listener.clone();
 	let next_id = AtomicU64::new(0);
 	let mut batch = Batch::new(port.batch);
 	let mut draining = false;
@@ -271,7 +444,7 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 					// `limits` (#165) and `proxy_protocol` (#312): None after one relaxed load when the rule has none
 					let limiter = rt.limits.get();
 					let pp = rt.proxy_protocol.get();
-					let mut map = sessions.lock().unwrap();
+					let mut map = lock(&shard.sessions);
 					let mut one = |peer: Peer, data: &[u8]| {
 						let client = peer.client();
 						if !rt.allowed(client.ip()) {
@@ -300,36 +473,11 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 								return;
 							}
 							_ => {
-								// a new session: within the limits, or the datagram is dropped
-								// every target full (#341): no session (with `tls.routes`, the route's
-								// targets are looked at once the name is read)
-								if rt.pool().all_full() && rt.routes.read().unwrap().is_empty() {
-									limits::refused(&rt, client, Reason::TargetFull, "udp");
-									return;
-								}
-								// the default cap first: a refused datagram spends nothing of the source's `limits`
-								let Some(counted) = count_session(&rt, limiter.as_deref()) else {
-									limits::refused(&rt, client, Reason::MaxConnections, "udp");
-									return;
-								};
-								let permit = match limiter.as_ref().map(|l| l.admit(client.ip())) {
-									None => None,
-									Some(Ok(p)) => Some(p),
-									Some(Err(reason)) => {
-										limits::refused(&rt, client, reason, "udp");
-										return;
-									}
-								};
-								let admitted = Admitted { _permit: permit, _counted: counted };
-								let id = next_id.fetch_add(1, Ordering::Relaxed);
-								let (tx, rx) = mpsc::channel(SESSION_QUEUE);
-								map.insert(peer, (id, tx.clone()));
-								let session = run_session(id, peer, rx, socket.clone(), rt.clone(), sessions.clone(), offset, port.sniffing.clone(), admitted);
-								rt.tracker.spawn(proxy_in::with_peer(peer.via(), session));
+								let Some(tx) = open(&rt, &shard, &mut map, &next_id, peer, data, limiter.as_deref()) else { return };
 								tx
 							}
 						};
-						if tx.try_send(data.to_vec()).is_err() {
+						if !enqueue(&tx, data) {
 							rt.stats.dropped();
 							debug!(event = "udp.drop", rule = %rt.key, client = %client);
 						}
@@ -357,6 +505,71 @@ pub async fn serve(socket: UdpSocket, port: Arc<Port>, rt: Arc<Runtime>, offset:
 			}
 		}
 	}
+	// the address was taken off the rule (the rule itself goes on): its sessions end with it
+	if !rt.stop.is_cancelled() {
+		shard.ended.cancel();
+	}
+}
+
+/// A new session for the first datagram of `peer`: within the limits, or the datagram is
+/// dropped (None).
+#[allow(clippy::too_many_arguments)]
+fn open(
+	rt: &Arc<Runtime>,
+	shard: &Arc<Shard>,
+	map: &mut Table,
+	next_id: &AtomicU64,
+	peer: Peer,
+	data: &[u8],
+	limiter: Option<&Limiter>,
+) -> Option<mpsc::Sender<Vec<u8>>> {
+	let client = peer.client();
+	// every target full (#341): no session (with `tls.routes`, the route's
+	// targets are looked at once the name is read)
+	if rt.pool().all_full() && rt.routes.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+		limits::refused(rt, client, Reason::TargetFull, "udp");
+		return None;
+	}
+	// DTLS terminate (#354): only a ClientHello starts a session, so stray or spoofed records
+	// of other kinds take nothing
+	if rt.tls().mode() == TlsMode::Terminate && !crate::tls::dtls::opens_handshake(data) {
+		rt.stats.dropped();
+		debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "not a DTLS ClientHello");
+		return None;
+	}
+	// the default cap first: a datagram refused there spends nothing of the source's `limits`;
+	// at the cap, room is made only when there is a session to evict
+	let (counted, over) = count_session(rt, limiter);
+	if over && !rt.udp_unreplied.any() {
+		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		return None;
+	}
+	let permit = match limiter.map(|l| l.admit(client.ip())) {
+		None => None,
+		Some(Ok(p)) => Some(p),
+		Some(Err(reason)) => {
+			limits::refused(rt, client, reason, "udp");
+			return None;
+		}
+	};
+	// within the source's own limits: only now does an older session make room (#354)
+	if over && !rt.udp_unreplied.evict_oldest() {
+		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		return None;
+	}
+	let Some(ticket) = session_ticket() else {
+		limits::refused(rt, client, Reason::MaxConnections, "udp");
+		return None;
+	};
+	let mark = rt.udp_unreplied.track(shard.ended.child_token());
+	let admitted = Admitted { _permit: permit, _counted: counted, _ticket: ticket, mark };
+	let id = next_id.fetch_add(1, Ordering::Relaxed);
+	let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+	map.insert(peer, (id, tx.clone()));
+	let registered = Registered { sessions: shard.sessions.clone(), peer, id };
+	let session = run_session(peer, rx, shard.clone(), rt.clone(), admitted, registered);
+	rt.tracker.spawn(proxy_in::with_peer(peer.via(), session));
+	Some(tx)
 }
 
 /// A refused datagram: counted always, logged like TCP's refusals but at most
@@ -383,62 +596,103 @@ fn header_denied(rt: &Runtime, peer: SocketAddr, refusal: proxy_in::Refusal) {
 
 /// One client's session. With `tls.mode: sni`, a new QUIC connection from the
 /// same client socket to another server name starts it over with the new name.
-/// `admitted` counts the session in the rule's `limits` and default cap until it ends.
-#[allow(clippy::too_many_arguments)]
+/// `admitted` counts the session in the rule's `limits` and default cap until it ends;
+/// `registered` takes it out of the shard's table then.
 async fn run_session(
-	id: u64,
 	peer: Peer,
 	mut from_client: mpsc::Receiver<Vec<u8>>,
-	listener: Arc<Listener>,
+	shard: Arc<Shard>,
 	rt: Arc<Runtime>,
-	sessions: Sessions,
-	offset: u16,
-	sniffing: Arc<SniSlots>,
 	admitted: Admitted,
+	registered: Registered,
 ) {
-	let _admitted = admitted;
+	let _registered = registered;
 	let tls = rt.tls();
 	if tls.mode() == TlsMode::Terminate {
-		return dtls_session(id, peer, from_client, listener, rt, sessions, offset, tls).await;
+		return dtls_session(peer, from_client, &shard, rt, tls, admitted).await;
 	}
 	let mut carry = vec![];
-	while let Some(next) = session(id, peer, &mut from_client, &listener, &rt, &sessions, offset, &sniffing, carry).await {
+	while let Some(next) = session(peer, &mut from_client, &shard, &rt, &admitted.mark, carry).await {
 		carry = next;
+	}
+}
+
+/// When a plain session ends without datagrams (#354). It is established once the backend
+/// has replied and the client has sent more than one datagram: a spoofed source sends one
+/// and never hears the reply, however readily the backend (DNS, a game server, QUIC)
+/// answers it. Until then it ends `UNREPLIED_TIMEOUT` after the client's last datagram,
+/// the backend's datagrams do not keep it, and it stays one to evict at the caps
+/// (`Unreplied`). Established, `udp_idle` after the last datagram either way.
+struct Quiet {
+	idle: Duration,
+	/// The backend has replied.
+	answered: bool,
+	/// Datagrams from the client.
+	from_client: u64,
+	last: tokio::time::Instant,
+}
+
+impl Quiet {
+	/// A session's clock, established already when an earlier run of it was (`Mark::is_replied`).
+	fn new(idle: Duration, mark: &Mark, first: usize) -> Self {
+		let established = mark.is_replied();
+		Quiet { idle, answered: established, from_client: if established { first.max(2) } else { first } as u64, last: tokio::time::Instant::now() }
+	}
+
+	fn established(&self) -> bool {
+		self.answered && self.from_client > 1
+	}
+
+	fn deadline(&self) -> tokio::time::Instant {
+		self.last + if self.established() { self.idle } else { self.idle.min(UNREPLIED_TIMEOUT) }
+	}
+
+	fn client(&mut self, datagrams: usize, mark: &Mark) {
+		self.from_client += datagrams as u64;
+		self.last = tokio::time::Instant::now();
+		self.settle(mark);
+	}
+
+	fn backend(&mut self, mark: &Mark) {
+		self.answered = true;
+		if self.established() {
+			self.last = tokio::time::Instant::now();
+		}
+		self.settle(mark);
+	}
+
+	fn settle(&self, mark: &Mark) {
+		if self.established() {
+			mark.replied();
+		}
 	}
 }
 
 /// A plain (not DTLS-terminating) UDP session. `carry`: datagrams already read
 /// that start it (a new QUIC connection that ended the previous session).
 /// Returns them when a new QUIC connection to another name should start over.
-#[allow(clippy::too_many_arguments)]
 async fn session(
-	id: u64,
 	peer: Peer,
 	from_client: &mut mpsc::Receiver<Vec<u8>>,
-	listener: &Arc<Listener>,
+	shard: &Shard,
 	rt: &Arc<Runtime>,
-	sessions: &Sessions,
-	offset: u16,
-	sniffing: &Arc<SniSlots>,
+	mark: &Mark,
 	carry: Vec<Vec<u8>>,
 ) -> Option<Vec<Vec<u8>>> {
+	let (listener, offset, stop) = (&shard.listener, shard.offset, mark.stop());
 	let (client, reply_to, local) = (peer.client(), peer.from, peer.local);
 	let tls = rt.tls();
 	let started = Instant::now();
 	let mut events = rt.pool_events.subscribe();
 	let mut idle_rx = rt.udp_idle.clone();
-	let mut idle = *idle_rx.borrow_and_update();
+	let idle = *idle_rx.borrow_and_update();
 	let mut bind_as = rt.bind_as(client);
 	// the rule's, or the `tls.routes` route's own (#297)
 	let mut source_ip = rt.source_ip;
 	// `tls.mode: sni` (#130): hold the first datagrams until the server name is read
 	let by_name = tls.mode() == TlsMode::Sni;
 	let (sni, first) = if by_name {
-		let Some(sniffed) = sniff(rt, from_client, sniffing, client.ip(), carry).await else {
-			remove(sessions, peer, id);
-			return None;
-		};
-		sniffed
+		sniff(rt, stop, from_client, &shard.sniffing, client.ip(), carry).await?
 	} else {
 		(None, carry)
 	};
@@ -450,8 +704,7 @@ async fn session(
 					sni = %clip(sni.as_deref().unwrap_or("")), proxy_peer = peer_field());
 				// swallow the rest of this client's datagrams until it goes quiet,
 				// rather than reading every one of them again as a new session
-				drain(rt, from_client, idle).await;
-				remove(sessions, peer, id);
+				drain(stop, from_client, idle.min(UNREPLIED_TIMEOUT)).await;
 				return None;
 			}
 			// a `tls.routes` backend: its addresses as resolved now, counted on the route's
@@ -484,14 +737,12 @@ async fn session(
 		Err(Miss::Full) => {
 			// the datagrams are dropped; the client's next one tries again
 			limits::refused(rt, client, Reason::TargetFull, "udp");
-			remove(sessions, peer, id);
 			return None;
 		}
 		Err(Miss::NoTarget) => {
 			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = "no resolved target",
 				sni = %clip(sni.as_deref().unwrap_or("")),
 				proxy_peer = peer_field());
-			remove(sessions, peer, id);
 			return None;
 		}
 	};
@@ -501,7 +752,6 @@ async fn session(
 		Ok(s) => s,
 		Err(e) => {
 			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = %e, proxy_peer = peer_field());
-			remove(sessions, peer, id);
 			return None;
 		}
 	};
@@ -521,27 +771,32 @@ async fn session(
 	let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
 	// the datagrams held while reading the server name, in order
 	let mut first = first;
-	rx_bytes += forward(rt, &upstream, &header, client, &mut first, &mut up).await;
+	let mut quiet = Quiet::new(idle, mark, first.len());
+	// ECONNREFUSED from the backend: an ICMP port unreachable, seen on a send or a read
+	let mut refused: Option<std::io::Error> = None;
+	rx_bytes += forward(rt, &upstream, &header, client, &mut first, &mut up, &mut refused).await;
 	drop(first);
 	// datagrams taken from the queue at once, sent on with one `sendmmsg`
 	let (mut inbox, mut out) = (Vec::new(), Vec::new());
-	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
+		if let Some(e) = refused.take() {
+			target_refused(rt, lease.as_ref(), &e);
+		}
 		tokio::select! {
-			_ = rt.kill.cancelled() => break "stopped",
-			_ = sleep_until(deadline) => break "idle",
+			_ = stop.cancelled() => break mark.stopped(),
+			_ = sleep_until(quiet.deadline()) => break "idle",
 			// a new QUIC connection that did not show its name in time: treat it as ours
 			_ = async { match &probe { Some(p) => sleep_until(p.until).await, None => std::future::pending().await } } => {
 				let mut held = probe.take().map(|p| p.held).unwrap_or_default();
-				rx_bytes += forward(rt, &upstream, &header, client, &mut held, &mut up).await;
+				rx_bytes += forward(rt, &upstream, &header, client, &mut held, &mut up, &mut refused).await;
 			},
 			received = from_client.recv_many(&mut inbox, BATCH) => {
 				if received == 0 {
 					break "closed";
 				}
-				deadline = tokio::time::Instant::now() + idle;
+				quiet.client(received, mark);
 				if !by_name {
-					rx_bytes += forward(rt, &upstream, &header, client, &mut inbox, &mut up).await;
+					rx_bytes += forward(rt, &upstream, &header, client, &mut inbox, &mut up, &mut refused).await;
 					inbox.clear();
 					continue;
 				}
@@ -562,7 +817,7 @@ async fn session(
 				} else {
 					drop(datagrams);
 				}
-				rx_bytes += forward(rt, &upstream, &header, client, &mut out, &mut up).await;
+				rx_bytes += forward(rt, &upstream, &header, client, &mut out, &mut up, &mut refused).await;
 				out.clear();
 				if restart.is_some() {
 					break "new connection";
@@ -579,7 +834,7 @@ async fn session(
 						Reply::Empty => break,
 						Reply::OverBandwidth => {
 							rt.stats.bandwidth_dropped();
-							deadline = tokio::time::Instant::now() + idle;
+							quiet.backend(mark);
 							continue;
 						}
 						Reply::Sent(n) => n,
@@ -599,18 +854,15 @@ async fn session(
 						// ICMP unreachable from the backend surfaces here on a connected socket
 						Reply::RecvFailed(e) => {
 							debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
-							if let (std::io::ErrorKind::ConnectionRefused, Some(lease)) = (e.kind(), &lease) {
-								let pool = rt.pool();
-								if pool.contains(lease.member()) {
-									pool.failed(&rt.key, lease.member(), "refused", &e.to_string());
-								}
+							if e.kind() == std::io::ErrorKind::ConnectionRefused {
+								target_refused(rt, lease.as_ref(), &e);
 							}
 							break;
 						}
 					};
 					tx_bytes += n as u64;
 					rt.stats.add_tx(n as u64);
-					deadline = tokio::time::Instant::now() + idle;
+					quiet.backend(mark);
 				}
 			},
 			// a target went down (or the targets changed): move off it
@@ -665,15 +917,11 @@ async fn session(
 				if changed.is_err() {
 					break "stopped";
 				}
-				idle = *idle_rx.borrow_and_update();
-				deadline = tokio::time::Instant::now() + idle;
+				quiet.idle = *idle_rx.borrow_and_update();
 			},
 		}
 	};
 
-	if restart.is_none() {
-		remove(sessions, peer, id);
-	}
 	drop(lease);
 	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr_or_empty(target),
@@ -688,6 +936,8 @@ struct Probe {
 	dcid: Vec<u8>,
 	sniffer: crate::tls::udp_sni::Sniffer,
 	held: Vec<Vec<u8>>,
+	/// Bytes in `held` (at most about `SNI_MAX_BYTES`, as `sniff`).
+	held_bytes: usize,
 	until: tokio::time::Instant,
 }
 
@@ -715,6 +965,7 @@ fn renamed(probe: &mut Option<Probe>, quic_dcid: &mut Option<Vec<u8>>, name: Opt
 					dcid,
 					sniffer: crate::tls::udp_sni::Sniffer::default(),
 					held: vec![],
+					held_bytes: 0,
 					until: tokio::time::Instant::now() + SNI_WAIT,
 				});
 			}
@@ -723,9 +974,10 @@ fn renamed(probe: &mut Option<Probe>, quic_dcid: &mut Option<Vec<u8>>, name: Opt
 	}
 	let Some(p) = probe.as_mut() else { return Step::Forward(vec![data]) };
 	let seen = p.sniffer.push(&data);
+	p.held_bytes += data.len();
 	p.held.push(data);
 	let new_name = match seen {
-		Sniff::NeedMore if p.held.len() < SNI_MAX_DATAGRAMS => return Step::Hold,
+		Sniff::NeedMore if p.held.len() < SNI_MAX_DATAGRAMS && p.held_bytes < SNI_MAX_BYTES => return Step::Hold,
 		Sniff::Done(n) => n,
 		_ => None,
 	};
@@ -786,6 +1038,7 @@ fn pick(rt: &Runtime, offset: u16, bind_as: Option<SocketAddr>) -> Result<Picked
 /// (taken once one datagram is not enough) was given up for a newer one.
 async fn sniff(
 	rt: &Runtime,
+	stop: &CancellationToken,
 	from_client: &mut mpsc::Receiver<Vec<u8>>,
 	slots: &Arc<SniSlots>,
 	client: IpAddr,
@@ -801,7 +1054,7 @@ async fn sniff(
 		let datagram = match carry.next() {
 			Some(d) => d,
 			None => tokio::select! {
-				_ = rt.kill.cancelled() => return None,
+				_ = stop.cancelled() => return None,
 				_ = sleep_until(deadline) => return Some((None, first)),
 				_ = async { match &slot { Some(s) => s.state.given_up.cancelled().await, None => std::future::pending().await } } => {
 					rt.stats.dropped();
@@ -825,10 +1078,10 @@ async fn sniff(
 }
 
 /// Drops a refused client's datagrams until it is idle for `idle`.
-async fn drain(rt: &Runtime, from_client: &mut mpsc::Receiver<Vec<u8>>, idle: Duration) {
+async fn drain(stop: &CancellationToken, from_client: &mut mpsc::Receiver<Vec<u8>>, idle: Duration) {
 	loop {
 		tokio::select! {
-			_ = rt.kill.cancelled() => return,
+			_ = stop.cancelled() => return,
 			_ = tokio::time::sleep(idle) => return,
 			d = from_client.recv() => if d.is_none() { return },
 		}
@@ -842,8 +1095,20 @@ fn proxy_header(source_ip: SourceIp, client: SocketAddr, local: SocketAddr) -> O
 	(source_ip == SourceIp::ProxyV2).then(|| source::proxy_v2_dgram_header(client, local))
 }
 
+/// The session's target answered with ICMP port unreachable (ECONNREFUSED, on a read or a
+/// send): it is failed (`outlier_detection`) when it is still one of the rule's targets.
+fn target_refused(rt: &Runtime, lease: Option<&Lease>, e: &std::io::Error) {
+	if let Some(lease) = lease {
+		let pool = rt.pool();
+		if pool.contains(lease.member()) {
+			pool.failed(&rt.key, lease.member(), "refused", &e.to_string());
+		}
+	}
+}
+
 /// Sends a client's datagrams on to its backend (those over the `bandwidth`
-/// limit, `up`, are dropped); their bytes.
+/// limit, `up`, are dropped); their bytes. A send refused by the backend (ICMP port
+/// unreachable of an earlier datagram) is kept in `refused`.
 async fn forward(
 	rt: &Runtime,
 	upstream: &UdpSocket,
@@ -851,6 +1116,7 @@ async fn forward(
 	client: SocketAddr,
 	datagrams: &mut Vec<Vec<u8>>,
 	up: &mut Gate,
+	refused: &mut Option<std::io::Error>,
 ) -> u64 {
 	if rt.bandwidth.is_on() {
 		datagrams.retain(|d| {
@@ -867,6 +1133,9 @@ async fn forward(
 	crate::net::udpsock::send_connected(upstream, header.as_deref(), datagrams, |e| {
 		rt.stats.dropped();
 		debug!(event = "udp.send_error", rule = %rt.key, client = %client, error = %e);
+		if e.kind() == std::io::ErrorKind::ConnectionRefused {
+			*refused = Some(std::io::Error::from(e.kind()));
+		}
 	})
 	.await;
 	let bytes = datagrams.iter().map(|d| d.len() as u64).sum();
@@ -949,36 +1218,52 @@ impl Upstream {
 		}
 	}
 
-	async fn recv(&self, buf: &mut [u8]) -> Result<usize, String> {
+	/// Err: the error, and whether it is a plain backend's ICMP port unreachable.
+	async fn recv(&self, buf: &mut [u8]) -> Result<usize, (String, Option<std::io::Error>)> {
 		match self {
-			Upstream::Plain(s) => s.recv(buf).await.map_err(|e| e.to_string()),
-			Upstream::Dtls(c) => c.read(buf, None).await.map_err(|e| e.to_string()),
+			Upstream::Plain(s) => s.recv(buf).await.map_err(|e| (e.to_string(), (e.kind() == std::io::ErrorKind::ConnectionRefused).then_some(e))),
+			Upstream::Dtls(c) => c.read(buf, None).await.map_err(|e| (e.to_string(), None)),
 		}
 	}
 }
 
-/// A UDP session whose client speaks DTLS to rproxy.
-#[allow(clippy::too_many_arguments)]
-async fn dtls_session(
-	id: u64,
-	peer: Peer,
-	from_client: mpsc::Receiver<Vec<u8>>,
-	listener: Arc<Listener>,
-	rt: Arc<Runtime>,
-	sessions: Sessions,
-	offset: u16,
-	tls: Arc<TlsRuntime>,
-) {
+/// A UDP session whose client speaks DTLS to rproxy. Until the handshake is through it
+/// is a session not replied to (`Unreplied`, evicted first at the cap), takes one of the
+/// port's slots of sessions that wait for more datagrams (`SniSlots`: at most 64 per source
+/// prefix, the prefix's oldest given up past that, #354), and ends unless a ClientHello with
+/// the cookie of the crate's HelloVerifyRequest comes back within `UNREPLIED_TIMEOUT`
+/// (`SessionConn::verified`: a spoofed source never sees the cookie).
+async fn dtls_session(peer: Peer, from_client: mpsc::Receiver<Vec<u8>>, shard: &Shard, rt: Arc<Runtime>, tls: Arc<TlsRuntime>, admitted: Admitted) {
 	let (client, local) = (peer.client(), peer.local);
+	let (offset, mark) = (shard.offset, &admitted.mark);
+	let stop = mark.stop();
 	let started = Instant::now();
-	// before `listener` moves into the DTLS connection
-	let listen = listener.local_for(local);
+	let listen = shard.listener.local_for(local);
 	let header = proxy_header(rt.source_ip, client, listen);
-	let conn: Arc<dyn Conn + Send + Sync> = Arc::new(SessionConn::new(from_client, listener, peer.from, local));
+	let session_conn = Arc::new(SessionConn::new(from_client, shard.listener.clone(), peer.from, local));
+	let conn: Arc<dyn Conn + Send + Sync> = session_conn.clone();
+	let slot = shard.sniffing.take(client.ip());
+	let unanswered = async {
+		tokio::time::sleep(UNREPLIED_TIMEOUT).await;
+		if session_conn.verified() {
+			std::future::pending::<()>().await;
+		}
+	};
 	let handshake = tokio::select! {
-		_ = rt.kill.cancelled() => { remove(&sessions, peer, id); return; }
+		_ = stop.cancelled() => return,
+		_ = slot.state.given_up.cancelled() => {
+			rt.stats.dropped();
+			debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "given up for a newer DTLS handshake of its network");
+			return;
+		}
+		_ = unanswered => {
+			rt.stats.dropped();
+			debug!(event = "udp.drop", rule = %rt.key, client = %client, reason = "no ClientHello with the cookie of the HelloVerifyRequest");
+			return;
+		}
 		r = tokio::time::timeout(HANDSHAKE_TIMEOUT, DTLSConn::new(conn, tls.dtls_server_config(), false, None)) => r,
 	};
+	drop(slot);
 	let dtls = match handshake {
 		Ok(Ok(c)) => c,
 		failed => {
@@ -988,16 +1273,15 @@ async fn dtls_session(
 			};
 			rt.stats.tls_failed();
 			throttled!(udp_errors(), client.ip(), warn, event = "tls.error", rule = %rt.key, client = %client, error = %error, dtls = true);
-			remove(&sessions, peer, id);
 			return;
 		}
 	};
+	mark.replied();
 	let state = dtls.connection_state().await;
 	if let Err(e) = tls.verify_dtls_client(&state.peer_certificates) {
 		rt.stats.tls_failed();
 		throttled!(udp_errors(), client.ip(), warn, event = "tls.error", rule = %rt.key, client = %client, error = %e, dtls = true);
 		let _ = dtls.close().await;
-		remove(&sessions, peer, id);
 		return;
 	}
 	let client_cn = state.peer_certificates.first().and_then(|c| crate::tls::config::common_name(c));
@@ -1006,7 +1290,6 @@ async fn dtls_session(
 
 	let Some(target) = rt.select(None, offset) else {
 		let _ = dtls.close().await;
-		remove(&sessions, peer, id);
 		return;
 	};
 	// the first with addresses and room (`max_connections`, #341)
@@ -1018,7 +1301,7 @@ async fn dtls_session(
 			None
 		}
 	});
-	let Some((chosen, _lease)) = chosen else {
+	let Some((chosen, lease)) = chosen else {
 		if full {
 			limits::refused(&rt, client, Reason::TargetFull, "udp");
 		} else {
@@ -1026,7 +1309,6 @@ async fn dtls_session(
 				dtls = true);
 		}
 		let _ = dtls.close().await;
-		remove(&sessions, peer, id);
 		return;
 	};
 	let upstream = async {
@@ -1048,7 +1330,6 @@ async fn dtls_session(
 		Err(e) => {
 			throttled!(udp_errors(), client.ip(), warn, event = "conn.error", rule = %rt.key, client = %client, error = %e, dtls = true);
 			let _ = dtls.close().await;
-			remove(&sessions, peer, id);
 			return;
 		}
 	};
@@ -1065,7 +1346,7 @@ async fn dtls_session(
 	let mut deadline = tokio::time::Instant::now() + idle;
 	let reason = loop {
 		tokio::select! {
-			_ = rt.kill.cancelled() => break "stopped",
+			_ = stop.cancelled() => break mark.stopped(),
 			_ = sleep_until(deadline) => break "idle",
 			read = dtls.read(&mut buf, None) => match read {
 				Ok(n) if !up.admit(&rt.bandwidth, n) => {
@@ -1097,7 +1378,17 @@ async fn dtls_session(
 					rt.stats.add_tx(n as u64);
 					deadline = tokio::time::Instant::now() + idle;
 				}
-				Err(e) => debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e),
+				// a plain backend's ICMP port unreachable comes once; a DTLS backend that closed
+				// (or failed) fails every read from now on: the session ends (#354)
+				Err((e, refused)) => {
+					debug!(event = "udp.recv_error", rule = %rt.key, client = %client, error = %e);
+					if matches!(upstream, Upstream::Dtls(_)) {
+						break "backend closed";
+					}
+					if let Some(refused) = refused {
+						target_refused(&rt, lease.as_ref(), &refused);
+					}
+				}
 			},
 			changed = idle_rx.changed() => {
 				if changed.is_err() {
@@ -1112,7 +1403,6 @@ async fn dtls_session(
 	if let Upstream::Dtls(up) = &upstream {
 		let _ = up.close().await;
 	}
-	remove(&sessions, peer, id);
 	rt.stats.closed();
 	info!(event = "conn.close", rule = %rt.key, client = %client, target = %addr, dtls = true,
 		rx_bytes, tx_bytes, duration_ms = started.elapsed().as_millis() as u64, reason, proxy_peer = peer_field());
@@ -1120,13 +1410,6 @@ async fn dtls_session(
 
 fn addr_or_empty(target: Option<SocketAddr>) -> String {
 	target.map(|t| t.to_string()).unwrap_or_default()
-}
-
-fn remove(sessions: &Sessions, peer: Peer, id: u64) {
-	let mut map = sessions.lock().unwrap();
-	if map.get(&peer).is_some_and(|(current, _)| *current == id) {
-		map.remove(&peer);
-	}
 }
 
 #[cfg(test)]
@@ -1197,6 +1480,101 @@ mod tests {
 		assert_eq!(t.taken, 1, "the one still held");
 		drop(t);
 		drop(legit);
+	}
+
+	// #354: at the caps, the oldest session that never saw a reply goes; replied and ended ones are not evicted
+	#[test]
+	fn the_oldest_unreplied_session_is_evicted() {
+		let unreplied = Unreplied::default();
+		let marks: Vec<Mark> = (0..3).map(|_| unreplied.track(CancellationToken::new())).collect();
+		marks[0].replied();
+		assert_eq!(unreplied.waiting(), 2);
+		assert!(unreplied.evict_oldest());
+		assert!(!marks[0].stop().is_cancelled() && marks[1].stop().is_cancelled() && !marks[2].stop().is_cancelled());
+		assert_eq!((marks[1].stopped(), marks[2].stopped()), ("evicted", "stopped"));
+		drop(marks);
+		assert!(!unreplied.evict_oldest(), "ended sessions are not evicted");
+		// many sessions answered at once: the queue is cleared out as it goes
+		for _ in 0..10_000 {
+			unreplied.track(CancellationToken::new()).replied();
+		}
+		assert!(unreplied.order.lock().unwrap().len() <= 2 * 64 + 1);
+		let last = unreplied.track(CancellationToken::new());
+		assert!(unreplied.evict_oldest() && last.stop().is_cancelled());
+	}
+
+	// #354: large datagrams queue less deep than small ones
+	#[test]
+	fn the_queue_is_bounded_in_bytes() {
+		let (tx, _rx) = mpsc::channel(SESSION_QUEUE);
+		let large = vec![0u8; 65_000];
+		let taken = (0..SESSION_QUEUE).take_while(|_| enqueue(&tx, &large)).count();
+		assert_eq!(taken, SESSION_QUEUE_BYTES / large.len());
+		// small datagrams still go behind them, up to the count
+		let small = [0u8; 100];
+		assert_eq!((0..SESSION_QUEUE).filter(|_| enqueue(&tx, &small)).count(), SESSION_QUEUE - taken);
+		assert!(!enqueue(&tx, &small));
+	}
+
+	// #354: until established (a reply, and more than one datagram from the client) a session ends UNREPLIED_TIMEOUT
+	// after the client's last datagram, the backend's datagrams do not keep it and it stays one to evict; established,
+	// udp_idle after the last datagram either way
+	#[tokio::test(start_paused = true)]
+	async fn quiet_sessions_end() {
+		let idle = Duration::from_secs(30);
+		let unreplied = Unreplied::default();
+		let mark = unreplied.track(CancellationToken::new());
+		let start = tokio::time::Instant::now();
+		let mut quiet = Quiet::new(idle, &mark, 1);
+		assert_eq!(quiet.deadline(), start + UNREPLIED_TIMEOUT);
+		tokio::time::advance(Duration::from_secs(2)).await;
+		// a reply to a single datagram (a spoofed query a backend answers): still unreplied, however much it sends
+		quiet.backend(&mark);
+		tokio::time::advance(Duration::from_secs(2)).await;
+		quiet.backend(&mark);
+		assert_eq!(quiet.deadline(), start + UNREPLIED_TIMEOUT);
+		assert_eq!(unreplied.waiting(), 1, "still one to evict");
+		// the client's second datagram: established, both ways from now on
+		quiet.client(1, &mark);
+		let now = tokio::time::Instant::now();
+		assert_eq!(quiet.deadline(), now + idle);
+		assert_eq!(unreplied.waiting(), 0, "established: not one to evict");
+		tokio::time::advance(Duration::from_secs(20)).await;
+		quiet.backend(&mark);
+		assert_eq!(quiet.deadline(), tokio::time::Instant::now() + idle);
+		// a later run of the same session (a new QUIC connection) starts established
+		assert!(Quiet::new(idle, &mark, 1).established());
+		// two datagrams before any reply: established with the first reply
+		let other = unreplied.track(CancellationToken::new());
+		let mut quiet = Quiet::new(idle, &other, 2);
+		assert!(!quiet.established());
+		quiet.backend(&other);
+		assert!(quiet.established() && unreplied.waiting() == 0);
+		// a short udp_idle stays as short unreplied
+		let third = unreplied.track(CancellationToken::new());
+		let quiet = Quiet::new(Duration::from_secs(1), &third, 1);
+		assert_eq!(quiet.deadline(), tokio::time::Instant::now() + Duration::from_secs(1));
+	}
+
+	// #354: what a new QUIC connection from the same socket holds while its name is read is bounded in bytes too
+	#[tokio::test]
+	async fn a_renamed_probe_holds_at_most_sni_max_bytes() {
+		use crate::tls::udp_sni::quic::Version;
+		use crate::tls::udp_sni::tests::{crypto_frame, initial, tls_hello};
+		let hello = tls_hello("other.example", &["h3"]);
+		// the first bytes of a ClientHello, padded to 15 000 bytes: the name never comes
+		let mut frames = crypto_frame(0, &hello[..10]);
+		frames.resize(15_000, 0);
+		let (mut probe, mut dcid) = (None, Some(vec![1u8; 8]));
+		for pn in 0..4 {
+			let step = renamed(&mut probe, &mut dcid, Some("first.example"), initial(Version::V1, &[2u8; 8], pn, &frames, b""));
+			assert!(matches!(step, Step::Hold), "datagram {pn} held");
+		}
+		match renamed(&mut probe, &mut dcid, Some("first.example"), initial(Version::V1, &[2u8; 8], 4, &frames, b"")) {
+			Step::Forward(held) => assert_eq!(held.len(), 5, "past SNI_MAX_BYTES: given up and sent on"),
+			_ => panic!("still held past SNI_MAX_BYTES"),
+		}
+		assert!(probe.is_none());
 	}
 
 	#[tokio::test]

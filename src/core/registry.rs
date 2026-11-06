@@ -461,6 +461,20 @@ fn panic_message(e: tokio::task::JoinError) -> String {
 		.unwrap_or_else(|| "unknown panic".into())
 }
 
+/// A udp rule's `proxy_protocol.from` with public ranges (#354): UDP sources are not
+/// proven, so anyone who can spoof an address in them can name any client in a header
+/// (and pass `allow_from`, `limits` and the logs as that client). Allowed, with a warning.
+fn warn_public_proxy_from(spec: &RuleSpec) {
+	if spec.key.protocol != Protocol::Udp {
+		return;
+	}
+	let public = spec.proxy_protocol.as_ref().map(|pp| pp.public_from()).unwrap_or_default();
+	if !public.is_empty() {
+		warn!(event = "rule.proxy_protocol_public", rule = %spec.key, from = ?public,
+			"proxy_protocol.from of a udp rule has public ranges: spoofed datagrams from them can name any client");
+	}
+}
+
 /// Two rules clash when they share a protocol and ports on an address of either
 /// (`listen_addr` or `extra_listen_addrs`), or on a wildcard that covers it.
 pub(crate) fn overlaps(a: &RuleSpec, b: &RuleSpec) -> bool {
@@ -1170,6 +1184,7 @@ impl Registry {
 			half_close_timeout_ms: crate::core::proxy::relay_timeout_ms(spec.half_close_timeout, crate::l4::idle::DEFAULT_HALF_CLOSE_TIMEOUT)
 				.into(),
 			udp_idle: idle_rx,
+			udp_unreplied: Default::default(),
 			stats: Stats::default(),
 			denied_log: crate::logging::Throttle::for_protocol(key.protocol),
 			limits: Default::default(),
@@ -1182,6 +1197,7 @@ impl Registry {
 
 		rt.limits.set(spec.limits.as_ref());
 		rt.bandwidth.set(spec.bandwidth.as_ref());
+		warn_public_proxy_from(&spec);
 
 		// bind everything first so a failure leaves nothing half-open
 		let bound = spec.listen_ips().into_iter().map(|ip| Ok((ip, bind_all(&spec, ip)?))).collect::<Result<Vec<_>, ApiError>>()?;
@@ -1586,6 +1602,9 @@ impl Registry {
 					|| r.spec.health_check != spec.health_check;
 				r.idle_tx.send_replace(spec.udp_idle);
 				*r.rt.allow_from.write().unwrap() = Arc::new(spec.allow_from.clone());
+				if r.spec.proxy_protocol != spec.proxy_protocol {
+					warn_public_proxy_from(&spec);
+				}
 				r.rt.proxy_protocol.set(spec.proxy_protocol.clone());
 				r.rt.crowdsec.store(spec.crowdsec, Ordering::Relaxed);
 				r.rt.set_connect_timeout(spec.connect_timeout);
@@ -2662,6 +2681,18 @@ fn http_metrics(out: &mut String, rules: &HashMap<Key, Entry>) {
 	let _ = writeln!(out, "# HELP rproxy_http_cache_memory_limit_bytes RPROXY_CACHE_MAX_MEMORY in force: bytes all cache middlewares may keep together (0: no limit).");
 	let _ = writeln!(out, "# TYPE rproxy_http_cache_memory_limit_bytes gauge");
 	let _ = writeln!(out, "rproxy_http_cache_memory_limit_bytes {limit}");
+	// the process's descriptors for connections and sessions (#354)
+	let _ = writeln!(out, "# HELP rproxy_session_budget_in_use Descriptors held by UDP sessions (and connections) of the process, of rproxy_session_budget_limit.");
+	let _ = writeln!(out, "# TYPE rproxy_session_budget_in_use gauge");
+	let _ = writeln!(out, "rproxy_session_budget_in_use {}", crate::core::budget::in_use());
+	let _ = writeln!(out, "# HELP rproxy_session_budget_limit Descriptors connections and sessions may hold: RLIMIT_NOFILE less a reserve of 1024 (0: no limit).");
+	let _ = writeln!(out, "# TYPE rproxy_session_budget_limit gauge");
+	// 0: no limit (an unlimited RLIMIT_NOFILE)
+	let budget = match crate::core::budget::limit() {
+		u64::MAX => 0,
+		n => n,
+	};
+	let _ = writeln!(out, "rproxy_session_budget_limit {budget}");
 	let _ = writeln!(out, "# HELP rproxy_http_compress_skipped_total Responses compress middlewares sent as they were because as many were being compressed (#356).");
 	let _ = writeln!(out, "# TYPE rproxy_http_compress_skipped_total counter");
 	let _ = writeln!(out, "rproxy_http_compress_skipped_total {}", crate::l7::compress::skipped());

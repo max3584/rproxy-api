@@ -174,6 +174,34 @@ async fn patch_adds_and_removes_addresses() {
 	assert_eq!(v["state"], "running", "{v}");
 }
 
+// #354: taking an address off a udp rule ends the sessions that came in on it, not those of its other addresses
+#[tokio::test]
+async fn udp_sessions_end_with_their_address() {
+	if !has_ipv6() {
+		return;
+	}
+	let h = harness().await;
+	let backend = udp_backend("U:").await;
+	let port = dual_udp_port();
+	let mut body = rule("udp", port, backend);
+	body["extra_listen_addrs"] = json!(["::1"]);
+	let (status, v) = h.post(body).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let v6 = UdpSocket::bind("[::1]:0").await.unwrap();
+	v6.connect(("::1", port)).await.unwrap();
+	assert_eq!(udp_roundtrip(&v6, "6").await, "U:6");
+	let v4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	v4.connect(("127.0.0.1", port)).await.unwrap();
+	assert_eq!(udp_roundtrip(&v4, "4").await, "U:4");
+	let path = format!("udp/127.0.0.1/{port}");
+	wait_for(&h, &format!("/rules/{path}"), |v| v["connections"] == 2).await;
+	let (status, v) = h.patch(&path, json!({"remote_addr": "127.0.0.1", "remote_port": backend.port(), "extra_listen_addrs": []})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	// the ::1 session ends now (udp_idle is 30 s), the other goes on
+	wait_for(&h, &format!("/rules/{path}"), |v| v["connections"] == 1).await;
+	assert_eq!(udp_roundtrip(&v4, "again").await, "U:again");
+}
+
 #[tokio::test]
 async fn a_port_range_on_both_addresses() {
 	if !has_ipv6() {

@@ -143,7 +143,7 @@ tokens:
 | `idle_timeout` | string | | 中継している接続が、どちらの向きにも何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`conn.close` の `reason: idle_timeout`）。相手が読まずに書けないままの接続も同じ。数えるのは接続のバイトだけで、TCP の keepalive のプローブは数えない。省くと `1h`、`0s` で上限なし、ほかは `1s` 以上。`tcp` のルールだけ（`udp` は `udp_idle_secs`、`http` のルールは `invalid` で `global.http.timeouts`）。PATCH で付けると置き換え（`0s` で上限なし、省けば今のまま）、次の接続から効く。表示は付けたときだけ |
 | `half_close_timeout` | string | | 片側が送り終えた（半分閉じた）後、残りの向きが何も運ばないままでいてよい時間（v0.4.20、#353、`features.tcp_idle_timeout`）。過ぎたら両側をリセットして閉じる（`reason: half_close_timeout`）。`idle_timeout` が短ければそちら。省くと `1m`、`0s` でなし（`idle_timeout` だけ）、ほかは `1s` 以上。形・PATCH・表示は `idle_timeout` と同じ |
 | `source_ip` | `"proxy"` \| `"proxy_v1"` \| `"proxy_v2"` \| `"transparent"` | | 既定は `"proxy"`（送信元 IP を引き渡さない）。`proxy_v1` は TCP でのみ使える。`proxy_v2` は UDP でも使え、転送先へのデータグラムごとに PROXY v2（DGRAM）のヘッダを付ける（応答にはヘッダがない。宛先アドレスはクライアントが送った宛先のアドレス。`0.0.0.0` / `::` で待ち受けていても、受けたアドレスになる）。UDP の `proxy_v2` と `tls.upstream.tls`（転送先への DTLS）は組み合わせられない（`unsupported`）。`transparent` は `GET /capabilities` の `transparent`（IPv4）/ `transparent_ipv6`（IPv6 の待ち受け）が true のときだけ指定できる。クライアントと転送先は同じアドレスファミリーであること（docs/TRANSPARENT.md） 。説明と転送先の設定の例は docs/SOURCE-IP.md。TLS を終端しない `tls.routes[]` には route ごとの `source_ip` も書ける（下の「`tls.routes[]` の `source_ip`」） |
-| `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。TCP では無視する |
+| `udp_idle_secs` | 1–86400 | | UDP セッションを無通信で破棄するまでの秒数。既定は 30。確立していない（転送先の返事とクライアントの 2 つ目のデータグラムのない）セッションは 5 秒（下の「UDP の送信元の偽装への備え」）。TCP では無視する |
 | `listen_port_end` | 1–65535 | | ポート範囲の終わり（`listen_port` 以上）。`listen_port..listen_port_end` の各ポートを、`remote_port` から順に同じ数だけずらした転送先へ送る。上限は `GET /capabilities` の `max_range_ports`（既定 20000） |
 | `tls` | object | | TLS（tcp）/ DTLS（udp）の扱い。省略すると `{"mode": "passthrough"}`。下の「TLS」を参照 |
 | `starttls` | `"smtp"` \| `"imap"` \| `"pop3"` | | STARTTLS の手前の平文のやり取りに rproxy が答え、TLS を終端する。`tls.mode` が `terminate` の tcp ルールでのみ使える |
@@ -220,7 +220,7 @@ UDP のルールを `0.0.0.0` / `::` で待ち受けると、rproxy は受けた
 
 `tls.client_auth.mode: optional_no_verify` は、クライアント証明書を求めるが、送られなくても、検証に通らなくても接続を受ける（Gateway API の `AllowInsecureFallback`）。`tcp` の `terminate`（`http` のルールと HTTP/3 を含む）と `udp` の DTLS の終端で使える。`GET /capabilities` の `features.client_auth_modes` に `optional_no_verify` があれば使える。
 
-`udp` の DTLS の終端は、ClientHello を断片に分けずに 1 つのレコードで送るクライアントを受ける（v0.4.11 から）。断片に分かれた ClientHello と、拡張の欄が途中で切れた ClientHello は捨てる（`debug` の `udp.drop`）。rproxy が使う DTLS のライブラリ（`dtls` 0.17.2）は、拡張が途中で切れた ClientHello を読むとそのセッションの処理が panic で止まるため（#287）。DTLS 1.2 の ClientHello はふつう 1 つのデータグラムに収まる。名前で振り分ける `sni` は rproxy の自前の読み取りなので、断片に分かれていても扱える。
+`udp` の DTLS の終端は、ClientHello を断片に分けずに 1 つのレコードで送るクライアントを受ける（v0.4.11 から）。断片に分かれた ClientHello と、拡張の欄が途中で切れた ClientHello は捨てる（`debug` の `udp.drop`）。rproxy が使う DTLS のライブラリ（`dtls` 0.17.2）は、拡張が途中で切れた ClientHello を読むとそのセッションの処理が panic で止まるため（#287）。DTLS 1.2 の ClientHello はふつう 1 つのデータグラムに収まる。名前で振り分ける `sni` は rproxy の自前の読み取りなので、断片に分かれていても扱える。v0.4.20 から、新しい送信元の最初のデータグラムが ClientHello でなければセッションを作らず、5 秒のうちに HelloVerifyRequest の cookie を持つ ClientHello が戻らなければ終える（「UDP の送信元の偽装への備え」、#354）。
 
 ```json
 "client_auth": {"mode": "optional_no_verify", "ca_file": "/etc/rproxy/clients-root.pem"}
@@ -841,6 +841,22 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - 上限を付けていないルールの転送は、読み込みごとに 1 回の不可分な読み出し（relaxed load）が増えるだけ。
 - 集計（#166 5.2）：`stats.rx_bytes`・`tx_bytes`・`total_connections` は単調増加、`stats.counters_since` は数え始めた時刻（Unix 秒。ルールを作り直すと変わる、`PATCH` では変わらない）、`stats.limited` を足した。`/metrics` に `rproxy_process_start_time_seconds`。
 
+### UDP の送信元の偽装への備え（v0.4.20、#354）
+
+UDP の送信元は偽れるので、1 つのデータグラムで作れるもの（セッション・転送先へのソケット・DTLS の接続）が積み上がらないようにしている。設定の形は変わらない（既定の動きが変わる）。
+
+- **確立していないセッション**：転送先から返事があり、かつクライアントが 2 つ以上データグラムを送ったセッションを「確立した」とみなす（偽った送信元は 1 つ送るだけで返事を受け取れない。DNS・ゲーム・QUIC の転送先がその 1 つに答えても確立しない）。確立していないセッションは、クライアントの最後のデータグラムから 5 秒で終わり（conntrack の unreplied と同じ考え。`udp_idle_secs` がそれより短ければそちら）、転送先からの通信では延びず、上限で終える対象になる。確立したら `udp_idle_secs`（どちらの向きの通信でも延びる）。1 つの問い合わせに 1 つ答える使い方（DNS など）はもともと 5 秒より短く終わる。一方、1 つ送った後は受けるだけのクライアント（購読してから流し続けてもらう、1 つの要求の後にサーバが送り続ける使い方）は、そのデータグラムから 5 秒で切れる（クライアントが何か送り続けるようにする）。また、平文の UDP にはクライアントがそのアドレスにいることの本当の確かめはない：偽った送信元が 2 つ送れば確立する（数で抑えるだけ。#366）。
+- **上限で古いものから**：ルールのセッションが既定の上限（`RPROXY_UDP_MAX_SESSIONS`）に達したときは、新しいセッションが送信元ごとの `limits` に通った後で、そのルールの確立していないいちばん古いセッションを終えて受ける（`conn.close` の `reason: evicted`）。確立したセッションは終えない。終えられるものがなければ今までどおり断る（`limits.max_connections` を付けたルールは、その上限で断る）。
+- **プロセス全体の枠**：UDP のセッション（転送先へのソケット 1 つ）は、プロセスのファイルの数の上限（`RLIMIT_NOFILE`。起動時にハードの上限まで上げる）から 1024（制御 API・DB・名前解決・ファイルの分）を除いた枠の中で作る（起動の `start` の行の `session_budget`、`/metrics` の `rproxy_session_budget_limit`（上限のない `RLIMIT_NOFILE` では 0）・`rproxy_session_budget_in_use`）。埋まったら、どのルールのものでも確立していないいちばん古いセッションを終えて受け（終わるまでのあいだ枠を超えるのは 512 まで）、なければ断る（`stats.limited`・`conn.limited` の `reason: max_connections`）。
+- **DTLS の終端**：新しい送信元の最初のデータグラムが ClientHello（epoch 0 のハンドシェイクのレコード）でなければ、セッションを作らずに捨てる。ハンドシェイクの間は、1 つのポートで「名前を読む」セッションと同じ枠（1 ポート 4096、1 つのプレフィックス（IPv4 /24・IPv6 /48）は 64 まで。超えたらそのプレフィックスのいちばん古いものをあきらめる）を使い、ハンドシェイクが終わるまでは確立していないセッションとして上限で終える対象になる。5 秒のうちに、DTLS のライブラリが送った HelloVerifyRequest の cookie を持つ ClientHello が戻ってこなければ終える（偽った送信元には cookie が届かない）。DTLS の設定はルールの TLS と一緒に 1 回だけ組み立てる。HelloVerifyRequest を rproxy が状態を持たずに答える（cookie を確かめてから DTLS の接続を作る）のは、使っている `dtls` クレート（0.17）ではできない（ライブラリが自分の cookie とハンドシェイクの番号を決めるため）。ライブラリはセッションごとに証明書の鍵を複製する。
+- **DTLS の転送先が閉じたとき**：転送先への DTLS が閉じる・失敗すると、そのセッションを終える（`reason: backend closed`。前は読み出しの誤りを繰り返して CPU を使い続けた）。
+- **QUIC の名前読み**：1 つのセッションで見る Initial は 16 まで（前は 64）、鍵は最初の Initial の接続 ID から 1 回だけ導き、違う接続 ID の Initial は読まない（RFC 9000 §12.2）。同じソケットからの別の名前の新しい接続を読む間に持つデータグラムは、数（16）に加えてバイト（64 KiB）でも上限がある。
+- **セッションのキュー**：1 つのセッションに渡す前のデータグラムは、数（1024）に加えて、大きさでも上限がある（そのデータグラムと同じ大きさで 2 MiB 分より多く並んでいれば捨てる。1 つのキューは多くて約 9 MiB。前は 64 MiB まで）。
+- **ICMP**：転送先からの ICMP port unreachable（`ECONNREFUSED`）は、読み出しだけでなく送信で返ってきたときも、その宛先の失敗として数える（`outlier_detection`）。
+- **`extra_listen_addrs` を外したとき**：外したアドレスで開いていた UDP のセッションも終える（TCP の接続はそのまま）。
+- **`proxy_protocol.from` が公開のアドレス**：`udp` のルールの `from` に私用・ループバック・リンクローカル・CGNAT（100.64.0.0/10）の外のアドレスが含まれると、作成・変更のときに `rule.proxy_protocol_public`（`warn`）を出す（断らない）。
+- DPDK の道（`global.performance.dpdk`）のセッションも、既定の上限（`RPROXY_UDP_MAX_SESSIONS`）を数える。DPDK のセッションの表には 5 秒の時間切れも古いものを終えることもない（上限で断るだけ）。
+
 ### GeoIP（#168）
 
 ```yaml
@@ -1093,7 +1109,7 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 ```
 
 - `from`・`required` の意味は TCP と同じ。違うのは、ヘッダが接続の最初に 1 回ではなく、`from` の前段からのデータグラムの 1 つ 1 つの前に付くこと（rproxy 自身の `source_ip: proxy_v2` が送る形）。
-- **`from` は外から偽れない網にいる前段だけにする**（#332）。UDP には接続（TCP のハンドシェイク）がないので、rproxy は前段をデータグラムの送信元の IP だけで信じる。`from` のアドレスを名乗ったデータグラムを外から届けられる網（送信元の偽装を止めていない網、インターネットに面したアドレス）では、だれでも好きなクライアントを名乗れる（`allow_from`・`geoip`・`crowdsec`・`limits`・ログ・転送先への `source_ip` がそのアドレスになる）。前段と rproxy の間は、外からのそのアドレスのパケットを捨てる私的な網（同じ L2・VPC の中、境界で送信元の検査（BCP 38）をする網）にする。
+- **`from` は外から偽れない網にいる前段だけにする**（#332）。UDP には接続（TCP のハンドシェイク）がないので、rproxy は前段をデータグラムの送信元の IP だけで信じる。`from` のアドレスを名乗ったデータグラムを外から届けられる網（送信元の偽装を止めていない網、インターネットに面したアドレス）では、だれでも好きなクライアントを名乗れる（`allow_from`・`geoip`・`crowdsec`・`limits`・ログ・転送先への `source_ip` がそのアドレスになる）。前段と rproxy の間は、外からのそのアドレスのパケットを捨てる私的な網（同じ L2・VPC の中、境界で送信元の検査（BCP 38）をする網）にする。`from` が私用・ループバック・リンクローカル・CGNAT の外のアドレスを含むと、作成・変更のときに `rule.proxy_protocol_public`（`warn`）を出す（v0.4.20、#354。断らない）。
 - 受け付けるのは v2 の DGRAM（UDP over IPv4 / IPv6）だけ。v1（UDP の形がない）、STREAM（TCP）のヘッダ、壊れたヘッダ、データグラムの中で終わらないヘッダは捨てる。大きさの上限は TCP と同じ（固定の 16 バイトの後が 4096 バイトまで）。v2 の `LOCAL`・`AF_UNSPEC` は前段のアドレスのまま。TLV は読み飛ばす。
 - `required: true`（既定）なら、`from` からのヘッダのないデータグラムは捨てる。`from` の外からヘッダ（v2 の署名か `PROXY `）で始まるデータグラムも捨てる。捨てた数は `stats.denied`、ログは `conn.denied`（`warn`、`reason: proxy_protocol` / `proxy_protocol_untrusted`、`client` は前段）。ログは送信元ごとに間引く（ほかの UDP の拒否と同じ。省いた数は次の行の `suppressed`）。
 - セッションは（前段のアドレス・ポート, ヘッダのクライアント）ごと（ワイルドカードの待ち受けでは受けたアドレスごとにも分かれる）。返事は、データグラムが来た前段のアドレス・ポートへ、ヘッダを付けずに返す（外側の rproxy はセッションごとのソケットで受けて、クライアントへ返す）。同じ前段のポートからのヘッダが別のクライアントを書いてきたら、別のセッションになる（前のセッションは `udp_idle_secs` で終わる）。
@@ -1293,7 +1309,7 @@ http:
 | `GET /rules` | | 200 | ルールの配列 |
 | `GET /rules/{protocol}/{listen_addr}/{listen_port}` | | 200 | ルール 1 件 |
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
-| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている接続はそのまま）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
+| `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている TCP の接続はそのまま。UDP のセッションは終える、#354）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する（v0.4.20 から 3600 秒まで。長い値は 3600 秒に切り詰める。組の `DELETE` も同じ） |
 | `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |

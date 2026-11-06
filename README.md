@@ -98,7 +98,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_MAX_RULESETS` | `--max-rulesets` | `1000` | ルールの組の数（`0` でなし。#358） |
 | `RPROXY_API_MAX_CONNECTIONS` | `--api-max-connections` | `512` | 制御 API の TCP の接続の数（アドレスごと。`0` でなし。超えた接続はすぐ閉じる。#358） |
 | `RPROXY_API_MAX_CONNECTIONS_PER_SOURCE` | `--api-max-connections-per-source` | `64` | 1 つの送信元（IPv6 は /64）からの制御 API の TCP の接続の数（`0` でなし。loopback は数えない。#358） |
-| `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | udp のルールのセッションの既定の上限（ルールの `limits.max_connections` があればそちら。`0` でなし。#332：偽った送信元でセッションと転送先へのソケットを増やせないように）。超えた新しいセッションのデータグラムは捨て、`stats.limited`・`conn.limited`（`reason: max_connections`）。多くのクライアントを受けるルールは `limits.max_connections` を付けるか、これを上げる（ファイルの数の上限 `LimitNOFILE` も） |
+| `RPROXY_UDP_MAX_SESSIONS` | `--udp-max-sessions` | `16384` | udp のルールのセッションの既定の上限（ルールの `limits.max_connections` があればそちら。`0` でなし。#332：偽った送信元でセッションと転送先へのソケットを増やせないように）。上限では確立していない（転送先の返事とクライアントの 2 つ目のデータグラムのない）いちばん古いセッションを終えて新しいものを受け（v0.4.20、#354）、なければ新しいセッションのデータグラムは捨て、`stats.limited`・`conn.limited`（`reason: max_connections`）。確立していないセッションは 5 秒で終わる。UDP のセッションはプロセス全体で `RLIMIT_NOFILE` から 1024 を除いた数まで（docs/API.md の「UDP の送信元の偽装への備え」）。多くのクライアントを受けるルールは `limits.max_connections` を付けるか、これを上げる（ファイルの数の上限 `LimitNOFILE` も） |
 | `RPROXY_CACHE_MAX_MEMORY` | `--cache-max-memory` | `536870912`（512 MiB） | すべての `cache` ミドルウェアが持つ量（答えと記録）の合計の上限（バイト。`0` でなし。#349）。ミドルウェアごとの `max_memory` とは別に、ルールを何本作っても 1 つのプロセスのメモリを使い切れないように。入らない答えは同じ `cache` の古いものから捨てて持ち、それでも入らなければ持たない（docs/API.md の「応答のキャッシュ」）。与えなければ `PATCH /config/global` の `cache_max_memory` で稼働中に変えられる。`/metrics` の `rproxy_http_cache_memory_bytes` |
 | `RPROXY_DNS_INTERVAL` | `--dns-interval` | `30` | 転送先ホスト名を再解決する間隔（秒）。解決に失敗したときは前回の結果を使い続ける |
 

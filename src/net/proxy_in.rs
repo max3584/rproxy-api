@@ -81,6 +81,11 @@ impl ProxyProtocol {
 		self.from.iter().any(|c| c.contains(peer))
 	}
 
+	/// The ranges of `from` that reach public addresses (`Cidr::is_public`).
+	pub fn public_from(&self) -> Vec<String> {
+		self.from.iter().filter(|c| c.is_public()).map(|c| c.to_string()).collect()
+	}
+
 	/// As the rule view (and `rproxy_rules`) shows it.
 	pub fn view(&self) -> ProxyProtocolSpec {
 		ProxyProtocolSpec { from: Some(self.from.iter().map(|c| c.to_string()).collect()), required: Some(self.required) }

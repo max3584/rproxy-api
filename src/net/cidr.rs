@@ -1,7 +1,7 @@
 //! Address ranges for `allow_from`.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use crate::error::ApiError;
@@ -46,6 +46,20 @@ impl Cidr {
 	pub fn contains(&self, ip: IpAddr) -> bool {
 		let ip = canonical(ip);
 		ip.is_ipv4() == self.net.is_ipv4() && mask(ip, self.prefix) == self.net
+	}
+
+	/// Whether the range reaches beyond private, loopback, link-local and shared (CGNAT)
+	/// addresses: a source from the internet there could be anyone's, spoofed too.
+	pub fn is_public(&self) -> bool {
+		const fn v4(a: u8, b: u8, prefix: u8) -> Cidr {
+			Cidr { net: IpAddr::V4(Ipv4Addr::new(a, b, 0, 0)), prefix }
+		}
+		const fn v6(first: u16, prefix: u8) -> Cidr {
+			Cidr { net: IpAddr::V6(Ipv6Addr::new(first, 0, 0, 0, 0, 0, 0, if first == 0 { 1 } else { 0 })), prefix }
+		}
+		const PRIVATE: [Cidr; 9] =
+			[v4(10, 0, 8), v4(172, 16, 12), v4(192, 168, 16), v4(127, 0, 8), v4(169, 254, 16), v4(100, 64, 10), v6(0, 128), v6(0xfc00, 7), v6(0xfe80, 10)];
+		!PRIVATE.iter().any(|b| self.prefix >= b.prefix && b.contains(self.net))
 	}
 }
 
@@ -97,6 +111,16 @@ mod tests {
 
 	fn c(s: &str) -> Cidr {
 		s.parse().unwrap()
+	}
+
+	#[test]
+	fn public_ranges() {
+		for private in ["10.1.2.0/24", "172.20.0.1", "192.168.0.0/16", "127.0.0.1", "100.64.1.0/24", "fd00::/8", "::1", "fe80::1/64"] {
+			assert!(!c(private).is_public(), "{private}");
+		}
+		for public in ["203.0.113.0/24", "8.8.8.8", "10.0.0.0/7", "172.0.0.0/8", "2001:db8::/32", "::ffff:198.51.100.1"] {
+			assert!(c(public).is_public(), "{public}");
+		}
 	}
 
 	#[test]
