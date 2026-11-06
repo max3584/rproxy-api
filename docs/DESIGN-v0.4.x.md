@@ -510,3 +510,12 @@ kill -9 の直後に起動し直したプロセスが、止まったプロセス
 - 接続ごとの費用：L4 の TCP は CAS 1 回と drop の `fetch_sub` 1 回、`http` は加えて `keep` の `fetch_sub` 1 回。`Ticket` は 8 バイトで、接続のタスクの future に入るだけ（`Runtime`・`Stats` の接続ごとに触る項目の並びは変えていない）。`Budgeted` は読み書きを `TcpStream` にそのまま渡す（`poll_write_vectored`・`is_write_vectored` も）。
 - CrowdSec の `rproxy-conn-limited` は `reason: fd_budget` を数えない（プロセス全体の混み具合で、そのクライアントのせいとは限らない）。
 - 試験：`tests/fd_budget.rs`（`budget::init_exact` で枠を 4 にする。枠がプロセスで 1 つなので別のテストのバイナリで 1 つのテスト）、単体は `core::budget`（`keep`、CAS の `reserve` は自分の数で試す：ほかの単体テストもプロセスの数を使うので）・`control::upgrade::handoff`（`Counters.fd_budget`）。
+
+## 23. DTLS の cookie を状態を持たずに確かめる（#366 で調べて見送り、#383）
+
+DTLS の終端で、最初の ClientHello に rproxy が自分の HelloVerifyRequest（送信元のアドレスに対する HMAC の cookie）で答え、cookie を持つ ClientHello が戻ってから `DTLSConn` を作れば、偽った送信元は crate の接続も鍵の複製も作れない。使っている `dtls` 0.17.2 では fork しない限りできないので、#360 の形（crate の HelloVerifyRequest の cookie を覚えて 5 秒、`SniSlots`、上限での追い出し）のままにした。
+
+- crate のサーバは `Flight0::generate` で cookie を `rand::rng()` から 20 バイト作り（設定から決められない）、`Flight2::parse` は `message_seq` がいちばん大きい ClientHello の cookie がそれと同じかを見る。受信は `message_seq` 0 から順で、`Flight0` は 0 番の ClientHello を要る。
+- Finished と extended master secret の `session_hash` は、いちばん新しい ClientHello の生のバイト（`message_seq` を含む DTLS のハンドシェイクのヘッダごと）で計算する（RFC 6347 §4.2.6）。crate の手元の ClientHello は、クライアントの 2 つ目（`message_seq` 1、rproxy の cookie）とバイトまで同じでなければならない。
+- 2 つ目を `message_seq` 0 にして渡し、crate の HelloVerifyRequest を捨てて 2 つ目をそのまま渡す筋は、cookie が違って `AccessDenied`。cookie を crate のものに書き換えると Finished が合わない。crate の HelloVerifyRequest もクライアントに届けると、3 つ目の ClientHello が `message_seq` 2 になり、crate は 1 を待つ（書き換えれば Finished が合わない）。`DTLSConn::new` の `initial_state` は再開のためで、ハンドシェイクの後から始まる。
+- 先にある道：`rtc-dtls`（webrtc-rs の sans-IO の後継）は `Config` に暗号の provider を渡せ、cookie もその乱数から作るので、接続ごとの provider で cookie を rproxy のものにすれば fork せずに通る見込み（crate の中で最初に引く乱数が cookie だという順に頼る。移し替えも大きい）。あるいは上流に cookie を作る・確かめる関数か HVR を飛ばす設定を足してもらう。#383 で追う。
