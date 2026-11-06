@@ -1839,7 +1839,8 @@ impl Conn {
 				Err(Failure::Status(status, error)) => {
 					warn!(event = "http.error", rule = %self.rt.key, route, service = %service.name, backend = %server.addr(),
 						status = status.as_u16(), error = %error, attempt, attempts);
-					if attempt >= attempts {
+					// the client's body failed (`send`): another server would not get it either
+					if attempt >= attempts || status == StatusCode::BAD_REQUEST {
 						return error_response(status);
 					}
 					drop(counted);
@@ -1999,6 +2000,9 @@ impl Conn {
 		req: Request<Body>,
 		per_try: Option<std::time::Duration>,
 	) -> Result<Response<Body>, Failure> {
+		// a request that fails because the client's body did (cut short, too slow, not what its
+		// Content-Length said) is not the server's failure (#355)
+		let (req, client_failed) = watch_client_body(req);
 		let result = match per_try {
 			Some(limit) => {
 				let at = tokio::time::Instant::now() + limit;
@@ -2011,6 +2015,9 @@ impl Conn {
 			}
 			None => self.send_once(router, service, index, req, false).await,
 		};
+		if result.is_err() && client_failed.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+			return Err(Failure::Status(StatusCode::BAD_REQUEST, "the request body failed".into()));
+		}
 		// outlier_detection (#170): 5xx answers, connection failures and timeouts count against the server
 		if service.outlier.is_some() {
 			let outcome = match &result {
@@ -2205,6 +2212,41 @@ fn empty_body() -> Body {
 
 /// Tells (through the returned receiver) when the request body has been sent to the end.
 /// None for a request without a body (most of them), which is sent already.
+/// `req` with a body that notes when it fails (none for a request without a body).
+fn watch_client_body(req: Request<Body>) -> (Request<Body>, Option<Arc<std::sync::atomic::AtomicBool>>) {
+	if req.body().is_end_stream() {
+		return (req, None);
+	}
+	let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	(req.map(|inner| ClientBody { inner, failed: failed.clone() }.boxed()), Some(failed))
+}
+
+struct ClientBody {
+	inner: Body,
+	failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl hyper::body::Body for ClientBody {
+	type Data = Bytes;
+	type Error = BoxError;
+
+	fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+		let poll = Pin::new(&mut self.inner).poll_frame(cx);
+		if matches!(poll, Poll::Ready(Some(Err(_)))) {
+			self.failed.store(true, Ordering::Relaxed);
+		}
+		poll
+	}
+
+	fn is_end_stream(&self) -> bool {
+		self.inner.is_end_stream()
+	}
+
+	fn size_hint(&self) -> hyper::body::SizeHint {
+		self.inner.size_hint()
+	}
+}
+
 fn until_sent(req: Request<Body>) -> (Request<Body>, Option<tokio::sync::watch::Receiver<bool>>) {
 	if req.body().is_end_stream() {
 		return (req, None);
