@@ -109,6 +109,8 @@ async fn idle_timeout_ends_quiet_and_stalled_connections() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["features"]["tcp_idle_timeout"], true);
+	// the UI writes connect_timeout to its database only when told it is restored (#379, UI #184)
+	assert_eq!(caps["features"]["db_connect_timeout"], true);
 	let backend = tcp_backend(">").await;
 
 	// plain TCP (the splice relay): ended after 1s of nothing, reset

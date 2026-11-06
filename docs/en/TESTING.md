@@ -580,7 +580,7 @@ Test files not covered by the sections above (see the description at the top of 
 
 | Test | What it checks |
 |---|---|
-| `loads_every_schema_version` | Can read from the current table including the `src_port_end` / `options` columns (including `allow_from`; rows with broken `options` are skipped), the previous table, and old tables that also lack `source_ip` / `udp_idle_secs` |
+| `loads_every_schema_version` | Can read from the current table including the `src_port_end` / `options` columns (including `allow_from`; rows with broken `options` are skipped), the previous table, and old tables that also lack `source_ip` / `udp_idle_secs`. `idle_timeout` / `half_close_timeout` (`0s`) and `connect_timeout` (#379) in `options` are restored too |
 
 ## Real path of transparent (`scripts/test-transparent.sh`)
 

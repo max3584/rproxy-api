@@ -247,6 +247,9 @@ pub struct Features {
 	/// `write_stall`, `upgraded_idle` and `http2_max_streams`, `mirror`'s `max_in_flight`, upgraded connections in the rule's `limits`,
 	/// `timeouts.request` over the middlewares, `stats.http.mirror_dropped`
 	pub http_stream_limits: bool,
+	/// `connect_timeout` in the `options` of rows of the UI's database (`forward_rules`) is restored
+	/// (#379, the UI's #184); before, such a row was refused (unknown key) and not restored
+	pub db_connect_timeout: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -320,6 +323,7 @@ impl Features {
 		tcp_idle_timeout: true,
 		control_limits: true,
 		http_stream_limits: true,
+		db_connect_timeout: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -376,6 +380,7 @@ impl Features {
 		tcp_idle_timeout: true,
 		control_limits: true,
 		http_stream_limits: true,
+		db_connect_timeout: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

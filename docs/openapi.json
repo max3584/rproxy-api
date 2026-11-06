@@ -2356,6 +2356,10 @@
               "http_stream_limits": {
                 "type": "boolean",
                 "description": "Limits on what one client can hold of an http rule (v0.4.20, #356): global.http.timeouts.write_stall (default 60s), upgraded_idle (default 1h) and http2_max_streams (default 128); mirror's max_in_flight (default 64); an upgraded connection (WebSocket) keeps its place in the rule's limits; timeouts.request covers the middlewares; stats.http.mirror_dropped and rproxy_http_mirror_dropped_total"
+              },
+              "db_connect_timeout": {
+                "type": "boolean",
+                "description": "connect_timeout in the options of rows of the UI's database (forward_rules) is restored; before, such a row was refused as an unknown key and not restored (v0.4.21, #379)"
               }
             }
           },
