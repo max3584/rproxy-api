@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,11 +50,12 @@ const SNI_MAX_BYTES: usize = 64 * 1024;
 /// Sessions of one port reading their server name over more than one datagram
 /// at the same time (`SniSlots`); beyond this the oldest is given up.
 const SNI_MAX_PENDING: usize = 4096;
-/// ... of them from one source prefix (`SNI_PREFIX_V4` / `_V6`); beyond this, the
-/// prefix's own oldest is given up for the new one, whatever the others do (#332).
+/// ... of them from one source prefix (`SOURCE_PREFIX_V4` / `_V6`, also the prefixes of
+/// `Unreplied`); beyond this, the prefix's own oldest is given up for the new one,
+/// whatever the others do (#332).
 const SNI_MAX_PENDING_PER_PREFIX: usize = 64;
-const SNI_PREFIX_V4: u8 = 24;
-const SNI_PREFIX_V6: u8 = 48;
+const SOURCE_PREFIX_V4: u8 = 24;
+const SOURCE_PREFIX_V6: u8 = 48;
 /// Sessions of a rule without `limits.max_connections` (#332 L3): a flood from
 /// spoofed sources could otherwise open a backend socket per source until `udp_idle`.
 /// `RPROXY_UDP_MAX_SESSIONS` (`set_max_sessions`), 0 for none.
@@ -160,12 +161,36 @@ impl Drop for Registered {
 
 /// A rule's UDP sessions that have not seen a reply from their backend yet (DTLS terminate:
 /// not through the handshake), oldest first (#354). When the rule's default cap
-/// (`MAX_SESSIONS`) or the process's descriptors (`core::budget`) are taken, the oldest of
-/// them makes room for the new session instead of the new one being refused: a flood from
+/// (`MAX_SESSIONS`) or the process's descriptors (`core::budget`) are taken, one of them
+/// makes room for the new session instead of the new one being refused: a flood from
 /// spoofed sources then pushes out only its own kind, and sessions that are answered stay.
+/// They are also kept by source prefix (IPv4 /24, IPv6 /48, as `SniSlots`, #366), so that a
+/// flood from one network pushes out its own: a prefix holds at most `per_prefix` of the
+/// rule's (past that, its own oldest goes for the new one), and at a cap the new session's
+/// prefix gives up its own oldest unless the oldest of all is of a prefix that holds more.
 #[derive(Default)]
 pub struct Unreplied {
-	order: Mutex<VecDeque<Arc<Waiting>>>,
+	/// Which of a session's counts (`Waiting::live`) is of this queue: 0 the rule's, 1 the process's.
+	slot: usize,
+	table: Mutex<UnrepliedTable>,
+}
+
+#[derive(Default)]
+struct UnrepliedTable {
+	/// Oldest first; done ones are skipped when evicting, and cleared out now and then.
+	order: VecDeque<Arc<Waiting>>,
+	by_prefix: HashMap<IpAddr, PrefixQueue>,
+	/// The prefix that held the most when it last took one (a hint: its count may have gone down since).
+	heaviest: Option<(IpAddr, Arc<AtomicUsize>)>,
+}
+
+/// The sessions of one source prefix in one `Unreplied`.
+#[derive(Default)]
+struct PrefixQueue {
+	/// Those not done yet: counted down by the session itself (`Waiting::finish`), no lock taken.
+	live: Arc<AtomicUsize>,
+	/// Oldest first, done ones among them as in `order`.
+	order: VecDeque<Arc<Waiting>>,
 }
 
 struct Waiting {
@@ -174,58 +199,157 @@ struct Waiting {
 	evicted: AtomicBool,
 	/// The session's own stop (a child of its shard's `ended`).
 	stop: CancellationToken,
+	/// Its prefix's `PrefixQueue::live` in its rule's queue and in the process's.
+	live: [Arc<AtomicUsize>; 2],
+}
+
+impl Waiting {
+	/// Done (replied, ended or evicted); false when it was already.
+	fn finish(&self) -> bool {
+		if self.done.swap(true, Ordering::Relaxed) {
+			return false;
+		}
+		for live in &self.live {
+			live.fetch_sub(1, Ordering::Relaxed);
+		}
+		true
+	}
+
+	fn is_done(&self) -> bool {
+		self.done.load(Ordering::Relaxed)
+	}
+
+	fn evict(&self) -> bool {
+		if !self.finish() {
+			return false;
+		}
+		self.evicted.store(true, Ordering::Relaxed);
+		self.stop.cancel();
+		true
+	}
 }
 
 /// Every rule's sessions not replied to yet, oldest first: the process's descriptors
-/// (`core::budget`) are shared by all rules, so the oldest of all makes room there.
-static ALL_UNREPLIED: Unreplied = Unreplied { order: Mutex::new(VecDeque::new()) };
+/// (`core::budget`) are shared by all rules, so one of all makes room there.
+static ALL_UNREPLIED: std::sync::LazyLock<Unreplied> = std::sync::LazyLock::new(|| Unreplied { slot: 1, table: Mutex::default() });
 
-impl Unreplied {
-	/// A new session, in its rule's queue and in the process's (`ALL_UNREPLIED`).
-	fn track(&self, stop: CancellationToken) -> Mark {
-		let state = Arc::new(Waiting { done: AtomicBool::new(false), evicted: AtomicBool::new(false), stop });
-		self.push(state.clone());
-		ALL_UNREPLIED.push(state.clone());
-		Mark(state)
+/// One source prefix holds at most this share of a rule's sessions not replied to (of
+/// `MAX_SESSIONS`, or of the process's descriptors when that is 0), and at least
+/// `UNREPLIED_PER_PREFIX_MIN` (#366).
+const UNREPLIED_PER_PREFIX_SHARE: u64 = 16;
+const UNREPLIED_PER_PREFIX_MIN: u64 = 64;
+
+fn unreplied_per_prefix() -> usize {
+	let cap = match MAX_SESSIONS.load(Ordering::Relaxed) {
+		0 => crate::core::budget::limit(),
+		max => max,
+	};
+	usize::try_from((cap / UNREPLIED_PER_PREFIX_SHARE).max(UNREPLIED_PER_PREFIX_MIN)).unwrap_or(usize::MAX)
+}
+
+impl UnrepliedTable {
+	/// `prefix`'s count of sessions not done, made if it has none.
+	fn live(&mut self, prefix: IpAddr) -> Arc<AtomicUsize> {
+		// prefixes with none left are cleared out now and then (amortised)
+		if !self.by_prefix.contains_key(&prefix) && self.by_prefix.len() >= 64 && self.by_prefix.len().is_power_of_two() {
+			self.by_prefix.retain(|_, q| q.live.load(Ordering::Relaxed) > 0);
+		}
+		self.by_prefix.entry(prefix).or_default().live.clone()
 	}
 
-	fn push(&self, state: Arc<Waiting>) {
-		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-		// done ones are skipped when evicting, and cleared out now and then (amortised)
-		if order.len() >= 64 && order.len().is_power_of_two() {
-			order.retain(|w| !w.done.load(Ordering::Relaxed));
+	/// `state` of `prefix`, counted in `live` already.
+	fn push(&mut self, prefix: IpAddr, live: &Arc<AtomicUsize>, state: Arc<Waiting>) {
+		let held = live.load(Ordering::Relaxed);
+		if self.heaviest.as_ref().is_none_or(|(p, most)| *p == prefix || most.load(Ordering::Relaxed) < held) {
+			self.heaviest = Some((prefix, live.clone()));
 		}
-		order.push_back(state);
+		if self.order.len() >= 64 && self.order.len().is_power_of_two() {
+			self.order.retain(|w| !w.is_done());
+		}
+		self.order.push_back(state.clone());
+		let queue = self.by_prefix.entry(prefix).or_default();
+		while queue.order.front().is_some_and(|w| w.is_done()) {
+			queue.order.pop_front();
+		}
+		if queue.order.len() >= 64 && queue.order.len().is_power_of_two() {
+			queue.order.retain(|w| !w.is_done());
+		}
+		queue.order.push_back(state);
+	}
+
+	/// The oldest of all not done yet.
+	fn oldest(&mut self) -> Option<&Arc<Waiting>> {
+		while self.order.front().is_some_and(|w| w.is_done()) {
+			self.order.pop_front();
+		}
+		self.order.front()
+	}
+
+	/// Ends the oldest session of `prefix` not done yet; false when it has none.
+	fn evict_in(&mut self, prefix: IpAddr) -> bool {
+		let Some(queue) = self.by_prefix.get_mut(&prefix) else { return false };
+		while let Some(w) = queue.order.pop_front() {
+			if w.evict() {
+				return true;
+			}
+		}
+		false
+	}
+}
+
+impl Unreplied {
+	fn lock(&self) -> std::sync::MutexGuard<'_, UnrepliedTable> {
+		self.table.lock().unwrap_or_else(|e| e.into_inner())
+	}
+
+	/// A new session of `client`, in its rule's queue and in the process's (`ALL_UNREPLIED`).
+	/// When its prefix already holds `unreplied_per_prefix` of the rule's, the oldest of them goes.
+	fn track(&self, client: IpAddr, stop: CancellationToken) -> Mark {
+		let prefix = limits::source_key(client, SOURCE_PREFIX_V4, SOURCE_PREFIX_V6);
+		let mut rule = self.lock();
+		let mut all = ALL_UNREPLIED.lock();
+		let live = [rule.live(prefix), all.live(prefix)];
+		if live[0].load(Ordering::Relaxed) >= unreplied_per_prefix() {
+			rule.evict_in(prefix);
+		}
+		for live in &live {
+			live.fetch_add(1, Ordering::Relaxed);
+		}
+		let state = Arc::new(Waiting { done: AtomicBool::new(false), evicted: AtomicBool::new(false), stop, live });
+		rule.push(prefix, &state.live[0], state.clone());
+		all.push(prefix, &state.live[1], state.clone());
+		Mark(state)
 	}
 
 	/// Whether there may be one to evict (a quick look before spending a source's `limits`).
 	fn any(&self) -> bool {
-		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-		while let Some(w) = order.front() {
-			if !w.done.load(Ordering::Relaxed) {
-				return true;
-			}
-			order.pop_front();
-		}
-		false
+		self.lock().oldest().is_some()
 	}
 
-	/// Ends the oldest session that has not seen a reply; false when there is none.
-	fn evict_oldest(&self) -> bool {
-		let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
-		while let Some(w) = order.pop_front() {
-			if !w.done.swap(true, Ordering::Relaxed) {
-				w.evicted.store(true, Ordering::Relaxed);
-				w.stop.cancel();
-				return true;
-			}
-		}
-		false
+	/// Ends a session not replied to, to make room for a new one of `client`; false when there
+	/// is none. Of the new one's own prefix, the one that held the most (`heaviest`) and the
+	/// prefix of the oldest of all, the one holding the most gives up its oldest (the new one's
+	/// own first, then the oldest of all, when they hold as many): a flood from one network evicts its own, and a client
+	/// of another network makes room at the flood's cost, not at that of the others. Three
+	/// counts read, no walk over the prefixes.
+	fn evict_for(&self, client: IpAddr) -> bool {
+		let prefix = limits::source_key(client, SOURCE_PREFIX_V4, SOURCE_PREFIX_V6);
+		let mut t = self.lock();
+		let Some(oldest) = t.oldest().cloned() else { return false };
+		let own = t.by_prefix.get(&prefix).map_or(0, |q| q.live.load(Ordering::Relaxed));
+		let (heaviest, most) = t.heaviest.as_ref().map_or((prefix, 0), |(p, live)| (*p, live.load(Ordering::Relaxed)));
+		let first = oldest.live[self.slot].load(Ordering::Relaxed);
+		let evicted = if own > 0 && own >= most && own >= first {
+			t.evict_in(prefix)
+		} else {
+			most > first && t.evict_in(heaviest)
+		};
+		evicted || oldest.evict()
 	}
 
 	#[cfg(test)]
 	fn waiting(&self) -> usize {
-		self.order.lock().unwrap().iter().filter(|w| !w.done.load(Ordering::Relaxed)).count()
+		self.lock().order.iter().filter(|w| !w.is_done()).count()
 	}
 }
 
@@ -235,11 +359,11 @@ struct Mark(Arc<Waiting>);
 impl Mark {
 	/// The backend answered (DTLS: the handshake is through): not one to evict any more.
 	fn replied(&self) {
-		self.0.done.store(true, Ordering::Relaxed);
+		self.0.finish();
 	}
 
 	fn is_replied(&self) -> bool {
-		self.0.done.load(Ordering::Relaxed)
+		self.0.is_done()
 	}
 
 	fn stop(&self) -> &CancellationToken {
@@ -254,7 +378,7 @@ impl Mark {
 
 impl Drop for Mark {
 	fn drop(&mut self) {
-		self.0.done.store(true, Ordering::Relaxed);
+		self.0.finish();
 	}
 }
 
@@ -345,7 +469,7 @@ impl SniSlots {
 
 	/// A slot for a session of `client`, giving up the oldest of its prefix (or of all) when full.
 	fn take(self: &Arc<Self>, client: IpAddr) -> SniSlot {
-		let prefix = limits::source_key(client, SNI_PREFIX_V4, SNI_PREFIX_V6);
+		let prefix = limits::source_key(client, SOURCE_PREFIX_V4, SOURCE_PREFIX_V6);
 		let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
 		while t.by_prefix.get(&prefix).is_some_and(|slots| slots.len() >= self.per_prefix.max(1)) {
 			let Some(oldest) = t.by_prefix.get_mut(&prefix).and_then(VecDeque::pop_front) else { break };
@@ -403,8 +527,8 @@ pub(crate) fn count_session(rt: &Arc<Runtime>, limiter: Option<&Limiter>) -> (Co
 /// all taken, the oldest session of any rule not replied to gives its up (`Ticket::force`:
 /// counted over until that session has ended, a moment later, within half the budget's
 /// reserve). None: none to give.
-fn session_ticket() -> Option<Ticket> {
-	Ticket::take(1).or_else(|| if ALL_UNREPLIED.evict_oldest() { Ticket::force(1) } else { None })
+fn session_ticket(client: IpAddr) -> Option<Ticket> {
+	Ticket::take(1).or_else(|| if ALL_UNREPLIED.evict_for(client) { Ticket::force(1) } else { None })
 }
 
 /// Serves one socket of one port of the rule; `offset` is the port's place in a
@@ -553,15 +677,15 @@ fn open(
 		}
 	};
 	// within the source's own limits: only now does an older session make room (#354)
-	if over && !rt.udp_unreplied.evict_oldest() {
+	if over && !rt.udp_unreplied.evict_for(client.ip()) {
 		limits::refused(rt, client, Reason::MaxConnections, "udp");
 		return None;
 	}
-	let Some(ticket) = session_ticket() else {
+	let Some(ticket) = session_ticket(client.ip()) else {
 		limits::refused(rt, client, Reason::FdBudget, "udp");
 		return None;
 	};
-	let mark = rt.udp_unreplied.track(shard.ended.child_token());
+	let mark = rt.udp_unreplied.track(client.ip(), shard.ended.child_token());
 	let admitted = Admitted { _permit: permit, _counted: counted, _ticket: ticket, mark };
 	let id = next_id.fetch_add(1, Ordering::Relaxed);
 	let (tx, rx) = mpsc::channel(SESSION_QUEUE);
@@ -1486,21 +1610,80 @@ mod tests {
 	#[test]
 	fn the_oldest_unreplied_session_is_evicted() {
 		let unreplied = Unreplied::default();
-		let marks: Vec<Mark> = (0..3).map(|_| unreplied.track(CancellationToken::new())).collect();
+		let marks: Vec<Mark> = (0..3).map(|_| unreplied.track(ip("192.0.2.1"), CancellationToken::new())).collect();
 		marks[0].replied();
 		assert_eq!(unreplied.waiting(), 2);
-		assert!(unreplied.evict_oldest());
+		assert!(unreplied.evict_for(ip("192.0.2.1")));
 		assert!(!marks[0].stop().is_cancelled() && marks[1].stop().is_cancelled() && !marks[2].stop().is_cancelled());
 		assert_eq!((marks[1].stopped(), marks[2].stopped()), ("evicted", "stopped"));
 		drop(marks);
-		assert!(!unreplied.evict_oldest(), "ended sessions are not evicted");
+		assert!(!unreplied.evict_for(ip("192.0.2.1")), "ended sessions are not evicted");
 		// many sessions answered at once: the queue is cleared out as it goes
 		for _ in 0..10_000 {
-			unreplied.track(CancellationToken::new()).replied();
+			unreplied.track(ip("192.0.2.1"), CancellationToken::new()).replied();
 		}
-		assert!(unreplied.order.lock().unwrap().len() <= 2 * 64 + 1);
-		let last = unreplied.track(CancellationToken::new());
-		assert!(unreplied.evict_oldest() && last.stop().is_cancelled());
+		assert!(unreplied.lock().order.len() <= 2 * 64 + 1);
+		let last = unreplied.track(ip("192.0.2.1"), CancellationToken::new());
+		assert!(unreplied.evict_for(ip("192.0.2.1")) && last.stop().is_cancelled());
+	}
+
+	fn v4(n: u32) -> IpAddr {
+		IpAddr::from(n.to_be_bytes())
+	}
+
+	// #366: a flood from one prefix pushes out its own unreplied sessions, not those of other prefixes
+	#[test]
+	fn a_flooding_prefix_evicts_its_own() {
+		let unreplied = Unreplied::default();
+		// a client of another network, waiting for its reply since before the flood
+		let legit = unreplied.track(v4(0x0a00_0001), CancellationToken::new());
+		let flood: Vec<Mark> = (0..10).map(|i| unreplied.track(v4(0xc000_0200 + i), CancellationToken::new())).collect();
+		// at the cap, a new session of the flood's /24 evicts the flood's oldest
+		assert!(unreplied.evict_for(v4(0xc000_02ff)));
+		assert!(flood[0].stop().is_cancelled() && !legit.stop().is_cancelled());
+		// a new client of a third network evicts the flood's oldest too: its prefix holds the most
+		assert!(unreplied.evict_for(v4(0x0b00_0001)));
+		assert!(flood[1].stop().is_cancelled() && !legit.stop().is_cancelled());
+		// IPv6: a /48
+		let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+		let six: Vec<Mark> = (0..20).map(|i| unreplied.track(v6(&format!("2001:db8:1:{i:x}::1")), CancellationToken::new())).collect();
+		assert!(unreplied.evict_for(v6("2001:db8:2::1")));
+		assert!(six[0].stop().is_cancelled() && !flood[2].stop().is_cancelled() && !legit.stop().is_cancelled());
+		// the prefixes as many as each other: the oldest of all goes
+		drop((flood, six));
+		let other = unreplied.track(v4(0x0c00_0001), CancellationToken::new());
+		assert!(unreplied.evict_for(v4(0x0d00_0001)));
+		assert!(legit.stop().is_cancelled() && !other.stop().is_cancelled());
+		assert_eq!(unreplied.waiting(), 1);
+	}
+
+	// #366: one prefix holds at most `unreplied_per_prefix` of a rule's unreplied sessions; past that its own oldest goes
+	#[test]
+	fn a_prefix_holds_at_most_its_share() {
+		let unreplied = Unreplied::default();
+		let share = unreplied_per_prefix();
+		assert_eq!(share, (DEFAULT_MAX_SESSIONS / UNREPLIED_PER_PREFIX_SHARE) as usize);
+		let legit = unreplied.track(v4(0x0a00_0001), CancellationToken::new());
+		let flood = |i: usize| v4(0xc000_0200 + (i % 256) as u32);
+		let marks: Vec<Mark> = (0..share + 3).map(|i| unreplied.track(flood(i), CancellationToken::new())).collect();
+		assert_eq!(marks.iter().filter(|m| m.stop().is_cancelled()).count(), 3);
+		assert!(marks[..3].iter().all(|m| m.stopped() == "evicted"));
+		assert!(!legit.stop().is_cancelled());
+		assert_eq!(unreplied.waiting(), share + 1);
+		// answered ones count no more: room again without evicting
+		marks[share].replied();
+		let next = unreplied.track(v4(0xc000_0201), CancellationToken::new());
+		assert!(!marks[3].stop().is_cancelled() && !next.stop().is_cancelled());
+		// many prefixes coming and going: the table of prefixes stays bounded
+		drop((marks, next));
+		for i in 0..10_000u32 {
+			unreplied.track(v4(i << 8), CancellationToken::new());
+		}
+		let t = unreplied.lock();
+		assert!(t.by_prefix.len() <= 2 * 64 + 1, "{}", t.by_prefix.len());
+		assert!(t.order.len() <= 2 * 64 + 1);
+		drop(t);
+		drop(legit);
 	}
 
 	// #354: large datagrams queue less deep than small ones
@@ -1523,7 +1706,7 @@ mod tests {
 	async fn quiet_sessions_end() {
 		let idle = Duration::from_secs(30);
 		let unreplied = Unreplied::default();
-		let mark = unreplied.track(CancellationToken::new());
+		let mark = unreplied.track(ip("192.0.2.1"), CancellationToken::new());
 		let start = tokio::time::Instant::now();
 		let mut quiet = Quiet::new(idle, &mark, 1);
 		assert_eq!(quiet.deadline(), start + UNREPLIED_TIMEOUT);
@@ -1545,13 +1728,13 @@ mod tests {
 		// a later run of the same session (a new QUIC connection) starts established
 		assert!(Quiet::new(idle, &mark, 1).established());
 		// two datagrams before any reply: established with the first reply
-		let other = unreplied.track(CancellationToken::new());
+		let other = unreplied.track(ip("192.0.2.1"), CancellationToken::new());
 		let mut quiet = Quiet::new(idle, &other, 2);
 		assert!(!quiet.established());
 		quiet.backend(&other);
 		assert!(quiet.established() && unreplied.waiting() == 0);
 		// a short udp_idle stays as short unreplied
-		let third = unreplied.track(CancellationToken::new());
+		let third = unreplied.track(ip("192.0.2.1"), CancellationToken::new());
 		let quiet = Quiet::new(Duration::from_secs(1), &third, 1);
 		assert_eq!(quiet.deadline(), tokio::time::Instant::now() + Duration::from_secs(1));
 	}
