@@ -148,11 +148,13 @@ pub struct Features {
 	/// (`tls.misdirected`, v0.4.3); `path_normalize` (paths and hosts normalised before routing),
 	/// `raw_path` (`http.raw_path`, to turn it off), `strict_path` (`http.strict_path`), `identity_headers` (identity headers of the
 	/// rule's authentication middlewares dropped from every request) and `http_timeouts`
-	/// (`global.http.timeouts`), all v0.4.17 (#320)
+	/// (`global.http.timeouts`), all v0.4.17 (#320); `pre_routing` (`http.pre_routing`, v0.4.22, #386)
 	pub http_options: &'static [&'static str],
 	/// Middleware kinds that `servers[].middlewares` may use (#229; `cors`, `redirect_scheme`,
 	/// `redirect_regex` and `mirror` since v0.4.3)
 	pub server_middleware_kinds: &'static [&'static str],
+	/// Middleware kinds that `http.pre_routing` may use (v0.4.22, #386)
+	pub pre_routing_kinds: &'static [&'static str],
 	/// Options of `forward_auth` (v0.4.3, the Gateway API's ExternalAuth): `service`, `grpc`,
 	/// `client_request`, `allow_status`, `forward_body`, `all_response_headers`
 	pub forward_auth: &'static [&'static str],
@@ -271,6 +273,7 @@ const HTTP_OPTIONS: &[&str] =
 	&[
 		"headers_add", "redirect_status", "route_timeouts", "server_middlewares", "server_status", "retry_status", "misdirected",
 		"path_normalize", "raw_path", "identity_headers", "http_timeouts", "strict_path",
+		"pre_routing",
 	];
 
 /// `features.performance`: the `global.performance` keys this build applies;
@@ -296,6 +299,7 @@ impl Features {
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
 		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
+		pre_routing_kinds: crate::l7::PRE_ROUTING_MIDDLEWARES,
 		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
 		tls_route_upstream: true,
@@ -355,6 +359,7 @@ impl Features {
 		services: &["health_check", "sticky", "balance", "outlier_detection", "protocol", "tls"],
 		http_options: HTTP_OPTIONS,
 		server_middleware_kinds: crate::l7::SERVER_MIDDLEWARES,
+		pre_routing_kinds: crate::l7::PRE_ROUTING_MIDDLEWARES,
 		forward_auth: FORWARD_AUTH,
 		tls_route_targets: true,
 		tls_route_upstream: true,

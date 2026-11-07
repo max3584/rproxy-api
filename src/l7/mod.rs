@@ -45,6 +45,11 @@ pub struct HttpSpec {
 	/// read differently from rproxy (`..;/`, a decoded `%2F`, double decoding; #320).
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub strict_path: bool,
+	/// Middlewares (names in `middlewares`) every request passes, in this order, before the
+	/// routes are matched (#386, the Gateway API's listener filters, GEP-5224): the routes then
+	/// see the path, headers and method as they left them. Kinds in `PRE_ROUTING_MIDDLEWARES`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_routing: Vec<String>,
 	#[serde(default)]
 	pub routes: Vec<RouteSpec>,
 	/// What a request that matches no route gets (404 when left out).
@@ -176,6 +181,14 @@ pub struct ServerSpec {
 pub const SERVER_MIDDLEWARES: &[&str] = &[
 	"headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex", "cors", "redirect_scheme",
 	"redirect_regex", "mirror", "forward_auth",
+];
+
+/// Middleware kinds that `http.pre_routing` may use (#386): all but those tied to the route or
+/// its backend (`retry`, `mirror`, `cache`) and `replace_host` (Host is not changed before routing).
+pub const PRE_ROUTING_MIDDLEWARES: &[&str] = &[
+	"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
+	"respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "circuit_breaker", "errors", "basic_auth",
+	"forward_auth", "oidc", "geoip", "cors",
 ];
 
 /// The service a middleware sends to besides the request's (`mirror`, `forward_auth` with `service`).
@@ -899,6 +912,19 @@ impl HttpSpec {
 		for (name, mw) in &self.middlewares {
 			mw.validate(name, &self.services)?;
 		}
+		for m in &self.pre_routing {
+			match self.middlewares.get(m) {
+				None => return Err(invalid(format!("pre_routing: middleware {m:?} is not defined"))),
+				Some(spec) if !PRE_ROUTING_MIDDLEWARES.contains(&spec.kind()) => {
+					return Err(invalid(format!(
+						"pre_routing: middleware {m:?} ({}) cannot run before routing; only {}",
+						spec.kind(),
+						PRE_ROUTING_MIDDLEWARES.join(", ")
+					)));
+				}
+				Some(_) => {}
+			}
+		}
 		let mut seen = std::collections::HashSet::new();
 		for r in &self.routes {
 			if r.name.is_empty() || !seen.insert(r.name.as_str()) {
@@ -1007,6 +1033,9 @@ impl HttpSpec {
 		}
 		if self.routes.iter().any(|r| r.timeouts.is_some()) {
 			used.push("route_timeouts");
+		}
+		if !self.pre_routing.is_empty() {
+			used.push("pre_routing");
 		}
 		if self.raw_path {
 			used.push("raw_path");
