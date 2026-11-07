@@ -186,6 +186,10 @@ pub struct State {
 	/// The `global` values set through the API (#342), put in force before the rules.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub global: Option<crate::config::global::Handoff>,
+	/// The storages and secrets of the `global.acme`s the old process had (#389): rules
+	/// may not name them here either (`protected::acme_seen`). Empty from an older process.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub acme_protected: Vec<crate::net::protected::Entry>,
 }
 
 /// A rule restored from the database that did not validate (#327), as handed over.
@@ -613,6 +617,7 @@ async fn snapshot(registry: &Registry) -> State {
 		invalid_rules,
 		owners,
 		global,
+		acme_protected: crate::net::protected::acme_seen(),
 	}
 }
 
@@ -805,6 +810,8 @@ impl State {
 	/// with who made them, when, and whether their row was up to date; then the
 	/// rule sets.
 	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
+		// the previous `global.acme`s' storages and secrets stay protected (#389)
+		crate::net::protected::adopt_acme_seen(self.acme_protected.clone());
 		// the global values set through the API first: rules using crowdsec need it (#342)
 		if let Some(g) = &self.global {
 			let settings = registry.global();
@@ -1017,5 +1024,34 @@ mod tests {
 		let after = Counters { fd_budget: 6, ..before.clone() };
 		assert_eq!(after.since(&Counters { fd_budget: 2, ..before.clone() }).fd_budget, 4);
 		assert_eq!(read.fd_budget, 0, "the state of a process before #373");
+	}
+
+	/// The previous `global.acme`s' storages and secrets go to the new process and stay
+	/// protected there (#389); an older process's state has none.
+	#[tokio::test]
+	async fn the_previous_acme_storages_are_handed_over() {
+		use crate::net::protected::{Entry, acme_seen, current};
+		let storage = std::env::temp_dir().join(format!("rproxy-handoff-acme-seen-{}", std::process::id()));
+		let entry = Entry::tree("under the ACME storage (global.acme.storage)", &storage);
+		let sent = State { acme_protected: vec![entry.clone()], ..Default::default() };
+		let read: State = serde_json::from_str(&serde_json::to_string(&sent).unwrap()).unwrap();
+		assert_eq!(read.acme_protected, vec![entry.clone()]);
+		let older: State = serde_json::from_str(r#"{"version":"0.4.21","process_start_time":"1","rules":[],"counters":[]}"#).unwrap();
+		assert!(older.acme_protected.is_empty());
+		assert!(!serde_json::to_value(&older).unwrap().as_object().unwrap().contains_key("acme_protected"), "nothing to send: left out");
+		let registry = Registry::new(crate::core::registry::Config {
+			dns_interval: Duration::from_secs(30),
+			lookup: crate::core::resolve::system_lookup(),
+			transparent: false,
+			transparent_ipv6: false,
+			max_range_ports: 100,
+			reserved: vec![],
+			http: Arc::new(crate::l7::access::HttpGlobal::default()),
+		});
+		read.restore_rules(&registry).await;
+		assert!(acme_seen().contains(&entry));
+		assert!(current(None, None).contains(&entry), "protected in the new process");
+		read.restore_rules(&registry).await;
+		assert_eq!(acme_seen().iter().filter(|e| **e == entry).count(), 1, "not twice");
 	}
 }

@@ -522,8 +522,9 @@ struct NewAcme {
 	acme: Option<Arc<Acme>>,
 	addrs: Vec<std::net::SocketAddr>,
 	bound: crate::acme::challenge::Bound,
-	/// What `Acme::carry_files` found (the files copied before the rules lock).
-	held: std::collections::BTreeMap<crate::acme::CertId, Option<(i64, i64)>>,
+	/// What `Acme::carry_files` found and copied before the rules lock (the copies are put
+	/// in place by `commit`; dropped with the change when it is refused, #389).
+	carried: crate::acme::Carried,
 }
 
 /// The live items built for a change, swapped in by `commit`.
@@ -678,15 +679,16 @@ async fn build_item(
 					"HTTP-01 is answered only by http rules on this address");
 			}
 			// the certificates of the acme in force carried to a new storage: file IO, done
-			// here (off the async workers, before the rules lock); `commit` takes the state
-			let held = match (&acme, registry.acme()) {
+			// here (off the async workers, before the rules lock), staged in that storage;
+			// `commit` puts them in place and takes the state
+			let carried = match (&acme, registry.acme()) {
 				(Some(new), Some(old)) => {
 					let new = new.clone();
 					tokio::task::spawn_blocking(move || new.carry_files(&old)).await.unwrap_or_default()
 				}
 				_ => Default::default(),
 			};
-			built.acme = Some(NewAcme { acme, addrs, bound, held });
+			built.acme = Some(NewAcme { acme, addrs, bound, carried });
 		}
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
@@ -1285,18 +1287,19 @@ fn acme_secrets_in_files(a: &AcmeGlobal) -> Result<(), String> {
 			let here = |m: String| format!("global.acme.dns_providers.{name}.{call}: {m} (through the API, credentials come from secret_file as {{secret}})");
 			let (base, query) = c.url.split_once('?').unwrap_or((&c.url, ""));
 			let rest = base.split_once("://").map_or(base, |(_, r)| r);
-			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+			let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
 			if authority.contains('@') {
 				return Err(here("the url names a user".into()));
 			}
-			// paths are logged and shown: no secret there
-			if path.contains("{secret}") {
-				return Err(here("{secret} in the url's path (put it in a header or the query)".into()));
+			// URLs are logged and shown: no secret anywhere in them, path or query (as
+			// `AcmeGlobal::check` says for the file's too), and no credential-looking query parameter
+			if c.url.contains("{secret}") {
+				return Err(here("{secret} in the url (put it in a header or the body)".into()));
 			}
 			for pair in query.split('&').filter(|p| !p.is_empty()) {
-				let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-				if (names_a_secret(k) || v.contains("{secret}")) && v != "{secret}" {
-					return Err(here(format!("the url's {k} must be exactly {{secret}}")));
+				let k = pair.split_once('=').map_or(pair, |(k, _)| k);
+				if names_a_secret(k) {
+					return Err(here(format!("the url's {k} names a credential (send it in a header or the body as {{secret}})")));
 				}
 			}
 			for (h, v) in &c.headers {
@@ -1415,11 +1418,13 @@ fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
 		registry.http_global().set_geoip(new)
 	});
 	let acme = acme.map(|a| {
-		let NewAcme { acme, addrs, bound, held } = a;
+		let NewAcme { acme, addrs, bound, carried } = a;
 		let old = registry.acme();
-		// memory only under the rules lock; what `old` does after this is taken over
-		// again once it has stopped (`Acme::spawn`)
+		// under the rules lock: the copies renamed into place (a few renames and directory syncs, before rules can
+		// take files from the new storage) and the state in memory; what `old` does after
+		// this is taken over again once it has stopped (`Acme::spawn`)
 		if let (Some(new), Some(old)) = (&acme, &old) {
+			let held = carried.place();
 			new.inherit(old, &held, false);
 		}
 		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
@@ -2441,7 +2446,7 @@ mod tests {
 				"add": {"url": url, "headers": headers, "body": body}}});
 			acme_secrets_in_files(&acme_spec(v))
 		};
-		call("https://h/add?fqdn={fqdn}&token={secret}", json!({"Authorization": "Bearer {secret}", "Accept": "application/json"}), Some("{\"name\":\"{fqdn}\"}"))
+		call("https://h/add?fqdn={fqdn}", json!({"Authorization": "Bearer {secret}", "Accept": "application/json"}), Some("{\"name\":\"{fqdn}\"}"))
 			.unwrap();
 		for (url, headers, body) in [
 			("https://u:p@h/add", json!({}), None),
@@ -2454,6 +2459,10 @@ mod tests {
 			("https://h/add", json!({"X-Api-Key": "k-{secret}"}), None),
 			("https://h/add", json!({"X-Other": "{secret}{secret}"}), None),
 			("https://h/add?token=x{secret}", json!({}), None),
+			// no {secret} anywhere in the url, nor a credential-looking query parameter
+			("https://h/add?token={secret}", json!({}), None),
+			("https://h/add?x={secret}", json!({}), None),
+			("https://h/add?api_key={fqdn}", json!({}), None),
 			("https://h/{secret}/add", json!({}), None),
 		] {
 			assert!(call(url, headers.clone(), body).is_err(), "{url} {headers} {body:?}");
