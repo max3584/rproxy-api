@@ -329,8 +329,9 @@ pub struct Registry {
 	config_status: RwLock<Option<ConfigStatus>>,
 	/// Every certificate the rules use, loaded once and shared.
 	certs: CertStore,
-	/// `global.acme`: certificates of `tls.certificates[].acme` (set once at startup).
-	acme: std::sync::OnceLock<Arc<crate::acme::Acme>>,
+	/// `global.acme`: certificates of `tls.certificates[].acme`; swapped by `set_acme`
+	/// (`PATCH /config/global`, a reload of the settings file, #345).
+	acme: std::sync::RwLock<Option<Arc<crate::acme::Acme>>>,
 	/// `rproxy_rules`: rules of `persist: true` tokens (#144; set once at startup).
 	persist: std::sync::OnceLock<Arc<crate::config::persist::Store>>,
 	/// Rule sets (`PUT /rulesets/{name}`, #28); in memory only.
@@ -517,7 +518,7 @@ impl Registry {
 			next_generation: AtomicU64::new(1),
 			config_status: RwLock::default(),
 			certs: CertStore::default(),
-			acme: std::sync::OnceLock::new(),
+			acme: Default::default(),
 			persist: std::sync::OnceLock::new(),
 			rulesets: Default::default(),
 			conditions: Default::default(),
@@ -644,28 +645,78 @@ impl Registry {
 		&self.readiness
 	}
 
-	/// Sets `global.acme` (before rules are loaded). A certificate written by
-	/// ACME is swapped in like a certificate file that changed.
-	pub fn set_acme(self: &Arc<Self>, acme: Arc<crate::acme::Acme>) {
-		let weak = Arc::downgrade(self);
-		acme.set_on_change(Box::new(move || {
-			if let Some(registry) = weak.upgrade() {
-				tokio::spawn(async move {
-					let (ok, failed) = registry.reload_changed_tls().await;
-					info!(event = "reload.tls", part = "acme", reloaded = ok, failed);
-				});
-			}
-		}));
-		let _ = self.acme.set(acme);
+	/// Sets `global.acme` (at the start before rules are loaded; while running under the
+	/// rules lock, #345) and returns the one it replaces (the caller stops it after the
+	/// lock: `acme_swapped`). A certificate written by ACME is swapped in like a
+	/// certificate file that changed.
+	pub fn set_acme(self: &Arc<Self>, acme: Option<Arc<crate::acme::Acme>>) -> Option<Arc<crate::acme::Acme>> {
+		if let Some(acme) = &acme {
+			let weak = Arc::downgrade(self);
+			acme.set_on_change(Box::new(move || {
+				if let Some(registry) = weak.upgrade() {
+					tokio::spawn(async move {
+						let (ok, failed) = registry.reload_changed_tls().await;
+						info!(event = "reload.tls", part = "acme", reloaded = ok, failed);
+					});
+				}
+			}));
+		}
+		std::mem::replace(&mut *self.acme.write().unwrap_or_else(|e| e.into_inner()), acme)
 	}
 
-	pub fn acme(&self) -> Option<&Arc<crate::acme::Acme>> {
-		self.acme.get()
+	pub fn acme(&self) -> Option<Arc<crate::acme::Acme>> {
+		self.acme.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// After `set_acme` swapped a new `global.acme` in (#345), with the rules lock let go:
+	/// the one replaced stops (its order in flight gives up and removes its TXT records;
+	/// the new one starts once it has, up to `acme::RETIRE_WAIT`), the rules with ACME
+	/// certificates take their files from the new storage (a stand-in until issued),
+	/// and the new one is told which certificates the rules want.
+	pub async fn acme_swapped(self: &Arc<Self>, old: Option<Arc<crate::acme::Acme>>) {
+		let new = self.acme();
+		match &new {
+			Some(n) => n.spawn(old),
+			None => {
+				if let Some(o) = old {
+					o.shutdown();
+				}
+			}
+		}
+		let changed: HashSet<Source> = {
+			let rules = self.rules.lock().await;
+			rules
+				.values()
+				.flat_map(|e| self.sources(&e.spec().tls))
+				.map(|(_, s)| s)
+				.filter(|s| matches!(s, Source::Acme { .. }))
+				.collect()
+		};
+		if !changed.is_empty() {
+			let (ok, failed) = self.apply_certs(&certstore::Changes { changed, failed: HashSet::new() }, false).await;
+			info!(event = "reload.tls", part = "acme", reason = "global.acme changed", reloaded = ok, failed);
+		}
+		self.gc_certs().await;
+	}
+
+	/// The addresses of `global.acme.http01_listen` in force (rules may not take them).
+	pub fn http01_listen(&self) -> Vec<SocketAddr> {
+		self.acme().map(|a| a.http01_listen().to_vec()).unwrap_or_default()
+	}
+
+	/// A rule with ACME certificates needs the resolver and the names it asks for in
+	/// the `global.acme` in force: checked again with the rules lock held, right before
+	/// it goes into the table, so a `global` change cannot take them away in between (#345).
+	fn acme_gate(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+		if spec.tls.certificates.iter().any(|c| c.acme.is_some()) {
+			self.check_acme(spec)?;
+		}
+		Ok(())
 	}
 
 	/// The certificate files a rule's TLS settings use (ACME ones included).
 	fn sources(&self, tls: &tlsconf::TlsSpec) -> Vec<(tlsconf::CertRole, Source)> {
-		certstore::sources_with(tls, self.acme().map(|a| a.as_ref()))
+		certstore::sources_with(tls, self.acme().as_deref())
 	}
 
 	/// Checks the ACME certificates of a rule: `global.acme` is set, the
@@ -674,7 +725,7 @@ impl Registry {
 		for c in &spec.tls.certificates {
 			let Some(resolver) = &c.acme else { continue };
 			let acme = self.acme().ok_or_else(|| {
-				ApiError::invalid(format!("acme resolver {resolver:?}: global.acme is not configured in the settings file (RPROXY_CONFIG)"))
+				ApiError::invalid(format!("acme resolver {resolver:?}: global.acme is not configured (the settings file or PATCH /config/global)"))
 			})?;
 			if spec.key.protocol != Protocol::Tcp {
 				return Err(ApiError::tls_config("acme certificates are for tcp rules (DTLS takes cert_file / key_file)"));
@@ -728,7 +779,7 @@ impl Registry {
 	fn build_tls(&self, spec: &RuleSpec) -> Result<TlsRuntime, ApiError> {
 		let tls = spec.runtime_tls();
 		self.check_acme(spec)?;
-		let loaded = self.certs.rule_certs_with(&tls, self.acme().map(|a| a.as_ref()))?;
+		let loaded = self.certs.rule_certs_with(&tls, self.acme().as_deref())?;
 		TlsRuntime::build(spec.key.protocol, &tls, spec.starttls, spec.starttls_required, &loaded)
 	}
 
@@ -762,8 +813,9 @@ impl Registry {
 		let start = u32::from(spec.key.listen.port());
 		let end = start + u32::from(spec.port_count) - 1;
 		let ips = spec.listen_ips();
-		// the control API's own sockets may be dual-stack
-		self.cfg.reserved.iter().copied().find(|r| {
+		// the control API's own sockets may be dual-stack; global.acme.http01_listen (#345)
+		let http01 = self.http01_listen();
+		self.cfg.reserved.iter().chain(http01.iter()).copied().find(|r| {
 			(start..=end).contains(&u32::from(r.port())) && ips.iter().any(|ip| crate::net::listen::clash(*ip, spec.v6only(), r.ip(), false))
 		})
 	}
@@ -1174,6 +1226,7 @@ impl Registry {
 		// called with the rules lock held (#342)
 		self.crowdsec_gate(&spec)?;
 		self.geoip_gate(&spec)?;
+		self.acme_gate(&spec)?;
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
 		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[]);
@@ -1579,6 +1632,7 @@ impl Registry {
 		}
 		self.crowdsec_gate(&spec)?;
 		self.geoip_gate(&spec)?;
+		self.acme_gate(&spec)?;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
@@ -1739,7 +1793,7 @@ impl Registry {
 		}
 		let global = self.http_global();
 		let crowdsec = global.crowdsec();
-		let entries = crate::net::protected::current(self.acme().map(|a| a.as_ref()), crowdsec.as_ref().map(|b| b.key_file()));
+		let entries = crate::net::protected::current(self.acme().as_deref(), crowdsec.as_ref().map(|b| b.key_file()));
 		for f in refs {
 			if crate::net::protected::protecting(&f.path, &entries).is_some() {
 				warn!(event = "rule.protected_file", rule, field = %f.field, phase,
@@ -2771,9 +2825,22 @@ fn rules_use(rules: &HashMap<Key, Entry>) -> crate::config::global::RulesUse {
 				out.crowdsec.appsec |= *appsec;
 			}
 		}
-		// the settings file's rules are checked against its own global.geoip, which wins
+		// the settings file's rules are checked against its own global.geoip and
+		// global.acme, which win
 		if spec.origin != Origin::Static {
 			out.geoip.add(crate::config::global::GeoipUse::of(spec));
+			for c in &spec.tls.certificates {
+				if let Some(resolver) = &c.acme {
+					out.acme.insert((resolver.clone(), c.domains.clone()));
+				}
+			}
+		}
+		out.sockets += crate::core::quota::sockets(spec);
+		if spec.key.protocol == Protocol::Tcp {
+			let start = spec.key.listen.port();
+			let end = start.saturating_add(spec.port_count.max(1) - 1);
+			let key = spec.key.to_string();
+			out.tcp.push(crate::config::global::Listening { key, ips: spec.listen_ips(), v6only: spec.v6only(), ports: (start, end) });
 		}
 	}
 	out

@@ -97,6 +97,11 @@ struct Options {
 	/// (`global.geoip`); unset, the API cannot set them (#345)
 	#[arg(long, env = "RPROXY_API_GEOIP_DIR")]
 	api_geoip_dir: Option<PathBuf>,
+	/// The directory the files of global.acme set through PATCH /config/global must be
+	/// in (secrets right in it, storage under it); unset, the API's acme names no file and
+	/// keeps the default storage (#345)
+	#[arg(long, env = "RPROXY_API_ACME_DIR")]
+	api_acme_dir: Option<PathBuf>,
 	/// Number of rotated log files to keep
 	#[arg(long, env = "RPROXY_LOG_KEEP", default_value_t = 14)]
 	log_keep: usize,
@@ -970,8 +975,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		warn!(event = "degraded", part = "global.acme.storage", error = %e,
 			"certificates cannot be stored; rules with acme certificates serve a self-signed one until this is fixed");
 	}
-	let mut reserved: Vec<SocketAddr> = addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect();
-	reserved.extend(acme.iter().flat_map(|a| a.http01_listen().to_vec()));
+	// global.acme.http01_listen is checked against the acme in force (Registry::reserved_clash, #345)
+	let reserved: Vec<SocketAddr> = addrs.iter().map(|ip| SocketAddr::new(*ip, opts.api_port)).collect();
 
 	let transparent = source::transparent_available();
 	let transparent_ipv6 = source::transparent_v6_available();
@@ -988,7 +993,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	});
 	registry.certs().set_warn_days(opts.cert_warn_days);
 	if let Some(a) = &acme {
-		registry.set_acme(a.clone());
+		registry.set_acme(Some(a.clone()));
 	}
 	if let Some(cert) = &opts.tls_cert {
 		note_api_cert(&registry, cert);
@@ -1049,6 +1054,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			main_log: opts.log_file.clone(),
 			database,
 			geoip_dir: opts.api_geoip_dir.clone(),
+			acme_dir: opts.api_acme_dir.clone(),
 			..Default::default()
 		};
 		registry.global().init(doc.as_ref().map(|(_, d)| (&d.global, &d.global_raw)), env, startup, options);
@@ -1078,8 +1084,10 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if let (Some(path), Some(error)) = (&config_path, config_unread) {
 		registry.set_config_status(ConfigStatus { path: path.display().to_string(), error: Some(error), ..Default::default() });
 	}
-	if let Some(a) = &acme {
-		for (addr, e) in a.spawn().await {
+	// the settings file's (a value restored from the database was started when it was put in force, #345)
+	if let Some(a) = registry.acme().filter(|now| acme.as_ref().is_some_and(|a| Arc::ptr_eq(a, now))) {
+		a.spawn(None);
+		for (addr, e) in rproxy_api::acme::challenge::set_http01(a.http01_listen()).await {
 			warn!(event = "degraded", part = "global.acme.http01_listen", addr = %addr, error = %e,
 				"HTTP-01 is answered only by http rules on this address");
 		}
@@ -1290,9 +1298,11 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if let Some(g) = registry.http_global().geoip() {
 		g.stop();
 	}
-	if let Some(a) = &acme {
+	// the acme in force (PATCH /config/global or a reload may have replaced the start's, #345)
+	if let Some(a) = registry.acme() {
 		a.shutdown();
 	}
+	rproxy_api::acme::challenge::install_http01(&[], Default::default());
 	// after a handoff the rules stop accepting at once and drain meanwhile
 	let runtimes = if handed.is_some() { registry.runtimes().await } else { vec![] };
 	let drain = upgrader.config().drain;

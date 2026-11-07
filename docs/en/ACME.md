@@ -14,7 +14,14 @@ Use `http-01` / `tls-alpn-01` first: they need no right to change DNS. Keep `dns
 
 ## Settings
 
-ACME is set up (accounts, DNS providers, resolvers, allowed names) only in `global.acme` of the settings file (`RPROXY_CONFIG`). Rules made through the API refer to a resolver by name; secrets (DNS API keys and the like) cannot be created, read or changed through the API. Changes to `global` take effect after a restart (`restart_needed` in `GET /config`).
+ACME is set up (accounts, DNS providers, resolvers, allowed names) in `global.acme` of the settings file (`RPROXY_CONFIG`). Rules made through the API refer to a resolver by name; secrets (DNS API keys and the like) cannot be created, read or changed through the API.
+
+Since v0.4.22 (#345, `features.global_api_acme`), `global.acme` can change while running: by a reload of the settings file and, when the file leaves it out, by `acme` in `PATCH /config/global` (`admin`, only over the Unix socket by default; "The global settings API" in docs/API.md). A new `Acme` is built first and then swapped in:
+
+- An order in flight gives up and removes the TXT records it wrote (`acme.dns` with `reason: stopped`) before the new settings start (the old ones are waited for up to 60 seconds). The rate limit's count and, with the same `storage`, each certificate's wait after failures and renewal window are carried over (a change does not order again at once).
+- When `storage` changes, the rules take their certificates from the new place (a self-signed stand-in until obtained there). `http01_listen` keeps the addresses that stay open, closes those removed and opens those added.
+- A change that removes a resolver (or names) rules use is `409 in_use` (so is clearing `acme`). A reload of the settings file keeps the one in force instead (`config.global_in_use`, `kept` in `GET /config/global`).
+- `acme` set through the API holds no secret: it names files only (an `http` provider's credentials cannot be written in headers, URLs or bodies; they come from `secret_file` as `{secret}`; no account `key_file`: the key is made in `storage`). The files must be right in `RPROXY_API_ACME_DIR` (`storage` a directory under it; unset, no file can be named and `storage` is the default), and `http01_listen` counts in `RPROXY_MAX_LISTENERS` (`409 limit` beyond). It cannot take a rule's or the control API's address (`409 in_use`).
 
 ```yaml
 # /etc/rproxy/rproxy.yaml

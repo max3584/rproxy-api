@@ -255,6 +255,12 @@ pub struct Features {
 	/// rules' geoip lists need is `409 in_use`; databases set through the API are files right
 	/// in `RPROXY_API_GEOIP_DIR`
 	pub global_api_geoip: bool,
+	/// `global.acme` through `PATCH /config/global` (only over the Unix socket by default) and a
+	/// reload of the settings file, while running (#345): rebuilt and swapped (orders in flight
+	/// give up and remove their TXT records); taking away a resolver or names the rules use is
+	/// `409 in_use`; files only right in `RPROXY_API_ACME_DIR`, no inline secret, no `key_file`;
+	/// `http01_listen` within `RPROXY_MAX_LISTENERS`
+	pub global_api_acme: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -330,6 +336,7 @@ impl Features {
 		http_stream_limits: true,
 		db_connect_timeout: true,
 		global_api_geoip: true,
+		global_api_acme: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -388,6 +395,7 @@ impl Features {
 		http_stream_limits: true,
 		db_connect_timeout: true,
 		global_api_geoip: true,
+		global_api_acme: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

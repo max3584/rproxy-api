@@ -223,7 +223,13 @@ pub struct Acme {
 	on_change: OnceLock<OnChange>,
 	clients: tokio::sync::Mutex<HashMap<String, Account>>,
 	stop: CancellationToken,
+	/// The task of `spawn`, waited for by the `Acme` that replaces this one (#345).
+	task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
+
+/// How long a new `Acme` waits for the one it replaces to finish its order in flight
+/// and remove the TXT records it wrote (#345), before it starts anyway.
+pub const RETIRE_WAIT: Duration = Duration::from_secs(60);
 
 impl std::fmt::Debug for Acme {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,12 +340,39 @@ impl Acme {
 			on_change: OnceLock::new(),
 			clients: tokio::sync::Mutex::default(),
 			stop: CancellationToken::new(),
+			task: Mutex::default(),
 			global: global.clone(),
 		}))
 	}
 
 	pub fn storage(&self) -> &Path {
 		&self.storage
+	}
+
+	/// `global.acme` as given.
+	pub fn global(&self) -> &AcmeGlobal {
+		&self.global
+	}
+
+	/// Takes over what `old` (the `Acme` this one replaces, #345) knows that the files
+	/// do not tell: the orders within the rate limit's period, and, with the same
+	/// storage, each certificate's failures, next attempt and renewal window (a change
+	/// of the settings does not order again at once what just failed).
+	pub fn inherit(&self, old: &Acme) {
+		let old_state = old.state.lock().unwrap_or_else(|e| e.into_inner());
+		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		state.orders = old_state.orders.clone();
+		if old.storage == self.storage {
+			for (id, m) in &old_state.certs {
+				let mut kept = Managed::new(m.issued);
+				kept.next_try = m.next_try;
+				kept.failures = m.failures;
+				kept.error = m.error.clone();
+				kept.ari = m.ari;
+				kept.ari_check = m.ari_check;
+				state.certs.insert(id.clone(), kept);
+			}
+		}
 	}
 
 	/// The addresses of `http01_listen` (rules may not take them).
@@ -502,23 +535,38 @@ impl Acme {
 	}
 
 	/// Starts the task that obtains and renews certificates (and removes TXT
-	/// records left over from before), and the HTTP-01 responder. Returns the
-	/// addresses of `http01_listen` that could not be opened.
-	pub async fn spawn(self: &Arc<Self>) -> Vec<(SocketAddr, String)> {
-		let mut failed = vec![];
-		for addr in &self.http01_listen {
-			match challenge::serve_http01(*addr, self.stop.clone()).await {
-				Ok(()) => info!(event = "acme.listening", addr = %addr),
-				Err(e) => failed.push((*addr, e.to_string())),
-			}
-		}
+	/// records left over from before). `after`: the `Acme` this one replaces (#345),
+	/// whose order in flight is finished (its TXT records removed) before this one
+	/// starts, up to `RETIRE_WAIT`. The HTTP-01 responders of `http01_listen` are the
+	/// process's (`challenge::set_http01`).
+	pub fn spawn(self: &Arc<Self>, after: Option<Arc<Acme>>) {
 		let me = self.clone();
+		let mut after = after;
 		// started again if it panics (#358)
-		crate::core::supervise::spawn("acme", move || {
+		let task = crate::core::supervise::spawn("acme", move || {
 			let me = me.clone();
-			async move { me.run().await }
+			let after = after.take();
+			async move {
+				if let Some(old) = after {
+					if !old.stopped(RETIRE_WAIT).await {
+						warn!(event = "acme.error", part = "swap", wait_secs = RETIRE_WAIT.as_secs(),
+							"the replaced global.acme has not finished its order; starting anyway");
+					}
+				}
+				me.run().await
+			}
 		});
-		failed
+		*self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+	}
+
+	/// Stops the task (`shutdown`) and waits up to `within` for it to end; true when it did.
+	pub async fn stopped(&self, within: Duration) -> bool {
+		self.stop.cancel();
+		let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+		match task {
+			Some(t) => tokio::time::timeout(within, t).await.is_ok(),
+			None => true,
+		}
 	}
 
 	pub fn shutdown(&self) {
@@ -708,10 +756,12 @@ impl Acme {
 			}
 			let renewal = self.status(&id).is_some_and(|s| s.not_after.is_some());
 			info!(event = "acme.order", resolver = %id.resolver, domains = ?id.domains, renewal);
-			let result = tokio::select! {
-				_ = self.stop.cancelled() => return,
-				r = self.issue(&id) => r,
-			};
+			// stopped (a change of global.acme, #345, or the end): the order gives up
+			// and removes the TXT records it wrote before this returns
+			let result = self.issue(&id).await;
+			if self.stop.is_cancelled() {
+				return;
+			}
 			let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(m) = state.certs.get_mut(&id) else { continue };
 			match result {
@@ -822,8 +872,24 @@ impl Acme {
 	}
 
 	/// One order: answer the challenges, finalize, write the certificate.
-	/// Returns its validity.
+	/// Returns its validity. Stopped meanwhile (#345), it gives up; either way the
+	/// answers are withdrawn and the TXT records written are removed.
 	async fn issue(&self, id: &CertId) -> Result<(i64, i64), String> {
+		let mut answers = challenge::Answers::default();
+		let mut records: Vec<dns::Written> = vec![];
+		let result = tokio::select! {
+			_ = self.stop.cancelled() => Err("stopped (global.acme changed, or rproxy is stopping)".to_string()),
+			r = self.order(id, &mut answers, &mut records) => r,
+		};
+		drop(answers);
+		if !records.is_empty() {
+			let reason = if self.stop.is_cancelled() { "stopped" } else { "validated" };
+			dns::remove_all(&self.dns, &self.journal, &records, reason).await;
+		}
+		result
+	}
+
+	async fn order(&self, id: &CertId, answers: &mut challenge::Answers, records: &mut Vec<dns::Written>) -> Result<(i64, i64), String> {
 		let r = self.resolvers.get(&id.resolver).ok_or("the resolver is no longer configured")?;
 		// the settings may have changed since the rule was checked
 		self.global.check_names(&id.resolver, &id.domains)?;
@@ -855,8 +921,6 @@ impl Acme {
 		let provider = r.dns_provider.as_deref();
 
 		// first the answers for every authorization, then tell the CA
-		let mut answers = challenge::Answers::default();
-		let mut records: Vec<dns::Written> = vec![];
 		{
 			let mut authorizations = order.authorizations();
 			while let Some(authz) = authorizations.next().await {
@@ -882,12 +946,7 @@ impl Acme {
 				debug!(event = "acme.challenge", resolver = %id.resolver, domain, challenge = r.challenge.as_str());
 			}
 		}
-		let result = self.validate_and_finalize(&mut order, kind, &records, id).await;
-		drop(answers);
-		if !records.is_empty() {
-			dns::remove_all(&self.dns, &self.journal, &records, "validated").await;
-		}
-		result
+		self.validate_and_finalize(&mut order, kind, records, id).await
 	}
 
 	async fn validate_and_finalize(

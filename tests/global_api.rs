@@ -977,3 +977,59 @@ async fn a_reload_swaps_geoip_and_keeps_what_rules_need() {
 	assert!(view(&unix).await["items"]["geoip"].get("kept").is_none());
 	fs::remove_dir_all(dir).unwrap();
 }
+
+/// `global.acme` from the file (#345): a reload swaps it in (not `restart_needed`), and
+/// keeps the one in force when it would take away a resolver the API's rules use (kept,
+/// handed over) until they do not.
+#[tokio::test]
+async fn a_reload_swaps_acme_and_keeps_the_resolvers_rules_use() {
+	let dir = workdir("reload-acme");
+	let h = harness_with(tokens(&dir)).await;
+	let file = dir.join("rproxy.yaml");
+	fs::write(&file, "version: 1\n").unwrap();
+	let reloader = reloader(&h, &file);
+	let unix = api(&h, &dir, true).await;
+	let with = |resolvers: &str| {
+		format!(
+			"version: 1\nglobal:\n  acme:\n    storage: {}\n    accounts: {{le: {{directory: 'https://127.0.0.1:1/dir', allowed_names: ['**.example.test']}}}}\n    resolvers: {{{resolvers}}}\n",
+			dir.join("acme").display()
+		)
+	};
+	fs::write(&file, with("a: {account: le, challenge: tls-alpn-01}, b: {account: le, challenge: tls-alpn-01}")).unwrap();
+	let Outcome::Applied(applied) = reloader.reload(true).await else { panic!("not applied") };
+	assert!(applied.restart_needed.is_empty(), "{applied:?}");
+	assert!(h.registry.acme().is_some_and(|a| a.global().resolvers.contains_key("b")));
+	let (status, e) = patch(&unix, "/config/global", json!({"acme": null})).await;
+	assert_eq!((status, &e["code"]), (StatusCode::CONFLICT, &json!("static")), "{e}");
+	let port = free_port();
+	let rule = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "remote_addr": "127.0.0.1", "remote_port": 9,
+		"tls": {"mode": "terminate", "certificates": [{"acme": "b", "domains": ["b.example.test"]}]}});
+	let (status, v) = call(&unix, "admin", Method::POST, "/rules", Some(rule)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// the file's acme is shown by its shape only
+	let v = view(&unix).await;
+	assert_eq!(v["items"]["acme"]["value"]["accounts"]["le"]["directory"], json!(rproxy_api::config::global::MASKED), "{v}");
+
+	// the file takes resolver b away while the rule uses it: kept, shown, handed over
+	fs::write(&file, with("a: {account: le, challenge: tls-alpn-01}")).unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.acme().is_some_and(|a| a.global().resolvers.contains_key("b")), "kept");
+	let v = view(&unix).await;
+	assert_eq!((&v["items"]["acme"]["kept"], &v["items"]["acme"]["source"]), (&json!(true), &json!("file")), "{v}");
+	assert!(h.registry.global().handoff().kept_acme.is_some_and(|a| a.resolvers.contains_key("b")), "handed over");
+	// a mistake in it refuses the reload, nothing changes
+	fs::write(&file, with("a: {account: nobody, challenge: tls-alpn-01}")).unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Failed(_)));
+	assert!(h.registry.acme().is_some_and(|a| a.global().resolvers.contains_key("b")));
+	// the rule gone, the next reload puts the file's in force
+	fs::write(&file, with("a: {account: le, challenge: tls-alpn-01}")).unwrap();
+	assert_eq!(call(&unix, "admin", Method::DELETE, &format!("/rules/tcp/127.0.0.1/{port}"), None).await.0, StatusCode::NO_CONTENT);
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.acme().is_some_and(|a| !a.global().resolvers.contains_key("b")));
+	assert!(view(&unix).await["items"]["acme"].get("kept").is_none());
+	// out of the file: no acme
+	fs::write(&file, "version: 1\n").unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.acme().is_none());
+	fs::remove_dir_all(dir).unwrap();
+}

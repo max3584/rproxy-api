@@ -2364,6 +2364,10 @@
               "global_api_geoip": {
                 "type": "boolean",
                 "description": "global.geoip through PATCH /config/global (only over the Unix socket by default) and a reload of the settings file, while running: the databases are opened again and swapped for the next connection or request; removing a database (country_db / asn_db) that rules' geoip lists need is 409 in_use; databases set through the API are regular files right in RPROXY_API_GEOIP_DIR (unset: 403 protected_file) (v0.4.22, #345)"
+              },
+              "global_api_acme": {
+                "type": "boolean",
+                "description": "global.acme through PATCH /config/global (only over the Unix socket by default) and a reload of the settings file, while running: rebuilt and swapped (an order in flight gives up and removes the TXT records it wrote; the rules' certificates come from the new storage); taking away a resolver or names that rules' acme certificates use is 409 in_use; the files it names are only right in RPROXY_API_ACME_DIR (storage under it), with no key_file and no inline secret; http01_listen counts in RPROXY_MAX_LISTENERS (409 limit) (v0.4.22, #345)"
               }
             }
           },
@@ -3886,7 +3890,7 @@
           },
           "unix_only": {
             "type": "boolean",
-            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec, geoip (and acme)"
+            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec, geoip, acme"
           },
           "settable": {
             "type": "boolean",
@@ -3905,7 +3909,7 @@
           },
           "kept": {
             "type": "boolean",
-            "description": "crowdsec: the file dropped it, but rules use it, so it stays in force (source file) until no rule does; geoip: the file took away a database the rules' lists need, so the previous geoip stays in force likewise (#345)"
+            "description": "crowdsec: the file dropped it, but rules use it, so it stays in force (source file) until no rule does; geoip / acme: the file took away a database the rules' lists need, or a resolver or names the rules' acme certificates use, so the previous one stays in force likewise (#345)"
           }
         },
         "required": [
@@ -3922,7 +3926,7 @@
         "properties": {
           "items": {
             "type": "object",
-            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions, cache_max_memory, geoip (live, geoip since v0.4.22); acme, performance, files, control_api (restart)",
+            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions, cache_max_memory, geoip, acme (live; geoip and acme since v0.4.22); performance, files, control_api (restart). acme's value from the settings file is shown by its shape only (every string ***)",
             "additionalProperties": {
               "$ref": "#/components/schemas/GlobalItem"
             }
@@ -4092,6 +4096,13 @@
               "null"
             ],
             "description": "As global.geoip (country_db, asn_db, check_interval, log_country); the databases are regular files right in RPROXY_API_GEOIP_DIR (unset: refused, 403 protected_file), opened before they are swapped in for the next connection or request; dropping a database the rules' geoip lists need is 409 in_use. Unix socket only by default (v0.4.22, #345)"
+          },
+          "acme": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "As global.acme; built, then swapped in (an order in flight gives up and removes its TXT records; rules take their certificates from the new storage). No account key_file and no inline secret (an http DNS provider's credentials come from secret_file as {secret}; 400 invalid); the files it names are right in RPROXY_API_ACME_DIR, storage a directory under it or the default (403 protected_file); taking away a resolver or names rules use, or an http01_listen on a rule's or the control API's address, is 409 in_use; http01_listen counts in RPROXY_MAX_LISTENERS (409 limit). Unix socket only by default (v0.4.22, #345)"
           }
         },
         "additionalProperties": false
@@ -4448,7 +4459,7 @@
             }
           },
           "403": {
-            "description": "The token lacks the admin scope; trusted_proxies, access_log, crowdsec or geoip over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, an access log outside RPROXY_API_ACCESS_LOG_DIR or a GeoIP database outside RPROXY_API_GEOIP_DIR (protected_file)",
+            "description": "The token lacks the admin scope; trusted_proxies, access_log, crowdsec, geoip or acme over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, an access log outside RPROXY_API_ACCESS_LOG_DIR, a GeoIP database outside RPROXY_API_GEOIP_DIR or a file of acme outside RPROXY_API_ACME_DIR (protected_file)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4458,7 +4469,7 @@
             }
           },
           "409": {
-            "description": "static: the settings file or the environment sets the item; restart_only: the item is read only at the start; in_use: rules use the crowdsec (appsec) or the geoip database (country_db, asn_db) being taken away",
+            "description": "static: the settings file or the environment sets the item; restart_only: the item is read only at the start; in_use: rules use the crowdsec (appsec), the geoip database (country_db, asn_db) or the acme resolver being taken away, or http01_listen takes a rule's address; limit: http01_listen past RPROXY_MAX_LISTENERS",
             "content": {
               "application/json": {
                 "schema": {

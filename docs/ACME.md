@@ -14,7 +14,14 @@ DNS の書き換えの権限が要らない `http-01` / `tls-alpn-01` を先に�
 
 ## 設定
 
-ACME の設定（アカウント・DNS のプロバイダ・resolver・許可する名前）は、設定ファイル（`RPROXY_CONFIG`）の `global.acme` にだけ書きます。API のルールは resolver を名前で指すだけで、秘密（DNS の API キーなど）を API から作る・読む・変えることはできません。`global` の変更は再起動で効きます（`GET /config` の `restart_needed`）。
+ACME の設定（アカウント・DNS のプロバイダ・resolver・許可する名前）は、設定ファイル（`RPROXY_CONFIG`）の `global.acme` に書きます。API のルールは resolver を名前で指すだけで、秘密（DNS の API キーなど）を API から作る・読む・変えることはできません。
+
+v0.4.22 から（#345、`features.global_api_acme`）、`global.acme` は稼働中に変えられます：設定ファイルの読み直しと、ファイルに書いていなければ `PATCH /config/global` の `acme`（`admin`、既定で Unix ソケットからだけ。docs/API.md の「global の設定の API」）。新しい `Acme` を組み立ててから入れ替えます：
+
+- 注文中の仕事はあきらめ、書いた TXT を消してから（`acme.dns` の `reason: stopped`）、新しい設定が始まります（前のものが終わるのを最大 60 秒待つ）。`rate_limit` の数と、同じ `storage` なら証明書ごとの失敗の待ちと更新の窓は引き継ぎます（設定を変えるたびにすぐ注文し直さない）。
+- `storage` が変わると、ルールは新しい場所の証明書を使います（なければ自己署名の仮の証明書で、新しく取ります）。`http01_listen` は残るアドレスを開いたまま、外したものを閉じ、足したものを開きます。
+- ルールが使う resolver（と名前）をなくす・許可の外にする変更は `409 in_use`（`acme` を消すのも同じ）。設定ファイルの読み直しでは前のものを残します（`config.global_in_use`、`GET /config/global` の `kept`）。
+- API で入れる `acme` は秘密を書けません：ファイルを指すだけ（`http` のプロバイダの資格情報はヘッダ・URL・本文に直接書けず、`secret_file` の `{secret}` から。アカウントの `key_file` も書けず、鍵は `storage` に作る）。指せるファイルは `RPROXY_API_ACME_DIR` のすぐ下だけで（`storage` はその下のディレクトリ。設定しなければファイルを指せず、`storage` は既定の場所だけ）、`http01_listen` の待ち受けは `RPROXY_MAX_LISTENERS` に数えます（超えると `409 limit`）。ルールの待ち受け・制御 API のアドレスは取れません（`409 in_use`）。
 
 ```yaml
 # /etc/rproxy/rproxy.yaml
@@ -123,7 +130,7 @@ rules:
    委任できないときは、ゾーン単位・TXT だけに書ける狭い権限のキーを使ってください。
 2. 書き込むゾーンは、プロバイダの `zones` のうち一番長く一致するもの（`zones` にない名前は失敗）。`zones` がなければ、PowerDNS はゾーンの一覧から、汎用の REST は DNS の SOA から決めます。
 3. 書く前に `<storage>/dns-pending.json` に記録し、TXT を書き、`dns_servers` から見えるまで待って（最長 `dns_propagation_timeout`）、CA に検証を頼みます。
-4. 検証が終わったら、成功しても失敗しても TXT を消します。消せなかったもの（と、途中でプロセスが止まったもの）は記録に残り、次の起動のときに消します（`acme.dns` の `reason: left over`）。
+4. 検証が終わったら、成功しても失敗しても TXT を消します。`global.acme` を変えたときと止めるときに注文中のものも、あきらめてから消します（`reason: stopped`、#345）。消せなかったもの（と、途中でプロセスが止まったもの）は記録に残り、次の起動のとき（と、同じ `storage` の新しい設定が始まるとき）に消します（`acme.dns` の `reason: left over`）。
 5. PowerDNS は `PATCH /api/v1/servers/{server_id}/zones/{zone}` で TXT の RRset を `REPLACE` / `DELETE` します（同じ名前の値は 1 回でまとめて。ワイルドカードとその親を一緒に取るときは 2 つの値）。
 
 DNS の秘密を本体から外に出すには、下の「補助プロセス（秘密を分ける）」を使います。
@@ -196,4 +203,4 @@ systemctl restart rproxy-api
 
 ## 試験
 
-CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS の API、RFC 2136（TSIG の SHA256・SHA512、違う鍵は断られること）、acme-dns（登録と CNAME の案内を含む）、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます（docs/TESTING.md）。
+CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS の API、RFC 2136（TSIG の SHA256・SHA512、違う鍵は断られること）、acme-dns（登録と CNAME の案内を含む）、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます。`acme_changes_while_running_with_pebble`（#345）は `PATCH /config/global` で `acme` を入れ・変え・消し、注文中の TXT の後片付け・`http01_listen` の移動・新しい `storage`・`409 in_use`・場所の外のファイルと直接書いた秘密を断ることを確かめます（docs/TESTING.md）。
