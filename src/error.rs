@@ -21,6 +21,8 @@ pub enum Reason {
 	NeedsCrowdsec,
 	/// `global.geoip` (or the database its lists need) is not in force (#345).
 	NeedsGeoip,
+	/// `global.acme` (or the resolver and names a certificate needs) is not in force (#345).
+	NeedsAcme,
 }
 
 impl ApiError {
@@ -71,6 +73,12 @@ impl ApiError {
 	/// that is not in force: started again once it is (#345).
 	pub fn needs_geoip(message: impl Into<String>) -> Self {
 		ApiError { reason: Some(Reason::NeedsGeoip), ..Self::invalid(message) }
+	}
+
+	/// `400 invalid` for a rule whose ACME certificate needs a `global.acme` (resolver,
+	/// names) that is not in force: started again once one is (#345).
+	pub fn needs_acme(message: impl Into<String>) -> Self {
+		ApiError { reason: Some(Reason::NeedsAcme), ..Self::invalid(message) }
 	}
 
 	pub fn unsupported(message: impl Into<String>) -> Self {

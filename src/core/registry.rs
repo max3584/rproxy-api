@@ -281,6 +281,9 @@ struct Prepared {
 	routes: Vec<(Route, Resolved)>,
 	tls: Arc<TlsRuntime>,
 	http: Option<Arc<crate::l7::server::Router>>,
+	/// The `global.acme` `tls` was built with (#345): checked against the one in force
+	/// when the rule goes into the table (`acme_gate`).
+	acme: Option<Arc<crate::acme::Acme>>,
 }
 
 /// What `Registry::check_rules` found: (label, message) per problem.
@@ -714,9 +717,22 @@ impl Registry {
 	/// A rule with ACME certificates needs the resolver and the names it asks for in
 	/// the `global.acme` in force: checked again with the rules lock held, right before
 	/// it goes into the table, so a `global` change cannot take them away in between (#345).
-	fn acme_gate(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+	/// `prepared.tls` was built with the `global.acme` of then: when another one is in
+	/// force now (a change crossed the rule's), it is built again with this one (its
+	/// storage's files, or the stand-in).
+	fn acme_gate(&self, spec: &RuleSpec, prepared: &mut Prepared) -> Result<(), ApiError> {
 		if spec.tls.certificates.iter().any(|c| c.acme.is_some()) {
 			self.check_acme(spec)?;
+			let now = self.acme();
+			let same = match (&prepared.acme, &now) {
+				(Some(a), Some(b)) => Arc::ptr_eq(a, b),
+				(None, None) => true,
+				_ => false,
+			};
+			if !same {
+				prepared.tls = Arc::new(self.build_tls(spec)?);
+				prepared.acme = now;
+			}
 		}
 		Ok(())
 	}
@@ -732,12 +748,12 @@ impl Registry {
 		for c in &spec.tls.certificates {
 			let Some(resolver) = &c.acme else { continue };
 			let acme = self.acme().ok_or_else(|| {
-				ApiError::invalid(format!("acme resolver {resolver:?}: global.acme is not configured (the settings file or PATCH /config/global)"))
+				ApiError::needs_acme(format!("acme resolver {resolver:?}: global.acme is not configured (the settings file or PATCH /config/global)"))
 			})?;
 			if spec.key.protocol != Protocol::Tcp {
 				return Err(ApiError::tls_config("acme certificates are for tcp rules (DTLS takes cert_file / key_file)"));
 			}
-			acme.check(resolver, &c.domains)?;
+			acme.check(resolver, &c.domains).map_err(|e| ApiError::needs_acme(e.message))?;
 		}
 		Ok(())
 	}
@@ -1117,6 +1133,7 @@ impl Registry {
 
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
 		// certificates, keys and secret files are read from disk (#358)
+		let acme = self.acme();
 		let (tls, http) = crate::net::files::blocking(|| self.build_parts(spec))?;
 		// with several targets, one that cannot be resolved yet is retried in the
 		// background; the rule fails only when none can be
@@ -1157,7 +1174,7 @@ impl Registry {
 			}
 			routes.push((route.clone(), members));
 		}
-		Ok(Prepared { members, routes, tls, http })
+		Ok(Prepared { members, routes, tls, http, acme })
 	}
 
 	/// The run-time targets of a rule, with their name resolution and health checks.
@@ -1229,11 +1246,11 @@ impl Registry {
 	}
 
 	/// Binds every port of the rule and starts serving. Called with the rules lock held.
-	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
+	fn start(self: &Arc<Self>, spec: RuleSpec, mut prepared: Prepared) -> Result<Running, ApiError> {
 		// called with the rules lock held (#342)
 		self.crowdsec_gate(&spec)?;
 		self.geoip_gate(&spec)?;
-		self.acme_gate(&spec)?;
+		self.acme_gate(&spec, &mut prepared)?;
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
 		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[]);
@@ -1352,7 +1369,8 @@ impl Registry {
 		// a token's new rule: within the limits of the process (#358)
 		if by.is_some() {
 			let added = crate::core::quota::sockets(&spec);
-			let sockets: usize = rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum();
+			// global.acme.http01_listen counts too (#345)
+			let sockets: usize = rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum::<usize>() + self.http01_listen().len();
 			crate::core::quota::check_process(rules.len() + 1, 1, sockets + added, added)?;
 		}
 		let key = spec.key;
@@ -1593,7 +1611,8 @@ impl Registry {
 		let owner = crate::net::protected::Owner::Token(by.to_string());
 		Usage {
 			rules: rules.len(),
-			sockets: rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum(),
+			// global.acme.http01_listen counts too (#345)
+			sockets: rules.values().map(|e| crate::core::quota::sockets(e.spec())).sum::<usize>() + self.http01_listen().len(),
 			owned: rules.values().filter(|e| self.owner_of(e.spec()) == owner).count(),
 		}
 	}
@@ -1631,7 +1650,7 @@ impl Registry {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{key} would take rproxy's control API ({api})")));
 		}
-		let prepared = self.prepare(&spec).await?;
+		let mut prepared = self.prepare(&spec).await?;
 
 		let mut rules = self.rules.lock().await;
 		if let Some((other, _)) = rules.iter().find(|(k, e)| *k != key && overlaps(e.spec(), &spec)) {
@@ -1639,7 +1658,7 @@ impl Registry {
 		}
 		self.crowdsec_gate(&spec)?;
 		self.geoip_gate(&spec)?;
-		self.acme_gate(&spec)?;
+		self.acme_gate(&spec, &mut prepared)?;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {

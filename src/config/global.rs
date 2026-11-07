@@ -1021,7 +1021,7 @@ impl State {
 		if let Some(a) = &values.acme {
 			// the acme in force is the API's own (the file's wins): its files are not others'
 			let bouncer = registry.http_global().crowdsec();
-			let entries = crate::net::protected::current(None, bouncer.as_ref().map(|b| b.key_file()));
+			let entries = crate::net::protected::others(bouncer.as_ref().map(|b| b.key_file()));
 			for (what, p) in acme_paths(a).into_iter().filter(|(w, _)| *w != "storage") {
 				if let Some(why) = crate::net::protected::protecting(p, &entries) {
 					return Some(("acme", format!("global.acme.{what}: {p} is {why}; the API may not name it in global")));
@@ -1043,6 +1043,13 @@ impl State {
 		let real = |d: &Path| std::fs::canonicalize(d).ok();
 		let default_storage = a.storage.as_deref().is_none_or(|s| Path::new(s) == Path::new(crate::acme::config::DEFAULT_STORAGE));
 		let files: Vec<(String, &str)> = acme_paths(a).into_iter().filter(|(w, _)| *w != "storage").collect();
+		// the storage and the certificate store do not hold one another
+		let storage = a.storage.clone().unwrap_or_else(|| crate::acme::config::DEFAULT_STORAGE.to_string());
+		let store = crate::net::protected::resolve(&crate::tls::named::dir()).real;
+		let at = crate::net::protected::resolve(Path::new(&storage)).real;
+		if at.starts_with(&store) || store.starts_with(&at) {
+			return Err(format!("global.acme.storage: {storage} and the certificate store (RPROXY_CERT_STORE) would hold one another"));
+		}
 		let Some(dir) = &self.opts.acme_dir else {
 			if let Some((what, p)) = files.first() {
 				return Err(format!("global.acme.{what}: {p}: no directory for files of global.acme set through the API: set RPROXY_API_ACME_DIR"));
@@ -1227,6 +1234,17 @@ fn names_a_secret(name: &str) -> bool {
 	["auth", "key", "token", "secret", "password", "passwd", "credential", "cookie", "session", "signature"].iter().any(|w| n.contains(w))
 }
 
+/// `{secret}`, or `<scheme> {secret}` (`Bearer {secret}`): nothing literal beside the secret.
+fn secret_header_value(v: &str) -> bool {
+	match v.strip_suffix("{secret}") {
+		Some("") => true,
+		Some(scheme) => scheme.strip_suffix(' ').is_some_and(|s| {
+			!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b)) && s.as_bytes()[0].is_ascii_alphabetic()
+		}),
+		None => false,
+	}
+}
+
 /// `global.acme` set through the API holds no secret itself (#345): account keys stay
 /// in the storage (no `key_file`), and the calls of an `http` DNS provider take their
 /// credentials from `secret_file` (`{secret}`): no user in a URL, a header or query
@@ -1242,19 +1260,24 @@ fn acme_secrets_in_files(a: &AcmeGlobal) -> Result<(), String> {
 			let Some(c) = c else { continue };
 			let here = |m: String| format!("global.acme.dns_providers.{name}.{call}: {m} (through the API, credentials come from secret_file as {{secret}})");
 			let (base, query) = c.url.split_once('?').unwrap_or((&c.url, ""));
-			let authority = base.split_once("://").map_or(base, |(_, r)| r.split('/').next().unwrap_or(r));
+			let rest = base.split_once("://").map_or(base, |(_, r)| r);
+			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
 			if authority.contains('@') {
 				return Err(here("the url names a user".into()));
 			}
+			// paths are logged and shown: no secret there
+			if path.contains("{secret}") {
+				return Err(here("{secret} in the url's path (put it in a header or the query)".into()));
+			}
 			for pair in query.split('&').filter(|p| !p.is_empty()) {
 				let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-				if names_a_secret(k) && !v.contains("{secret}") {
-					return Err(here(format!("the url's {k} is inline")));
+				if (names_a_secret(k) || v.contains("{secret}")) && v != "{secret}" {
+					return Err(here(format!("the url's {k} must be exactly {{secret}}")));
 				}
 			}
 			for (h, v) in &c.headers {
-				if names_a_secret(h) && !v.contains("{secret}") {
-					return Err(here(format!("the header {h} is inline")));
+				if (names_a_secret(h) || v.contains("{secret}")) && !secret_header_value(v) {
+					return Err(here(format!("the header {h} must be {{secret}} or \"<scheme> {{secret}}\"")));
 				}
 			}
 			if let Some(b) = &c.body {
@@ -1371,7 +1394,7 @@ fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
 		let NewAcme { acme, addrs, bound } = a;
 		let old = registry.acme();
 		if let (Some(new), Some(old)) = (&acme, &old) {
-			new.inherit(old);
+			new.inherit(old, false);
 		}
 		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
 		crate::acme::challenge::install_http01(&addrs, bound);
@@ -1967,7 +1990,8 @@ fn redact_named(v: Value) -> Value {
 						masked(v)
 					} else if lower == "url" || lower.ends_with("_url") {
 						match v {
-							Value::String(u) => Value::String(masked_url(&u)),
+							// the path too: a token may sit in it (#345)
+							Value::String(u) => Value::String(masked_url_path(&u)),
 							other => redact_named(other),
 						}
 					} else {
@@ -2016,6 +2040,18 @@ fn masked_url(u: &str) -> String {
 	out
 }
 
+/// A URL without its user, path (beyond `/`), query and fragment: what `redacted` shows
+/// of a URL written in `global` (a REST API's token may sit in the path, #345).
+fn masked_url_path(u: &str) -> String {
+	let m = masked_url(u);
+	let Some((scheme, rest)) = m.split_once("://") else { return m };
+	let (authority, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+	let query = tail.find('?').map(|q| &tail[q..]).unwrap_or("");
+	let path = tail.strip_suffix(query).unwrap_or(tail);
+	let path = if path.is_empty() || path == "/" { path.to_string() } else { format!("/{MASKED}") };
+	format!("{scheme}://{authority}{path}{query}")
+}
+
 /// What rules failed waiting for that a change put in force (`changed`: the items whose
 /// value in force changed; `to`: in force after it).
 fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
@@ -2025,6 +2061,9 @@ fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
 	}
 	if changed.contains(&"geoip") && to.geoip.is_some() {
 		out.push(crate::error::Reason::NeedsGeoip);
+	}
+	if changed.contains(&"acme") && to.acme.is_some() {
+		out.push(crate::error::Reason::NeedsAcme);
 	}
 	out
 }
@@ -2139,7 +2178,7 @@ mod tests {
 		assert_eq!(
 			redacted("performance", other),
 			json!({"tls": {"cert_file": "/c.pem", "key_file": MASKED, "client_secret": MASKED}, "api_token": MASKED,
-				"url": format!("https://{MASKED}@h:1/x?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
+				"url": format!("https://{MASKED}@h:1/{MASKED}?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
 				"call": {"headers": {"X-Api-Key": MASKED}, "body": MASKED}})
 		);
 		// in the view: the file's acme, and a kept one (stored by a later release)
@@ -2380,9 +2419,21 @@ mod tests {
 			("https://h/add", json!({"Authorization": "Bearer abc"}), None),
 			("https://h/add", json!({"X-Api-Key": "abc"}), None),
 			("https://h/add", json!({}), Some("{\"token\":\"abc\"}")),
+			// a literal beside the secret, the secret in the path
+			("https://h/add", json!({"Authorization": "Bearer abc{secret}"}), None),
+			("https://h/add", json!({"X-Api-Key": "k-{secret}"}), None),
+			("https://h/add", json!({"X-Other": "{secret}{secret}"}), None),
+			("https://h/add?token=x{secret}", json!({}), None),
+			("https://h/{secret}/add", json!({}), None),
 		] {
 			assert!(call(url, headers.clone(), body).is_err(), "{url} {headers} {body:?}");
 		}
+		call("https://h/add", json!({"X-Api-Key": "{secret}", "Authorization": "sso-key {secret}"}), None).unwrap();
+		assert!(secret_header_value("Bearer {secret}") && secret_header_value("{secret}"));
+		assert!(!secret_header_value("Bearer  {secret}") && !secret_header_value("1x {secret}") && !secret_header_value("a b {secret}"));
+		assert_eq!(masked_url_path("https://u:p@h:1/v1/tok123?k=t"), format!("https://{MASKED}@h:1/{MASKED}?{MASKED}"));
+		assert_eq!(masked_url_path("https://h/"), "https://h/");
+		assert_eq!(masked_url_path("https://h"), "https://h");
 	}
 
 	#[test]

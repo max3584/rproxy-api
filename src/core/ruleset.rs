@@ -620,8 +620,11 @@ impl Registry {
 		}
 		let kept = current.values().filter(|c| !ours(c));
 		let rules_after = kept.clone().count() + specs.len();
-		let sockets_before: usize = current.values().map(|c| quota::sockets(&c.spec)).sum();
-		let sockets_after: usize = kept.map(|c| quota::sockets(&c.spec)).sum::<usize>() + specs.iter().map(|(_, s)| quota::sockets(s)).sum::<usize>();
+		// global.acme.http01_listen counts too (#345)
+		let http01 = self.http01_listen().len();
+		let sockets_before: usize = current.values().map(|c| quota::sockets(&c.spec)).sum::<usize>() + http01;
+		let sockets_after: usize =
+			kept.map(|c| quota::sockets(&c.spec)).sum::<usize>() + specs.iter().map(|(_, s)| quota::sockets(s)).sum::<usize>() + http01;
 		quota::check_process(rules_after, rules_after.saturating_sub(current.len()), sockets_after, sockets_after.saturating_sub(sockets_before))?;
 		let owner = current_set.map(|s| s.owner.as_str()).or(opts.owner).unwrap_or(opts.by);
 		if owner == opts.by {

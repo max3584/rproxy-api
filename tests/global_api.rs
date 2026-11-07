@@ -52,9 +52,10 @@ fn tokens(dir: &Path) -> Tokens {
 	fs::write(
 		&file,
 		format!(
-			"tokens:\n  - {{name: admin, sha256: {}, scopes: [admin, rules:read, rules:write], persist: true}}\n  - {{name: reader, sha256: {}, scopes: [rules:read]}}\n",
+			"tokens:\n  - {{name: admin, sha256: {}, scopes: [admin, rules:read, rules:write], persist: true}}\n  - {{name: reader, sha256: {}, scopes: [rules:read]}}\n  - {{name: writer, sha256: {}, scopes: [rules:read, rules:write]}}\n",
 			sha("admin"),
-			sha("reader")
+			sha("reader"),
+			sha("writer")
 		),
 	)
 	.unwrap();
@@ -168,6 +169,7 @@ fn options(dir: &Path, database: bool) -> Options {
 		database,
 		sync_wait: Duration::from_secs(2),
 		geoip_dir: Some(dir.join("geoip")),
+		acme_dir: Some(dir.join("acme-api")),
 		..Default::default()
 	}
 }
@@ -1076,5 +1078,73 @@ async fn rules_waiting_for_geoip_start_once_it_is_in_force() {
 	assert_eq!(status, StatusCode::OK, "{v}");
 	assert_eq!(state(p_asn).await, json!("running"));
 	assert!(!relayed_from("127.0.0.2", p_asn).await, "AS64496 denied");
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// `global.acme` through the API, in process (#345): a rule waiting for it starts once it
+/// is set; a new storage takes the certificates over (no stand-in, no new order); the
+/// previous storage stays protected from rules (#319).
+#[tokio::test]
+async fn acme_through_the_api_moves_storage_and_keeps_the_old_one_protected() {
+	let dir = workdir("acme-api");
+	let api_dir = dir.join("acme-api");
+	for d in ["store1", "store2"] {
+		fs::create_dir_all(api_dir.join(d)).unwrap();
+	}
+	rproxy_api::net::protected::set_api_acme_dir(Some(api_dir.clone()));
+	let h = harness_with(tokens(&dir)).await;
+	init_with_file(&h, &dir, "version: 1\n", false);
+	let unix = api(&h, &dir, true).await;
+	let acme = |storage: &str| {
+		json!({"acme": {"storage": api_dir.join(storage),
+			"accounts": {"le": {"directory": "https://127.0.0.1:1/dir", "allowed_names": ["**.example.test"]}},
+			"resolvers": {"r": {"account": "le", "challenge": "tls-alpn-01"}}}})
+	};
+	// a certificate already in the first storage
+	let (cert, key) = rproxy_api::acme::store::cert_files(&api_dir.join("store1"), "r", &["a.example.test".to_string()]);
+	let mut params = rcgen::CertificateParams::new(vec!["a.example.test".to_string()]).unwrap();
+	params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(60);
+	let k = rcgen::KeyPair::generate().unwrap();
+	rproxy_api::acme::store::write_private(Path::new(&key), k.serialize_pem().as_bytes()).unwrap();
+	rproxy_api::acme::store::write_private(Path::new(&cert), params.self_signed(&k).unwrap().pem().as_bytes()).unwrap();
+	// a rule restored before global.acme is in force waits for it
+	let port = free_port();
+	let rule = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "remote_addr": "127.0.0.1", "remote_port": 9,
+		"tls": {"mode": "terminate", "certificates": [{"acme": "r", "domains": ["a.example.test"]}]}});
+	h.registry.restore_as(vec![serde_json::from_value(rule).unwrap()], Origin::Dynamic).await;
+	let path = format!("/rules/tcp/127.0.0.1/{port}");
+	assert_eq!(call(&unix, "admin", Method::GET, &path, None).await.1["state"], "failed");
+	let (status, v) = patch(&unix, "/config/global", acme("store1")).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(call(&unix, "admin", Method::GET, &path, None).await.1["state"], "running", "started once acme is in force");
+
+	let a = h.registry.acme().unwrap();
+	let id = a.check("r", &["a.example.test".into()]).unwrap();
+	assert_eq!(a.files(&id), (cert.clone(), key.clone()));
+	assert_eq!(a.status(&id).unwrap().state, "valid");
+
+	// a new storage: the certificate is carried over, the rule keeps it
+	let (status, v) = patch(&unix, "/config/global", acme("store2")).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	let b = h.registry.acme().unwrap();
+	assert!(!Arc::ptr_eq(&a, &b));
+	assert_eq!(b.status(&id).unwrap().state, "valid", "no stand-in, no new order");
+	assert_eq!(fs::read(b.files(&id).0).unwrap(), fs::read(&cert).unwrap());
+	let (_, v) = call(&unix, "admin", Method::GET, &path, None).await;
+	assert_eq!(v["acme"][0]["state"], "valid", "{v}");
+
+	// the first storage's keys stay out of rules' reach (a token that only writes rules)
+	let other = free_port();
+	let with_files = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": other, "remote_addr": "127.0.0.1", "remote_port": 9,
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}});
+	let (status, e) = call(&unix, "writer", Method::POST, "/rules", Some(with_files)).await;
+	assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("protected_file")), "{e}");
+	assert_eq!(call(&unix, "admin", Method::DELETE, &path, None).await.0, StatusCode::NO_CONTENT);
+	let (status, v) = patch(&unix, "/config/global", json!({"acme": null})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	let (status, e) = call(&unix, "writer", Method::POST, "/rules", Some(json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": other,
+		"remote_addr": "127.0.0.1", "remote_port": 9, "tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}}))).await;
+	assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("protected_file")), "with no acme in force too: {e}");
+	rproxy_api::net::protected::set_api_acme_dir(None);
 	fs::remove_dir_all(dir).unwrap();
 }

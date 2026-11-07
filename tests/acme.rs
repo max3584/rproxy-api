@@ -1158,16 +1158,24 @@ async fn acme_changes_while_running_with_pebble() {
 	assert_eq!(c.iter().filter(|c| c.starts_with("present")).count(), c.iter().filter(|c| c.starts_with("cleanup")).count(), "every record removed: {c:?}");
 	// the responder moved
 	wait_until("the new http01_listen", 10, &logs, || async { not_found(http01_b).await }).await;
-	assert!(std::net::TcpStream::connect(("127.0.0.1", http01_a)).is_err(), "the old http01_listen closed");
+	wait_until("the old http01_listen closed", 10, &logs, || async { std::net::TcpStream::connect(("127.0.0.1", http01_a)).is_err() }).await;
 
-	// a new storage: the rules take their certificates from it (obtained again)
+	// a new storage: the certificates are carried over (served on, not ordered again)
+	let served = served_cert(p_alpn, "alpn.example.test", &[]).await.unwrap().0;
+	let orders = rp.log().matches(r#""event":"acme.order""#).count();
 	let r = patch(acme(&api_dir.join("store2"), "1s", http01_b, both.clone())).await;
 	assert_eq!(status_of(&r), 200, "{r}");
-	wait_until("the certificate in the new storage", 60, &logs, || async {
-		fs::read_dir(api_dir.join("store2/certs")).is_ok_and(|d| d.count() >= 2)
-			&& get(format!("/rules/tcp/127.0.0.1/{p_alpn}")).await["acme"][0]["state"] == "valid"
-	})
-	.await;
+	assert!(fs::read_dir(api_dir.join("store2/certs")).is_ok_and(|d| d.count() >= 2), "carried over");
+	assert_eq!(get(format!("/rules/tcp/127.0.0.1/{p_alpn}")).await["acme"][0]["state"], "valid");
+	assert_eq!(served_cert(p_alpn, "alpn.example.test", &[]).await.unwrap().0, served, "no stand-in");
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(rp.log().matches(r#""event":"acme.order""#).count(), orders, "no new order: {}", logs());
+	// the old storage stays out of rules' reach (#319)
+	let old_key = fs::read_dir(api_dir.join("store/certs/alpn")).unwrap().next().unwrap().unwrap().path().join("key.pem");
+	let mut naming = rule(free_port(), "alpn", "x.example.test");
+	naming["tls"]["certificates"] = json!([{"cert_file": old_key.with_file_name("cert.pem"), "key_file": old_key}]);
+	let r = unix_post(&socket, "/rules", &naming.to_string()).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (403, json!("protected_file")), "{r}");
 	let v = get("/config/global".into()).await;
 	assert_eq!(v["items"]["acme"]["source"], "api", "{v}");
 	assert!(!v.to_string().contains(RELAY_SECRET));

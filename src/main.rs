@@ -590,6 +590,8 @@ fn main() -> ExitCode {
 	if let Some(dir) = &opts.cert_store {
 		rproxy_api::tls::named::set_dir(dir.clone());
 	}
+	// RPROXY_API_ACME_DIR is protected whatever global.acme is in force (#345)
+	rproxy_api::net::protected::set_api_acme_dir(opts.api_acme_dir.clone());
 	// the options' secrets rules from the API may not name (#319), also for --check-config's warnings
 	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(
 		opts.token_file.as_deref(),

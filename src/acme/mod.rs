@@ -223,8 +223,20 @@ pub struct Acme {
 	on_change: OnceLock<OnChange>,
 	clients: tokio::sync::Mutex<HashMap<String, Account>>,
 	stop: CancellationToken,
-	/// The task of `spawn`, waited for by the `Acme` that replaces this one (#345).
-	task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	/// Whether `spawn` started the task, and its end (set once the task has returned:
+	/// its order given up, its TXT records removed), waited for by the `Acme` that
+	/// replaces this one (#345).
+	spawned: std::sync::atomic::AtomicBool,
+	finished: Arc<(std::sync::atomic::AtomicBool, Notify)>,
+}
+
+/// One lock per storage's DNS-01 journal (`dns-pending.json`): the task of an `Acme`
+/// holds it while it runs, so two (one replacing the other, #345) never handle the same
+/// journal at once.
+fn journal_lock(storage: &Path) -> Arc<tokio::sync::Mutex<()>> {
+	static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+	let mut all = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+	all.entry(storage.to_path_buf()).or_default().clone()
 }
 
 /// How long a new `Acme` waits for the one it replaces to finish its order in flight
@@ -340,7 +352,8 @@ impl Acme {
 			on_change: OnceLock::new(),
 			clients: tokio::sync::Mutex::default(),
 			stop: CancellationToken::new(),
-			task: Mutex::default(),
+			spawned: Default::default(),
+			finished: Default::default(),
 			global: global.clone(),
 		}))
 	}
@@ -355,22 +368,80 @@ impl Acme {
 	}
 
 	/// Takes over what `old` (the `Acme` this one replaces, #345) knows that the files
-	/// do not tell: the orders within the rate limit's period, and, with the same
-	/// storage, each certificate's failures, next attempt and renewal window (a change
-	/// of the settings does not order again at once what just failed).
-	pub fn inherit(&self, old: &Acme) {
+	/// do not tell: the orders within the rate limit's period, and each certificate's
+	/// failures, next attempt and renewal window (a change of the settings does not
+	/// order again at once what just failed, or what is valid). With another storage,
+	/// the certificates (and account keys) `old` holds and the new one lacks, or holds
+	/// older, are copied there first, so rules keep serving them and nothing is ordered
+	/// again because of the move. `only_known`: only the certificates this one already
+	/// manages (the second call, once `old` has stopped: what it obtained meanwhile).
+	pub fn inherit(&self, old: &Acme, only_known: bool) {
+		let moved = old.storage != self.storage;
+		if moved && !only_known {
+			self.carry_accounts(old);
+		}
 		let old_state = old.state.lock().unwrap_or_else(|e| e.into_inner());
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		state.orders = old_state.orders.clone();
-		if old.storage == self.storage {
-			for (id, m) in &old_state.certs {
-				let mut kept = Managed::new(m.issued);
-				kept.next_try = m.next_try;
-				kept.failures = m.failures;
-				kept.error = m.error.clone();
-				kept.ari = m.ari;
-				kept.ari_check = m.ari_check;
-				state.certs.insert(id.clone(), kept);
+		for (id, m) in &old_state.certs {
+			if only_known && !state.certs.contains_key(id) {
+				continue;
+			}
+			if moved && !self.carry_cert(old, id, m.issued, state.certs.get(id).and_then(|n| n.issued)) {
+				continue;
+			}
+			let mut kept = Managed::new(m.issued);
+			kept.next_try = m.next_try;
+			kept.failures = m.failures;
+			kept.error = m.error.clone();
+			kept.force = m.force;
+			kept.ari = m.ari;
+			kept.ari_check = m.ari_check;
+			state.certs.insert(id.clone(), kept);
+		}
+	}
+
+	/// Copies a certificate `old` issued into this storage unless this one holds it as
+	/// new or newer (key first, as `issue` writes). True when this storage now holds `old`'s.
+	fn carry_cert(&self, old: &Acme, id: &CertId, issued: Option<(i64, i64)>, mine: Option<(i64, i64)>) -> bool {
+		let Some((_, old_after)) = issued else { return false };
+		let (old_cert, old_key) = old.files(id);
+		let (cert, key) = self.files(id);
+		let mine = mine.or_else(|| validity(&cert, &key));
+		if mine.is_some_and(|(_, after)| after >= old_after) {
+			return false;
+		}
+		let (Ok(k), Ok(c)) = (std::fs::read(&old_key), std::fs::read(&old_cert)) else { return false };
+		match store::write_private(Path::new(&key), &k).and_then(|()| store::write_private(Path::new(&cert), &c)) {
+			Ok(()) => {
+				info!(event = "acme.storage", action = "carried", resolver = %id.resolver, domains = ?id.domains,
+					from = %old.storage.display(), to = %self.storage.display());
+				true
+			}
+			Err(e) => {
+				warn!(event = "acme.error", part = "storage", file = %cert, error = %e, "the certificate is obtained again in the new storage");
+				false
+			}
+		}
+	}
+
+	/// Copies the account keys (and URLs) `old` keeps in its storage for the same account
+	/// at the same CA, when this storage has none: the move does not make new accounts.
+	fn carry_accounts(&self, old: &Acme) {
+		for (name, a) in &self.accounts {
+			let Some(o) = old.accounts.get(name) else { continue };
+			let mine = self.storage.join("accounts");
+			if o.directory != a.directory || a.key_file != mine.join(format!("{name}.key")) || a.key_file.exists() || !o.key_file.exists() {
+				continue;
+			}
+			let meta = old.storage.join("accounts").join(format!("{name}.json"));
+			let copied = std::fs::read(&o.key_file).and_then(|k| store::write_private(&a.key_file, &k)).and_then(|()| match std::fs::read(&meta) {
+				Ok(m) => store::write_private(&mine.join(format!("{name}.json")), &m),
+				Err(_) => Ok(()),
+			});
+			match copied {
+				Ok(()) => info!(event = "acme.storage", action = "carried", account = %name, from = %old.storage.display(), to = %self.storage.display()),
+				Err(e) => warn!(event = "acme.error", part = "storage", account = %name, error = %e, "a new account is made in the new storage"),
 			}
 		}
 	}
@@ -542,30 +613,57 @@ impl Acme {
 	pub fn spawn(self: &Arc<Self>, after: Option<Arc<Acme>>) {
 		let me = self.clone();
 		let mut after = after;
+		self.spawned.store(true, std::sync::atomic::Ordering::SeqCst);
 		// started again if it panics (#358)
 		let task = crate::core::supervise::spawn("acme", move || {
 			let me = me.clone();
 			let after = after.take();
 			async move {
 				if let Some(old) = after {
-					if !old.stopped(RETIRE_WAIT).await {
+					let deadline = tokio::time::Instant::now() + RETIRE_WAIT;
+					let ended = tokio::select! {
+						ended = old.stopped_by(deadline) => ended,
+						// replaced in turn before it started: the one after it waits for this
+						// task, which waits (within the same time) for the one before
+						_ = me.stop.cancelled() => {
+							old.stopped_by(deadline).await;
+							return;
+						}
+					};
+					if !ended {
 						warn!(event = "acme.error", part = "swap", wait_secs = RETIRE_WAIT.as_secs(),
-							"the replaced global.acme has not finished its order; starting anyway");
+							"the replaced global.acme has not finished its order; starting anyway (the DNS-01 journal is still not shared)");
 					}
+					// what it obtained or tried meanwhile
+					me.inherit(&old, true);
 				}
 				me.run().await
 			}
 		});
-		*self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+		let finished = self.finished.clone();
+		tokio::spawn(async move {
+			let _ = task.await;
+			finished.0.store(true, std::sync::atomic::Ordering::SeqCst);
+			finished.1.notify_waiters();
+		});
 	}
 
-	/// Stops the task (`shutdown`) and waits up to `within` for it to end; true when it did.
-	pub async fn stopped(&self, within: Duration) -> bool {
+	/// Stops the task (`shutdown`) and waits until `deadline` for it to end; true when it
+	/// did (or was never started).
+	pub async fn stopped_by(&self, deadline: tokio::time::Instant) -> bool {
 		self.stop.cancel();
-		let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
-		match task {
-			Some(t) => tokio::time::timeout(within, t).await.is_ok(),
-			None => true,
+		if !self.spawned.load(std::sync::atomic::Ordering::SeqCst) {
+			return true;
+		}
+		let (done, notify) = &*self.finished;
+		loop {
+			let wait = notify.notified();
+			if done.load(std::sync::atomic::Ordering::SeqCst) {
+				return true;
+			}
+			if tokio::time::timeout_at(deadline, wait).await.is_err() {
+				return done.load(std::sync::atomic::Ordering::SeqCst);
+			}
 		}
 	}
 
@@ -701,6 +799,12 @@ impl Acme {
 	}
 
 	async fn run(self: Arc<Self>) {
+		// this storage's journal is this task's alone until it returns (#345)
+		let lock = journal_lock(&self.storage);
+		let _journal = tokio::select! {
+			g = lock.lock_owned() => g,
+			_ = self.stop.cancelled() => return,
+		};
 		// TXT records a crash or a failed removal left behind
 		let leftover = self.journal.read();
 		if !leftover.is_empty() {
@@ -885,6 +989,11 @@ impl Acme {
 		if !records.is_empty() {
 			let reason = if self.stop.is_cancelled() { "stopped" } else { "validated" };
 			dns::remove_all(&self.dns, &self.journal, &records, reason).await;
+			let left = self.journal.read();
+			if records.iter().any(|r| left.contains(r)) {
+				warn!(event = "degraded", part = "acme.dns", storage = %self.storage.display(),
+					"TXT records could not be removed; they are kept in this storage's dns-pending.json and removed when it is used again");
+			}
 		}
 		result
 	}
@@ -1097,6 +1206,59 @@ mod tests {
 		let text = v.to_string();
 		assert!(!text.contains("key_file") && !text.contains(".key"), "no key files in the view: {text}");
 		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Replaced in turn before it started (A -> B -> C): B does not wait its full time
+	/// for A, nor C for B; B never runs (#345).
+	#[tokio::test]
+	async fn a_replaced_replacement_does_not_chain_the_waits() {
+		let dir = std::env::temp_dir().join(format!("rproxy-acme-chain-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let (a, b, c) = (manager(&dir, ""), manager(&dir, ""), manager(&dir, ""));
+		a.spawn(None);
+		b.spawn(Some(a.clone()));
+		c.spawn(Some(b.clone()));
+		let soon = tokio::time::Instant::now() + Duration::from_secs(5);
+		assert!(b.stopped_by(soon).await, "B ended at once");
+		assert!(a.finished.0.load(std::sync::atomic::Ordering::SeqCst), "A before it");
+		assert!(!c.finished.0.load(std::sync::atomic::Ordering::SeqCst), "C runs");
+		assert!(c.stopped_by(tokio::time::Instant::now() + Duration::from_secs(5)).await);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Another storage: the certificates the old one holds are carried over with their
+	/// state, the newer of the two kept (#345).
+	#[test]
+	fn a_new_storage_takes_the_certificates_over() {
+		let base = std::env::temp_dir().join(format!("rproxy-acme-carry-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&base);
+		let old = manager(&base.join("a"), "");
+		let new = manager(&base.join("b"), "");
+		let id = old.check("le", &["a.example.com".into()]).unwrap();
+		let issue = |m: &Acme, days: i64| {
+			let (cert, key) = m.files(&id);
+			let mut params = rcgen::CertificateParams::new(id.domains.clone()).unwrap();
+			params.not_before = time::OffsetDateTime::from_unix_timestamp(now() - 86_400).unwrap();
+			params.not_after = time::OffsetDateTime::from_unix_timestamp(now() + days * 86_400).unwrap();
+			let k = rcgen::KeyPair::generate().unwrap();
+			store::write_private(Path::new(&key), k.serialize_pem().as_bytes()).unwrap();
+			store::write_private(Path::new(&cert), params.self_signed(&k).unwrap().pem().as_bytes()).unwrap();
+		};
+		issue(&old, 60);
+		old.set_wanted([id.clone()].into());
+		old.state.lock().unwrap().certs.get_mut(&id).unwrap().failures = 3;
+		new.inherit(&old, false);
+		new.set_wanted([id.clone()].into());
+		let s = new.status(&id).unwrap();
+		assert_eq!(s.state, "valid", "{s:?}");
+		assert_eq!(new.state.lock().unwrap().certs[&id].failures, 3, "its state too");
+		assert_eq!(std::fs::read(new.files(&id).0).unwrap(), std::fs::read(old.files(&id).0).unwrap());
+		// the new storage's own, newer certificate is kept
+		issue(&new, 80);
+		let mine = std::fs::read(new.files(&id).0).unwrap();
+		new.inherit(&old, true);
+		assert_eq!(std::fs::read(new.files(&id).0).unwrap(), mine);
+		let _ = std::fs::remove_dir_all(&base);
 	}
 
 	#[test]
