@@ -255,11 +255,13 @@ struct Db {
 	reader: RwLock<Option<Arc<Reader<Vec<u8>>>>>,
 	/// The version last tried (loaded or not), and the last problem logged.
 	seen: Mutex<(Option<Stamp>, Option<String>)>,
+	/// Set through the API: opened without following a link (#345).
+	nofollow: bool,
 }
 
 impl Db {
-	fn new(what: &'static str, path: &str) -> Db {
-		Db { what, path: PathBuf::from(path), reader: RwLock::new(None), seen: Mutex::new((None, None)) }
+	fn new(what: &'static str, path: &str, nofollow: bool) -> Db {
+		Db { what, path: PathBuf::from(path), reader: RwLock::new(None), seen: Mutex::new((None, None)), nofollow }
 	}
 
 	fn get(&self) -> Option<Arc<Reader<Vec<u8>>>> {
@@ -276,7 +278,7 @@ impl Db {
 				return Ok(false);
 			}
 		}
-		let loaded = load(&self.path);
+		let loaded = load(&self.path, self.nofollow);
 		self.seen.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(stamp);
 		let reader = loaded?;
 		*self.reader.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(reader));
@@ -311,17 +313,20 @@ impl Db {
 const MAX_DB: u64 = 1 << 30;
 
 /// Reads a database: a regular file only (a FIFO or a device is refused before it
-/// is read, #345: `/dev/zero` has no length and would be read without end), not a
-/// symbolic link (`O_NOFOLLOW`: the file named, not one a link put in its place), and
-/// no more than `MAX_DB` whatever its length says.
-fn load(path: &Path) -> Result<Reader<Vec<u8>>, (std::io::ErrorKind, String)> {
+/// is read, #345: `/dev/zero` has no length and would be read without end), and no
+/// more than `MAX_DB` whatever its length says. `nofollow`: a path set through the API
+/// (checked to be a regular file right in `RPROXY_API_GEOIP_DIR`) is not opened through
+/// a link put in its place since (`O_NOFOLLOW`); the settings file's paths follow links
+/// (Kubernetes volumes, distribution layouts).
+fn load(path: &Path, nofollow: bool) -> Result<Reader<Vec<u8>>, (std::io::ErrorKind, String)> {
 	use std::io::Read;
 	use std::os::unix::fs::OpenOptionsExt;
 	let err = |e: std::io::Error| match e.raw_os_error() {
 		Some(libc::ELOOP) => (std::io::ErrorKind::InvalidData, format!("{}: a symbolic link (name the file itself)", path.display())),
 		_ => (e.kind(), format!("{}: {e}", path.display())),
 	};
-	let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path).map_err(err)?;
+	let flags = if nofollow { libc::O_NONBLOCK | libc::O_NOFOLLOW } else { libc::O_NONBLOCK };
+	let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).map_err(err)?;
 	let meta = file.metadata().map_err(err)?;
 	if !meta.is_file() {
 		return Err((std::io::ErrorKind::InvalidData, format!("{}: not a regular file", path.display())));
@@ -378,10 +383,20 @@ impl Geoip {
 	/// logged as `degraded` and tried again every `check_interval` (until then
 	/// its lists see every client as unknown).
 	pub fn open(spec: &GeoipGlobal) -> Result<Arc<Geoip>, GeoipError> {
+		Geoip::open_with(spec, false)
+	}
+
+	/// `open` for databases set through the API (#345): no link is followed, also when
+	/// they are read again.
+	pub fn open_api(spec: &GeoipGlobal) -> Result<Arc<Geoip>, GeoipError> {
+		Geoip::open_with(spec, true)
+	}
+
+	fn open_with(spec: &GeoipGlobal, nofollow: bool) -> Result<Arc<Geoip>, GeoipError> {
 		let geoip = Geoip {
 			spec: spec.clone(),
-			country: spec.country_db.as_deref().map(|p| Db::new("country", p)),
-			asn: spec.asn_db.as_deref().map(|p| Db::new("asn", p)),
+			country: spec.country_db.as_deref().map(|p| Db::new("country", p, nofollow)),
+			asn: spec.asn_db.as_deref().map(|p| Db::new("asn", p, nofollow)),
 			stop: CancellationToken::new(),
 		};
 		for db in geoip.dbs() {
@@ -408,7 +423,7 @@ impl Geoip {
 		let db = |what, bytes: Option<Vec<u8>>| -> Result<Option<Db>, String> {
 			let Some(bytes) = bytes else { return Ok(None) };
 			let reader = Reader::from_source(bytes).map_err(|e| e.to_string())?;
-			let db = Db::new(what, "");
+			let db = Db::new(what, "", false);
 			*db.reader.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(reader));
 			Ok(Some(db))
 		};
@@ -614,21 +629,40 @@ mod tests {
 		let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
 		// SAFETY: a valid C string and mode
 		assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-		assert!(load(&fifo).unwrap_err().1.contains("not a regular file"));
-		// a link to /dev/zero (and a link to a good database): not followed
+		for nofollow in [false, true] {
+			assert!(load(&fifo, nofollow).unwrap_err().1.contains("not a regular file"));
+		}
+		// a link to /dev/zero: followed (the settings file), a device, refused; not followed (the API)
 		let zero = dir.join("zero.mmdb");
 		std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
-		let e = load(&zero).unwrap_err();
+		assert!(load(&zero, false).unwrap_err().1.contains("not a regular file"));
+		let e = load(&zero, true).unwrap_err();
 		assert_eq!(e.0, std::io::ErrorKind::InvalidData, "{e:?}");
 		assert!(e.1.contains("symbolic link"), "{e:?}");
-		let good = write(&dir, "good.mmdb", &mmdb::build("GeoLite2-Country", &[("192.0.2.0/24", mmdb::country("JP"))]));
-		load(Path::new(&good)).unwrap();
-		std::os::unix::fs::symlink(&good, dir.join("link.mmdb")).unwrap();
-		assert!(load(&dir.join("link.mmdb")).is_err());
 		// larger than MAX_DB (sparse): refused before it is read
 		let big = dir.join("big.mmdb");
 		std::fs::File::create(&big).unwrap().set_len(MAX_DB + 1).unwrap();
-		assert!(load(&big).unwrap_err().1.contains("larger than"));
+		assert!(load(&big, false).unwrap_err().1.contains("larger than"));
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	/// A database behind a link (a Kubernetes volume's `..data/`) loads from the settings
+	/// file; the same path set through the API is refused (#345).
+	#[test]
+	fn links_are_followed_for_the_file_only() {
+		let dir = std::env::temp_dir().join(format!("rproxy-geoip-link-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(dir.join("..data")).unwrap();
+		let good = write(&dir.join("..data"), "country.mmdb", &mmdb::build("GeoLite2-Country", &[("192.0.2.0/24", mmdb::country("JP"))]));
+		let link = dir.join("country.mmdb");
+		std::os::unix::fs::symlink(&good, &link).unwrap();
+		let spec = GeoipGlobal { country_db: Some(link.to_str().unwrap().into()), check_interval: Some("0s".into()), ..Default::default() };
+		let g = Geoip::open(&spec).unwrap();
+		assert_eq!(g.lookup("192.0.2.1".parse().unwrap()).country_str(), Some("JP"));
+		g.refresh(true);
+		assert_eq!(g.lookup("192.0.2.1".parse().unwrap()).country_str(), Some("JP"), "read again through the link");
+		assert!(matches!(Geoip::open_api(&spec), Err(GeoipError::Config(e)) if e.contains("symbolic link")));
+		Geoip::open_api(&GeoipGlobal { country_db: Some(good), ..spec }).unwrap();
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 

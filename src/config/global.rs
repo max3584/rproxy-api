@@ -591,7 +591,9 @@ async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration, required: bool) -> Re
 }
 
 /// Builds one item (files opened, the bouncer started and synced; nothing swapped yet).
-async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode) -> Result<(), BuildError> {
+/// `from_api`: the value comes from the API (`PATCH`, stored or handed over), not the file:
+/// its files were checked (`State::path_refused`) and are opened without following a link.
+async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode, from_api: bool) -> Result<(), BuildError> {
 	match item {
 		"trusted_proxies" => {
 			built.trusted_proxies = Some(cidr::parse_list(&to.trusted_proxies).map_err(|e| BuildError::Invalid(e.message))?)
@@ -633,7 +635,10 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 				// tens of MB read from disk
 				Some(g) => {
 					let g = g.clone();
-					match tokio::task::spawn_blocking(move || Geoip::open(&g)).await {
+					// the API's files are right in RPROXY_API_GEOIP_DIR, checked just before: opened
+					// without following a link put there since; the file's may be links (Kubernetes volumes)
+					let open = if from_api { Geoip::open_api } else { Geoip::open };
+					match tokio::task::spawn_blocking(move || open(&g)).await {
 						Ok(Ok(g)) => NewGeoip(Some(g)),
 						Ok(Err(crate::net::geoip::GeoipError::Config(e))) => return Err(BuildError::Invalid(e)),
 						Err(e) => return Err(BuildError::Invalid(format!("global.geoip: {e}"))),
@@ -1480,17 +1485,19 @@ impl Settings {
 		for item in failed.keys() {
 			in_force.clear(item);
 		}
-		let (mut to, _) = self.state().effective_with(&file, &in_force);
+		let (mut to, mut sources) = self.state().effective_with(&file, &in_force);
 		// databases the old process kept for its rules (#345), until a reload finds they are not needed
 		if let Some(g) = self.state().kept_geoip.clone() {
 			to.geoip = Some(g);
+			sources.insert("geoip", Source::File);
 		}
 		if let Some(a) = self.state().kept_acme.clone() {
 			to.acme = Some(a);
 		}
 		let mut built = Built::default();
 		for item in differing(&before, &to) {
-			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore).await {
+			let from_api = sources.get(item) == Some(&Source::Api);
+			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore, from_api).await {
 				let e = e.message();
 				warn!(event = "degraded", part = "global", item, from, error = %e,
 					"a global value set through the API cannot be put in force; the value before it stays");
@@ -1540,17 +1547,18 @@ impl Settings {
 				self.turn.clone().lock_owned().await
 			}
 		};
-		let (before, mut to, opts, file) = {
+		let (before, mut to, opts, file, sources) = {
 			let s = self.state();
 			let file = Values::of_file(spec, raw);
-			let (to, _) = s.effective_with(&file, &s.api_in_force());
-			(s.live.clone(), to, s.opts.clone(), file)
+			let (to, sources) = s.effective_with(&file, &s.api_in_force());
+			(s.live.clone(), to, s.opts.clone(), file, sources)
 		};
 		let mut built = Built::default();
 		let mut changed = vec![];
 		let mut not_in_force = vec![];
 		for item in differing(&before, &to) {
-			match build_item(item, &to, &mut built, &opts, Mode::File).await {
+			let from_api = sources.get(item) == Some(&Source::Api);
+			match build_item(item, &to, &mut built, &opts, Mode::File, from_api).await {
 				Ok(()) => changed.push(item),
 				Err(BuildError::NotSynced(e)) => {
 					warn!(event = "config.global_kept", item, error = %e, "the CrowdSec in force stays until its LAPI answers (reload again)");
@@ -1772,7 +1780,8 @@ impl Settings {
 		}
 		let mut built = Built::default();
 		for item in &applied {
-			build_item(item, &to, &mut built, &opts, Mode::Api).await.map_err(|e| match e {
+			// a PATCH builds only what it names, which the file does not
+			build_item(item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
 				BuildError::Invalid(e) => PatchError::Invalid(e),
 				BuildError::NotSynced(e) => PatchError::Unavailable(e),
 			})?;
