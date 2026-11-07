@@ -372,6 +372,8 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `global_in_a_later_file_of_a_directory_is_the_file_s` | `RPROXY_CONFIG` がディレクトリで、`global` が 2 つ目のファイルにあっても、その項目はファイルのもの（`409 static`） |
 | `geoip_through_the_api_is_swapped_for_the_next_connection` | `geoip`（#345）：TCP から `403`、`RPROXY_API_GEOIP_DIR` の外・リンク・`.` で始まる名前・`..`・`/dev/zero`・`/proc/self/environ`・トークンファイルは `403 protected_file`、相対パスと mmdb でないファイルは `400`。入れると次の接続から国で判定し、国のリストを使うルールがあると `country_db` を外す・`geoip` を消すのは `409 in_use`（dry run も）、`asn_db` がないと ASN のリストのルールは作れない。新しい版のデータベースに替えると次の接続から。ルールがなくなれば消せる。場所の外を指す保存した値は効かせず `error` |
 | `a_reload_swaps_geoip_and_keeps_what_rules_need` | 読み直しで `geoip` が入り（`restart_needed` に出ない）、API では `409 static`。mmdb でないデータベースは読み直しを断り何も変えない。API のルールが使う `country_db` をファイルが外すと前のものを残し（`kept`・`source: file`、引き継ぎの状態にも、ほかの PATCH でも残る）、ルールがなくなった後の読み直しでファイルのものに替わる |
+| `a_reload_swaps_acme_and_keeps_the_resolvers_rules_use` | `acme`（#345）：読み直しで入り（`restart_needed` に出ない）、API では `409 static`、ファイルのものは形だけの表示。API のルールが使う resolver をファイルが消すと前のものを残し（`kept`・`source: file`・引き継ぎの状態にも）、誤りのある `acme` は読み直しを断る。ルールがなくなった後の読み直しでファイルのものに替わり、ファイルから消えればなくなる |
+| `acme_through_the_api_moves_storage_and_keeps_the_old_one_protected` | `acme`（#345）：`acme` がなくて起動できなかったルールが PATCH で動く、`storage` を変えると証明書が写り（仮の証明書にならず `valid` のまま）、前の `storage` の鍵はルールを書くだけのトークンから指せない（`acme` を消した後も、#319） |
 | `rules_waiting_for_geoip_start_once_it_is_in_force` | 起動で行を読めず `geoip` がなくて起動できなかったルール（国・ASN のリスト）が、照合が行を読んだとき（国）・`asn_db` を入れる PATCH の後（ASN）に動く（#345） |
 
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
@@ -575,7 +577,7 @@ mmdb はテストが作る（`tests/common/mmdb.rs`：IPv6 の木（IPv4 は ::/
 | `tests/gateway_l7.rs` | Gateway API 向けの L7（#224・#226〜#232・#235）：`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`（504、送信ごと、本文の途中で切る）、`replace_host`、転送先ごとのミドルウェア、`cors`（プリフライト・ワイルドカードのオリジン）、`retry` の `status`、`mirror`（割合・本文・つながらないミラー）、`status` の転送先、`features`。許さないオリジンのプリフライトに rproxy が答える・転送先が 1 つでも `retry` が送り直す、クライアント証明書の `X-Client-Verify`・`X-Forwarded-Client-Cert`（`optional_no_verify`、偽のヘッダは消す）（#238）。`client_auth` のない平文のルール・Upgrade・`forward_auth`・`mirror` でも証明書のヘッダを偽れない、`mirror` の写しの X-Forwarded-For（セキュリティレビュー H1・M5） |
 | `tests/backend_tls.rs` | サービスの `tls`（#236）：サービスの CA・SNI の名前、`subject_alt_names`（DNS 名・URI）、転送先へのクライアント証明書、平文の HTTP のルールからの `https://` の転送先、形とファイルの誤り |
 | `tests/crowdsec.rs` | `crowdsec` ミドルウェア（偽の LAPI と AppSec）。API のルールはキーのファイルを指せない（#319、`rules_may_not_name_the_key_file`） |
-| `tests/acme.rs` | ACME（#208）：API の守り（いつも動く。#319 の保存先と秘密のファイルは `rules_may_not_name_acme_files`）と、Pebble・PowerDNS で実際に証明書を取る（上の表） |
+| `tests/acme.rs` | ACME（#208）：API の守り（いつも動く。#319 の保存先と秘密のファイルは `rules_may_not_name_acme_files`）と、Pebble・PowerDNS で実際に証明書を取る（上の表）。`acme_changes_while_running_with_pebble`（#345）は Pebble だけ（`PEBBLE_VA_ALWAYS_VALID`）で、`PATCH /config/global` の `acme` を Unix ソケットから入れ・変え・消す：場所の外のファイル・直接書いた秘密・`key_file` を断る、resolver・`acme` を消す・ルールのポートの `http01_listen` は `409 in_use`、注文中（TXT が見えるのを待つ間）の変更で TXT が消え新しい設定で取り直す、`http01_listen` の移動、新しい `storage` で取り直す |
 | `tests/traefik_convert.rs` | Traefik の設定の変換（`crates/rproxy-traefik`）：`tests/fixtures/traefik/` のすべての場合（`cases`）の出力を rproxy が読んで受け付ける。いくつかは中身も確かめる。変換が知っているミドルウェア（`KNOWN_MIDDLEWARES`）が `Features::CURRENT` にある |
 | `crates/rproxy-traefik` のテスト（`cargo test -p rproxy-traefik`） | 出力が `tests/fixtures/traefik/*/expected*` とバイト単位で同じ（期待する出力は Python の版 `contrib/traefik2rproxy.py` が書いたもの。足し方は `tests/fixtures/traefik/README.md`）、終了コード・`-o`、YAML の書き方（PyYAML と同じ）・ルール・ミドルウェア・期間などの単体テスト。読むのは管理者が渡す手元のファイルなので、ファジングのターゲットは置かない（インターネットから読むものではない） |
 

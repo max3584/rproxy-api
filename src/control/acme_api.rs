@@ -51,8 +51,8 @@ pub fn check_rule_scope(principal: &Principal, create: Option<&RuleRequest>, upd
 	Ok(())
 }
 
-fn acme(state: &AppState) -> Result<&Arc<crate::acme::Acme>, ApiError> {
-	state.registry.acme().ok_or_else(|| ApiError::not_found("global.acme is not configured in the settings file (RPROXY_CONFIG)"))
+fn acme(state: &AppState) -> Result<Arc<crate::acme::Acme>, ApiError> {
+	state.registry.acme().ok_or_else(|| ApiError::not_found("global.acme is not configured (the settings file or PATCH /config/global)"))
 }
 
 /// The strong operations: the scope, then the Unix socket.

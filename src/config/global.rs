@@ -10,10 +10,11 @@
 //!
 //! Items that can change while running (`Apply::Live`) are swapped in the shared
 //! `HttpGlobal` as one snapshot (the next request or connection takes it), the
-//! GeoIP databases (#345, the next connection or request) or the UDP default
+//! GeoIP databases (#345, the next connection or request), ACME (#345: the next
+//! order; the rules' certificates come from the new storage) or the UDP default
 //! session cap (the next session). Items read once at the start (`Apply::Restart`:
-//! `acme`, `performance`, `files`, the control API's listener) are only shown; the
-//! API does not change them (`409 restart_only`).
+//! `performance`, `files`, the control API's listener) are only shown; the API does
+//! not change them (`409 restart_only`).
 //!
 //! A change is built first (files opened, a new CrowdSec bouncer started and
 //! synced with its LAPI) and swapped in under the registry's rules lock, where
@@ -34,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
+use crate::acme::Acme;
+use crate::acme::config::AcmeGlobal;
 use crate::config::{CrowdsecGlobal, GlobalSpec};
 use crate::core::registry::Registry;
 use crate::l7::access::{AccessLog, AccessLogError, Update};
@@ -97,8 +100,8 @@ pub const ITEMS: &[Item] = &[
 	Item { name: "udp_max_sessions", apply: Apply::Live, unix_only: false, path: ("udp_max_sessions", None), in_file: false },
 	// RPROXY_CACHE_MAX_MEMORY (#349, no file key)
 	Item { name: "cache_max_memory", apply: Apply::Live, unix_only: false, path: ("cache_max_memory", None), in_file: false },
-	// later through the API (#345); read at the start now
-	Item { name: "acme", apply: Apply::Restart, unix_only: true, path: ("acme", None), in_file: true },
+	// obtains certificates, writes files (confined to RPROXY_API_ACME_DIR) and gives secrets to DNS APIs (#345)
+	Item { name: "acme", apply: Apply::Live, unix_only: true, path: ("acme", None), in_file: true },
 	// decides who passes the rules' geoip lists; reads files (confined to RPROXY_API_GEOIP_DIR, #345)
 	Item { name: "geoip", apply: Apply::Live, unix_only: true, path: ("geoip", None), in_file: true },
 	Item { name: "performance", apply: Apply::Restart, unix_only: false, path: ("performance", None), in_file: true },
@@ -182,6 +185,8 @@ pub struct Values {
 	pub cache_max_memory: Option<u64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub geoip: Option<GeoipGlobal>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub acme: Option<AcmeGlobal>,
 }
 
 /// The live items in force.
@@ -194,6 +199,7 @@ pub struct Live {
 	pub udp_max_sessions: u64,
 	pub cache_max_memory: u64,
 	pub geoip: Option<GeoipGlobal>,
+	pub acme: Option<AcmeGlobal>,
 }
 
 impl Default for Live {
@@ -206,6 +212,7 @@ impl Default for Live {
 			udp_max_sessions: crate::l4::udp::DEFAULT_MAX_SESSIONS,
 			cache_max_memory: crate::l7::middleware::cache::DEFAULT_PROCESS_MAX_MEMORY,
 			geoip: None,
+			acme: None,
 		}
 	}
 }
@@ -223,6 +230,7 @@ impl Values {
 			udp_max_sessions: None,
 			cache_max_memory: None,
 			geoip: spec.geoip.clone(),
+			acme: spec.acme.clone(),
 		}
 	}
 
@@ -235,6 +243,7 @@ impl Values {
 			"udp_max_sessions" => self.udp_max_sessions.is_some(),
 			"cache_max_memory" => self.cache_max_memory.is_some(),
 			"geoip" => self.geoip.is_some(),
+			"acme" => self.acme.is_some(),
 			_ => false,
 		}
 	}
@@ -253,6 +262,7 @@ impl Values {
 			"udp_max_sessions" => serde_json::to_value(self.udp_max_sessions?),
 			"cache_max_memory" => serde_json::to_value(self.cache_max_memory?),
 			"geoip" => serde_json::to_value(self.geoip.as_ref()?),
+			"acme" => serde_json::to_value(self.acme.as_ref()?).map(pruned),
 			_ => return None,
 		};
 		v.ok()
@@ -274,6 +284,7 @@ impl Values {
 			("udp_max_sessions", v) => next.udp_max_sessions = v.map(|v| parse(item, v)).transpose()?,
 			("cache_max_memory", v) => next.cache_max_memory = v.map(|v| parse(item, v)).transpose()?,
 			("geoip", v) => next.geoip = v.map(|v| parse(item, v)).transpose()?,
+			("acme", v) => next.acme = v.map(|v| parse(item, v)).transpose()?,
 			_ => return Err(format!("global.{item} is not an item the API sets")),
 		}
 		next.check_item(item)?;
@@ -331,6 +342,15 @@ impl Values {
 					}
 				}
 			}
+			"acme" => {
+				if let Some(a) = &self.acme {
+					a.check()?;
+					for (what, p) in acme_paths(a) {
+						absolute(&format!("global.acme.{what}"), p)?;
+					}
+					acme_secrets_in_files(a)?;
+				}
+			}
 			_ => {}
 		}
 		Ok(())
@@ -378,6 +398,7 @@ fn effective(file: &Values, env: &Values, api: &Values) -> (Live, BTreeMap<&'sta
 		udp_max_sessions: pick("udp_max_sessions").and_then(|v| v.udp_max_sessions).unwrap_or(d.udp_max_sessions),
 		cache_max_memory: pick("cache_max_memory").and_then(|v| v.cache_max_memory).unwrap_or(d.cache_max_memory),
 		geoip: pick("geoip").and_then(|v| v.geoip.clone()),
+		acme: pick("acme").and_then(|v| v.acme.clone()),
 	};
 	(live, sources)
 }
@@ -406,6 +427,9 @@ fn differing(a: &Live, b: &Live) -> Vec<&'static str> {
 	if a.geoip != b.geoip {
 		out.push("geoip");
 	}
+	if a.acme != b.acme {
+		out.push("acme");
+	}
 	out
 }
 
@@ -418,6 +442,7 @@ fn live_value(l: &Live, item: &str) -> Value {
 		"udp_max_sessions" => json!(l.udp_max_sessions),
 		"cache_max_memory" => json!(l.cache_max_memory),
 		"geoip" => serde_json::to_value(&l.geoip).unwrap_or(Value::Null),
+		"acme" => serde_json::to_value(&l.acme).map(pruned).unwrap_or(Value::Null),
 		_ => Value::Null,
 	}
 }
@@ -432,6 +457,7 @@ fn keep_item(to: &mut Live, before: &Live, item: &str) {
 		"udp_max_sessions" => to.udp_max_sessions = before.udp_max_sessions,
 		"cache_max_memory" => to.cache_max_memory = before.cache_max_memory,
 		"geoip" => to.geoip = before.geoip.clone(),
+		"acme" => to.acme = before.acme.clone(),
 		_ => {}
 	}
 }
@@ -489,6 +515,17 @@ impl Drop for NewGeoip {
 	}
 }
 
+/// `global.acme` built for a change (#345): the new `Acme` (not started; None: no
+/// ACME) and the `http01_listen` addresses bound for it (closed if the change does
+/// not take them).
+struct NewAcme {
+	acme: Option<Arc<Acme>>,
+	addrs: Vec<std::net::SocketAddr>,
+	bound: crate::acme::challenge::Bound,
+	/// What `Acme::carry_files` found (the files copied before the rules lock).
+	held: std::collections::BTreeMap<crate::acme::CertId, Option<(i64, i64)>>,
+}
+
 /// The live items built for a change, swapped in by `commit`.
 #[derive(Default)]
 struct Built {
@@ -503,6 +540,7 @@ struct Built {
 	cache_max_memory: Option<u64>,
 	/// Some(None): no databases; Some(Some): the new ones.
 	geoip: Option<NewGeoip>,
+	acme: Option<NewAcme>,
 }
 
 /// Why building one item failed.
@@ -557,7 +595,15 @@ async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration, required: bool) -> Re
 /// Builds one item (files opened, the bouncer started and synced; nothing swapped yet).
 /// `from_api`: the value comes from the API (`PATCH`, stored or handed over), not the file:
 /// its files were checked (`State::path_refused`) and are opened without following a link.
-async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode, from_api: bool) -> Result<(), BuildError> {
+async fn build_item(
+	registry: &Registry,
+	item: &str,
+	to: &Live,
+	built: &mut Built,
+	opts: &Options,
+	mode: Mode,
+	from_api: bool,
+) -> Result<(), BuildError> {
 	match item {
 		"trusted_proxies" => {
 			built.trusted_proxies = Some(cidr::parse_list(&to.trusted_proxies).map_err(|e| BuildError::Invalid(e.message))?)
@@ -610,16 +656,105 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 				}
 			})
 		}
+		"acme" => {
+			let acme = match &to.acme {
+				None => None,
+				Some(g) => Some(Acme::new(g).map_err(BuildError::Invalid)?),
+			};
+			if let Some(e) = acme.as_ref().and_then(|a| a.storage_problem()) {
+				if mode == Mode::Api {
+					return Err(BuildError::Invalid(format!("global.acme.storage: {e}")));
+				}
+				warn!(event = "degraded", part = "global.acme.storage", error = %e,
+					"certificates cannot be stored; rules with acme certificates serve a self-signed one until this is fixed");
+			}
+			let addrs = acme.as_ref().map(|a| a.http01_listen().to_vec()).unwrap_or_default();
+			let (bound, failed) = crate::acme::challenge::bind_http01(&addrs).await;
+			for (addr, e) in failed {
+				if mode == Mode::Api {
+					return Err(BuildError::Invalid(format!("global.acme.http01_listen: {addr}: {e}")));
+				}
+				warn!(event = "degraded", part = "global.acme.http01_listen", addr = %addr, error = %e,
+					"HTTP-01 is answered only by http rules on this address");
+			}
+			// the certificates of the acme in force carried to a new storage: file IO, done
+			// here (off the async workers, before the rules lock); `commit` takes the state
+			let held = match (&acme, registry.acme()) {
+				(Some(new), Some(old)) => {
+					let new = new.clone();
+					tokio::task::spawn_blocking(move || new.carry_files(&old)).await.unwrap_or_default()
+				}
+				_ => Default::default(),
+			};
+			built.acme = Some(NewAcme { acme, addrs, bound, held });
+		}
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
 	Ok(())
 }
 
 /// What the rules use of `global` (`Registry::under_rules_lock`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RulesUse {
 	pub crowdsec: CrowdsecUse,
 	pub geoip: GeoipUse,
+	/// The ACME certificates (resolver, names) of the rules not from the settings file (#345).
+	pub acme: BTreeSet<(String, Vec<String>)>,
+	/// The listening sockets of every rule (`quota::sockets`).
+	pub sockets: usize,
+	/// Where TCP rules listen (`global.acme.http01_listen` may not take it).
+	pub tcp: Vec<Listening>,
+}
+
+/// Where a TCP rule listens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listening {
+	pub key: String,
+	pub ips: Vec<std::net::IpAddr>,
+	pub v6only: bool,
+	pub ports: (u16, u16),
+}
+
+impl RulesUse {
+	/// Why the ACME certificates of the rules cannot be obtained with `acme`, if they cannot (#345).
+	fn acme_refuses(&self, acme: Option<&AcmeGlobal>) -> Option<String> {
+		let (resolver, _) = self.acme.iter().next()?;
+		let Some(a) = acme else {
+			return Some(format!("rules use acme certificates (resolver {resolver:?})"));
+		};
+		self.acme.iter().find_map(|(r, d)| a.check_names(r, d).err().map(|e| format!("rules use acme resolver {r:?} for {d:?}: {e}")))
+	}
+
+	/// Why `http01_listen` cannot listen on `addrs` (`now`: the addresses it listens on):
+	/// a TCP rule listens there (`409 in_use`), or the rules' listening sockets and these
+	/// together pass `RPROXY_MAX_LISTENERS` (`409 limit`, #358).
+	fn http01_refuses(
+		&self,
+		addrs: &[std::net::SocketAddr],
+		now: &[std::net::SocketAddr],
+		reserved: &[std::net::SocketAddr],
+	) -> Option<PatchError> {
+		for a in addrs {
+			if let Some(l) = self.tcp.iter().find(|l| {
+				(l.ports.0..=l.ports.1).contains(&a.port()) && l.ips.iter().any(|ip| crate::net::listen::clash(*ip, l.v6only, a.ip(), false))
+			}) {
+				return Some(PatchError::InUse(format!("global.acme.http01_listen {a}: the rule {} listens there", l.key)));
+			}
+			if let Some(r) = reserved.iter().find(|r| r.port() == a.port() && crate::net::listen::clash(r.ip(), false, a.ip(), false)) {
+				return Some(PatchError::InUse(format!("global.acme.http01_listen {a}: the control API listens there ({r})")));
+			}
+		}
+		let added = addrs.iter().filter(|a| !now.contains(a)).count();
+		crate::core::quota::check_process(0, 0, self.sockets + addrs.len(), added).err().map(|e| PatchError::Limit(e.message))
+	}
+
+	/// Why the rules cannot run with `to` in force, for the items a change applies.
+	fn refused(&self, to: &Live, applied: &[&str]) -> Option<String> {
+		let crowdsec = self.crowdsec.refuses(to.crowdsec.as_ref()).filter(|_| applied.contains(&"crowdsec")).map(String::from);
+		crowdsec
+			.or_else(|| self.geoip.refuses(to.geoip.as_ref()).filter(|_| applied.contains(&"geoip")).map(String::from))
+			.or_else(|| self.acme_refuses(to.acme.as_ref()).filter(|_| applied.contains(&"acme")))
+	}
 }
 
 /// The databases of `global.geoip` the rules' `geoip` lists need (theirs and their
@@ -671,14 +806,6 @@ pub struct CrowdsecUse {
 	pub appsec: bool,
 }
 
-impl RulesUse {
-	/// Why the rules cannot run with `to` in force, for the items a change applies.
-	fn refused(&self, to: &Live, applied: &[&str]) -> Option<&'static str> {
-		let crowdsec = self.crowdsec.refuses(to.crowdsec.as_ref()).filter(|_| applied.contains(&"crowdsec"));
-		crowdsec.or_else(|| self.geoip.refuses(to.geoip.as_ref()).filter(|_| applied.contains(&"geoip")))
-	}
-}
-
 impl CrowdsecUse {
 	/// Why the rules cannot run with `c` in force, if they cannot.
 	fn refuses(&self, c: Option<&CrowdsecGlobal>) -> Option<&'static str> {
@@ -704,6 +831,8 @@ pub enum PatchError {
 	/// `403 protected_file` (#319): a path names one of rproxy's own files, or is
 	/// outside the directory access logs may be in.
 	Protected(String),
+	/// `409 limit`: `global.acme.http01_listen` would pass `RPROXY_MAX_LISTENERS` (#358).
+	Limit(String),
 	/// `502 crowdsec_unavailable`: the new LAPI did not answer; nothing changed.
 	Unavailable(String),
 	/// `503 not_loaded`: the stored values could not be read yet (a change would
@@ -752,6 +881,9 @@ pub struct Handoff {
 	/// A `geoip` whose databases the file took away while rules use them, kept in force (#345).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub kept_geoip: Option<GeoipGlobal>,
+	/// An `acme` whose resolvers (or allowed names) the file took away while rules use them, kept in force (#345).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kept_acme: Option<AcmeGlobal>,
 }
 
 /// What a live upgrade hands over that the file dropped while rules use it, kept in
@@ -760,11 +892,12 @@ pub struct Handoff {
 pub struct Kept {
 	pub crowdsec: Option<CrowdsecGlobal>,
 	pub geoip: Option<GeoipGlobal>,
+	pub acme: Option<AcmeGlobal>,
 }
 
 impl Handoff {
 	pub fn kept(&self) -> Kept {
-		Kept { crowdsec: self.kept_crowdsec.clone(), geoip: self.kept_geoip.clone() }
+		Kept { crowdsec: self.kept_crowdsec.clone(), geoip: self.kept_geoip.clone(), acme: self.kept_acme.clone() }
 	}
 }
 
@@ -785,6 +918,10 @@ pub struct Options {
 	/// The directory the GeoIP databases set through the API must be in
 	/// (`RPROXY_API_GEOIP_DIR`, #345); None: the API cannot set them.
 	pub geoip_dir: Option<PathBuf>,
+	/// The directory the files `global.acme` set through the API names must be in
+	/// (`RPROXY_API_ACME_DIR`, #345): secrets right in it, `storage` under it. None:
+	/// the API's `acme` names no file and keeps the default storage.
+	pub acme_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -796,6 +933,7 @@ impl Default for Options {
 			database: false,
 			sync_wait: BOUNCER_SYNC_WAIT,
 			geoip_dir: None,
+			acme_dir: None,
 		}
 	}
 }
@@ -819,6 +957,8 @@ struct State {
 	/// A `geoip` whose databases the file took away while rules use them: in force
 	/// until a reload finds the rules do without them (#345).
 	kept_geoip: Option<GeoipGlobal>,
+	/// The same for `acme` (its resolvers and allowed names, #345).
+	kept_acme: Option<AcmeGlobal>,
 	/// The start-only items not from the file: (source, value) as started.
 	startup: BTreeMap<&'static str, (Source, Value)>,
 	/// What is in force, and where each item comes from.
@@ -882,7 +1022,7 @@ impl State {
 	/// Why the API may not name a path (#319): rproxy's secrets and stores, and for
 	/// the access log, anything outside `access_log_dir`.
 	fn path_refused(&self, registry: &Registry, values: &Values) -> Option<(&'static str, String)> {
-		let entries = crate::net::protected::current(registry.acme().map(|a| a.as_ref()), None);
+		let entries = crate::net::protected::current(registry.acme().as_deref(), None);
 		let mut paths =
 			vec![("access_log", values.access_log.as_deref()), ("crowdsec", values.crowdsec.as_ref().map(|c| c.api_key_file.as_str()))];
 		paths.extend(values.geoip.iter().flat_map(|g| g.databases()).map(|(_, p)| ("geoip", Some(p))));
@@ -902,7 +1042,80 @@ impl State {
 				return Some(("geoip", e));
 			}
 		}
+		if let Some(a) = &values.acme {
+			// the acme in force is the API's own (the file's wins): its files are not others'
+			let bouncer = registry.http_global().crowdsec();
+			let entries = crate::net::protected::others(bouncer.as_ref().map(|b| b.key_file()));
+			for (what, p) in acme_paths(a).into_iter().filter(|(w, _)| *w != "storage") {
+				if let Some(why) = crate::net::protected::protecting(p, &entries) {
+					return Some(("acme", format!("global.acme.{what}: {p} is {why}; the API may not name it in global")));
+				}
+			}
+			if let Err(e) = self.acme_allowed(a) {
+				return Some(("acme", e));
+			}
+		}
 		None
+	}
+
+	/// The files `global.acme` set through the API names (#345): `storage` is left out
+	/// (the default) or a directory under `acme_dir`; the secrets, CA files and the
+	/// helper's socket are files right in `acme_dir` (not links, so not in the storage;
+	/// an acme-dns `credentials_file` that does not exist yet is written there). The API
+	/// cannot have rproxy read, send or write any other file.
+	fn acme_allowed(&self, a: &AcmeGlobal) -> Result<(), String> {
+		let real = |d: &Path| std::fs::canonicalize(d).ok();
+		let default_storage = a.storage.as_deref().is_none_or(|s| Path::new(s) == Path::new(crate::acme::config::DEFAULT_STORAGE));
+		let files: Vec<(String, &str)> = acme_paths(a).into_iter().filter(|(w, _)| *w != "storage").collect();
+		// the storage and the certificate store do not hold one another
+		let storage = a.storage.clone().unwrap_or_else(|| crate::acme::config::DEFAULT_STORAGE.to_string());
+		let store = crate::net::protected::resolve(&crate::tls::named::dir()).real;
+		let at = crate::net::protected::resolve(Path::new(&storage)).real;
+		if at.starts_with(&store) || store.starts_with(&at) {
+			return Err(format!("global.acme.storage: {storage} and the certificate store (RPROXY_CERT_STORE) would hold one another"));
+		}
+		let Some(dir) = &self.opts.acme_dir else {
+			if let Some((what, p)) = files.first() {
+				return Err(format!("global.acme.{what}: {p}: no directory for files of global.acme set through the API: set RPROXY_API_ACME_DIR"));
+			}
+			if !default_storage {
+				return Err("global.acme.storage: no directory for global.acme set through the API: leave storage out (the default) or set RPROXY_API_ACME_DIR".into());
+			}
+			return Ok(());
+		};
+		let Some(top) = real(dir) else { return Err(format!("RPROXY_API_ACME_DIR {} does not exist", dir.display())) };
+		// a storage under the directory: its files (keys, certificates) are not right in it
+		match &a.storage {
+			Some(s) if !default_storage => {
+				let p = Path::new(s);
+				let meta = std::fs::symlink_metadata(p).map_err(|e| format!("global.acme.storage: {s}: {e} (create it first)"))?;
+				let inside = real(p).is_some_and(|r| r.starts_with(&top) && r != top);
+				if !meta.is_dir() || !inside {
+					return Err(format!("global.acme.storage: {s} is not a directory under {} (RPROXY_API_ACME_DIR)", dir.display()));
+				}
+			}
+			_ => {}
+		}
+		for (what, p) in files {
+			let path = Path::new(p);
+			let outside = || format!("global.acme.{what}: {p} is not right in {} (RPROXY_API_ACME_DIR)", dir.display());
+			let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+				return Err(outside());
+			};
+			if name.starts_with('.') || real(parent).as_ref() != Some(&top) {
+				return Err(outside());
+			}
+			match std::fs::symlink_metadata(path) {
+				Ok(m) if m.file_type().is_file() => {}
+				Ok(m) if what == "helper.socket" && std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()) => {}
+				Ok(_) => return Err(format!("global.acme.{what}: {p} is not a regular file")),
+				// written when the first name registers (acme-dns)
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound && what.ends_with("credentials_file") => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound && what == "helper.socket" => {}
+				Err(e) => return Err(format!("global.acme.{what}: {p}: {e}")),
+			}
+		}
+		Ok(())
 	}
 
 	/// A GeoIP database set through the API is a regular file (not a link) right in
@@ -989,8 +1202,116 @@ impl State {
 		if self.kept_geoip.is_some() && self.live.geoip == self.kept_geoip {
 			self.sources.insert("geoip", Source::File);
 		}
+		if self.kept_acme.is_some() && self.live.acme == self.kept_acme {
+			self.sources.insert("acme", Source::File);
+		}
 		self.warn_shadowed();
 	}
+}
+
+/// JSON without nulls and empty lists or maps (how `acme` is shown and stored).
+fn pruned(v: Value) -> Value {
+	match v {
+		Value::Object(m) => Value::Object(
+			m.into_iter()
+				.map(|(k, v)| (k, pruned(v)))
+				.filter(|(_, v)| !(v.is_null() || v.as_array().is_some_and(|a| a.is_empty()) || v.as_object().is_some_and(|o| o.is_empty())))
+				.collect(),
+		),
+		Value::Array(a) => Value::Array(a.into_iter().map(pruned).collect()),
+		other => other,
+	}
+}
+
+/// Every path `global.acme` names: (where, path). `storage` too.
+fn acme_paths(a: &AcmeGlobal) -> Vec<(String, &str)> {
+	let mut out: Vec<(String, &str)> = vec![];
+	if let Some(s) = &a.storage {
+		out.push(("storage".into(), s));
+	}
+	for (name, acc) in &a.accounts {
+		out.extend(acc.key_file.as_deref().map(|f| (format!("accounts.{name}.key_file"), f)));
+		out.extend(acc.ca_file.as_deref().map(|f| (format!("accounts.{name}.ca_file"), f)));
+		out.extend(acc.eab.as_ref().map(|e| (format!("accounts.{name}.eab.hmac_key_file"), e.hmac_key_file.as_str())));
+	}
+	for (name, p) in &a.dns_providers {
+		for (field, f) in [
+			("api_key_file", &p.api_key_file),
+			("secret_file", &p.secret_file),
+			("tsig_secret_file", &p.tsig_secret_file),
+			("credentials_file", &p.credentials_file),
+			("ca_file", &p.ca_file),
+		] {
+			out.extend(f.as_deref().map(|f| (format!("dns_providers.{name}.{field}"), f)));
+		}
+	}
+	if let Some(h) = &a.helper {
+		out.push(("helper.socket".into(), &h.socket));
+	}
+	out
+}
+
+/// Names of headers and query parameters that carry a secret: through the API their
+/// value comes from the provider's `secret_file` (`{secret}`), never inline (#345).
+fn names_a_secret(name: &str) -> bool {
+	let n = name.to_ascii_lowercase();
+	["auth", "key", "token", "secret", "password", "passwd", "credential", "cookie", "session", "signature"].iter().any(|w| n.contains(w))
+}
+
+/// `{secret}`, or `<scheme> {secret}` (`Bearer {secret}`): nothing literal beside the secret.
+fn secret_header_value(v: &str) -> bool {
+	match v.strip_suffix("{secret}") {
+		Some("") => true,
+		Some(scheme) => scheme.strip_suffix(' ').is_some_and(|s| {
+			!s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b)) && s.as_bytes()[0].is_ascii_alphabetic()
+		}),
+		None => false,
+	}
+}
+
+/// `global.acme` set through the API holds no secret itself (#345): account keys stay
+/// in the storage (no `key_file`), and the calls of an `http` DNS provider take their
+/// credentials from `secret_file` (`{secret}`): no user in a URL, a header or query
+/// parameter named like a credential must be `{secret}`-based, and a body naming one must use `{secret}`.
+fn acme_secrets_in_files(a: &AcmeGlobal) -> Result<(), String> {
+	for (name, acc) in &a.accounts {
+		if acc.key_file.is_some() {
+			return Err(format!("global.acme.accounts.{name}.key_file: through the API the account key is kept in the storage; leave key_file out"));
+		}
+	}
+	for (name, p) in &a.dns_providers {
+		for (call, c) in [("add", &p.add), ("remove", &p.remove)] {
+			let Some(c) = c else { continue };
+			let here = |m: String| format!("global.acme.dns_providers.{name}.{call}: {m} (through the API, credentials come from secret_file as {{secret}})");
+			let (base, query) = c.url.split_once('?').unwrap_or((&c.url, ""));
+			let rest = base.split_once("://").map_or(base, |(_, r)| r);
+			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+			if authority.contains('@') {
+				return Err(here("the url names a user".into()));
+			}
+			// paths are logged and shown: no secret there
+			if path.contains("{secret}") {
+				return Err(here("{secret} in the url's path (put it in a header or the query)".into()));
+			}
+			for pair in query.split('&').filter(|p| !p.is_empty()) {
+				let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+				if (names_a_secret(k) || v.contains("{secret}")) && v != "{secret}" {
+					return Err(here(format!("the url's {k} must be exactly {{secret}}")));
+				}
+			}
+			for (h, v) in &c.headers {
+				if (names_a_secret(h) || v.contains("{secret}")) && !secret_header_value(v) {
+					return Err(here(format!("the header {h} must be {{secret}} or \"<scheme> {{secret}}\"")));
+				}
+			}
+			if let Some(b) = &c.body {
+				if names_a_secret(b) && !b.contains("{secret}") {
+					return Err(here("the body names a credential without {secret}".into()));
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 /// Whether `name` is `<stem>.<YYYY-MM-DD>.<ext>` (a file the access log's rotation wrote).
@@ -1039,9 +1360,21 @@ struct Swapped {
 	/// The GeoIP databases replaced (#345): their watcher stops; the memory goes with
 	/// the last connection that looked them up.
 	geoip: Option<Arc<Geoip>>,
+	/// `global.acme` was swapped (#345): the one replaced (`Registry::acme_swapped`).
+	acme: Option<Option<Arc<Acme>>>,
 }
 
 impl Swapped {
+	/// `finish`, then, for a new `global.acme`, `Registry::acme_swapped` (after the rules
+	/// lock: it waits for the rules' TLS to be rebuilt).
+	async fn finish_with(mut self, registry: &Arc<Registry>) {
+		let acme = self.acme.take();
+		self.finish();
+		if let Some(old) = acme {
+			registry.acme_swapped(old).await;
+		}
+	}
+
 	/// Stops the bouncer replaced; the snapshot before goes off the data plane (its
 	/// access log file is flushed and closed there).
 	fn finish(self) {
@@ -1059,8 +1392,8 @@ impl Swapped {
 }
 
 /// Swaps what was built in, under the rules lock.
-fn commit(registry: &Registry, built: Built) -> Swapped {
-	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, cache_max_memory, geoip, .. } = built;
+fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
+	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, cache_max_memory, geoip, acme, .. } = built;
 	let crowdsec = crowdsec.map(|mut b| b.take());
 	if let Some(Some(b)) = &crowdsec {
 		info!(event = "crowdsec.swap", synced = b.synced(), "a new CrowdSec bouncer is in force");
@@ -1081,7 +1414,19 @@ fn commit(registry: &Registry, built: Built) -> Swapped {
 		}
 		registry.http_global().set_geoip(new)
 	});
-	Swapped { bouncer, snapshot, geoip }
+	let acme = acme.map(|a| {
+		let NewAcme { acme, addrs, bound, held } = a;
+		let old = registry.acme();
+		// memory only under the rules lock; what `old` does after this is taken over
+		// again once it has stopped (`Acme::spawn`)
+		if let (Some(new), Some(old)) = (&acme, &old) {
+			new.inherit(old, &held, false);
+		}
+		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
+		crate::acme::challenge::install_http01(&addrs, bound);
+		registry.set_acme(acme)
+	});
+	Swapped { bouncer, snapshot, geoip, acme }
 }
 
 impl Settings {
@@ -1145,6 +1490,9 @@ impl Settings {
 			if kept_over.geoip.is_some() {
 				s.kept_geoip = kept_over.geoip;
 			}
+			if kept_over.acme.is_some() {
+				s.kept_acme = kept_over.acme;
+			}
 			// the paths the API may not name, checked again (#319)
 			let mut check = api.clone();
 			while let Some((item, e)) = s.path_refused(registry, &check) {
@@ -1164,10 +1512,13 @@ impl Settings {
 			to.geoip = Some(g);
 			sources.insert("geoip", Source::File);
 		}
+		if let Some(a) = self.state().kept_acme.clone() {
+			to.acme = Some(a);
+		}
 		let mut built = Built::default();
 		for item in differing(&before, &to) {
 			let from_api = sources.get(item) == Some(&Source::Api);
-			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore, from_api).await {
+			if let Err(e) = build_item(registry, item, &to, &mut built, &opts, Mode::Restore, from_api).await {
 				let e = e.message();
 				warn!(event = "degraded", part = "global", item, from, error = %e,
 					"a global value set through the API cannot be put in force; the value before it stays");
@@ -1177,7 +1528,7 @@ impl Settings {
 		}
 		let fallback = built.access_log_fallback;
 		let brought = brought(&differing(&before, &to), &to);
-		registry.under_rules_lock(|_| commit(registry, built)).await.finish();
+		registry.under_rules_lock(|_| commit(registry, built)).await.finish_with(registry).await;
 		{
 			let mut s = self.state();
 			s.kept = kept;
@@ -1208,7 +1559,7 @@ impl Settings {
 	/// A mistake (an access log directory that does not exist, a CrowdSec key file that
 	/// cannot be read) refuses the reload with nothing changed; a new LAPI that does not
 	/// answer leaves the CrowdSec in force (`config.global_kept`).
-	pub async fn prepare_file(&self, spec: &GlobalSpec, raw: &Value) -> Result<FilePrepared, String> {
+	pub async fn prepare_file(&self, registry: &Registry, spec: &GlobalSpec, raw: &Value) -> Result<FilePrepared, String> {
 		// held to the commit: a PATCH in between would be undone by it
 		let turn = match self.turn.clone().try_lock_owned() {
 			Ok(t) => t,
@@ -1228,7 +1579,7 @@ impl Settings {
 		let mut not_in_force = vec![];
 		for item in differing(&before, &to) {
 			let from_api = sources.get(item) == Some(&Source::Api);
-			match build_item(item, &to, &mut built, &opts, Mode::File, from_api).await {
+			match build_item(registry, item, &to, &mut built, &opts, Mode::File, from_api).await {
 				Ok(()) => changed.push(item),
 				Err(BuildError::NotSynced(e)) => {
 					warn!(event = "config.global_kept", item, error = %e, "the CrowdSec in force stays until its LAPI answers (reload again)");
@@ -1262,6 +1613,17 @@ impl Settings {
 				} else {
 					self.state().kept_geoip = None;
 				}
+				// nor the resolvers and names of the rules' acme certificates
+				if let Some(why) = uses.acme_refuses(to.acme.as_ref()).filter(|_| uses.acme_refuses(before.acme.as_ref()).is_none()) {
+					warn!(event = "config.global_in_use", item = "acme", reason = %why,
+						"global.acme stays as it is until no rule needs what the file takes away (then reload again)");
+					to.acme = before.acme.clone();
+					built.acme = None;
+					changed.retain(|i| *i != "acme");
+					self.state().kept_acme = before.acme.clone();
+				} else {
+					self.state().kept_acme = None;
+				}
 				let uses = uses.crowdsec;
 				if let Some(why) = uses.refuses(to.crowdsec.as_ref()).filter(|_| before.crowdsec.is_some()) {
 					warn!(
@@ -1290,7 +1652,7 @@ impl Settings {
 				commit(registry, built_with_fallback(&mut built))
 			})
 			.await;
-		replaced.finish();
+		replaced.finish_with(registry).await;
 		let brought = {
 			let mut s = self.state();
 			s.file_raw = raw;
@@ -1326,7 +1688,7 @@ impl Settings {
 		};
 		if let Ok(log) = AccessLog::open(Some(Path::new(&path)), s.opts.keep_files) {
 			let (_, old) = registry.http_global().update(Update { access_log: Some(log), ..Default::default() });
-			Swapped { bouncer: None, snapshot: old, geoip: None }.finish();
+			Swapped { bouncer: None, snapshot: old, geoip: None, acme: None }.finish();
 			s.access_log_fallback = false;
 			info!(event = "config.global", item = "access_log", "the access log can be written again");
 		}
@@ -1402,11 +1764,22 @@ impl Settings {
 			})
 			.collect();
 		let applied = differing(&before, &to);
+		// what the rules use, before anything is opened or bound (checked again under the
+		// rules lock when it is swapped in)
+		let uses = registry.under_rules_lock(|uses| uses).await;
+		if let Some(why) = uses.refused(&to, &applied) {
+			return Err(PatchError::InUse(format!("{why}; change those rules first")));
+		}
+		if let (true, Some(a)) = (applied.contains(&"acme"), &to.acme) {
+			let addrs: Vec<std::net::SocketAddr> = a.http01_listen.iter().filter_map(|s| s.parse().ok()).collect();
+			if let Some(e) = uses.http01_refuses(&addrs, &registry.http01_listen(), registry.reserved()) {
+				return Err(e);
+			}
+		}
 		if dry_run {
 			// checked as far as it goes without opening files or starting a bouncer
-			let uses = registry.under_rules_lock(|uses| uses).await;
-			if let Some(why) = uses.refused(&to, &applied) {
-				return Err(PatchError::InUse(format!("{why}; change those rules first")));
+			if let (true, Some(a)) = (applied.contains(&"acme"), &to.acme) {
+				crate::acme::Acme::new(a).map_err(PatchError::Invalid)?;
 			}
 			// the databases are opened by the change itself; here only that they are files
 			if let (true, Some(g)) = (applied.contains(&"geoip"), &to.geoip) {
@@ -1429,7 +1802,7 @@ impl Settings {
 		let mut built = Built::default();
 		for item in &applied {
 			// a PATCH builds only what it names, which the file does not
-			build_item(item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
+			build_item(registry, item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
 				BuildError::Invalid(e) => PatchError::Invalid(e),
 				BuildError::NotSynced(e) => PatchError::Unavailable(e),
 			})?;
@@ -1440,10 +1813,15 @@ impl Settings {
 				if let Some(why) = uses.refused(&to, &applied) {
 					return Err(PatchError::InUse(format!("{why}; change those rules first")));
 				}
+				if let Some(a) = built.acme.as_ref().filter(|_| applied.contains(&"acme")) {
+					if let Some(e) = uses.http01_refuses(&a.addrs, &registry.http01_listen(), registry.reserved()) {
+						return Err(e);
+					}
+				}
 				Ok(commit(registry, built_with_fallback(&mut built)))
 			})
 			.await?;
-		replaced.finish();
+		replaced.finish_with(registry).await;
 		let brought = {
 			let mut s = self.state();
 			for (i, _) in &named {
@@ -1457,6 +1835,9 @@ impl Settings {
 			}
 			if applied.contains(&"geoip") {
 				s.kept_geoip = None;
+			}
+			if applied.contains(&"acme") {
+				s.kept_acme = None;
 			}
 			if let Some(f) = built.access_log_fallback {
 				s.access_log_fallback = f;
@@ -1508,6 +1889,7 @@ impl Settings {
 			|| s.not_loaded
 			|| s.kept_crowdsec.is_some()
 			|| s.kept_geoip.is_some()
+			|| s.kept_acme.is_some()
 	}
 
 	/// For the new process of a live upgrade.
@@ -1521,6 +1903,7 @@ impl Settings {
 			not_loaded: s.not_loaded,
 			kept_crowdsec: s.kept_crowdsec.clone(),
 			kept_geoip: s.kept_geoip.clone(),
+			kept_acme: s.kept_acme.clone(),
 		}
 	}
 
@@ -1537,9 +1920,11 @@ impl Settings {
 					None => s.startup.get(i.name).cloned().unwrap_or((Source::Default, Value::Null)),
 				},
 			};
-			// what may be a secret is masked (#347)
+			// what may be a secret is masked (#347); the file's acme keeps only its shape
+			// (written by hand, it may hold secrets inline), the API's names files only (#345)
 			let shown = |v: Value| shown(i, v);
-			v.insert("value".into(), shown(value));
+			let value = if i.name == "acme" && source != Source::Api { masked(value) } else { shown(value) };
+			v.insert("value".into(), value);
 			v.insert("source".into(), json!(source));
 			v.insert("apply".into(), json!(i.apply));
 			v.insert("unix_only".into(), json!(i.unix_only));
@@ -1552,6 +1937,10 @@ impl Settings {
 			}
 			if i.name == "crowdsec" && s.kept_crowdsec.is_some() && s.live.crowdsec == s.kept_crowdsec && !s.file.has("crowdsec") {
 				// the file dropped it; rules still use it
+				v.insert("kept".into(), json!(true));
+			}
+			if i.name == "acme" && s.kept_acme.is_some() && s.live.acme == s.kept_acme {
+				// the file took away resolvers or names that rules still use (#345)
 				v.insert("kept".into(), json!(true));
 			}
 			if i.name == "geoip" && s.kept_geoip.is_some() && s.live.geoip == s.kept_geoip {
@@ -1593,6 +1982,7 @@ pub const MASKED: &str = "***";
 fn shown(i: &Item, v: Value) -> Value {
 	match (i.apply, i.name, v) {
 		(Apply::Restart, name, v) => redacted(name, v),
+		(_, "acme", v) => redact_named(v),
 		(_, "crowdsec", Value::Object(mut m)) => {
 			for k in ["lapi_url", "appsec_url"] {
 				if let Some(Value::String(u)) = m.get_mut(k) {
@@ -1630,7 +2020,8 @@ fn redact_named(v: Value) -> Value {
 						masked(v)
 					} else if lower == "url" || lower.ends_with("_url") {
 						match v {
-							Value::String(u) => Value::String(masked_url(&u)),
+							// the path too: a token may sit in it (#345)
+							Value::String(u) => Value::String(masked_url_path(&u)),
 							other => redact_named(other),
 						}
 					} else {
@@ -1679,6 +2070,18 @@ fn masked_url(u: &str) -> String {
 	out
 }
 
+/// A URL without its user, path (beyond `/`), query and fragment: what `redacted` shows
+/// of a URL written in `global` (a REST API's token may sit in the path, #345).
+fn masked_url_path(u: &str) -> String {
+	let m = masked_url(u);
+	let Some((scheme, rest)) = m.split_once("://") else { return m };
+	let (authority, tail) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+	let query = tail.find('?').map(|q| &tail[q..]).unwrap_or("");
+	let path = tail.strip_suffix(query).unwrap_or(tail);
+	let path = if path.is_empty() || path == "/" { path.to_string() } else { format!("/{MASKED}") };
+	format!("{scheme}://{authority}{path}{query}")
+}
+
 /// What rules failed waiting for that a change put in force (`changed`: the items whose
 /// value in force changed; `to`: in force after it).
 fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
@@ -1688,6 +2091,9 @@ fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
 	}
 	if changed.contains(&"geoip") && to.geoip.is_some() {
 		out.push(crate::error::Reason::NeedsGeoip);
+	}
+	if changed.contains(&"acme") && to.acme.is_some() {
+		out.push(crate::error::Reason::NeedsAcme);
 	}
 	out
 }
@@ -1711,6 +2117,7 @@ fn built_with_fallback(built: &mut Built) -> Built {
 		udp_max_sessions: built.udp_max_sessions.take(),
 		cache_max_memory: built.cache_max_memory.take(),
 		geoip: built.geoip.take(),
+		acme: built.acme.take(),
 	}
 }
 
@@ -1801,7 +2208,7 @@ mod tests {
 		assert_eq!(
 			redacted("performance", other),
 			json!({"tls": {"cert_file": "/c.pem", "key_file": MASKED, "client_secret": MASKED}, "api_token": MASKED,
-				"url": format!("https://{MASKED}@h:1/x?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
+				"url": format!("https://{MASKED}@h:1/{MASKED}?{MASKED}"), "lapi_url": "http://h/", "workers": 2,
 				"call": {"headers": {"X-Api-Key": MASKED}, "body": MASKED}})
 		);
 		// in the view: the file's acme, and a kept one (stored by a later release)
@@ -1984,7 +2391,7 @@ mod tests {
 		assert!(http.trusts("192.0.2.1".parse().unwrap()));
 		assert_eq!(s.persisted(), Some(false), "not written yet");
 		let (spec, raw) = file("trusted_proxies: [10.0.0.0/8]\n");
-		let prepared = s.prepare_file(&spec, &raw).await.unwrap();
+		let prepared = s.prepare_file(&r, &spec, &raw).await.unwrap();
 		assert!(http.trusts("192.0.2.1".parse().unwrap()), "nothing in force before the commit");
 		assert_eq!(s.commit_file(&r, prepared).await, ["trusted_proxies"]);
 		assert!(!http.trusts("192.0.2.1".parse().unwrap()) && http.trusts("10.1.2.3".parse().unwrap()));
@@ -1994,7 +2401,7 @@ mod tests {
 		assert_eq!(view["warnings"][0]["code"], "config.global_shadowed");
 		// the file leaves it out again: the API value is in force
 		let (spec, raw) = file("{}");
-		let prepared = s.prepare_file(&spec, &raw).await.unwrap();
+		let prepared = s.prepare_file(&r, &spec, &raw).await.unwrap();
 		s.commit_file(&r, prepared).await;
 		assert!(http.trusts("192.0.2.1".parse().unwrap()));
 		assert_eq!(s.view()["warnings"], json!([]));
@@ -2015,6 +2422,100 @@ mod tests {
 		assert!(r.http_global().trusts("192.0.2.1".parse().unwrap()));
 		assert_eq!(view["persisted"], true);
 		assert_eq!(s.stored().unwrap().0, spec, "everything stored is written back");
+	}
+
+	fn acme_spec(v: Value) -> AcmeGlobal {
+		serde_json::from_value(v).unwrap()
+	}
+
+	#[test]
+	fn the_api_s_acme_names_secrets_only_by_file() {
+		let base = json!({"accounts": {"le": {"allowed_names": ["example.com"]}}});
+		acme_secrets_in_files(&acme_spec(base.clone())).unwrap();
+		let mut with_key = base.clone();
+		with_key["accounts"]["le"]["key_file"] = json!("/k");
+		assert!(acme_secrets_in_files(&acme_spec(with_key)).unwrap_err().contains("key_file"));
+		let call = |url: &str, headers: Value, body: Option<&str>| {
+			let mut v = base.clone();
+			v["dns_providers"] = json!({"x": {"type": "http", "allowed_names": ["example.com"], "secret_file": "/s",
+				"add": {"url": url, "headers": headers, "body": body}}});
+			acme_secrets_in_files(&acme_spec(v))
+		};
+		call("https://h/add?fqdn={fqdn}&token={secret}", json!({"Authorization": "Bearer {secret}", "Accept": "application/json"}), Some("{\"name\":\"{fqdn}\"}"))
+			.unwrap();
+		for (url, headers, body) in [
+			("https://u:p@h/add", json!({}), None),
+			("https://h/add?api_key=abc", json!({}), None),
+			("https://h/add", json!({"Authorization": "Bearer abc"}), None),
+			("https://h/add", json!({"X-Api-Key": "abc"}), None),
+			("https://h/add", json!({}), Some("{\"token\":\"abc\"}")),
+			// a literal beside the secret, the secret in the path
+			("https://h/add", json!({"Authorization": "Bearer abc{secret}"}), None),
+			("https://h/add", json!({"X-Api-Key": "k-{secret}"}), None),
+			("https://h/add", json!({"X-Other": "{secret}{secret}"}), None),
+			("https://h/add?token=x{secret}", json!({}), None),
+			("https://h/{secret}/add", json!({}), None),
+		] {
+			assert!(call(url, headers.clone(), body).is_err(), "{url} {headers} {body:?}");
+		}
+		call("https://h/add", json!({"X-Api-Key": "{secret}", "Authorization": "sso-key {secret}"}), None).unwrap();
+		assert!(secret_header_value("Bearer {secret}") && secret_header_value("{secret}"));
+		assert!(!secret_header_value("Bearer  {secret}") && !secret_header_value("1x {secret}") && !secret_header_value("a b {secret}"));
+		assert_eq!(masked_url_path("https://u:p@h:1/v1/tok123?k=t"), format!("https://{MASKED}@h:1/{MASKED}?{MASKED}"));
+		assert_eq!(masked_url_path("https://h/"), "https://h/");
+		assert_eq!(masked_url_path("https://h"), "https://h");
+	}
+
+	#[test]
+	fn the_api_s_acme_files_stay_in_their_directory() {
+		let dir = std::env::temp_dir().join(format!("rproxy-global-acme-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(dir.join("store")).unwrap();
+		std::fs::write(dir.join("key"), "k").unwrap();
+		std::fs::write(dir.join("store/key"), "k").unwrap();
+		std::os::unix::fs::symlink(dir.join("key"), dir.join("link")).unwrap();
+		let with = |storage: Option<&str>, file: &str| {
+			let mut v = json!({"accounts": {"le": {"allowed_names": ["example.com"], "eab": {"kid": "k", "hmac_key_file": file}}}});
+			if let Some(s) = storage {
+				v["storage"] = json!(s);
+			}
+			acme_spec(v)
+		};
+		let mut state = State::default();
+		let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+		// no directory: no file, the default storage only
+		assert!(state.acme_allowed(&with(None, &p("key"))).unwrap_err().contains("RPROXY_API_ACME_DIR"));
+		assert!(state.acme_allowed(&acme_spec(json!({"accounts": {"le": {"allowed_names": ["example.com"]}}}))).is_ok());
+		assert!(state.acme_allowed(&acme_spec(json!({"storage": p("store")}))).is_err());
+		state.opts.acme_dir = Some(dir.clone());
+		state.acme_allowed(&with(Some(&p("store")), &p("key"))).unwrap();
+		for (storage, file) in [
+			(Some(p("store")), p("link")),
+			(Some(p("store")), p("store/key")),
+			(Some(p("store")), "/etc/passwd".to_string()),
+			(Some(p("store")), p("../key")),
+			(Some("/var/tmp".to_string()), p("key")),
+			(Some(p("")), p("key")),
+		] {
+			assert!(state.acme_allowed(&with(storage.as_deref(), &file)).is_err(), "{storage:?} {file}");
+		}
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn http01_listen_does_not_take_a_rule_s_port_nor_pass_the_listener_limit() {
+		let uses = RulesUse {
+			sockets: 3,
+			tcp: vec![Listening { key: "tcp/0.0.0.0:80".into(), ips: vec!["0.0.0.0".parse().unwrap()], v6only: false, ports: (80, 80) }],
+			..Default::default()
+		};
+		let a = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+		assert!(matches!(uses.http01_refuses(&[a("127.0.0.1:80")], &[], &[]), Some(PatchError::InUse(m)) if m.contains("tcp/0.0.0.0:80")));
+		assert!(matches!(uses.http01_refuses(&[a("127.0.0.1:9000")], &[], &[a("127.0.0.1:9000")]), Some(PatchError::InUse(m)) if m.contains("control API")));
+		assert!(uses.http01_refuses(&[a("127.0.0.1:81")], &[], &[]).is_none());
+		let full = RulesUse { sockets: crate::core::quota::max_listeners(), ..Default::default() };
+		assert!(matches!(full.http01_refuses(&[a("127.0.0.1:81")], &[], &[]), Some(PatchError::Limit(_))));
+		assert!(full.http01_refuses(&[a("127.0.0.1:81")], &[a("127.0.0.1:81")], &[]).is_none(), "nothing added");
 	}
 
 	#[tokio::test]

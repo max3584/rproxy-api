@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Let's Encrypt (production) when an account leaves `directory` out.
 pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -23,7 +23,7 @@ pub const DEFAULT_PROPAGATION: Duration = Duration::from_secs(120);
 /// Names one certificate may hold.
 pub const MAX_NAMES: usize = 100;
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeGlobal {
 	/// Account keys, certificates and the DNS-01 journal (`DEFAULT_STORAGE`).
@@ -56,14 +56,14 @@ pub struct AcmeGlobal {
 	pub helper: Option<HelperSpec>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HelperSpec {
 	/// The helper's Unix socket (e.g. /run/rproxy-acme/helper.sock).
 	pub socket: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AccountSpec {
 	/// The CA's directory URL (`LETS_ENCRYPT` by default).
@@ -85,7 +85,7 @@ pub struct AccountSpec {
 	pub allowed_names: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EabSpec {
 	pub kid: String,
@@ -95,7 +95,7 @@ pub struct EabSpec {
 
 /// One HTTP call of a `type: http` provider; `{fqdn}`, `{value}`, `{zone}` and
 /// `{secret}` are replaced in `url`, `headers` and `body`.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpCallSpec {
 	/// POST by default.
@@ -106,7 +106,7 @@ pub struct HttpCallSpec {
 	pub body: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DnsProviderSpec {
 	/// `powerdns` (the PowerDNS HTTP API) or `http` (a REST template).
@@ -174,7 +174,7 @@ impl DnsProviderSpec {
 	}
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverSpec {
 	pub account: String,
@@ -184,7 +184,7 @@ pub struct ResolverSpec {
 	pub dns_provider: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitSpec {
 	pub orders: u32,

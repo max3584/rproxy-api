@@ -273,13 +273,10 @@ impl ConfigDoc {
 
 	/// `global` settings that differ from `other` and take effect only after a
 	/// restart. The live items (`trusted_proxies`, `access_log`, `crowdsec`,
-	/// `http.timeouts`, `geoip`; #342, #345, `config::global`) are put in force by the reload.
+	/// `http.timeouts`, `geoip`, `acme`; #342, #345, `config::global`) are put in force by the reload.
 	pub fn restart_needed(&self, other: &ConfigDoc) -> Vec<&'static str> {
 		let (a, b) = (&self.global, &other.global);
 		let mut out = vec![];
-		if a.acme != b.acme {
-			out.push("global.acme");
-		}
 		if a.performance != b.performance {
 			out.push("global.performance");
 		}

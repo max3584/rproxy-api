@@ -223,7 +223,27 @@ pub struct Acme {
 	on_change: OnceLock<OnChange>,
 	clients: tokio::sync::Mutex<HashMap<String, Account>>,
 	stop: CancellationToken,
+	/// Whether `spawn` started the task, and its end (set once the task has returned:
+	/// its order given up, its TXT records removed), waited for by the `Acme` that
+	/// replaces this one (#345).
+	spawned: std::sync::atomic::AtomicBool,
+	finished: Arc<(std::sync::atomic::AtomicBool, Notify)>,
 }
+
+/// One lock per storage's DNS-01 journal (`dns-pending.json`): the task of an `Acme`
+/// holds it while it runs, so two (one replacing the other, #345) never handle the same
+/// journal at once.
+fn journal_lock(storage: &Path) -> Arc<tokio::sync::Mutex<()>> {
+	static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+	// one key per directory however it is written (`a/./b/`, a link to it)
+	let key = std::fs::canonicalize(storage).unwrap_or_else(|_| storage.components().collect());
+	let mut all = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+	all.entry(key).or_default().clone()
+}
+
+/// How long a new `Acme` waits for the one it replaces to finish its order in flight
+/// and remove the TXT records it wrote (#345), before it starts anyway.
+pub const RETIRE_WAIT: Duration = Duration::from_secs(60);
 
 impl std::fmt::Debug for Acme {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,12 +354,124 @@ impl Acme {
 			on_change: OnceLock::new(),
 			clients: tokio::sync::Mutex::default(),
 			stop: CancellationToken::new(),
+			spawned: Default::default(),
+			finished: Default::default(),
 			global: global.clone(),
 		}))
 	}
 
 	pub fn storage(&self) -> &Path {
 		&self.storage
+	}
+
+	/// `global.acme` as given.
+	pub fn global(&self) -> &AcmeGlobal {
+		&self.global
+	}
+
+	/// The files part of taking over from `old` (the `Acme` this one replaces, #345):
+	/// blocking file IO, run off the async workers and outside the rules lock. With
+	/// another storage, the certificates `old` holds that this one lacks or holds older
+	/// (and the account keys) are copied here, so rules keep serving them and nothing is
+	/// ordered again because of the move. Returns, for each certificate of `old` whose
+	/// names this one still allows, the validity this storage holds for it now (None: none).
+	pub fn carry_files(&self, old: &Acme) -> BTreeMap<CertId, Option<(i64, i64)>> {
+		let certs: Vec<(CertId, Option<(i64, i64)>)> =
+			old.state.lock().unwrap_or_else(|e| e.into_inner()).certs.iter().map(|(id, m)| (id.clone(), m.issued)).collect();
+		let allowed = |id: &CertId| self.global.check_names(&id.resolver, &id.domains).is_ok();
+		if old.storage == self.storage {
+			return certs.into_iter().filter(|(id, _)| allowed(id)).collect();
+		}
+		self.carry_accounts(old);
+		let mine: BTreeMap<CertId, Option<(i64, i64)>> =
+			self.state.lock().unwrap_or_else(|e| e.into_inner()).certs.iter().map(|(id, m)| (id.clone(), m.issued)).collect();
+		let mut out = BTreeMap::new();
+		for (id, issued) in certs.into_iter().filter(|(id, _)| allowed(id)) {
+			let (cert, key) = self.files(&id);
+			let held = mine.get(&id).copied().flatten().or_else(|| validity(&cert, &key));
+			let held = if self.carry_cert(old, &id, issued, held) { issued } else { held };
+			out.insert(id, held);
+		}
+		out
+	}
+
+	/// The state part of taking over from `old` (#345): memory only, so it may run under
+	/// the rules lock. `held`: what `carry_files` found. The orders within the rate
+	/// limit's period, and for each certificate this storage holds as `old` did (or that
+	/// neither has issued), its failures, next attempt, renewal window and a pending
+	/// forced renewal: a change of the settings does not order again at once what just
+	/// failed, or what is valid. `only_known`: only the certificates this one manages
+	/// already (the second call, once `old` has stopped: what it did meanwhile).
+	pub fn inherit(&self, old: &Acme, held: &BTreeMap<CertId, Option<(i64, i64)>>, only_known: bool) {
+		let old_state = old.state.lock().unwrap_or_else(|e| e.into_inner());
+		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		state.orders = old_state.orders.clone();
+		for (id, m) in &old_state.certs {
+			let Some(issued) = held.get(id).copied() else { continue };
+			if only_known && !state.certs.contains_key(id) {
+				continue;
+			}
+			let entry = state.certs.entry(id.clone()).or_insert_with(|| Managed::new(issued));
+			if issued.is_some() {
+				entry.issued = issued;
+			}
+			// the same certificate (or none on either side): its state is the old one's
+			if issued == m.issued {
+				entry.next_try = entry.next_try.max(m.next_try);
+				entry.failures = entry.failures.max(m.failures);
+				if m.error.is_some() {
+					entry.error = m.error.clone();
+				}
+				entry.ari = m.ari.or(entry.ari);
+				entry.ari_check = m.ari_check;
+			}
+			entry.force |= m.force;
+		}
+	}
+
+	/// Copies a certificate `old` issued into this storage unless this one holds it as
+	/// new or newer (key first, as `issue` writes). True when this storage now holds `old`'s.
+	fn carry_cert(&self, old: &Acme, id: &CertId, issued: Option<(i64, i64)>, mine: Option<(i64, i64)>) -> bool {
+		let Some((_, old_after)) = issued else { return false };
+		let (old_cert, old_key) = old.files(id);
+		let (cert, key) = self.files(id);
+		let mine = mine.or_else(|| validity(&cert, &key));
+		if mine.is_some_and(|(_, after)| after >= old_after) {
+			return false;
+		}
+		let (Ok(k), Ok(c)) = (std::fs::read(&old_key), std::fs::read(&old_cert)) else { return false };
+		match store::write_private(Path::new(&key), &k).and_then(|()| store::write_private(Path::new(&cert), &c)) {
+			Ok(()) => {
+				info!(event = "acme.storage", action = "carried", resolver = %id.resolver, domains = ?id.domains,
+					from = %old.storage.display(), to = %self.storage.display());
+				true
+			}
+			Err(e) => {
+				warn!(event = "acme.error", part = "storage", file = %cert, error = %e, "the certificate is obtained again in the new storage");
+				false
+			}
+		}
+	}
+
+	/// Copies the account keys (and URLs) `old` keeps in its storage for the same account
+	/// at the same CA, when this storage has none: the move does not make new accounts.
+	fn carry_accounts(&self, old: &Acme) {
+		for (name, a) in &self.accounts {
+			let Some(o) = old.accounts.get(name) else { continue };
+			let mine = self.storage.join("accounts");
+			if o.directory != a.directory || a.key_file != mine.join(format!("{name}.key")) || a.key_file.exists() || !o.key_file.exists() {
+				continue;
+			}
+			let meta = old.storage.join("accounts").join(format!("{name}.json"));
+			let copied = std::fs::read(&o.key_file).and_then(|k| store::write_private(&a.key_file, &k)).and_then(|()| match std::fs::read(&meta) {
+				Ok(m) => store::write_private(&mine.join(format!("{name}.json")), &m),
+				Err(_) => Ok(()),
+			});
+			match copied {
+				Ok(()) => info!(event = "acme.storage", action = "carried", account = %name, from = %old.storage.display(), to = %self.storage.display()),
+				Err(e) => warn!(event = "acme.error", part = "storage", account = %name, error = %e, "a new account is made in the new storage"),
+			}
+		}
 	}
 
 	/// The addresses of `http01_listen` (rules may not take them).
@@ -502,23 +634,67 @@ impl Acme {
 	}
 
 	/// Starts the task that obtains and renews certificates (and removes TXT
-	/// records left over from before), and the HTTP-01 responder. Returns the
-	/// addresses of `http01_listen` that could not be opened.
-	pub async fn spawn(self: &Arc<Self>) -> Vec<(SocketAddr, String)> {
-		let mut failed = vec![];
-		for addr in &self.http01_listen {
-			match challenge::serve_http01(*addr, self.stop.clone()).await {
-				Ok(()) => info!(event = "acme.listening", addr = %addr),
-				Err(e) => failed.push((*addr, e.to_string())),
+	/// records left over from before). `after`: the `Acme` this one replaces (#345),
+	/// whose order in flight is finished (its TXT records removed) before this one
+	/// starts, up to `RETIRE_WAIT`. The HTTP-01 responders of `http01_listen` are the
+	/// process's (`challenge::set_http01`).
+	pub fn spawn(self: &Arc<Self>, after: Option<Arc<Acme>>) {
+		let me = self.clone();
+		let mut after = after;
+		self.spawned.store(true, std::sync::atomic::Ordering::SeqCst);
+		// started again if it panics (#358)
+		let task = crate::core::supervise::spawn("acme", move || {
+			let me = me.clone();
+			let after = after.take();
+			async move {
+				if let Some(old) = after {
+					let deadline = tokio::time::Instant::now() + RETIRE_WAIT;
+					let ended = tokio::select! {
+						ended = old.stopped_by(deadline) => ended,
+						// replaced in turn before it started: the one after it waits for this
+						// task, which waits (within the same time) for the one before
+						_ = me.stop.cancelled() => {
+							old.stopped_by(deadline).await;
+							return;
+						}
+					};
+					if !ended {
+						warn!(event = "acme.error", part = "swap", wait_secs = RETIRE_WAIT.as_secs(),
+							"the replaced global.acme has not finished its order; starting anyway (the DNS-01 journal is still not shared)");
+					}
+					// what it obtained or tried meanwhile (file IO off the async workers)
+					let (m, o) = (me.clone(), old.clone());
+					let held = tokio::task::spawn_blocking(move || m.carry_files(&o)).await.unwrap_or_default();
+					me.inherit(&old, &held, true);
+				}
+				me.run().await
+			}
+		});
+		let finished = self.finished.clone();
+		tokio::spawn(async move {
+			let _ = task.await;
+			finished.0.store(true, std::sync::atomic::Ordering::SeqCst);
+			finished.1.notify_waiters();
+		});
+	}
+
+	/// Stops the task (`shutdown`) and waits until `deadline` for it to end; true when it
+	/// did (or was never started).
+	pub async fn stopped_by(&self, deadline: tokio::time::Instant) -> bool {
+		self.stop.cancel();
+		if !self.spawned.load(std::sync::atomic::Ordering::SeqCst) {
+			return true;
+		}
+		let (done, notify) = &*self.finished;
+		loop {
+			let wait = notify.notified();
+			if done.load(std::sync::atomic::Ordering::SeqCst) {
+				return true;
+			}
+			if tokio::time::timeout_at(deadline, wait).await.is_err() {
+				return done.load(std::sync::atomic::Ordering::SeqCst);
 			}
 		}
-		let me = self.clone();
-		// started again if it panics (#358)
-		crate::core::supervise::spawn("acme", move || {
-			let me = me.clone();
-			async move { me.run().await }
-		});
-		failed
 	}
 
 	pub fn shutdown(&self) {
@@ -653,6 +829,12 @@ impl Acme {
 	}
 
 	async fn run(self: Arc<Self>) {
+		// this storage's journal is this task's alone until it returns (#345)
+		let lock = journal_lock(&self.storage);
+		let _journal = tokio::select! {
+			g = lock.lock_owned() => g,
+			_ = self.stop.cancelled() => return,
+		};
 		// TXT records a crash or a failed removal left behind
 		let leftover = self.journal.read();
 		if !leftover.is_empty() {
@@ -708,10 +890,12 @@ impl Acme {
 			}
 			let renewal = self.status(&id).is_some_and(|s| s.not_after.is_some());
 			info!(event = "acme.order", resolver = %id.resolver, domains = ?id.domains, renewal);
-			let result = tokio::select! {
-				_ = self.stop.cancelled() => return,
-				r = self.issue(&id) => r,
-			};
+			// stopped (a change of global.acme, #345, or the end): the order gives up
+			// and removes the TXT records it wrote before this returns
+			let result = self.issue(&id).await;
+			if self.stop.is_cancelled() {
+				return;
+			}
 			let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 			let Some(m) = state.certs.get_mut(&id) else { continue };
 			match result {
@@ -822,8 +1006,29 @@ impl Acme {
 	}
 
 	/// One order: answer the challenges, finalize, write the certificate.
-	/// Returns its validity.
+	/// Returns its validity. Stopped meanwhile (#345), it gives up; either way the
+	/// answers are withdrawn and the TXT records written are removed.
 	async fn issue(&self, id: &CertId) -> Result<(i64, i64), String> {
+		let mut answers = challenge::Answers::default();
+		let mut records: Vec<dns::Written> = vec![];
+		let result = tokio::select! {
+			_ = self.stop.cancelled() => Err("stopped (global.acme changed, or rproxy is stopping)".to_string()),
+			r = self.order(id, &mut answers, &mut records) => r,
+		};
+		drop(answers);
+		if !records.is_empty() {
+			let reason = if self.stop.is_cancelled() { "stopped" } else { "validated" };
+			dns::remove_all(&self.dns, &self.journal, &records, reason).await;
+			let left = self.journal.read();
+			if records.iter().any(|r| left.contains(r)) {
+				warn!(event = "degraded", part = "acme.dns", storage = %self.storage.display(),
+					"TXT records could not be removed; they are kept in this storage's dns-pending.json and removed when it is used again");
+			}
+		}
+		result
+	}
+
+	async fn order(&self, id: &CertId, answers: &mut challenge::Answers, records: &mut Vec<dns::Written>) -> Result<(i64, i64), String> {
 		let r = self.resolvers.get(&id.resolver).ok_or("the resolver is no longer configured")?;
 		// the settings may have changed since the rule was checked
 		self.global.check_names(&id.resolver, &id.domains)?;
@@ -855,8 +1060,6 @@ impl Acme {
 		let provider = r.dns_provider.as_deref();
 
 		// first the answers for every authorization, then tell the CA
-		let mut answers = challenge::Answers::default();
-		let mut records: Vec<dns::Written> = vec![];
 		{
 			let mut authorizations = order.authorizations();
 			while let Some(authz) = authorizations.next().await {
@@ -882,12 +1085,7 @@ impl Acme {
 				debug!(event = "acme.challenge", resolver = %id.resolver, domain, challenge = r.challenge.as_str());
 			}
 		}
-		let result = self.validate_and_finalize(&mut order, kind, &records, id).await;
-		drop(answers);
-		if !records.is_empty() {
-			dns::remove_all(&self.dns, &self.journal, &records, "validated").await;
-		}
-		result
+		self.validate_and_finalize(&mut order, kind, records, id).await
 	}
 
 	async fn validate_and_finalize(
@@ -1038,6 +1236,75 @@ mod tests {
 		let text = v.to_string();
 		assert!(!text.contains("key_file") && !text.contains(".key"), "no key files in the view: {text}");
 		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	/// Replaced in turn before it started (A -> B -> C): B does not wait its full time
+	/// for A, nor C for B; B never runs (#345).
+	#[tokio::test]
+	async fn a_replaced_replacement_does_not_chain_the_waits() {
+		let dir = std::env::temp_dir().join(format!("rproxy-acme-chain-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		let (a, b, c) = (manager(&dir, ""), manager(&dir, ""), manager(&dir, ""));
+		a.spawn(None);
+		b.spawn(Some(a.clone()));
+		c.spawn(Some(b.clone()));
+		let soon = tokio::time::Instant::now() + Duration::from_secs(5);
+		assert!(b.stopped_by(soon).await, "B ended at once");
+		assert!(a.finished.0.load(std::sync::atomic::Ordering::SeqCst), "A before it");
+		assert!(!c.finished.0.load(std::sync::atomic::Ordering::SeqCst), "C runs");
+		assert!(c.stopped_by(tokio::time::Instant::now() + Duration::from_secs(5)).await);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// Another storage: the certificates the old one holds are carried over with their
+	/// state, the newer of the two kept (#345).
+	#[test]
+	fn a_new_storage_takes_the_certificates_over() {
+		let base = std::env::temp_dir().join(format!("rproxy-acme-carry-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&base);
+		let old = manager(&base.join("a"), "");
+		let new = manager(&base.join("b"), "");
+		let id = old.check("le", &["a.example.com".into()]).unwrap();
+		let issue = |m: &Acme, days: i64| {
+			let (cert, key) = m.files(&id);
+			let mut params = rcgen::CertificateParams::new(id.domains.clone()).unwrap();
+			params.not_before = time::OffsetDateTime::from_unix_timestamp(now() - 86_400).unwrap();
+			params.not_after = time::OffsetDateTime::from_unix_timestamp(now() + days * 86_400).unwrap();
+			let k = rcgen::KeyPair::generate().unwrap();
+			store::write_private(Path::new(&key), k.serialize_pem().as_bytes()).unwrap();
+			store::write_private(Path::new(&cert), params.self_signed(&k).unwrap().pem().as_bytes()).unwrap();
+		};
+		issue(&old, 60);
+		old.set_wanted([id.clone()].into());
+		old.state.lock().unwrap().certs.get_mut(&id).unwrap().failures = 3;
+		old.state.lock().unwrap().certs.get_mut(&id).unwrap().force = true;
+		let held = new.carry_files(&old);
+		new.inherit(&old, &held, false);
+		new.set_wanted([id.clone()].into());
+		let s = new.status(&id).unwrap();
+		assert_eq!(s.state, "renewing", "issued (not pending), with the forced renewal: {s:?}");
+		assert_eq!(new.state.lock().unwrap().certs[&id].failures, 3, "its state too");
+		assert!(new.state.lock().unwrap().certs[&id].force, "a forced renewal too");
+		assert_eq!(std::fs::read(new.files(&id).0).unwrap(), std::fs::read(old.files(&id).0).unwrap());
+		// the new storage's own, newer certificate is kept
+		issue(&new, 80);
+		let mine = std::fs::read(new.files(&id).0).unwrap();
+		let held = new.carry_files(&old);
+		new.inherit(&old, &held, true);
+		assert_eq!(std::fs::read(new.files(&id).0).unwrap(), mine);
+		assert!(new.state.lock().unwrap().certs[&id].force, "the second call keeps a forced renewal");
+		// names the new settings no longer allow are not written
+		let narrow = Acme::new(
+			&crate::config::from_yaml::<AcmeGlobal>(&format!(
+				"storage: {}\naccounts: {{le: {{directory: 'https://127.0.0.1:1/dir', allowed_names: [other.example.com]}}}}\nresolvers: {{le: {{account: le, challenge: tls-alpn-01}}}}\n",
+				base.join("c").display()
+			))
+			.unwrap(),
+		)
+		.unwrap();
+		assert!(narrow.carry_files(&old).is_empty());
+		assert!(!Path::new(&narrow.files(&id).0).exists());
+		let _ = std::fs::remove_dir_all(&base);
 	}
 
 	#[test]

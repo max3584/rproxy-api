@@ -182,7 +182,7 @@ pub async fn check(input: &CheckInput) -> Report {
 	});
 	registry.certs().set_warn_days(input.warn_days);
 	if let Some(a) = acme {
-		registry.set_acme(a);
+		registry.set_acme(Some(a));
 	}
 	let checked = registry.check_rules(doc.labeled_rules());
 	for (rule, message) in checked.errors {
@@ -195,7 +195,7 @@ pub async fn check(input: &CheckInput) -> Report {
 	{
 		use crate::net::protected::{self, FileRef, Use};
 		let crowdsec_key = doc.global.crowdsec.as_ref().map(|c| Path::new(c.api_key_file.as_str()));
-		let entries = protected::current(registry.acme().map(|a| a.as_ref()), crowdsec_key);
+		let entries = protected::current(registry.acme().as_deref(), crowdsec_key);
 		let refs: Vec<(String, Vec<FileRef>)> =
 			doc.labeled_rules().into_iter().map(|(label, r)| (label, protected::refs(r.tls.as_ref(), r.http.as_ref()))).collect();
 		for (label, files) in &refs {

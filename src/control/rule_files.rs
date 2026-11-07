@@ -86,7 +86,7 @@ pub async fn check(
 	let _one = CHECKS.lock().await;
 	let global = registry.http_global();
 	let crowdsec = global.crowdsec();
-	let entries = protected::current(registry.acme().map(|a| a.as_ref()), crowdsec.as_ref().map(|b| b.key_file()));
+	let entries = protected::current(registry.acme().as_deref(), crowdsec.as_ref().map(|b| b.key_file()));
 	let (replaced, others): (Vec<_>, Vec<_>) = registry.file_refs().await.into_iter().partition(|(key, set, _, _)| match &replacing {
 		Replacing::Nothing => false,
 		Replacing::Rule(k) => *k == key,

@@ -51,12 +51,14 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 	let mut name = path.file_name().unwrap_or_default().to_os_string();
 	name.push(".tmp");
 	let tmp = path.with_file_name(name);
+	// a new file of its own: not one (or a link) someone put there (#345)
+	let _ = std::fs::remove_file(&tmp);
 	let mut options = std::fs::OpenOptions::new();
-	options.write(true).create(true).truncate(true);
+	options.write(true).create_new(true);
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::OpenOptionsExt;
-		options.mode(0o600);
+		options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
 	}
 	let mut f = options.open(&tmp)?;
 	f.write_all(data)?;

@@ -70,26 +70,76 @@ pub fn process_entries(token_file: Option<&Path>, tls_key: Option<&Path>, diff_t
 	out
 }
 
-/// Everything protected now: the certificate store, the options' secrets, and
-/// the given `global` parts (ACME, CrowdSec's key).
-pub fn current(acme: Option<&crate::acme::Acme>, crowdsec_key: Option<&Path>) -> Vec<Entry> {
+/// `RPROXY_API_ACME_DIR` (#345), set at startup.
+static API_ACME_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Sets `RPROXY_API_ACME_DIR` (startup; tests).
+pub fn set_api_acme_dir(dir: Option<PathBuf>) {
+	*API_ACME_DIR.write().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+/// Where ACME keeps keys and secrets whatever `global.acme` is in force (#345): the
+/// default storage and `RPROXY_API_ACME_DIR` (the API's secrets and storages). A
+/// change of `global.acme` leaves the previous storage's keys and the previous
+/// secrets there, so they stay protected after it.
+fn acme_trees() -> Vec<Entry> {
+	let mut out = vec![Entry::tree(
+		"under the default ACME storage (/var/lib/rproxy/acme; use {\"acme\": ...} with the acme:write scope)",
+		crate::acme::config::DEFAULT_STORAGE,
+	)];
+	if let Some(d) = API_ACME_DIR.read().unwrap_or_else(|e| e.into_inner()).clone() {
+		out.push(Entry::tree("under RPROXY_API_ACME_DIR (the secrets and storages of global.acme)", d));
+	}
+	out
+}
+
+/// The storages and secret files of every `global.acme` put in force in this process
+/// (#345): one replaced (a PATCH, a reload of the settings file) leaves its keys and
+/// secrets where they were, so they stay protected for the rest of its life.
+static ACME_SEEN: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
+
+/// Remembers the storage and secret files of `acme` (`Registry::set_acme`).
+pub fn remember_acme(acme: &crate::acme::Acme) {
+	let mut seen = ACME_SEEN.write().unwrap_or_else(|e| e.into_inner());
+	for e in acme_entries(acme) {
+		if !seen.iter().any(|s| s.path == e.path && s.tree == e.tree) {
+			seen.push(e);
+		}
+	}
+}
+
+/// The storage (tree) and secret files of one `global.acme`.
+fn acme_entries(a: &crate::acme::Acme) -> Vec<Entry> {
+	let mut out = vec![Entry::tree(
+		"under the ACME storage (global.acme.storage; use {\"acme\": ...} with the acme:write scope)",
+		a.storage(),
+	)];
+	out.extend(a.protected_files().into_iter().map(|(what, f)| Entry::file(format!("a secret of global.acme ({what})"), f)));
+	out
+}
+
+/// What is protected whatever `global` says: the certificate store, the options'
+/// secrets and CrowdSec's key (what `global.acme` set through the API may not name either).
+pub fn others(crowdsec_key: Option<&Path>) -> Vec<Entry> {
 	let mut out = vec![Entry::tree(
 		"under the certificate store (RPROXY_CERT_STORE; name a stored certificate with {\"cert\": \"<name>\"})",
 		crate::tls::named::dir(),
 	)];
 	out.extend(PROCESS.read().unwrap_or_else(|e| e.into_inner()).iter().cloned());
-	if let Some(a) = acme {
-		out.push(Entry::tree(
-			"under the ACME storage (global.acme.storage; use {\"acme\": ...} with the acme:write scope)",
-			a.storage(),
-		));
-		out.extend(
-			a.protected_files()
-				.into_iter()
-				.map(|(what, f)| Entry::file(format!("a secret of global.acme ({what})"), f)),
-		);
-	}
 	out.extend(crowdsec_key.map(|p| Entry::file("the CrowdSec key (global.crowdsec.api_key_file)", p)));
+	out
+}
+
+/// Everything protected now: `others`, ACME's places (`acme_trees`), the storages and
+/// secrets of every `global.acme` this process has had (`remember_acme`) and the given
+/// one (its storage and secrets).
+pub fn current(acme: Option<&crate::acme::Acme>, crowdsec_key: Option<&Path>) -> Vec<Entry> {
+	let mut out = others(crowdsec_key);
+	out.extend(acme_trees());
+	out.extend(ACME_SEEN.read().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+	if let Some(a) = acme {
+		out.extend(acme_entries(a));
+	}
 	out
 }
 

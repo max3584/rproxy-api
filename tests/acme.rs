@@ -147,7 +147,7 @@ async fn the_api_guards_acme() {
 	let yaml = acme_settings(&dir, "https://127.0.0.1:1/directory", "");
 	let global: rproxy_api::acme::config::AcmeGlobal = rproxy_api::config::from_yaml(&yaml).unwrap();
 	let acme = rproxy_api::acme::Acme::new(&global).unwrap();
-	h.registry.set_acme(acme.clone());
+	h.registry.set_acme(Some(acme.clone()));
 
 	let post = |token: &'static str, body: Value| {
 		let (http, base) = (h.http.clone(), h.base.clone());
@@ -277,7 +277,7 @@ async fn rules_may_not_name_acme_files() {
 	let yaml = acme_settings(&dir, "https://127.0.0.1:1/directory", "");
 	let global: rproxy_api::acme::config::AcmeGlobal = rproxy_api::config::from_yaml(&yaml).unwrap();
 	let acme = rproxy_api::acme::Acme::new(&global).unwrap();
-	h.registry.set_acme(acme.clone());
+	h.registry.set_acme(Some(acme.clone()));
 	let certs = dir.join("acme/certs");
 	fs::create_dir_all(&certs).unwrap();
 	fs::write(certs.join("www.crt"), "c").unwrap();
@@ -600,6 +600,11 @@ async fn start_acme_dns(pdns_api: String) -> u16 {
 
 /// Pebble with its own HTTPS certificate (the package ships none).
 fn start_pebble(dir: &Path, pebble: &str, dns: u16, http_port: u16, tls_port: u16) -> (Proc, String, PathBuf) {
+	start_pebble_with(dir, pebble, dns, http_port, tls_port, &[])
+}
+
+/// `start_pebble` with more of Pebble's environment (`PEBBLE_VA_ALWAYS_VALID`).
+fn start_pebble_with(dir: &Path, pebble: &str, dns: u16, http_port: u16, tls_port: u16, env: &[(&str, &str)]) -> (Proc, String, PathBuf) {
 	let ca = rcgen::KeyPair::generate().unwrap();
 	let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
 	ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -633,7 +638,7 @@ fn start_pebble(dir: &Path, pebble: &str, dns: u16, http_port: u16, tls_port: u1
 		dir,
 		pebble,
 		&["-config", &config_path, "-dnsserver", &dns, "-strict=false"],
-		&[("PEBBLE_VA_NOSLEEP", "1"), ("PEBBLE_WFE_NONCEREJECT", "0"), ("PEBBLE_AUTHZREUSE", "0")],
+		&[&[("PEBBLE_VA_NOSLEEP", "1"), ("PEBBLE_WFE_NONCEREJECT", "0"), ("PEBBLE_AUTHZREUSE", "0")], env].concat(),
 	);
 	(proc, format!("https://127.0.0.1:{wfe}/dir"), ca_file)
 }
@@ -652,10 +657,15 @@ impl Drop for Rproxy {
 
 impl Rproxy {
 	fn start(dir: &Path, api_port: u16, config: &Path, socket: &Path) -> Rproxy {
+		Rproxy::start_with(dir, api_port, config, socket, &[])
+	}
+
+	fn start_with(dir: &Path, api_port: u16, config: &Path, socket: &Path, env: &[(&str, &str)]) -> Rproxy {
 		let out = dir.join(format!("rproxy-{api_port}.log"));
 		let child = Command::new(env!("CARGO_BIN_EXE_rproxy-api"))
 			.current_dir(dir)
 			.env_clear()
+			.envs(env.iter().copied())
 			.env("RPROXY_API_PORT", api_port.to_string())
 			.env("RPROXY_CONFIG", config)
 			.env("RPROXY_API_SOCKET", socket)
@@ -675,10 +685,14 @@ impl Rproxy {
 }
 
 async fn unix_post(socket: &Path, path: &str, body: &str) -> String {
+	unix_call(socket, "POST", path, body).await
+}
+
+async fn unix_call(socket: &Path, method: &str, path: &str, body: &str) -> String {
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	let mut s = tokio::net::UnixStream::connect(socket).await.unwrap();
 	let req = format!(
-		"POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer e2e-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+		"{method} {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer e2e-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
 		body.len()
 	);
 	s.write_all(req.as_bytes()).await.unwrap();
@@ -974,6 +988,209 @@ async fn issues_certificates_from_pebble() {
 	}
 	drop(rp);
 	drop(helper);
+	drop(pebble_proc);
+	let _ = fs::remove_dir_all(&dir);
+}
+
+/// A REST endpoint for the `http` DNS provider that only records the calls (the TXT
+/// records are never visible: the order waits `dns_propagation_timeout`).
+async fn start_recorder() -> (u16, Arc<Mutex<Vec<String>>>) {
+	let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	let seen = calls.clone();
+	let app = axum::Router::new().route(
+		"/{op}",
+		axum::routing::post(move |axum::extract::Path(op): axum::extract::Path<String>, headers: axum::http::HeaderMap, body: String| {
+			let seen = seen.clone();
+			async move {
+				if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {RELAY_SECRET}")) {
+					return axum::http::StatusCode::UNAUTHORIZED;
+				}
+				let v: Value = serde_json::from_str(&body).unwrap_or_default();
+				seen.lock().unwrap().push(format!("{op} {}", v["fqdn"].as_str().unwrap_or("")));
+				axum::http::StatusCode::NO_CONTENT
+			}
+		}),
+	);
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	(port, calls)
+}
+
+fn status_of(answer: &str) -> u16 {
+	answer.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn body_of(answer: &str) -> Value {
+	let body = answer.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+	// chunked or not: the JSON object in it
+	let start = body.find('{').unwrap_or(0);
+	let end = body.rfind('}').map_or(body.len(), |e| e + 1);
+	serde_json::from_str(&body[start..end]).unwrap_or_default()
+}
+
+/// `global.acme` changed while running through `PATCH /config/global` (#345), against
+/// Pebble (which validates nothing here: `PEBBLE_VA_ALWAYS_VALID`, so no DNS server is
+/// needed). Only over the Unix socket, only files in RPROXY_API_ACME_DIR, no inline
+/// secret; a resolver the rules use stays; an order in flight gives up and removes the
+/// TXT record it wrote; `http01_listen` moves; a new storage takes the certificates.
+#[tokio::test]
+async fn acme_changes_while_running_with_pebble() {
+	let Some(pebble) = env("RPROXY_TEST_PEBBLE") else {
+		assert!(env("RPROXY_TEST_REQUIRE_ACME").is_none(), "RPROXY_TEST_REQUIRE_ACME=1 needs Pebble");
+		eprintln!("skipped: set RPROXY_TEST_PEBBLE");
+		return;
+	};
+	let dir = workdir("live");
+	let (pebble_proc, directory, ca_file) =
+		start_pebble_with(&dir, &pebble, free_udp_port(), free_port(), free_port(), &[("PEBBLE_VA_ALWAYS_VALID", "1")]);
+	let pebble_log = || format!("{}\n{}", pebble_proc.log(), fs::read_to_string(dir.join("pebble.err")).unwrap_or_default());
+	wait_until("Pebble", 20, &pebble_log, || async { std::net::TcpStream::connect(directory.trim_start_matches("https://").trim_end_matches("/dir")).is_ok() }).await;
+	let (recorder, calls) = start_recorder().await;
+	// the files the API's acme may name
+	let api_dir = dir.join("acme-api");
+	fs::create_dir_all(api_dir.join("store")).unwrap();
+	fs::create_dir_all(api_dir.join("store2")).unwrap();
+	fs::copy(&ca_file, api_dir.join("ca.pem")).unwrap();
+	fs::write(api_dir.join("relay.token"), format!("{RELAY_SECRET}\n")).unwrap();
+	fs::write(dir.join("outside.pem"), fs::read(&ca_file).unwrap()).unwrap();
+	let config_file = dir.join("rproxy.yaml");
+	fs::write(&config_file, "version: 1\n").unwrap();
+	fs::write(dir.join("tokens"), "e2e-token\n").unwrap();
+	let api = free_port();
+	let socket = dir.join("api.sock");
+	let rp = Rproxy::start_with(&dir, api, &config_file, &socket, &[("RPROXY_API_ACME_DIR", api_dir.to_str().unwrap())]);
+	let logs = || format!("{}\n--- pebble ---\n{}", rp.log(), pebble_log());
+	wait_until("rproxy", 20, &logs, || async { socket.exists() }).await;
+
+	let (http01_a, http01_b) = (free_port(), free_port());
+	let acme = |storage: &Path, propagation: &str, http01: u16, resolvers: Value| {
+		json!({"acme": {
+			"storage": storage,
+			"accounts": {"test": {"directory": directory, "contact": ["mailto:admin@example.test"], "ca_file": api_dir.join("ca.pem"),
+				"allowed_names": ["**.example.test", "example.test"]}},
+			"dns_providers": {"relay": {"type": "http", "zones": ["example.test"], "allowed_names": ["rest.example.test"],
+				"secret_file": api_dir.join("relay.token"),
+				"add": {"url": format!("http://127.0.0.1:{recorder}/present"), "headers": {"Authorization": "Bearer {secret}"}, "body": "{\"fqdn\":\"{fqdn}\"}"},
+				"remove": {"url": format!("http://127.0.0.1:{recorder}/cleanup"), "headers": {"Authorization": "Bearer {secret}"}, "body": "{\"fqdn\":\"{fqdn}\"}"}}},
+			"resolvers": resolvers,
+			"dns_servers": [format!("127.0.0.1:{}", free_udp_port())],
+			"dns_propagation_timeout": propagation,
+			"http01_listen": [format!("127.0.0.1:{http01}")],
+			"rate_limit": {"orders": 50, "period": "1h"},
+		}})
+	};
+	let both = json!({"alpn": {"account": "test", "challenge": "tls-alpn-01"}, "rest": {"account": "test", "challenge": "dns-01", "dns_provider": "relay"}});
+	let first = acme(&api_dir.join("store"), "60s", http01_a, both.clone());
+	let patch = |body: Value| {
+		let socket = socket.clone();
+		async move { unix_call(&socket, "PATCH", "/config/global", &body.to_string()).await }
+	};
+
+	// over TCP: refused; files outside the directory, inline secrets, key_file: refused
+	let r = reqwest::Client::new().patch(format!("http://127.0.0.1:{api}/config/global")).bearer_auth("e2e-token").json(&first).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::FORBIDDEN);
+	let mut outside = first.clone();
+	outside["acme"]["accounts"]["test"]["ca_file"] = json!(dir.join("outside.pem"));
+	let r = patch(outside).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (403, json!("protected_file")), "{r}");
+	let mut inline = first.clone();
+	inline["acme"]["dns_providers"]["relay"]["add"]["headers"]["Authorization"] = json!(format!("Bearer {RELAY_SECRET}"));
+	let r = patch(inline).await;
+	assert_eq!(status_of(&r), 400, "{r}");
+	let mut key_file = first.clone();
+	key_file["acme"]["accounts"]["test"]["key_file"] = json!(api_dir.join("account.key"));
+	assert_eq!(status_of(&patch(key_file).await), 400);
+
+	// in force: the HTTP-01 responder listens, and rules take certificates from it
+	let r = patch(first.clone()).await;
+	assert_eq!(status_of(&r), 200, "{r}");
+	assert_eq!(body_of(&r)["applied"], json!(["acme"]), "{r}");
+	assert!(!r.contains(RELAY_SECRET));
+	let not_found = |port: u16| async move {
+		reqwest::Client::new().get(format!("http://127.0.0.1:{port}/.well-known/acme-challenge/x")).send().await.is_ok_and(|r| r.status() == StatusCode::NOT_FOUND)
+	};
+	assert!(not_found(http01_a).await, "http01_listen answers");
+	let backend = tcp_backend("app:").await;
+	let (p_alpn, p_rest) = (free_port(), free_port());
+	let rule = |port: u16, resolver: &str, domain: &str| {
+		json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "remote_addr": "127.0.0.1", "remote_port": backend.port(),
+			"tls": {"mode": "terminate", "certificates": [{"acme": resolver, "domains": [domain]}]}})
+	};
+	let r = unix_post(&socket, "/rules", &rule(p_alpn, "alpn", "alpn.example.test").to_string()).await;
+	assert_eq!(status_of(&r), 201, "{r}");
+	let get = |path: String| {
+		let socket = socket.clone();
+		async move { body_of(&unix_call(&socket, "GET", &path, "").await) }
+	};
+	wait_until("alpn.example.test", 60, &logs, || async { get(format!("/rules/tcp/127.0.0.1/{p_alpn}")).await["acme"][0]["state"] == "valid" }).await;
+	wait_until("the issued certificate", 15, &logs, || async {
+		served_cert(p_alpn, "alpn.example.test", &[]).await.is_some_and(|(leaf, _)| issuer_cn(&leaf).to_ascii_lowercase().contains("pebble"))
+	})
+	.await;
+
+	// a resolver the rules use stays; so does acme
+	let r = patch(acme(&api_dir.join("store"), "60s", http01_a, json!({"rest": both["rest"]}))).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (409, json!("in_use")), "{r}");
+	let r = patch(json!({"acme": null})).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (409, json!("in_use")), "{r}");
+	// http01_listen on a rule's port
+	let r = patch(acme(&api_dir.join("store"), "60s", p_alpn, both.clone())).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (409, json!("in_use")), "{r}");
+
+	// an order in flight (waiting for its TXT record to be seen): the change makes it give
+	// up and remove the record; the new settings order again
+	let r = unix_post(&socket, "/rules", &rule(p_rest, "rest", "rest.example.test").to_string()).await;
+	assert_eq!(status_of(&r), 201, "{r}");
+	let presented = || calls.lock().unwrap().iter().filter(|c| c.starts_with("present")).count();
+	wait_until("the TXT record", 30, &logs, || async { presented() == 1 }).await;
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(get(format!("/rules/tcp/127.0.0.1/{p_rest}")).await["acme"][0]["state"] != "valid");
+	let r = patch(acme(&api_dir.join("store"), "1s", http01_b, both.clone())).await;
+	assert_eq!(status_of(&r), 200, "{r}");
+	wait_until("the record removed by the stopped order", 30, &logs, || async {
+		calls.lock().unwrap().iter().any(|c| c == "cleanup _acme-challenge.rest.example.test")
+	})
+	.await;
+	assert!(rp.log().contains(r#""reason":"stopped""#), "{}", logs());
+	wait_until("rest.example.test", 60, &logs, || async { get(format!("/rules/tcp/127.0.0.1/{p_rest}")).await["acme"][0]["state"] == "valid" }).await;
+	let c = calls.lock().unwrap().clone();
+	assert_eq!(c.iter().filter(|c| c.starts_with("present")).count(), c.iter().filter(|c| c.starts_with("cleanup")).count(), "every record removed: {c:?}");
+	// the responder moved
+	wait_until("the new http01_listen", 10, &logs, || async { not_found(http01_b).await }).await;
+	wait_until("the old http01_listen closed", 10, &logs, || async { std::net::TcpStream::connect(("127.0.0.1", http01_a)).is_err() }).await;
+
+	// a new storage: the certificates are carried over (served on, not ordered again)
+	let served = served_cert(p_alpn, "alpn.example.test", &[]).await.unwrap().0;
+	let orders = rp.log().matches(r#""event":"acme.order""#).count();
+	let r = patch(acme(&api_dir.join("store2"), "1s", http01_b, both.clone())).await;
+	assert_eq!(status_of(&r), 200, "{r}");
+	assert!(fs::read_dir(api_dir.join("store2/certs")).is_ok_and(|d| d.count() >= 2), "carried over");
+	assert_eq!(get(format!("/rules/tcp/127.0.0.1/{p_alpn}")).await["acme"][0]["state"], "valid");
+	assert_eq!(served_cert(p_alpn, "alpn.example.test", &[]).await.unwrap().0, served, "no stand-in");
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(rp.log().matches(r#""event":"acme.order""#).count(), orders, "no new order: {}", logs());
+	// the old storage stays out of rules' reach (#319)
+	let old_key = fs::read_dir(api_dir.join("store/certs/alpn")).unwrap().next().unwrap().unwrap().path().join("key.pem");
+	let mut naming = rule(free_port(), "alpn", "x.example.test");
+	naming["tls"]["certificates"] = json!([{"cert_file": old_key.with_file_name("cert.pem"), "key_file": old_key}]);
+	let r = unix_post(&socket, "/rules", &naming.to_string()).await;
+	assert_eq!((status_of(&r), body_of(&r)["code"].clone()), (403, json!("protected_file")), "{r}");
+	let v = get("/config/global".into()).await;
+	assert_eq!(v["items"]["acme"]["source"], "api", "{v}");
+	assert!(!v.to_string().contains(RELAY_SECRET));
+
+	// the rules gone, acme can go: the responder closes
+	for p in [p_alpn, p_rest] {
+		assert_eq!(status_of(&unix_call(&socket, "DELETE", &format!("/rules/tcp/127.0.0.1/{p}"), "").await), 204);
+	}
+	let r = patch(json!({"acme": null})).await;
+	assert_eq!(status_of(&r), 200, "{r}");
+	assert_eq!(status_of(&unix_call(&socket, "GET", "/acme", "").await), 404);
+	wait_until("the responder closed", 10, &logs, || async { std::net::TcpStream::connect(("127.0.0.1", http01_b)).is_err() }).await;
+	let log = rp.log();
+	assert!(!log.contains(RELAY_SECRET), "a secret in the log");
+	drop(rp);
 	drop(pebble_proc);
 	let _ = fs::remove_dir_all(&dir);
 }

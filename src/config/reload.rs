@@ -94,7 +94,7 @@ impl ConfigReloader {
 				// the live global items (#342): built first (files, a new bouncer synced), swapped
 				// in only once the rules are known to be valid, before the rules (rules using
 				// crowdsec need it); the file wins over the API
-				let applied = match self.registry.global().prepare_file(&doc.global, &doc.global_raw).await {
+				let applied = match self.registry.global().prepare_file(&self.registry, &doc.global, &doc.global_raw).await {
 					Err(e) => Err(e),
 					Ok(prepared) => match self.registry.validate_static(doc.labeled_rules()) {
 						// dropping what was built stops a new bouncer: nothing changed

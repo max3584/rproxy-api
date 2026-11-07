@@ -424,6 +424,7 @@ async fn global_patch(
 			Err(PatchError::Protected(e)) => (ApiError::protected_file(e).into_response(), "protected_file"),
 			Err(PatchError::InUse(e)) => (refused(StatusCode::CONFLICT, "in_use", e, None), "in_use"),
 			Err(PatchError::Unavailable(e)) => (refused(StatusCode::BAD_GATEWAY, "crowdsec_unavailable", e, None), "crowdsec_unavailable"),
+			Err(PatchError::Limit(e)) => (ApiError::limit(e).into_response(), "limit"),
 			Err(PatchError::NotLoaded) => {
 				let e = "the stored global values could not be read yet (the database); try again after the next check".to_string();
 				(refused(StatusCode::SERVICE_UNAVAILABLE, "not_loaded", e, None), "not_loaded")
@@ -466,6 +467,10 @@ async fn interfaces(State(state): State<Arc<AppState>>) -> AppResult<impl IntoRe
 		.reserved()
 		.iter()
 		.map(|a| json!({"protocol": "tcp", "addr": a.ip().to_string(), "port": a.port(), "purpose": "control API"}))
+		// global.acme.http01_listen in force (#345)
+		.chain(state.registry.http01_listen().iter().map(|a| {
+			json!({"protocol": "tcp", "addr": a.ip().to_string(), "port": a.port(), "purpose": "acme http01_listen"})
+		}))
 		.collect();
 	Ok(Json(json!({ "interfaces": list, "reserved": reserved })))
 }

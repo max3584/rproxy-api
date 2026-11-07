@@ -14,7 +14,15 @@ DNS の書き換えの権限が要らない `http-01` / `tls-alpn-01` を先に�
 
 ## 設定
 
-ACME の設定（アカウント・DNS のプロバイダ・resolver・許可する名前）は、設定ファイル（`RPROXY_CONFIG`）の `global.acme` にだけ書きます。API のルールは resolver を名前で指すだけで、秘密（DNS の API キーなど）を API から作る・読む・変えることはできません。`global` の変更は再起動で効きます（`GET /config` の `restart_needed`）。
+ACME の設定（アカウント・DNS のプロバイダ・resolver・許可する名前）は、設定ファイル（`RPROXY_CONFIG`）の `global.acme` に書きます。API のルールは resolver を名前で指すだけで、秘密（DNS の API キーなど）を API から作る・読む・変えることはできません。
+
+v0.4.22 から（#345、`features.global_api_acme`）、`global.acme` は稼働中に変えられます：設定ファイルの読み直しと、ファイルに書いていなければ `PATCH /config/global` の `acme`（`admin`、既定で Unix ソケットからだけ。docs/API.md の「global の設定の API」）。新しい `Acme` を組み立ててから入れ替えます：
+
+- 注文中の仕事はあきらめ、書いた TXT を消してから（`acme.dns` の `reason: stopped`）、新しい設定が始まります（前のものが終わるのを最大 60 秒待つ。待つ間にまた変えたら、間のものは動かずに終わります）。同じ `storage` の DNS-01 の記録（`dns-pending.json`）を 2 つが同時に扱うことはありません。消せなかった TXT は前の `storage` の記録に残り（`degraded`、`part: acme.dns` にその場所）、その `storage` をまた使うときに消します。`rate_limit` の数と、証明書ごとの失敗の待ち・更新の窓は引き継ぎます（設定を変えるたびにすぐ注文し直さない。前のものが待つ間に取ったものも引き継ぐ）。
+- `storage` が変わると、前の `storage` の証明書と鍵（と同じ CA の同じ名前のアカウントの鍵）を、新しい場所になければ（古ければ）写してから入れ替えます：ルールは同じ証明書を返し続け、移したことでは注文し直しません（Let's Encrypt の同じ証明書の回数の制限に当たらない）。写せなかったものは新しい場所で取り直します（それまで自己署名の仮の証明書）。前の `storage` のファイルは残します。`http01_listen` は残るアドレスを開いたまま、外したものを閉じ、足したものを開きます。
+- `acme` がなくて（resolver がなくて）起動できなかったルール（DB・引き継ぎから戻したもの）は、`acme` が入ったときに動かし直します。
+- ルールが使う resolver（と名前）をなくす・許可の外にする変更は `409 in_use`（`acme` を消すのも同じ）。設定ファイルの読み直しでは前のものを残します（`config.global_in_use`、`GET /config/global` の `kept`）。
+- API で入れる `acme` は秘密を書けません：ファイルを指すだけ（`http` のプロバイダの資格情報は `secret_file` の `{secret}` から。資格情報らしい名前のヘッダ・`{secret}` を使うヘッダは `{secret}` か `<方式> {secret}`（`Bearer {secret}`）だけ、クエリは `{secret}` だけ、URL のパスには `{secret}` を置けない。アカウントの `key_file` も書けず、鍵は `storage` に作る）。ただし名前で見る確かめなので**完全ではありません**：トークンは必ず `secret_file` に置き、`{secret}` で使ってください（パスに直接書いたトークンなどは見分けられない。表示では URL のパスも伏せます）。指せるファイルは `RPROXY_API_ACME_DIR` のすぐ下だけで（`storage` はその下のディレクトリ。証明書のストアと重なるものは不可。設定しなければファイルを指せず、`storage` は既定の場所だけ）、**このディレクトリは ACME だけのものにし、ほかの秘密（環境変数のファイルなど）を置かないでください**（その下は丸ごとルールから指せなくなり、API の `acme` はすぐ下のファイルを読んで DNS の API に送れます）。`http01_listen` の待ち受けは `RPROXY_MAX_LISTENERS` に数えます（超えると `409 limit`）。ルールの待ち受け・制御 API のアドレスは取れません（`409 in_use`）。
 
 ```yaml
 # /etc/rproxy/rproxy.yaml
@@ -123,7 +131,7 @@ rules:
    委任できないときは、ゾーン単位・TXT だけに書ける狭い権限のキーを使ってください。
 2. 書き込むゾーンは、プロバイダの `zones` のうち一番長く一致するもの（`zones` にない名前は失敗）。`zones` がなければ、PowerDNS はゾーンの一覧から、汎用の REST は DNS の SOA から決めます。
 3. 書く前に `<storage>/dns-pending.json` に記録し、TXT を書き、`dns_servers` から見えるまで待って（最長 `dns_propagation_timeout`）、CA に検証を頼みます。
-4. 検証が終わったら、成功しても失敗しても TXT を消します。消せなかったもの（と、途中でプロセスが止まったもの）は記録に残り、次の起動のときに消します（`acme.dns` の `reason: left over`）。
+4. 検証が終わったら、成功しても失敗しても TXT を消します。`global.acme` を変えたときと止めるときに注文中のものも、あきらめてから消します（`reason: stopped`、#345）。消せなかったもの（と、途中でプロセスが止まったもの）は記録に残り、次の起動のとき（と、同じ `storage` の新しい設定が始まるとき）に消します（`acme.dns` の `reason: left over`）。
 5. PowerDNS は `PATCH /api/v1/servers/{server_id}/zones/{zone}` で TXT の RRset を `REPLACE` / `DELETE` します（同じ名前の値は 1 回でまとめて。ワイルドカードとその親を一緒に取るときは 2 つの値）。
 
 DNS の秘密を本体から外に出すには、下の「補助プロセス（秘密を分ける）」を使います。
@@ -196,4 +204,4 @@ systemctl restart rproxy-api
 
 ## 試験
 
-CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS の API、RFC 2136（TSIG の SHA256・SHA512、違う鍵は断られること）、acme-dns（登録と CNAME の案内を含む）、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます（docs/TESTING.md）。
+CI の `clippy + tests` のジョブが、Alpine の Pebble（ACME の試験用の CA）と PowerDNS を同じコンテナで動かし、tests/acme.rs で HTTP-01（`http01_listen`）・TLS-ALPN-01・DNS-01（PowerDNS の API、RFC 2136（TSIG の SHA256・SHA512、違う鍵は断られること）、acme-dns（登録と CNAME の案内を含む）、CNAME の委任、汎用の REST の小さな中継）で実際に証明書を取り、TXT が消えること、前の起動の TXT の後片付け、Unix ソケットからの更新、再起動の後に保存した証明書を使うこと、秘密が応答とログに出ないことを確かめます。`acme_changes_while_running_with_pebble`（#345）は `PATCH /config/global` で `acme` を入れ・変え・消し、注文中の TXT の後片付け・`http01_listen` の移動・新しい `storage`・`409 in_use`・場所の外のファイルと直接書いた秘密を断ることを確かめます（docs/TESTING.md）。

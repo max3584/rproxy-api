@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -16,7 +16,7 @@ use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The ALPN protocol of TLS-ALPN-01 (RFC 8737).
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
@@ -137,51 +137,107 @@ impl Drop for Answers {
 	}
 }
 
-/// `global.acme.http01_listen`: answers HTTP-01 challenges, 404 for anything else.
-pub async fn serve_http01(addr: SocketAddr, stop: CancellationToken) -> std::io::Result<()> {
-	// a live upgrade (#174) hands the old process's socket over
-	let listener = match crate::control::upgrade::inherit::take_tcp(addr) {
-		Some(l) => {
-			l.set_nonblocking(true)?;
-			tokio::net::TcpListener::from_std(l)?
+/// The `global.acme.http01_listen` responders of the process, by address (#345): one
+/// set whatever `Acme` is in force, so that a change of `global.acme` keeps the
+/// listeners it still names (answers are shared by every listener anyway).
+fn http01_serving() -> &'static Mutex<HashMap<SocketAddr, CancellationToken>> {
+	static SERVING: OnceLock<Mutex<HashMap<SocketAddr, CancellationToken>>> = OnceLock::new();
+	SERVING.get_or_init(Default::default)
+}
+
+/// The addresses HTTP-01 is answered on now.
+pub fn http01_addrs() -> Vec<SocketAddr> {
+	let mut out: Vec<SocketAddr> = http01_serving().lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+	out.sort();
+	out
+}
+
+/// Listeners bound for a change of `http01_listen`, not serving yet (closed when dropped).
+#[derive(Default)]
+pub struct Bound(Vec<(SocketAddr, tokio::net::TcpListener)>);
+
+/// Binds the addresses of `addrs` that are not served yet (a live upgrade hands the old
+/// process's socket over, #174). Returns them and the addresses that could not be bound.
+pub async fn bind_http01(addrs: &[SocketAddr]) -> (Bound, Vec<(SocketAddr, String)>) {
+	let serving = http01_addrs();
+	let mut bound = Bound::default();
+	let mut failed = vec![];
+	for addr in addrs.iter().filter(|a| !serving.contains(a)) {
+		let listener = match crate::control::upgrade::inherit::take_tcp(*addr) {
+			Some(l) => l.set_nonblocking(true).and_then(|()| tokio::net::TcpListener::from_std(l)),
+			None => tokio::net::TcpListener::bind(addr).await,
+		};
+		match listener {
+			Ok(l) => bound.0.push((*addr, l)),
+			Err(e) => failed.push((*addr, e.to_string())),
 		}
-		None => tokio::net::TcpListener::bind(addr).await?,
-	};
-	tokio::spawn(async move {
-		loop {
-			let (stream, client) = tokio::select! {
-				_ = stop.cancelled() => return,
-				r = listener.accept() => match r {
-					Ok(v) => v,
-					Err(e) => {
-						warn!(event = "acme.error", part = "http01_listen", error = %e);
-						tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-						continue;
-					}
-				},
-			};
-			crate::net::source::nodelay(&stream);
-			let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| async move {
-				let resp = match http_answer(req.uri().path()) {
-					Some(answer) => {
-						debug!(event = "acme.answer", challenge = "http-01", client = %client, path = req.uri().path());
-						http_response::<Full<Bytes>>(answer)
-					}
-					None => {
-						let mut r = Response::new(Full::new(Bytes::new()));
-						*r.status_mut() = StatusCode::NOT_FOUND;
-						r
-					}
-				};
-				Ok::<_, std::convert::Infallible>(resp)
-			});
-			tokio::spawn(async move {
-				let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
-				let _ = tokio::time::timeout(std::time::Duration::from_secs(30), conn).await;
-			});
+	}
+	(bound, failed)
+}
+
+/// Makes `addrs` the responders: those no longer named stop, the ones of `bound` start,
+/// the others go on as they are.
+pub fn install_http01(addrs: &[SocketAddr], bound: Bound) {
+	let mut serving = http01_serving().lock().unwrap_or_else(|e| e.into_inner());
+	serving.retain(|addr, stop| {
+		let keep = addrs.contains(addr);
+		if !keep {
+			stop.cancel();
+			info!(event = "acme.listening", addr = %addr, action = "stop");
 		}
+		keep
 	});
-	Ok(())
+	for (addr, listener) in bound.0 {
+		let stop = CancellationToken::new();
+		if let Some(old) = serving.insert(addr, stop.clone()) {
+			old.cancel();
+		}
+		info!(event = "acme.listening", addr = %addr);
+		tokio::spawn(serve_http01(listener, stop));
+	}
+}
+
+/// `bind_http01` and `install_http01`: returns the addresses that could not be bound.
+pub async fn set_http01(addrs: &[SocketAddr]) -> Vec<(SocketAddr, String)> {
+	let (bound, failed) = bind_http01(addrs).await;
+	install_http01(addrs, bound);
+	failed
+}
+
+/// `global.acme.http01_listen`: answers HTTP-01 challenges, 404 for anything else.
+async fn serve_http01(listener: tokio::net::TcpListener, stop: CancellationToken) {
+	loop {
+		let (stream, client) = tokio::select! {
+			_ = stop.cancelled() => return,
+			r = listener.accept() => match r {
+				Ok(v) => v,
+				Err(e) => {
+					warn!(event = "acme.error", part = "http01_listen", error = %e);
+					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+					continue;
+				}
+			},
+		};
+		crate::net::source::nodelay(&stream);
+		let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| async move {
+			let resp = match http_answer(req.uri().path()) {
+				Some(answer) => {
+					debug!(event = "acme.answer", challenge = "http-01", client = %client, path = req.uri().path());
+					http_response::<Full<Bytes>>(answer)
+				}
+				None => {
+					let mut r = Response::new(Full::new(Bytes::new()));
+					*r.status_mut() = StatusCode::NOT_FOUND;
+					r
+				}
+			};
+			Ok::<_, std::convert::Infallible>(resp)
+		});
+		tokio::spawn(async move {
+			let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+			let _ = tokio::time::timeout(std::time::Duration::from_secs(30), conn).await;
+		});
+	}
 }
 
 #[cfg(test)]
