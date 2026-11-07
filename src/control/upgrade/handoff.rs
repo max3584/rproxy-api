@@ -809,7 +809,7 @@ impl State {
 		if let Some(g) = &self.global {
 			let settings = registry.global();
 			settings
-				.restore(registry, &g.values, g.updated_by.clone(), g.updated_at, g.persisted, g.kept_crowdsec.clone(), "handoff")
+				.restore(registry, &g.values, g.updated_by.clone(), g.updated_at, g.persisted, g.kept(), "handoff")
 				.await;
 			// the old process had not read the stored values: the periodic check reads them
 			if g.not_loaded {

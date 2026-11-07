@@ -301,7 +301,7 @@ impl Runtime {
 	pub fn geoip_check(&self, client: std::net::IpAddr) -> Result<Option<crate::net::geoip::Info>, crate::net::geoip::Info> {
 		let policy = self.geoip.read().unwrap_or_else(|e| e.into_inner());
 		match policy.as_deref() {
-			Some(p) => crate::net::geoip::check(p, self.global.geoip().map(|g| g.as_ref()), client).map(Some),
+			Some(p) => crate::net::geoip::check(p, self.global.geoip().as_deref(), client).map(Some),
 			None => Ok(None),
 		}
 	}
@@ -329,7 +329,7 @@ impl Runtime {
 	/// The client's country (and ASN) for `conn.open` with `global.geoip.log_country`;
 	/// `known` is what `geoip_check` already looked up.
 	pub fn geo_for_log(&self, client: std::net::IpAddr, known: Option<crate::net::geoip::Info>) -> Option<crate::net::geoip::Info> {
-		if !self.global.geoip().is_some_and(|g| g.log_country()) {
+		if !self.global.logs_country() {
 			return None;
 		}
 		known.or_else(|| self.global.geo_for_log(client))

@@ -250,6 +250,11 @@ pub struct Features {
 	/// `connect_timeout` in the `options` of rows of the UI's database (`forward_rules`) is restored
 	/// (#379, the UI's #184); before, such a row was refused (unknown key) and not restored
 	pub db_connect_timeout: bool,
+	/// `global.geoip` through `PATCH /config/global` and a reload of the settings file, while
+	/// running: the databases are opened again and swapped (#345); removing a database the
+	/// rules' geoip lists need is `409 in_use`; databases set through the API are files right
+	/// in `RPROXY_API_GEOIP_DIR`
+	pub global_api_geoip: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -324,6 +329,7 @@ impl Features {
 		control_limits: true,
 		http_stream_limits: true,
 		db_connect_timeout: true,
+		global_api_geoip: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -381,6 +387,7 @@ impl Features {
 		control_limits: true,
 		http_stream_limits: true,
 		db_connect_timeout: true,
+		global_api_geoip: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.

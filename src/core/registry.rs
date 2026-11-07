@@ -534,30 +534,38 @@ impl Registry {
 		&self.global
 	}
 
-	/// What the rules use of `global.crowdsec` (#342: it is not taken away from them).
-	pub async fn uses_crowdsec(&self) -> crate::config::global::CrowdsecUse {
-		crowdsec_use(&*self.rules.lock().await)
+	/// What the rules use of `global` (#342, #345: it is not taken away from them).
+	pub async fn uses_global(&self) -> crate::config::global::RulesUse {
+		rules_use(&*self.rules.lock().await)
 	}
 
 	/// Runs `f` with the rules lock held and what the rules use of `global.crowdsec`
-	/// (#342): a change of `global` swapped in there cannot cross a rule being created
-	/// or changed (they check `crowdsec_gate` under the same lock).
-	pub async fn under_rules_lock<R>(&self, f: impl FnOnce(crate::config::global::CrowdsecUse) -> R) -> R {
+	/// and `global.geoip` (#342, #345): a change of `global` swapped in there cannot
+	/// cross a rule being created or changed (they check `crowdsec_gate` and
+	/// `geoip_gate` under the same lock).
+	pub async fn under_rules_lock<R>(&self, f: impl FnOnce(crate::config::global::RulesUse) -> R) -> R {
 		let rules = self.rules.lock().await;
-		f(crowdsec_use(&rules))
+		f(rules_use(&rules))
 	}
 
 	/// Starts again the rules that failed for want of `global.crowdsec` (or its
 	/// `appsec_url`), after a change of `global` brought it (#342: the stored values
 	/// read late by the periodic check, a `PATCH`, a reload). Returns how many started.
 	pub async fn retry_waiting_for_crowdsec(self: &Arc<Self>) -> usize {
+		self.retry_waiting_for(crate::error::Reason::NeedsCrowdsec).await
+	}
+
+	/// Starts again the rules that failed waiting for `reason` (`global.crowdsec`,
+	/// `global.geoip`, #342, #345), after a change of `global` brought what they wait
+	/// for. Returns how many started.
+	pub async fn retry_waiting_for(self: &Arc<Self>, reason: crate::error::Reason) -> usize {
 		let waiting: Vec<(RuleSpec, u64)> = self
 			.rules
 			.lock()
 			.await
 			.values()
 			.filter_map(|e| match e {
-				Entry::Failed(f) if f.reason == Some(crate::error::Reason::NeedsCrowdsec) => Some((f.spec.clone(), f.generation)),
+				Entry::Failed(f) if f.reason == Some(reason) => Some((f.spec.clone(), f.generation)),
 				_ => None,
 			})
 			.collect();
@@ -575,7 +583,7 @@ impl Registry {
 			let result = prepared.and_then(|p| self.start(spec.clone(), p));
 			match result {
 				Ok(running) => {
-					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
+					info!(event = "rule.create", rule = %key, phase = "global", waited_for = ?reason, "what the rule waited for in global is in force now");
 					rules.insert(key, Entry::Running(running));
 					started += 1;
 				}
@@ -611,6 +619,21 @@ impl Registry {
 			None => Err(ApiError::needs_crowdsec(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)"))),
 			Some(b) if appsec && !b.has_appsec() => Err(ApiError::needs_crowdsec(format!("crowdsec appsec {NEEDS_CROWDSEC}.appsec_url"))),
 			Some(_) => Ok(()),
+		}
+	}
+
+	/// A rule whose `geoip` lists (its own or a middleware's) need a database of
+	/// `global.geoip` is checked again with the rules lock held, right before it goes
+	/// into the table: a `global` change cannot take the database away in between (#345).
+	fn geoip_gate(&self, spec: &RuleSpec) -> Result<(), ApiError> {
+		let need = crate::config::global::GeoipUse::of(spec);
+		if need == Default::default() {
+			return Ok(());
+		}
+		let geoip = self.cfg.http.geoip();
+		match need.refuses(geoip.as_ref().map(|g| g.spec())) {
+			Some(why) => Err(ApiError::needs_geoip(format!("geoip: {why} (the settings file or PATCH /config/global)"))),
+			None => Ok(()),
 		}
 	}
 
@@ -1020,15 +1043,16 @@ impl Registry {
 			return Err(ApiError::needs_crowdsec(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
 		}
 		// geoip lists need the databases of global.geoip (#168)
-		let geoip = self.cfg.http.geoip().map(|g| g.spec());
+		let databases = self.cfg.http.geoip();
+		let geoip = databases.as_ref().map(|g| g.spec());
 		if let Some(g) = &spec.geoip {
-			g.check_databases("geoip", geoip).map_err(ApiError::invalid)?;
+			g.check_databases("geoip", geoip).map_err(ApiError::needs_geoip)?;
 		}
 		let http = match &spec.http {
 			Some(h) => {
 				for (name, m) in &h.middlewares {
 					if let crate::l7::MiddlewareSpec::Geoip(g) = m {
-						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::invalid)?;
+						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::needs_geoip)?;
 					}
 				}
 				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec().as_ref())?;
@@ -1156,6 +1180,7 @@ impl Registry {
 	fn start(self: &Arc<Self>, spec: RuleSpec, prepared: Prepared) -> Result<Running, ApiError> {
 		// called with the rules lock held (#342)
 		self.crowdsec_gate(&spec)?;
+		self.geoip_gate(&spec)?;
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
 		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[]);
@@ -1560,6 +1585,7 @@ impl Registry {
 			return Err(ApiError::already_exists(format!("{key} overlaps with {other}")));
 		}
 		self.crowdsec_gate(&spec)?;
+		self.geoip_gate(&spec)?;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
 		match entry {
 			Entry::Running(r) => {
@@ -2740,17 +2766,21 @@ async fn supervise(registry: Weak<Registry>, key: Key, generation: u64, rt: Arc<
 /// it is in force (#342, #347).
 pub const NEEDS_CROWDSEC: &str = "needs global.crowdsec";
 
-/// What the rules in the table use of `global.crowdsec` (#342).
-fn crowdsec_use(rules: &HashMap<Key, Entry>) -> crate::config::global::CrowdsecUse {
-	let mut out = crate::config::global::CrowdsecUse::default();
+/// What the rules in the table use of `global.crowdsec` (#342) and `global.geoip` (#345).
+fn rules_use(rules: &HashMap<Key, Entry>) -> crate::config::global::RulesUse {
+	let mut out = crate::config::global::RulesUse::default();
 	for e in rules.values() {
 		let spec = e.spec();
-		out.any |= spec.crowdsec;
+		out.crowdsec.any |= spec.crowdsec;
 		for m in spec.http.iter().flat_map(|h| h.middlewares.values()) {
 			if let crate::l7::MiddlewareSpec::Crowdsec { appsec, .. } = m {
-				out.any = true;
-				out.appsec |= *appsec;
+				out.crowdsec.any = true;
+				out.crowdsec.appsec |= *appsec;
 			}
+		}
+		// the settings file's rules are checked against its own global.geoip, which wins
+		if spec.origin != Origin::Static {
+			out.geoip.add(crate::config::global::GeoipUse::of(spec));
 		}
 	}
 	out

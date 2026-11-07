@@ -93,6 +93,10 @@ struct Options {
 	/// set one (#342)
 	#[arg(long, env = "RPROXY_API_ACCESS_LOG_DIR")]
 	api_access_log_dir: Option<PathBuf>,
+	/// The directory GeoIP databases set through PATCH /config/global must be in
+	/// (`global.geoip`); unset, the API cannot set them (#345)
+	#[arg(long, env = "RPROXY_API_GEOIP_DIR")]
+	api_geoip_dir: Option<PathBuf>,
 	/// Number of rotated log files to keep
 	#[arg(long, env = "RPROXY_LOG_KEEP", default_value_t = 14)]
 	log_keep: usize,
@@ -956,7 +960,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		g.spawn();
 	}
 	let http_timeouts = doc.as_ref().and_then(|(_, d)| d.global.http.as_ref()).map(|h| h.timeouts()).unwrap_or_default();
-	let http_global = http_global.with_crowdsec(crowdsec.clone()).with_geoip(geoip.clone()).with_timeouts(http_timeouts);
+	let http_global = http_global.with_crowdsec(crowdsec.clone()).with_geoip(geoip).with_timeouts(http_timeouts);
 	// global.acme: certificates of `tls.certificates[].acme`, obtained and renewed in the background
 	let acme = match doc.as_ref().and_then(|(path, d)| d.global.acme.as_ref().map(|a| (path, a))) {
 		Some((path, a)) => Some(rproxy_api::acme::Acme::new(a).map_err(|e| format!("{}: {e}", path.display()))?),
@@ -1044,6 +1048,7 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 			access_log_dir,
 			main_log: opts.log_file.clone(),
 			database,
+			geoip_dir: opts.api_geoip_dir.clone(),
 			..Default::default()
 		};
 		registry.global().init(doc.as_ref().map(|(_, d)| (&d.global, &d.global_raw)), env, startup, options);
@@ -1116,7 +1121,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 		if let Some(store) = registry.persist() {
 			match store.load_global().await {
 				Ok(Some(row)) => {
-					registry.global().restore(&registry, &row.spec, Some(row.updated_by), Some(row.updated_at), Some(true), None, "database").await
+					let (by, at) = (Some(row.updated_by), Some(row.updated_at));
+					registry.global().restore(&registry, &row.spec, by, at, Some(true), Default::default(), "database").await
 				}
 				Ok(None) => {}
 				// a PATCH would overwrite what is stored: refused until the periodic check reads it
@@ -1280,7 +1286,8 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 	if let Some(b) = &crowdsec {
 		b.stop();
 	}
-	if let Some(g) = &geoip {
+	// the databases in force (PATCH /config/global or a reload may have replaced those of the start, #345)
+	if let Some(g) = registry.http_global().geoip() {
 		g.stop();
 	}
 	if let Some(a) = &acme {
@@ -1636,7 +1643,7 @@ async fn wait_for_shutdown(
 						Err(e) => warn!(event = "reload.crowdsec", error = %e, "keeping the current CrowdSec key"),
 					}
 				}
-				if let Some(g) = registry.http_global().geoip().cloned() {
+				if let Some(g) = registry.http_global().geoip() {
 					let _ = tokio::task::spawn_blocking(move || g.refresh(true)).await;
 				}
 			}

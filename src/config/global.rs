@@ -9,10 +9,11 @@
 //! the rules, and handed over by a live upgrade.
 //!
 //! Items that can change while running (`Apply::Live`) are swapped in the shared
-//! `HttpGlobal` as one snapshot (the next request or connection takes it) or the
-//! UDP default session cap (the next session). Items read once at the start
-//! (`Apply::Restart`: `acme`, `geoip`, `performance`, `files`, the control API's
-//! listener) are only shown; the API does not change them (`409 restart_only`).
+//! `HttpGlobal` as one snapshot (the next request or connection takes it), the
+//! GeoIP databases (#345, the next connection or request) or the UDP default
+//! session cap (the next session). Items read once at the start (`Apply::Restart`:
+//! `acme`, `performance`, `files`, the control API's listener) are only shown; the
+//! API does not change them (`409 restart_only`).
 //!
 //! A change is built first (files opened, a new CrowdSec bouncer started and
 //! synced with its LAPI) and swapped in under the registry's rules lock, where
@@ -39,6 +40,7 @@ use crate::l7::access::{AccessLog, AccessLogError, Update};
 use crate::l7::middleware::crowdsec::{Bouncer, CrowdsecError};
 use crate::l7::timeouts::{HttpGlobalSpec, HttpTimeouts, HttpTimeoutsSpec};
 use crate::net::cidr::{self, Cidr};
+use crate::net::geoip::{Geoip, GeoipGlobal, GeoipSpec};
 
 /// How `rproxy_global.spec` is written; bumped when its reading changes. Read item
 /// by item: items this build does not know are kept and written back (#345, a
@@ -97,7 +99,8 @@ pub const ITEMS: &[Item] = &[
 	Item { name: "cache_max_memory", apply: Apply::Live, unix_only: false, path: ("cache_max_memory", None), in_file: false },
 	// later through the API (#345); read at the start now
 	Item { name: "acme", apply: Apply::Restart, unix_only: true, path: ("acme", None), in_file: true },
-	Item { name: "geoip", apply: Apply::Restart, unix_only: false, path: ("geoip", None), in_file: true },
+	// decides who passes the rules' geoip lists; reads files (confined to RPROXY_API_GEOIP_DIR, #345)
+	Item { name: "geoip", apply: Apply::Live, unix_only: true, path: ("geoip", None), in_file: true },
 	Item { name: "performance", apply: Apply::Restart, unix_only: false, path: ("performance", None), in_file: true },
 	Item { name: "files", apply: Apply::Restart, unix_only: false, path: ("files", None), in_file: true },
 	// RPROXY_API_ADDR / _PORT / _SOCKET
@@ -177,6 +180,8 @@ pub struct Values {
 	pub udp_max_sessions: Option<u64>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cache_max_memory: Option<u64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub geoip: Option<GeoipGlobal>,
 }
 
 /// The live items in force.
@@ -188,6 +193,7 @@ pub struct Live {
 	pub timeouts: Option<HttpTimeoutsSpec>,
 	pub udp_max_sessions: u64,
 	pub cache_max_memory: u64,
+	pub geoip: Option<GeoipGlobal>,
 }
 
 impl Default for Live {
@@ -199,6 +205,7 @@ impl Default for Live {
 			timeouts: None,
 			udp_max_sessions: crate::l4::udp::DEFAULT_MAX_SESSIONS,
 			cache_max_memory: crate::l7::middleware::cache::DEFAULT_PROCESS_MAX_MEMORY,
+			geoip: None,
 		}
 	}
 }
@@ -215,6 +222,7 @@ impl Values {
 			http: spec.http.as_ref().and_then(|h| h.timeouts.clone()).map(|t| HttpGlobalSpec { timeouts: Some(t) }),
 			udp_max_sessions: None,
 			cache_max_memory: None,
+			geoip: spec.geoip.clone(),
 		}
 	}
 
@@ -226,6 +234,7 @@ impl Values {
 			"http.timeouts" => self.timeouts().is_some(),
 			"udp_max_sessions" => self.udp_max_sessions.is_some(),
 			"cache_max_memory" => self.cache_max_memory.is_some(),
+			"geoip" => self.geoip.is_some(),
 			_ => false,
 		}
 	}
@@ -243,6 +252,7 @@ impl Values {
 			"http.timeouts" => serde_json::to_value(self.timeouts()?),
 			"udp_max_sessions" => serde_json::to_value(self.udp_max_sessions?),
 			"cache_max_memory" => serde_json::to_value(self.cache_max_memory?),
+			"geoip" => serde_json::to_value(self.geoip.as_ref()?),
 			_ => return None,
 		};
 		v.ok()
@@ -263,6 +273,7 @@ impl Values {
 			}
 			("udp_max_sessions", v) => next.udp_max_sessions = v.map(|v| parse(item, v)).transpose()?,
 			("cache_max_memory", v) => next.cache_max_memory = v.map(|v| parse(item, v)).transpose()?,
+			("geoip", v) => next.geoip = v.map(|v| parse(item, v)).transpose()?,
 			_ => return Err(format!("global.{item} is not an item the API sets")),
 		}
 		next.check_item(item)?;
@@ -312,6 +323,14 @@ impl Values {
 					t.check()?;
 				}
 			}
+			"geoip" => {
+				if let Some(g) = &self.geoip {
+					g.check()?;
+					for (what, p) in g.databases() {
+						absolute(&format!("global.geoip.{what}"), p)?;
+					}
+				}
+			}
 			_ => {}
 		}
 		Ok(())
@@ -358,6 +377,7 @@ fn effective(file: &Values, env: &Values, api: &Values) -> (Live, BTreeMap<&'sta
 		timeouts: pick("http.timeouts").and_then(|v| v.timeouts().cloned()),
 		udp_max_sessions: pick("udp_max_sessions").and_then(|v| v.udp_max_sessions).unwrap_or(d.udp_max_sessions),
 		cache_max_memory: pick("cache_max_memory").and_then(|v| v.cache_max_memory).unwrap_or(d.cache_max_memory),
+		geoip: pick("geoip").and_then(|v| v.geoip.clone()),
 	};
 	(live, sources)
 }
@@ -383,6 +403,9 @@ fn differing(a: &Live, b: &Live) -> Vec<&'static str> {
 	if a.cache_max_memory != b.cache_max_memory {
 		out.push("cache_max_memory");
 	}
+	if a.geoip != b.geoip {
+		out.push("geoip");
+	}
 	out
 }
 
@@ -394,6 +417,7 @@ fn live_value(l: &Live, item: &str) -> Value {
 		"http.timeouts" => serde_json::to_value(&l.timeouts).unwrap_or(Value::Null),
 		"udp_max_sessions" => json!(l.udp_max_sessions),
 		"cache_max_memory" => json!(l.cache_max_memory),
+		"geoip" => serde_json::to_value(&l.geoip).unwrap_or(Value::Null),
 		_ => Value::Null,
 	}
 }
@@ -407,6 +431,7 @@ fn keep_item(to: &mut Live, before: &Live, item: &str) {
 		"http.timeouts" => to.timeouts = before.timeouts.clone(),
 		"udp_max_sessions" => to.udp_max_sessions = before.udp_max_sessions,
 		"cache_max_memory" => to.cache_max_memory = before.cache_max_memory,
+		"geoip" => to.geoip = before.geoip.clone(),
 		_ => {}
 	}
 }
@@ -446,6 +471,24 @@ impl Drop for NewBouncer {
 	}
 }
 
+/// GeoIP databases opened for a change (#345); their watcher is started once they
+/// are in force, and stopped if the change does not take them.
+struct NewGeoip(Option<Arc<Geoip>>);
+
+impl NewGeoip {
+	fn take(&mut self) -> Option<Arc<Geoip>> {
+		self.0.take()
+	}
+}
+
+impl Drop for NewGeoip {
+	fn drop(&mut self) {
+		if let Some(g) = self.0.take() {
+			g.stop();
+		}
+	}
+}
+
 /// The live items built for a change, swapped in by `commit`.
 #[derive(Default)]
 struct Built {
@@ -458,6 +501,8 @@ struct Built {
 	timeouts: Option<HttpTimeouts>,
 	udp_max_sessions: Option<u64>,
 	cache_max_memory: Option<u64>,
+	/// Some(None): no databases; Some(Some): the new ones.
+	geoip: Option<NewGeoip>,
 }
 
 /// Why building one item failed.
@@ -510,7 +555,9 @@ async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration, required: bool) -> Re
 }
 
 /// Builds one item (files opened, the bouncer started and synced; nothing swapped yet).
-async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode) -> Result<(), BuildError> {
+/// `from_api`: the value comes from the API (`PATCH`, stored or handed over), not the file:
+/// its files were checked (`State::path_refused`) and are opened without following a link.
+async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode, from_api: bool) -> Result<(), BuildError> {
 	match item {
 		"trusted_proxies" => {
 			built.trusted_proxies = Some(cidr::parse_list(&to.trusted_proxies).map_err(|e| BuildError::Invalid(e.message))?)
@@ -546,9 +593,75 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 		"http.timeouts" => built.timeouts = Some(to.timeouts.as_ref().map(HttpTimeoutsSpec::resolve).unwrap_or_default()),
 		"udp_max_sessions" => built.udp_max_sessions = Some(to.udp_max_sessions),
 		"cache_max_memory" => built.cache_max_memory = Some(to.cache_max_memory),
+		"geoip" => {
+			built.geoip = Some(match &to.geoip {
+				None => NewGeoip(None),
+				// tens of MB read from disk
+				Some(g) => {
+					let g = g.clone();
+					// the API's files are right in RPROXY_API_GEOIP_DIR, checked just before: opened
+					// without following a link put there since; the file's may be links (Kubernetes volumes)
+					let open = if from_api { Geoip::open_api } else { Geoip::open };
+					match tokio::task::spawn_blocking(move || open(&g)).await {
+						Ok(Ok(g)) => NewGeoip(Some(g)),
+						Ok(Err(crate::net::geoip::GeoipError::Config(e))) => return Err(BuildError::Invalid(e)),
+						Err(e) => return Err(BuildError::Invalid(format!("global.geoip: {e}"))),
+					}
+				}
+			})
+		}
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
 	Ok(())
+}
+
+/// What the rules use of `global` (`Registry::under_rules_lock`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RulesUse {
+	pub crowdsec: CrowdsecUse,
+	pub geoip: GeoipUse,
+}
+
+/// The databases of `global.geoip` the rules' `geoip` lists need (theirs and their
+/// middlewares', #345).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GeoipUse {
+	pub countries: bool,
+	pub asns: bool,
+}
+
+impl GeoipUse {
+	pub fn of(spec: &crate::core::rule::RuleSpec) -> GeoipUse {
+		let mut out = GeoipUse::default();
+		let middlewares = spec.http.iter().flat_map(|h| h.middlewares.values()).filter_map(|m| match m {
+			crate::l7::MiddlewareSpec::Geoip(g) => Some(g),
+			_ => None,
+		});
+		for g in spec.geoip.iter().chain(middlewares) {
+			out.add(GeoipUse::of_lists(g));
+		}
+		out
+	}
+
+	fn of_lists(g: &GeoipSpec) -> GeoipUse {
+		GeoipUse { countries: g.uses_countries(), asns: g.uses_asns() }
+	}
+
+	pub fn add(&mut self, other: GeoipUse) {
+		self.countries |= other.countries;
+		self.asns |= other.asns;
+	}
+
+	/// Why the rules cannot run with `g` in force, if they cannot.
+	pub fn refuses(&self, g: Option<&GeoipGlobal>) -> Option<&'static str> {
+		if self.countries && !g.is_some_and(|g| g.country_db.is_some()) {
+			return Some("rules use country lists, which need global.geoip.country_db");
+		}
+		if self.asns && !g.is_some_and(|g| g.asn_db.is_some()) {
+			return Some("rules use ASN lists, which need global.geoip.asn_db");
+		}
+		None
+	}
 }
 
 /// What the rules use of `global.crowdsec`: any crowdsec, and AppSec (`Registry::under_rules_lock`).
@@ -556,6 +669,14 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 pub struct CrowdsecUse {
 	pub any: bool,
 	pub appsec: bool,
+}
+
+impl RulesUse {
+	/// Why the rules cannot run with `to` in force, for the items a change applies.
+	fn refused(&self, to: &Live, applied: &[&str]) -> Option<&'static str> {
+		let crowdsec = self.crowdsec.refuses(to.crowdsec.as_ref()).filter(|_| applied.contains(&"crowdsec"));
+		crowdsec.or_else(|| self.geoip.refuses(to.geoip.as_ref()).filter(|_| applied.contains(&"geoip")))
+	}
 }
 
 impl CrowdsecUse {
@@ -628,6 +749,23 @@ pub struct Handoff {
 	/// A `crowdsec` the file dropped and rules still use, kept in force.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub kept_crowdsec: Option<CrowdsecGlobal>,
+	/// A `geoip` whose databases the file took away while rules use them, kept in force (#345).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kept_geoip: Option<GeoipGlobal>,
+}
+
+/// What a live upgrade hands over that the file dropped while rules use it, kept in
+/// force (`Settings::restore`).
+#[derive(Clone, Debug, Default)]
+pub struct Kept {
+	pub crowdsec: Option<CrowdsecGlobal>,
+	pub geoip: Option<GeoipGlobal>,
+}
+
+impl Handoff {
+	pub fn kept(&self) -> Kept {
+		Kept { crowdsec: self.kept_crowdsec.clone(), geoip: self.kept_geoip.clone() }
+	}
 }
 
 /// What the start gives (`main`).
@@ -644,11 +782,21 @@ pub struct Options {
 	pub database: bool,
 	/// `BOUNCER_SYNC_WAIT` (shorter in tests).
 	pub sync_wait: Duration,
+	/// The directory the GeoIP databases set through the API must be in
+	/// (`RPROXY_API_GEOIP_DIR`, #345); None: the API cannot set them.
+	pub geoip_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
 	fn default() -> Self {
-		Options { keep_files: 14, access_log_dir: None, main_log: None, database: false, sync_wait: BOUNCER_SYNC_WAIT }
+		Options {
+			keep_files: 14,
+			access_log_dir: None,
+			main_log: None,
+			database: false,
+			sync_wait: BOUNCER_SYNC_WAIT,
+			geoip_dir: None,
+		}
 	}
 }
 
@@ -668,6 +816,9 @@ struct State {
 	failed: BTreeMap<&'static str, String>,
 	/// A `crowdsec` the file dropped while rules use it: in force until they do not.
 	kept_crowdsec: Option<CrowdsecGlobal>,
+	/// A `geoip` whose databases the file took away while rules use them: in force
+	/// until a reload finds the rules do without them (#345).
+	kept_geoip: Option<GeoipGlobal>,
 	/// The start-only items not from the file: (source, value) as started.
 	startup: BTreeMap<&'static str, (Source, Value)>,
 	/// What is in force, and where each item comes from.
@@ -732,7 +883,9 @@ impl State {
 	/// the access log, anything outside `access_log_dir`.
 	fn path_refused(&self, registry: &Registry, values: &Values) -> Option<(&'static str, String)> {
 		let entries = crate::net::protected::current(registry.acme().map(|a| a.as_ref()), None);
-		let paths = [("access_log", values.access_log.as_deref()), ("crowdsec", values.crowdsec.as_ref().map(|c| c.api_key_file.as_str()))];
+		let mut paths =
+			vec![("access_log", values.access_log.as_deref()), ("crowdsec", values.crowdsec.as_ref().map(|c| c.api_key_file.as_str()))];
+		paths.extend(values.geoip.iter().flat_map(|g| g.databases()).map(|(_, p)| ("geoip", Some(p))));
 		for (item, path) in paths {
 			let Some(path) = path else { continue };
 			if let Some(what) = crate::net::protected::protecting(path, &entries) {
@@ -744,7 +897,34 @@ impl State {
 				return Some(("access_log", e));
 			}
 		}
+		for (_, p) in values.geoip.iter().flat_map(|g| g.databases()) {
+			if let Err(e) = self.geoip_allowed(p) {
+				return Some(("geoip", e));
+			}
+		}
 		None
+	}
+
+	/// A GeoIP database set through the API is a regular file (not a link) right in
+	/// `geoip_dir` (#345): the API cannot have rproxy read any file it can read.
+	fn geoip_allowed(&self, p: &str) -> Result<(), String> {
+		let Some(dir) = &self.opts.geoip_dir else {
+			return Err("no directory for GeoIP databases set through the API: set RPROXY_API_GEOIP_DIR".into());
+		};
+		let path = Path::new(p);
+		let outside = || format!("{p} is not in {} (RPROXY_API_GEOIP_DIR)", dir.display());
+		let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+			return Err(outside());
+		};
+		let real = |d: &Path| std::fs::canonicalize(d).ok();
+		if name.starts_with('.') || real(parent).is_none() || real(parent) != real(dir) {
+			return Err(outside());
+		}
+		match std::fs::symlink_metadata(path) {
+			Ok(m) if m.file_type().is_file() => Ok(()),
+			Ok(_) => Err(format!("{p} is not a regular file")),
+			Err(e) => Err(format!("{p}: {e}")),
+		}
 	}
 
 	/// An access log set through the API is a file right in `access_log_dir`
@@ -806,6 +986,9 @@ impl State {
 		if self.live.crowdsec.is_some() && self.live.crowdsec == self.kept_crowdsec && !self.api.has("crowdsec") {
 			self.sources.insert("crowdsec", Source::File);
 		}
+		if self.kept_geoip.is_some() && self.live.geoip == self.kept_geoip {
+			self.sources.insert("geoip", Source::File);
+		}
 		self.warn_shadowed();
 	}
 }
@@ -853,6 +1036,9 @@ pub struct FilePrepared {
 struct Swapped {
 	bouncer: Option<Arc<Bouncer>>,
 	snapshot: Arc<crate::l7::access::Snapshot>,
+	/// The GeoIP databases replaced (#345): their watcher stops; the memory goes with
+	/// the last connection that looked them up.
+	geoip: Option<Arc<Geoip>>,
 }
 
 impl Swapped {
@@ -861,6 +1047,9 @@ impl Swapped {
 	fn finish(self) {
 		if let Some(b) = self.bouncer {
 			b.stop();
+		}
+		if let Some(g) = self.geoip {
+			g.stop();
 		}
 		let old = self.snapshot;
 		if tokio::runtime::Handle::try_current().is_ok() {
@@ -871,7 +1060,7 @@ impl Swapped {
 
 /// Swaps what was built in, under the rules lock.
 fn commit(registry: &Registry, built: Built) -> Swapped {
-	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, cache_max_memory, .. } = built;
+	let Built { trusted_proxies, access_log, crowdsec, timeouts, udp_max_sessions, cache_max_memory, geoip, .. } = built;
 	let crowdsec = crowdsec.map(|mut b| b.take());
 	if let Some(Some(b)) = &crowdsec {
 		info!(event = "crowdsec.swap", synced = b.synced(), "a new CrowdSec bouncer is in force");
@@ -883,7 +1072,16 @@ fn commit(registry: &Registry, built: Built) -> Swapped {
 	if let Some(n) = cache_max_memory {
 		crate::l7::middleware::cache::set_max_memory(n);
 	}
-	Swapped { bouncer, snapshot }
+	let geoip = geoip.and_then(|mut g| {
+		let new = g.take();
+		if let Some(g) = &new {
+			g.spawn();
+			info!(event = "geoip.swap", country_db = g.spec().country_db.is_some(), asn_db = g.spec().asn_db.is_some(),
+				"new GeoIP databases are in force");
+		}
+		registry.http_global().set_geoip(new)
+	});
+	Swapped { bouncer, snapshot, geoip }
 }
 
 impl Settings {
@@ -931,7 +1129,7 @@ impl Settings {
 		updated_by: Option<String>,
 		updated_at: Option<u64>,
 		persisted: Option<bool>,
-		kept_crowdsec: Option<CrowdsecGlobal>,
+		kept_over: Kept,
 		from: &str,
 	) {
 		let turn = self.turn.lock().await;
@@ -942,7 +1140,10 @@ impl Settings {
 		let (before, file, opts) = {
 			let mut s = self.state();
 			if s.live.crowdsec.is_none() {
-				s.kept_crowdsec = kept_crowdsec;
+				s.kept_crowdsec = kept_over.crowdsec;
+			}
+			if kept_over.geoip.is_some() {
+				s.kept_geoip = kept_over.geoip;
 			}
 			// the paths the API may not name, checked again (#319)
 			let mut check = api.clone();
@@ -957,10 +1158,16 @@ impl Settings {
 		for item in failed.keys() {
 			in_force.clear(item);
 		}
-		let (mut to, _) = self.state().effective_with(&file, &in_force);
+		let (mut to, mut sources) = self.state().effective_with(&file, &in_force);
+		// databases the old process kept for its rules (#345), until a reload finds they are not needed
+		if let Some(g) = self.state().kept_geoip.clone() {
+			to.geoip = Some(g);
+			sources.insert("geoip", Source::File);
+		}
 		let mut built = Built::default();
 		for item in differing(&before, &to) {
-			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore).await {
+			let from_api = sources.get(item) == Some(&Source::Api);
+			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore, from_api).await {
 				let e = e.message();
 				warn!(event = "degraded", part = "global", item, from, error = %e,
 					"a global value set through the API cannot be put in force; the value before it stays");
@@ -969,7 +1176,7 @@ impl Settings {
 			}
 		}
 		let fallback = built.access_log_fallback;
-		let brings_crowdsec = to.crowdsec.is_some() && to.crowdsec != before.crowdsec;
+		let brought = brought(&differing(&before, &to), &to);
 		registry.under_rules_lock(|_| commit(registry, built)).await.finish();
 		{
 			let mut s = self.state();
@@ -993,9 +1200,7 @@ impl Settings {
 		// not under the turn: name resolution may take a while, and each rule is
 		// checked again (its generation, `crowdsec_gate`) under the rules lock (#347)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 	}
 
 	/// Builds the live items of a version of the settings file (`ConfigReloader::reload`,
@@ -1012,17 +1217,18 @@ impl Settings {
 				self.turn.clone().lock_owned().await
 			}
 		};
-		let (before, mut to, opts, file) = {
+		let (before, mut to, opts, file, sources) = {
 			let s = self.state();
 			let file = Values::of_file(spec, raw);
-			let (to, _) = s.effective_with(&file, &s.api_in_force());
-			(s.live.clone(), to, s.opts.clone(), file)
+			let (to, sources) = s.effective_with(&file, &s.api_in_force());
+			(s.live.clone(), to, s.opts.clone(), file, sources)
 		};
 		let mut built = Built::default();
 		let mut changed = vec![];
 		let mut not_in_force = vec![];
 		for item in differing(&before, &to) {
-			match build_item(item, &to, &mut built, &opts, Mode::File).await {
+			let from_api = sources.get(item) == Some(&Source::Api);
+			match build_item(item, &to, &mut built, &opts, Mode::File, from_api).await {
 				Ok(()) => changed.push(item),
 				Err(BuildError::NotSynced(e)) => {
 					warn!(event = "config.global_kept", item, error = %e, "the CrowdSec in force stays until its LAPI answers (reload again)");
@@ -1044,6 +1250,19 @@ impl Settings {
 		let before = self.state().live.clone();
 		let replaced = registry
 			.under_rules_lock(|uses| {
+				// databases the rules' geoip lists need are not taken away (#345)
+				let geoip_refused = uses.geoip.refuses(to.geoip.as_ref()).filter(|_| uses.geoip.refuses(before.geoip.as_ref()).is_none());
+				if let Some(why) = geoip_refused {
+					warn!(event = "config.global_in_use", item = "geoip", reason = why,
+						"global.geoip stays as it is until no rule needs what the file takes away (then reload again)");
+					to.geoip = before.geoip.clone();
+					built.geoip = None;
+					changed.retain(|i| *i != "geoip");
+					self.state().kept_geoip = before.geoip.clone();
+				} else {
+					self.state().kept_geoip = None;
+				}
+				let uses = uses.crowdsec;
 				if let Some(why) = uses.refuses(to.crowdsec.as_ref()).filter(|_| before.crowdsec.is_some()) {
 					warn!(
 						event = "config.global_in_use",
@@ -1072,7 +1291,7 @@ impl Settings {
 			})
 			.await;
 		replaced.finish();
-		let brings_crowdsec = {
+		let brought = {
 			let mut s = self.state();
 			s.file_raw = raw;
 			if let Some(f) = built.access_log_fallback {
@@ -1085,15 +1304,13 @@ impl Settings {
 				s.failed.insert(item, e);
 			}
 			let api = s.api.clone();
-			let brings = changed.contains(&"crowdsec") && to.crowdsec.is_some();
+			let brings = brought(&changed, &to);
 			s.settle(to, file, api);
 			brings
 		};
 		// not under the turn (#347, as in `restore`)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 		changed
 	}
 
@@ -1109,7 +1326,7 @@ impl Settings {
 		};
 		if let Ok(log) = AccessLog::open(Some(Path::new(&path)), s.opts.keep_files) {
 			let (_, old) = registry.http_global().update(Update { access_log: Some(log), ..Default::default() });
-			Swapped { bouncer: None, snapshot: old }.finish();
+			Swapped { bouncer: None, snapshot: old, geoip: None }.finish();
 			s.access_log_fallback = false;
 			info!(event = "config.global", item = "access_log", "the access log can be written again");
 		}
@@ -1188,8 +1405,16 @@ impl Settings {
 		if dry_run {
 			// checked as far as it goes without opening files or starting a bouncer
 			let uses = registry.under_rules_lock(|uses| uses).await;
-			if let Some(why) = uses.refuses(to.crowdsec.as_ref()).filter(|_| applied.contains(&"crowdsec")) {
+			if let Some(why) = uses.refused(&to, &applied) {
 				return Err(PatchError::InUse(format!("{why}; change those rules first")));
+			}
+			// the databases are opened by the change itself; here only that they are files
+			if let (true, Some(g)) = (applied.contains(&"geoip"), &to.geoip) {
+				for (what, p) in g.databases() {
+					if !std::fs::metadata(p).is_ok_and(|m| m.is_file()) {
+						return Err(PatchError::Invalid(format!("global.geoip.{what}: {p} is not a file that can be read")));
+					}
+				}
 			}
 			if let (true, Some(p)) = (applied.contains(&"access_log"), &to.access_log) {
 				if let Err(AccessLogError::Config(e) | AccessLogError::Unavailable(e)) = crate::l7::access::access_log_dir(Path::new(p)) {
@@ -1203,7 +1428,8 @@ impl Settings {
 		}
 		let mut built = Built::default();
 		for item in &applied {
-			build_item(item, &to, &mut built, &opts, Mode::Api).await.map_err(|e| match e {
+			// a PATCH builds only what it names, which the file does not
+			build_item(item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
 				BuildError::Invalid(e) => PatchError::Invalid(e),
 				BuildError::NotSynced(e) => PatchError::Unavailable(e),
 			})?;
@@ -1211,14 +1437,14 @@ impl Settings {
 		// swapped in with the rules lock held: no rule is created or changed meanwhile
 		let replaced = registry
 			.under_rules_lock(|uses| {
-				if let Some(why) = uses.refuses(to.crowdsec.as_ref()).filter(|_| applied.contains(&"crowdsec")) {
+				if let Some(why) = uses.refused(&to, &applied) {
 					return Err(PatchError::InUse(format!("{why}; change those rules first")));
 				}
 				Ok(commit(registry, built_with_fallback(&mut built)))
 			})
 			.await?;
 		replaced.finish();
-		let brings_crowdsec = {
+		let brought = {
 			let mut s = self.state();
 			for (i, _) in &named {
 				if let Some(d) = item(i) {
@@ -1228,6 +1454,9 @@ impl Settings {
 			}
 			if to.crowdsec != s.kept_crowdsec {
 				s.kept_crowdsec = None;
+			}
+			if applied.contains(&"geoip") {
+				s.kept_geoip = None;
 			}
 			if let Some(f) = built.access_log_fallback {
 				s.access_log_fallback = f;
@@ -1240,13 +1469,11 @@ impl Settings {
 				s.persisted = Some(false);
 			}
 			info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
-			applied.contains(&"crowdsec") && s.live.crowdsec.is_some()
+			brought(&applied, &s.live)
 		};
 		// not under the turn (#347, as in `restore`)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 		Ok(Patched { changes, applied })
 	}
 
@@ -1276,7 +1503,11 @@ impl Settings {
 	/// Whether there is anything to hand over.
 	pub fn has_api_values(&self) -> bool {
 		let s = self.state();
-		s.api != Values::default() || s.kept.as_object().is_some_and(|m| !m.is_empty()) || s.not_loaded || s.kept_crowdsec.is_some()
+		s.api != Values::default()
+			|| s.kept.as_object().is_some_and(|m| !m.is_empty())
+			|| s.not_loaded
+			|| s.kept_crowdsec.is_some()
+			|| s.kept_geoip.is_some()
 	}
 
 	/// For the new process of a live upgrade.
@@ -1289,6 +1520,7 @@ impl Settings {
 			persisted: s.persisted,
 			not_loaded: s.not_loaded,
 			kept_crowdsec: s.kept_crowdsec.clone(),
+			kept_geoip: s.kept_geoip.clone(),
 		}
 	}
 
@@ -1320,6 +1552,10 @@ impl Settings {
 			}
 			if i.name == "crowdsec" && s.kept_crowdsec.is_some() && s.live.crowdsec == s.kept_crowdsec && !s.file.has("crowdsec") {
 				// the file dropped it; rules still use it
+				v.insert("kept".into(), json!(true));
+			}
+			if i.name == "geoip" && s.kept_geoip.is_some() && s.live.geoip == s.kept_geoip {
+				// the file took databases away that rules still use (#345)
 				v.insert("kept".into(), json!(true));
 			}
 			if let Some(e) = s.failed.get(i.name) {
@@ -1443,6 +1679,27 @@ fn masked_url(u: &str) -> String {
 	out
 }
 
+/// What rules failed waiting for that a change put in force (`changed`: the items whose
+/// value in force changed; `to`: in force after it).
+fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
+	let mut out = vec![];
+	if changed.contains(&"crowdsec") && to.crowdsec.is_some() {
+		out.push(crate::error::Reason::NeedsCrowdsec);
+	}
+	if changed.contains(&"geoip") && to.geoip.is_some() {
+		out.push(crate::error::Reason::NeedsGeoip);
+	}
+	out
+}
+
+/// Starts again the rules that waited for what a change brought (#347, #345); not under
+/// the turn: each rule is checked again under the rules lock.
+async fn retry_brought(registry: &Arc<Registry>, brought: Vec<crate::error::Reason>) {
+	for reason in brought {
+		registry.retry_waiting_for(reason).await;
+	}
+}
+
 /// Takes what `commit` swaps in out of `built`, leaving the fallback flag.
 fn built_with_fallback(built: &mut Built) -> Built {
 	Built {
@@ -1453,6 +1710,7 @@ fn built_with_fallback(built: &mut Built) -> Built {
 		timeouts: built.timeouts.take(),
 		udp_max_sessions: built.udp_max_sessions.take(),
 		cache_max_memory: built.cache_max_memory.take(),
+		geoip: built.geoip.take(),
 	}
 }
 
@@ -1708,7 +1966,7 @@ mod tests {
 		assert!(refused(dir.join("access.log")).await.is_ok());
 		assert!(matches!(refused(dir.join("web.")).await, Err(PatchError::Protected(ref m)) if m.contains("empty extension")));
 		// restored values are checked the same way: not in force
-		s.restore(&r, &json!({"access_log": "/etc/s.conf"}), None, None, None, None, "database").await;
+		s.restore(&r, &json!({"access_log": "/etc/s.conf"}), None, None, None, Default::default(), "database").await;
 		let view = s.view();
 		assert_eq!(view["items"]["access_log"]["value"], Value::Null);
 		assert!(view["items"]["access_log"]["error"].as_str().unwrap().contains("RPROXY_API_ACCESS_LOG_DIR"), "{view}");
@@ -1749,7 +2007,7 @@ mod tests {
 		let dir = std::env::temp_dir();
 		s.init(None, Values::default(), BTreeMap::new(), Options { database: true, access_log_dir: Some(dir), ..Default::default() });
 		let spec = json!({"access_log": "/nonexistent-rproxy/a.log", "trusted_proxies": ["192.0.2.0/24"], "later": {"x": 1}});
-		s.restore(&r, &spec, Some("ui".into()), Some(1), Some(true), None, "database").await;
+		s.restore(&r, &spec, Some("ui".into()), Some(1), Some(true), Default::default(), "database").await;
 		let view = s.view();
 		assert_eq!(view["items"]["access_log"]["value"], Value::Null);
 		assert!(view["items"]["access_log"]["error"].is_string(), "{view}");
@@ -1767,7 +2025,7 @@ mod tests {
 		s.set_not_loaded();
 		assert!(matches!(s.patch(&r, &body(json!({"udp_max_sessions": 5})), "t", false).await, Err(PatchError::NotLoaded)));
 		assert!(s.stored().is_none() && s.handoff().not_loaded);
-		s.restore(&r, &json!({"http": {"timeouts": {"idle": "3s"}}}), None, None, Some(true), None, "database").await;
+		s.restore(&r, &json!({"http": {"timeouts": {"idle": "3s"}}}), None, None, Some(true), Default::default(), "database").await;
 		assert!(s.loaded());
 		s.patch(&r, &body(json!({"http": {"timeouts": {"idle": "4s"}}})), "t", false).await.unwrap();
 	}

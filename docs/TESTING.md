@@ -370,6 +370,9 @@ v0.4 の設定（docs/DESIGN-v0.4.md）の形をまとめて確かめる。v0.4.
 | `a_patch_starts_the_rules_waiting_for_crowdsec` | `crowdsec` がなくて起動できなかったルール（ルールの `crowdsec`・ミドルウェア・ミドルウェアの `appsec`）が、`appsec_url` つきの `crowdsec` を入れる PATCH の後に動く（誤りの理由で探す、`turn` を放してから動かし直す、#347） |
 | `a_rule_waiting_for_crowdsec_is_retried_until_its_target_resolves` | `crowdsec` が効いたときに転送先の名前をまだ引けないルールは、ほかの名前を引けないルールと同じく裏で試し直し、引けたら動く（#347） |
 | `global_in_a_later_file_of_a_directory_is_the_file_s` | `RPROXY_CONFIG` がディレクトリで、`global` が 2 つ目のファイルにあっても、その項目はファイルのもの（`409 static`） |
+| `geoip_through_the_api_is_swapped_for_the_next_connection` | `geoip`（#345）：TCP から `403`、`RPROXY_API_GEOIP_DIR` の外・リンク・`.` で始まる名前・`..`・`/dev/zero`・`/proc/self/environ`・トークンファイルは `403 protected_file`、相対パスと mmdb でないファイルは `400`。入れると次の接続から国で判定し、国のリストを使うルールがあると `country_db` を外す・`geoip` を消すのは `409 in_use`（dry run も）、`asn_db` がないと ASN のリストのルールは作れない。新しい版のデータベースに替えると次の接続から。ルールがなくなれば消せる。場所の外を指す保存した値は効かせず `error` |
+| `a_reload_swaps_geoip_and_keeps_what_rules_need` | 読み直しで `geoip` が入り（`restart_needed` に出ない）、API では `409 static`。mmdb でないデータベースは読み直しを断り何も変えない。API のルールが使う `country_db` をファイルが外すと前のものを残し（`kept`・`source: file`、引き継ぎの状態にも、ほかの PATCH でも残る）、ルールがなくなった後の読み直しでファイルのものに替わる |
+| `rules_waiting_for_geoip_start_once_it_is_in_force` | 起動で行を読めず `geoip` がなくて起動できなかったルール（国・ASN のリスト）が、照合が行を読んだとき（国）・`asn_db` を入れる PATCH の後（ASN）に動く（#345） |
 
 ## 結合テスト：performance（`tests/performance.rs`、#194・#184）
 

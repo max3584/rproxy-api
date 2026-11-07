@@ -2360,6 +2360,10 @@
               "db_connect_timeout": {
                 "type": "boolean",
                 "description": "connect_timeout in the options of rows of the UI's database (forward_rules) is restored; before, such a row was refused as an unknown key and not restored (v0.4.21, #379)"
+              },
+              "global_api_geoip": {
+                "type": "boolean",
+                "description": "global.geoip through PATCH /config/global (only over the Unix socket by default) and a reload of the settings file, while running: the databases are opened again and swapped for the next connection or request; removing a database (country_db / asn_db) that rules' geoip lists need is 409 in_use; databases set through the API are regular files right in RPROXY_API_GEOIP_DIR (unset: 403 protected_file) (v0.4.22, #345)"
               }
             }
           },
@@ -3882,7 +3886,7 @@
           },
           "unix_only": {
             "type": "boolean",
-            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec (and acme)"
+            "description": "Changed only over the Unix socket while RPROXY_API_RELOAD_UNIX_ONLY is true: trusted_proxies, access_log, crowdsec, geoip (and acme)"
           },
           "settable": {
             "type": "boolean",
@@ -3901,7 +3905,7 @@
           },
           "kept": {
             "type": "boolean",
-            "description": "crowdsec only: the file dropped it, but rules use it, so it stays in force (source file) until no rule does"
+            "description": "crowdsec: the file dropped it, but rules use it, so it stays in force (source file) until no rule does; geoip: the file took away a database the rules' lists need, so the previous geoip stays in force likewise (#345)"
           }
         },
         "required": [
@@ -3918,7 +3922,7 @@
         "properties": {
           "items": {
             "type": "object",
-            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions, cache_max_memory (live); acme, geoip, performance, files, control_api (restart)",
+            "description": "By item: trusted_proxies, access_log, crowdsec, http.timeouts, udp_max_sessions, cache_max_memory, geoip (live, geoip since v0.4.22); acme, performance, files, control_api (restart)",
             "additionalProperties": {
               "$ref": "#/components/schemas/GlobalItem"
             }
@@ -4081,6 +4085,13 @@
             ],
             "minimum": 0,
             "description": "Bytes all cache middlewares of the process keep together (RPROXY_CACHE_MAX_MEMORY; default 536870912, 0: none) (v0.4.19, #349)"
+          },
+          "geoip": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "As global.geoip (country_db, asn_db, check_interval, log_country); the databases are regular files right in RPROXY_API_GEOIP_DIR (unset: refused, 403 protected_file), opened before they are swapped in for the next connection or request; dropping a database the rules' geoip lists need is 409 in_use. Unix socket only by default (v0.4.22, #345)"
           }
         },
         "additionalProperties": false
@@ -4437,7 +4448,7 @@
             }
           },
           "403": {
-            "description": "The token lacks the admin scope; trusted_proxies, access_log or crowdsec over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, or an access log outside RPROXY_API_ACCESS_LOG_DIR (protected_file)",
+            "description": "The token lacks the admin scope; trusted_proxies, access_log, crowdsec or geoip over TCP while RPROXY_API_RELOAD_UNIX_ONLY is true (forbidden); a path naming rproxy's own secrets or stores, an access log outside RPROXY_API_ACCESS_LOG_DIR or a GeoIP database outside RPROXY_API_GEOIP_DIR (protected_file)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4447,7 +4458,7 @@
             }
           },
           "409": {
-            "description": "static: the settings file or the environment sets the item; restart_only: the item is read only at the start; in_use: rules use the crowdsec (appsec) being taken away",
+            "description": "static: the settings file or the environment sets the item; restart_only: the item is read only at the start; in_use: rules use the crowdsec (appsec) or the geoip database (country_db, asn_db) being taken away",
             "content": {
               "application/json": {
                 "schema": {
