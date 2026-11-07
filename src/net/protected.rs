@@ -26,7 +26,7 @@ use std::sync::RwLock;
 use serde_json::Value;
 
 /// One protected file or directory tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
 	/// What it is, for the error (`the certificate store (RPROXY_CERT_STORE)`).
 	pub what: String,
@@ -95,13 +95,27 @@ fn acme_trees() -> Vec<Entry> {
 
 /// The storages and secret files of every `global.acme` put in force in this process
 /// (#345): one replaced (a PATCH, a reload of the settings file) leaves its keys and
-/// secrets where they were, so they stay protected for the rest of its life.
+/// secrets where they were, so they stay protected for the rest of its life, and on in
+/// the process of a live upgrade (`acme_seen`, #389); not past a restart.
 static ACME_SEEN: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
 
 /// Remembers the storage and secret files of `acme` (`Registry::set_acme`).
 pub fn remember_acme(acme: &crate::acme::Acme) {
+	adopt_acme_seen(acme_entries(acme));
+}
+
+/// The storages and secret files of the `global.acme`s this process has had
+/// (`remember_acme`), handed to the process of a live upgrade (#389).
+pub fn acme_seen() -> Vec<Entry> {
+	ACME_SEEN.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Takes over the old process's `acme_seen` (a live upgrade, #389). A restart starts
+/// without them: only the `global.acme` in force, the default storage and
+/// `RPROXY_API_ACME_DIR` are protected then.
+pub fn adopt_acme_seen(entries: Vec<Entry>) {
 	let mut seen = ACME_SEEN.write().unwrap_or_else(|e| e.into_inner());
-	for e in acme_entries(acme) {
+	for e in entries {
 		if !seen.iter().any(|s| s.path == e.path && s.tree == e.tree) {
 			seen.push(e);
 		}

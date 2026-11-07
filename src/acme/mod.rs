@@ -274,6 +274,95 @@ fn validity(cert_file: &str, key_file: &str) -> Option<(i64, i64)> {
 	Some((check.not_before, check.not_after))
 }
 
+/// What `Acme::carry_files` found and copied (#345, #389).
+#[derive(Debug, Default)]
+pub struct Carried {
+	/// For each certificate of the replaced `Acme` whose names the new one allows, the
+	/// validity the new storage holds for it once `staged` is placed (None: none).
+	pub held: BTreeMap<CertId, Option<(i64, i64)>>,
+	/// The copies, not in place yet.
+	pub staged: Staged,
+}
+
+/// Files copied into a new storage (#389), written in a directory of their own there
+/// (`.carry-<pid>-<n>`) and renamed into place by `place` once the change is in force
+/// (`config::global::commit`). Dropped unplaced (a change refused after the copies),
+/// the directory goes, and a storage no change took keeps nothing of them.
+#[derive(Debug, Default)]
+pub struct Staged {
+	/// The new storage and the directory in it (None: nothing to copy).
+	dir: Option<(PathBuf, PathBuf)>,
+	/// (staged, final), in the order they are renamed: a key before its certificate (as `issue` writes).
+	files: Vec<(PathBuf, PathBuf)>,
+}
+
+const STAGING_PREFIX: &str = ".carry-";
+const STAGING_STALE: Duration = Duration::from_secs(3600);
+
+impl Staged {
+	/// A directory in `storage` for this process's copies (made by the first `write`).
+	/// Ones a process that ended before placing left there (an hour old: not those of a
+	/// change under way, in this process or the other one of a live upgrade) are removed.
+	fn new(storage: &Path) -> Staged {
+		static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+		let pid = std::process::id();
+		if let Ok(dir) = std::fs::read_dir(storage) {
+			let stale =
+				|e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|a| a > STAGING_STALE));
+			for e in dir.flatten() {
+				if e.file_name().to_string_lossy().starts_with(STAGING_PREFIX) && stale(&e) {
+					let _ = std::fs::remove_dir_all(e.path());
+				}
+			}
+		}
+		let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		Staged { dir: Some((storage.to_path_buf(), storage.join(format!("{STAGING_PREFIX}{pid}-{n}")))), files: vec![] }
+	}
+
+	/// Writes the copy of `to` (a file in the storage) into the directory; its path there.
+	fn write(&mut self, to: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+		let Some((storage, dir)) = &self.dir else { return Err(std::io::Error::other("no staging directory")) };
+		let rel = to.strip_prefix(storage).map_err(|_| std::io::Error::other(format!("{} is not in {}", to.display(), storage.display())))?;
+		let at = dir.join(rel);
+		store::write_private(&at, data)?;
+		self.files.push((at.clone(), to.to_path_buf()));
+		Ok(at)
+	}
+
+	/// Leaves copies out (removed now, not placed).
+	fn forget(&mut self, staged: &[PathBuf]) {
+		for f in staged {
+			let _ = std::fs::remove_file(f);
+		}
+		self.files.retain(|(s, _)| !staged.contains(s));
+	}
+
+	/// Whether nothing was copied.
+	pub fn is_empty(&self) -> bool {
+		self.files.is_empty()
+	}
+
+	/// Renames the copies into place (a few renames in the same storage) and removes the directory.
+	pub fn place(mut self) {
+		for (from, to) in std::mem::take(&mut self.files) {
+			let moved = to.parent().map_or(Ok(()), store::create_private_dir).and_then(|()| std::fs::rename(&from, &to));
+			// another file system under the storage: written in place instead
+			let moved = moved.or_else(|_| std::fs::read(&from).and_then(|d| store::write_private(&to, &d)));
+			if let Err(e) = moved {
+				warn!(event = "acme.error", part = "storage", file = %to.display(), error = %e, "a copied file could not be put in place");
+			}
+		}
+	}
+}
+
+impl Drop for Staged {
+	fn drop(&mut self) {
+		if let Some((_, dir)) = self.dir.take() {
+			let _ = std::fs::remove_dir_all(dir);
+		}
+	}
+}
+
 impl Acme {
 	/// Sets up `global.acme` (already checked by `ConfigDoc::load`). Nothing
 	/// starts until `spawn`.
@@ -373,26 +462,29 @@ impl Acme {
 	/// blocking file IO, run off the async workers and outside the rules lock. With
 	/// another storage, the certificates `old` holds that this one lacks or holds older
 	/// (and the account keys) are copied here, so rules keep serving them and nothing is
-	/// ordered again because of the move. Returns, for each certificate of `old` whose
-	/// names this one still allows, the validity this storage holds for it now (None: none).
-	pub fn carry_files(&self, old: &Acme) -> BTreeMap<CertId, Option<(i64, i64)>> {
+	/// ordered again because of the move. The copies wait in a directory of their own in
+	/// this storage (`Carried::staged`) until the change is in force (#389). `held`: for
+	/// each certificate of `old` whose names this one still allows, the validity this
+	/// storage holds for it once the copies are in place (None: none).
+	pub fn carry_files(&self, old: &Acme) -> Carried {
 		let certs: Vec<(CertId, Option<(i64, i64)>)> =
 			old.state.lock().unwrap_or_else(|e| e.into_inner()).certs.iter().map(|(id, m)| (id.clone(), m.issued)).collect();
 		let allowed = |id: &CertId| self.global.check_names(&id.resolver, &id.domains).is_ok();
 		if old.storage == self.storage {
-			return certs.into_iter().filter(|(id, _)| allowed(id)).collect();
+			return Carried { held: certs.into_iter().filter(|(id, _)| allowed(id)).collect(), staged: Staged::default() };
 		}
-		self.carry_accounts(old);
+		let mut staged = Staged::new(&self.storage);
+		self.carry_accounts(old, &mut staged);
 		let mine: BTreeMap<CertId, Option<(i64, i64)>> =
 			self.state.lock().unwrap_or_else(|e| e.into_inner()).certs.iter().map(|(id, m)| (id.clone(), m.issued)).collect();
-		let mut out = BTreeMap::new();
+		let mut held = BTreeMap::new();
 		for (id, issued) in certs.into_iter().filter(|(id, _)| allowed(id)) {
 			let (cert, key) = self.files(&id);
-			let held = mine.get(&id).copied().flatten().or_else(|| validity(&cert, &key));
-			let held = if self.carry_cert(old, &id, issued, held) { issued } else { held };
-			out.insert(id, held);
+			let have = mine.get(&id).copied().flatten().or_else(|| validity(&cert, &key));
+			let have = self.carry_cert(old, &id, issued, have, &mut staged).unwrap_or(have);
+			held.insert(id, have);
 		}
-		out
+		Carried { held, staged }
 	}
 
 	/// The state part of taking over from `old` (#345): memory only, so it may run under
@@ -429,33 +521,54 @@ impl Acme {
 		}
 	}
 
-	/// Copies a certificate `old` issued into this storage unless this one holds it as
-	/// new or newer (key first, as `issue` writes). True when this storage now holds `old`'s.
-	fn carry_cert(&self, old: &Acme, id: &CertId, issued: Option<(i64, i64)>, mine: Option<(i64, i64)>) -> bool {
-		let Some((_, old_after)) = issued else { return false };
+	/// Copies a certificate `old` issued into `staged` unless this storage holds it as
+	/// new or newer. The copy is checked as `issue`'s files are (#389): `old` may not have
+	/// stopped (`RETIRE_WAIT` passed) and be between writing a new key and its certificate.
+	/// Some(validity): this storage holds `old`'s once `staged` is placed; None: it keeps
+	/// what it has (a pair that does not match is not copied, so what this storage lacks is
+	/// ordered again rather than a stand-in served until the renewal time).
+	fn carry_cert(
+		&self,
+		old: &Acme,
+		id: &CertId,
+		issued: Option<(i64, i64)>,
+		mine: Option<(i64, i64)>,
+		staged: &mut Staged,
+	) -> Option<Option<(i64, i64)>> {
+		let (_, old_after) = issued?;
 		let (old_cert, old_key) = old.files(id);
 		let (cert, key) = self.files(id);
 		let mine = mine.or_else(|| validity(&cert, &key));
 		if mine.is_some_and(|(_, after)| after >= old_after) {
-			return false;
+			return None;
 		}
-		let (Ok(k), Ok(c)) = (std::fs::read(&old_key), std::fs::read(&old_cert)) else { return false };
-		match store::write_private(Path::new(&key), &k).and_then(|()| store::write_private(Path::new(&cert), &c)) {
-			Ok(()) => {
-				info!(event = "acme.storage", action = "carried", resolver = %id.resolver, domains = ?id.domains,
-					from = %old.storage.display(), to = %self.storage.display());
-				true
-			}
+		let (Ok(k), Ok(c)) = (std::fs::read(&old_key), std::fs::read(&old_cert)) else { return None };
+		let failed = |e: std::io::Error| {
+			warn!(event = "acme.error", part = "storage", file = %cert, error = %e, "the certificate is obtained again in the new storage");
+		};
+		let k = staged.write(Path::new(&key), &k).map_err(failed).ok()?;
+		let c = match staged.write(Path::new(&cert), &c) {
+			Ok(c) => c,
 			Err(e) => {
-				warn!(event = "acme.error", part = "storage", file = %cert, error = %e, "the certificate is obtained again in the new storage");
-				false
+				staged.forget(&[k]);
+				failed(e);
+				return None;
 			}
-		}
+		};
+		let Some(copied) = validity(&c.to_string_lossy(), &k.to_string_lossy()) else {
+			staged.forget(&[k, c]);
+			warn!(event = "acme.error", part = "storage", resolver = %id.resolver, domains = ?id.domains, from = %old.storage.display(),
+				"the previous storage's key and certificate do not match (being written); not copied");
+			return None;
+		};
+		info!(event = "acme.storage", action = "carried", resolver = %id.resolver, domains = ?id.domains,
+			from = %old.storage.display(), to = %self.storage.display());
+		Some(Some(copied))
 	}
 
 	/// Copies the account keys (and URLs) `old` keeps in its storage for the same account
-	/// at the same CA, when this storage has none: the move does not make new accounts.
-	fn carry_accounts(&self, old: &Acme) {
+	/// at the same CA into `staged`, when this storage has none: the move does not make new accounts.
+	fn carry_accounts(&self, old: &Acme, staged: &mut Staged) {
 		for (name, a) in &self.accounts {
 			let Some(o) = old.accounts.get(name) else { continue };
 			let mine = self.storage.join("accounts");
@@ -463,8 +576,8 @@ impl Acme {
 				continue;
 			}
 			let meta = old.storage.join("accounts").join(format!("{name}.json"));
-			let copied = std::fs::read(&o.key_file).and_then(|k| store::write_private(&a.key_file, &k)).and_then(|()| match std::fs::read(&meta) {
-				Ok(m) => store::write_private(&mine.join(format!("{name}.json")), &m),
+			let copied = std::fs::read(&o.key_file).and_then(|k| staged.write(&a.key_file, &k)).and_then(|_| match std::fs::read(&meta) {
+				Ok(m) => staged.write(&mine.join(format!("{name}.json")), &m).map(|_| ()),
 				Err(_) => Ok(()),
 			});
 			match copied {
@@ -664,7 +777,13 @@ impl Acme {
 					}
 					// what it obtained or tried meanwhile (file IO off the async workers)
 					let (m, o) = (me.clone(), old.clone());
-					let held = tokio::task::spawn_blocking(move || m.carry_files(&o)).await.unwrap_or_default();
+					let held = tokio::task::spawn_blocking(move || {
+						let c = m.carry_files(&o);
+						c.staged.place();
+						c.held
+					})
+					.await
+					.unwrap_or_default();
 					me.inherit(&old, &held, true);
 				}
 				me.run().await
@@ -1278,8 +1397,10 @@ mod tests {
 		old.set_wanted([id.clone()].into());
 		old.state.lock().unwrap().certs.get_mut(&id).unwrap().failures = 3;
 		old.state.lock().unwrap().certs.get_mut(&id).unwrap().force = true;
-		let held = new.carry_files(&old);
-		new.inherit(&old, &held, false);
+		let carried = new.carry_files(&old);
+		assert!(!Path::new(&new.files(&id).0).exists(), "staged, not in place before the commit");
+		carried.staged.place();
+		new.inherit(&old, &carried.held, false);
 		new.set_wanted([id.clone()].into());
 		let s = new.status(&id).unwrap();
 		assert_eq!(s.state, "renewing", "issued (not pending), with the forced renewal: {s:?}");
@@ -1289,8 +1410,9 @@ mod tests {
 		// the new storage's own, newer certificate is kept
 		issue(&new, 80);
 		let mine = std::fs::read(new.files(&id).0).unwrap();
-		let held = new.carry_files(&old);
-		new.inherit(&old, &held, true);
+		let carried = new.carry_files(&old);
+		assert!(carried.staged.is_empty());
+		new.inherit(&old, &carried.held, true);
 		assert_eq!(std::fs::read(new.files(&id).0).unwrap(), mine);
 		assert!(new.state.lock().unwrap().certs[&id].force, "the second call keeps a forced renewal");
 		// names the new settings no longer allow are not written
@@ -1302,8 +1424,99 @@ mod tests {
 			.unwrap(),
 		)
 		.unwrap();
-		assert!(narrow.carry_files(&old).is_empty());
+		assert!(narrow.carry_files(&old).held.is_empty());
 		assert!(!Path::new(&narrow.files(&id).0).exists());
+		let _ = std::fs::remove_dir_all(&base);
+	}
+
+	/// What is left in `storage` but the staging directories (#389).
+	fn staging_dirs(storage: &Path) -> Vec<String> {
+		std::fs::read_dir(storage)
+			.map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(STAGING_PREFIX)).collect())
+			.unwrap_or_default()
+	}
+
+	/// A self-signed certificate valid for `days` (and its key) written as `m`'s files of `id` (#389).
+	fn write_cert(m: &Acme, id: &CertId, days: i64) {
+		let (cert, key) = m.files(id);
+		let mut params = rcgen::CertificateParams::new(id.domains.clone()).unwrap();
+		params.not_before = time::OffsetDateTime::from_unix_timestamp(now() - 86_400).unwrap();
+		params.not_after = time::OffsetDateTime::from_unix_timestamp(now() + days * 86_400).unwrap();
+		let k = rcgen::KeyPair::generate().unwrap();
+		store::write_private(Path::new(&key), k.serialize_pem().as_bytes()).unwrap();
+		store::write_private(Path::new(&cert), params.self_signed(&k).unwrap().pem().as_bytes()).unwrap();
+	}
+
+	/// A key and certificate of the old storage that do not match (the old one was between
+	/// writing them) are not copied: the new storage orders it again rather than serving a
+	/// stand-in as `valid` until the renewal time (#389).
+	#[test]
+	fn a_pair_that_does_not_match_is_not_carried() {
+		let base = std::env::temp_dir().join(format!("rproxy-acme-carry-mismatch-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&base);
+		let old = manager(&base.join("a"), "");
+		let new = manager(&base.join("b"), "");
+		let id = old.check("le", &["a.example.com".into()]).unwrap();
+		write_cert(&old, &id, 60);
+		old.set_wanted([id.clone()].into());
+		assert!(old.state.lock().unwrap().certs[&id].issued.is_some());
+		// the key replaced, the certificate not yet
+		let (_, key) = old.files(&id);
+		store::write_private(Path::new(&key), rcgen::KeyPair::generate().unwrap().serialize_pem().as_bytes()).unwrap();
+		let carried = new.carry_files(&old);
+		assert_eq!(carried.held.get(&id), Some(&None), "nothing held: ordered again");
+		assert!(carried.staged.is_empty());
+		carried.staged.place();
+		new.inherit(&old, &carried.held, false);
+		new.set_wanted([id.clone()].into());
+		assert_eq!(new.state.lock().unwrap().certs[&id].issued, None);
+		assert_eq!(new.status(&id).unwrap().state, "pending");
+		assert!(!Path::new(&new.files(&id).0).exists() && !Path::new(&new.files(&id).1).exists());
+		assert!(staging_dirs(&base.join("b")).is_empty());
+		// the new storage's own (older but whole) pair is kept, not overwritten by the broken one
+		write_cert(&new, &id, 10);
+		let mine = (std::fs::read(new.files(&id).0).unwrap(), std::fs::read(new.files(&id).1).unwrap());
+		let fresh = manager(&base.join("b"), "");
+		let carried = fresh.carry_files(&old);
+		assert!(carried.held[&id].is_some(), "its own is held");
+		carried.staged.place();
+		assert_eq!((std::fs::read(new.files(&id).0).unwrap(), std::fs::read(new.files(&id).1).unwrap()), mine);
+		let _ = std::fs::remove_dir_all(&base);
+	}
+
+	/// Copies made for a change that is then refused (the `Carried` dropped unplaced) leave
+	/// nothing in the new storage (#389); a staging directory a process left behind an hour
+	/// ago is removed, a fresh one (a change under way) is not.
+	#[test]
+	fn copies_of_a_refused_change_are_removed() {
+		let base = std::env::temp_dir().join(format!("rproxy-acme-carry-refused-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&base);
+		let old = manager(&base.join("a"), "");
+		let new = manager(&base.join("b"), "");
+		let id = old.check("le", &["a.example.com".into()]).unwrap();
+		write_cert(&old, &id, 60);
+		old.set_wanted([id.clone()].into());
+		let carried = new.carry_files(&old);
+		assert!(carried.held[&id].is_some());
+		assert!(!carried.staged.is_empty());
+		assert_eq!(staging_dirs(&base.join("b")).len(), 1, "staged in the new storage");
+		drop(carried);
+		assert!(staging_dirs(&base.join("b")).is_empty(), "removed with the refused change");
+		assert!(!Path::new(&new.files(&id).0).exists() && !Path::new(&new.files(&id).1).exists());
+		assert!(!base.join("b").join("certs").exists(), "nothing else written");
+		// left behind by a process that ended before placing
+		let left = base.join("b").join(format!("{STAGING_PREFIX}1-0"));
+		store::write_private(&left.join("certs").join("x"), b"x").unwrap();
+		let fresh = base.join("b").join(format!("{STAGING_PREFIX}2-0"));
+		store::create_private_dir(&fresh).unwrap();
+		let hour_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+		std::fs::File::open(&left).unwrap().set_modified(hour_ago).unwrap();
+		let carried = new.carry_files(&old);
+		assert!(!left.exists(), "an old one is removed");
+		assert!(fresh.exists(), "a fresh one stays");
+		carried.staged.place();
+		assert!(Path::new(&new.files(&id).0).exists() && Path::new(&new.files(&id).1).exists(), "placed");
+		assert_eq!(staging_dirs(&base.join("b")), vec![format!("{STAGING_PREFIX}2-0")], "its own directory is gone");
 		let _ = std::fs::remove_dir_all(&base);
 	}
 

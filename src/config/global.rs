@@ -522,8 +522,9 @@ struct NewAcme {
 	acme: Option<Arc<Acme>>,
 	addrs: Vec<std::net::SocketAddr>,
 	bound: crate::acme::challenge::Bound,
-	/// What `Acme::carry_files` found (the files copied before the rules lock).
-	held: std::collections::BTreeMap<crate::acme::CertId, Option<(i64, i64)>>,
+	/// What `Acme::carry_files` found and copied before the rules lock (the copies are put
+	/// in place by `commit`; dropped with the change when it is refused, #389).
+	carried: crate::acme::Carried,
 }
 
 /// The live items built for a change, swapped in by `commit`.
@@ -678,15 +679,16 @@ async fn build_item(
 					"HTTP-01 is answered only by http rules on this address");
 			}
 			// the certificates of the acme in force carried to a new storage: file IO, done
-			// here (off the async workers, before the rules lock); `commit` takes the state
-			let held = match (&acme, registry.acme()) {
+			// here (off the async workers, before the rules lock), staged in that storage;
+			// `commit` puts them in place and takes the state
+			let carried = match (&acme, registry.acme()) {
 				(Some(new), Some(old)) => {
 					let new = new.clone();
 					tokio::task::spawn_blocking(move || new.carry_files(&old)).await.unwrap_or_default()
 				}
 				_ => Default::default(),
 			};
-			built.acme = Some(NewAcme { acme, addrs, bound, held });
+			built.acme = Some(NewAcme { acme, addrs, bound, carried });
 		}
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
@@ -1415,11 +1417,14 @@ fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
 		registry.http_global().set_geoip(new)
 	});
 	let acme = acme.map(|a| {
-		let NewAcme { acme, addrs, bound, held } = a;
+		let NewAcme { acme, addrs, bound, carried } = a;
 		let old = registry.acme();
-		// memory only under the rules lock; what `old` does after this is taken over
-		// again once it has stopped (`Acme::spawn`)
+		// under the rules lock: the copies renamed into place (a few renames, before rules can
+		// take files from the new storage) and the state in memory; what `old` does after
+		// this is taken over again once it has stopped (`Acme::spawn`)
 		if let (Some(new), Some(old)) = (&acme, &old) {
+			let crate::acme::Carried { held, staged } = carried;
+			staged.place();
 			new.inherit(old, &held, false);
 		}
 		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
