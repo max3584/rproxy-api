@@ -1135,7 +1135,7 @@ impl Conn {
 						self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
 					}
 					// the client as global.trusted_proxies decided; refused like ip_allow
-					Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().map(|g| g.as_ref()), client_ip) {
+					Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().as_deref(), client_ip) {
 						Ok(_) => None,
 						Err(info) => {
 							if log && entry.country.is_empty() {

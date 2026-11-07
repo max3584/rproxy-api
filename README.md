@@ -83,6 +83,7 @@ systemd で動かす場合は `EnvironmentFile=/etc/rproxy/rproxy.env` で同じ
 | `RPROXY_CERT_WARN_DAYS` | `--cert-warn-days` | `14` | 期限の何日前から `expiring`（警告）にするか |
 | `RPROXY_LOG_FILE` | `--log-file` | 標準出力 | JSON Lines のログ。日ごとに `<名前>.<日付>.<拡張子>` へローテーションする |
 | `RPROXY_API_ACCESS_LOG_DIR` | `--api-access-log-dir` | なし（API ではアクセスログを入れられない） | `PATCH /config/global` で入れるアクセスログ（`access_log`）を置けるディレクトリ（すぐ下のファイルだけ）。古いファイルの削除で同じ名前で始まるファイルを消すので、rproxy のアクセスログだけのディレクトリにする（v0.4.19、#342。docs/API.md の「global の設定の API」） |
+| `RPROXY_API_GEOIP_DIR` | `--api-geoip-dir` | なし（API では GeoIP のデータベースを入れられない） | `PATCH /config/global` で入れる GeoIP のデータベース（`geoip.country_db`・`asn_db`）を置けるディレクトリ（すぐ下の通常のファイルだけ。`geoipupdate` の `DatabaseDirectory`、`/var/lib/GeoIP` など）。API が rproxy に読めるファイルを何でも読ませられないように（v0.4.22、#345。docs/API.md の「global の設定の API」） |
 | `RPROXY_LOG_KEEP` | `--log-keep` | `14` | 残すログファイルの数 |
 | `RPROXY_LOG_LEVEL` | `--log-level` | `info` | `debug` などのフィルタ |
 | `RPROXY_CONFIG` | `--config` | なし | 設定ファイル（YAML / JSON。`version`・`global`・`rules`）か、そのディレクトリ。ルールは固定ルールとして開始し、ファイルが変わると再起動なしで差分を反映する（docs/API.md の「設定ファイル」）。起動時に中身が不正なら起動しない。YAML は 1.2 として読む（`yes`・`on` は文字列。`010`・`1_000` のような数は数になるので、文字列にするなら引用符で囲む。マージキー `<<` が使える） |

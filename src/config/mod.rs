@@ -273,15 +273,12 @@ impl ConfigDoc {
 
 	/// `global` settings that differ from `other` and take effect only after a
 	/// restart. The live items (`trusted_proxies`, `access_log`, `crowdsec`,
-	/// `http.timeouts`; #342, `config::global`) are put in force by the reload.
+	/// `http.timeouts`, `geoip`; #342, #345, `config::global`) are put in force by the reload.
 	pub fn restart_needed(&self, other: &ConfigDoc) -> Vec<&'static str> {
 		let (a, b) = (&self.global, &other.global);
 		let mut out = vec![];
 		if a.acme != b.acme {
 			out.push("global.acme");
-		}
-		if a.geoip != b.geoip {
-			out.push("global.geoip");
 		}
 		if a.performance != b.performance {
 			out.push("global.performance");
@@ -503,7 +500,7 @@ rules:
 		assert!(c.restart_needed(&a).is_empty());
 		assert_eq!(c.global_raw["access_log"], "/tmp/a.log");
 		let d = ConfigDoc::parse(Path::new("d.yaml"), "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8], http: {timeouts: {idle: 5m}}, geoip: {country_db: /c.mmdb}, files: {owner_check: off}}").unwrap();
-		assert_eq!(d.restart_needed(&a), ["global.geoip", "global.files"]);
+		assert_eq!(d.restart_needed(&a), ["global.files"], "geoip is live (#345)");
 		assert_eq!(d.global.http.unwrap().timeouts().idle, Some(std::time::Duration::from_secs(300)));
 	}
 

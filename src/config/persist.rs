@@ -1102,7 +1102,7 @@ impl Store {
 							Some(r) => (r.spec, Some(r.updated_by), Some(r.updated_at)),
 							None => (serde_json::json!({}), None, None),
 						};
-						registry.global().restore(registry, &spec, by, at, Some(true), None, "reconcile").await;
+						registry.global().restore(registry, &spec, by, at, Some(true), Default::default(), "reconcile").await;
 					}
 					Err(_) => break 'retry,
 				}

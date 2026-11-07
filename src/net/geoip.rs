@@ -59,6 +59,11 @@ impl GeoipGlobal {
 		Ok(())
 	}
 
+	/// The databases named: (`country_db` / `asn_db`, path).
+	pub fn databases(&self) -> impl Iterator<Item = (&'static str, &str)> {
+		[("country_db", &self.country_db), ("asn_db", &self.asn_db)].into_iter().filter_map(|(w, p)| p.as_deref().map(|p| (w, p)))
+	}
+
 	/// How often the files are looked at; None: never (`0s`).
 	pub fn interval(&self) -> Option<Duration> {
 		match self.check_interval.as_deref() {
@@ -305,12 +310,27 @@ impl Db {
 /// The largest database read (GeoLite2/GeoIP2 City are about 100 MiB).
 const MAX_DB: u64 = 1 << 30;
 
+/// Reads a database: a regular file only (a FIFO or a device is refused before it
+/// is read, #345: `/dev/zero` has no length and would be read without end), and no
+/// more than `MAX_DB` whatever its length says.
 fn load(path: &Path) -> Result<Reader<Vec<u8>>, (std::io::ErrorKind, String)> {
-	let size = std::fs::metadata(path).map_err(|e| (e.kind(), format!("{}: {e}", path.display())))?.len();
-	if size > MAX_DB {
-		return Err((std::io::ErrorKind::InvalidData, format!("{}: larger than {} MiB", path.display(), MAX_DB >> 20)));
+	use std::io::Read;
+	use std::os::unix::fs::OpenOptionsExt;
+	let err = |e: std::io::Error| (e.kind(), format!("{}: {e}", path.display()));
+	let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(err)?;
+	let meta = file.metadata().map_err(err)?;
+	if !meta.is_file() {
+		return Err((std::io::ErrorKind::InvalidData, format!("{}: not a regular file", path.display())));
 	}
-	let bytes = std::fs::read(path).map_err(|e| (e.kind(), format!("{}: {e}", path.display())))?;
+	let too_large = || (std::io::ErrorKind::InvalidData, format!("{}: larger than {} MiB", path.display(), MAX_DB >> 20));
+	if meta.len() > MAX_DB {
+		return Err(too_large());
+	}
+	let mut bytes = Vec::with_capacity(meta.len() as usize);
+	file.take(MAX_DB + 1).read_to_end(&mut bytes).map_err(err)?;
+	if bytes.len() as u64 > MAX_DB {
+		return Err(too_large());
+	}
 	Reader::from_source(bytes).map_err(|e| (std::io::ErrorKind::InvalidData, format!("{}: not a MaxMind database: {e}", path.display())))
 }
 

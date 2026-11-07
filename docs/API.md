@@ -344,7 +344,8 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
     - 変わっていないルールには触らない（接続も切らない）。
     - 同じキーのルールが API（DB）から作られていれば、そちらを残してファイルのルールを `rule.failed` としてログに出す。
   - **v0.4.19 から（#342）**：`global` のうちその場で変えられる項目（`trusted_proxies`・`access_log`・`crowdsec`・`http.timeouts`）は、読み直したときに入れ替える（新しいリクエスト・接続から。`config.global`。前は再起動まで効かなかった）。API で同じ項目に値を入れていても、ファイルに書いた値が勝つ（下の「global の設定の API」）。入れ替えるのはルールを確かめた後で、ルールの誤りでも live の項目の誤り（ない `access_log` のディレクトリ、読めない CrowdSec のキー）でも、何も変えずに読み直しを断る（**前は通っていた誤りで読み直しが止まるようになった**）。書けないアクセスログは主のログに出して試し直し、答えない LAPI の `crowdsec` は今のものを残し、ルールが使っている `crowdsec` をファイルから消したときは使うルールがなくなるまで残す（`config.global_in_use`）。
-  - 起動のときだけ読む項目（`acme`・`geoip`・`performance`・`files`）の変更は再起動するまで効かない（起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
+  - **v0.4.22 から（#345）**：`geoip` も読み直しでデータベースを開き直して入れ替える（新しい接続・リクエストから。開けない・mmdb でないデータベースは読み直しを断る）。API のルールの `geoip` のリストが要るデータベースをファイルから外したときは、使うルールがなくなるまで残す（`config.global_in_use`）。
+  - 起動のときだけ読む項目（`acme`・`performance`・`files`）の変更は再起動するまで効かない（起動時の値と違うと `config.reload` の警告と `GET /config` の `restart_needed` で知らせる）。
   - 状態は `GET /config` で見える：`{"configured":true,"path":"/etc/rproxy/conf.d","files":[...],"loaded_at":1790000000,"rules":5,"last_reload":{"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0},"error":null,"restart_needed":[]}`（設定ファイルを使っていなければ `{"configured":false}`）。`error` は最新の版を反映できなかった理由（それまでの版が動いている）。
 - 反映する前に確かめる：`rproxy-api --check-config [PATH]` が、起動時・再読み込みと同じ検証（書式、ルールの値、待ち受けの重なり・制御 API との重なり、証明書・鍵・CA のファイルと期限、`global`、ミドルウェアの秘密のファイル）をして、問題がなければ 0、誤りがあれば 1 で終わる（待ち受けも DB も開かない。`--check-config-format json` で `{"ok","path","files","rules","errors":[{"rule","message"}],"warnings":[...]}`）。名前解決はしない。パッケージのユニットの `ExecReload` は、先にこの確認をする（誤りがあれば reload は失敗し、SIGHUP を送らない）。
 - 同じキーや重なるポートのルールを API や DB から作ろうとすると、`already_exists` になる。
@@ -882,6 +883,7 @@ rules:
 - L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
 - L7（ミドルウェアの `geoip`）：`global.trusted_proxies` で決めたクライアントの IP で判定し、拒否は `403`（`ip_allow` と同じ）。`http.access` の `refused_by: "geoip"`・`middleware`、`country`・`asn`。
 - `log_country: true` で、`conn.open`（TCP・UDP）と `http.access` に `country`（と `asn`）が付く（分からないときは付かない）。
+- `global.geoip` は稼働中に変えられる（v0.4.22、#345）：設定ファイルの読み直しと、ファイルに書いていなければ `PATCH /config/global`（既定で Unix ソケットからだけ、ファイルは `RPROXY_API_GEOIP_DIR` の下だけ。上の「global の設定の API」）。データベースを開き直して入れ替え、新しい接続・リクエストから使う。ルールのリストが要るデータベースを外すのは `409 in_use`。
 - 国のリストは `country_db`、ASN のリストは `asn_db` がないと `400 invalid`（設定ファイルは検証の誤り）。`PATCH` で `geoip` を付けると丸ごと置き換え、`{}` で外す（接続は切らない。次の接続・データグラムから）。
 - CrowdSec と組み合わせるとき：国・ASN での粗い絞り込みは `geoip`、振る舞いでの ban は CrowdSec（L4 のルールの `crowdsec: true`、L7 の `crowdsec` ミドルウェア）。判定の順は `allow_from` → `geoip` → `crowdsec`。CrowdSec の側でも `crowdsecurity/geoip-enrich` で国を付けられるので、rproxy の `log_country` は SIEM などで rproxy のログだけを見るとき向け（docs/CROWDSEC.md）。
 
@@ -1003,35 +1005,36 @@ GRANT SELECT ON rproxy.rproxy_rule_sets TO 'rproxy_ui'@'%';
 | `udp_max_sessions` | `live`（新しいセッションから。今のセッションは切らない） | | `RPROXY_UDP_MAX_SESSIONS` |
 | `cache_max_memory` | `live`（次に持つ答えから。下げても持っている答えは期限まで残る。v0.4.19、#349） | | `RPROXY_CACHE_MAX_MEMORY` |
 | `acme` | `restart`（API では変えない。後の版で、#345） | ○ | `global.acme` |
-| `geoip` | `restart`（同上） | | `global.geoip` |
+| `geoip` | `live`（データベースを開き直してから入れ替える。新しい接続・リクエストから。古いものの見張りは止める。v0.4.22、#345、`features.global_api_geoip`） | ○（ルールの `geoip` のリストを誰が通るかを決める。ファイルを読む） | `global.geoip` |
 | `performance` | `restart`（`workers`・`udp_shards`・CPU の固定・`busy_poll_usecs`・`splice`・`xdp`） | | `global.performance`、`RPROXY_WORKERS` など |
 | `files` | `restart` | | `global.files`、`RPROXY_FILES_TRUSTED_DIRS` |
 | `control_api` | `restart`（制御 API の待ち受け） | | `RPROXY_API_ADDR`・`RPROXY_API_PORT`・`RPROXY_API_SOCKET` |
 
-- `GET /config/global`（`admin`）：`{"items":{"trusted_proxies":{"value":[...],"source":"api","apply":"live","unix_only":true,"settable":true,"api_value":[...],"shadowed":false},...},"storage":"database","persisted":true,"loaded":true,"updated_by":"ui","updated_at":1790000000,"warnings":[]}`。`value` は今効いている値（`restart` の項目は起動したときの値。手で書いた値で秘密を含みうるので、`acme` は形だけ（文字列はすべて `***`。キー・数・真偽は残す）、ほかの `restart` の項目もヘッダの値・`body`・名前に `secret`・`token`・`key`・`password`・`credential`・`eab` を含むもの（ファイルの場所も）・URL の利用者とクエリを `***` にする。`api_value` も同じ。`crowdsec` の `lapi_url`・`appsec_url` は利用者・クエリ・`#` 以降を伏せる、#347）、`source` は `file` / `env` / `api` / `default`、`settable` は今 API で変えられるか（Unix ソケットだけの項目も true。`unix_only` を見る）、`api_value` は API の値（あるときだけ）、`shadowed` は API の値があるがファイル・環境変数が勝っていて効いていない、`error` は戻した API の値を効かせられなかった理由（効いていないが保存したまま）。`crowdsec` の `kept: true` は、ファイルから消えたがルールが使っているので残しているもの（`source` は `file`）。`loaded` は保存した値を読めたか（下の「保存」）。
+- `GET /config/global`（`admin`）：`{"items":{"trusted_proxies":{"value":[...],"source":"api","apply":"live","unix_only":true,"settable":true,"api_value":[...],"shadowed":false},...},"storage":"database","persisted":true,"loaded":true,"updated_by":"ui","updated_at":1790000000,"warnings":[]}`。`value` は今効いている値（`restart` の項目は起動したときの値。手で書いた値で秘密を含みうるので、`acme` は形だけ（文字列はすべて `***`。キー・数・真偽は残す）、ほかの `restart` の項目もヘッダの値・`body`・名前に `secret`・`token`・`key`・`password`・`credential`・`eab` を含むもの（ファイルの場所も）・URL の利用者とクエリを `***` にする。`api_value` も同じ。`crowdsec` の `lapi_url`・`appsec_url` は利用者・クエリ・`#` 以降を伏せる、#347）、`source` は `file` / `env` / `api` / `default`、`settable` は今 API で変えられるか（Unix ソケットだけの項目も true。`unix_only` を見る）、`api_value` は API の値（あるときだけ）、`shadowed` は API の値があるがファイル・環境変数が勝っていて効いていない、`error` は戻した API の値を効かせられなかった理由（効いていないが保存したまま）。`crowdsec` の `kept: true` は、ファイルから消えたがルールが使っているので残しているもの（`source` は `file`）。`geoip` の `kept: true` は、ルールのリストが要るデータベースをファイルが外したので前のものを残しているもの（同じく `source` は `file`、#345）。`loaded` は保存した値を読めたか（下の「保存」）。
 - `PATCH /config/global`（`admin`）：本文は設定ファイルの `global` と同じ形（`{"trusted_proxies":["10.0.0.0/8"],"http":{"timeouts":{"idle":"5m"}},"udp_max_sessions":4096}`）。名前を挙げた項目だけを、項目ごと丸ごと置き換える（`http.timeouts` の中も丸ごと）。`null` で API の値を消す（既定に戻る）。`[]`・`{}` は値として入る（`trusted_proxies: []` は「信じる前段なし」を API で決めたもの、`http: {"timeouts": {}}` はすべて既定の値を API で決めたもの）。答えは `GET` と同じ形に `changes`（`[{"item","before","after","api_before","api_after"}]`）と `applied`（効いている値が変わった項目）。`?dry_run=true` は何も変えずに `{"dry_run":true,"changes":[...],"applied":[...]}`（ファイルを開かず、bouncer も動かさない。形・パス・ルールが使うかは確かめる）。
   - 断るとき：
     - `409 static`（ファイル・環境変数の項目）、`409 restart_only`（`restart` の項目）。どちらも `items`。
-    - `400 invalid`：知らない項目、形や値の誤り、ない `access_log` のディレクトリ、書けないアクセスログ、読めない CrowdSec のキーのファイル。
-    - `409 in_use`：ルールが使っている `crowdsec` を消す、`appsec` を使うルールがあるのに `appsec_url` を外す。
-    - `403 protected_file`：パスが証明書のストア・ACME の保存先・rproxy の秘密（トークンファイルなど）・`/proc` などを指す。アクセスログが下の場所の外。
+    - `400 invalid`：知らない項目、形や値の誤り、ない `access_log` のディレクトリ、書けないアクセスログ、読めない CrowdSec のキーのファイル、ない・mmdb でない GeoIP のデータベース。
+    - `409 in_use`：ルールが使っている `crowdsec` を消す、`appsec` を使うルールがあるのに `appsec_url` を外す、ルール（とミドルウェア）の `geoip` の国のリストがあるのに `country_db` を、ASN のリストがあるのに `asn_db` を外す（`geoip` を消すのも同じ、#345）。
+    - `403 protected_file`：パスが証明書のストア・ACME の保存先・rproxy の秘密（トークンファイルなど）・`/proc` などを指す。アクセスログ・GeoIP のデータベースが下の場所の外。
     - `403 forbidden`：Unix ソケットだけの項目を TCP から（dry run も同じ。誤りの文は「Unix ソケット（`RPROXY_API_SOCKET`）からだけ」）。この守りは `POST /config/reload` などと同じ `RPROXY_API_RELOAD_UNIX_ONLY` で、`false` にすると TCP からも変えられる（勧めない）。`event=audit` に `outcome: forbidden`・`code: unix_only`。
     - `502 crowdsec_unavailable`：新しい LAPI が 10 秒のうちに答えない（今の bouncer のまま、何も変えない）。そのため `crowdsec` の PATCH は最大 10 秒かかり、その間ほかの `global` の変更（PATCH・設定ファイルの読み直し）は順番を待つ。
     - `503 not_loaded`：起動のときに保存した値を読めなかった（DB に届かない、行が読めない形）。書けば保存したものを消してしまうので、定期の照合が読めるまで断る（読めない形の行は直すまで）。
     - `503 upgrading` / `shutting_down`：引き継ぎ・終了の途中。
-  - パス（`access_log`・`crowdsec.api_key_file`）は絶対パス。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前・拡張子が空の名前（`x.`）は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
+  - パス（`access_log`・`crowdsec.api_key_file`・`geoip.country_db`・`geoip.asn_db`）は絶対パス。**API で入れる GeoIP のデータベース**（v0.4.22、#345）は `RPROXY_API_GEOIP_DIR` のすぐ下の通常のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前・デバイスなどは不可。API が rproxy に読めるファイルを何でも読ませられないように）。`geoipupdate` の `DatabaseDirectory`（`/var/lib/GeoIP` など）を指す。開くのは PATCH のとき（1 GiB まで、通常のファイルだけ）で、`dry_run` はファイルがあることまで確かめる。**API で入れるアクセスログ**は `RPROXY_API_ACCESS_LOG_DIR` のすぐ下のファイルだけ（設定しなければ API では入れられない。下のディレクトリ・`..`・シンボリックリンク・`.` で始まる名前・拡張子が空の名前（`x.`）は不可）。日ごとに `<名前>.<日付>.<拡張子>` で書き、古いもの（同じ名前で始まり同じ拡張子で終わるファイル）を `RPROXY_LOG_KEEP` まで残して消すので、**そのディレクトリは rproxy のアクセスログだけのものにする**。消してしまうもの（`<名前>.<YYYY-MM-DD>.<拡張子>` の形でない、名前で始まり拡張子で終わるファイル）があるときと、rproxy 自身のログ（`RPROXY_LOG_FILE`）と名前が重なるときは断る。確かめるのは PATCH のときで、その後にディレクトリに置かれたものまでは守らない（ディレクトリは rproxy だけが書けるようにしておく）。
   - `event=audit`（`action: config.global`。dry run も `dry_run: true` で）と `config.global`（項目・効いた項目）に残る。
-- 入れ替え：live の項目はまとめて 1 つの写しとして入れ替わり、1 つのリクエストは始まったときの写しを最後まで使う（いくつかの項目を変える PATCH の途中の組み合わせは見えない）。CrowdSec を使うルールの作成・変更と `crowdsec` の変更はルールの表の鍵の下で順に行うので、`crowdsec` を使うルールが `crowdsec` なしで動くことはない。
+- 入れ替え：live の項目はまとめて 1 つの写しとして入れ替わり、1 つのリクエストは始まったときの写しを最後まで使う（いくつかの項目を変える PATCH の途中の組み合わせは見えない）。CrowdSec を使うルールの作成・変更と `crowdsec` の変更はルールの表の鍵の下で順に行うので、`crowdsec` を使うルールが `crowdsec` なしで動くことはない。`geoip`（#345）も同じで、リストが要るデータベースなしでルールが動くことはない。`geoip` は先にデータベースを開いて（数十 MB を読む）から入れ替え、古いデータベースの見張り（`check_interval`）を止める（古いものを使っている接続は判定を終えるまでそのまま）。
 - 保存：DB（`RPROXY_DATABASE_URL`）があれば、応答の前にテーブル `rproxy_global` に自分の `node` の 1 行（API の値を JSON で）を書く（`persisted`）。書けなければ（DB に届かない、テーブルがない）値は効かせたまま `persisted: false`、`degraded`（`part: "db"`）、定期の照合（`RPROXY_PERSIST_CHECK_SECS`）が書き直す。行は項目ごとに読み、この版が知らない項目（後の版の `acme` など）や読めない値は効かせずにそのまま残して書き戻す（`spec_version` は `rproxy_global` だけの番号）。
   - 起動のときは `forward_rules`・`rproxy_rules` のルールより先に読んで効かせる（`restore.global`。ルールの `crowdsec` が要るため）。戻した値も API の値と同じく確かめ（守るファイル・アクセスログの場所）、断ったもの・作れないものは効かせず `GET` の `error`（`degraded`、`part: "global"`）。戻した `crowdsec`（起動のとき・引き継ぎ・定期の照合が後から読んだとき）は最初の取得を 2 秒まで待ち、取れなくても入れる（LAPI が答えなければ、起動はルールを戻す前に、照合もそれぞれ最大 2 秒遅れる。設定ファイルの `crowdsec` を起動のときに入れるのと同じく、取れるまでの判定はルールの `on_error`。L4 の `crowdsec` は通す）。
   - 読めなければ（DB に届かない、行が読めない形）`loaded: false` で、`PATCH` は `503 not_loaded`、行も書かない。定期の照合が読めたら効かせる。そのあいだ `crowdsec` がなくて起動できなかったルールは、`crowdsec` が効いたときに動かし直す（PATCH・読み直しで入ったときも同じ）。
   - DB がなければ値はこのプロセスの中だけ（`storage: "memory"`、再起動で消える）。行が正になることはない（書くのは rproxy だけ。照合は書き直すだけ）。
-- 引き継ぎ（`/admin/upgrade`）では、API の値（知らない項目も）・書いた人・時刻・`persisted`・読めていないこと・残している `crowdsec` を新しいプロセスに渡し、ルールより先に効かせる。v0.4.19 より前の版への引き継ぎ（戻すとき）では API の値は渡らない（その版は知らない。DB の行は残るので、v0.4.19 以後に戻せばまた読む）。
+- 引き継ぎ（`/admin/upgrade`）では、API の値（知らない項目も）・書いた人・時刻・`persisted`・読めていないこと・残している `crowdsec` と `geoip` を新しいプロセスに渡し、ルールより先に効かせる。v0.4.19 より前の版への引き継ぎ（戻すとき）では API の値は渡らない（その版は知らない。DB の行は残るので、v0.4.19 以後に戻せばまた読む）。
 - 設定ファイルを読み直したとき：
   - API の値がある項目がファイルに現れたらファイルが勝つ：API の値は残すが効かず、`GET /config/global` に `shadowed: true` と `warnings`（`{"code":"config.global_shadowed","item","message"}`）、ログに `config.global_shadowed`（1 回）。ファイルからまた消えたら API の値が効く。
   - live の項目は、ルールを確かめてから入れ替える（ルールの誤りで読み直しを断るときは何も変えない）。live の項目の誤りも読み直しを断る。
   - 書けないアクセスログは主のログに出し（`degraded`）、設定ファイルを確かめるたびに試し直す。
   - 新しい `crowdsec` の LAPI が答えなければ今のものを残す（`config.global_kept`、`GET` の `error`。次の読み直しでまた試す）。読み直しが LAPI を待つあいだ、ほかの `global` の変更は順番を待つ（`config.reload` の行）。ルールが使う `crowdsec`（`appsec` を使うルールがあれば `appsec_url` も）をファイルから消したときは、使うルールがなくなるまで残す（`config.global_in_use`、`GET` の `kept`、ほかの項目の PATCH でも残り、引き継ぎでも渡す）。使うルールがなくなった後の読み直しで外す。
+  - `geoip`（v0.4.22、#345）：開けない・mmdb でないデータベースは読み直しを断る（何も変えない）。API のルールの `geoip` のリストが要るデータベースをファイルが外したら、前の `geoip` を丸ごと残す（`config.global_in_use`、`GET` の `kept`、ほかの項目の PATCH でも残り、引き継ぎでも渡す）。読み直しのたびにファイルのものを試し、要るルールがなくなっていれば入れ替える。設定ファイルのルールのリストはファイルの `geoip` で確かめる（今までどおり）。
 - テーブル（UI リポジトリの `db/migrations/013_rproxy_global.sql`）：
 
 ```sql
@@ -1329,7 +1332,7 @@ http:
 | `PUT /rulesets/{name}?dry_run=true` | `{"generation","rules":[<ルール>...]}` | 200 | v0.4（#28）：その組のルールを本文のとおりにする（作る・変える・消す）。`If-Match` が今の etag と違えば `412 precondition_failed`、古い `generation` は `409 stale_generation`、組に属さないルールと同じキーは `409 already_exists` / `static`。どれかのルールの形が不正なら何も変えない（`400`、`rules[i]: ...`）。応答 `{"name","generation","etag","dry_run","results":[{"rule","action","change","state","error"}]}`。`rules:write`、各ルールは `allow_listen_ports` の内。組のルールを個別に `PATCH` / `DELETE` すると `409 owned`。詳しくは上の「ルールの組・状態・readiness」 |
 | `DELETE /rulesets/{name}?drain_secs=N` | | 204 | v0.4（#28）：その組のルールをすべて同時に止めて組を消す（`If-Match` も使える）。`rules:write` |
 | `GET /config/global` | | 200 | v0.4.19（#342）：`global` の項目ごとの今の値・出どころ（`file` / `env` / `api` / `default`）・変え方（`live` / `restart`）（上の「global の設定の API」）。`admin` |
-| `PATCH /config/global` | `global` の形の JSON（`null` で消す） | 200 | v0.4.19（#342）：ファイル・環境変数にない項目の API の値を変える。`live` の項目は新しいリクエスト・接続・セッションから。`dry_run`。`409 static` / `restart_only` / `in_use`、`403 protected_file`、`502 crowdsec_unavailable`、`503 not_loaded`。`admin`、`trusted_proxies`・`access_log`・`crowdsec` は既定で Unix ソケットからだけ |
+| `PATCH /config/global` | `global` の形の JSON（`null` で消す） | 200 | v0.4.19（#342）：ファイル・環境変数にない項目の API の値を変える。`live` の項目は新しいリクエスト・接続・セッションから。`dry_run`。`409 static` / `restart_only` / `in_use`、`403 protected_file`、`502 crowdsec_unavailable`、`503 not_loaded`。`admin`、`trusted_proxies`・`access_log`・`crowdsec`・`geoip` は既定で Unix ソケットからだけ |
 | `POST /config/plan` | 設定ファイルの形の JSON | 200 | v0.4（#169）：本文の設定を今動いているものと比べて差分を返す（何も変えない。`--check-config --diff` が使う）。`admin`、既定では Unix ソケットからだけ |
 | `POST /admin/upgrade` | | 202 | v0.4（#174）：ディスクの上の今のバイナリに引き継ぐ（SIGUSR2 と同じ。docs/UPGRADE.md）。`{"status":"started"}` を返し、引き継ぎは後ろで進む（結果はログの `handoff.*` と `/metrics` の `rproxy_handoffs_total`）。すでに動いていれば `409 upgrading`。`admin`、既定では Unix ソケットからだけ |
 | `GET /admin/update` | | 200 | v0.4（#174）：自動更新の状態 `{"mode","current":{"version","sha256"},"available":{"version","sha256"}\|null,"last_check","error","bad_versions"}`。`admin` |

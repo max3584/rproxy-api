@@ -160,8 +160,12 @@ pub struct Update {
 #[derive(Default)]
 pub struct HttpGlobal {
 	current: RwLock<Arc<Snapshot>>,
-	/// `global.geoip`: the databases of the `geoip` lists (#168).
-	geoip: Option<Arc<crate::net::geoip::Geoip>>,
+	/// `global.geoip`: the databases of the `geoip` lists (#168), swapped by `set_geoip`
+	/// (#345). Read only by rules with `geoip` lists and with `log_country`.
+	geoip: RwLock<Option<Arc<crate::net::geoip::Geoip>>>,
+	/// `global.geoip.log_country` of the databases in force: one relaxed load on
+	/// each connection without it.
+	log_country: std::sync::atomic::AtomicBool,
 }
 
 /// Why the access log file cannot be used.
@@ -189,13 +193,13 @@ impl HttpGlobal {
 		let trusted_proxies = cidr::parse_list(trusted_proxies).map_err(|e| AccessLogError::Config(e.message))?;
 		let AccessLog(sink) = AccessLog::open(access_log, keep_files)?;
 		let snapshot = Snapshot { trusted_proxies, sink: Arc::new(sink), ..Default::default() };
-		Ok(HttpGlobal { current: RwLock::new(Arc::new(snapshot)), geoip: None })
+		Ok(HttpGlobal { current: RwLock::new(Arc::new(snapshot)), ..Default::default() })
 	}
 
 	/// Same as `new` without an access log file, for when it cannot be written.
 	pub fn without_file(trusted_proxies: &[String]) -> Self {
 		let snapshot = Snapshot { trusted_proxies: cidr::parse_list(trusted_proxies).unwrap_or_default(), ..Default::default() };
-		HttpGlobal { current: RwLock::new(Arc::new(snapshot)), geoip: None }
+		HttpGlobal { current: RwLock::new(Arc::new(snapshot)), ..Default::default() }
 	}
 
 	/// What is in force now; a request keeps it to its end.
@@ -236,13 +240,27 @@ impl HttpGlobal {
 	}
 
 	/// Attaches the databases of `global.geoip`.
-	pub fn with_geoip(mut self, geoip: Option<Arc<crate::net::geoip::Geoip>>) -> Self {
-		self.geoip = geoip;
+	pub fn with_geoip(self, geoip: Option<Arc<crate::net::geoip::Geoip>>) -> Self {
+		self.set_geoip(geoip);
 		self
 	}
 
-	pub fn geoip(&self) -> Option<&Arc<crate::net::geoip::Geoip>> {
-		self.geoip.as_ref()
+	/// Swaps the databases of `global.geoip` (#345); returns the ones before (the
+	/// caller stops their watcher). A connection checked meanwhile uses either.
+	pub fn set_geoip(&self, geoip: Option<Arc<crate::net::geoip::Geoip>>) -> Option<Arc<crate::net::geoip::Geoip>> {
+		let mut current = self.geoip.write().unwrap_or_else(|e| e.into_inner());
+		self.log_country.store(geoip.as_ref().is_some_and(|g| g.log_country()), std::sync::atomic::Ordering::Relaxed);
+		std::mem::replace(&mut *current, geoip)
+	}
+
+	/// The databases in force.
+	pub fn geoip(&self) -> Option<Arc<crate::net::geoip::Geoip>> {
+		self.geoip.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// Whether `global.geoip.log_country` is on.
+	pub fn logs_country(&self) -> bool {
+		self.log_country.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
 	/// Sets the time limits of client connections (`global.http.timeouts`, #320).
@@ -257,7 +275,10 @@ impl HttpGlobal {
 
 	/// The country (and ASN) of a client for the logs, when `global.geoip.log_country` is on.
 	pub fn geo_for_log(&self, ip: IpAddr) -> Option<crate::net::geoip::Info> {
-		self.geoip.as_ref().filter(|g| g.log_country()).map(|g| g.lookup(ip))
+		if !self.logs_country() {
+			return None;
+		}
+		self.geoip().filter(|g| g.log_country()).map(|g| g.lookup(ip))
 	}
 
 	pub fn trusts(&self, peer: IpAddr) -> bool {

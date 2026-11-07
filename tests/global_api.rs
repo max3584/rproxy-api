@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 
 use rproxy_api::config::ConfigDoc;
 use rproxy_api::config::check::CheckInput;
@@ -162,7 +162,14 @@ fn crowdsec_rule(port: u16, backend: SocketAddr, appsec: bool) -> Value {
 }
 
 fn options(dir: &Path, database: bool) -> Options {
-	Options { keep_files: 1, access_log_dir: Some(dir.to_path_buf()), database, sync_wait: Duration::from_secs(2), ..Default::default() }
+	Options {
+		keep_files: 1,
+		access_log_dir: Some(dir.to_path_buf()),
+		database,
+		sync_wait: Duration::from_secs(2),
+		geoip_dir: Some(dir.join("geoip")),
+		..Default::default()
+	}
 }
 
 /// The file's `global` as `main` gives it to the settings at the start.
@@ -415,7 +422,8 @@ async fn stored_restored_and_written_again() {
 	// what a newer version stored: kept and written back
 	store.memory_put_global(StoredGlobal { spec: json!({"later": {"x": 1}}), spec_version: 2, updated_by: "new".into(), updated_at: 1 });
 	let row = store.memory_global().unwrap();
-	h.registry.global().restore(&h.registry, &row.spec, Some(row.updated_by), Some(row.updated_at), Some(true), None, "database").await;
+	let kept = Default::default();
+	h.registry.global().restore(&h.registry, &row.spec, Some(row.updated_by), Some(row.updated_at), Some(true), kept, "database").await;
 	let (status, v) =
 		patch(&base, "/config/global", json!({"http": {"timeouts": {"idle": "8s"}}, "trusted_proxies": ["192.0.2.0/24"]})).await;
 	assert_eq!((status, &v["persisted"], &v["storage"]), (StatusCode::OK, &json!(true), &json!("database")), "{v}");
@@ -441,7 +449,7 @@ async fn stored_restored_and_written_again() {
 	again.registry.set_persist(Arc::new(Store::memory("node-a")));
 	init_with_file(&again, &dir, "version: 1\nglobal: {trusted_proxies: [10.0.0.0/8]}\n", true);
 	let spec = json!({"trusted_proxies": ["192.0.2.0/24"], "http": {"timeouts": {"idle": "9s"}}});
-	again.registry.global().restore(&again.registry, &spec, Some("admin".into()), Some(1), Some(true), None, "database").await;
+	again.registry.global().restore(&again.registry, &spec, Some("admin".into()), Some(1), Some(true), Default::default(), "database").await;
 	let http = again.registry.http_global();
 	assert_eq!(http.timeouts().idle, Some(Duration::from_secs(9)));
 	assert!(http.trusts("10.0.0.1".parse().unwrap()) && !http.trusts("192.0.2.1".parse().unwrap()), "the file wins");
@@ -794,5 +802,178 @@ async fn a_rule_waiting_for_crowdsec_is_retried_until_its_target_resolves() {
 		assert!(Instant::now() < deadline, "not started once the name resolves: {v}");
 		tokio::time::sleep(Duration::from_millis(50)).await;
 	}
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// GeoIP databases in `<dir>/geoip` (RPROXY_API_GEOIP_DIR): `country.mmdb` says
+/// 127.0.0.1 is `country` and 127.0.0.2 is US; `asn.mmdb` puts 127.0.0.2 in AS64496.
+fn geoip_files(dir: &Path, country: &str) -> (PathBuf, PathBuf) {
+	let geo = dir.join("geoip");
+	fs::create_dir_all(&geo).unwrap();
+	let c = mmdb::build("GeoLite2-Country", &[("127.0.0.1", mmdb::country(country)), ("127.0.0.2", mmdb::country("US"))]);
+	let a = mmdb::build("GeoLite2-ASN", &[("127.0.0.2", mmdb::asn(64496, "Example Net"))]);
+	// written aside and renamed in, as geoipupdate does
+	for (name, bytes) in [("country.mmdb", c), ("asn.mmdb", a)] {
+		fs::write(geo.join(format!(".{name}.tmp")), bytes).unwrap();
+		fs::rename(geo.join(format!(".{name}.tmp")), geo.join(name)).unwrap();
+	}
+	(geo.join("country.mmdb"), geo.join("asn.mmdb"))
+}
+
+/// Whether a connection from `from` (127.0.0.x) to `port` is relayed by the echo backend.
+async fn relayed_from(from: &str, port: u16) -> bool {
+	let socket = TcpSocket::new_v4().unwrap();
+	socket.bind(format!("{from}:0").parse().unwrap()).unwrap();
+	let Ok(mut s) = socket.connect(SocketAddr::from(([127, 0, 0, 1], port))).await else { return false };
+	if s.write_all(b"x").await.is_err() {
+		return false;
+	}
+	let mut buf = [0u8; 64];
+	matches!(tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await, Ok(Ok(n)) if n > 0)
+}
+
+/// `global.geoip` through the API (#345): only over the Unix socket, only files right in
+/// RPROXY_API_GEOIP_DIR, swapped for the next connection, and a database the rules' lists
+/// need is not taken away (409 in_use), neither by a PATCH nor by a rule racing it.
+#[tokio::test]
+async fn geoip_through_the_api_is_swapped_for_the_next_connection() {
+	let dir = workdir("geoip");
+	let h = harness_with(tokens(&dir)).await;
+	init_with_file(&h, &dir, "version: 1\n", false);
+	let tcp = api(&h, &dir, false).await;
+	let unix = api(&h, &dir, true).await;
+	let (country, asn) = geoip_files(&dir, "JP");
+	let v = view(&tcp).await;
+	assert_eq!((&v["items"]["geoip"]["apply"], &v["items"]["geoip"]["unix_only"]), (&json!("live"), &json!(true)), "{v}");
+	assert_eq!(v["items"]["geoip"]["settable"], true);
+
+	let (status, e) = patch(&tcp, "/config/global?dry_run=true", json!({"geoip": {"country_db": country}})).await;
+	assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("forbidden")), "{e}");
+	// no file outside the directory, no link, no device, nothing hidden; relative paths are mistakes
+	fs::write(dir.join("outside.mmdb"), fs::read(&country).unwrap()).unwrap();
+	std::os::unix::fs::symlink(dir.join("outside.mmdb"), dir.join("geoip/link.mmdb")).unwrap();
+	fs::write(dir.join("geoip/.hidden.mmdb"), fs::read(&country).unwrap()).unwrap();
+	for p in [
+		dir.join("outside.mmdb"),
+		dir.join("geoip/link.mmdb"),
+		dir.join("geoip/.hidden.mmdb"),
+		dir.join("geoip/../outside.mmdb"),
+		PathBuf::from("/dev/zero"),
+		PathBuf::from("/proc/self/environ"),
+		dir.join("tokens.yaml"),
+	] {
+		let (status, e) = patch(&unix, "/config/global", json!({"geoip": {"country_db": p}})).await;
+		assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("protected_file")), "{}: {e}", p.display());
+	}
+	let (status, e) = patch(&unix, "/config/global", json!({"geoip": {"country_db": "country.mmdb"}})).await;
+	assert_eq!((status, &e["code"]), (StatusCode::BAD_REQUEST, &json!("invalid")), "{e}");
+	fs::write(dir.join("geoip/garbage.mmdb"), "not a database").unwrap();
+	let (status, e) = patch(&unix, "/config/global", json!({"geoip": {"country_db": dir.join("geoip/garbage.mmdb")}})).await;
+	assert_eq!((status, &e["code"]), (StatusCode::BAD_REQUEST, &json!("invalid")), "{e}");
+	assert!(h.registry.http_global().geoip().is_none(), "nothing in force");
+
+	// in force for the next connection
+	let (status, v) = patch(&unix, "/config/global", json!({"geoip": {"country_db": country, "check_interval": "0s"}})).await;
+	assert_eq!((status, &v["applied"], &v["items"]["geoip"]["source"]), (StatusCode::OK, &json!(["geoip"]), &json!("api")), "{v}");
+	let backend = tcp_backend("G:").await;
+	let port = free_port();
+	let mut body = rule("tcp", port, backend);
+	body["geoip"] = json!({"allow_countries": ["JP"]});
+	let (status, v) = call(&unix, "admin", Method::POST, "/rules", Some(body)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert!(relayed_from("127.0.0.1", port).await, "JP");
+	assert!(!relayed_from("127.0.0.2", port).await, "US");
+	let asn_port = free_port();
+	let mut asn_rule = rule("tcp", asn_port, backend);
+	asn_rule["geoip"] = json!({"deny_asns": [64496]});
+	let (status, e) = call(&unix, "admin", Method::POST, "/rules", Some(asn_rule.clone())).await;
+	assert_eq!((status, &e["code"]), (StatusCode::BAD_REQUEST, &json!("invalid")), "no asn_db yet: {e}");
+
+	// what the rule's lists need is not taken away
+	for body in [json!({"geoip": null}), json!({"geoip": {"asn_db": asn}})] {
+		for q in ["?dry_run=true", ""] {
+			let (status, e) = patch(&unix, &format!("/config/global{q}"), body.clone()).await;
+			assert_eq!((status, &e["code"]), (StatusCode::CONFLICT, &json!("in_use")), "{body}{q}: {e}");
+		}
+	}
+	assert!(relayed_from("127.0.0.1", port).await, "still in force");
+
+	// both databases: the ASN rule can be made; a new version of the country database, by the API
+	let (status, v) = patch(&unix, "/config/global", json!({"geoip": {"country_db": country, "asn_db": asn, "check_interval": "0s"}})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	let (status, v) = call(&unix, "admin", Method::POST, "/rules", Some(asn_rule)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let renamed = dir.join("geoip/country-2.mmdb");
+	geoip_files(&dir, "FR");
+	fs::rename(&country, &renamed).unwrap();
+	let (status, v) = patch(&unix, "/config/global", json!({"geoip": {"country_db": renamed, "asn_db": asn, "check_interval": "0s"}})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert!(!relayed_from("127.0.0.1", port).await, "FR now, for the next connection");
+
+	// the rules gone, the databases can go
+	for p in [port, asn_port] {
+		assert_eq!(call(&unix, "admin", Method::DELETE, &format!("/rules/tcp/127.0.0.1/{p}"), None).await.0, StatusCode::NO_CONTENT);
+	}
+	let (status, v) = patch(&unix, "/config/global", json!({"geoip": null})).await;
+	assert_eq!((status, &v["items"]["geoip"]["source"]), (StatusCode::OK, &json!("default")), "{v}");
+	assert!(h.registry.http_global().geoip().is_none());
+
+	// a stored value outside the directory is not put in force
+	h.registry
+		.global()
+		.restore(&h.registry, &json!({"geoip": {"country_db": dir.join("outside.mmdb")}}), None, None, None, Default::default(), "database")
+		.await;
+	let v = view(&unix).await;
+	assert!(v["items"]["geoip"]["error"].as_str().is_some_and(|e| e.contains("RPROXY_API_GEOIP_DIR")), "{v}");
+	assert!(h.registry.http_global().geoip().is_none());
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// A reload swaps the file's databases in, and keeps one the API's rules use when the
+/// file takes it away (also handed over), until they do not.
+#[tokio::test]
+async fn a_reload_swaps_geoip_and_keeps_what_rules_need() {
+	let dir = workdir("reload-geoip");
+	let h = harness_with(tokens(&dir)).await;
+	let (country, asn) = geoip_files(&dir, "JP");
+	let file = dir.join("rproxy.yaml");
+	fs::write(&file, "version: 1\n").unwrap();
+	let reloader = reloader(&h, &file);
+	let unix = api(&h, &dir, true).await;
+	let with = |g: Value| format!("version: 1\nglobal: {{geoip: {g}}}\n");
+	fs::write(&file, with(json!({"country_db": country, "asn_db": asn, "check_interval": "0s"}))).unwrap();
+	let Outcome::Applied(applied) = reloader.reload(true).await else { panic!("not applied") };
+	assert!(applied.restart_needed.is_empty(), "{applied:?}");
+	assert!(h.registry.http_global().geoip().is_some_and(|g| g.spec().asn_db.is_some()));
+	let (status, e) = patch(&unix, "/config/global", json!({"geoip": null})).await;
+	assert_eq!((status, &e["code"]), (StatusCode::CONFLICT, &json!("static")), "{e}");
+	let backend = tcp_backend("G:").await;
+	let port = free_port();
+	let mut body = rule("tcp", port, backend);
+	body["geoip"] = json!({"allow_countries": ["JP"]});
+	assert_eq!(call(&unix, "admin", Method::POST, "/rules", Some(body)).await.0, StatusCode::CREATED);
+	assert!(relayed_from("127.0.0.1", port).await);
+
+	// a database that is not one refuses the reload: nothing changes
+	fs::write(dir.join("geoip/garbage.mmdb"), "garbage").unwrap();
+	fs::write(&file, with(json!({"country_db": dir.join("geoip/garbage.mmdb")}))).unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Failed(e) if e.contains("not a MaxMind database")));
+	assert!(h.registry.http_global().geoip().is_some_and(|g| g.spec().asn_db.is_some()));
+	// the file takes the country database away while the rule needs it: kept, shown, handed over
+	fs::write(&file, with(json!({"asn_db": asn}))).unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.http_global().geoip().is_some_and(|g| g.spec().country_db.is_some()), "kept");
+	assert!(relayed_from("127.0.0.1", port).await);
+	let v = view(&unix).await;
+	assert_eq!((&v["items"]["geoip"]["kept"], &v["items"]["geoip"]["source"]), (&json!(true), &json!("file")), "{v}");
+	assert!(h.registry.global().handoff().kept_geoip.is_some_and(|g| g.country_db.is_some()), "handed over");
+	assert_eq!(patch(&unix, "/config/global", json!({"udp_max_sessions": 100})).await.0, StatusCode::OK);
+	assert!(h.registry.http_global().geoip().is_some_and(|g| g.spec().country_db.is_some()), "an unrelated change keeps it");
+	assert_eq!(patch(&unix, "/config/global", json!({"udp_max_sessions": null})).await.0, StatusCode::OK);
+	// the rule gone, the next reload puts the file's in force
+	assert_eq!(call(&unix, "admin", Method::DELETE, &format!("/rules/tcp/127.0.0.1/{port}"), None).await.0, StatusCode::NO_CONTENT);
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.http_global().geoip().is_some_and(|g| g.spec().country_db.is_none()));
+	assert!(view(&unix).await["items"]["geoip"].get("kept").is_none());
 	fs::remove_dir_all(dir).unwrap();
 }
