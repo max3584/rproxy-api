@@ -1287,18 +1287,19 @@ fn acme_secrets_in_files(a: &AcmeGlobal) -> Result<(), String> {
 			let here = |m: String| format!("global.acme.dns_providers.{name}.{call}: {m} (through the API, credentials come from secret_file as {{secret}})");
 			let (base, query) = c.url.split_once('?').unwrap_or((&c.url, ""));
 			let rest = base.split_once("://").map_or(base, |(_, r)| r);
-			let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+			let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
 			if authority.contains('@') {
 				return Err(here("the url names a user".into()));
 			}
-			// paths are logged and shown: no secret there
-			if path.contains("{secret}") {
-				return Err(here("{secret} in the url's path (put it in a header or the query)".into()));
+			// URLs are logged and shown: no secret anywhere in them, path or query (as
+			// `AcmeGlobal::check` says for the file's too), and no credential-looking query parameter
+			if c.url.contains("{secret}") {
+				return Err(here("{secret} in the url (put it in a header or the body)".into()));
 			}
 			for pair in query.split('&').filter(|p| !p.is_empty()) {
-				let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-				if (names_a_secret(k) || v.contains("{secret}")) && v != "{secret}" {
-					return Err(here(format!("the url's {k} must be exactly {{secret}}")));
+				let k = pair.split_once('=').map_or(pair, |(k, _)| k);
+				if names_a_secret(k) {
+					return Err(here(format!("the url's {k} names a credential (send it in a header or the body as {{secret}})")));
 				}
 			}
 			for (h, v) in &c.headers {
@@ -2446,7 +2447,7 @@ mod tests {
 				"add": {"url": url, "headers": headers, "body": body}}});
 			acme_secrets_in_files(&acme_spec(v))
 		};
-		call("https://h/add?fqdn={fqdn}&token={secret}", json!({"Authorization": "Bearer {secret}", "Accept": "application/json"}), Some("{\"name\":\"{fqdn}\"}"))
+		call("https://h/add?fqdn={fqdn}", json!({"Authorization": "Bearer {secret}", "Accept": "application/json"}), Some("{\"name\":\"{fqdn}\"}"))
 			.unwrap();
 		for (url, headers, body) in [
 			("https://u:p@h/add", json!({}), None),
@@ -2459,6 +2460,10 @@ mod tests {
 			("https://h/add", json!({"X-Api-Key": "k-{secret}"}), None),
 			("https://h/add", json!({"X-Other": "{secret}{secret}"}), None),
 			("https://h/add?token=x{secret}", json!({}), None),
+			// no {secret} anywhere in the url, nor a credential-looking query parameter
+			("https://h/add?token={secret}", json!({}), None),
+			("https://h/add?x={secret}", json!({}), None),
+			("https://h/add?api_key={fqdn}", json!({}), None),
 			("https://h/{secret}/add", json!({}), None),
 		] {
 			assert!(call(url, headers.clone(), body).is_err(), "{url} {headers} {body:?}");
