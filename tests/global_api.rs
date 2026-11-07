@@ -1029,6 +1029,16 @@ async fn a_reload_swaps_acme_and_keeps_the_resolvers_rules_use() {
 	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
 	assert!(h.registry.acme().is_some_and(|a| !a.global().resolvers.contains_key("b")));
 	assert!(view(&unix).await["items"]["acme"].get("kept").is_none());
+	// another storage in the file: the old one stays out of rules' reach (#319)
+	let moved = with("a: {account: le, challenge: tls-alpn-01}").replace(&dir.join("acme").display().to_string(), &dir.join("acme-b").display().to_string());
+	fs::write(&file, moved).unwrap();
+	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
+	assert!(h.registry.acme().is_some_and(|a| a.storage() == dir.join("acme-b")));
+	let old = dir.join("acme/certs/x");
+	let naming = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": free_port(), "remote_addr": "127.0.0.1", "remote_port": 9,
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": old.join("cert.pem"), "key_file": old.join("key.pem")}]}});
+	let (status, e) = call(&unix, "writer", Method::POST, "/rules", Some(naming)).await;
+	assert_eq!((status, &e["code"]), (StatusCode::FORBIDDEN, &json!("protected_file")), "{e}");
 	// out of the file: no acme
 	fs::write(&file, "version: 1\n").unwrap();
 	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));

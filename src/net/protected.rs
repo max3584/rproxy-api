@@ -93,6 +93,31 @@ fn acme_trees() -> Vec<Entry> {
 	out
 }
 
+/// The storages and secret files of every `global.acme` put in force in this process
+/// (#345): one replaced (a PATCH, a reload of the settings file) leaves its keys and
+/// secrets where they were, so they stay protected for the rest of its life.
+static ACME_SEEN: RwLock<Vec<Entry>> = RwLock::new(Vec::new());
+
+/// Remembers the storage and secret files of `acme` (`Registry::set_acme`).
+pub fn remember_acme(acme: &crate::acme::Acme) {
+	let mut seen = ACME_SEEN.write().unwrap_or_else(|e| e.into_inner());
+	for e in acme_entries(acme) {
+		if !seen.iter().any(|s| s.path == e.path && s.tree == e.tree) {
+			seen.push(e);
+		}
+	}
+}
+
+/// The storage (tree) and secret files of one `global.acme`.
+fn acme_entries(a: &crate::acme::Acme) -> Vec<Entry> {
+	let mut out = vec![Entry::tree(
+		"under the ACME storage (global.acme.storage; use {\"acme\": ...} with the acme:write scope)",
+		a.storage(),
+	)];
+	out.extend(a.protected_files().into_iter().map(|(what, f)| Entry::file(format!("a secret of global.acme ({what})"), f)));
+	out
+}
+
 /// What is protected whatever `global` says: the certificate store, the options'
 /// secrets and CrowdSec's key (what `global.acme` set through the API may not name either).
 pub fn others(crowdsec_key: Option<&Path>) -> Vec<Entry> {
@@ -105,21 +130,15 @@ pub fn others(crowdsec_key: Option<&Path>) -> Vec<Entry> {
 	out
 }
 
-/// Everything protected now: `others`, ACME's places (`acme_trees`) and the given
-/// `global.acme` (its storage and secrets).
+/// Everything protected now: `others`, ACME's places (`acme_trees`), the storages and
+/// secrets of every `global.acme` this process has had (`remember_acme`) and the given
+/// one (its storage and secrets).
 pub fn current(acme: Option<&crate::acme::Acme>, crowdsec_key: Option<&Path>) -> Vec<Entry> {
 	let mut out = others(crowdsec_key);
 	out.extend(acme_trees());
+	out.extend(ACME_SEEN.read().unwrap_or_else(|e| e.into_inner()).iter().cloned());
 	if let Some(a) = acme {
-		out.push(Entry::tree(
-			"under the ACME storage (global.acme.storage; use {\"acme\": ...} with the acme:write scope)",
-			a.storage(),
-		));
-		out.extend(
-			a.protected_files()
-				.into_iter()
-				.map(|(what, f)| Entry::file(format!("a secret of global.acme ({what})"), f)),
-		);
+		out.extend(acme_entries(a));
 	}
 	out
 }

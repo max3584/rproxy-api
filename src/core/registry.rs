@@ -661,6 +661,8 @@ impl Registry {
 	/// certificate file that changed.
 	pub fn set_acme(self: &Arc<Self>, acme: Option<Arc<crate::acme::Acme>>) -> Option<Arc<crate::acme::Acme>> {
 		if let Some(acme) = &acme {
+			// protected from rules for the rest of the process, also once replaced (#345, #319)
+			crate::net::protected::remember_acme(acme);
 			let weak = Arc::downgrade(self);
 			acme.set_on_change(Box::new(move || {
 				if let Some(registry) = weak.upgrade() {

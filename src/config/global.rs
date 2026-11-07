@@ -522,6 +522,8 @@ struct NewAcme {
 	acme: Option<Arc<Acme>>,
 	addrs: Vec<std::net::SocketAddr>,
 	bound: crate::acme::challenge::Bound,
+	/// What `Acme::carry_files` found (the files copied before the rules lock).
+	held: std::collections::BTreeMap<crate::acme::CertId, Option<(i64, i64)>>,
 }
 
 /// The live items built for a change, swapped in by `commit`.
@@ -593,7 +595,15 @@ async fn start_bouncer(c: &CrowdsecGlobal, wait: Duration, required: bool) -> Re
 /// Builds one item (files opened, the bouncer started and synced; nothing swapped yet).
 /// `from_api`: the value comes from the API (`PATCH`, stored or handed over), not the file:
 /// its files were checked (`State::path_refused`) and are opened without following a link.
-async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mode: Mode, from_api: bool) -> Result<(), BuildError> {
+async fn build_item(
+	registry: &Registry,
+	item: &str,
+	to: &Live,
+	built: &mut Built,
+	opts: &Options,
+	mode: Mode,
+	from_api: bool,
+) -> Result<(), BuildError> {
 	match item {
 		"trusted_proxies" => {
 			built.trusted_proxies = Some(cidr::parse_list(&to.trusted_proxies).map_err(|e| BuildError::Invalid(e.message))?)
@@ -667,7 +677,16 @@ async fn build_item(item: &str, to: &Live, built: &mut Built, opts: &Options, mo
 				warn!(event = "degraded", part = "global.acme.http01_listen", addr = %addr, error = %e,
 					"HTTP-01 is answered only by http rules on this address");
 			}
-			built.acme = Some(NewAcme { acme, addrs, bound });
+			// the certificates of the acme in force carried to a new storage: file IO, done
+			// here (off the async workers, before the rules lock); `commit` takes the state
+			let held = match (&acme, registry.acme()) {
+				(Some(new), Some(old)) => {
+					let new = new.clone();
+					tokio::task::spawn_blocking(move || new.carry_files(&old)).await.unwrap_or_default()
+				}
+				_ => Default::default(),
+			};
+			built.acme = Some(NewAcme { acme, addrs, bound, held });
 		}
 		_ => return Err(BuildError::Invalid(format!("global.{item} cannot change while running"))),
 	}
@@ -1396,10 +1415,12 @@ fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
 		registry.http_global().set_geoip(new)
 	});
 	let acme = acme.map(|a| {
-		let NewAcme { acme, addrs, bound } = a;
+		let NewAcme { acme, addrs, bound, held } = a;
 		let old = registry.acme();
+		// memory only under the rules lock; what `old` does after this is taken over
+		// again once it has stopped (`Acme::spawn`)
 		if let (Some(new), Some(old)) = (&acme, &old) {
-			new.inherit(old, false);
+			new.inherit(old, &held, false);
 		}
 		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
 		crate::acme::challenge::install_http01(&addrs, bound);
@@ -1497,7 +1518,7 @@ impl Settings {
 		let mut built = Built::default();
 		for item in differing(&before, &to) {
 			let from_api = sources.get(item) == Some(&Source::Api);
-			if let Err(e) = build_item(item, &to, &mut built, &opts, Mode::Restore, from_api).await {
+			if let Err(e) = build_item(registry, item, &to, &mut built, &opts, Mode::Restore, from_api).await {
 				let e = e.message();
 				warn!(event = "degraded", part = "global", item, from, error = %e,
 					"a global value set through the API cannot be put in force; the value before it stays");
@@ -1538,7 +1559,7 @@ impl Settings {
 	/// A mistake (an access log directory that does not exist, a CrowdSec key file that
 	/// cannot be read) refuses the reload with nothing changed; a new LAPI that does not
 	/// answer leaves the CrowdSec in force (`config.global_kept`).
-	pub async fn prepare_file(&self, spec: &GlobalSpec, raw: &Value) -> Result<FilePrepared, String> {
+	pub async fn prepare_file(&self, registry: &Registry, spec: &GlobalSpec, raw: &Value) -> Result<FilePrepared, String> {
 		// held to the commit: a PATCH in between would be undone by it
 		let turn = match self.turn.clone().try_lock_owned() {
 			Ok(t) => t,
@@ -1558,7 +1579,7 @@ impl Settings {
 		let mut not_in_force = vec![];
 		for item in differing(&before, &to) {
 			let from_api = sources.get(item) == Some(&Source::Api);
-			match build_item(item, &to, &mut built, &opts, Mode::File, from_api).await {
+			match build_item(registry, item, &to, &mut built, &opts, Mode::File, from_api).await {
 				Ok(()) => changed.push(item),
 				Err(BuildError::NotSynced(e)) => {
 					warn!(event = "config.global_kept", item, error = %e, "the CrowdSec in force stays until its LAPI answers (reload again)");
@@ -1781,7 +1802,7 @@ impl Settings {
 		let mut built = Built::default();
 		for item in &applied {
 			// a PATCH builds only what it names, which the file does not
-			build_item(item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
+			build_item(registry, item, &to, &mut built, &opts, Mode::Api, true).await.map_err(|e| match e {
 				BuildError::Invalid(e) => PatchError::Invalid(e),
 				BuildError::NotSynced(e) => PatchError::Unavailable(e),
 			})?;
@@ -2370,7 +2391,7 @@ mod tests {
 		assert!(http.trusts("192.0.2.1".parse().unwrap()));
 		assert_eq!(s.persisted(), Some(false), "not written yet");
 		let (spec, raw) = file("trusted_proxies: [10.0.0.0/8]\n");
-		let prepared = s.prepare_file(&spec, &raw).await.unwrap();
+		let prepared = s.prepare_file(&r, &spec, &raw).await.unwrap();
 		assert!(http.trusts("192.0.2.1".parse().unwrap()), "nothing in force before the commit");
 		assert_eq!(s.commit_file(&r, prepared).await, ["trusted_proxies"]);
 		assert!(!http.trusts("192.0.2.1".parse().unwrap()) && http.trusts("10.1.2.3".parse().unwrap()));
@@ -2380,7 +2401,7 @@ mod tests {
 		assert_eq!(view["warnings"][0]["code"], "config.global_shadowed");
 		// the file leaves it out again: the API value is in force
 		let (spec, raw) = file("{}");
-		let prepared = s.prepare_file(&spec, &raw).await.unwrap();
+		let prepared = s.prepare_file(&r, &spec, &raw).await.unwrap();
 		s.commit_file(&r, prepared).await;
 		assert!(http.trusts("192.0.2.1".parse().unwrap()));
 		assert_eq!(s.view()["warnings"], json!([]));
