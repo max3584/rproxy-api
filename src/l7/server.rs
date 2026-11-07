@@ -160,8 +160,10 @@ impl Router {
 		}
 		let mut routes = vec![];
 		for (i, r) in spec.routes.iter().enumerate() {
-			let chain = r
-				.middlewares
+			// a middleware runs at most once per request (#386): one of http.pre_routing has run
+			// whenever the route's chain runs, so the route skips it (request and response side)
+			let names: Vec<String> = r.middlewares.iter().filter(|m| !spec.pre_routing.contains(m)).cloned().collect();
+			let chain = names
 				.iter()
 				.map(|m| middlewares.get(m).cloned().ok_or_else(|| ApiError::invalid(format!("middleware {m:?} is not defined"))))
 				.collect::<Result<Vec<_>, _>>()?;
@@ -181,7 +183,7 @@ impl Router {
 					matcher,
 					service,
 					middlewares: chain,
-					names: r.middlewares.clone(),
+					names,
 					request_timeout: deadline::limit(timeouts.request.as_ref()),
 					backend_timeout: deadline::limit(timeouts.backend_request.as_ref()),
 				},
@@ -1117,6 +1119,7 @@ impl Conn {
 		let received = (!pre.is_empty()).then(tokio::time::Instant::now);
 		if !pre.is_empty() && answer.is_none() {
 			let kept = KeptHost::of(&parts);
+			let path_before = parts.uri.path_and_query().cloned();
 			let mut step = Step {
 				router: &router,
 				snapshot: &snapshot,
@@ -1146,6 +1149,21 @@ impl Conn {
 			}
 			// Host and :authority stay as the client sent them, for routing and the backend
 			kept.restore(&mut parts);
+			// a path they rewrote is checked and normalised again before routing (#320): a
+			// strip_prefix must not make /../admin slip past a route's authentication
+			if answer.is_none() && path_before.as_ref().map_or("/", |p| p.path()) != parts.uri.path() {
+				let bad = if router.strict_path && super::normalize::risky(parts.uri.path()) {
+					Some("strict_path")
+				} else if router.raw_path {
+					None
+				} else {
+					normalize_target(&mut parts.uri).err().map(|_| "bad_path")
+				};
+				if let Some(why) = bad {
+					answer = Some(error_response(StatusCode::BAD_REQUEST));
+					answered_by = Some((why, ""));
+				}
+			}
 		}
 		// routes see the request as the pre-routing middlewares left it, matched once
 		let headers: Vec<(String, String)> = if router.match_headers {
@@ -1171,6 +1189,17 @@ impl Conn {
 		// timeouts.request (#227) counts from here (or from before http.pre_routing)
 		let deadline = request_timeout.map(|d| received.unwrap_or_else(tokio::time::Instant::now) + d);
 		entry.route = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
+		// the time ran out in http.pre_routing (#386): nothing more goes on, not even to the backend
+		if let (Some(_), Some(at)) = (received, deadline) {
+			if answer.is_none() && at <= tokio::time::Instant::now() {
+				warn!(event = "http.error", rule = %self.rt.key, route = route_name, status = 504,
+					error = "request timed out in the middlewares");
+				answer = Some(error_response(StatusCode::GATEWAY_TIMEOUT));
+				answered_by = Some(("request_timeout", ""));
+				// not the backend's doing: a pre-routing circuit_breaker does not count it
+				sent.tickets.clear();
+			}
+		}
 		// timeouts.request (#227) covers the middlewares too (#356): reading a body, asking an
 		// auth server or an OIDC provider, waiting for a cache's lead
 		let offset = pre.len();
@@ -1360,7 +1389,7 @@ impl Conn {
 				}
 			},
 			Middleware::ForwardAuth(fa) => {
-				match self.forward_auth(st.router, fa, st.parts, st.body, st.replay, st.client_ip, st.host).await {
+				match Box::pin(self.forward_auth(st.router, fa, st.parts, st.body, st.replay, st.client_ip, st.host)).await {
 					AuthOutcome::Allow(add) => {
 						st.response_headers.extend(add.into_iter().map(|h| (i, h)));
 						None
@@ -1368,7 +1397,7 @@ impl Conn {
 					AuthOutcome::Deny(resp) => Some(resp),
 				}
 			}
-			Middleware::Oidc(o) => match o.handle(st.parts, self.https, st.authority).await {
+			Middleware::Oidc(o) => match Box::pin(o.handle(st.parts, self.https, st.authority)).await {
 				oidc::Outcome::Pass { session, set_cookie } => {
 					o.pass_identity(&mut st.parts.headers, &session);
 					st.set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
@@ -1377,7 +1406,7 @@ impl Conn {
 				answer => Some(oidc_response(answer)),
 			},
 			Middleware::Crowdsec { name, appsec, block_on_error } => {
-				self.crowdsec(st.snapshot, name, *appsec, *block_on_error, st.parts, st.body, st.client_ip, st.host).await
+				Box::pin(self.crowdsec(st.snapshot, name, *appsec, *block_on_error, st.parts, st.body, st.client_ip, st.host)).await
 			}
 			// the client as global.trusted_proxies decided; refused like ip_allow
 			Middleware::Geoip(policy) => match crate::net::geoip::check(policy, self.rt.global.geoip().as_deref(), st.client_ip) {

@@ -34,8 +34,8 @@ async fn backend(name: &'static str) -> SocketAddr {
 	serve(app).await
 }
 
-/// An auth server: `X-Token: gold` / `silver` pass with that `X-Tier`, `slow` after 1.5 s; a
-/// body `let me in` passes as gold; anything else gets 401.
+/// An auth server: `X-Token: gold` / `silver` pass with that `X-Tier`, `slow` after 1.5 s and
+/// `slowish` after 200 ms as silver; a body `let me in` passes as gold; anything else gets 401.
 async fn auth_server() -> SocketAddr {
 	let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
 		let token = req.headers().get("x-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -44,6 +44,10 @@ async fn auth_server() -> SocketAddr {
 			"gold" | "silver" => token.clone(),
 			"slow" => {
 				tokio::time::sleep(Duration::from_millis(1500)).await;
+				"silver".into()
+			}
+			"slowish" => {
+				tokio::time::sleep(Duration::from_millis(200)).await;
 				"silver".into()
 			}
 			_ if &body[..] == b"let me in" => "gold".into(),
@@ -73,7 +77,8 @@ async fn json_of(r: reqwest::Response) -> Value {
 	serde_json::from_str(&text).unwrap_or(Value::String(text))
 }
 
-/// gold → `gold`, the rest → `other`; `/new/` (written by a pre-routing middleware) → `moved`.
+/// `X-Tier: gold` → `gold`; `/new/` (written by a pre-routing middleware) → `moved` (the gold
+/// backend); Host `evil.test` → `evil` (the gold backend); other `/app` paths → `other`; the rest: 404.
 fn routes(gold: SocketAddr, other: SocketAddr) -> Value {
 	json!([
 		{"name": "gold", "match": "Header(`X-Tier`, `gold`)", "to": format!("http://{gold}")},
@@ -229,13 +234,39 @@ async fn pre_routing_takes_only_kinds_that_run_before_routing() {
 		("retry", json!({"retry": {"attempts": 2}})),
 		("cache", json!({"cache": {"ttl": "1s"}})),
 		("replace_host", json!({"replace_host": {"host": "x.test"}})),
+		("mirror", json!({"mirror": {"service": "copy"}})),
 	] {
-		let (status, v) = h.post(base(json!(["m"]), json!({ "m": spec }))).await;
+		let mut rule = base(json!(["m"]), json!({ "m": spec }));
+		rule["http"]["services"] = json!({"copy": {"servers": [{"url": "http://127.0.0.1:9"}]}});
+		let (status, v) = h.post(rule).await;
 		assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{kind}: {v}");
 		assert!(v["error"].as_str().unwrap().contains("cannot run before routing"), "{kind}: {v}");
 	}
 	let (status, v) = h.post(base(json!(["nope"]), json!({}))).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	// a middleware runs at most once per request: not twice in pre_routing
+	let (status, v) = h.post(base(json!(["h", "h"]), json!({"h": {"headers": {"request": {"set": {"X-A": "1"}}}}}))).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("listed twice"), "{v}");
+	// a sign-in before routing makes every route's cache need share_after_auth (#340)
+	let cached = |share: bool| {
+		http_rule(
+			free_port(),
+			json!({
+				"pre_routing": ["fa"],
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": "http://127.0.0.1:9", "middlewares": ["c"]}],
+				"middlewares": {
+					"fa": {"forward_auth": {"address": "http://127.0.0.1:9/"}},
+					"c": {"cache": {"ttl": "1s", "share_after_auth": share}},
+				},
+			}),
+		)
+	};
+	let (status, v) = h.post(cached(false)).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("share_after_auth"), "{v}");
+	let (status, v) = h.post(cached(true)).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
 
 	let (_, caps) = h.get("/capabilities").await;
 	assert!(caps["features"]["http_options"].as_array().unwrap().contains(&json!("pre_routing")), "{caps}");
@@ -268,4 +299,188 @@ async fn a_pre_routing_circuit_breaker_counts_the_routes_answers_once() {
 	assert_eq!(client().get(&url).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
 	// also for requests no route would take
 	assert_eq!(client().get(format!("http://127.0.0.1:{port}/other")).send().await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Counts the requests it gets; `GET /flip` turns failing (500) on and off.
+async fn counting_backend() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+	use std::sync::atomic::Ordering;
+	let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+	let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let (s, f) = (seen.clone(), failing.clone());
+	let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+		let (s, f) = (s.clone(), f.clone());
+		async move {
+			s.fetch_add(1, Ordering::SeqCst);
+			if req.uri().path() == "/slow" {
+				tokio::time::sleep(Duration::from_millis(300)).await;
+			}
+			if f.load(Ordering::SeqCst) {
+				(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "down")
+			} else {
+				(axum::http::StatusCode::OK, "up")
+			}
+		}
+	});
+	(serve(app).await, seen, failing)
+}
+
+/// The same middleware in pre_routing and in a route runs once (#386): stateful kinds work.
+#[tokio::test]
+async fn a_middleware_in_pre_routing_and_a_route_runs_once() {
+	use std::sync::atomic::Ordering;
+	let (backend, _, failing) = counting_backend().await;
+	let dir = std::env::temp_dir().join(format!("rproxy-pre-routing-{}", std::process::id()));
+	rproxy_api::net::files::private_umask();
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let users = dir.join("users");
+	std::fs::write(&users, format!("alice:{}\n", bcrypt::hash("wonderland", 4).unwrap())).unwrap();
+	let h = harness().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"pre_routing": ["cb", "one", "auth"],
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "middlewares": ["auth", "one", "cb"]}],
+				"middlewares": {
+					"cb": {"circuit_breaker": {"failure_percent": 50, "window": "10s", "recovery": "300ms"}},
+					"one": {"in_flight": {"amount": 1}},
+					"auth": {"basic_auth": {"users_file": users}},
+				},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let url = format!("http://127.0.0.1:{port}/x");
+	let get = || client().get(&url).basic_auth("alice", Some("wonderland")).send();
+	// basic_auth: Authorization is not gone for a second check; in_flight (1): not 429 against itself
+	for _ in 0..3 {
+		assert_eq!(get().await.unwrap().status(), StatusCode::OK);
+	}
+	assert_eq!(client().get(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+	// circuit_breaker: opens, and closes again after a probe that passes
+	failing.store(true, Ordering::SeqCst);
+	let mut opened = false;
+	for _ in 0..20 {
+		match get().await.unwrap().status() {
+			StatusCode::INTERNAL_SERVER_ERROR => {}
+			StatusCode::SERVICE_UNAVAILABLE => {
+				opened = true;
+				break;
+			}
+			other => panic!("{other}"),
+		}
+	}
+	assert!(opened, "the breaker opens");
+	failing.store(false, Ordering::SeqCst);
+	tokio::time::sleep(Duration::from_millis(400)).await;
+	for n in 0..3 {
+		assert_eq!(get().await.unwrap().status(), StatusCode::OK, "after recovery, request {n}");
+	}
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A path rewritten before routing is normalised (and checked) again (#320, #386).
+#[tokio::test]
+async fn a_path_rewritten_before_routing_is_normalised_again() {
+	let other = backend("other").await;
+	let h = harness().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"pre_routing": ["strip", "broken"],
+				"routes": [
+					{"name": "admin", "match": "PathPrefix(`/admin`)", "to": format!("http://{other}"), "middlewares": ["deny"]},
+					{"name": "rest", "match": "PathPrefix(`/`)", "to": format!("http://{other}")},
+				],
+				"middlewares": {
+					"strip": {"strip_prefix": {"prefixes": ["/x"]}},
+					"broken": {"replace_path_regex": {"regex": "^/bad$", "replacement": "/%zz"}},
+					"deny": {"ip_allow": {"source_range": ["192.0.2.0/24"]}},
+				},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let url = |p: &str| format!("http://127.0.0.1:{port}{p}");
+	// /x../admin is normal; without /x it is /../admin, which is /admin
+	assert_eq!(client().get(url("/x../admin")).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+	let r = client().get(url("/x../doc")).send().await.unwrap();
+	assert_eq!(json_of(r).await["path"], "/doc");
+	// a broken percent-encoding written before routing is a bad path
+	assert_eq!(client().get(url("/bad")).send().await.unwrap().status(), StatusCode::BAD_REQUEST);
+}
+
+/// The time of a route's timeouts.request that pre_routing used up: 504 at once, nothing to the
+/// backend, and not a backend failure for a circuit_breaker before.
+#[tokio::test]
+async fn a_deadline_spent_before_routing_is_answered_at_once() {
+	use std::sync::atomic::Ordering;
+	let auth = auth_server().await;
+	let (backend, seen, _) = counting_backend().await;
+	let h = harness().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"pre_routing": ["cb", "fa"],
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "timeouts": {"request": "100ms"}}],
+				"middlewares": {
+					"cb": {"circuit_breaker": {"failure_percent": 50, "window": "30s", "recovery": "30s"}},
+					"fa": {"forward_auth": {"address": format!("http://{auth}/check"), "timeout": "5s"}},
+				},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let url = format!("http://127.0.0.1:{port}/x");
+	let c = client();
+	let r = c.get(&url).header("X-Token", "gold").send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::OK);
+	assert_eq!(r.text().await.unwrap(), "up");
+	let before = seen.load(Ordering::SeqCst);
+	// more than MIN_REQUESTS (10): as backend failures they would open the breaker
+	for n in 0..11 {
+		let r = c.get(&url).header("X-Token", "slowish").send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::GATEWAY_TIMEOUT, "request {n}");
+	}
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	assert_eq!(seen.load(Ordering::SeqCst), before, "nothing went to the backend after the deadline");
+	assert_eq!(c.get(&url).header("X-Token", "gold").send().await.unwrap().status(), StatusCode::OK, "the breaker stays closed");
+}
+
+/// HTTP/2: `:authority` as the client sent it, whatever pre_routing does to Host (#386).
+#[tokio::test]
+async fn http2_authority_is_kept() {
+	use http_body_util::{BodyExt, Empty};
+	let (gold, other) = (backend("gold").await, backend("other").await);
+	let h = harness().await;
+	let port = free_port();
+	let (status, v) = h
+		.post(http_rule(
+			port,
+			json!({
+				"pre_routing": ["host"],
+				"routes": routes(gold, other),
+				"middlewares": {"host": {"headers": {"request": {"set": {"Host": "evil.test"}}}}},
+			}),
+		))
+		.await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let (mut sender, conn) = hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+		.handshake(hyper_util::rt::TokioIo::new(tcp))
+		.await
+		.unwrap();
+	tokio::spawn(conn);
+	let req = hyper::Request::get("http://app.test/app/x").body(Empty::<bytes::Bytes>::new()).unwrap();
+	let resp = sender.send_request(req).await.unwrap();
+	assert_eq!(resp.status(), hyper::StatusCode::OK);
+	let body = resp.into_body().collect().await.unwrap().to_bytes();
+	let v: Value = serde_json::from_slice(&body).unwrap();
+	assert_eq!((v["name"].as_str(), v["host"].as_str()), (Some("other"), Some("app.test")), "{v}");
 }

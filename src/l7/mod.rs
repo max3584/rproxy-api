@@ -912,7 +912,10 @@ impl HttpSpec {
 		for (name, mw) in &self.middlewares {
 			mw.validate(name, &self.services)?;
 		}
-		for m in &self.pre_routing {
+		for (i, m) in self.pre_routing.iter().enumerate() {
+			if self.pre_routing[..i].contains(m) {
+				return Err(invalid(format!("pre_routing: middleware {m:?} is listed twice (a middleware runs at most once per request)")));
+			}
 			match self.middlewares.get(m) {
 				None => return Err(invalid(format!("pre_routing: middleware {m:?} is not defined"))),
 				Some(spec) if !PRE_ROUTING_MIDDLEWARES.contains(&spec.kind()) => {
@@ -985,7 +988,8 @@ impl HttpSpec {
 			)));
 		}
 		let MiddlewareSpec::Cache(spec) = &self.middlewares[&r.middlewares[at]] else { return Ok(()) };
-		if let Some(m) = r.middlewares[..at].iter().find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
+		// http.pre_routing (#386) runs before every route's middlewares
+		if let Some(m) = self.pre_routing.iter().chain(&r.middlewares[..at]).find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
 			if !spec.share_after_auth {
 				return Err(invalid(format!(
 					"{what}: {m:?} ({}) comes before it, so the backend may answer each user differently; set share_after_auth: true only if every user who gets in may see the same answer",
@@ -1009,7 +1013,8 @@ impl HttpSpec {
 			let kinds: Vec<(&String, &MiddlewareSpec)> = r.middlewares.iter().filter_map(|m| self.middlewares.get(m).map(|s| (m, s))).collect();
 			let Some(at) = kinds.iter().position(|(_, s)| matches!(s, MiddlewareSpec::Cache(_))) else { continue };
 			let (name, MiddlewareSpec::Cache(c)) = kinds[at] else { continue };
-			if !c.share_credentials && kinds[..at].iter().any(|(_, s)| s.kind() == "oidc") {
+			let pre_oidc = self.pre_routing.iter().any(|m| self.middlewares.get(m).is_some_and(|s| s.kind() == "oidc"));
+			if !c.share_credentials && (pre_oidc || kinds[..at].iter().any(|(_, s)| s.kind() == "oidc")) {
 				out.push(format!(
 					"route {}: cache {name:?} comes after oidc, whose session cookie makes every request BYPASS the cache; set share_credentials: true if every signed-in user may get the same answer",
 					r.name
