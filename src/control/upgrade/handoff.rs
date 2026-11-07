@@ -812,8 +812,6 @@ impl State {
 	pub async fn restore_rules(&self, registry: &Arc<Registry>) {
 		// the previous `global.acme`s' storages and secrets stay protected (#389)
 		crate::net::protected::adopt_acme_seen(self.acme_protected.clone());
-		// the previous `global.acme`s' storages and secrets stay protected (#389)
-		crate::net::protected::adopt_acme_seen(self.acme_protected.clone());
 		// the global values set through the API first: rules using crowdsec need it (#342)
 		if let Some(g) = &self.global {
 			let settings = registry.global();

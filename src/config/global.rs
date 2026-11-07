@@ -1420,12 +1420,11 @@ fn commit(registry: &Arc<Registry>, built: Built) -> Swapped {
 	let acme = acme.map(|a| {
 		let NewAcme { acme, addrs, bound, carried } = a;
 		let old = registry.acme();
-		// under the rules lock: the copies renamed into place (a few renames, before rules can
+		// under the rules lock: the copies renamed into place (a few renames and directory syncs, before rules can
 		// take files from the new storage) and the state in memory; what `old` does after
 		// this is taken over again once it has stopped (`Acme::spawn`)
 		if let (Some(new), Some(old)) = (&acme, &old) {
-			let crate::acme::Carried { held, staged } = carried;
-			staged.place();
+			let held = carried.place();
 			new.inherit(old, &held, false);
 		}
 		info!(event = "acme.swap", acme = acme.is_some(), http01_listen = ?addrs, "global.acme changed: new orders use it");
