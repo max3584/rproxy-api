@@ -134,6 +134,29 @@ pub enum Middleware {
 }
 
 impl Middleware {
+	/// The request side is `on_request` alone: no body, no I/O, nothing for the response side
+	/// to pick up (`server.rs` runs these without its async step).
+	pub fn plain(&self) -> bool {
+		matches!(
+			self,
+			Middleware::RedirectScheme { .. }
+				| Middleware::RedirectRegex { .. }
+				| Middleware::Respond { .. }
+				| Middleware::IpAllow(_)
+				| Middleware::Headers(_)
+				| Middleware::StripPrefix(_)
+				| Middleware::AddPrefix(_)
+				| Middleware::ReplacePath(_)
+				| Middleware::ReplacePathRegex { .. }
+				| Middleware::RateLimit { .. }
+				| Middleware::InFlight { .. }
+				| Middleware::Cors(_)
+				| Middleware::ReplaceHost(_)
+				| Middleware::Compress { .. }
+				| Middleware::Errors { .. }
+		)
+	}
+
 	/// The kind as written in the settings (`refused_by` of the access log).
 	pub fn kind(&self) -> &'static str {
 		match self {

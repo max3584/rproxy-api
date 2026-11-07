@@ -97,6 +97,10 @@ struct Route {
 /// so requests always see one consistent version.
 pub struct Router {
 	routes: Vec<Route>,
+	/// `http.pre_routing` (#386): run on every request before the routes are matched.
+	pre_routing: Vec<Arc<Middleware>>,
+	/// Names of `pre_routing` as in the settings (access log).
+	pre_names: Vec<String>,
 	default_status: StatusCode,
 	default_service: Option<Arc<Service>>,
 	/// Every service, for health reports.
@@ -156,8 +160,10 @@ impl Router {
 		}
 		let mut routes = vec![];
 		for (i, r) in spec.routes.iter().enumerate() {
-			let chain = r
-				.middlewares
+			// a middleware runs at most once per request (#386): one of http.pre_routing has run
+			// whenever the route's chain runs, so the route skips it (request and response side)
+			let names: Vec<String> = r.middlewares.iter().filter(|m| !spec.pre_routing.contains(m)).cloned().collect();
+			let chain = names
 				.iter()
 				.map(|m| middlewares.get(m).cloned().ok_or_else(|| ApiError::invalid(format!("middleware {m:?} is not defined"))))
 				.collect::<Result<Vec<_>, _>>()?;
@@ -177,12 +183,17 @@ impl Router {
 					matcher,
 					service,
 					middlewares: chain,
-					names: r.middlewares.clone(),
+					names,
 					request_timeout: deadline::limit(timeouts.request.as_ref()),
 					backend_timeout: deadline::limit(timeouts.backend_request.as_ref()),
 				},
 			));
 		}
+		let pre_routing = spec
+			.pre_routing
+			.iter()
+			.map(|m| middlewares.get(m).cloned().ok_or_else(|| ApiError::invalid(format!("pre_routing: middleware {m:?} is not defined"))))
+			.collect::<Result<Vec<_>, _>>()?;
 		// higher priority first; the order in the settings breaks ties
 		routes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 		let default = spec.default.as_ref();
@@ -224,6 +235,8 @@ impl Router {
 		caches.sort_by(|a, b| a.name.cmp(&b.name));
 		Ok(Router {
 			routes,
+			pre_routing,
+			pre_names: spec.pre_routing.clone(),
 			default_status,
 			default_service,
 			services: all,
@@ -903,6 +916,63 @@ struct Sent {
 	cached: Option<(String, cache::Outcome)>,
 }
 
+/// What the request side of a middleware works on (`Conn::request_side`): the same for
+/// `http.pre_routing` (#386) and the route's chain.
+struct Step<'a> {
+	router: &'a Router,
+	snapshot: &'a crate::l7::access::Snapshot,
+	ctx: &'a Ctx,
+	client_ip: IpAddr,
+	host: &'a str,
+	authority: &'a str,
+	/// Empty before routing.
+	route_name: &'a str,
+	log: bool,
+	parts: &'a mut hyper::http::request::Parts,
+	body: &'a mut Body,
+	replay: &'a mut Option<Bytes>,
+	retry: &'a mut Option<RetryPolicy>,
+	mirrors: &'a mut Vec<mirror::Copy>,
+	set_cookies: &'a mut Vec<(usize, HeaderValue)>,
+	response_headers: &'a mut Vec<(usize, ext_authz::HeaderOption)>,
+	entry: &'a mut AccessEntry,
+	sent: &'a mut Sent,
+}
+
+/// `Host` and `:authority` as the client sent them (#386): what `http.pre_routing` does to them
+/// is undone, so neither routing nor the backend sees it (the Gateway API's listener filters
+/// must not change the Host; the listener is not chosen again).
+struct KeptHost {
+	host: Vec<HeaderValue>,
+	authority: Option<hyper::http::uri::Authority>,
+}
+
+impl KeptHost {
+	fn of(parts: &hyper::http::request::Parts) -> KeptHost {
+		KeptHost { host: parts.headers.get_all(header::HOST).iter().cloned().collect(), authority: parts.uri.authority().cloned() }
+	}
+
+	fn restore(self, parts: &mut hyper::http::request::Parts) {
+		if !parts.headers.get_all(header::HOST).iter().eq(self.host.iter()) {
+			debug!(event = "http.pre_routing", "a pre-routing middleware changed Host; the client's is kept");
+			parts.headers.remove(header::HOST);
+			for v in self.host {
+				parts.headers.append(header::HOST, v);
+			}
+		}
+		if parts.uri.authority() != self.authority.as_ref() {
+			let mut uri = parts.uri.clone().into_parts();
+			uri.authority = self.authority;
+			if uri.authority.is_none() {
+				uri.scheme = None;
+			}
+			if let Ok(u) = Uri::from_parts(uri) {
+				parts.uri = u;
+			}
+		}
+	}
+}
+
 impl Conn {
 	pub(super) async fn handle(&self, mut req: Request<Body>) -> Response<Body> {
 		// HTTP/2 and HTTP/3 may split the cookie header into several fields; join them
@@ -963,38 +1033,16 @@ impl Conn {
 		let peer = canonical(self.client.ip());
 		let global = &self.rt.global;
 		let client_ip = snapshot.client_ip(peer, req.headers().get_all("x-forwarded-for").iter().filter_map(|v| v.to_str().ok()));
-		let headers: Vec<(String, String)> = if router.match_headers {
-			req.headers().iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
-		} else {
-			vec![]
-		};
-		let info = RequestInfo {
-			host: &host,
-			path: req.uri().path(),
-			query: req.uri().query().unwrap_or(""),
-			method: req.method().as_str(),
-			headers: &headers,
-			client: client_ip,
-		};
 		// tls.misdirected: a coalesced HTTP/2 connection (or any) carrying a request for a name of
 		// another group than its TLS server name gets 421, before routing (RFC 9110 §15.5.20)
 		let misdirected = self.misdirected(&host);
-		let refused = misdirected || bad_path.is_some();
-		let (route_name, service, chain, names, request_timeout, backend_timeout) = match router.route(&info).filter(|_| !refused) {
-			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
-			None if refused => ("", None, &[][..], &[][..], None, None),
-			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
-		};
-		// timeouts.request (#227) counts from here
-		let deadline = request_timeout.map(|d| tokio::time::Instant::now() + d);
 		let header_text = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-		// the access log line is put together only when it is written (the statistics need just the route)
+		// the access log line is put together only when it is written (the statistics need just the
+		// route, filled in once it is known)
 		let log = snapshot.logging();
-		let route_label = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
 		let mut entry = if log {
 			AccessEntry {
 				rule: self.rt.key.to_string(),
-				route: route_label,
 				client: client_ip.to_string(),
 				method: req.method().to_string(),
 				host: host.clone(),
@@ -1012,7 +1060,7 @@ impl Conn {
 				..Default::default()
 			}
 		} else {
-			AccessEntry { route: route_label, ..Default::default() }
+			AccessEntry::default()
 		};
 		if log {
 			if let Some(geo) = global.geo_for_log(client_ip) {
@@ -1037,9 +1085,11 @@ impl Conn {
 			caches: vec![],
 			cached: None,
 		};
-		// request side in the route's order, until one answers
+		// request side in the chain's order, until one answers
 		let (mut parts, mut body) = req.into_parts();
-		let mut ran = 0;
+		// how many of the route's and of http.pre_routing's middlewares ran: u32 each, so the two
+		// take the room of the one usize before #386 (they are kept across the backend's await)
+		let mut ran: u32 = 0;
 		let mut answer = None;
 		let mut replay: Option<Bytes> = None;
 		let mut retry: Option<RetryPolicy> = None;
@@ -1063,6 +1113,97 @@ impl Conn {
 			answer = Some(error_response(StatusCode::BAD_REQUEST));
 			answered_by = Some((why, ""));
 		}
+		// http.pre_routing (#386): every request, before the routes are matched (and before
+		// `default`); positions 0.. of the chain, the route's middlewares follow
+		let pre = router.pre_routing.as_slice();
+		let mut ran_pre: u32 = 0;
+		// a route's timeouts.request counts from before them (#227: from receiving the request)
+		let received = (!pre.is_empty()).then(tokio::time::Instant::now);
+		if !pre.is_empty() && answer.is_none() {
+			let kept = KeptHost::of(&parts);
+			let path_before = parts.uri.path_and_query().cloned();
+			let mut step = Step {
+				router: &router,
+				snapshot: &snapshot,
+				ctx: &ctx,
+				client_ip,
+				host: &host,
+				authority: &authority,
+				route_name: "",
+				log,
+				parts: &mut parts,
+				body: &mut body,
+				replay: &mut replay,
+				retry: &mut retry,
+				mirrors: &mut mirrors,
+				set_cookies: &mut set_cookies,
+				response_headers: &mut response_headers,
+				entry: &mut entry,
+				sent: &mut sent,
+			};
+			for (i, m) in pre.iter().enumerate() {
+				ran_pre += 1;
+				// the plain kinds directly, without the async step (#386: the hot path stays as before)
+				let resp = if m.plain() { m.on_request(step.parts, step.ctx) } else { self.request_side(m, i, &mut step).await };
+				if let Some(resp) = resp {
+					answer = Some(resp);
+					answered_by = Some((m.kind(), router.pre_names.get(i).map_or("", String::as_str)));
+					break;
+				}
+			}
+			// Host and :authority stay as the client sent them, for routing and the backend
+			kept.restore(&mut parts);
+			// a path they rewrote is checked and normalised again before routing (#320): a
+			// strip_prefix must not make /../admin slip past a route's authentication
+			if answer.is_none() && path_before.as_ref().map_or("/", |p| p.path()) != parts.uri.path() {
+				let bad = if router.strict_path && super::normalize::risky(parts.uri.path()) {
+					Some("strict_path")
+				} else if router.raw_path {
+					None
+				} else {
+					normalize_target(&mut parts.uri).err().map(|_| "bad_path")
+				};
+				if let Some(why) = bad {
+					answer = Some(error_response(StatusCode::BAD_REQUEST));
+					answered_by = Some((why, ""));
+				}
+			}
+		}
+		// routes see the request as the pre-routing middlewares left it, matched once
+		let headers: Vec<(String, String)> = if router.match_headers {
+			parts.headers.iter().map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())).collect()
+		} else {
+			vec![]
+		};
+		let info = RequestInfo {
+			host: &host,
+			path: parts.uri.path(),
+			query: parts.uri.query().unwrap_or(""),
+			method: parts.method.as_str(),
+			headers: &headers,
+			client: client_ip,
+		};
+		// an answer already (421, 400, a pre-routing middleware's) goes out as it is
+		let matched = if answer.is_none() { router.route(&info) } else { None };
+		let (route_name, service, chain, names, request_timeout, backend_timeout) = match matched {
+			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
+			None if answer.is_some() => ("", None, &[][..], &[][..], None, None),
+			None => ("", router.default_service.clone(), &[][..], &[][..], None, None),
+		};
+		// timeouts.request (#227) counts from here (or from before http.pre_routing)
+		let deadline = request_timeout.map(|d| received.unwrap_or_else(tokio::time::Instant::now) + d);
+		entry.route = if route_name.is_empty() { NO_ROUTE.to_string() } else { route_name.to_string() };
+		// the time ran out in http.pre_routing (#386): nothing more goes on, not even to the backend
+		if let (Some(_), Some(at)) = (received, deadline) {
+			if answer.is_none() && at <= tokio::time::Instant::now() {
+				warn!(event = "http.error", rule = %self.rt.key, route = route_name, status = 504,
+					error = "request timed out in the middlewares");
+				answer = Some(error_response(StatusCode::GATEWAY_TIMEOUT));
+				answered_by = Some(("request_timeout", ""));
+				// not the backend's doing: a pre-routing circuit_breaker does not count it
+				sent.tickets.clear();
+			}
+		}
 		// timeouts.request (#227) covers the middlewares too (#356): reading a body, asking an
 		// auth server or an OIDC provider, waiting for a cache's lead
 		let chain_run = async {
@@ -1071,152 +1212,32 @@ impl Conn {
 				answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
 				answered_by = Some(("oidc", o.name.as_str()));
 			}
+			if answer.is_some() || chain.is_empty() {
+				return;
+			}
+			let mut step = Step {
+				router: &router,
+				snapshot: &snapshot,
+				ctx: &ctx,
+				client_ip,
+				host: &host,
+				authority: &authority,
+				route_name,
+				log,
+				parts: &mut parts,
+				body: &mut body,
+				replay: &mut replay,
+				retry: &mut retry,
+				mirrors: &mut mirrors,
+				set_cookies: &mut set_cookies,
+				response_headers: &mut response_headers,
+				entry: &mut entry,
+				sent: &mut sent,
+			};
 			for (i, m) in chain.iter().enumerate() {
-				if answer.is_some() {
-					break;
-				}
 				ran += 1;
-				let resp = match m.as_ref() {
-					Middleware::BasicAuth(b) => match b.check(&parts.headers).await {
-						BasicVerdict::Allow(user) => {
-							if log {
-								entry.user = user.clone();
-							}
-							if !b.keep_authorization {
-								parts.headers.remove(header::AUTHORIZATION);
-							}
-							if let Some(h) = &b.user_header {
-								parts.headers.remove(h);
-								if let Ok(v) = HeaderValue::from_str(&user) {
-									parts.headers.insert(h.clone(), v);
-								}
-							}
-							None
-						}
-						BasicVerdict::Deny(why) => {
-							if log {
-								entry.auth_error = why.to_string();
-							}
-							let mut resp = error_response(StatusCode::UNAUTHORIZED);
-							resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
-							Some(resp)
-						}
-						BasicVerdict::Unavailable => {
-							if log {
-								entry.auth_error = "unavailable".into();
-							}
-							Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
-						}
-						BasicVerdict::Busy => {
-							if log {
-								entry.auth_error = "busy".into();
-							}
-							let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE);
-							resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-							Some(resp)
-						}
-					},
-					Middleware::ForwardAuth(fa) => match self.forward_auth(&router, fa, &mut parts, &mut body, &mut replay, client_ip, &host).await {
-						AuthOutcome::Allow(add) => {
-							response_headers.extend(add.into_iter().map(|h| (i, h)));
-							None
-						}
-						AuthOutcome::Deny(resp) => Some(resp),
-					},
-					Middleware::Oidc(o) => match o.handle(&parts, self.https, &authority).await {
-						oidc::Outcome::Pass { session, set_cookie } => {
-							o.pass_identity(&mut parts.headers, &session);
-							set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
-							None
-						}
-						answer => Some(oidc_response(answer)),
-					},
-					Middleware::Crowdsec { name, appsec, block_on_error } => {
-						self.crowdsec(&snapshot, name, *appsec, *block_on_error, &parts, &mut body, client_ip, &host).await
-					}
-					// the client as global.trusted_proxies decided; refused like ip_allow
-					Middleware::Geoip(policy) => match crate::net::geoip::check(policy, global.geoip().as_deref(), client_ip) {
-						Ok(_) => None,
-						Err(info) => {
-							if log && entry.country.is_empty() {
-								entry.country = info.country_str().unwrap_or("").to_string();
-								entry.asn = info.asn;
-							}
-							Some(error_response(StatusCode::FORBIDDEN))
-						}
-					},
-					Middleware::Buffering { max } => {
-						let taken = std::mem::replace(&mut body, empty_body());
-						match resilience::buffer(&parts.headers, taken, *max).await {
-							Ok(bytes) => {
-								body = full_body(bytes.clone());
-								replay = Some(bytes);
-								None
-							}
-							Err(true) => Some(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
-							Err(false) => Some(error_response(StatusCode::BAD_REQUEST)),
-						}
-					}
-					Middleware::Retry(policy) => {
-						retry = Some(policy.clone());
-						None
-					}
-					Middleware::Mirror { name, service: to, share, slots } => {
-						if let Some(slot) = share.take().then(|| self.mirror_slot(slots, route_name, name)).flatten() {
-							mirrors.push(mirror::Copy {
-								name: name.clone(),
-								service: to.clone(),
-								method: parts.method.clone(),
-								uri: parts.uri.clone(),
-								headers: parts.headers.clone(),
-								client_ip,
-								host: host.clone(),
-								forwarded: false,
-								trusted: snapshot.trusts(canonical(self.client.ip())),
-								slot,
-							});
-						}
-						None
-					}
-					Middleware::CircuitBreaker(breaker) => match breaker.admit() {
-						Some(ticket) => {
-							sent.tickets.push((i, ticket));
-							None
-						}
-						None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
-					},
-					Middleware::Cache(c) => {
-						// the client certificate is a credential, and part of the key (#340)
-						let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
-							let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
-							(t.client_cert, format!("{} {xfcc}", t.client_verify()))
-						});
-						let mut ask = cache::Ask {
-							host: &host,
-							route: route_name,
-							https: self.https,
-							port: self.local.port(),
-							cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
-							body_empty: false,
-						};
-						// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
-						// for only when the head would let the cache answer
-						if c.admits(&parts, &ask) {
-							ask.body_empty = cache::settle(&mut body).await;
-						}
-						match c.request(&mut parts, &ask).await {
-							Ok((resp, outcome)) => {
-								sent.cached = Some((c.name.clone(), outcome));
-								Some(resp)
-							}
-							Err(pending) => {
-								sent.caches.push((i, pending));
-								None
-							}
-						}
-					}
-					m => m.on_request(&mut parts, &ctx),
-				};
+				// the plain kinds directly, without the async step (#386: the hot path stays as before)
+				let resp = if m.plain() { m.on_request(step.parts, step.ctx) } else { self.request_side(m, router.pre_routing.len() + i, &mut step).await };
 				if let Some(resp) = resp {
 					answer = Some(resp);
 					answered_by = Some((m.kind(), names.get(i).map_or("", String::as_str)));
@@ -1297,15 +1318,21 @@ impl Conn {
 			// validation makes such a route end in an answering middleware
 			(None, None) => error_response(StatusCode::NOT_FOUND),
 		};
-		// response side in reverse, also for answers of the middlewares
-		for (i, m) in chain[..ran].iter().enumerate().rev() {
-			for (_, c) in set_cookies.iter().filter(|(at, _)| *at == i) {
-				resp.headers_mut().append(header::SET_COOKIE, c.clone());
+		// response side in reverse, also for answers of the middlewares: the route's, then
+		// http.pre_routing's (#386)
+		// (`pre_routing` read again: locals kept across the backend's await grow the future)
+		let pre = router.pre_routing.as_slice();
+		for (from, ran) in [(pre.len(), &chain[..ran as usize]), (0, &pre[..ran_pre as usize])] {
+			for (i, m) in ran.iter().enumerate().rev() {
+				let i = from + i;
+				for (_, c) in set_cookies.iter().filter(|(at, _)| *at == i) {
+					resp.headers_mut().append(header::SET_COOKIE, c.clone());
+				}
+				for (_, h) in response_headers.iter().filter(|(at, _)| *at == i) {
+					h.apply(resp.headers_mut());
+				}
+				resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 			}
-			for (_, h) in response_headers.iter().filter(|(at, _)| *at == i) {
-				h.apply(resp.headers_mut());
-			}
-			resp = self.on_response(&router, m, i, resp, &ctx, &mut sent).await;
 		}
 		if let Some((name, outcome)) = sent.cached.take() {
 			self.rt.http_stats.cache(route_name, &name, outcome);
@@ -1323,6 +1350,154 @@ impl Conn {
 		// logged and counted when the response body ends
 		let rt = self.rt.clone();
 		resp.map(|body| Logged { inner: body, bytes: 0, entry, log, rt, global: snapshot, started, _holds: holds }.boxed())
+	}
+
+	/// The request side of one middleware, at position `i` of the chain (`http.pre_routing`'s
+	/// first, #386, then the route's). `Some` answers the request without going further.
+	async fn request_side(&self, m: &Middleware, i: usize, st: &mut Step<'_>) -> Option<Response<Body>> {
+		match m {
+			Middleware::BasicAuth(b) => match b.check(&st.parts.headers).await {
+				BasicVerdict::Allow(user) => {
+					if st.log {
+						st.entry.user = user.clone();
+					}
+					if !b.keep_authorization {
+						st.parts.headers.remove(header::AUTHORIZATION);
+					}
+					if let Some(h) = &b.user_header {
+						st.parts.headers.remove(h);
+						if let Ok(v) = HeaderValue::from_str(&user) {
+							st.parts.headers.insert(h.clone(), v);
+						}
+					}
+					None
+				}
+				BasicVerdict::Deny(why) => {
+					if st.log {
+						st.entry.auth_error = why.to_string();
+					}
+					let mut resp = error_response(StatusCode::UNAUTHORIZED);
+					resp.headers_mut().insert(header::WWW_AUTHENTICATE, b.challenge());
+					Some(resp)
+				}
+				BasicVerdict::Unavailable => {
+					if st.log {
+						st.entry.auth_error = "unavailable".into();
+					}
+					Some(error_response(StatusCode::SERVICE_UNAVAILABLE))
+				}
+				BasicVerdict::Busy => {
+					if st.log {
+						st.entry.auth_error = "busy".into();
+					}
+					let mut resp = error_response(StatusCode::SERVICE_UNAVAILABLE);
+					resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+					Some(resp)
+				}
+			},
+			Middleware::ForwardAuth(fa) => {
+				match Box::pin(self.forward_auth(st.router, fa, st.parts, st.body, st.replay, st.client_ip, st.host)).await {
+					AuthOutcome::Allow(add) => {
+						st.response_headers.extend(add.into_iter().map(|h| (i, h)));
+						None
+					}
+					AuthOutcome::Deny(resp) => Some(resp),
+				}
+			}
+			Middleware::Oidc(o) => match Box::pin(o.handle(st.parts, self.https, st.authority)).await {
+				oidc::Outcome::Pass { session, set_cookie } => {
+					o.pass_identity(&mut st.parts.headers, &session);
+					st.set_cookies.extend(set_cookie.into_iter().map(|c| (i, c)));
+					None
+				}
+				answer => Some(oidc_response(answer)),
+			},
+			Middleware::Crowdsec { name, appsec, block_on_error } => {
+				Box::pin(self.crowdsec(st.snapshot, name, *appsec, *block_on_error, st.parts, st.body, st.client_ip, st.host)).await
+			}
+			// the client as global.trusted_proxies decided; refused like ip_allow
+			Middleware::Geoip(policy) => match crate::net::geoip::check(policy, self.rt.global.geoip().as_deref(), st.client_ip) {
+				Ok(_) => None,
+				Err(info) => {
+					if st.log && st.entry.country.is_empty() {
+						st.entry.country = info.country_str().unwrap_or("").to_string();
+						st.entry.asn = info.asn;
+					}
+					Some(error_response(StatusCode::FORBIDDEN))
+				}
+			},
+			Middleware::Buffering { max } => {
+				let taken = std::mem::replace(st.body, empty_body());
+				match resilience::buffer(&st.parts.headers, taken, *max).await {
+					Ok(bytes) => {
+						*st.body = full_body(bytes.clone());
+						*st.replay = Some(bytes);
+						None
+					}
+					Err(true) => Some(error_response(StatusCode::PAYLOAD_TOO_LARGE)),
+					Err(false) => Some(error_response(StatusCode::BAD_REQUEST)),
+				}
+			}
+			Middleware::Retry(policy) => {
+				*st.retry = Some(policy.clone());
+				None
+			}
+			Middleware::Mirror { name, service: to, share, slots } => {
+				if let Some(slot) = share.take().then(|| self.mirror_slot(slots, st.route_name, name)).flatten() {
+					st.mirrors.push(mirror::Copy {
+						name: name.clone(),
+						service: to.clone(),
+						method: st.parts.method.clone(),
+						uri: st.parts.uri.clone(),
+						headers: st.parts.headers.clone(),
+						client_ip: st.client_ip,
+						host: st.host.to_string(),
+						forwarded: false,
+						trusted: st.snapshot.trusts(canonical(self.client.ip())),
+						slot,
+					});
+				}
+				None
+			}
+			Middleware::CircuitBreaker(breaker) => match breaker.admit() {
+				Some(ticket) => {
+					st.sent.tickets.push((i, ticket));
+					None
+				}
+				None => Some(error_response(StatusCode::SERVICE_UNAVAILABLE)),
+			},
+			Middleware::Cache(c) => {
+				// the client certificate is a credential, and part of the key (#340)
+				let cert = self.client_auth().then_some(self.tls.as_ref()).flatten().map(|t| {
+					let xfcc = xfcc(t).and_then(|v| v.to_str().ok().map(str::to_string)).unwrap_or_default();
+					(t.client_cert, format!("{} {xfcc}", t.client_verify()))
+				});
+				let mut ask = cache::Ask {
+					host: st.host,
+					route: st.route_name,
+					https: self.https,
+					port: self.local.port(),
+					cert: cert.as_ref().map(|(given, id)| (*given, id.as_str())),
+					body_empty: false,
+				};
+				// a GET or HEAD may still carry DATA frames over HTTP/2 and HTTP/3 (#340); looked
+				// for only when the head would let the cache answer
+				if c.admits(st.parts, &ask) {
+					ask.body_empty = cache::settle(st.body).await;
+				}
+				match c.request(st.parts, &ask).await {
+					Ok((resp, outcome)) => {
+						st.sent.cached = Some((c.name.clone(), outcome));
+						Some(resp)
+					}
+					Err(pending) => {
+						st.sent.caches.push((i, pending));
+						None
+					}
+				}
+			}
+			m => m.on_request(st.parts, st.ctx),
+		}
 	}
 
 	/// The response side of one middleware.

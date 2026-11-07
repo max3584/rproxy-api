@@ -416,7 +416,7 @@ v0.3.0 で形を決め、中身は v0.3.x のパッチで順に使えるよう�
 ### `http` のルールの動き（v0.3.1）
 
 - クライアントとは HTTP/1.1 と HTTP/2 で話す。`terminate` では、`tls.alpn` を指定していなければ ALPN で `h2` と `http/1.1` を提示する（`GET /rules` の `tls.alpn` は指定どおりのまま）。平文では HTTP/1.1 と、前置きで始まる HTTP/2（h2c）を受ける。
-- ルートは `priority` の大きい順（省略時は `match` の文字数。Traefik と同じ）、同じなら書いた順に試し、最初に一致したものを使う。どれにも一致しなければ `default`（`service` か `status`。省略時は 404）。
+- ルートは `priority` の大きい順（省略時は `match` の文字数。Traefik と同じ）、同じなら書いた順に試し、最初に一致したものを使う。どれにも一致しなければ `default`（`service` か `status`。省略時は 404）。`http.pre_routing`（v0.4.22）のミドルウェアは照合の前に働く（下の「ルートを選ぶ前のミドルウェア」）。
 - `Host` はポートを除き、大文字小文字を区別せず、末尾のドットを除いて比べる（`EXAMPLE.com.` は `example.com`。v0.4.17、#320）。HTTP/2 では `:authority` を使う。パスは照合の前に正規化する（下の「HTTP の転送の扱い」の「パス」）。`ClientIP` はクライアントの IP：接続元、または接続元が `global.trusted_proxies` の範囲なら、`X-Forwarded-For` を右から見て最初の信頼しないアドレス（Traefik と同じ。クライアントが左に書き足したアドレスは使わない）。`ip_allow`・`X-Real-IP`・アクセスログも同じ IP を使う。
 - `match` の式の上限（v0.3.18）：括弧と `!` の入れ子は 32 段まで、1 つの式に書ける条件（`Host(...)` など。引数の数は数えない）は 256 個まで。超えると設定の誤り（API は 400、設定ファイルは起動・再読み込み・`--check-config` の誤り）。
 - 時間の値（`10s`・`500ms`・`1m`・`2h` の形。`period`・`timeouts`・`health_check` の `interval` / `timeout`・`initial_interval`・`window` / `recovery`・`update_interval` など）は 365 日（`8760h`）まで（v0.3.18）。それより長い値は設定の誤り。
@@ -692,6 +692,7 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
 | ルートの時間の上限（#227） | `http.routes[].timeouts` | `{"request": "10s", "backend_request": "5s"}` | `http_options` の `route_timeouts` |
 | Host の書き換え（#228） | ミドルウェア `replace_host` | `{"host": "one.example.org"}` | `middlewares` の `replace_host` |
 | 転送先ごとのミドルウェア（#229、v0.4.3 で `cors`・リダイレクト・`mirror`） | `http.services.<名前>.servers[].middlewares` | `http.middlewares` の名前の一覧 | `http_options` の `server_middlewares`（使える種類は `server_middleware_kinds`） |
+| ルートを選ぶ前のミドルウェア（v0.4.22、#386、GEP-5224 の listener のフィルタ） | `http.pre_routing` | `http.middlewares` の名前の一覧（書いた順） | `http_options` の `pre_routing`（使える種類は `pre_routing_kinds`） |
 | CORS（#230） | ミドルウェア `cors` | `allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age` | `middlewares` の `cors` |
 | 状態コードでの送り直し（#231） | `retry` | `status: ["500", "502-504"]` | `http_options` の `retry_status` |
 | ミラー（#232） | ミドルウェア `mirror` | `{"service": "<名前>", "percent": 20}` か `{"service": "<名前>", "fraction": {"numerator": 1, "denominator": 3}}` | `middlewares` の `mirror` |
@@ -749,6 +750,19 @@ rproxy-gateway（#28）が Gateway API の HTTPRoute・GRPCRoute・TLSRoute・Ba
   - `backend_request`：転送先への 1 回の送信の、送り始めから応答の本文の終わりまで。応答ヘッダの前に過ぎたら 504（`retry` が送り直せるなら次の転送先へ）。応答ヘッダの後は `request` と同じく切る。このルートではサービスの `timeouts.response` の代わりに使う（`timeouts.connect` はそのまま）。
   - 101（WebSocket など）の後の中継は数えない。
 - **`replace_host`**（#228）：転送先へ送る `Host`（HTTP/2 の転送先なら `:authority`）を `host`（`host[:port]`）にする。サービスの `pass_host_header` より優先。`X-Forwarded-Host` はクライアントが送った値のまま。`match` には効かない（ルートを選んだ後に働く）。
+- **ルートを選ぶ前のミドルウェア**（v0.4.22、#386。Gateway API の listener の `filters.requests`、GEP-5224）：`http.pre_routing` に `http.middlewares` の名前を並べると、そのルールが受けた**すべての**リクエストに、ルートの照合の前に書いた順で働く（`default` のリクエストにも）。
+  - ルートは、それらが変えた後のパス・ヘッダ・メソッドで 1 回だけ照合する（例：`forward_auth` の `response_headers` で写した認可サーバのヘッダを `Header(...)` で見てルートを選ぶ。`strip_prefix` などで変えたパスで照合する）。
+  - `Host`・`:authority` の変更は効かない：照合にも転送先にも、クライアントが送った値を使う（ミドルウェアが変えたら元に戻す。5xx で断ることはしない）。待ち受け（ルール）の選び直しもしない。
+  - 答えたもの（`forward_auth` の認可サーバの 401 / 403 など、`ip_allow` の 403、リダイレクト）はそのまま返し、ルートの照合には進まない。どのルートにも合わないリクエストでも、404 や `default` の前に断る。
+  - 応答へは逆の順で、ルートのミドルウェアの応答側の後に働く（`headers` の `response`・`cors`・`compress`・`errors`・`circuit_breaker` の結果など）。
+  - ルートの `timeouts.request` はリクエストを受けたとき（ルートを選ぶ前のミドルウェアの前）から数える。ルートはまだ決まっていないので、ルートを選ぶ前のミドルウェアのあいだは止めず（`forward_auth` の `timeout` などそれぞれの上限）、照合の後で過ぎていれば、ルートのミドルウェアも転送先も通さずにすぐ 504（`refused_by: request_timeout`）。`circuit_breaker` は 1 つのリクエストを 1 回数え、ファイルの枠の 503（`BudgetRefused`）と時間切れの 504 は転送先の失敗に数えない（ルートのミドルウェアと同じ）。
+  - 使える種類：`redirect_scheme`・`redirect_regex`・`ip_allow`・`headers`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`・`respond`・`rate_limit`・`in_flight`・`crowdsec`・`compress`・`buffering`・`circuit_breaker`・`errors`・`basic_auth`・`forward_auth`（`forward_body` も）・`oidc`・`geoip`・`cors`。ルート・転送先に結びつく `retry`・`mirror`・`cache` と、Host を変える `replace_host` は置けない（`400 invalid`）。一覧は `features.pre_routing_kinds`、使えるかは `features.http_options` の `pre_routing`。
+  - 1 つのミドルウェアは 1 つのリクエストに 1 回だけ働く：ルートの `middlewares` にも同じ名前があれば、ルートではリクエスト側も応答側も飛ばす（`circuit_breaker`・`in_flight`・`basic_auth` などが 2 回目で壊れないように。rproxy-gateway は listener とルートに同じ ExtensionRef を置ける）。`pre_routing` の中で同じ名前を 2 回書くと `400 invalid`。飛ばすのはルートの `middlewares` だけで、転送先ごとの `servers[].middlewares` は同じ名前でも働く。ルートの `cache` の検証（後ろに置けない種類など）も、飛ばした後の並びで見る。
+  - パスを変えたら、照合の前にもう一度正規化する（#320 と同じ。`http.strict_path` の確かめも。`http.raw_path` のルールは正規化しない）。`strip_prefix` で `/../admin` になっても `/admin` として照合する。正規化できないパスは 400（`refused_by: bad_path`）。
+  - 認証（`basic_auth`・`forward_auth`・`oidc`）を置くと、どのルートの `cache` にも `share_after_auth: true` が要る（ルートの中で前に置いたときと同じ。#340）。
+  - ACME の HTTP-01 の答え、421（`tls.misdirected`）、400（`bad_path`・`strict_path`）は、これより前に答える。
+  - アクセスログの `route` は選んだルート（断ったときは選ぶ前なので `(none)`）、`refused_by`・`middleware` は断ったミドルウェア。
+  - 空（既定）のときは今までと同じ。
 - **転送先ごとのミドルウェア**（#229）：`servers[].middlewares` のミドルウェアは、その転送先へ送るリクエストにだけ、ルートのミドルウェアの後に働く（`retry` の送り直しでは、送り直す先の転送先のもの）。応答へは逆の順で、ルートのミドルウェアの応答側より先に働く。使える種類は `headers`・`replace_host`・`strip_prefix`・`add_prefix`・`replace_path`・`replace_path_regex`、v0.4.3 から `cors`・`redirect_scheme`・`redirect_regex`・`mirror`・`forward_auth`（ほかは `400 invalid`。`features.server_middleware_kinds` に一覧）。
   - v0.4.3 で足した種類（Gateway API の backendRef の `CORS`・`RequestRedirect`・`RequestMirror` のフィルタ）：`cors` はその転送先に当たったプリフライトに答え、その転送先の応答に CORS のヘッダを付ける。`redirect_scheme`・`redirect_regex` はその転送先に当たったリクエストに転送先へ送らずリダイレクトで答える（`retry` の送り直しはしない）。`mirror` はその転送先へ送るリクエストの写しを、そこまでのミドルウェア（ルートのもの、その転送先の前のもの）を通った形で `service` の転送先へも送る（`X-Forwarded-*` もそのまま。1 つのリクエストで 1 回だけ：`retry` の送り直しでは、最初に `mirror` のある転送先に当たったときだけ）。本文は流れてくるそのまま、`buffering` で読み切った本文はそれを写す。`mirror` の先のサービスの転送先が自分で `mirror` を持つと `400 invalid`（写しを写さない）。
 - **`cors`**（#230）：

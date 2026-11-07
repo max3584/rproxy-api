@@ -45,6 +45,11 @@ pub struct HttpSpec {
 	/// read differently from rproxy (`..;/`, a decoded `%2F`, double decoding; #320).
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub strict_path: bool,
+	/// Middlewares (names in `middlewares`) every request passes, in this order, before the
+	/// routes are matched (#386, the Gateway API's listener filters, GEP-5224): the routes then
+	/// see the path, headers and method as they left them. Kinds in `PRE_ROUTING_MIDDLEWARES`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_routing: Vec<String>,
 	#[serde(default)]
 	pub routes: Vec<RouteSpec>,
 	/// What a request that matches no route gets (404 when left out).
@@ -176,6 +181,14 @@ pub struct ServerSpec {
 pub const SERVER_MIDDLEWARES: &[&str] = &[
 	"headers", "replace_host", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex", "cors", "redirect_scheme",
 	"redirect_regex", "mirror", "forward_auth",
+];
+
+/// Middleware kinds that `http.pre_routing` may use (#386): all but those tied to the route or
+/// its backend (`retry`, `mirror`, `cache`) and `replace_host` (Host is not changed before routing).
+pub const PRE_ROUTING_MIDDLEWARES: &[&str] = &[
+	"redirect_scheme", "redirect_regex", "ip_allow", "headers", "strip_prefix", "add_prefix", "replace_path", "replace_path_regex",
+	"respond", "rate_limit", "in_flight", "crowdsec", "compress", "buffering", "circuit_breaker", "errors", "basic_auth",
+	"forward_auth", "oidc", "geoip", "cors",
 ];
 
 /// The service a middleware sends to besides the request's (`mirror`, `forward_auth` with `service`).
@@ -899,6 +912,22 @@ impl HttpSpec {
 		for (name, mw) in &self.middlewares {
 			mw.validate(name, &self.services)?;
 		}
+		for (i, m) in self.pre_routing.iter().enumerate() {
+			if self.pre_routing[..i].contains(m) {
+				return Err(invalid(format!("pre_routing: middleware {m:?} is listed twice (a middleware runs at most once per request)")));
+			}
+			match self.middlewares.get(m) {
+				None => return Err(invalid(format!("pre_routing: middleware {m:?} is not defined"))),
+				Some(spec) if !PRE_ROUTING_MIDDLEWARES.contains(&spec.kind()) => {
+					return Err(invalid(format!(
+						"pre_routing: middleware {m:?} ({}) cannot run before routing; only {}",
+						spec.kind(),
+						PRE_ROUTING_MIDDLEWARES.join(", ")
+					)));
+				}
+				Some(_) => {}
+			}
+		}
 		let mut seen = std::collections::HashSet::new();
 		for r in &self.routes {
 			if r.name.is_empty() || !seen.insert(r.name.as_str()) {
@@ -947,19 +976,22 @@ impl HttpSpec {
 	/// before it that signs users in needs `share_after_auth` (the answer is shared).
 	fn check_cache_route(&self, r: &RouteSpec) -> Result<(), ApiError> {
 		let kind = |m: &String| self.middlewares[m].kind();
-		let Some(at) = r.middlewares.iter().position(|m| kind(m) == "cache") else { return Ok(()) };
-		let what = format!("route {}: middleware {:?} (cache)", r.name, r.middlewares[at]);
-		if r.middlewares[at + 1..].iter().any(|m| kind(m) == "cache") {
+		// the chain as it runs: names of http.pre_routing are skipped in a route (#386)
+		let chain: Vec<String> = r.middlewares.iter().filter(|m| !self.pre_routing.contains(m)).cloned().collect();
+		let Some(at) = chain.iter().position(|m| kind(m) == "cache") else { return Ok(()) };
+		let what = format!("route {}: middleware {:?} (cache)", r.name, chain[at]);
+		if chain[at + 1..].iter().any(|m| kind(m) == "cache") {
 			return Err(invalid(format!("{what}: a route takes one cache")));
 		}
-		if let Some(m) = r.middlewares[at + 1..].iter().find(|m| middleware::cache::GATES.contains(&kind(m))) {
+		if let Some(m) = chain[at + 1..].iter().find(|m| middleware::cache::GATES.contains(&kind(m))) {
 			return Err(invalid(format!(
 				"{what}: {m:?} ({}) comes after it, and an answer from the cache would not pass it; put it before the cache",
 				kind(m)
 			)));
 		}
-		let MiddlewareSpec::Cache(spec) = &self.middlewares[&r.middlewares[at]] else { return Ok(()) };
-		if let Some(m) = r.middlewares[..at].iter().find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
+		let MiddlewareSpec::Cache(spec) = &self.middlewares[&chain[at]] else { return Ok(()) };
+		// http.pre_routing (#386) runs before every route's middlewares
+		if let Some(m) = self.pre_routing.iter().chain(&chain[..at]).find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
 			if !spec.share_after_auth {
 				return Err(invalid(format!(
 					"{what}: {m:?} ({}) comes before it, so the backend may answer each user differently; set share_after_auth: true only if every user who gets in may see the same answer",
@@ -983,7 +1015,8 @@ impl HttpSpec {
 			let kinds: Vec<(&String, &MiddlewareSpec)> = r.middlewares.iter().filter_map(|m| self.middlewares.get(m).map(|s| (m, s))).collect();
 			let Some(at) = kinds.iter().position(|(_, s)| matches!(s, MiddlewareSpec::Cache(_))) else { continue };
 			let (name, MiddlewareSpec::Cache(c)) = kinds[at] else { continue };
-			if !c.share_credentials && kinds[..at].iter().any(|(_, s)| s.kind() == "oidc") {
+			let pre_oidc = self.pre_routing.iter().any(|m| self.middlewares.get(m).is_some_and(|s| s.kind() == "oidc"));
+			if !c.share_credentials && (pre_oidc || kinds[..at].iter().any(|(_, s)| s.kind() == "oidc")) {
 				out.push(format!(
 					"route {}: cache {name:?} comes after oidc, whose session cookie makes every request BYPASS the cache; set share_credentials: true if every signed-in user may get the same answer",
 					r.name
@@ -1007,6 +1040,9 @@ impl HttpSpec {
 		}
 		if self.routes.iter().any(|r| r.timeouts.is_some()) {
 			used.push("route_timeouts");
+		}
+		if !self.pre_routing.is_empty() {
+			used.push("pre_routing");
 		}
 		if self.raw_path {
 			used.push("raw_path");
