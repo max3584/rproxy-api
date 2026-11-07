@@ -1476,7 +1476,7 @@ impl Settings {
 			}
 		}
 		let fallback = built.access_log_fallback;
-		let brings_crowdsec = to.crowdsec.is_some() && to.crowdsec != before.crowdsec;
+		let brought = brought(&differing(&before, &to), &to);
 		registry.under_rules_lock(|_| commit(registry, built)).await.finish_with(registry).await;
 		{
 			let mut s = self.state();
@@ -1500,9 +1500,7 @@ impl Settings {
 		// not under the turn: name resolution may take a while, and each rule is
 		// checked again (its generation, `crowdsec_gate`) under the rules lock (#347)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 	}
 
 	/// Builds the live items of a version of the settings file (`ConfigReloader::reload`,
@@ -1603,7 +1601,7 @@ impl Settings {
 			})
 			.await;
 		replaced.finish_with(registry).await;
-		let brings_crowdsec = {
+		let brought = {
 			let mut s = self.state();
 			s.file_raw = raw;
 			if let Some(f) = built.access_log_fallback {
@@ -1616,15 +1614,13 @@ impl Settings {
 				s.failed.insert(item, e);
 			}
 			let api = s.api.clone();
-			let brings = changed.contains(&"crowdsec") && to.crowdsec.is_some();
+			let brings = brought(&changed, &to);
 			s.settle(to, file, api);
 			brings
 		};
 		// not under the turn (#347, as in `restore`)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 		changed
 	}
 
@@ -1773,7 +1769,7 @@ impl Settings {
 			})
 			.await?;
 		replaced.finish_with(registry).await;
-		let brings_crowdsec = {
+		let brought = {
 			let mut s = self.state();
 			for (i, _) in &named {
 				if let Some(d) = item(i) {
@@ -1801,13 +1797,11 @@ impl Settings {
 				s.persisted = Some(false);
 			}
 			info!(event = "config.global", token = by, items = ?changes.iter().map(|c| c.item).collect::<Vec<_>>(), applied = ?applied);
-			applied.contains(&"crowdsec") && s.live.crowdsec.is_some()
+			brought(&applied, &s.live)
 		};
 		// not under the turn (#347, as in `restore`)
 		drop(turn);
-		if brings_crowdsec {
-			registry.retry_waiting_for_crowdsec().await;
-		}
+		retry_brought(registry, brought).await;
 		Ok(Patched { changes, applied })
 	}
 
@@ -2020,6 +2014,27 @@ fn masked_url(u: &str) -> String {
 		out.push_str(MASKED);
 	}
 	out
+}
+
+/// What rules failed waiting for that a change put in force (`changed`: the items whose
+/// value in force changed; `to`: in force after it).
+fn brought(changed: &[&'static str], to: &Live) -> Vec<crate::error::Reason> {
+	let mut out = vec![];
+	if changed.contains(&"crowdsec") && to.crowdsec.is_some() {
+		out.push(crate::error::Reason::NeedsCrowdsec);
+	}
+	if changed.contains(&"geoip") && to.geoip.is_some() {
+		out.push(crate::error::Reason::NeedsGeoip);
+	}
+	out
+}
+
+/// Starts again the rules that waited for what a change brought (#347, #345); not under
+/// the turn: each rule is checked again under the rules lock.
+async fn retry_brought(registry: &Arc<Registry>, brought: Vec<crate::error::Reason>) {
+	for reason in brought {
+		registry.retry_waiting_for(reason).await;
+	}
 }
 
 /// Takes what `commit` swaps in out of `built`, leaving the fallback flag.

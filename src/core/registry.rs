@@ -553,13 +553,20 @@ impl Registry {
 	/// `appsec_url`), after a change of `global` brought it (#342: the stored values
 	/// read late by the periodic check, a `PATCH`, a reload). Returns how many started.
 	pub async fn retry_waiting_for_crowdsec(self: &Arc<Self>) -> usize {
+		self.retry_waiting_for(crate::error::Reason::NeedsCrowdsec).await
+	}
+
+	/// Starts again the rules that failed waiting for `reason` (`global.crowdsec`,
+	/// `global.geoip`, #342, #345), after a change of `global` brought what they wait
+	/// for. Returns how many started.
+	pub async fn retry_waiting_for(self: &Arc<Self>, reason: crate::error::Reason) -> usize {
 		let waiting: Vec<(RuleSpec, u64)> = self
 			.rules
 			.lock()
 			.await
 			.values()
 			.filter_map(|e| match e {
-				Entry::Failed(f) if f.reason == Some(crate::error::Reason::NeedsCrowdsec) => Some((f.spec.clone(), f.generation)),
+				Entry::Failed(f) if f.reason == Some(reason) => Some((f.spec.clone(), f.generation)),
 				_ => None,
 			})
 			.collect();
@@ -577,7 +584,7 @@ impl Registry {
 			let result = prepared.and_then(|p| self.start(spec.clone(), p));
 			match result {
 				Ok(running) => {
-					info!(event = "rule.create", rule = %key, phase = "crowdsec", "global.crowdsec is in force now");
+					info!(event = "rule.create", rule = %key, phase = "global", waited_for = ?reason, "what the rule waited for in global is in force now");
 					rules.insert(key, Entry::Running(running));
 					started += 1;
 				}
@@ -626,7 +633,7 @@ impl Registry {
 		}
 		let geoip = self.cfg.http.geoip();
 		match need.refuses(geoip.as_ref().map(|g| g.spec())) {
-			Some(why) => Err(ApiError::invalid(format!("geoip: {why} (the settings file or PATCH /config/global)"))),
+			Some(why) => Err(ApiError::needs_geoip(format!("geoip: {why} (the settings file or PATCH /config/global)"))),
 			None => Ok(()),
 		}
 	}
@@ -1091,13 +1098,13 @@ impl Registry {
 		let databases = self.cfg.http.geoip();
 		let geoip = databases.as_ref().map(|g| g.spec());
 		if let Some(g) = &spec.geoip {
-			g.check_databases("geoip", geoip).map_err(ApiError::invalid)?;
+			g.check_databases("geoip", geoip).map_err(ApiError::needs_geoip)?;
 		}
 		let http = match &spec.http {
 			Some(h) => {
 				for (name, m) in &h.middlewares {
 					if let crate::l7::MiddlewareSpec::Geoip(g) = m {
-						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::invalid)?;
+						g.check_databases(&format!("middleware {name}"), geoip).map_err(ApiError::needs_geoip)?;
 					}
 				}
 				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec().as_ref())?;

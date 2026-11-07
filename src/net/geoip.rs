@@ -311,13 +311,17 @@ impl Db {
 const MAX_DB: u64 = 1 << 30;
 
 /// Reads a database: a regular file only (a FIFO or a device is refused before it
-/// is read, #345: `/dev/zero` has no length and would be read without end), and no
-/// more than `MAX_DB` whatever its length says.
+/// is read, #345: `/dev/zero` has no length and would be read without end), not a
+/// symbolic link (`O_NOFOLLOW`: the file named, not one a link put in its place), and
+/// no more than `MAX_DB` whatever its length says.
 fn load(path: &Path) -> Result<Reader<Vec<u8>>, (std::io::ErrorKind, String)> {
 	use std::io::Read;
 	use std::os::unix::fs::OpenOptionsExt;
-	let err = |e: std::io::Error| (e.kind(), format!("{}: {e}", path.display()));
-	let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(err)?;
+	let err = |e: std::io::Error| match e.raw_os_error() {
+		Some(libc::ELOOP) => (std::io::ErrorKind::InvalidData, format!("{}: a symbolic link (name the file itself)", path.display())),
+		_ => (e.kind(), format!("{}: {e}", path.display())),
+	};
+	let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path).map_err(err)?;
 	let meta = file.metadata().map_err(err)?;
 	if !meta.is_file() {
 		return Err((std::io::ErrorKind::InvalidData, format!("{}: not a regular file", path.display())));
@@ -597,6 +601,34 @@ mod tests {
 		assert!(matches!(Geoip::open(&missing), Err(GeoipError::Config(e)) if e.contains("country_db")));
 		let garbage = GeoipGlobal { asn_db: Some(write(&dir, "garbage.mmdb", b"garbage")), ..Default::default() };
 		assert!(matches!(Geoip::open(&garbage), Err(GeoipError::Config(e)) if e.contains("not a MaxMind database")));
+		std::fs::remove_dir_all(dir).unwrap();
+	}
+
+	#[test]
+	fn only_regular_files_up_to_the_limit_are_read() {
+		let dir = std::env::temp_dir().join(format!("rproxy-geoip-load-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		// a FIFO: refused without blocking on it
+		let fifo = dir.join("fifo.mmdb");
+		let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+		// SAFETY: a valid C string and mode
+		assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+		assert!(load(&fifo).unwrap_err().1.contains("not a regular file"));
+		// a link to /dev/zero (and a link to a good database): not followed
+		let zero = dir.join("zero.mmdb");
+		std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+		let e = load(&zero).unwrap_err();
+		assert_eq!(e.0, std::io::ErrorKind::InvalidData, "{e:?}");
+		assert!(e.1.contains("symbolic link"), "{e:?}");
+		let good = write(&dir, "good.mmdb", &mmdb::build("GeoLite2-Country", &[("192.0.2.0/24", mmdb::country("JP"))]));
+		load(Path::new(&good)).unwrap();
+		std::os::unix::fs::symlink(&good, dir.join("link.mmdb")).unwrap();
+		assert!(load(&dir.join("link.mmdb")).is_err());
+		// larger than MAX_DB (sparse): refused before it is read
+		let big = dir.join("big.mmdb");
+		std::fs::File::create(&big).unwrap().set_len(MAX_DB + 1).unwrap();
+		assert!(load(&big).unwrap_err().1.contains("larger than"));
 		std::fs::remove_dir_all(dir).unwrap();
 	}
 

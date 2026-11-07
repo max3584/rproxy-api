@@ -19,6 +19,8 @@ pub struct ApiError {
 pub enum Reason {
 	/// `global.crowdsec` (or its `appsec_url`) is not in force.
 	NeedsCrowdsec,
+	/// `global.geoip` (or the database its lists need) is not in force (#345).
+	NeedsGeoip,
 }
 
 impl ApiError {
@@ -63,6 +65,12 @@ impl ApiError {
 	/// `global.crowdsec` (or its `appsec_url`) in force (#342, #347).
 	pub fn needs_crowdsec(message: impl Into<String>) -> Self {
 		ApiError { reason: Some(Reason::NeedsCrowdsec), ..Self::invalid(message) }
+	}
+
+	/// `400 invalid` for a rule whose `geoip` lists need a database of `global.geoip`
+	/// that is not in force: started again once it is (#345).
+	pub fn needs_geoip(message: impl Into<String>) -> Self {
+		ApiError { reason: Some(Reason::NeedsGeoip), ..Self::invalid(message) }
 	}
 
 	pub fn unsupported(message: impl Into<String>) -> Self {

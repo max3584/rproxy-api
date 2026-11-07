@@ -834,7 +834,7 @@ async fn relayed_from(from: &str, port: u16) -> bool {
 
 /// `global.geoip` through the API (#345): only over the Unix socket, only files right in
 /// RPROXY_API_GEOIP_DIR, swapped for the next connection, and a database the rules' lists
-/// need is not taken away (409 in_use), neither by a PATCH nor by a rule racing it.
+/// need is not taken away by a PATCH (409 in_use).
 #[tokio::test]
 async fn geoip_through_the_api_is_swapped_for_the_next_connection() {
 	let dir = workdir("geoip");
@@ -1031,5 +1031,50 @@ async fn a_reload_swaps_acme_and_keeps_the_resolvers_rules_use() {
 	fs::write(&file, "version: 1\n").unwrap();
 	assert!(matches!(reloader.reload(true).await, Outcome::Applied(_)));
 	assert!(h.registry.acme().is_none());
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// Rules that could not start for want of `global.geoip` (restored before it was read, or
+/// lacking the database their lists need) start once a PATCH or the stored values read
+/// late bring it (#345).
+#[tokio::test]
+async fn rules_waiting_for_geoip_start_once_it_is_in_force() {
+	let dir = workdir("geoip-waiting");
+	let h = harness_with(tokens(&dir)).await;
+	let store = Arc::new(Store::memory("node-a"));
+	h.registry.set_persist(store.clone());
+	init_with_file(&h, &dir, "version: 1\n", true);
+	let (country, asn) = geoip_files(&dir, "JP");
+	store.memory_put_global(StoredGlobal {
+		spec: json!({"geoip": {"country_db": country, "check_interval": "0s"}}),
+		spec_version: 1,
+		updated_by: "ui".into(),
+		updated_at: 1,
+	});
+	// as main does when load_global fails, then the rules
+	h.registry.global().set_not_loaded();
+	let backend = tcp_backend("G:").await;
+	let (p_country, p_asn) = (free_port(), free_port());
+	let mut by_country = rule("tcp", p_country, backend);
+	by_country["geoip"] = json!({"allow_countries": ["JP"]});
+	let mut by_asn = rule("tcp", p_asn, backend);
+	by_asn["geoip"] = json!({"deny_asns": [64496]});
+	let specs = [by_country, by_asn].into_iter().map(|r| serde_json::from_value(r).unwrap()).collect();
+	h.registry.restore_as(specs, Origin::Dynamic).await;
+	let unix = api(&h, &dir, true).await;
+	let state = |port: u16| {
+		let unix = unix.clone();
+		async move { call(&unix, "admin", Method::GET, &format!("/rules/tcp/127.0.0.1/{port}"), None).await.1["state"].clone() }
+	};
+	assert_eq!((state(p_country).await, state(p_asn).await), (json!("failed"), json!("failed")));
+	// the periodic check reads the stored values: the country rule starts, the ASN rule still waits
+	store.reconcile(&h.registry).await.unwrap();
+	assert_eq!((state(p_country).await, state(p_asn).await), (json!("running"), json!("failed")));
+	assert!(relayed_from("127.0.0.1", p_country).await);
+	// a PATCH brings the ASN database
+	let (status, v) = patch(&unix, "/config/global", json!({"geoip": {"country_db": country, "asn_db": asn, "check_interval": "0s"}})).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	assert_eq!(state(p_asn).await, json!("running"));
+	assert!(!relayed_from("127.0.0.2", p_asn).await, "AS64496 denied");
 	fs::remove_dir_all(dir).unwrap();
 }

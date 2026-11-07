@@ -879,11 +879,11 @@ rules:
 ```
 
 - データベースは同梱しない。MaxMind の GeoLite2（アカウントを作って `geoipupdate` で取る）か、同じ項目（`country.iso_code`、なければ `registered_country.iso_code`、`autonomous_system_number`）を持つ mmdb を使う。ファイルはメモリに読み込み（mmap はしない）、`check_interval` ごとと SIGHUP で変わっていれば読み直す（`event: "geoip.reload"`）。読み直せない（書きかけ・壊れている・権限）ときは今のものを使い続ける（`event: "degraded"`、`part: "geoip"`。同じ問題は 1 回だけ）。起動時（と `--check-config`）は、ファイルがない・mmdb でないなら設定のエラーで起動しない。権限で読めないなら `degraded` を出して起動し、読めるまでそのデータベースの判定はすべて「分からない」になる。
-- 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（分かっている国か ASN が、そのリストに当たらなければ拒否。もう一方が分からなくても拒否する。セキュリティレビュー L18）。リストが要る国・ASN がどれも分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。**データベースが読めないときも `unknown` になる**ので、拒否に倒したいときは `unknown: deny` にする。データベースは 1 GiB まで（それより大きいファイルは読まない）。
+- 判定：まず `deny_*` に当たれば拒否。`allow_*` のどれかが書いてあれば、どれかの `allow_*` に当たるものだけ通す（分かっている国か ASN が、そのリストに当たらなければ拒否。もう一方が分からなくても拒否する。セキュリティレビュー L18）。リストが要る国・ASN がどれも分からない（データベースにない・私用アドレス・データベースが読めない）ものは `unknown`（既定 `allow`）。**データベースが読めないときも `unknown` になる**ので、拒否に倒したいときは `unknown: deny` にする。データベースは 1 GiB まで（それより大きいファイルは読まない）。読むのは通常のファイルだけで、シンボリックリンクはたどらない（v0.4.22、#345。`country_db`・`asn_db` がリンクなら設定の誤り。リンクの先のファイルを指す。FIFO・デバイスも読まない）。
 - L4（ルールの `geoip`）：`allow_from` の後、`crowdsec` の前、受け付けた直後（TLS より前。`proxy_protocol` ではヘッダのクライアントで）に判定する。TCP は接続を閉じ、UDP はデータグラムを捨てる（開いているセッションのものも。セッションは作らない）。HTTP/3 は QUIC の接続を受ける前。`http` のルールでも使える（見るのは接続元の IP）。拒否は `stats.denied` に数え、`conn.denied`（`reason: "geoip"`、分かれば `country`・`asn`。UDP は `allow_from` と同じく送信元ごとに間引く）。
 - L7（ミドルウェアの `geoip`）：`global.trusted_proxies` で決めたクライアントの IP で判定し、拒否は `403`（`ip_allow` と同じ）。`http.access` の `refused_by: "geoip"`・`middleware`、`country`・`asn`。
 - `log_country: true` で、`conn.open`（TCP・UDP）と `http.access` に `country`（と `asn`）が付く（分からないときは付かない）。
-- `global.geoip` は稼働中に変えられる（v0.4.22、#345）：設定ファイルの読み直しと、ファイルに書いていなければ `PATCH /config/global`（既定で Unix ソケットからだけ、ファイルは `RPROXY_API_GEOIP_DIR` の下だけ。上の「global の設定の API」）。データベースを開き直して入れ替え、新しい接続・リクエストから使う。ルールのリストが要るデータベースを外すのは `409 in_use`。
+- `global.geoip` は稼働中に変えられる（v0.4.22、#345）：設定ファイルの読み直しと、ファイルに書いていなければ `PATCH /config/global`（既定で Unix ソケットからだけ、ファイルは `RPROXY_API_GEOIP_DIR` の下だけ。上の「global の設定の API」）。データベースを開き直して入れ替え、新しい接続・リクエストから使う。ルールのリストが要るデータベースを外すのは `409 in_use`。データベースがなくて起動できなかったルール（DB・引き継ぎから戻したもの）は、`geoip` が入ったとき（PATCH・読み直し・照合が後から読んだとき）に動かし直す。
 - 国のリストは `country_db`、ASN のリストは `asn_db` がないと `400 invalid`（設定ファイルは検証の誤り）。`PATCH` で `geoip` を付けると丸ごと置き換え、`{}` で外す（接続は切らない。次の接続・データグラムから）。
 - CrowdSec と組み合わせるとき：国・ASN での粗い絞り込みは `geoip`、振る舞いでの ban は CrowdSec（L4 のルールの `crowdsec: true`、L7 の `crowdsec` ミドルウェア）。判定の順は `allow_from` → `geoip` → `crowdsec`。CrowdSec の側でも `crowdsecurity/geoip-enrich` で国を付けられるので、rproxy の `log_country` は SIEM などで rproxy のログだけを見るとき向け（docs/CROWDSEC.md）。
 
