@@ -976,20 +976,22 @@ impl HttpSpec {
 	/// before it that signs users in needs `share_after_auth` (the answer is shared).
 	fn check_cache_route(&self, r: &RouteSpec) -> Result<(), ApiError> {
 		let kind = |m: &String| self.middlewares[m].kind();
-		let Some(at) = r.middlewares.iter().position(|m| kind(m) == "cache") else { return Ok(()) };
-		let what = format!("route {}: middleware {:?} (cache)", r.name, r.middlewares[at]);
-		if r.middlewares[at + 1..].iter().any(|m| kind(m) == "cache") {
+		// the chain as it runs: names of http.pre_routing are skipped in a route (#386)
+		let chain: Vec<String> = r.middlewares.iter().filter(|m| !self.pre_routing.contains(m)).cloned().collect();
+		let Some(at) = chain.iter().position(|m| kind(m) == "cache") else { return Ok(()) };
+		let what = format!("route {}: middleware {:?} (cache)", r.name, chain[at]);
+		if chain[at + 1..].iter().any(|m| kind(m) == "cache") {
 			return Err(invalid(format!("{what}: a route takes one cache")));
 		}
-		if let Some(m) = r.middlewares[at + 1..].iter().find(|m| middleware::cache::GATES.contains(&kind(m))) {
+		if let Some(m) = chain[at + 1..].iter().find(|m| middleware::cache::GATES.contains(&kind(m))) {
 			return Err(invalid(format!(
 				"{what}: {m:?} ({}) comes after it, and an answer from the cache would not pass it; put it before the cache",
 				kind(m)
 			)));
 		}
-		let MiddlewareSpec::Cache(spec) = &self.middlewares[&r.middlewares[at]] else { return Ok(()) };
+		let MiddlewareSpec::Cache(spec) = &self.middlewares[&chain[at]] else { return Ok(()) };
 		// http.pre_routing (#386) runs before every route's middlewares
-		if let Some(m) = self.pre_routing.iter().chain(&r.middlewares[..at]).find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
+		if let Some(m) = self.pre_routing.iter().chain(&chain[..at]).find(|m| middleware::cache::SIGN_IN.contains(&kind(m))) {
 			if !spec.share_after_auth {
 				return Err(invalid(format!(
 					"{what}: {m:?} ({}) comes before it, so the backend may answer each user differently; set share_after_auth: true only if every user who gets in may see the same answer",

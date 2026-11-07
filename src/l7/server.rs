@@ -1087,7 +1087,9 @@ impl Conn {
 		};
 		// request side in the chain's order, until one answers
 		let (mut parts, mut body) = req.into_parts();
-		let mut ran = 0;
+		// how many of the route's and of http.pre_routing's middlewares ran: u32 each, so the two
+		// take the room of the one usize before #386 (they are kept across the backend's await)
+		let mut ran: u32 = 0;
 		let mut answer = None;
 		let mut replay: Option<Bytes> = None;
 		let mut retry: Option<RetryPolicy> = None;
@@ -1114,7 +1116,7 @@ impl Conn {
 		// http.pre_routing (#386): every request, before the routes are matched (and before
 		// `default`); positions 0.. of the chain, the route's middlewares follow
 		let pre = router.pre_routing.as_slice();
-		let mut ran_pre = 0;
+		let mut ran_pre: u32 = 0;
 		// a route's timeouts.request counts from before them (#227: from receiving the request)
 		let received = (!pre.is_empty()).then(tokio::time::Instant::now);
 		if !pre.is_empty() && answer.is_none() {
@@ -1141,7 +1143,9 @@ impl Conn {
 			};
 			for (i, m) in pre.iter().enumerate() {
 				ran_pre += 1;
-				if let Some(resp) = self.request_side(m, i, &mut step).await {
+				// the plain kinds directly, without the async step (#386: the hot path stays as before)
+				let resp = if m.plain() { m.on_request(step.parts, step.ctx) } else { self.request_side(m, i, &mut step).await };
+				if let Some(resp) = resp {
 					answer = Some(resp);
 					answered_by = Some((m.kind(), router.pre_names.get(i).map_or("", String::as_str)));
 					break;
@@ -1202,7 +1206,6 @@ impl Conn {
 		}
 		// timeouts.request (#227) covers the middlewares too (#356): reading a body, asking an
 		// auth server or an OIDC provider, waiting for a cache's lead
-		let offset = pre.len();
 		let chain_run = async {
 			// sign-in callbacks and logout of `oidc`, whichever route matched
 			if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
@@ -1233,7 +1236,9 @@ impl Conn {
 			};
 			for (i, m) in chain.iter().enumerate() {
 				ran += 1;
-				if let Some(resp) = self.request_side(m, offset + i, &mut step).await {
+				// the plain kinds directly, without the async step (#386: the hot path stays as before)
+				let resp = if m.plain() { m.on_request(step.parts, step.ctx) } else { self.request_side(m, router.pre_routing.len() + i, &mut step).await };
+				if let Some(resp) = resp {
 					answer = Some(resp);
 					answered_by = Some((m.kind(), names.get(i).map_or("", String::as_str)));
 					break;
@@ -1315,7 +1320,9 @@ impl Conn {
 		};
 		// response side in reverse, also for answers of the middlewares: the route's, then
 		// http.pre_routing's (#386)
-		for (from, ran) in [(offset, &chain[..ran]), (0, &pre[..ran_pre])] {
+		// (`pre_routing` read again: locals kept across the backend's await grow the future)
+		let pre = router.pre_routing.as_slice();
+		for (from, ran) in [(pre.len(), &chain[..ran as usize]), (0, &pre[..ran_pre as usize])] {
 			for (i, m) in ran.iter().enumerate().rev() {
 				let i = from + i;
 				for (_, c) in set_cookies.iter().filter(|(at, _)| *at == i) {

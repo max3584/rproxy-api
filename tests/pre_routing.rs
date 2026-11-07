@@ -267,6 +267,11 @@ async fn pre_routing_takes_only_kinds_that_run_before_routing() {
 	assert!(v["error"].as_str().unwrap().contains("share_after_auth"), "{v}");
 	let (status, v) = h.post(cached(true)).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
+	// a gate after the cache that pre_routing runs already is skipped there: not "after the cache"
+	let mut rule = cached(true);
+	rule["http"]["routes"][0]["middlewares"] = json!(["c", "fa"]);
+	let (status, v) = h.post(rule).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
 
 	let (_, caps) = h.get("/capabilities").await;
 	assert!(caps["features"]["http_options"].as_array().unwrap().contains(&json!("pre_routing")), "{caps}");
