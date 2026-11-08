@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # CrowdSec's own image (Alpine; crowdsec and cscli in /usr/local/bin, the configuration in /staging)
-      image: crowdsecurity/crowdsec:v1.8.1-slim
+      image: crowdsecurity/crowdsec:v1.8.2-slim
       # the clients live in a network namespace (ip netns)
       options: --privileged
     steps:
