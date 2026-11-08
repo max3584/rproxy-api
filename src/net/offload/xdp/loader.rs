@@ -49,14 +49,16 @@ impl Steer {
 		let mut ebpf = Ebpf::load(PROGRAM).map_err(err)?;
 		let program: &mut Xdp = ebpf.program_mut("xdp_redirect").ok_or_else(|| io::Error::other("xdp_redirect not in the object"))?.try_into().map_err(err)?;
 		program.load().map_err(err)?;
-		program.attach(iface, mode.aya()).map_err(err)?;
+		// aya 0.16 takes the interface name as a C string (or an index).
+		let name = std::ffi::CString::new(iface).map_err(err)?;
+		program.attach(name.as_c_str(), mode.aya()).map_err(err)?;
 		Ok(Steer { ebpf, iface: iface.to_string(), mode })
 	}
 
 	/// Steers this UDP destination port to the XSKs.
 	pub fn add_port(&mut self, port: u16) -> io::Result<()> {
 		let mut ports: BpfHashMap<_, u16, u8> = BpfHashMap::try_from(self.ebpf.map_mut("PORTS").ok_or_else(|| io::Error::other("no PORTS map"))?).map_err(err)?;
-		ports.insert(port, 1u8, 0).map_err(err)
+		ports.insert(&port, &1u8, 0).map_err(err)
 	}
 
 	/// Binds the AF_XDP socket `fd` as the target for RX `queue`.

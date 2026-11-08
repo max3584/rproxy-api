@@ -9,7 +9,7 @@ name = "xdp-redirect"
 path = "src/main.rs"
 
 [dependencies]
-aya-ebpf = "0.2.0"
+aya-ebpf = "0.3.0"
 
 [profile.dev]
 opt-level = 3

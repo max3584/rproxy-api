@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum_server::accept::Accept;
+use axum_server::tls::TlsService;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -321,7 +322,7 @@ where
 	S: Send + 'static,
 {
 	type Stream = TlsStream<I>;
-	type Service = <axum::Extension<ClientCert> as Layer<S>>::Service;
+	type Service = <axum::Extension<ClientCert> as Layer<TlsService<S>>>::Service;
 	type Future = BoxFuture<io::Result<(Self::Stream, Self::Service)>>;
 
 	fn accept(&self, stream: I, service: S) -> Self::Future {
