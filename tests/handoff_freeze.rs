@@ -46,16 +46,27 @@ fn sha(s: &str) -> String {
 	sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `ci` stores its rules and sets.
+/// `ci` stores its rules and sets; `root` is `admin` (changes other tokens' rules, #401).
 fn tokens(dir: &std::path::Path) -> Tokens {
 	let file = dir.join("tokens.yaml");
-	fs::write(&file, format!("tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n", sha("ci")))
-		.unwrap();
+	fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+			sha("ci"),
+			sha("root")
+		),
+	)
+	.unwrap();
 	Tokens::from_file(file).unwrap()
 }
 
 async fn call(h: &Harness, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-	let mut req = h.http.request(method, format!("{}{path}", h.base)).bearer_auth("ci");
+	call_as(h, "ci", method, path, body).await
+}
+
+async fn call_as(h: &Harness, token: &str, method: Method, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+	let mut req = h.http.request(method, format!("{}{path}", h.base)).bearer_auth(token);
 	if let Some(b) = body {
 		req = req.json(&b);
 	}
@@ -344,8 +355,11 @@ async fn invalid_rules_and_owners_carry_over() {
 	let (status, v) = call(&new, Method::GET, &format!("/rules/tcp/127.0.0.1/{dynamic}"), None).await;
 	assert_eq!((status, &v["state"], &v["origin"]), (StatusCode::OK, &json!("failed"), &json!("dynamic")), "{v}");
 	assert!(new.registry.owners().contains(&(key(made), "ci".to_string())), "{:?}", new.registry.owners());
-	// fixed in the new process
-	let (status, v) = call(&new, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{api}"), Some(json!({"remote_addr": "127.0.0.1", "remote_port": 9, "allow_from": []}))).await;
+	// fixed in the new process: someone's rule, so not by ci (#401), by an admin token
+	let fix = json!({"remote_addr": "127.0.0.1", "remote_port": 9, "allow_from": []});
+	let (status, v) = call(&new, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{api}"), Some(fix.clone())).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "the owner carried over: {v}");
+	let (status, v) = call_as(&new, "root", Method::PATCH, &format!("/rules/tcp/127.0.0.1/{api}"), Some(fix)).await;
 	assert_eq!((status, &v["state"], &v["persisted"]), (StatusCode::OK, &json!("running"), &json!(true)), "{v}");
 	fs::remove_dir_all(dir).unwrap();
 }
