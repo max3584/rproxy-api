@@ -232,6 +232,9 @@ async fn an_overlay_oidc_does_not_take_a_file_routes_path() {
 	let (secret, cookie) = (dir.join("client.secret"), dir.join("cookie.secret"));
 	std::fs::write(&secret, "s3cret").unwrap();
 	std::fs::write(&cookie, "0123456789abcdef0123456789abcdef").unwrap();
+	for f in [&secret, &cookie] {
+		std::fs::set_permissions(f, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+	}
 	let port = free_port();
 	let file = json!({"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "http": {
 		"routes": [{"name": "cb", "match": "PathPrefix(`/cb`)", "service": "a"}],
@@ -508,7 +511,10 @@ async fn an_overlay_reaching_the_files_secrets_needs_admin() {
 	let dir = std::env::temp_dir().join(format!("rproxy-it-overlay-files-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let users = dir.join("users");
+	// a secret file passes the owner check only when no one else may read it
+	rproxy_api::net::files::private_umask();
 	std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+	std::fs::set_permissions(&users, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
 	let tokens = dir.join("tokens.yaml");
 	std::fs::write(
 		&tokens,
