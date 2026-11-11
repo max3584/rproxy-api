@@ -41,9 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: DPDK (Ubuntu packages)
+        # The runner's Azure mirror sometimes stalls on the librte-* packages of noble-updates
+        # (20 s per package, past the job's timeout): short timeouts with retries, then the
+        # same packages from archive.ubuntu.com.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends libdpdk-dev dpdk pkg-config python3
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=15)
+          pkgs=(libdpdk-dev dpdk pkg-config python3)
+          sudo apt-get "${apt_opts[@]}" update -q
+          if ! timeout 600 sudo apt-get "${apt_opts[@]}" install -y -q --no-install-recommends "${pkgs[@]}"; then
+            echo "::warning::the runner's apt mirror failed; using archive.ubuntu.com"
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+            sudo apt-get "${apt_opts[@]}" update -q
+            sudo apt-get "${apt_opts[@]}" install -y -q --no-install-recommends "${pkgs[@]}"
+          fi
           pkg-config --modversion libdpdk
       - uses: dtolnay/rust-toolchain@stable
         with:
