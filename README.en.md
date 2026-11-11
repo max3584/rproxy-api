@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/max3584/rproxy-api/master/scripts/i
 
 ### apt (Debian / Ubuntu)
 
-Can be installed from the apt repository (amd64 / arm64 / armhf). The same repository also has the management UI `rproxy-ui` (`sudo apt install rproxy-api rproxy-ui`. The UI requires Node.js 20.9 or later. See the [TCP-UDP-rproxy-ui README](https://github.com/max3584/TCP-UDP-rproxy-ui)).
+Can be installed from the apt repository (amd64 / arm64 / armhf). The same repository also has the management UI `rproxy-ui` (`sudo apt install rproxy-api rproxy-ui`. The UI requires Node.js 22.23.4 or later (24.22.1 or later on 24). On arm64 it runs with NodeSource's nodejs; on a Raspberry Pi, use a 64-bit OS. See the [TCP-UDP-rproxy-ui README](https://github.com/max3584/TCP-UDP-rproxy-ui)).
 
 ```shell
 sudo curl -fsSLo /usr/share/keyrings/rproxy-archive-keyring.gpg https://max3584.github.io/rproxy-api/rproxy-archive-keyring.gpg
