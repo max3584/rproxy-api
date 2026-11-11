@@ -428,10 +428,11 @@ struct SetState {
 	owner: String,
 }
 
-/// A token other than the set's owner may change it only with `admin` (security review M3).
+/// A token other than the set's owner may change it only with `admin` (security review M3;
+/// `403 not_owner` as rules and overlays, #401).
 fn check_owner(name: &str, current: Option<&SetState>, by: &str, admin: bool) -> Result<(), ApiError> {
 	match current {
-		Some(s) if s.owner != by && !admin => Err(ApiError::forbidden(format!(
+		Some(s) if s.owner != by && !admin => Err(ApiError::not_owner(format!(
 			"rule set {name:?} belongs to token {:?}; only it or an admin token may change it",
 			s.owner
 		))),

@@ -376,9 +376,10 @@ async fn overlays_survive_a_restart_and_a_live_upgrade() {
 	std::fs::write(
 		&file,
 		format!(
-			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n",
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
 			sha("ci"),
-			sha("ui")
+			sha("ui"),
+			sha("root")
 		),
 	)
 	.unwrap();
@@ -386,7 +387,7 @@ async fn overlays_survive_a_restart_and_a_live_upgrade() {
 	let store = Arc::new(Store::memory("node-o"));
 	old.registry.set_persist(store.clone());
 	old.registry.load_static_labeled(requests(json!([file_rule(port, a)]))).await.unwrap();
-	let (ci, ui) = ("Bearer ci".to_string(), "Bearer ui".to_string());
+	let (ci, ui, root) = ("Bearer ci".to_string(), "Bearer ui".to_string(), "Bearer root".to_string());
 	// a token without persist: in force, in memory only (as its rules)
 	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(overlay(b)), &[("authorization", &ui)]).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
@@ -394,16 +395,19 @@ async fn overlays_survive_a_restart_and_a_live_upgrade() {
 	assert!(store.memory_overlays().is_empty());
 	assert_eq!(fetch(port, "/x").await, (200, "B".into()));
 	assert_eq!(call(&old, Method::DELETE, &path(port), None, &[("authorization", &ui)]).await.0, StatusCode::NO_CONTENT);
-	// a persist token's is stored, and a later change by any token is written too
+	// a persist token's is stored, and a later change by any token that may make it (an admin
+	// one without persist; another token may not, #401) is written too
 	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(overlay(b)), &[("authorization", &ci)]).await;
 	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
 	let mut changed = overlay(b);
 	changed["http"]["routes"][1]["priority"] = json!(300000);
-	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(changed), &[("authorization", &ui)]).await;
-	assert_eq!((status, &v["persisted"], &v["updated_by"]), (StatusCode::OK, &json!(true), &json!("ui")), "{v}");
+	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(changed.clone()), &[("authorization", &ui)]).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "{v}");
+	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(changed), &[("authorization", &root)]).await;
+	assert_eq!((status, &v["persisted"], &v["updated_by"]), (StatusCode::OK, &json!(true), &json!("root")), "{v}");
 	let rows = store.memory_overlays();
 	assert_eq!(rows.len(), 1);
-	assert_eq!((rows[0].spec.http.as_ref().unwrap().routes[1].priority, rows[0].updated_by.as_str()), (Some(300000), "ui"));
+	assert_eq!((rows[0].spec.http.as_ref().unwrap().routes[1].priority, rows[0].updated_by.as_str()), (Some(300000), "root"));
 	std::fs::remove_dir_all(dir).unwrap();
 
 	// a live upgrade: the state, as JSON, to a new registry that read the settings file

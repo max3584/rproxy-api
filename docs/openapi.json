@@ -54,6 +54,7 @@
               "cert_store_unavailable",
               "protected_file",
               "file_not_allowed",
+              "not_owner",
               "secret_reuse",
               "file_in_use",
               "limit",
@@ -2411,6 +2412,10 @@
               "static_overlay": {
                 "type": "boolean",
                 "description": "GET / PUT / DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay: routes, services, middlewares and tls.routes added through the API on a static rule's listener, tried after the settings file's (the file wins on names: 409 overlay_conflict, shadowed after a reload); kept but not_applied while the static rule cannot take them; stored in rproxy_rule_overlays (v0.4.23, #397)"
+              },
+              "rule_owners": {
+                "type": "boolean",
+                "description": "A token without the admin scope changes and deletes (PATCH / DELETE /rules/..., dry_run too) only the rules it made (created_by, or the creator rproxy remembers for dynamic rules), and changes or removes only the overlays it made (an overlay where there is none may be made by any token with the ports); otherwise 403 not_owner. Rules whose creator is not known (restored from the UI's forward_rules, older rows without created_by) only with the token's allow_restored: true. A rule set's owner check answers 403 not_owner too (v0.4.23, #401)"
               }
             }
           },
@@ -4967,7 +4972,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope or the listen port",
+            "description": "The token lacks a scope or the listen port, or the rule is another token's or its creator is not known (not_owner, #401)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5046,7 +5051,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope or the listen port",
+            "description": "The token lacks a scope or the listen port, or the rule is another token's or its creator is not known (not_owner, #401)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5258,7 +5263,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope or the listen port (the static rule's whole range)",
+            "description": "The token lacks a scope or the listen port (the static rule's whole range), or the overlay is another token's (not_owner, #401)",
             "content": {
               "application/json": {
                 "schema": {
@@ -5336,7 +5341,7 @@
             }
           },
           "403": {
-            "description": "The token lacks a scope or the listen port (the static rule's whole range)",
+            "description": "The token lacks a scope or the listen port (the static rule's whole range), or the overlay is another token's (not_owner, #401)",
             "content": {
               "application/json": {
                 "schema": {

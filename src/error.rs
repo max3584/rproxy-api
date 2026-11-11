@@ -38,6 +38,12 @@ impl ApiError {
 		Self::new(StatusCode::FORBIDDEN, "forbidden", message)
 	}
 
+	/// A token other than `admin` changes or deletes a rule, an overlay or a rule set another
+	/// token made, or a rule whose creator is not known (#401).
+	pub fn not_owner(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::FORBIDDEN, "not_owner", message)
+	}
+
 	/// A rule from the API names a file of the certificate store, the ACME storage or a
 	/// secret of the settings (#319).
 	pub fn protected_file(message: impl Into<String>) -> Self {

@@ -516,15 +516,18 @@ async fn key_files_keep_to_their_owner() {
 	created(send(Method::POST, "/rules".into(), "a", files_rule(free_port(), &key)).await, "team-a again");
 	created(send(Method::POST, "/rules".into(), "admin", files_rule(free_port(), &key)).await, "admin");
 
-	// PATCH: adding the key to a rule of its own is refused; a PATCH of team-a's rule (its
-	// ports are team-b's too) that keeps the key it names is not
+	// PATCH: adding the key to a rule of its own is refused; team-b may not PATCH team-a's
+	// rule (#401), and team-a's PATCH that keeps the key it names is not refused
 	let b_port = free_port();
 	created(send(Method::POST, "/rules".into(), "b", rule("tcp", b_port, backend)).await, "team-b's rule");
 	let with_key = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(),
 		"tls": {"mode": "terminate", "certificates": [{"cert_file": cert, "key_file": key}]}});
 	in_use(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{b_port}"), "b", with_key.clone()).await, "PATCH adding the key");
 	in_use(send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{b_port}?dry_run=true"), "b", with_key).await, "PATCH dry run");
-	let (status, v) = send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{a_port}"), "b", json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(), "udp_idle_secs": 40})).await;
+	let keeps = json!({"remote_addr": backend.ip().to_string(), "remote_port": backend.port(), "udp_idle_secs": 40});
+	let (status, v) = send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{a_port}"), "b", keeps.clone()).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "another token's rule: {v}");
+	let (status, v) = send(Method::PATCH, format!("/rules/tcp/127.0.0.1/{a_port}"), "a", keeps).await;
 	assert_eq!(status, StatusCode::OK, "a PATCH that keeps the rule's files: {v}");
 
 	// rule sets: another token's set may not, its owner's PUT keeps its files

@@ -1072,11 +1072,22 @@ impl Registry {
 			return Owner::Token(by.clone());
 		}
 		if origin == Origin::Api {
-			if let Some(by) = self.persist().and_then(|s| s.created_by(key)) {
+			// a row without a creator (an older version's) is no token's (#401)
+			if let Some(by) = self.persist().and_then(|s| s.created_by(key)).filter(|by| !by.is_empty()) {
 				return Owner::Token(by);
 			}
 		}
 		Owner::Restored
+	}
+
+	/// Whose the rule of `key` is (#401: who may change or delete it), also of a rule that did
+	/// not validate; None when the key holds no rule or a rule of a set (changed only through
+	/// its set: `409 owned`).
+	pub async fn rule_owner(&self, key: &Key) -> Option<crate::net::protected::Owner> {
+		if let Some(spec) = self.rules.lock().await.get(key).map(|e| e.spec()) {
+			return spec.ruleset.is_none().then(|| self.owner_of(spec));
+		}
+		self.invalid_of(key).map(|i| self.owner_of_key(key, i.origin, None))
 	}
 
 	/// The tokens that created the rules made through the API (a live upgrade, #323).
@@ -3086,6 +3097,18 @@ impl Registry {
 		Ok(o.view(key.to_string(), exists, persisted))
 	}
 
+	/// An overlay is changed or removed by the token that made it (`created_by`) or an `admin`
+	/// one (#401); anyone with the ports may make one where there is none. Looked at in turn
+	/// with the other overlay changes (`static_turn`).
+	fn check_overlay_owner(&self, key: &Key, by: &str, admin: bool) -> Result<(), ApiError> {
+		match self.overlay(key) {
+			Some(o) if !admin && o.created_by != by => {
+				Err(ApiError::not_owner(format!("{key}: the overlay belongs to another token; only it or an admin token may change it")))
+			}
+			_ => Ok(()),
+		}
+	}
+
 	fn check_if_match(&self, key: &Key, if_match: Option<&str>) -> Result<Option<crate::core::overlay::Overlay>, ApiError> {
 		let current = self.overlay(key);
 		if let Some(want) = if_match.map(str::trim) {
@@ -3116,6 +3139,7 @@ impl Registry {
 		key: &Key,
 		spec: crate::core::overlay::OverlaySpec,
 		by: &str,
+		admin: bool,
 		persist: bool,
 		ports: &(dyn Fn(u16, u16) -> Result<(), ApiError> + Sync),
 		if_match: Option<&str>,
@@ -3126,6 +3150,7 @@ impl Registry {
 		let _turn = self.static_turn.lock().await;
 		let file = self.static_rule(key).await?;
 		ports(key.listen.port(), key.listen.port().saturating_add(file.port_count.saturating_sub(1)))?;
+		self.check_overlay_owner(key, by, admin)?;
 		let current = self.check_if_match(key, if_match)?;
 		let merged = crate::core::overlay::merge(&file, &spec, &self.caps().features).map_err(|(_, e)| e)?;
 		if !merged.shadowed.is_empty() {
@@ -3164,6 +3189,8 @@ impl Registry {
 	pub async fn delete_overlay(
 		self: &Arc<Self>,
 		key: &Key,
+		by: &str,
+		admin: bool,
 		ports: &(dyn Fn(u16, u16) -> Result<(), ApiError> + Sync),
 		if_match: Option<&str>,
 		dry_run: bool,
@@ -3173,6 +3200,7 @@ impl Registry {
 		let file = self.static_rule(key).await.ok();
 		let last = key.listen.port().saturating_add(file.as_ref().map_or(0, |f| f.port_count.saturating_sub(1)));
 		ports(key.listen.port(), last)?;
+		self.check_overlay_owner(key, by, admin)?;
 		let current = self.check_if_match(key, if_match)?.ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
 		let change = Change::of(key, Some(&current.spec), None);
 		if dry_run {

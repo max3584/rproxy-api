@@ -34,15 +34,17 @@ fn sha(s: &str) -> String {
 	sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `ci` stores its rules, `ui` does not.
+/// `ci` stores its rules, `ui` does not (and, as the UI's token, may change the rules restored
+/// from `forward_rules`, #401); `root` is `admin` and stores its rules.
 fn token_file(dir: &std::path::Path) -> PathBuf {
 	let file = dir.join("tokens.yaml");
 	fs::write(
 		&file,
 		format!(
-			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n",
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write], allow_restored: true}}\n  - {{name: root, sha256: {}, scopes: [admin], persist: true}}\n",
 			sha("ci"),
-			sha("ui")
+			sha("ui"),
+			sha("root")
 		),
 	)
 	.unwrap();
@@ -89,14 +91,19 @@ async fn persist_tokens_store_their_rules() {
 	assert_eq!((&r.1["origin"], r.1.get("persisted")), (&json!("dynamic"), None), "not a persist token: {}", r.1);
 	assert_eq!(store.memory_rows().len(), 1);
 
-	// a change is written whichever token makes it; the creator stays
+	// another token may not change it (#401); a change is written whichever token makes it (an
+	// admin one here); the creator stays
 	let path = format!("/rules/tcp/127.0.0.1/{stored}");
-	let r = call(&h, Method::PATCH, &path, "ui", Some(json!({"remote_addr": "127.0.0.1", "remote_port": backend.port(), "allow_from": ["127.0.0.0/8"]}))).await;
+	let patch = json!({"remote_addr": "127.0.0.1", "remote_port": backend.port(), "allow_from": ["127.0.0.0/8"]});
+	let r = call(&h, Method::PATCH, &path, "ui", Some(patch.clone())).await;
+	assert_eq!((r.0, r.1["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "{}", r.1);
+	let r = call(&h, Method::PATCH, &path, "root", Some(patch)).await;
 	assert_eq!((r.0, &r.1["persisted"]), (StatusCode::OK, &json!(true)), "{}", r.1);
 	let rows = store.memory_rows();
-	assert_eq!((rows[0].spec.allow_from.clone(), rows[0].created_by.as_str(), rows[0].updated_by.as_str()), (vec!["127.0.0.0/8".to_string()], "ci", "ui"));
-	// a persist token changing a rule that is not its kind does not store it
-	let r = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{plain}"), "ci", Some(json!({"remote_addr": "127.0.0.1", "remote_port": backend.port()}))).await;
+	assert_eq!((rows[0].spec.allow_from.clone(), rows[0].created_by.as_str(), rows[0].updated_by.as_str()), (vec!["127.0.0.0/8".to_string()], "ci", "root"));
+	// a persist token changing a rule that is not its kind does not store it (an admin one: the
+	// rule is ui's)
+	let r = call(&h, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{plain}"), "root", Some(json!({"remote_addr": "127.0.0.1", "remote_port": backend.port()}))).await;
 	assert_eq!((r.0, &r.1["origin"]), (StatusCode::OK, &json!("dynamic")));
 	assert_eq!(store.memory_rows().len(), 1);
 
@@ -496,7 +503,10 @@ async fn invalid_rules_keep_their_files_and_count() {
 	let key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{again}").parse().unwrap() };
 	// as a live upgrade hands it over
 	h.registry.set_owner(key, "ui");
-	assert_eq!(call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{again}"), "ci", None).await.0, StatusCode::NO_CONTENT);
+	// ui's now: ci may not delete it (#401), an admin token may
+	let (status, v) = call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{again}"), "ci", None).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "{v}");
+	assert_eq!(call(&h, Method::DELETE, &format!("/rules/tcp/127.0.0.1/{again}"), "root", None).await.0, StatusCode::NO_CONTENT);
 	assert!(!h.registry.owners().iter().any(|(k, _)| *k == key));
 	store.memory_put_row(row(bad));
 	store.reconcile(&h.registry).await.unwrap();

@@ -19,6 +19,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
         - name: ui
           sha256: 9f86d081...        # printf %s "$TOKEN" | sha256sum
           scopes: [rules:read, rules:write, metrics:read]
+          allow_restored: true       # v0.4.23（#401）：作ったトークンの分からないルール（UI の forward_rules から戻したもの）も直す・消す（UI のトークン。既定 false）
         - name: ci-deploy
           sha256: 2c26b46b...
           scopes: [rules:write]
@@ -33,6 +34,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
       ```
 
     - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`certs:read`（`GET /certs`。v0.4.2）、`certs:write`（`PUT` / `DELETE /certs/{name}`。v0.4.2）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
+    - v0.4.23（#401）から、`admin` でないトークンが直す・消すことができるのは自分で作ったルール・重ねる分・組だけ（ほかは `403 not_owner`。「持ち主だけが直す・消す」）。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
     - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで（IPv6 の /64 は合わせてその 5 倍まで）、その後は 1 秒に 1 行にする（全体でも続けて 200 行、その後は 1 秒に 50 行。データの経路の行とは別の枠。v0.4.20、「ログの間引きと長さ」）。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
@@ -94,6 +96,7 @@ tokens:
 3. 古いトークンをトークンファイルから消して SIGHUP。
 
 - `expires` を付けておくと、切れる前に `token.expiring` で知らせる（`--token-warn-days`）。
+- ルール・重ねる分・組の持ち主はトークンの **名前**（v0.4.23、#401）。同じ名前のまま `sha256` を新しいものに置き換えれば、作ったものはそのトークンのまま。名前を変える（新しい名前のエントリを足して古いものを消す）と、前の名前で作ったものはほかのトークンのものになり、`admin` だけが直す・消すことができる（持ち主を移す API はない。新しい名前で作り直す）。名前は 1 つのファイルに 1 回しか書けないので、名前を変えずに入れ替えるときは古いトークンが同時には通らない（止められないクライアントは、そのあいだ送り直す）。
 - クライアント証明書は、同じ名前で新しい証明書を発行してクライアントに配る（トークンファイルは変えなくてよい）。名前を変えるときは、新しい名前のエントリを足す → クライアントを切り替える → 古いエントリを消す（どれも SIGHUP）。
 - CA を入れ替えるときは、`--tls-client-ca` のファイルに新旧の CA を並べて SIGHUP → クライアントの証明書を新しい CA のものに替える → 古い CA を消して SIGHUP。
 
@@ -807,7 +810,7 @@ Kubernetes のコントローラ（別のリポジトリ `max3584/rproxy-gateway
 - 名前は `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?`（例 `k8s/default/web-gateway`）。パスの `/` はそのまま書く（`PUT /rulesets/k8s/default/web-gateway`）。
 - 本文は `{"generation": <整数>, "rules": [<POST /rules と同じルール>...]}`（ルールは 10,000 個まで、本文は 32 MiB まで）。本文を読んで解析する `PUT` は同時に 2 つまで（ほかは 30 秒まで順番を待ち、待てなければ `503 busy`）、本文は 60 秒以内に届かなければ `408 timeout`（v0.4.20、#358）。同じキーのルールを 2 つ書くと `400 invalid`。
 - 順番：まず全部を確かめ、どれかが通らなければ**何も変えない**。
-  0. 持ち主（セキュリティレビュー M3）：組はそれを作ったトークン（`owner`）のもので、ほかのトークンは `admin` でなければ `PUT` / `DELETE` できない（`403 forbidden`）。トークンの `allow_rulesets`（名前の先頭の一覧）の外の名前も `403`。rproxy の再起動のあと先に組を作られないように、コントローラのトークンには `allow_rulesets: [k8s/]` のように付け、ほかの `rules:write` のトークンには付けない名前にする。`generation` は 2^53 - 1 まで（`400 invalid`。JSON のクライアントが正しく読める数）。
+  0. 持ち主（セキュリティレビュー M3）：組はそれを作ったトークン（`owner`）のもので、ほかのトークンは `admin` でなければ `PUT` / `DELETE` できない（`403`。v0.4.23 から `code` は `not_owner`、前は `forbidden`）。トークンの `allow_rulesets`（名前の先頭の一覧）の外の名前も `403`。rproxy の再起動のあと先に組を作られないように、コントローラのトークンには `allow_rulesets: [k8s/]` のように付け、ほかの `rules:write` のトークンには付けない名前にする。`generation` は 2^53 - 1 まで（`400 invalid`。JSON のクライアントが正しく読める数）。
   1. `If-Match`（あれば）：今の etag と違う、または組がまだないと `412 precondition_failed`。`*` は「組があれば」。ETag ヘッダの引用符つきの値でも、本文の `etag` の値そのままでもよい（`W/`・カンマ区切りも受ける）。
   2. `generation`：覚えている値より小さいと `409 stale_generation`（同じ値はよい）。
   3. 各ルールの形（`POST /rules` と同じ検証。この版で動かせない設定は `unsupported`）と、本文の中のルール同士の重なり（`400 invalid`）。
@@ -1181,11 +1184,24 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 - 前の版で API から作ったルール（DB・組の保存から戻すもの、DB との照合、引き継ぎ）は断らずに動かし、守るファイルを指していれば `rule.protected_file`（`warn`。ルールと項目だけで、パスは出さない）をログに出す。そのルールの API での変更（PATCH）は、PATCH で出来上がるルール全体で確かめるので、宛先だけの PATCH でも守るファイルを指したままなら `403 protected_file`（ファイルを置き換える PATCH は通る）。
 - `oidc` のセッションの cookie は、cookie の名前に加えて `issuer` と `client_id` にも結びつける（AES-256-GCM の関連データ）。同じ cookie の秘密を使うほかの `oidc` のミドルウェアの cookie は通らない。この版に上げると、今のセッションは一度だけサインインし直しになる。
 
+### 持ち主だけが直す・消す（v0.4.23、#401、`features.rule_owners`）
+
+`admin` のスコープのトークンは何でもできる。`admin` でないトークン（サービスアカウント）はルールを作れ、**自分で作ったものだけ** を直す・消すことができる。ほかのトークンが作ったものには触れない。
+
+- 対象：`PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}`（`dry_run` も）。持ち主でなければ `403 not_owner` で、何も変えない（監査ログは `outcome: "forbidden"`・`code: "not_owner"`）。rproxy の API に一時停止・再開の口はない（UI は一時停止を `DELETE`、再開を `POST` で行う）ので、それも同じ。
+- 持ち主：`origin: "api"` は `created_by`、`dynamic` は作ったトークンを rproxy が覚える（引き継ぎで渡す）。`admin` が直しても持ち主は変わらない。読むこと（`GET`）は今までどおり。
+- 作ったトークンの分からないルール（UI の `forward_rules` から戻したもの、前の版の `rproxy_rules` の行で `created_by` が空のもの、再起動の後の `dynamic` のルール）：`admin` と、トークンファイルで **`allow_restored: true`** のトークンだけが直す・消すことができる。直しても持ち主は分からないまま（ほかの `allow_restored` のトークンも直せる）。
+- 重ねる分（`PUT` / `DELETE /rules/{key}/overlay`、`dry_run` も）：今の重ねる分の `created_by` のトークンと `admin` だけ。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる（作ったトークンのものになる）。
+- 組（`PUT` / `DELETE /rulesets/{name}`）：前から持ち主だけ（セキュリティレビュー M3）。断るときの `code` も `not_owner` にそろえた。組のルールを個別に直す・消すのは、誰でも今までどおり `409 owned`。設定ファイルのルールは `409 static`。
+- 持ち主はトークンの **名前**。同じ名前で `sha256` を入れ替えれば持ち主は変わらない。名前を変えると、前の名前で作ったものは `admin` だけが直せる（「トークン・証明書の入れ替え」）。1 行に 1 トークンの書き方のトークン（`token-1`…）とトークンファイルのないときは `admin` なので、何も変わらない。
+- **UI（TCP-UDP-rproxy-ui）**：UI は 1 つのトークンで話し、利用者ごとの持ち主は UI が自分で確かめる。UI が動いている間に作ったルールは UI のトークンのものなので、そのまま直せる。rproxy の再起動の後に `forward_rules` から戻したルールは作ったトークンが分からないので、UI のトークンが `admin` でなければ **`allow_restored: true` を付ける**（付けないと、再起動の後に UI からそのルールを直す・一時停止する・消すことが `403 not_owner` になる）。UI の README の手順（1 行に 1 トークンの書き方）は `admin` なので、付けなくてよい。`allow_restored` は UI のトークンにだけ付け、サービスアカウントには付けない。
+- rproxy-gateway のコントローラは組だけを使う（ルールの `PATCH` / `DELETE` も重ねる分も使わない）ので、変わらない。
+
 ### ほかの持ち主の鍵・秘密のファイル（v0.4.18、#323、`features.file_owners`）
 
 ルールの鍵・秘密のファイル（`tls` と `http` の `key_file`（証明書の鍵・サービスのクライアント証明書の鍵）・`client_secret_file`・`cookie_secret_file`・`users_file`）は、ほかの持ち主のルールが指していれば、API（`POST` / `PATCH /rules`・`PUT /rulesets/{name}`、`dry_run` も）からは指せない：`409 file_in_use`。ルールの組やポートに絞ったトークンが、別のチームのルールの鍵で自分のポートの TLS を終端して、そのサイトになりすませないように。証明書・チェーン・CA のファイルは公開のものなので共有してよい。
 
-- 持ち主：API で作ったルールは作ったトークン（`origin: "api"` は `created_by`。`dynamic` は rproxy が覚える。ほかのトークンが PATCH しても持ち主は変わらない）、組のルールは組の持ち主、設定ファイルのルール（`origin: static`）は設定ファイル、UI の `forward_rules` から戻したルール（作ったトークンが分からない）はどのトークンのものでもない。
+- 持ち主：API で作ったルールは作ったトークン（`origin: "api"` は `created_by`。`dynamic` は rproxy が覚える。`admin` が PATCH しても持ち主は変わらない。v0.4.23 からほかのトークンは直せない、「持ち主だけが直す・消す」）、組のルールは組の持ち主、設定ファイルのルール（`origin: static`）は設定ファイル、UI の `forward_rules` から戻したルール（作ったトークンが分からない）はどのトークンのものでもない。
 - `admin` のスコープのトークン（トークンファイルがないときも）は断らない。同じトークンは自分のほかのルール・組と共有できる。
 - 同じファイルかは inode で比べる（ハードリンク・シンボリックリンク・`..` でも同じ）。中身が同じでも写しは別のファイル。
 - PATCH・組の PUT は、置き換えるルールが今指しているファイルを指したままにできる（新しく足すファイルだけを比べる。宛先だけの PATCH は通る）。
@@ -1347,7 +1363,7 @@ http:
 - `GET …/overlay`：本文の形に `rule`・`state`（`applied` / `not_applied`）・`reason`・`error`・`shadowed`（`[{"kind","name","reason"}]`）・`etag`・`created_by`・`created_at`・`updated_by`・`updated_at`・`persisted`（DB があるとき）。ルールの表示（`GET /rules`）は今までどおりファイルの形で、`overlay`（`{"state","reason"?,"routes","tls_routes","shadowed"?}`）が付く。重ねる分のルートの数は `stats.http.routes` に名前で出る。
 - 重ねる分を変えると、ルールの `http` のルーターを作り直す（今の接続はそのまま）。設定の変わらないサービス・ミドルウェア（ファイルのものも）は前のものをそのまま使うので、`rate_limit`・`cache`・`in_flight`・ヘルスチェックなどの状態は続く（重ねる分の変更でファイルの `rate_limit` をやり直させることはできない）。変わったものと、サービスに送るミドルウェア（`mirror`・`errors`・`service` の `forward_auth`）・転送先ごとのミドルウェアのあるサービスは空から。読み直しと重ねる分の変更は順番に動く。
 - 送り元を言うヘッダ（`X-Forwarded-For`・`X-Real-IP`・`Forwarded`・`X-Forwarded-Proto` / `-Host` / `-Port` / `-Prefix` / `-Server`・`X-Forwarded-Client-Cert`・`X-Client-Verify`）は身元のヘッダにならない（v0.4.23 から、どのルールでもクライアントの値を消さない）。`basic_auth` の `user_header`・`forward_auth` の `response_headers` にこれらを書くと、API のルール・組・重ねる分は `400 invalid`、設定ファイルは `--check-config` の警告。
-- ファイル：重ねる分が指すファイル（サービスの `tls`、`basic_auth` の `users_file`、`oidc` の秘密）は API のルールと同じく確かめる（`403 protected_file`・`file_not_allowed`、`409 file_in_use`・`secret_reuse`）。持ち主は最初に作ったトークン（`created_by`）。ほかのトークンも `rules:write` とポートがあれば直せる（`updated_by` が変わる）。
+- ファイル：重ねる分が指すファイル（サービスの `tls`、`basic_auth` の `users_file`、`oidc` の秘密）は API のルールと同じく確かめる（`403 protected_file`・`file_not_allowed`、`409 file_in_use`・`secret_reuse`）。持ち主は最初に作ったトークン（`created_by`）。直す・外すことができるのは持ち主と `admin` だけ（v0.4.23、#401。ほかは `403 not_owner`。`admin` が直すと `updated_by` が変わり、持ち主は変わらない）。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる。
 - 範囲外：API のルール（`PATCH` で直す）と組のルール（組の `PUT` で直す）には重ねられない（`409 not_static`）。ルールのないキーは `404`。
 - 保存：トークンの `persist` に従う（API のルールと同じ）。`persist: true` のトークンが作った重ねる分は、DB（`RPROXY_DATABASE_URL`）があれば応答の前に `rproxy_rule_overlays` に書き（消すときは行を消す）、一度書いたものはどのトークンの変更・削除でも書く。`persist: false` のトークンのものと DB がないときはメモリだけ（再起動で消える。再起動なしの更新では状態で渡す）で、`persisted` は出ない。書けなければ `persisted: false`・`degraded`（`part: "db"`）、定期の照合が書き直す（行を正にはしない）。起動では設定ファイルのルールの後に戻す（`restore.overlays`）。テーブルがなければ戻すものはなく、書き込みは `degraded`。
 - テーブル（UI リポジトリの `db/migrations/014_rproxy_rule_overlays.sql`）：
@@ -1439,6 +1455,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `cert_store_unavailable` | 503 | v0.4.2：証明書の保存先に書けない |
 | `protected_file` | 403 | v0.4.17（#319）：API のルールが、証明書のストア・ACME の保存先の下か、設定・オプションの秘密のファイルを指している |
 | `file_not_allowed` | 403 | v0.4.17（#319）：`allow_certs` のあるトークンがルールにファイルのパスを書いた |
+| `not_owner` | 403 | v0.4.23（#401）：`admin` でないトークンが、ほかのトークンの作ったルール・重ねる分・組、または作ったトークンの分からないルール（`allow_restored` のないとき）を直す・消そうとした |
 | `secret_reuse` | 409 | v0.4.17（#319）：OIDC の client secret のファイルを、同じ issuer・client の client secret のほかにも使っている |
 | `file_in_use` | 409 | v0.4.18（#323）：ほかの持ち主（ほかのトークン・ほかのトークンの組・設定ファイル・作ったトークンの分からない戻したルール）のルールが指す鍵・秘密のファイルを、`admin` でないトークンが指した |
 | `not_static` | 409 | v0.4.23（#397）：重ねる分は固定ルールにだけ（API のルール・組のルールは範囲外） |
