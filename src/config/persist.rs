@@ -1447,8 +1447,10 @@ impl Store {
 	pub async fn save_overlay(&self, registry: &Registry, key: &Key, by: &str) -> bool {
 		let (seq, job) = {
 			let _order = self.order.lock().await;
+			// only a stored overlay has a row: one kept in memory only (a `persist: false` token's
+			// that replaced a stored one whose removal is still to be written) removes it
 			let job = match registry.overlay(key) {
-				Some(o) => Job::SaveOverlay(OverlayRecord {
+				Some(o) if o.stored => Job::SaveOverlay(OverlayRecord {
 					key: *key,
 					spec: serde_json::to_value(&o.spec).unwrap_or_default(),
 					created_by: o.created_by,
@@ -1456,7 +1458,7 @@ impl Store {
 					updated_by: o.updated_by,
 					updated_at: o.updated_at,
 				}),
-				None => Job::RemoveOverlay(*key),
+				_ => Job::RemoveOverlay(*key),
 			};
 			let seq = self.intend(|u, seq| {
 				u.overlays.insert(*key, by.into());

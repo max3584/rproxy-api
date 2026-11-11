@@ -643,3 +643,47 @@ async fn an_overlay_change_keeps_the_files_rate_limit() {
 	assert_eq!(call(&h, Method::DELETE, &path(port), None, &[]).await.0, StatusCode::NO_CONTENT);
 	assert_eq!(fetch(port, "/app").await.0, 429);
 }
+
+/// Review S1: only a stored overlay has a row. A stored overlay removed while the database is
+/// down, then a `persist: false` token's PUT on the key, then the periodic check: the row goes
+/// and the memory-only overlay is not written.
+#[tokio::test]
+async fn the_periodic_check_writes_no_memory_only_overlay() {
+	let dir = std::env::temp_dir().join(format!("rproxy-it-overlay-s1-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let file = dir.join("tokens.yaml");
+	std::fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n",
+			sha("ci"),
+			sha("ui")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(file).unwrap()).await;
+	let store = Arc::new(Store::memory("node-s1"));
+	h.registry.set_persist(store.clone());
+	let (a, b) = (backend("A").await, backend("B").await);
+	let port = free_port();
+	h.registry.load_static_labeled(requests(json!([file_rule(port, a)]))).await.unwrap();
+	let (ci, ui) = ("Bearer ci".to_string(), "Bearer ui".to_string());
+	assert_eq!(call(&h, Method::PUT, &path(port), Some(overlay(b)), &[("authorization", &ci)]).await.0, StatusCode::CREATED);
+	assert_eq!(store.memory_overlays().len(), 1);
+	// the database is down: the removal is not written
+	store.fail_writes(true);
+	assert_eq!(call(&h, Method::DELETE, &path(port), None, &[("authorization", &ci)]).await.0, StatusCode::NO_CONTENT);
+	assert_eq!(store.memory_overlays().len(), 1, "the row stays until the database is back");
+	// a token without persist puts one in memory on the same key
+	let mut mine = overlay(b);
+	mine["http"]["routes"].as_array_mut().unwrap().truncate(1);
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(mine), &[("authorization", &ui)]).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert!(v.get("persisted").is_none(), "{v}");
+	// back: the periodic check writes the removal, not the memory-only overlay
+	store.fail_writes(false);
+	store.reconcile(&h.registry).await.unwrap();
+	assert!(store.memory_overlays().is_empty(), "rows: {:?}", store.memory_overlays());
+	assert_eq!(fetch(port, "/x").await, (200, "B".into()), "the memory-only overlay is in force");
+	std::fs::remove_dir_all(dir).unwrap();
+}
