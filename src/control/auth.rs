@@ -70,6 +70,9 @@ pub struct Principal {
 	pub max_rulesets: Option<usize>,
 	/// `allow_freebind: true` of the token file (#358).
 	allow_freebind: bool,
+	/// `allow_restored: true` of the token file (#401): may change and delete rules whose
+	/// creator is not known (restored from the UI's `forward_rules`), as `admin` may.
+	allow_restored: bool,
 }
 
 impl Principal {
@@ -86,6 +89,7 @@ impl Principal {
 			max_rules: None,
 			max_rulesets: None,
 			allow_freebind: false,
+			allow_restored: false,
 		}
 	}
 
@@ -119,6 +123,20 @@ impl Principal {
 			))),
 			_ => Ok(()),
 		}
+	}
+
+	/// Whether the token may change or delete a rule of `owner` (#401): `admin` any rule, the
+	/// others their own (`created_by`, or the creator rproxy remembers), and rules whose
+	/// creator is not known only with `allow_restored`. Static rules and rules of sets are
+	/// refused elsewhere (`409 static`, `409 owned`).
+	pub fn may_change(&self, owner: &crate::net::protected::Owner) -> bool {
+		use crate::net::protected::Owner;
+		self.has(Scope::Admin)
+			|| match owner {
+				Owner::Static => true,
+				Owner::Token(name) => *name == self.name,
+				Owner::Restored => self.allow_restored,
+			}
 	}
 
 	/// Whether the token is limited to some stored certificates (`allow_certs`): it may
@@ -188,6 +206,9 @@ struct TokenEntry {
 	/// Rules with `listen_freebind` without `admin` (#358).
 	#[serde(default)]
 	allow_freebind: bool,
+	/// Change and delete rules whose creator is not known (#401; the UI's token).
+	#[serde(default)]
+	allow_restored: bool,
 	#[serde(default)]
 	expires: Option<String>,
 }
@@ -297,6 +318,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					max_rules: e.max_rules,
 					max_rulesets: e.max_rulesets,
 					allow_freebind: e.allow_freebind,
+					allow_restored: e.allow_restored,
 				},
 				expires,
 			});
@@ -321,6 +343,7 @@ fn read_tokens(path: &PathBuf) -> io::Result<Vec<Token>> {
 					max_rules: None,
 					max_rulesets: None,
 					allow_freebind: false,
+					allow_restored: false,
 				},
 				expires: None,
 			})
@@ -552,6 +575,33 @@ mod tests {
 
 	fn sha(s: &str) -> String {
 		Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	/// #401: who may change a rule of each kind of owner.
+	#[test]
+	fn tokens_change_their_own_rules() {
+		use crate::net::protected::Owner;
+		let file = tempfile(
+			"owners",
+			&format!(
+				"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:write]}}\n  - {{name: ui, sha256: {}, scopes: [rules:write], allow_restored: true}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+				sha("c"),
+				sha("u"),
+				sha("r")
+			),
+		);
+		let tokens = Tokens::from_file(file).unwrap();
+		let who = |t: &str| tokens.authenticate(Some(&format!("Bearer {t}"))).unwrap();
+		let (ci, ui, root) = (who("c"), who("u"), who("r"));
+		let mine = Owner::Token("ci".into());
+		assert!(ci.may_change(&mine) && !ui.may_change(&mine) && root.may_change(&mine));
+		assert!(!ci.may_change(&Owner::Restored) && ui.may_change(&Owner::Restored) && root.may_change(&Owner::Restored));
+		// static rules are refused elsewhere (409 static)
+		assert!(ci.may_change(&Owner::Static));
+		// one-per-line tokens are admin, as is no token file
+		let line = Tokens::from_file(tempfile("owners-line", "x\n")).unwrap();
+		assert!(line.authenticate(Some("Bearer x")).unwrap().may_change(&mine));
+		assert!(Principal::anonymous().may_change(&Owner::Restored));
 	}
 
 	#[test]

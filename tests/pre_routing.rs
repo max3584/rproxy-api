@@ -420,7 +420,9 @@ async fn a_path_rewritten_before_routing_is_normalised_again() {
 }
 
 /// The time of a route's timeouts.request that pre_routing used up: 504 at once, nothing to the
-/// backend, and not a backend failure for a circuit_breaker before.
+/// backend, and not a backend failure for a circuit_breaker before. The deadline (1 s) leaves a
+/// loaded CI runner room for the request that passes (it was 100 ms, and a slow first request
+/// with its connections to the auth server and the backend got 504).
 #[tokio::test]
 async fn a_deadline_spent_before_routing_is_answered_at_once() {
 	use std::sync::atomic::Ordering;
@@ -433,7 +435,7 @@ async fn a_deadline_spent_before_routing_is_answered_at_once() {
 			port,
 			json!({
 				"pre_routing": ["cb", "fa"],
-				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "timeouts": {"request": "100ms"}}],
+				"routes": [{"name": "r", "match": "PathPrefix(`/`)", "to": format!("http://{backend}"), "timeouts": {"request": "1s"}}],
 				"middlewares": {
 					"cb": {"circuit_breaker": {"failure_percent": 50, "window": "30s", "recovery": "30s"}},
 					"fa": {"forward_auth": {"address": format!("http://{auth}/check"), "timeout": "5s"}},
@@ -450,10 +452,11 @@ async fn a_deadline_spent_before_routing_is_answered_at_once() {
 	let before = seen.load(Ordering::SeqCst);
 	// more than MIN_REQUESTS (10): as backend failures they would open the breaker
 	for n in 0..11 {
-		let r = c.get(&url).header("X-Token", "slowish").send().await.unwrap();
+		let r = c.get(&url).header("X-Token", "slow").send().await.unwrap();
 		assert_eq!(r.status(), StatusCode::GATEWAY_TIMEOUT, "request {n}");
 	}
-	tokio::time::sleep(Duration::from_millis(200)).await;
+	// past the auth server's answer (1.5 s) to the last request
+	tokio::time::sleep(Duration::from_millis(700)).await;
 	assert_eq!(seen.load(Ordering::SeqCst), before, "nothing went to the backend after the deadline");
 	assert_eq!(c.get(&url).header("X-Token", "gold").send().await.unwrap().status(), StatusCode::OK, "the breaker stays closed");
 }

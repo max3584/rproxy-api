@@ -188,7 +188,8 @@ fn check_ports(principal: &Principal, first: u16, last: Option<u16>) -> AppResul
 fn audit<T>(principal: &Principal, client: &Client, action: &str, rule: &str, result: &AppResult<T>) {
 	let (outcome, code) = match result {
 		Ok(_) => ("ok", ""),
-		// refused by the token's allow_listen_ports, allow_certs, or a protected file (#319)
+		// refused by the token's allow_listen_ports, allow_certs, a protected file (#319), or
+		// another token's rule (#401, `not_owner`)
 		Err(e) if e.status == StatusCode::FORBIDDEN => ("forbidden", e.code),
 		Err(e) => ("error", e.code),
 	};
@@ -604,6 +605,41 @@ async fn check_rule_ports(state: &AppState, principal: &Principal, key: &Key) ->
 	check_ports(principal, view.listen_port, view.listen_port_end)
 }
 
+/// A change or deletion of a rule by a token other than `admin` (#401): only of its own rules
+/// (`created_by`, or the creator rproxy remembers for `dynamic` ones), and of rules whose
+/// creator is not known (restored from the UI's `forward_rules`, older rows) only with
+/// `allow_restored`. Otherwise `403 not_owner`. A key without a rule passes (the change
+/// answers `404`), as do static rules and rules of sets (`409 static`, `409 owned`).
+///
+/// This early check answers before the other checks and for dry runs; the change itself is
+/// checked again under the rules lock (`owner_check`, `Registry::take_as` / `update_as`), so a
+/// rule another token makes on the key in between is not changed.
+async fn check_rule_owner(state: &AppState, principal: &Principal, key: &Key) -> AppResult<()> {
+	match state.registry.rule_owner(key).await {
+		Some(owner) => may_change(principal, key, &owner),
+		None => Ok(()),
+	}
+}
+
+/// `403 not_owner` unless the token may change a rule of `owner` (#401).
+fn may_change(principal: &Principal, key: &Key, owner: &crate::net::protected::Owner) -> AppResult<()> {
+	if principal.may_change(owner) {
+		return Ok(());
+	}
+	let whose = match owner {
+		crate::net::protected::Owner::Restored => {
+			"its creator is not known (restored from the UI's database or an older version); only an admin token or one with allow_restored may change it"
+		}
+		_ => "it belongs to another token; only it or an admin token may change it",
+	};
+	Err(ApiError::not_owner(format!("{key}: {whose}")))
+}
+
+/// The owner check the registry runs under the rules lock (#401); None for `admin`.
+fn owner_check<'a>(principal: &'a Principal, key: &'a Key) -> Option<impl Fn(&crate::net::protected::Owner) -> AppResult<()> + Sync + 'a> {
+	(!principal.has(Scope::Admin)).then_some(move |owner: &crate::net::protected::Owner| may_change(principal, key, owner))
+}
+
 /// The ports and scopes of a PATCH. A PATCH of a restored rule that did not validate
 /// (#327) starts the rule it makes as a new one: that body is checked as a `POST`.
 async fn check_update_scope(state: &AppState, principal: &Principal, key: &Key, req: &UpdateRequest) -> AppResult<()> {
@@ -633,6 +669,7 @@ async fn update(
 		h.check_names()?;
 	}
 	if crate::config::plan::dry_run(&query)? {
+		check_rule_owner(&state, &principal, &key).await?;
 		check_update_scope(&state, &principal, &key, &req).await?;
 		drop(super::rule_files::check_update(&state.registry, &principal, &key, &req).await?);
 		return Ok(Json(crate::config::plan::plan_update(&state.registry, &key, req).await?).into_response());
@@ -640,10 +677,12 @@ async fn update(
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		let result = async {
+			check_rule_owner(&state, &principal, &key).await?;
 			check_update_scope(&state, &principal, &key, &req).await?;
 			check_update_limits(&state, &key, &req).await?;
 			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
-			state.registry.update(&key, req).await
+			let owner = owner_check(&principal, &key);
+			state.registry.update_as(&key, req, owner.as_ref().map(|f| f as crate::core::registry::OwnerCheck<'_>)).await
 		}
 		.await;
 		audit(&principal, &client, "update", &key.to_string(), &result);
@@ -662,6 +701,7 @@ async fn delete(
 ) -> AppResult<impl IntoResponse> {
 	let key = parse_key(&protocol, &addr, &port)?;
 	if crate::config::plan::dry_run(&query)? {
+		check_rule_owner(&state, &principal, &key).await?;
 		check_rule_ports(&state, &principal, &key).await?;
 		return Ok(Json(crate::config::plan::plan_delete(&state.registry, &key).await?).into_response());
 	}
@@ -677,8 +717,10 @@ async fn delete(
 			store.check_backlog(principal.has(Scope::Admin))?;
 		}
 		let result = async {
+			check_rule_owner(&state, &principal, &key).await?;
 			check_rule_ports(&state, &principal, &key).await?;
-			state.registry.take(&key).await
+			let owner = owner_check(&principal, &key);
+			state.registry.take_as(&key, owner.as_ref().map(|f| f as crate::core::registry::OwnerCheck<'_>)).await
 		}
 		.await;
 		audit(&principal, &client, "delete", &key.to_string(), &result);
@@ -765,7 +807,7 @@ async fn put_overlay(
 		return Ok(Json(
 			state
 				.registry
-				.put_overlay(&key, spec, &principal.name, principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), true)
+				.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), true)
 				.await?,
 		)
 		.into_response());
@@ -777,7 +819,7 @@ async fn put_overlay(
 			let ports = overlay_ports(&principal);
 			state
 				.registry
-				.put_overlay(&key, spec, &principal.name, principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), false)
+				.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), false)
 				.await
 		}
 		.await;
@@ -804,7 +846,7 @@ async fn delete_overlay(
 	let if_match = if_match(&headers)?;
 	if crate::config::plan::dry_run(&query)? {
 		let ports = overlay_ports(&principal);
-		return Ok(Json(state.registry.delete_overlay(&key, &ports, if_match.as_deref(), true).await?).into_response());
+		return Ok(Json(state.registry.delete_overlay(&key, &principal.name, principal.has(Scope::Admin), &ports, if_match.as_deref(), true).await?).into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
@@ -812,7 +854,7 @@ async fn delete_overlay(
 		let stored = state.registry.overlay(&key).is_some_and(|o| o.stored);
 		let result = async {
 			let ports = overlay_ports(&principal);
-			state.registry.delete_overlay(&key, &ports, if_match.as_deref(), false).await
+			state.registry.delete_overlay(&key, &principal.name, principal.has(Scope::Admin), &ports, if_match.as_deref(), false).await
 		}
 		.await;
 		audit(&principal, &client, "overlay.delete", &key.to_string(), &result);

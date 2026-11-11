@@ -267,6 +267,10 @@ pub struct Features {
 	/// `tls.routes` added through the API on a static rule's listener, tried after the file's
 	/// (the file wins on names); stored in `rproxy_rule_overlays` (#397)
 	pub static_overlay: bool,
+	/// A token other than `admin` changes and deletes only the rules and overlays it made
+	/// (`403 not_owner`); rules whose creator is not known only with the token's
+	/// `allow_restored` (#401)
+	pub rule_owners: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -346,6 +350,7 @@ impl Features {
 		global_api_geoip: true,
 		global_api_acme: true,
 		static_overlay: true,
+		rule_owners: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -407,6 +412,7 @@ impl Features {
 		global_api_geoip: true,
 		global_api_acme: true,
 		static_overlay: true,
+		rule_owners: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
