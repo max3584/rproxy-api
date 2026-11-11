@@ -519,6 +519,10 @@ impl Drop for Rproxy {
 
 impl Rproxy {
 	fn start(dir: &std::path::Path, port: u16, url: &str, tag: &str) -> Rproxy {
+		Rproxy::start_with(dir, port, url, tag, &[])
+	}
+
+	fn start_with(dir: &std::path::Path, port: u16, url: &str, tag: &str, env: &[(&str, String)]) -> Rproxy {
 		let out = dir.join(format!("{tag}.log"));
 		let child = Command::new(env!("CARGO_BIN_EXE_rproxy-api"))
 			.current_dir(dir)
@@ -527,6 +531,7 @@ impl Rproxy {
 			.env("RPROXY_DATABASE_URL", url)
 			.env("RPROXY_NODE_NAME", "node-a")
 			.env("RPROXY_TOKEN_FILE", dir.join("tokens.yaml"))
+			.envs(env.iter().map(|(k, v)| (*k, v.as_str())))
 			.stdout(fs::File::create(&out).unwrap())
 			.stderr(Stdio::null())
 			.spawn()
@@ -770,6 +775,91 @@ async fn global_values_survive_a_restart_with_mariadb() {
 	let row: (String,) = sqlx::query_as("SELECT CAST(spec AS CHAR) FROM rproxy_global WHERE node = 'node-a'").fetch_one(&pool).await.unwrap();
 	assert_eq!(row.0, "[1]", "not overwritten");
 	for drop in ["DROP TABLE IF EXISTS forward_rules", "DROP TABLE IF EXISTS rproxy_rules", "DROP TABLE IF EXISTS rproxy_global"] {
+		pool.execute(drop).await.unwrap();
+	}
+	fs::remove_dir_all(dir).unwrap();
+}
+
+/// The DDL of `rproxy_rule_overlays` in docs/API.md (#397; the UI repository's migration 014).
+const RPROXY_RULE_OVERLAYS: &str = "CREATE TABLE rproxy_rule_overlays (
+	node         VARCHAR(255) NOT NULL,
+	protocol     VARCHAR(8)   NOT NULL,
+	listen_addr  VARCHAR(45)  NOT NULL,
+	listen_port  INT UNSIGNED NOT NULL,
+	spec         JSON         NOT NULL,
+	spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+	created_by   VARCHAR(255) NOT NULL,
+	created_at   DATETIME(3)  NOT NULL,
+	updated_by   VARCHAR(255) NOT NULL,
+	updated_at   DATETIME(3)  NOT NULL,
+	PRIMARY KEY (node, protocol, listen_addr, listen_port)
+)";
+
+/// #397 with the real binary and MariaDB: a `persist: true` token's overlay on a static rule
+/// is in force without `rproxy_rule_overlays` (`persisted: false`), written once the table is
+/// there, put back on the static rule after a restart, and its row goes with `DELETE`; a
+/// `persist: false` token's is kept in memory only.
+#[tokio::test]
+async fn overlays_survive_a_restart_with_mariadb() {
+	use sqlx::Executor;
+	let Ok(url) = std::env::var("RPROXY_TEST_DATABASE_URL") else {
+		eprintln!("skipping: RPROXY_TEST_DATABASE_URL is not set");
+		return;
+	};
+	let _db = DB.lock().await;
+	let pool = sqlx::mysql::MySqlPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+	let drops = ["DROP TABLE IF EXISTS forward_rules", "DROP TABLE IF EXISTS rproxy_rules", "DROP TABLE IF EXISTS rproxy_rule_overlays"];
+	for drop in drops {
+		pool.execute(drop).await.unwrap();
+	}
+	pool.execute(FORWARD_RULES).await.unwrap();
+	pool.execute(RPROXY_RULES).await.unwrap();
+	let dir = workdir("db-overlay");
+	token_file(&dir);
+	let backend = tcp_backend("O:").await;
+	let (api_port, port, other) = (free_port(), free_port(), free_port());
+	let config = dir.join("rules.yaml");
+	let static_rule = |p: u16| format!("  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {p}, remote_addr: 127.0.0.1, remote_port: 9, tls: {{mode: sni, routes: [{{server_name: a.test, remote_addr: 127.0.0.1, remote_port: 9}}]}}}}\n");
+	fs::write(&config, format!("version: 1\nrules:\n{}{}", static_rule(port), static_rule(other))).unwrap();
+	let env = [("RPROXY_CONFIG", config.display().to_string())];
+	let client = reqwest::Client::new();
+	let path = format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{port}/overlay");
+	let overlay = json!({"tls": {"routes": [{"server_name": "b.test", "remote_addr": "127.0.0.1", "remote_port": backend.port()}]}});
+	{
+		let rp = Rproxy::start_with(&dir, api_port, &url, "first", &env);
+		rp.wait(api_port).await;
+		// before migration 014: in force, not stored
+		let r = client.put(&path).bearer_auth("ci").json(&overlay).send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::CREATED);
+		let v: Value = r.json().await.unwrap();
+		assert_eq!((&v["state"], &v["persisted"]), (&json!("applied"), &json!(false)), "{v}");
+		pool.execute(RPROXY_RULE_OVERLAYS).await.unwrap();
+		let r = client.put(&path).bearer_auth("ci").json(&overlay).send().await.unwrap();
+		let v: Value = r.json().await.unwrap();
+		assert_eq!((&v["persisted"], &v["created_by"]), (&json!(true), &json!("ci")), "{v}\n{}", rp.log());
+		// another port's overlay by a token without persist: memory only
+		let r = client.put(format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{other}/overlay")).bearer_auth("ui").json(&overlay).send().await.unwrap();
+		let v: Value = r.json().await.unwrap();
+		assert!(v.get("persisted").is_none(), "{v}");
+	}
+	let row: (String, String, u32) =
+		sqlx::query_as("SELECT CAST(spec AS CHAR), created_by, listen_port FROM rproxy_rule_overlays WHERE node = 'node-a'").fetch_one(&pool).await.unwrap();
+	assert_eq!((serde_json::from_str::<Value>(&row.0).unwrap(), row.1.as_str(), row.2), (overlay.clone(), "ci", u32::from(port)), "one row: the persist token's");
+	{
+		let rp = Rproxy::start_with(&dir, api_port, &url, "second", &env);
+		rp.wait(api_port).await;
+		rp.wait_log("restore.overlays").await;
+		let v: Value = client.get(&path).bearer_auth("ci").send().await.unwrap().json().await.unwrap();
+		assert_eq!((&v["state"], &v["persisted"], &v["created_by"]), (&json!("applied"), &json!(true), &json!("ci")), "{v}");
+		// the persist: false token's is gone after the restart
+		let r = client.get(format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{other}/overlay")).bearer_auth("ci").send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::NOT_FOUND);
+		let r = client.delete(&path).bearer_auth("ci").send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::NO_CONTENT);
+	}
+	let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rproxy_rule_overlays").fetch_one(&pool).await.unwrap();
+	assert_eq!(rows.0, 0, "the row goes with DELETE");
+	for drop in drops {
 		pool.execute(drop).await.unwrap();
 	}
 	fs::remove_dir_all(dir).unwrap();

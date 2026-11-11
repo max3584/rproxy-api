@@ -367,6 +367,7 @@ setcap cap_net_bind_service,cap_net_admin+ep ./target/release/rproxy-api
 | `reload.secret` | 認証のミドルウェアの秘密のファイル（htpasswd・OIDC のシークレット）を読み直した、または読み直せず今の中身を使い続ける |
 | `config.file` | ルールが指すファイル（証明書・鍵・`users_file` など）が使えない理由（`what`・`file`・`error`）。制御 API の答えには理由を出さないので、ここで見る（v0.4.18、#333） |
 | `rule.protected_file` | 戻したルール（DB・組の保存・照合・引き継ぎ）が、API のルールなら断るファイル（証明書のストア・ACME の保存先・秘密・`/proc` など）を指している（`rule`・`field`・`phase`。パスは出さない。v0.4.17、#319） |
+| `rule.overlay` / `rule.overlay.persist` / `restore.overlays` | 固定ルールに重ねる分（v0.4.23、#397）：置いた・外した（`action`・`token`）、効かない（`warn`、`reason`・`error`。ルールはファイルの分だけで動く）、ファイルの名前に負けて外した項目がある / `rproxy_rule_overlays` に書いた / 起動・引き継ぎで戻した（`overlays`） |
 | `rule.shared_file` | 戻したルール（DB・組の保存・引き継ぎ）のうち、持ち主（トークン・組・設定ファイル）の違うルールが同じ鍵・秘密のファイルを指している（`rule`・`field`・`other_rule`・`other_field`・`phase`。パスは出さない。組み合わせごとに 1 回。API の新しいルールでは `409 file_in_use`。v0.4.18、#323） |
 | `http.health` / `http.breaker` | ヘルスチェックで転送先が down / up になった（`service`、`server`、`up`）、`circuit_breaker` が開いた・閉じた（`middleware`、`state`） |
 | `http.mirror` | `mirror` ミドルウェアの写しの結果（debug。`middleware`、`service`、`backend`、`status`、失敗なら `error`）。クライアントの応答には影響しない |

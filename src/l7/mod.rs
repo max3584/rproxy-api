@@ -59,6 +59,18 @@ pub struct HttpSpec {
 	pub services: BTreeMap<String, ServiceSpec>,
 	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
 	pub middlewares: BTreeMap<String, MiddlewareSpec>,
+	/// Set only on the `http` a static rule runs with (#397, `core::overlay::merge`): what its
+	/// overlay added. Never read from or written to the settings, the API or the database.
+	#[serde(skip)]
+	pub overlay: Option<OverlayMarks>,
+}
+
+/// What an overlay added to a static rule's `http` (#397): the routes from `first_route` on
+/// (tried after every route before it) and the middlewares of these names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OverlayMarks {
+	pub first_route: usize,
+	pub middlewares: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,7 +817,47 @@ pub fn check_name(what: &str, name: &str) -> Result<(), ApiError> {
 	Ok(())
 }
 
+/// Request headers that say where a request came from (`X-Forwarded-For`, which `client_ip`
+/// believes from `trusted_proxies`, and the like) or that rproxy writes itself: no
+/// authentication middleware may name them as the identity it sets (`basic_auth`'s
+/// `user_header`, `forward_auth`'s `response_headers`). Their names are never stripped as
+/// identity headers either (#397 review M1: stripping a trusted proxy's X-Forwarded-For before
+/// `client_ip` would make every request the proxy's). Compared in lower case, `_` read as `-`.
+pub const FORWARDING_HEADERS: &[&str] = &[
+	"x-forwarded-for",
+	"x-real-ip",
+	"forwarded",
+	"x-forwarded-proto",
+	"x-forwarded-host",
+	"x-forwarded-port",
+	"x-forwarded-prefix",
+	"x-forwarded-server",
+	"x-forwarded-client-cert",
+	"x-client-verify",
+];
+
+/// Whether `name` is one of `FORWARDING_HEADERS`.
+pub fn is_forwarding_header(name: &str) -> bool {
+	let name = name.to_ascii_lowercase().replace('_', "-");
+	FORWARDING_HEADERS.contains(&name.as_str())
+}
+
 impl HttpSpec {
+	/// Identity headers its authentication middlewares would set that are forwarding headers
+	/// (`FORWARDING_HEADERS`): (middleware, header).
+	pub fn forwarding_identities(&self) -> Vec<(String, String)> {
+		let mut out = vec![];
+		for (name, m) in &self.middlewares {
+			let names: Vec<&String> = match m {
+				MiddlewareSpec::BasicAuth { user_header, .. } => user_header.iter().collect(),
+				MiddlewareSpec::ForwardAuth { response_headers, .. } => response_headers.iter().collect(),
+				_ => vec![],
+			};
+			out.extend(names.into_iter().filter(|h| is_forwarding_header(h)).map(|h| (name.clone(), h.clone())));
+		}
+		out
+	}
+
 	/// Checks the settings on their own (names, references, expressions).
 	/// The names of routes, middlewares and services (`check_name`, #358), for what the
 	/// control API is sent (`POST` / `PATCH /rules`, `PUT /rulesets`): rules of the settings
@@ -820,6 +872,12 @@ impl HttpSpec {
 		}
 		for r in self.routes.iter().filter(|r| !r.name.is_empty()) {
 			check_name("route", &r.name)?;
+		}
+		// the settings file is only warned (`warnings`): a file that ran before keeps running
+		if let Some((m, h)) = self.forwarding_identities().into_iter().next() {
+			return Err(invalid(format!(
+				"middleware {m}: {h} says where a request came from (rproxy writes it, or believes it from trusted_proxies); an authentication middleware may not set it"
+			)));
 		}
 		Ok(())
 	}
@@ -1011,6 +1069,11 @@ impl HttpSpec {
 	/// What is allowed but likely not meant (`--check-config` warnings).
 	pub fn warnings(&self) -> Vec<String> {
 		let mut out = vec![];
+		for (m, h) in self.forwarding_identities() {
+			out.push(format!(
+				"middleware {m}: {h} says where a request came from; rproxy does not take it as an identity header (a client's is not removed), and rules from the API may not set it"
+			));
+		}
 		for r in &self.routes {
 			let kinds: Vec<(&String, &MiddlewareSpec)> = r.middlewares.iter().filter_map(|m| self.middlewares.get(m).map(|s| (m, s))).collect();
 			let Some(at) = kinds.iter().position(|(_, s)| matches!(s, MiddlewareSpec::Cache(_))) else { continue };

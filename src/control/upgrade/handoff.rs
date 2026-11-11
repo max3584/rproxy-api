@@ -190,6 +190,25 @@ pub struct State {
 	/// may not name them here either (`protected::acme_seen`). Empty from an older process.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub acme_protected: Vec<crate::net::protected::Entry>,
+	/// Overlays on static rules added through the API (#397): put on the static rules the
+	/// new process read from the settings file. Empty from an older process.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub overlays: Vec<OverlaySnapshot>,
+}
+
+/// An overlay on a static rule (#397), as handed over.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OverlaySnapshot {
+	pub protocol: crate::core::rule::Protocol,
+	pub listen: std::net::SocketAddr,
+	pub spec: serde_json::Value,
+	pub created_by: String,
+	pub created_at: u64,
+	pub updated_by: String,
+	pub updated_at: u64,
+	/// Kept in `rproxy_rule_overlays` (otherwise memory only, a `persist: false` token's).
+	#[serde(default)]
+	pub stored: bool,
 }
 
 /// A rule restored from the database that did not validate (#327), as handed over.
@@ -618,6 +637,20 @@ async fn snapshot(registry: &Registry) -> State {
 		owners,
 		global,
 		acme_protected: crate::net::protected::acme_seen(),
+		overlays: registry
+			.overlays()
+			.into_iter()
+			.map(|(k, o)| OverlaySnapshot {
+				protocol: k.protocol,
+				listen: k.listen,
+				spec: serde_json::to_value(&o.spec).unwrap_or_default(),
+				created_by: o.created_by,
+				created_at: o.created_at,
+				updated_by: o.updated_by,
+				updated_at: o.updated_at,
+				stored: o.stored,
+			})
+			.collect(),
 	}
 }
 
@@ -823,6 +856,8 @@ impl State {
 				settings.set_not_loaded();
 			}
 		}
+		// overlays on the static rules (#397), read from the settings file before this
+		self.restore_overlays(registry).await;
 		let (mut dynamic, mut api) = (vec![], vec![]);
 		for (req, view) in self.rules() {
 			if view["origin"] == "api" {
@@ -877,6 +912,32 @@ impl State {
 		self.restore_rulesets(registry).await;
 		if let Some(store) = registry.persist() {
 			store.adopt_pending(self.persist_pending.clone());
+		}
+	}
+
+	/// Puts the old process's overlays (#397) on the static rules again.
+	pub async fn restore_overlays(&self, registry: &Arc<Registry>) {
+		let mut overlays = vec![];
+		for o in &self.overlays {
+			match serde_json::from_value::<crate::core::overlay::OverlaySpec>(o.spec.clone()) {
+				Ok(spec) => overlays.push((
+					Key { protocol: o.protocol, listen: o.listen },
+					crate::core::overlay::Overlay {
+						spec,
+						created_by: o.created_by.clone(),
+						created_at: o.created_at,
+						updated_by: o.updated_by.clone(),
+						updated_at: o.updated_at,
+						status: crate::core::overlay::Status::Applied { shadowed: vec![] },
+						stored: o.stored,
+					},
+				)),
+				Err(e) => warn!(event = "handoff.overlay", error = %e, rule = %o.listen, "an overlay from the old process could not be read; dropped"),
+			}
+		}
+		if !overlays.is_empty() {
+			let n = registry.restore_overlays(overlays, "handoff").await;
+			info!(event = "restore.overlays", overlays = n, from = "handoff");
 		}
 	}
 

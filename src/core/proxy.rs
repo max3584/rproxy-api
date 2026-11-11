@@ -111,6 +111,9 @@ pub struct RouteTarget {
 	pub source_ip: Option<SourceIp>,
 	/// Its targets (`remote_addr` / `remote_port` as one, or `targets`, #234).
 	pub pool: Arc<Pool>,
+	/// Added by the overlay of a static rule (#397): after every route of the file, looked at
+	/// only for names none of those match.
+	pub overlay: bool,
 }
 
 /// One backend a connection may go to.
@@ -345,7 +348,11 @@ impl Runtime {
 	pub fn select(&self, server_name: Option<&str>, offset: u16) -> Option<Target> {
 		let routes = self.routes.read().unwrap().clone();
 		if let Some(name) = server_name {
-			if let Some(i) = best_match(routes.iter().map(|r| r.patterns.as_slice()), name) {
+			// the file's routes first, an overlay's (after them, #397) for the names left
+			let file = routes.partition_point(|r| !r.overlay);
+			let found = best_match(routes[..file].iter().map(|r| r.patterns.as_slice()), name)
+				.or_else(|| best_match(routes[file..].iter().map(|r| r.patterns.as_slice()), name).map(|i| i + file));
+			if let Some(i) = found {
 				let route = &routes[i];
 				let candidates = route
 					.pool

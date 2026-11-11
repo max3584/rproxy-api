@@ -284,6 +284,12 @@ struct Prepared {
 	/// The `global.acme` `tls` was built with (#345): checked against the one in force
 	/// when the rule goes into the table (`acme_gate`).
 	acme: Option<Arc<crate::acme::Acme>>,
+	/// The `http` the router was compiled from (with a static rule's overlay, #397).
+	http_spec: Option<crate::l7::HttpSpec>,
+	/// Where an overlay's `tls.routes` start in `routes` (#397; `usize::MAX` without).
+	tls_from: usize,
+	/// Whether a static rule's overlay is in it (#397), recorded once the rule takes it.
+	overlay: Option<crate::core::overlay::Status>,
 }
 
 /// What `Registry::check_rules` found: (label, message) per problem.
@@ -355,6 +361,12 @@ pub struct Registry {
 	shared_warned: std::sync::Mutex<HashSet<(String, String, String, String)>>,
 	/// `global`: the file's, the environment's and the API's items (#342).
 	global: crate::config::global::Settings,
+	/// What the API added on static rules' listeners (#397), by the static rule's key; kept
+	/// while the rule is gone (`not_applied`).
+	overlays: std::sync::Mutex<HashMap<Key, crate::core::overlay::Overlay>>,
+	/// Reloads of the settings file and overlay changes take turns (#397): neither puts back
+	/// what the other replaced.
+	static_turn: Mutex<()>,
 }
 
 /// A rule restored from the database (`forward_rules`, `rproxy_rules`) or a live upgrade
@@ -364,6 +376,17 @@ pub struct Invalid {
 	pub request: RuleRequest,
 	pub origin: Origin,
 	pub error: String,
+}
+
+/// How a rebuild relates to a static rule's overlay (#397).
+#[derive(Clone, Copy)]
+enum Overlaying<'a> {
+	/// Any other change: the overlay held, if any; one that cannot apply is `not_applied`.
+	No,
+	/// `PUT`: this overlay (not held yet), which must apply; unchanged state is taken over.
+	Put(&'a crate::core::overlay::OverlaySpec),
+	/// `DELETE` (or a restore): the overlay held, if any; unchanged state is taken over.
+	Change,
 }
 
 /// What `Registry::apply_certs` does with one rule.
@@ -530,6 +553,8 @@ impl Registry {
 			invalid: Default::default(),
 			shared_warned: Default::default(),
 			global: Default::default(),
+			overlays: Default::default(),
+			static_turn: Mutex::const_new(()),
 		})
 	}
 
@@ -789,6 +814,9 @@ impl Registry {
 			if let Some(store) = self.persist() {
 				store.decorate(&entry.spec().key, &mut view);
 			}
+		}
+		if view.origin == Origin::Static {
+			view.overlay = self.overlay_summary(&entry.spec().key);
 		}
 		if self.caps().features.conditions {
 			let cause = match entry {
@@ -1108,6 +1136,15 @@ impl Registry {
 	/// with the certificates from the store, and its compiled `http` (secret files
 	/// read). Shared by starting a rule and by `--check-config` (`check_rules`).
 	pub(super) fn build_parts(&self, spec: &RuleSpec) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
+		self.build_parts_reusing(spec, None)
+	}
+
+	/// `build_parts`; the router takes over from `previous` what did not change (#397).
+	fn build_parts_reusing(
+		&self,
+		spec: &RuleSpec,
+		previous: Option<&crate::l7::server::Router>,
+	) -> Result<(Arc<TlsRuntime>, Option<Arc<crate::l7::server::Router>>), ApiError> {
 		let tls = Arc::new(self.build_tls(spec)?);
 		if spec.crowdsec && self.cfg.http.crowdsec().is_none() {
 			return Err(ApiError::needs_crowdsec(format!("crowdsec {NEEDS_CROWDSEC} (the settings file or PATCH /config/global)")));
@@ -1126,7 +1163,7 @@ impl Registry {
 					}
 				}
 				crate::l7::middleware::crowdsec::check_refs(h, self.cfg.http.crowdsec().as_ref())?;
-				Some(Arc::new(crate::l7::server::Router::compile(h, &spec.tls.upstream, self.cfg.lookup.clone())?))
+				Some(Arc::new(crate::l7::server::Router::compile_reusing(h, &spec.tls.upstream, self.cfg.lookup.clone(), previous)?))
 			}
 			None => None,
 		};
@@ -1134,9 +1171,58 @@ impl Registry {
 	}
 
 	async fn prepare(&self, spec: &RuleSpec) -> Result<Prepared, ApiError> {
+		self.prepare_as(spec, Overlaying::No).await
+	}
+
+	/// `prepare`; a static rule with an overlay (#397) runs with it merged in. An overlay that
+	/// cannot apply is the error for `Overlaying::Put`; otherwise the rule runs with the file's
+	/// part alone and the overlay is `not_applied`.
+	async fn prepare_as(&self, spec: &RuleSpec, overlaying: Overlaying<'_>) -> Result<Prepared, ApiError> {
+		use crate::core::overlay::{Reason, Status};
+		// an overlay change takes over the router's state that did not change
+		let previous = match overlaying {
+			Overlaying::No => None,
+			_ => self.rules.lock().await.get(&spec.key).and_then(|e| match e {
+				Entry::Running(r) => r.rt.http_router(),
+				Entry::Failed(_) => None,
+			}),
+		};
+		let previous = previous.as_deref();
+		let overlay = match overlaying {
+			Overlaying::Put(o) => Some(o.clone()),
+			_ => (spec.origin == Origin::Static).then(|| self.overlay_spec(&spec.key)).flatten(),
+		};
+		let Some(overlay) = overlay else {
+			return self.prepare_spec(spec, usize::MAX, previous).await;
+		};
+		let (reason, e) = match crate::core::overlay::merge(spec, &overlay, &self.caps().features) {
+			Ok(merged) => match self.prepare_spec(&merged.spec, merged.tls_from, previous).await {
+				Ok(mut prepared) => {
+					for s in &merged.shadowed {
+						warn!(event = "rule.overlay", rule = %spec.key, kind = %s.kind, name = %s.name, reason = %s.reason,
+							"an item of the overlay added through the API is left out: the settings file has the name");
+					}
+					prepared.overlay = Some(Status::Applied { shadowed: merged.shadowed });
+					return Ok(prepared);
+				}
+				Err(e) => (Reason::Failed, e),
+			},
+			Err(refused) => refused,
+		};
+		if matches!(overlaying, Overlaying::Put(_)) {
+			return Err(e);
+		}
+		warn!(event = "rule.overlay", rule = %spec.key, reason = reason.as_str(), error = %e.message,
+			"the overlay added through the API does not apply; the rule runs with the settings file's part alone");
+		let mut prepared = self.prepare_spec(spec, usize::MAX, previous).await?;
+		prepared.overlay = Some(Status::NotApplied { reason, error: e.message });
+		Ok(prepared)
+	}
+
+	async fn prepare_spec(&self, spec: &RuleSpec, tls_from: usize, previous: Option<&crate::l7::server::Router>) -> Result<Prepared, ApiError> {
 		// certificates, keys and secret files are read from disk (#358)
 		let acme = self.acme();
-		let (tls, http) = crate::net::files::blocking(|| self.build_parts(spec))?;
+		let (tls, http) = crate::net::files::blocking(|| self.build_parts_reusing(spec, previous))?;
 		// with several targets, one that cannot be resolved yet is retried in the
 		// background; the rule fails only when none can be
 		let wanted = spec.members();
@@ -1176,7 +1262,7 @@ impl Registry {
 			}
 			routes.push((route.clone(), members));
 		}
-		Ok(Prepared { members, routes, tls, http, acme })
+		Ok(Prepared { members, routes, tls, http, acme, http_spec: spec.http.clone(), tls_from, overlay: None })
 	}
 
 	/// The run-time targets of a rule, with their name resolution and health checks.
@@ -1217,10 +1303,16 @@ impl Registry {
 	/// The run-time `tls.routes`: a pool of targets each (#234), like the rule's.
 	/// `before`: the routes they replace; a route of the same names hands its targets'
 	/// counts on (`max_connections`, #341).
-	fn install_routes(&self, key: Key, routes: Vec<(Route, Resolved)>, before: &[RouteTarget]) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
+	fn install_routes(
+		&self,
+		key: Key,
+		routes: Vec<(Route, Resolved)>,
+		before: &[RouteTarget],
+		tls_from: usize,
+	) -> (Arc<Vec<RouteTarget>>, Vec<Resolver>) {
 		let mut targets = vec![];
 		let mut resolvers = vec![];
-		for (route, members) in routes {
+		for (i, (route, members)) in routes.into_iter().enumerate() {
 			let patterns = route.patterns();
 			let old = before.iter().find(|r| r.patterns == patterns).map(|r| &r.pool);
 			let mut taken = vec![];
@@ -1242,6 +1334,7 @@ impl Registry {
 				passthrough: route.passthrough,
 				source_ip: route.source_ip,
 				pool: Arc::new(pool),
+				overlay: i >= tls_from,
 			});
 		}
 		(Arc::new(targets), resolvers)
@@ -1255,7 +1348,8 @@ impl Registry {
 		self.acme_gate(&spec, &mut prepared)?;
 		let key = spec.key;
 		let (idle_tx, idle_rx) = watch::channel(spec.udp_idle);
-		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[]);
+		let overlay = prepared.overlay.take();
+		let (routes, route_resolvers) = self.install_routes(key, prepared.routes, &[], prepared.tls_from);
 		let kill = CancellationToken::new();
 		let events = Arc::new(watch::channel(0).0);
 		let (pool, backends) = self.install_pool(&spec, prepared.members, &events, &kill, None);
@@ -1340,6 +1434,9 @@ impl Registry {
 
 		let generation = self.generation();
 		let supervisor = tokio::spawn(supervise(Arc::downgrade(self), key, generation, rt.clone(), serve));
+		if let Some(status) = overlay {
+			self.set_overlay_status(&key, status);
+		}
 		let started_at = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|d| d.as_secs())
@@ -1649,10 +1746,23 @@ impl Registry {
 	/// Puts a changed spec into effect on an existing rule, keeping its
 	/// connections (the fields PATCH can change: target, timeouts, TLS, allow_from, http).
 	pub(super) async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
+		self.apply_as(key, spec, tls_changed, http_changed, Overlaying::No).await
+	}
+
+	/// `apply`; `strict`: a change of a static rule's overlay (#397), which fails if the
+	/// overlay cannot apply (`prepare_as`).
+	async fn apply_as(
+		self: &Arc<Self>,
+		key: &Key,
+		spec: RuleSpec,
+		tls_changed: bool,
+		http_changed: bool,
+		overlaying: Overlaying<'_>,
+	) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{key} would take rproxy's control API ({api})")));
 		}
-		let mut prepared = self.prepare(&spec).await?;
+		let mut prepared = self.prepare_as(&spec, overlaying).await?;
 
 		let mut rules = self.rules.lock().await;
 		if let Some((other, _)) = rules.iter().find(|(k, e)| *k != key && overlaps(e.spec(), &spec)) {
@@ -1732,7 +1842,8 @@ impl Registry {
 				}
 				if http_changed {
 					*r.rt.http.write().unwrap() = prepared.http;
-					if let Some(h) = &spec.http {
+					// with a static rule's overlay (#397), its routes' counts stay too
+					if let Some(h) = &prepared.http_spec {
 						r.rt.http_stats.retain(h);
 					}
 				}
@@ -1740,7 +1851,7 @@ impl Registry {
 					*r.rt.tls.write().unwrap() = prepared.tls;
 					r.stop_route_resolvers();
 					let before = r.rt.routes.read().unwrap().clone();
-					let (routes, resolvers) = self.install_routes(*key, prepared.routes, &before);
+					let (routes, resolvers) = self.install_routes(*key, prepared.routes, &before, prepared.tls_from);
 					*r.rt.routes.write().unwrap() = routes;
 					r.route_resolvers = resolvers;
 				}
@@ -1753,6 +1864,9 @@ impl Registry {
 					crate::l7::h3::stop(&r.rt);
 				}
 				r.spec = spec;
+				if let Some(status) = prepared.overlay.take() {
+					self.set_overlay_status(key, status);
+				}
 			}
 			Entry::Failed(f) => {
 				if let Some(retry) = f.retry.take() {
@@ -1850,7 +1964,7 @@ impl Registry {
 			let refs = crate::net::protected::refs(i.request.tls.as_ref(), i.request.http.as_ref());
 			(key, None, self.owner_of_key(&key, i.origin, None), refs)
 		});
-		running.chain(invalid).filter(|(_, _, _, refs)| !refs.is_empty()).collect()
+		running.chain(invalid).chain(self.overlay_refs()).filter(|(_, _, _, refs)| !refs.is_empty()).collect()
 	}
 
 	/// The rules that name the stored certificate `name` (#240), as `protocol/addr:port`.
@@ -2360,6 +2474,8 @@ impl Registry {
 	/// re-creates them, and leaves unchanged rules alone.
 	pub async fn reload_static(self: &Arc<Self>, reqs: Vec<(String, RuleRequest)>) -> Result<ReloadCounts, String> {
 		let specs = self.validate_static(reqs)?;
+		// an overlay change waits (#397): it applies to the file's rule as this leaves it
+		let _turn = self.static_turn.lock().await;
 		let current: HashMap<Key, (RuleSpec, bool)> = self
 			.rules
 			.lock()
@@ -2488,6 +2604,7 @@ impl Registry {
 		target_metrics(&mut out, &rules);
 		http_metrics(&mut out, &rules);
 		self.cert_metrics(&mut out, &rules);
+		self.overlay_metrics(&mut out, &rules);
 		crate::core::ruleset::label_metrics(&mut out, rules.iter().map(|(k, e)| (k, &e.spec().labels)));
 		if let Some(b) = self.cfg.http.crowdsec() {
 			let _ = writeln!(out, "# HELP rproxy_crowdsec_decisions Addresses and ranges blocked by the CrowdSec LAPI decisions.");
@@ -2915,6 +3032,218 @@ async fn retry_start(registry: Weak<Registry>, spec: RuleSpec, generation: u64) 
 			}
 		}
 		return;
+	}
+}
+
+/// What the API adds on static rules' listeners (#397, `core::overlay`).
+impl Registry {
+	fn overlay_spec(&self, key: &Key) -> Option<crate::core::overlay::OverlaySpec> {
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|o| o.spec.clone())
+	}
+
+	fn set_overlay_status(&self, key: &Key, status: crate::core::overlay::Status) {
+		if let Some(o) = self.overlays.lock().unwrap_or_else(|e| e.into_inner()).get_mut(key) {
+			o.status = status;
+		}
+	}
+
+	/// Every overlay (a live upgrade, storing).
+	pub fn overlays(&self) -> Vec<(Key, crate::core::overlay::Overlay)> {
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(k, o)| (*k, o.clone())).collect()
+	}
+
+	pub fn overlay(&self, key: &Key) -> Option<crate::core::overlay::Overlay> {
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+	}
+
+	/// The overlay's summary for a static rule's view.
+	fn overlay_summary(&self, key: &Key) -> Option<crate::core::overlay::OverlaySummary> {
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).get(key).map(|o| o.summary())
+	}
+
+	/// The file's rule of `key`, or why there is none to overlay.
+	async fn static_rule(&self, key: &Key) -> Result<RuleSpec, ApiError> {
+		let rules = self.rules.lock().await;
+		match rules.get(key).map(|e| e.spec()) {
+			Some(s) if s.origin == Origin::Static => Ok(s.clone()),
+			Some(s) if s.ruleset.is_some() => Err(ApiError::not_static(format!(
+				"{key} belongs to rule set {}; change it with PUT /rulesets (overlays are for rules of the settings file)",
+				s.ruleset.as_deref().unwrap_or_default()
+			))),
+			Some(_) => Err(ApiError::not_static(format!("{key} is not from the settings file; change it with PATCH (overlays are for static rules)"))),
+			None if self.invalid_of(key).is_some() => {
+				Err(ApiError::not_static(format!("{key} is a restored rule, not one of the settings file")))
+			}
+			None => Err(ApiError::not_found(format!("{key}: no static rule has this key"))),
+		}
+	}
+
+	/// `GET /rules/{key}/overlay`.
+	pub async fn overlay_view(&self, key: &Key) -> Result<crate::core::overlay::OverlayView, ApiError> {
+		let o = self.overlay(key).ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
+		let exists = self.rules.lock().await.get(key).is_some_and(|e| e.spec().origin == Origin::Static);
+		let persisted = self.persist().filter(|s| s.enabled() && o.stored).map(|s| s.overlay_persisted(key));
+		Ok(o.view(key.to_string(), exists, persisted))
+	}
+
+	fn check_if_match(&self, key: &Key, if_match: Option<&str>) -> Result<Option<crate::core::overlay::Overlay>, ApiError> {
+		let current = self.overlay(key);
+		if let Some(want) = if_match.map(str::trim) {
+			let ok = match &current {
+				Some(o) => want == "*" || want.split(',').any(|t| t.trim() == o.spec.etag()),
+				None => false,
+			};
+			if !ok {
+				return Err(ApiError::precondition_failed(format!("{key}: the overlay changed (If-Match does not match its ETag)")));
+			}
+		}
+		Ok(current)
+	}
+
+	/// The `http` of the static rule of `key` (#397: what an overlay may name), if any.
+	pub async fn static_http(&self, key: &Key) -> Option<crate::l7::HttpSpec> {
+		self.static_rule(key).await.ok().and_then(|s| s.http)
+	}
+
+	/// `PUT /rules/{key}/overlay` (`persist`: by a `persist: true` token; `ports`: whether the
+	/// token may use the rule's ports, first and last, looked at in turn with reloads): checks it
+	/// against the file's rule (a name the file has is `409 overlay_conflict`, a merge that does
+	/// not validate or build is the error) and puts it in force in place, taking over the
+	/// router's state that did not change. `dry_run`: only the checks and the plan.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn put_overlay(
+		self: &Arc<Self>,
+		key: &Key,
+		spec: crate::core::overlay::OverlaySpec,
+		by: &str,
+		persist: bool,
+		ports: &(dyn Fn(u16, u16) -> Result<(), ApiError> + Sync),
+		if_match: Option<&str>,
+		dry_run: bool,
+	) -> Result<crate::core::overlay::Change, ApiError> {
+		use crate::core::overlay::{Change, Overlay, Status};
+		spec.check()?;
+		let _turn = self.static_turn.lock().await;
+		let file = self.static_rule(key).await?;
+		ports(key.listen.port(), key.listen.port().saturating_add(file.port_count.saturating_sub(1)))?;
+		let current = self.check_if_match(key, if_match)?;
+		let merged = crate::core::overlay::merge(&file, &spec, &self.caps().features).map_err(|(_, e)| e)?;
+		if !merged.shadowed.is_empty() {
+			let names: Vec<String> = merged.shadowed.iter().map(|s| format!("{} {:?} ({})", s.kind, s.name, s.reason)).collect();
+			return Err(ApiError::overlay_conflict(format!("{key}: the settings file has these names: {}", names.join(", "))));
+		}
+		// the files it names and the compiled router, without starting anything
+		crate::net::files::blocking(|| self.build_parts(&merged.spec))?;
+		let change = Change::of(key, current.as_ref().map(|o| &o.spec), Some(&spec));
+		if dry_run {
+			return Ok(change);
+		}
+		let (http_changed, tls_changed) = (spec.http_differs(current.as_ref().map(|o| &o.spec)), spec.tls_differs(current.as_ref().map(|o| &o.spec)));
+		// in force first (the overlay given, not held yet), then held: a failure leaves the
+		// previous one held and in force
+		self.apply_as(key, file, tls_changed, http_changed, Overlaying::Put(&spec)).await?;
+		let now = tlsconf::unix_now().max(0) as u64;
+		let overlay = Overlay {
+			created_by: current.as_ref().map_or_else(|| by.to_string(), |o| o.created_by.clone()),
+			created_at: current.as_ref().map_or(now, |o| o.created_at),
+			updated_by: by.to_string(),
+			updated_at: now,
+			// a PUT refuses names the file has: nothing is left out
+			status: Status::Applied { shadowed: vec![] },
+			// as `api` rules: a `persist: true` token's is stored, and a stored one stays stored
+			stored: persist || current.as_ref().is_some_and(|o| o.stored),
+			spec,
+		};
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).insert(*key, overlay);
+		info!(event = "rule.overlay", rule = %key, action = "put", token = by);
+		Ok(change)
+	}
+
+	/// `DELETE /rules/{key}/overlay`: the rule runs with the file's part alone again (also
+	/// for an overlay whose static rule is gone: `ports` then has the key's port alone).
+	pub async fn delete_overlay(
+		self: &Arc<Self>,
+		key: &Key,
+		ports: &(dyn Fn(u16, u16) -> Result<(), ApiError> + Sync),
+		if_match: Option<&str>,
+		dry_run: bool,
+	) -> Result<crate::core::overlay::Change, ApiError> {
+		use crate::core::overlay::Change;
+		let _turn = self.static_turn.lock().await;
+		let file = self.static_rule(key).await.ok();
+		let last = key.listen.port().saturating_add(file.as_ref().map_or(0, |f| f.port_count.saturating_sub(1)));
+		ports(key.listen.port(), last)?;
+		let current = self.check_if_match(key, if_match)?.ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
+		let change = Change::of(key, Some(&current.spec), None);
+		if dry_run {
+			return Ok(change);
+		}
+		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+		if let Some(file) = file {
+			let (http_changed, tls_changed) = (current.spec.http_differs(None), current.spec.tls_differs(None));
+			if let Err(e) = self.apply_as(key, file, tls_changed, http_changed, Overlaying::Change).await {
+				self.overlays.lock().unwrap_or_else(|e| e.into_inner()).insert(*key, current);
+				return Err(e);
+			}
+		}
+		info!(event = "rule.overlay", rule = %key, action = "delete");
+		Ok(change)
+	}
+
+	/// Overlays from the database or a live upgrade (#397): put in force on their static
+	/// rules as they are now. One that cannot apply is kept `not_applied`, never refused.
+	pub async fn restore_overlays(self: &Arc<Self>, overlays: Vec<(Key, crate::core::overlay::Overlay)>, phase: &'static str) -> usize {
+		let _turn = self.static_turn.lock().await;
+		let count = overlays.len();
+		for (key, overlay) in overlays {
+			let (http_changed, tls_changed) = (overlay.spec.http_differs(None), overlay.spec.tls_differs(None));
+			self.overlays.lock().unwrap_or_else(|e| e.into_inner()).insert(key, overlay);
+			match self.static_rule(&key).await {
+				Ok(file) => {
+					if let Err(e) = self.apply(&key, file, tls_changed, http_changed).await {
+						warn!(event = "rule.overlay", rule = %key, phase, error = %e.message, "could not put the overlay in force");
+					}
+				}
+				Err(_) => warn!(event = "rule.overlay", rule = %key, phase, reason = "no_static_rule",
+					"no static rule has the overlay's key; kept until one does"),
+			}
+		}
+		count
+	}
+
+	/// The overlays' files (#319, #323): the token that made each owns them.
+	fn overlay_refs(&self) -> Vec<(Key, Option<String>, crate::net::protected::Owner, Vec<crate::net::protected::FileRef>)> {
+		self.overlays()
+			.into_iter()
+			.map(|(k, o)| (k, None, crate::net::protected::Owner::Token(o.created_by.clone()), o.spec.file_refs()))
+			.filter(|(_, _, _, refs)| !refs.is_empty())
+			.collect()
+	}
+
+	/// The files of `key`'s overlay (a `PUT` keeps them).
+	pub fn overlay_files(&self, key: &Key) -> Vec<crate::net::protected::FileRef> {
+		self.overlay(key).map(|o| o.spec.file_refs()).unwrap_or_default()
+	}
+
+	/// `rproxy_rule_overlay`.
+	fn overlay_metrics(&self, out: &mut String, rules: &HashMap<Key, Entry>) {
+		let mut samples: Vec<String> = self
+			.overlays()
+			.iter()
+			.map(|(k, o)| {
+				let (state, _) = o.state(rules.get(k).is_some_and(|e| e.spec().origin == Origin::Static));
+				format!("{{protocol=\"{}\",listen=\"{}\",state=\"{state}\"}} 1", k.protocol, k.listen)
+			})
+			.collect();
+		if samples.is_empty() {
+			return;
+		}
+		samples.sort();
+		let _ = writeln!(out, "# HELP rproxy_rule_overlay Overlays added through the API on static rules (#397), by whether they apply.");
+		let _ = writeln!(out, "# TYPE rproxy_rule_overlay gauge");
+		for s in samples {
+			let _ = writeln!(out, "rproxy_rule_overlay{s}");
+		}
 	}
 }
 

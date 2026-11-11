@@ -38,6 +38,10 @@ pub enum Job {
 	/// This node's row of `rproxy_global` (#342).
 	ReadGlobal,
 	SaveGlobal(GlobalRecord),
+	/// This node's rows of `rproxy_rule_overlays` (#397).
+	ReadOverlays,
+	SaveOverlay(OverlayRecord),
+	RemoveOverlay(Key),
 	/// Keeps the connection open (it holds the lock), when one is open.
 	Ping,
 	/// The last job (the old process after a live upgrade): the connection closes
@@ -48,7 +52,10 @@ pub enum Job {
 impl Job {
 	/// Whether the job writes a row (and so goes through only under the lock).
 	pub fn writes(&self) -> bool {
-		matches!(self, Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_) | Job::SaveGlobal(_))
+		matches!(
+			self,
+			Job::SaveRule(_) | Job::RemoveRule(_) | Job::SaveSet(_) | Job::RemoveSet(_) | Job::SaveGlobal(_) | Job::SaveOverlay(_) | Job::RemoveOverlay(_)
+		)
 	}
 }
 
@@ -89,6 +96,19 @@ pub struct GlobalRecord {
 	pub now: u64,
 }
 
+/// A row of `rproxy_rule_overlays` to write (#397).
+#[derive(Clone, Debug)]
+pub struct OverlayRecord {
+	pub key: Key,
+	/// `core::overlay::OverlaySpec` as JSON.
+	pub spec: serde_json::Value,
+	pub created_by: String,
+	/// Unix seconds.
+	pub created_at: u64,
+	pub updated_by: String,
+	pub updated_at: u64,
+}
+
 /// What a job did.
 #[derive(Debug)]
 pub enum Done {
@@ -99,6 +119,8 @@ pub enum Done {
 	Sets(Vec<StoredSet>),
 	/// `ReadGlobal`: None when there is no row (or no table).
 	Global(Option<StoredGlobal>),
+	/// `ReadOverlays` (#397): empty without the table.
+	Overlays(Vec<super::StoredOverlay>),
 }
 
 /// Which connection holds this node's lock (what MariaDB shows of it).

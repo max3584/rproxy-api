@@ -54,7 +54,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::core::registry::Registry;
 use crate::core::rule::{parse_listen, Key, Origin, Protocol, RuleRequest, RuleView};
-use queue::{Done, GlobalRecord, Holder, Job, JobError, JobFuture, JobResult, Liveness, LocalQueue, PersistQueue, RuleRow, SetRecord, Worker};
+use queue::{
+	Done, GlobalRecord, Holder, Job, JobError, JobFuture, JobResult, Liveness, LocalQueue, OverlayRecord, PersistQueue, RuleRow, SetRecord, Worker,
+};
 
 /// rproxy's own table (definition and GRANT: the UI repository's `db/` migrations;
 /// the DDL is in docs/API.md).
@@ -70,6 +72,13 @@ pub const SETS_TABLE: &str = "rproxy_rule_sets";
 /// The `global` values set through the API (#342): one row per node (the UI
 /// repository's migration 013; the DDL is in docs/API.md).
 pub const GLOBAL_TABLE: &str = "rproxy_global";
+
+/// Overlays on static rules (#397): one row per rule key and node (the UI repository's
+/// migration 014; the DDL is in docs/API.md).
+pub const OVERLAYS_TABLE: &str = "rproxy_rule_overlays";
+
+/// How `rproxy_rule_overlays.spec` is written.
+pub const OVERLAY_SPEC_VERSION: u32 = 1;
 
 /// Longest one statement of the write connection runs in MariaDB (the
 /// session's `max_statement_time` and `innodb_lock_wait_timeout`).
@@ -193,6 +202,33 @@ pub struct StoredGlobal {
 	pub updated_at: u64,
 }
 
+/// One row of `rproxy_rule_overlays` (#397).
+#[derive(Clone, Debug)]
+pub struct StoredOverlay {
+	pub key: Key,
+	pub spec: crate::core::overlay::OverlaySpec,
+	pub created_by: String,
+	pub created_at: u64,
+	pub updated_by: String,
+	pub updated_at: u64,
+}
+
+impl StoredOverlay {
+	/// As the registry holds it (whether it applies is found when it is put in force).
+	pub fn into_overlay(self) -> (Key, crate::core::overlay::Overlay) {
+		let overlay = crate::core::overlay::Overlay {
+			spec: self.spec,
+			created_by: self.created_by,
+			created_at: self.created_at,
+			updated_by: self.updated_by,
+			updated_at: self.updated_at,
+			status: crate::core::overlay::Status::Applied { shadowed: vec![] },
+			stored: true,
+		};
+		(self.key, overlay)
+	}
+}
+
 /// One row of `rproxy_rules`.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StoredRule {
@@ -229,6 +265,7 @@ struct Memory {
 	rows: Mutex<HashMap<Key, StoredRule>>,
 	sets: Mutex<HashMap<String, StoredSet>>,
 	global: Mutex<Option<StoredGlobal>>,
+	overlays: Mutex<HashMap<Key, StoredOverlay>>,
 	/// Makes the writes fail.
 	fail: AtomicBool,
 	/// Another connection holds the lock: the lock and the writes answer `Busy`.
@@ -265,6 +302,9 @@ struct Unwritten {
 	/// The `global` row (#342): by whom, and the last write queued for it.
 	global: Option<String>,
 	latest_global: u64,
+	/// Overlays (#397) whose row is not up to date (written or deleted): by whom.
+	overlays: HashMap<Key, String>,
+	latest_overlays: HashMap<Key, u64>,
 }
 
 /// What a live upgrade hands over of the writes that are not done (#174): the
@@ -286,6 +326,9 @@ pub struct Pending {
 	/// The `global` row is not up to date (#342): by whom.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub global: Option<String>,
+	/// Overlays (#397) whose row is not up to date (to write or to delete).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub overlays: Vec<PendingRule>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +807,7 @@ impl Store {
 			sets: sets(&u.sets),
 			removed_sets: sets(&u.removed_sets),
 			global: u.global.clone(),
+			overlays: rules(&u.overlays),
 		}
 	}
 
@@ -790,6 +834,9 @@ impl Store {
 		}
 		if pending.global.is_some() {
 			u.global = pending.global;
+		}
+		for r in pending.overlays {
+			u.overlays.insert(Key { protocol: r.protocol, listen: r.listen }, r.by);
 		}
 	}
 
@@ -1085,11 +1132,11 @@ impl Store {
 		}
 		let mut out = Reconciled::default();
 		// 1. what did not go through, written again (the first failure ends it: the database is in trouble)
-		let (rules, removed_rules, sets, removed_sets, global) = {
+		let (rules, removed_rules, sets, removed_sets, global, overlays) = {
 			let u = self.unwritten.lock().unwrap();
 			let take = |m: &HashMap<Key, String>| m.iter().map(|(k, by)| (*k, by.clone())).collect::<Vec<_>>();
 			let take_sets = |m: &HashMap<String, String>| m.iter().map(|(n, by)| (n.clone(), by.clone())).collect::<Vec<_>>();
-			(take(&u.rules), take(&u.removed_rules), take_sets(&u.sets), take_sets(&u.removed_sets), u.global.clone())
+			(take(&u.rules), take(&u.removed_rules), take_sets(&u.sets), take_sets(&u.removed_sets), u.global.clone(), take(&u.overlays))
 		};
 		let mut budget = RETRIES_PER_ROUND;
 		'retry: {
@@ -1110,6 +1157,17 @@ impl Store {
 			if let Some(by) = global {
 				budget -= 1;
 				if !self.save_global(registry, &by).await {
+					break 'retry;
+				}
+				out.written += 1;
+			}
+			// overlays (#397): written again as they are now, the rows never win
+			for (key, by) in overlays {
+				if budget == 0 {
+					break 'retry;
+				}
+				budget -= 1;
+				if !self.save_overlay(registry, &key, &by).await {
 					break 'retry;
 				}
 				out.written += 1;
@@ -1365,6 +1423,82 @@ impl Store {
 	pub fn memory_put_global(&self, row: StoredGlobal) {
 		if let Some(m) = &self.memory {
 			*m.global.lock().unwrap() = Some(row);
+		}
+	}
+}
+
+/// Overlays on static rules (#397): one row per key in `rproxy_rule_overlays`, written
+/// (or deleted) on every `PUT` / `DELETE` before the answer, read at the start after the
+/// settings file's rules. `reconcile` writes again what did not go through; rows never
+/// win over the running overlays.
+impl Store {
+	/// This node's rows (none without the table).
+	pub async fn load_overlays(&self) -> Result<Vec<StoredOverlay>, String> {
+		match self.submit(Job::ReadOverlays).await {
+			Ok(Done::Overlays(rows)) => Ok(rows),
+			Ok(other) => Err(format!("unexpected answer {other:?}")),
+			Err(e) => Err(e.to_string()),
+		}
+	}
+
+	/// Writes `key`'s overlay as the registry has it now (deletes the row without one);
+	/// read under `order`, where it is queued. Whether the row is up to date (false
+	/// without a database).
+	pub async fn save_overlay(&self, registry: &Registry, key: &Key, by: &str) -> bool {
+		let (seq, job) = {
+			let _order = self.order.lock().await;
+			// only a stored overlay has a row: one kept in memory only (a `persist: false` token's
+			// that replaced a stored one whose removal is still to be written) removes it
+			let job = match registry.overlay(key) {
+				Some(o) if o.stored => Job::SaveOverlay(OverlayRecord {
+					key: *key,
+					spec: serde_json::to_value(&o.spec).unwrap_or_default(),
+					created_by: o.created_by,
+					created_at: o.created_at,
+					updated_by: o.updated_by,
+					updated_at: o.updated_at,
+				}),
+				_ => Job::RemoveOverlay(*key),
+			};
+			let seq = self.intend(|u, seq| {
+				u.overlays.insert(*key, by.into());
+				u.latest_overlays.insert(*key, seq);
+			});
+			(seq, self.enqueue(job))
+		};
+		let result = job.await;
+		self.note_lock(&result, true);
+		let persisted = result.is_ok();
+		{
+			let mut u = self.unwritten.lock().unwrap_or_else(|e| e.into_inner());
+			if persisted && u.latest_overlays.get(key) == Some(&seq) {
+				u.overlays.remove(key);
+				u.latest_overlays.remove(key);
+			}
+		}
+		match result {
+			Ok(_) => info!(event = "rule.overlay.persist", rule = %key, token = by),
+			Err(_) if !self.enabled() => {}
+			Err(e) => warn!(event = "degraded", part = "db", table = OVERLAYS_TABLE, rule = %key, error = %e,
+				"the overlay is in force but its row is not up to date yet (written again by the next check)"),
+		}
+		persisted
+	}
+
+	/// Whether `key`'s row is up to date.
+	pub fn overlay_persisted(&self, key: &Key) -> bool {
+		!self.unwritten.lock().unwrap_or_else(|e| e.into_inner()).overlays.contains_key(key)
+	}
+
+	/// The rows of a memory store (tests).
+	pub fn memory_overlays(&self) -> Vec<StoredOverlay> {
+		self.memory.as_ref().map(|m| m.overlays.lock().unwrap().values().cloned().collect()).unwrap_or_default()
+	}
+
+	/// Puts a row in a memory store (tests).
+	pub fn memory_put_overlay(&self, row: StoredOverlay) {
+		if let Some(m) = &self.memory {
+			m.overlays.lock().unwrap().insert(row.key, row);
 		}
 	}
 }
@@ -1656,6 +1790,49 @@ impl DbWorker {
 		Ok(Done::Sets(out))
 	}
 
+	async fn read_overlays(&self) -> JobResult {
+		let mut conn = self.conn().await?;
+		let query = sqlx::query(
+			"SELECT protocol, listen_addr, CAST(listen_port AS SIGNED) AS listen_port, CAST(spec AS CHAR) AS spec, \
+			 CAST(spec_version AS SIGNED) AS spec_version, created_by, CAST(UNIX_TIMESTAMP(created_at) AS SIGNED) AS created_at, \
+			 updated_by, CAST(UNIX_TIMESTAMP(updated_at) AS SIGNED) AS updated_at \
+			 FROM rproxy_rule_overlays WHERE node = ? ORDER BY protocol, listen_addr, listen_port",
+		)
+		.bind(&self.node);
+		let rows = match query.fetch_all(&mut *conn).await {
+			Ok(rows) => rows,
+			Err(e) if missing_table(&e) => return Ok(Done::Overlays(vec![])),
+			Err(e) => return Err(failed(e)),
+		};
+		let mut out = vec![];
+		for row in rows {
+			let get_str = |c: &str| row.try_get::<String, _>(c).map_err(|e| format!("{c}: {e}"));
+			let get_int = |c: &str| row.try_get::<i64, _>(c).map_err(|e| format!("{c}: {e}"));
+			let read = || -> Result<StoredOverlay, String> {
+				let spec_version = u32::try_from(get_int("spec_version")?).unwrap_or(u32::MAX);
+				if spec_version > OVERLAY_SPEC_VERSION {
+					return Err(format!("spec_version {spec_version} is newer than this build reads ({OVERLAY_SPEC_VERSION})"));
+				}
+				let protocol: Protocol = get_str("protocol")?.parse().map_err(|e: crate::error::ApiError| e.message)?;
+				let port = u16::try_from(get_int("listen_port")?).map_err(|e| format!("listen_port: {e}"))?;
+				let listen = parse_listen(&get_str("listen_addr")?, port).map_err(|e| e.message)?;
+				Ok(StoredOverlay {
+					key: Key { protocol, listen },
+					spec: serde_json::from_str(&get_str("spec")?).map_err(|e| format!("spec: {e}"))?,
+					created_by: get_str("created_by")?,
+					created_at: get_int("created_at")?.max(0) as u64,
+					updated_by: get_str("updated_by")?,
+					updated_at: get_int("updated_at")?.max(0) as u64,
+				})
+			};
+			match read() {
+				Ok(o) => out.push(o),
+				Err(e) => warn!(event = "restore.skip", table = OVERLAYS_TABLE, error = %e),
+			}
+		}
+		Ok(Done::Overlays(out))
+	}
+
 	async fn read_global(&self) -> JobResult {
 		let mut conn = self.conn().await?;
 		let query = sqlx::query(
@@ -1695,6 +1872,36 @@ impl DbWorker {
 
 	async fn job(&mut self, job: Job) -> JobResult {
 		match job {
+			Job::ReadOverlays => self.read_overlays().await,
+			Job::SaveOverlay(o) => {
+				let query = sqlx::query(
+					"INSERT INTO rproxy_rule_overlays (node, protocol, listen_addr, listen_port, spec, spec_version, \
+					 created_by, created_at, updated_by, updated_at) \
+					 VALUES (?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?), ?, FROM_UNIXTIME(?)) \
+					 ON DUPLICATE KEY UPDATE spec = VALUES(spec), spec_version = VALUES(spec_version), \
+					 updated_by = VALUES(updated_by), updated_at = VALUES(updated_at)",
+				)
+				.bind(&self.node)
+				.bind(o.key.protocol.to_string())
+				.bind(o.key.listen.ip().to_string())
+				.bind(u32::from(o.key.listen.port()))
+				.bind(o.spec.to_string())
+				.bind(OVERLAY_SPEC_VERSION)
+				.bind(o.created_by)
+				.bind(o.created_at)
+				.bind(o.updated_by)
+				.bind(o.updated_at);
+				self.write(query).await
+			}
+			Job::RemoveOverlay(key) => {
+				let query =
+					sqlx::query("DELETE FROM rproxy_rule_overlays WHERE node = ? AND protocol = ? AND listen_addr = ? AND listen_port = ?")
+						.bind(&self.node)
+						.bind(key.protocol.to_string())
+						.bind(key.listen.ip().to_string())
+						.bind(u32::from(key.listen.port()));
+				self.write(query).await
+			}
 			Job::ReadGlobal => self.read_global().await,
 			Job::SaveGlobal(g) => {
 				let query = sqlx::query(
@@ -1859,6 +2066,24 @@ impl MemoryWorker {
 			Job::ReadRules => Ok(Done::Rules(m.rows.lock().unwrap().values().filter(|r| r.node == self.node).cloned().collect())),
 			Job::ReadSets => Ok(Done::Sets(m.sets.lock().unwrap().values().cloned().collect())),
 			Job::ReadGlobal => Ok(Done::Global(m.global.lock().unwrap().clone())),
+			Job::ReadOverlays => Ok(Done::Overlays(m.overlays.lock().unwrap().values().cloned().collect())),
+			Job::SaveOverlay(o) => {
+				let spec = serde_json::from_value(o.spec).map_err(|e| JobError::Failed(e.to_string()))?;
+				let row = StoredOverlay {
+					key: o.key,
+					spec,
+					created_by: o.created_by,
+					created_at: o.created_at,
+					updated_by: o.updated_by,
+					updated_at: o.updated_at,
+				};
+				m.overlays.lock().unwrap().insert(o.key, row);
+				Ok(Done::Ok)
+			}
+			Job::RemoveOverlay(key) => {
+				m.overlays.lock().unwrap().remove(&key);
+				Ok(Done::Ok)
+			}
 			Job::SaveGlobal(g) => {
 				*m.global.lock().unwrap() =
 					Some(StoredGlobal { spec: g.spec, spec_version: crate::config::global::GLOBAL_SPEC_VERSION, updated_by: g.by, updated_at: g.now / 1000 });

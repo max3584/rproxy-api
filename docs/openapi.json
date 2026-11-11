@@ -2041,6 +2041,31 @@
             ],
             "description": "api: created through the API and stored in rproxy_rules (v0.4, #144); treat unknown values like dynamic"
           },
+          "overlay": {
+            "type": "object",
+            "description": "A static rule's overlay (v0.4.23, #397); left out without one",
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "applied",
+                  "not_applied"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "routes": {
+                "type": "integer"
+              },
+              "tls_routes": {
+                "type": "integer"
+              },
+              "shadowed": {
+                "type": "integer"
+              }
+            }
+          },
           "state": {
             "type": "string",
             "enum": [
@@ -2382,6 +2407,10 @@
               "global_api_acme": {
                 "type": "boolean",
                 "description": "global.acme through PATCH /config/global (only over the Unix socket by default) and a reload of the settings file, while running: rebuilt and swapped (an order in flight gives up and removes the TXT records it wrote; the rules' certificates come from the new storage); taking away a resolver or names that rules' acme certificates use is 409 in_use; the files it names are only right in RPROXY_API_ACME_DIR (storage under it), with no key_file and no inline secret; http01_listen counts in RPROXY_MAX_LISTENERS (409 limit) (v0.4.22, #345)"
+              },
+              "static_overlay": {
+                "type": "boolean",
+                "description": "GET / PUT / DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay: routes, services, middlewares and tls.routes added through the API on a static rule's listener, tried after the settings file's (the file wins on names: 409 overlay_conflict, shadowed after a reload); kept but not_applied while the static rule cannot take them; stored in rproxy_rule_overlays (v0.4.23, #397)"
               }
             }
           },
@@ -4142,6 +4171,164 @@
           "code",
           "error"
         ]
+      },
+      "OverlaySpec": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "What the API adds on a static rule's listener (v0.4.23, #397). The file's part is not in it and never changes through it.",
+        "properties": {
+          "http": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Only when the static rule has http. Routes are tried after every route of the file, whatever their priority; they may name the file's services and middlewares (read only). pre_routing, default, http3, raw_path and strict_path are the file's.",
+            "properties": {
+              "routes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HttpRoute"
+                }
+              },
+              "services": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/HttpService"
+                }
+              },
+              "middlewares": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/Middleware"
+                }
+              }
+            }
+          },
+          "tls": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "More server names: tls.mode sni, or terminate without http and client_auth. Only names no file route matches use them; no upstream.",
+            "properties": {
+              "routes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TlsRoute"
+                }
+              }
+            }
+          }
+        }
+      },
+      "OverlayShadowed": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "route",
+              "service",
+              "middleware",
+              "tls_route"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "Overlay": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OverlaySpec"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "rule": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "applied",
+                  "not_applied"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "no_static_rule",
+                  "shape",
+                  "invalid",
+                  "failed"
+                ],
+                "description": "Why it does not apply (the overlay is kept)"
+              },
+              "error": {
+                "type": "string"
+              },
+              "shadowed": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/OverlayShadowed"
+                },
+                "description": "Items left out because the settings file has the name (after a reload)"
+              },
+              "etag": {
+                "type": "string"
+              },
+              "created_by": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "integer"
+              },
+              "updated_by": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "integer"
+              },
+              "persisted": {
+                "type": "boolean",
+                "description": "Whether rproxy_rule_overlays has it as it is (left out without a database)"
+              }
+            }
+          }
+        ]
+      },
+      "OverlayPlan": {
+        "type": "object",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "delete",
+              "none"
+            ]
+          },
+          "rule": {
+            "type": "string"
+          },
+          "before": {
+            "$ref": "#/components/schemas/OverlaySpec"
+          },
+          "after": {
+            "$ref": "#/components/schemas/OverlaySpec"
+          },
+          "diff": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffEntry"
+            }
+          }
+        }
       }
     }
   },
@@ -4860,6 +5047,296 @@
           },
           "403": {
             "description": "The token lacks a scope or the listen port",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rules/{protocol}/{listen_addr}/{listen_port}/overlay": {
+      "parameters": [
+        {
+          "name": "protocol",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Protocol"
+          }
+        },
+        {
+          "name": "listen_addr",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "IP address; IPv6 without brackets"
+        },
+        {
+          "name": "listen_port",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
+      ],
+      "get": {
+        "summary": "The overlay added through the API on a static rule (rules:read; v0.4.23, #397)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overlay"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found (no overlay)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port (the static rule's whole range)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Add or replace the overlay of a static rule (rules:write; v0.4.23, #397). Put in force in place; the router of http is rebuilt.",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Check and answer what would change without changing anything (OverlayPlan, 200)"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The ETag of GET; 412 precondition_failed when the overlay changed (or there is none)"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OverlaySpec"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced (with dry_run: OverlayPlan)",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overlay"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overlay"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid (the merge does not validate) / tls_config",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found (no rule has the key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "not_static (an API or rule-set rule) / overlay_conflict (the settings file has a name) / file_in_use / secret_reuse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed (If-Match)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port (the static rule's whole range)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Remove the overlay (rules:write; v0.4.23, #397); the rule runs with the file's part alone",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Check and answer what would change without changing anything (OverlayPlan, 200)"
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The ETag of GET; 412 precondition_failed when the overlay changed (or there is none)"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "200": {
+            "description": "dry_run: what would change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverlayPlan"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found (no overlay)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "precondition_failed (If-Match)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, unknown or expired token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The token lacks a scope or the listen port (the static rule's whole range)",
             "content": {
               "application/json": {
                 "schema": {

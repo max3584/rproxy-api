@@ -335,7 +335,7 @@ If a config file (or its directory) is given in `RPROXY_CONFIG` (`--config`), it
   - Each file has one of the shapes above. `rules` are concatenated. Only one file may contain `global` (an error if two do).
   - If two rules have the same key (protocol, address, port), it is an error showing both file names and positions (e.g. `web.yaml rule #2`).
 - Started before restoring from the DB. Works even if the DB cannot be reached.
-- Cannot be modified or deleted via the API (`409 static`). To change them, edit the file.
+- Cannot be modified or deleted via the API (`409 static`). To change them, edit the file. To add http routes or `tls.routes` names on the same listener through the API, use the overlay (`/rules/{key}/overlay`, v0.4.23, "Overlays on a static rule's listener" below).
 - **Applying without restart**: every `RPROXY_CONFIG_CHECK_SECS` (default 10 seconds; `0` means only on SIGHUP), the file's size, modification time and inode (and for a directory, files added or removed) are checked, and the file is reloaded if anything changed. Sending SIGHUP reloads even if nothing changed. To get the result immediately, use `POST /config/reload` (in the endpoint table below). Swapping symbolic links (ConfigMap updates) is also detected.
   - The reloaded configuration is first validated as a whole. If there are errors, nothing is changed and the previous rules stay in use (`event: "config.error"`; once per identical content). The same applies when it cannot be read (permissions): it retries at every check until readable.
   - If valid, only the differences are applied (`event: "config.reload"`; counts of `added`, `removed`, `changed`, `unchanged`, `failed`).
@@ -1323,6 +1323,53 @@ So that a `rules:write` token cannot use up the process's resources (file descri
 - Background tasks (the watchers of the settings file, tokens and certificates, ACME, GeoIP's reloads, the database worker, its ping and the reconciliation) that panic log `degraded` (`part`) and are started again after a pause (1 second, doubled up to a minute; back to 1 second after 5 minutes of running); `rproxy_task_restarts_total{part}` in `/metrics`. A database job that panics fails alone, and the database connection is opened again.
 - Live upgrades (#174): while the old process of the last handoff is still draining, no new handoff starts (`409 upgrading`; SIGUSR2 and the self-update too), since its last counters come to this process. It waits at most the old process's drain (`RPROXY_HANDOFF_DRAIN`) and 60 seconds; `parent_draining` of `GET /admin/update`. The self-update does not mark the version bad for this refusal (it tries again at its next check).
 
+### Overlays on a static rule's listener (v0.4.23, #397, `features.static_overlay`)
+
+**Adds** http routes, services and middlewares and `tls.routes` server-name targets through the API and UI on the listener of a settings-file rule (`origin: static`): the overlay. The static rule stays the file's (`409 static` as before); the API changes or removes only what it added.
+
+- `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay`. `PUT` replaces the overlay as a whole (the UI does `GET` → edit → `PUT` with `GET`'s `ETag` in `If-Match`; if the overlay changed meanwhile, `412 precondition_failed`). `?dry_run=true` (`PUT`, `DELETE`) checks and answers `{"dry_run":true,"action":"create|update|delete|none","rule","before","after","diff"}`. Scopes `rules:read` (`GET`) and `rules:write`; the token's `allow_listen_ports` must cover the rule's whole range. Audit `action: overlay.put` / `overlay.delete`.
+- Body:
+
+```json
+{
+  "http": {
+    "routes": [{"name": "wiki", "match": "Host(`wiki.example.com`)", "service": "wiki", "middlewares": ["sso"]}],
+    "services": {"wiki": {"servers": [{"url": "http://10.0.0.5:8080"}]}},
+    "middlewares": {}
+  },
+  "tls": {"routes": [{"server_name": "git.example.com", "remote_addr": "10.0.0.6", "remote_port": 443}]}
+}
+```
+
+- **http**: only when the static rule has `http`. Only `routes`, `services` and `middlewares` can be added (`pre_routing`, `default`, `http3`, `raw_path` and `strict_path` are the file's). Overlay routes see **only requests no file route matches** (however high their `priority`, they cannot take a file route's requests, so the file routes' authentication cannot be skipped). Among themselves they are ordered as usual (`priority`, then order). With neither, the file's `default`. Overlay routes and middlewares may name the file's `services` and `middlewares` (an overlay route reaches a file service without the file routes' middlewares; the secret files (client keys, `oidc` secrets, `users_file`) of the file services and middlewares it reaches are the settings file's, so a token without `admin` gets `409 file_in_use`). The file's `pre_routing` runs for overlay routes too. An overlay `oidc`'s callback and logout paths are not answered for requests a file route matches. Identity headers only the overlay's authentication middlewares set are removed only from requests no file route matched (an overlay route's, `default`).
+- **`tls.routes`**: only on static rules with `tls.mode: sni` (tcp, udp) or `terminate` without `http` and `client_auth`. **Only names no file `tls.routes` entry matches** look at the overlay's routes (names under the file's `*.example.com` are the file's; names and patterns a file pattern takes entirely could never be used and are `409 overlay_conflict`). Overlay routes take no `upstream` (the rule's is used). On `unmatched: reject` rules the overlay's names are accepted.
+- Names: a name the file has (routes, services, middlewares; the same pattern for `tls.routes`) is `409 overlay_conflict` on `PUT`. When the file adds the same name later (a reload), the file wins and the overlay's item (with the overlay routes and middlewares that use it) is left out and listed in `shadowed` (`rule.overlay`, warn).
+- When it cannot apply: the static rule is gone after a reload (`reason: no_static_rule`), `http` is gone or `tls.mode` changed (`shape`), the merge does not validate (`invalid`), or building fails (`failed`). The overlay is **kept, not deleted**, and the rule runs with the file's part alone: `state: not_applied`, `reason` and `error` in `GET …/overlay`, `overlay` in the rule view, `rproxy_rule_overlay{protocol,listen,state}` in `/metrics`. When the file allows it again (a reload, a restart) it applies again.
+- `GET …/overlay`: the body's shape plus `rule`, `state` (`applied` / `not_applied`), `reason`, `error`, `shadowed` (`[{"kind","name","reason"}]`), `etag`, `created_by`, `created_at`, `updated_by`, `updated_at`, `persisted` (with a database). Rule views (`GET /rules`) keep the file's shape and get `overlay` (`{"state","reason"?,"routes","tls_routes","shadowed"?}`). Overlay routes are counted by name in `stats.http.routes`.
+- Changing the overlay rebuilds the rule's `http` router (connections stay). Services and middlewares whose settings did not change (the file's too) are taken over, so `rate_limit`, `cache`, `in_flight`, health checks and the like keep their state (an overlay change cannot start the file's `rate_limit` afresh). Changed ones, middlewares that send to a service (`mirror`, `errors`, `forward_auth` with `service`) and services with per-server middlewares start empty. Reloads and overlay changes take turns.
+- Headers saying where a request came from (`X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Proto` / `-Host` / `-Port` / `-Prefix` / `-Server`, `X-Forwarded-Client-Cert`, `X-Client-Verify`) are no identity headers (from v0.4.23 a client's is never removed as one, on any rule). Naming them as `basic_auth`'s `user_header` or `forward_auth`'s `response_headers` is `400 invalid` for API rules, rule sets and overlays, and a `--check-config` warning for the settings file.
+- Files: files the overlay names (services' `tls`, `basic_auth`'s `users_file`, `oidc`'s secrets) are checked as for API rules (`403 protected_file` / `file_not_allowed`, `409 file_in_use` / `secret_reuse`). Their owner is the token that created the overlay (`created_by`). Other tokens with `rules:write` and the ports may change it (`updated_by` changes).
+- Out of scope: API rules (change them with `PATCH`) and rule-set rules (with the set's `PUT`) take no overlay (`409 not_static`). A key without a rule is `404`.
+- Storage: follows the token's `persist` (as API rules do). An overlay a `persist: true` token made is written to `rproxy_rule_overlays` before the answer when there is a database (`RPROXY_DATABASE_URL`; the row is deleted on `DELETE`), and once written every token's change or removal is written. A `persist: false` token's overlay, and any overlay without a database, lives in memory only (lost on a restart, handed over by a live upgrade) and shows no `persisted`. A failed write is `persisted: false` and `degraded` (`part: "db"`); the periodic check writes it again (rows never win). Restored at startup after the settings file's rules (`restore.overlays`). Without the table nothing is restored and writes are `degraded`.
+- Table (the UI repository's `db/migrations/014_rproxy_rule_overlays.sql`):
+
+```sql
+CREATE TABLE IF NOT EXISTS rproxy_rule_overlays (
+  node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (as in rproxy_rules)
+  protocol     VARCHAR(8)   NOT NULL,   -- the static rule's key
+  listen_addr  VARCHAR(45)  NOT NULL,
+  listen_port  INT UNSIGNED NOT NULL,
+  spec         JSON         NOT NULL,   -- the body of PUT /rules/{key}/overlay
+  spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+  created_by   VARCHAR(255) NOT NULL,
+  created_at   DATETIME(3)  NOT NULL,
+  updated_by   VARCHAR(255) NOT NULL,
+  updated_at   DATETIME(3)  NOT NULL,
+  PRIMARY KEY (node, protocol, listen_addr, listen_port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_overlays TO 'rproxy'@'%';
+```
+
 ## Endpoints
 
 | Method and path | Body | On success | Description |
@@ -1338,6 +1385,7 @@ So that a `rules:write` token cannot use up the process's resources (file descri
 | `POST /rules` | rule | 201 | Starts forwarding. Responds after name resolution and bind have completed |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` or `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | Changes the destination. Including `extra_listen_addrs` replaces the additional listen addresses entirely (`[]` removes all; omitted keeps the current ones): only added addresses are opened and only removed addresses are closed (other addresses, and TCP connections open on removed addresses, are kept; UDP sessions on them end, #354). For rules listening on `::`, changes that toggle whether there are additional addresses (dual-stack vs. IPv6 only) are `unsupported` (recreate the rule). The destination (`remote_addr` / `remote_port` or `targets`, `balance`, `health_check`) is replaced together every time: an omitted `balance` becomes `round_robin`, an omitted `health_check` becomes none. To go back to a single destination, send `remote_addr` / `remote_port` (`"targets": []` may be included). Including `crowdsec` enables or disables disconnection by decisions (from the next connection). Takes effect immediately from new connections. Including `tls` replaces the whole TLS configuration (specify `starttls` together; omitting it means no STARTTLS). With `http`, the L7 settings are replaced as a whole (from the next request; adding `http` to a rule without it is `unsupported`; "v0.3 settings" above). `source_ip` and the port range cannot be changed: sending `source_ip` or `listen_port_end` with a value other than the current one is `unsupported` (the same value is accepted; to change them, re-create the rule) |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | Stops forwarding. Existing connections are cut immediately. With `drain_secs`, waits that many seconds for existing connections to finish before cutting them (from v0.4.20 up to 3600 seconds: a longer value is cut to 3600; the same for rule sets' `DELETE`) |
+| `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay` | overlay (`PUT`) | 200 / 201 / 204 | v0.4.23 (#397): what the API adds on a static rule's listener ("Overlays on a static rule's listener" above). `?dry_run=true`, `ETag` / `If-Match` |
 | `GET /acme` | | 200 | ACME state (docs/en/ACME.md): `{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`. Neither secrets nor where they are kept are shown. `rules:read`. `404` without `global.acme` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | Renews that certificate now (within `rate_limit`; see `GET /acme` for the result). `acme:write`; like `POST /config/reload`, only over the Unix socket by default (`RPROXY_API_RELOAD_UNIX_ONLY`). `404` when no rule uses it. `event=audit` (`action: acme.renew`) |
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | Revokes the issued certificate at the CA and orders a new one at once. Scope and Unix socket as for `POST /acme/renew`. `event=audit` (`action: acme.revoke`). docs/en/ACME.md |
@@ -1394,6 +1442,8 @@ On failure, responses take the following shape.
 | `file_not_allowed` | 403 | v0.4.17 (#319): a token with `allow_certs` named a file in a rule |
 | `secret_reuse` | 409 | v0.4.17 (#319): an OIDC client secret file is used for something else than the client secret of the same issuer and client |
 | `file_in_use` | 409 | v0.4.18 (#323): a token without `admin` named a key or secret file that a rule of another owner names (another token's, another token's rule set's, the settings file's, or a restored rule whose creator is not known) |
+| `not_static` | 409 | v0.4.23 (#397): overlays are for static rules only (not API or rule-set rules) |
+| `overlay_conflict` | 409 | v0.4.23 (#397): the overlay used a name the settings file has (a route, service, middleware or `tls.routes` name) |
 | `limit` | 409 | v0.4.20 (#358): past a limit of the process (`RPROXY_MAX_RULES`, `RPROXY_MAX_LISTENERS`, `RPROXY_MAX_RULESETS`) or of the token (`max_rules`, `max_rulesets`) |
 | `busy` | 503 | v0.4.20 (#358): other rule sets' `PUT` bodies are being read / too many deletions wait for the database; send again in a moment |
 | `too_large` | 413 | v0.4.20 (#358): a rule set's `PUT` body over 32 MiB |

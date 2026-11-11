@@ -26,6 +26,7 @@ rproxy-api・TCP-UDP-rproxy-ui・rproxy-gateway の 3 つがどうつながる�
 | UI のルール | UI（`origin: dynamic`） | UI の DB `forward_rules` | 即時 |
 | API のルール | 制御 API `POST /rules`（`origin: api`） | `rproxy_rules` | 即時 |
 | ルールセット | rproxy-gateway `PUT /rulesets` | `rproxy_rule_sets` | 即時・まとめて |
+| 固定のルールに重ねる分 | 制御 API `PUT /rules/{key}/overlay`（v0.4.23、#397。ファイルのルートの後に照合） | `rproxy_rule_overlays` | 即時 |
 | global（変わる値） | 制御 API `PATCH /config/global`・UI の global の画面 | `rproxy_global` | 即時（`trusted_proxies`・`access_log`・`crowdsec`・`http.timeouts`・UDP のセッション上限・`cache_max_memory`） |
 | global（固定の値） | 設定ファイル・環境変数（API より強い） | ファイル・環境 | 一部は再起動（`acme`・`geoip`・`performance`・`files`・制御 API の待ち受け） |
 | トークン | トークンファイル | ファイル | 変化を見て読み直す |
