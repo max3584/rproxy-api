@@ -45,7 +45,7 @@ jobs:
         # (20 s per package, past the job's timeout): short timeouts with retries, then the
         # same packages from archive.ubuntu.com.
         run: |
-          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=15)
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true)
           pkgs=(libdpdk-dev dpdk pkg-config python3)
           sudo apt-get "${apt_opts[@]}" update -q
           if ! timeout 300 sudo apt-get "${apt_opts[@]}" install -y -q --no-install-recommends "${pkgs[@]}"; then
