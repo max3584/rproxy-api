@@ -729,10 +729,21 @@ async fn delete(
 
 /// `If-Match` of an overlay change (#397).
 fn if_match(headers: &axum::http::HeaderMap) -> AppResult<Option<String>> {
-	headers
-		.get(header::IF_MATCH)
-		.map(|v| v.to_str().map(str::to_string).map_err(|_| ApiError::invalid("If-Match is not text")))
-		.transpose()
+	text_header(headers, header::IF_MATCH)
+}
+
+fn text_header(headers: &axum::http::HeaderMap, name: header::HeaderName) -> AppResult<Option<String>> {
+	headers.get(&name).map(|v| v.to_str().map(str::to_string).map_err(|_| ApiError::invalid(format!("{name} is not text")))).transpose()
+}
+
+/// `If-Match` and `If-None-Match` of an overlay `PUT` (#399): `If-None-Match: *` creates only.
+/// Both at once is `400 invalid` (no use for an overlay, and easy to get wrong).
+fn put_preconditions(headers: &axum::http::HeaderMap) -> AppResult<(Option<String>, Option<String>)> {
+	let (if_match, if_none_match) = (if_match(headers)?, text_header(headers, header::IF_NONE_MATCH)?);
+	if if_match.is_some() && if_none_match.is_some() {
+		return Err(ApiError::invalid("send If-Match or If-None-Match, not both"));
+	}
+	Ok((if_match, if_none_match))
 }
 
 fn etag_header(etag: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
@@ -773,20 +784,29 @@ async fn put_overlay(
 ) -> AppResult<Response> {
 	let key = parse_key(&protocol, &addr, &port)?;
 	let spec: crate::core::overlay::OverlaySpec = parse_body(&body)?;
-	let if_match = if_match(&headers)?;
+	let (if_match, if_none_match) = put_preconditions(&headers)?;
 	// the key's port first (the rule's whole range again in turn with reloads, `overlay_ports`)
 	check_ports(&principal, key.listen.port(), None)?;
 	if crate::config::plan::dry_run(&query)? {
 		drop(super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?);
 		let ports = overlay_ports(&principal);
-		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), true).await?).into_response());
+		return Ok(Json(
+			state
+				.registry
+				.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), true)
+				.await?,
+		)
+		.into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		let result = async {
 			let _files = super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?;
 			let ports = overlay_ports(&principal);
-			state.registry.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), false).await
+			state
+				.registry
+				.put_overlay(&key, spec, &principal.name, principal.has(Scope::Admin), principal.persist, &ports, if_match.as_deref(), if_none_match.as_deref(), false)
+				.await
 		}
 		.await;
 		audit(&principal, &client, "overlay.put", &key.to_string(), &result);

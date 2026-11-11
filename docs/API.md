@@ -1191,7 +1191,7 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 - 対象：`PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}`（`dry_run` も）。持ち主でなければ `403 not_owner` で、何も変えない（監査ログは `outcome: "forbidden"`・`code: "not_owner"`）。rproxy の API に一時停止・再開の口はない（UI は一時停止を `DELETE`、再開を `POST` で行う）ので、それも同じ。
 - 持ち主：`origin: "api"` は `created_by`、`dynamic` は作ったトークンを rproxy が覚える（引き継ぎで渡す）。`admin` が直しても持ち主は変わらない。読むこと（`GET`）は今までどおり。
 - 作ったトークンの分からないルール（UI の `forward_rules` から戻したもの、前の版の `rproxy_rules` の行で `created_by` が空のもの、再起動の後の `dynamic` のルール）：`admin` と、トークンファイルで **`allow_restored: true`** のトークンだけが直す・消すことができる。直しても持ち主は分からないまま（ほかの `allow_restored` のトークンも直せる）。
-- 重ねる分（`PUT` / `DELETE /rules/{key}/overlay`、`dry_run` も）：今の重ねる分の `created_by` のトークンと `admin` だけ。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる（作ったトークンのものになる）。
+- 重ねる分（`PUT` / `DELETE /rules/{key}/overlay`、`dry_run` も）：今の重ねる分の `created_by` のトークンと `admin` だけ。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる（作ったトークンのものになる）。`If-Match` / `If-None-Match`（#399）は先に確かめるので、`If-None-Match: *` で作る取り合いに負けたトークンは `403` ではなく `412` を受け取る。
 - 組（`PUT` / `DELETE /rulesets/{name}`）：前から持ち主だけ（セキュリティレビュー M3）。断るときの `code` も `not_owner` にそろえた。組のルールを個別に直す・消すのは、誰でも今までどおり `409 owned`。設定ファイルのルールは `409 static`。
 - 持ち主はトークンの **名前**。同じ名前で `sha256` を入れ替えれば持ち主は変わらない。名前を変えると、前の名前で作ったものは `admin` だけが直せる（「トークン・証明書の入れ替え」）。1 行に 1 トークンの書き方のトークン（`token-1`…）とトークンファイルのないときは `admin` なので、何も変わらない。
 - **UI（TCP-UDP-rproxy-ui）**：UI は 1 つのトークンで話し、利用者ごとの持ち主は UI が自分で確かめる。UI が動いている間に作ったルールは UI のトークンのものなので、そのまま直せる。rproxy の再起動の後に `forward_rules` から戻したルールは作ったトークンが分からないので、UI のトークンが `admin` でなければ **`allow_restored: true` を付ける**（付けないと、再起動の後に UI からそのルールを直す・一時停止する・消すことが `403 not_owner` になる）。UI の README の手順（1 行に 1 トークンの書き方）は `admin` なので、付けなくてよい。`allow_restored` は UI のトークンにだけ付け、サービスアカウントには付けない。
@@ -1342,7 +1342,7 @@ http:
 
 設定ファイルの固定ルール（`origin: static`）の待ち受けに、API・UI から http のルート・サービス・ミドルウェアと `tls.routes` の名前の宛先を **足す**（重ねる分、overlay）。固定ルールそのものはファイルのまま（`409 static` は変わらない）で、API は自分が足した分だけを変える・消す。
 
-- `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay`。`PUT` は重ねる分を丸ごと置き換える（UI は `GET` → 直す → `If-Match` に `GET` の `ETag` を付けた `PUT`。重ねる分が変わっていれば `412 precondition_failed`）。`?dry_run=true`（`PUT`・`DELETE`）は確かめて `{"dry_run":true,"action":"create|update|delete|none","rule","before","after","diff"}` を返す。スコープは `rules:read`（`GET`）・`rules:write`、トークンの `allow_listen_ports` はルールの範囲すべてを含むこと。監査は `action: overlay.put` / `overlay.delete`。
+- `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay`。`PUT` は重ねる分を丸ごと置き換える（UI は `GET` → 直す → `If-Match` に `GET` の `ETag` を付けた `PUT`。重ねる分が変わっていれば `412 precondition_failed`）。新しく作るときは `If-None-Match: *`（#399）：重ねる分がすでにあれば `412 precondition_failed`（読んでから作るまでに別の人が作ったものを上書きしない。ETag を並べれば、そのどれかの重ねる分があれば `412`）。`If-Match` と同じく、待ち受けの変更の順番の中で今の重ねる分と比べ、`dry_run` でも同じに確かめる。`If-Match` と `If-None-Match` を両方付けると `400 invalid`（RFC 9110 の順に比べると重ねる分では意味がなく、間違いのもとのため断る）。`?dry_run=true`（`PUT`・`DELETE`）は確かめて `{"dry_run":true,"action":"create|update|delete|none","rule","before","after","diff"}` を返す。スコープは `rules:read`（`GET`）・`rules:write`、トークンの `allow_listen_ports` はルールの範囲すべてを含むこと。監査は `action: overlay.put` / `overlay.delete`。
 - 本文：
 
 ```json
@@ -1400,7 +1400,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_overlays TO 'rproxy'@
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている TCP の接続はそのまま。UDP のセッションは終える、#354）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する（v0.4.20 から 3600 秒まで。長い値は 3600 秒に切り詰める。組の `DELETE` も同じ） |
-| `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay` | 重ねる分（`PUT`） | 200 / 201 / 204 | v0.4.23（#397）：固定ルールの待ち受けに API で足す分（上の「固定ルールの待ち受けに重ねる分」）。`?dry_run=true`、`ETag` / `If-Match` |
+| `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay` | 重ねる分（`PUT`） | 200 / 201 / 204 | v0.4.23（#397）：固定ルールの待ち受けに API で足す分（上の「固定ルールの待ち受けに重ねる分」）。`?dry_run=true`、`ETag` / `If-Match`、作るときは `If-None-Match: *`（#399） |
 | `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
@@ -1445,7 +1445,7 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `bind_failed` | 409 | 待ち受けポートを開けない |
 | `resolve_failed` | 502 | 転送先の名前解決に失敗し、キャッシュもない |
 | `owned` | 409 | v0.4：ルールが組（`ruleset`）に属するので個別には変えられない |
-| `precondition_failed` | 412 | v0.4：`If-Match` の etag が今の組と違う |
+| `precondition_failed` | 412 | v0.4：`If-Match` の etag が今の組と違う（重ねる分は v0.4.23：`If-Match` が合わない、`If-None-Match` に当たる） |
 | `stale_generation` | 409 | v0.4：組の `generation` が今より古い |
 | `locked_out` | 429 | v0.4：認証の失敗が続いたので、この送信元を一時的に止めている（`Retry-After`） |
 | `upgrading` | 503 / 409 | v0.4（#174）：再起動なしの更新の途中なので変更を受け付けない（503。少し待って送り直す。v0.4.15 から、引き継ぎが始まる前に受け付けて順番を待っていた変更も何も変えずに 503）／すでに更新が動いている（`POST /admin/upgrade` の 409） |

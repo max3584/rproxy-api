@@ -201,6 +201,9 @@ async fn overlays_are_changed_by_their_creator() {
 	let (status, v) = call(&h, Method::PUT, &path, "a", Some(overlay(1))).await;
 	assert_eq!((status, &v["created_by"]), (StatusCode::CREATED, &json!("a")), "{v}");
 	not_owner(call(&h, Method::PUT, &path, "b", Some(overlay(2))).await, "PUT");
+	// a create that lost the race is 412 first (#399), whoever made the overlay
+	let r = h.http.put(format!("{}{path}", h.base)).bearer_auth("b").header("if-none-match", "*").json(&overlay(2)).send().await.unwrap();
+	assert_eq!(r.status(), StatusCode::PRECONDITION_FAILED);
 	not_owner(call(&h, Method::PUT, &format!("{path}?dry_run=true"), "b", Some(overlay(2))).await, "PUT dry run");
 	not_owner(call(&h, Method::DELETE, &path, "b", None).await, "DELETE");
 	not_owner(call(&h, Method::DELETE, &format!("{path}?dry_run=true"), "ui", None).await, "DELETE dry run");
