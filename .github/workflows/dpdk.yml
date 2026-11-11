@@ -40,6 +40,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # the .debs of the last good install: the job does not depend on the mirror being up
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: dpdk-apt-noble-v1
       - name: DPDK (Ubuntu packages)
         # The runner's Azure mirror sometimes stalls on the librte-* packages of noble-updates
         # (20 s per package, past the job's timeout): short timeouts with retries, then the
@@ -47,6 +52,8 @@ jobs:
         run: |
           apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true)
           pkgs=(libdpdk-dev dpdk pkg-config python3)
+          mkdir -p ~/apt-archives
+          sudo cp ~/apt-archives/*.deb /var/cache/apt/archives/ 2>/dev/null || true
           sudo apt-get "${apt_opts[@]}" update -q
           if ! timeout 300 sudo apt-get "${apt_opts[@]}" install -y -q --no-install-recommends "${pkgs[@]}"; then
             echo "::warning::the runner's apt mirror failed; using archive.ubuntu.com"
@@ -58,6 +65,7 @@ jobs:
             sudo apt-get "${apt_opts[@]}" install -y -q --no-install-recommends "${pkgs[@]}"
           fi
           pkg-config --modversion libdpdk
+          cp /var/cache/apt/archives/*.deb ~/apt-archives/ 2>/dev/null || true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
