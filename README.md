@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/max3584/rproxy-api/master/scripts/i
 
 ### apt（Debian / Ubuntu）
 
-apt リポジトリから入れられる（amd64 / arm64 / armhf）。同じリポジトリに管理 UI の `rproxy-ui` もある（`sudo apt install rproxy-api rproxy-ui`。UI は Node.js 20.9 以上が要る。[TCP-UDP-rproxy-ui の README](https://github.com/max3584/TCP-UDP-rproxy-ui)）。
+apt リポジトリから入れられる（amd64 / arm64 / armhf）。同じリポジトリに管理 UI の `rproxy-ui` もある（`sudo apt install rproxy-api rproxy-ui`。UI は Node.js 22.23.4 以上（24 なら 24.22.1 以上）が要る。arm64 は NodeSource の nodejs で動き、Raspberry Pi なら 64 ビットの OS を勧める。[TCP-UDP-rproxy-ui の README](https://github.com/max3584/TCP-UDP-rproxy-ui)）。
 
 ```shell
 sudo curl -fsSLo /usr/share/keyrings/rproxy-archive-keyring.gpg https://max3584.github.io/rproxy-api/rproxy-archive-keyring.gpg
