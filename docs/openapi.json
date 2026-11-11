@@ -5159,7 +5159,16 @@
             "schema": {
               "type": "string"
             },
-            "description": "The ETag of GET; 412 precondition_failed when the overlay changed (or there is none)"
+            "description": "The ETag of GET; 412 precondition_failed when the overlay changed (or there is none). Not with If-None-Match (400 invalid)"
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "* to create only: 412 precondition_failed when there is an overlay already (a list of ETags: when it is one of them); checked in turn with the listener's other changes, in a dry run too. Not with If-Match (400 invalid) (v0.4.23, #399)"
           }
         ],
         "requestBody": {
@@ -5208,7 +5217,7 @@
             }
           },
           "400": {
-            "description": "invalid (the merge does not validate) / tls_config",
+            "description": "invalid (the merge does not validate) / tls_config / If-Match and If-None-Match both sent",
             "content": {
               "application/json": {
                 "schema": {
@@ -5238,7 +5247,7 @@
             }
           },
           "412": {
-            "description": "precondition_failed (If-Match)",
+            "description": "precondition_failed (If-Match, or If-None-Match when there is an overlay)",
             "content": {
               "application/json": {
                 "schema": {
