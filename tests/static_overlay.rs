@@ -92,7 +92,10 @@ async fn overlay_routes_come_after_the_files_and_cannot_skip_its_authentication(
 	h.registry.load_static_labeled(requests(json!([file_rule(port, a)]))).await.unwrap();
 	assert_eq!(fetch(port, "/x").await.0, 404);
 
-	let (status, v, etag) = call(&h, Method::PUT, &path(port), Some(overlay(b)), &[]).await;
+	// If-None-Match: * creates only (#399): a dry run, then the creation
+	let (status, v, _) = call(&h, Method::PUT, &format!("{}?dry_run=true", path(port)), Some(overlay(b)), &[("If-None-Match", "*")]).await;
+	assert_eq!((status, v["action"].as_str()), (StatusCode::OK, Some("create")), "{v}");
+	let (status, v, etag) = call(&h, Method::PUT, &path(port), Some(overlay(b)), &[("If-None-Match", "*")]).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	assert_eq!((v["state"].as_str(), v["created_by"].as_str()), (Some("applied"), Some("")), "{v}");
 	assert_eq!(etag.as_deref(), v["etag"].as_str());
@@ -142,6 +145,18 @@ async fn overlay_routes_come_after_the_files_and_cannot_skip_its_authentication(
 	changed["http"]["routes"][0]["match"] = json!("PathPrefix(`/z`)");
 	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(changed.clone()), &[("If-Match", "\"o-0000\"")]).await;
 	assert_eq!((status, v["code"].as_str()), (StatusCode::PRECONDITION_FAILED, Some("precondition_failed")), "{v}");
+	// an overlay is there: If-None-Match: * (or its ETag) fails, in a dry run too; another ETag passes
+	for (query, value) in [("", "*"), ("?dry_run=true", "*"), ("", etag.as_deref().unwrap())] {
+		let (status, v, _) = call(&h, Method::PUT, &format!("{}{query}", path(port)), Some(changed.clone()), &[("If-None-Match", value)]).await;
+		assert_eq!((status, v["code"].as_str()), (StatusCode::PRECONDITION_FAILED, Some("precondition_failed")), "{query} {value}: {v}");
+	}
+	let (status, v, _) =
+		call(&h, Method::PUT, &format!("{}?dry_run=true", path(port)), Some(changed.clone()), &[("If-None-Match", "\"o-0000\"")]).await;
+	assert_eq!((status, v["action"].as_str()), (StatusCode::OK, Some("update")), "{v}");
+	// both at once is refused
+	let both = [("If-Match", etag.as_deref().unwrap()), ("If-None-Match", "*")];
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(changed.clone()), &both).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid")), "{v}");
 	let (status, v, _) = call(&h, Method::PUT, &format!("{}?dry_run=true", path(port)), Some(changed.clone()), &[]).await;
 	assert_eq!((status, v["action"].as_str()), (StatusCode::OK, Some("update")), "{v}");
 	assert!(!v["diff"].as_array().unwrap().is_empty(), "{v}");
@@ -158,6 +173,17 @@ async fn overlay_routes_come_after_the_files_and_cannot_skip_its_authentication(
 	assert_eq!(call(&h, Method::GET, &path(port), None, &[]).await.0, StatusCode::NOT_FOUND);
 	let (_, rule) = h.get(&format!("/rules/tcp/127.0.0.1/{port}")).await;
 	assert!(rule.get("overlay").is_none(), "{rule}");
+
+	// two creations at once with If-None-Match: *: one makes it, the other is 412
+	let (target, only_new) = (path(port), [("If-None-Match", "*")]);
+	let ((one, v1, _), (two, v2, _)) = tokio::join!(
+		call(&h, Method::PUT, &target, Some(overlay(b)), &only_new),
+		call(&h, Method::PUT, &target, Some(overlay(b)), &only_new)
+	);
+	let mut statuses = [one, two];
+	statuses.sort();
+	assert_eq!(statuses, [StatusCode::CREATED, StatusCode::PRECONDITION_FAILED], "{v1} {v2}");
+	assert_eq!(fetch(port, "/x").await, (200, "B".into()));
 }
 
 #[tokio::test]

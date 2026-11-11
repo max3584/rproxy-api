@@ -3086,16 +3086,25 @@ impl Registry {
 		Ok(o.view(key.to_string(), exists, persisted))
 	}
 
-	fn check_if_match(&self, key: &Key, if_match: Option<&str>) -> Result<Option<crate::core::overlay::Overlay>, ApiError> {
+	/// The preconditions of an overlay change, under `static_turn`: `If-Match` (`*` or one of
+	/// the ETags: the overlay is there as read) and `If-None-Match` (#399, `*` or one of the
+	/// ETags: the overlay is not there, or not as named; `*` makes a `PUT` create only).
+	fn check_if_match(
+		&self,
+		key: &Key,
+		if_match: Option<&str>,
+		if_none_match: Option<&str>,
+	) -> Result<Option<crate::core::overlay::Overlay>, ApiError> {
 		let current = self.overlay(key);
-		if let Some(want) = if_match.map(str::trim) {
-			let ok = match &current {
-				Some(o) => want == "*" || want.split(',').any(|t| t.trim() == o.spec.etag()),
-				None => false,
-			};
-			if !ok {
-				return Err(ApiError::precondition_failed(format!("{key}: the overlay changed (If-Match does not match its ETag)")));
-			}
+		let names = |header: &str, o: &crate::core::overlay::Overlay| {
+			let header = header.trim();
+			header == "*" || header.split(',').any(|t| t.trim() == o.spec.etag())
+		};
+		if if_match.is_some_and(|want| !current.as_ref().is_some_and(|o| names(want, o))) {
+			return Err(ApiError::precondition_failed(format!("{key}: the overlay changed (If-Match does not match its ETag)")));
+		}
+		if let Some(want) = if_none_match.filter(|want| current.as_ref().is_some_and(|o| names(want, o))) {
+			return Err(ApiError::precondition_failed(format!("{key}: the overlay exists (If-None-Match {})", want.trim())));
 		}
 		Ok(current)
 	}
@@ -3109,7 +3118,9 @@ impl Registry {
 	/// token may use the rule's ports, first and last, looked at in turn with reloads): checks it
 	/// against the file's rule (a name the file has is `409 overlay_conflict`, a merge that does
 	/// not validate or build is the error) and puts it in force in place, taking over the
-	/// router's state that did not change. `dry_run`: only the checks and the plan.
+	/// router's state that did not change. `if_match` / `if_none_match`: the preconditions,
+	/// checked under `static_turn` (`412 precondition_failed`). `dry_run`: only the checks and
+	/// the plan.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn put_overlay(
 		self: &Arc<Self>,
@@ -3119,6 +3130,7 @@ impl Registry {
 		persist: bool,
 		ports: &(dyn Fn(u16, u16) -> Result<(), ApiError> + Sync),
 		if_match: Option<&str>,
+		if_none_match: Option<&str>,
 		dry_run: bool,
 	) -> Result<crate::core::overlay::Change, ApiError> {
 		use crate::core::overlay::{Change, Overlay, Status};
@@ -3126,7 +3138,7 @@ impl Registry {
 		let _turn = self.static_turn.lock().await;
 		let file = self.static_rule(key).await?;
 		ports(key.listen.port(), key.listen.port().saturating_add(file.port_count.saturating_sub(1)))?;
-		let current = self.check_if_match(key, if_match)?;
+		let current = self.check_if_match(key, if_match, if_none_match)?;
 		let merged = crate::core::overlay::merge(&file, &spec, &self.caps().features).map_err(|(_, e)| e)?;
 		if !merged.shadowed.is_empty() {
 			let names: Vec<String> = merged.shadowed.iter().map(|s| format!("{} {:?} ({})", s.kind, s.name, s.reason)).collect();
@@ -3173,7 +3185,7 @@ impl Registry {
 		let file = self.static_rule(key).await.ok();
 		let last = key.listen.port().saturating_add(file.as_ref().map_or(0, |f| f.port_count.saturating_sub(1)));
 		ports(key.listen.port(), last)?;
-		let current = self.check_if_match(key, if_match)?.ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
+		let current = self.check_if_match(key, if_match, None)?.ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
 		let change = Change::of(key, Some(&current.spec), None);
 		if dry_run {
 			return Ok(change);
