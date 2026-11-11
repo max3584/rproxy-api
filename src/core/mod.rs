@@ -5,6 +5,7 @@ pub mod bandwidth;
 pub mod budget;
 pub mod limits;
 pub mod outlier;
+pub mod overlay;
 pub mod prom;
 pub mod quota;
 pub mod proxy;

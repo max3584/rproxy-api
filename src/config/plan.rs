@@ -105,7 +105,7 @@ pub fn shape(spec: &RuleSpec) -> Value {
 	let mut v = serde_json::to_value(view).unwrap_or_default();
 	if let Some(map) = v.as_object_mut() {
 		for key in [
-			"origin", "ruleset", "conditions", "persisted", "created_by", "created_at", "state", "error", "resolved",
+			"origin", "overlay", "ruleset", "conditions", "persisted", "created_by", "created_at", "state", "error", "resolved",
 			"connections", "all_targets_down", "down_services", "stats", "started_at", "cert_status", "acme",
 		] {
 			map.remove(key);

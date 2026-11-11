@@ -91,6 +91,8 @@ struct Route {
 	/// `timeouts` (#227): the whole request, and one attempt to a backend.
 	request_timeout: Option<std::time::Duration>,
 	backend_timeout: Option<std::time::Duration>,
+	/// Added by the overlay of a static rule (#397): tried after every route of the file.
+	overlay: bool,
 }
 
 /// The compiled `http` of a rule. Replaced as a whole when the rule changes,
@@ -108,8 +110,9 @@ pub struct Router {
 	dialer: Dialer,
 	/// Stops the health checks when this version of the settings is dropped.
 	health_stop: CancellationToken,
-	/// `oidc` middlewares: their callback and logout paths are answered before routing.
-	oidc: Vec<Arc<Oidc>>,
+	/// `oidc` middlewares: their callback and logout paths are answered before routing;
+	/// with true, an overlay's (#397), only for requests no file route matched.
+	oidc: Vec<(Arc<Oidc>, bool)>,
 	/// Middlewares with secret files, re-read on SIGHUP.
 	secrets: Vec<Arc<Middleware>>,
 	/// Some route looks at headers (`RequestInfo.headers` is filled only then).
@@ -175,10 +178,12 @@ impl Router {
 			};
 			let priority = r.priority.unwrap_or_else(|| Matcher::default_priority(&r.rule));
 			let timeouts = r.timeouts.clone().unwrap_or_default();
+			let overlay = spec.overlay.as_ref().is_some_and(|o| i >= o.first_route);
 			routes.push((
 				priority,
 				i,
 				Route {
+					overlay,
 					name: r.name.clone(),
 					matcher,
 					service,
@@ -194,8 +199,9 @@ impl Router {
 			.iter()
 			.map(|m| middlewares.get(m).cloned().ok_or_else(|| ApiError::invalid(format!("pre_routing: middleware {m:?} is not defined"))))
 			.collect::<Result<Vec<_>, _>>()?;
-		// higher priority first; the order in the settings breaks ties
-		routes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+		// the file's routes before an overlay's (#397), then higher priority first; the order in
+		// the settings breaks ties
+		routes.sort_by(|a, b| a.2.overlay.cmp(&b.2.overlay).then(b.0.cmp(&a.0)).then(a.1.cmp(&b.1)));
 		let default = spec.default.as_ref();
 		let default_service = match default.and_then(|d| d.service.as_ref()) {
 			Some(s) => Some(services.get(s).cloned().ok_or_else(|| ApiError::invalid(format!("service {s:?} is not defined")))?),
@@ -226,7 +232,11 @@ impl Router {
 			}
 		}
 		backend::start_idle_sweep(pooled, health_stop.clone());
-		let oidc = middlewares.values().filter_map(|m| if let Middleware::Oidc(o) = m.as_ref() { Some(o.clone()) } else { None }).collect();
+		let added = |name: &String| spec.overlay.as_ref().is_some_and(|o| o.middlewares.contains(name));
+		let oidc = middlewares
+			.iter()
+			.filter_map(|(name, m)| if let Middleware::Oidc(o) = m.as_ref() { Some((o.clone(), added(name))) } else { None })
+			.collect();
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
 		let identity_headers = identity_headers(middlewares.values().map(|m| m.as_ref()));
@@ -1208,7 +1218,11 @@ impl Conn {
 		// auth server or an OIDC provider, waiting for a cache's lead
 		let chain_run = async {
 			// sign-in callbacks and logout of `oidc`, whichever route matched
-			if let Some(o) = router.oidc.iter().find(|o| answer.is_none() && o.owns(parts.uri.path())) {
+			// an overlay's (#397) never takes a path from a file route's request
+			let file_route = matched.is_some_and(|r| !r.overlay);
+			if let Some((o, _)) =
+				router.oidc.iter().find(|(o, overlay)| answer.is_none() && !(*overlay && file_route) && o.owns(parts.uri.path()))
+			{
 				answer = Some(oidc_response(o.handle(&parts, self.https, &authority).await));
 				answered_by = Some(("oidc", o.name.as_str()));
 			}

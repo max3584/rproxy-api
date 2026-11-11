@@ -263,6 +263,10 @@ pub struct Features {
 	/// `409 in_use`; files only right in `RPROXY_API_ACME_DIR`, no inline secret, no `key_file`;
 	/// `http01_listen` within `RPROXY_MAX_LISTENERS`
 	pub global_api_acme: bool,
+	/// `GET` / `PUT` / `DELETE /rules/{key}/overlay`: routes, services, middlewares and
+	/// `tls.routes` added through the API on a static rule's listener, tried after the file's
+	/// (the file wins on names); stored in `rproxy_rule_overlays` (#397)
+	pub static_overlay: bool,
 }
 
 /// Every name of `Features::forward_auth`.
@@ -341,6 +345,7 @@ impl Features {
 		db_connect_timeout: true,
 		global_api_geoip: true,
 		global_api_acme: true,
+		static_overlay: true,
 	};
 
 	/// Everything the settings can describe; for registering a startup rule
@@ -401,6 +406,7 @@ impl Features {
 		db_connect_timeout: true,
 		global_api_geoip: true,
 		global_api_acme: true,
+		static_overlay: true,
 	};
 
 	/// The first setting in `tls` / `http` that this build cannot run.
@@ -1167,6 +1173,9 @@ pub struct RuleView {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub outlier_detection: Option<L4OutlierSpec>,
 	pub origin: Origin,
+	/// A static rule's overlay added through the API (#397): whether it applies, what it adds.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub overlay: Option<crate::core::overlay::OverlaySummary>,
 	/// The rule set (`PUT /rulesets/{name}`) the rule belongs to (#28, v0.4).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub ruleset: Option<String>,
@@ -1306,6 +1315,7 @@ impl RuleView {
 			outlier_detection: req.outlier_detection.clone(),
 			origin,
 			ruleset: None,
+			overlay: None,
 			conditions: vec![],
 			persisted: None,
 			created_by: None,
@@ -1355,6 +1365,7 @@ impl RuleView {
 			outlier_detection: spec.outlier_detection.clone(),
 			origin: spec.origin,
 			ruleset: spec.ruleset.clone(),
+			overlay: None,
 			conditions: vec![],
 			persisted: None,
 			created_by: None,

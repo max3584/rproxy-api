@@ -59,6 +59,18 @@ pub struct HttpSpec {
 	pub services: BTreeMap<String, ServiceSpec>,
 	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
 	pub middlewares: BTreeMap<String, MiddlewareSpec>,
+	/// Set only on the `http` a static rule runs with (#397, `core::overlay::merge`): what its
+	/// overlay added. Never read from or written to the settings, the API or the database.
+	#[serde(skip)]
+	pub overlay: Option<OverlayMarks>,
+}
+
+/// What an overlay added to a static rule's `http` (#397): the routes from `first_route` on
+/// (tried after every route before it) and the middlewares of these names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OverlayMarks {
+	pub first_route: usize,
+	pub middlewares: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

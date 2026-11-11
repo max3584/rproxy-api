@@ -62,6 +62,8 @@ pub enum Replacing<'a> {
 	Rule(&'a Key),
 	/// A rule set's PUT: all its rules.
 	Ruleset(&'a str),
+	/// A static rule's overlay (#397): the overlay it replaces (not the file's rule).
+	Overlay(&'a Key),
 }
 
 /// Checks the files of the rules of a change: (label for the errors, files) per rule.
@@ -87,10 +89,11 @@ pub async fn check(
 	let global = registry.http_global();
 	let crowdsec = global.crowdsec();
 	let entries = protected::current(registry.acme().as_deref(), crowdsec.as_ref().map(|b| b.key_file()));
-	let (replaced, others): (Vec<_>, Vec<_>) = registry.file_refs().await.into_iter().partition(|(key, set, _, _)| match &replacing {
+	let (replaced, others): (Vec<_>, Vec<_>) = registry.file_refs().await.into_iter().partition(|(key, set, owner, _)| match &replacing {
 		Replacing::Nothing => false,
 		Replacing::Rule(k) => *k == key,
 		Replacing::Ruleset(name) => set.as_deref() == Some(*name),
+		Replacing::Overlay(k) => *k == key && !matches!(owner, Owner::Static),
 	});
 	// what the replaced rules name already may stay (#323)
 	let kept: Vec<FileRef> = replaced.into_iter().flat_map(|(_, _, _, refs)| refs).collect();
@@ -236,4 +239,15 @@ pub async fn check_ruleset(
 		.map(|(i, r)| (format!("rules[{i}]: "), protected::refs(r.tls.as_ref(), r.http.as_ref())))
 		.collect();
 	check(registry, principal, rules, Replacing::Ruleset(name)).await
+}
+
+/// `PUT /rules/{key}/overlay` (#397): the files the overlay names; those the overlay it
+/// replaces names already may stay.
+pub async fn check_overlay(
+	registry: &Registry,
+	principal: &Principal,
+	key: &Key,
+	overlay: &crate::core::overlay::OverlaySpec,
+) -> Result<Intent, ApiError> {
+	check(registry, principal, vec![("overlay: ".to_string(), overlay.file_refs())], Replacing::Overlay(key)).await
 }

@@ -26,6 +26,7 @@ Refused connections are dropped as early as possible (allow_from and limits befo
 | UI rules | UI (`origin: dynamic`) | UI database `forward_rules` | At once |
 | API rules | Control API `POST /rules` (`origin: api`) | `rproxy_rules` | At once |
 | Rule sets | rproxy-gateway `PUT /rulesets` | `rproxy_rule_sets` | At once, as a whole |
+| Overlays on fixed rules | Control API `PUT /rules/{key}/overlay` (v0.4.23, #397; matched after the file's routes) | `rproxy_rule_overlays` | At once |
 | global (changing values) | Control API `PATCH /config/global`, the UI's global page | `rproxy_global` | At once (`trusted_proxies`, `access_log`, `crowdsec`, `http.timeouts`, the UDP session cap, `cache_max_memory`) |
 | global (fixed values) | Settings file, environment (wins over the API) | File, environment | Some need a restart (`acme`, `geoip`, `performance`, `files`, the control API listener) |
 | Tokens | Token file | File | Re-read on change |

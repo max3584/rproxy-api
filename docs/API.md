@@ -335,7 +335,7 @@ udp のルールでも `tls.mode: sni` と `tls.routes` で、最初のデータ
   - 各ファイルは上のどちらかの形。`rules` はつなげる。`global` を書けるのは 1 つのファイルだけ（2 つにあるとエラー）。
   - 同じキー（プロトコル・アドレス・ポート）のルールが 2 つあると、両方のファイル名と位置（`web.yaml rule #2` など）を示してエラーにする。
 - DB からの復元より前に開始する。DB に接続できなくても動く。
-- API からは変更・削除できない（`409 static`）。変えるときはファイルを書き換える。
+- API からは変更・削除できない（`409 static`）。変えるときはファイルを書き換える。同じ待ち受けに http のルートや `tls.routes` の名前を API で足すときは、重ねる分（`/rules/{key}/overlay`、v0.4.23、下の「固定ルールの待ち受けに重ねる分」）を使う。
 - **再起動なしの反映**：`RPROXY_CONFIG_CHECK_SECS`（既定 10 秒。`0` なら SIGHUP のときだけ）ごとに、ファイルの大きさ・更新時刻・inode（ディレクトリならファイルの増減も）を確かめ、変わっていれば読み直す。SIGHUP を送ると、変わっていなくても読み直す。結果をその場で知りたいときは `POST /config/reload`（下のエンドポイントの表）。シンボリックリンクの差し替え（ConfigMap の更新）も検知する。
   - 読み直した設定は、まず全体を検証する。誤りがあれば何も変えず、それまでのルールを使い続ける（`event: "config.error"`。同じ内容では 1 回だけ）。読めない（権限）ときも同じで、読めるようになるまで確認のたびに試す。
   - 正しければ差分だけを反映する（`event: "config.reload"`。`added`・`removed`・`changed`・`unchanged`・`failed` の件数）。
@@ -1322,6 +1322,52 @@ http:
 - 背景のタスク（設定ファイル・トークン・証明書の監視、ACME、GeoIP の読み直し、DB の係・ping・照合）は panic しても `degraded`（`part`）をログに出して、1 秒から倍々で 1 分まで待って動かし直す（5 分以上動いた後の panic は 1 秒から）。`/metrics` の `rproxy_task_restarts_total{part}`。DB の係で panic した仕事はその仕事だけが失敗し、DB の接続は開き直す。
 - 引き継ぎ（#174）：引き継いだ古いプロセスがまだ drain しているあいだは、新しい引き継ぎを始めない（`409 upgrading`、SIGUSR2・自動更新も。古いプロセスの最後の数がこのプロセスに届くため）。待つのは長くても古いプロセスの drain（`RPROXY_HANDOFF_DRAIN`）と 60 秒まで。`GET /admin/update` の `parent_draining`。自動更新はこの断りでその版を悪い版にしない（次の確認でまた試す）。
 
+### 固定ルールの待ち受けに重ねる分（v0.4.23、#397、`features.static_overlay`）
+
+設定ファイルの固定ルール（`origin: static`）の待ち受けに、API・UI から http のルート・サービス・ミドルウェアと `tls.routes` の名前の宛先を **足す**（重ねる分、overlay）。固定ルールそのものはファイルのまま（`409 static` は変わらない）で、API は自分が足した分だけを変える・消す。
+
+- `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay`。`PUT` は重ねる分を丸ごと置き換える（UI は `GET` → 直す → `If-Match` に `GET` の `ETag` を付けた `PUT`。重ねる分が変わっていれば `412 precondition_failed`）。`?dry_run=true`（`PUT`・`DELETE`）は確かめて `{"dry_run":true,"action":"create|update|delete|none","rule","before","after","diff"}` を返す。スコープは `rules:read`（`GET`）・`rules:write`、トークンの `allow_listen_ports` はルールの範囲すべてを含むこと。監査は `action: overlay.put` / `overlay.delete`。
+- 本文：
+
+```json
+{
+  "http": {
+    "routes": [{"name": "wiki", "match": "Host(`wiki.example.com`)", "service": "wiki", "middlewares": ["sso"]}],
+    "services": {"wiki": {"servers": [{"url": "http://10.0.0.5:8080"}]}},
+    "middlewares": {}
+  },
+  "tls": {"routes": [{"server_name": "git.example.com", "remote_addr": "10.0.0.6", "remote_port": 443}]}
+}
+```
+
+- **http**：固定ルールに `http` があるときだけ。`routes`・`services`・`middlewares` だけを足せる（`pre_routing`・`default`・`http3`・`raw_path`・`strict_path` はファイルのもの）。重ねる分のルートは **ファイルのルートのどれにも当たらないリクエストだけ** を見る（`priority` をどれだけ高くしてもファイルのルートのリクエストは取れない。ファイルのルートの認証を避けられない）。重ねる分の中の順は今までどおり（`priority`、書いた順）。どちらにも当たらなければファイルの `default`。重ねる分のルート・ミドルウェアはファイルの `services`・`middlewares` を名前で使える。ファイルの `pre_routing` は重ねる分のルートにも掛かる。重ねる分の `oidc` のコールバック・ログアウトのパスは、ファイルのルートに当たるリクエストでは答えない。重ねる分の認証のミドルウェアが付ける身元のヘッダは、ファイルのルートのリクエストでも消す。
+- **`tls.routes`**：`tls.mode: sni`（tcp・udp）か、`http` も `client_auth` もない `terminate` の固定ルールだけ。**ファイルの `tls.routes` に当たらない名前だけ** が重ねる分の route を見る（ファイルの `*.example.com` の下の名前はファイルのもの）。重ねる分の route は `upstream` を持てない（ルールの `upstream` を使う）。`unmatched: reject` のルールでは、重ねる分の名前は受け付ける。
+- 名前：ファイルにある名前（ルート・サービス・ミドルウェア、`tls.routes` は同じパターン）は `PUT` で `409 overlay_conflict`。後からファイルが同じ名前を足したら（読み直し）、ファイルが勝ち、重ねる分のその項目（と、それを使う重ねる分のルート・ミドルウェア）は外れて `shadowed` に出る（`rule.overlay` の warn）。
+- 効かないとき：読み直しで固定ルールが消えた（`reason: no_static_rule`）、`http` がなくなった・`tls.mode` が変わった（`shape`）、合わせると検証が通らない（`invalid`）、組み立てに失敗した（`failed`）ときは、重ねる分を **消さずに残し**、ルールはファイルの分だけで動く。`GET …/overlay` の `state: not_applied`・`reason`・`error`、ルールの表示の `overlay`、`/metrics` の `rproxy_rule_overlay{protocol,listen,state}`。ファイルが戻れば（読み直し・再起動）また効く。
+- `GET …/overlay`：本文の形に `rule`・`state`（`applied` / `not_applied`）・`reason`・`error`・`shadowed`（`[{"kind","name","reason"}]`）・`etag`・`created_by`・`created_at`・`updated_by`・`updated_at`・`persisted`（DB があるとき）。ルールの表示（`GET /rules`）は今までどおりファイルの形で、`overlay`（`{"state","reason"?,"routes","tls_routes","shadowed"?}`）が付く。重ねる分のルートの数は `stats.http.routes` に名前で出る。
+- 重ねる分を変えると、ルールの `http` のルーターを作り直す（`PATCH` で `http` を変えたときと同じ：今の接続はそのまま、`rate_limit`・`cache` などの状態は空から）。読み直しと重ねる分の変更は順番に動く。
+- ファイル：重ねる分が指すファイル（サービスの `tls`、`basic_auth` の `users_file`、`oidc` の秘密）は API のルールと同じく確かめる（`403 protected_file`・`file_not_allowed`、`409 file_in_use`・`secret_reuse`）。持ち主は最初に作ったトークン（`created_by`）。ほかのトークンも `rules:write` とポートがあれば直せる（`updated_by` が変わる）。
+- 範囲外：API のルール（`PATCH` で直す）と組のルール（組の `PUT` で直す）には重ねられない（`409 not_static`）。ルールのないキーは `404`。
+- 保存：DB（`RPROXY_DATABASE_URL`）があれば、トークンの `persist` に関わらず応答の前に `rproxy_rule_overlays` に書く（消すときは行を消す）。書けなければ `persisted: false`・`degraded`（`part: "db"`）、定期の照合が書き直す（行を正にはしない）。起動では設定ファイルのルールの後に戻す（`restore.overlays`）。テーブルがなければ戻すものはなく、書き込みは `degraded`。再起動なしの更新では状態で渡す。DB がなければメモリだけ（再起動で消える）。
+- テーブル（UI リポジトリの `db/migrations/014_rproxy_rule_overlays.sql`）：
+
+```sql
+CREATE TABLE IF NOT EXISTS rproxy_rule_overlays (
+  node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (as in rproxy_rules)
+  protocol     VARCHAR(8)   NOT NULL,   -- the static rule's key
+  listen_addr  VARCHAR(64)  NOT NULL,
+  listen_port  INT UNSIGNED NOT NULL,
+  spec         JSON         NOT NULL,   -- the body of PUT /rules/{key}/overlay
+  spec_version INT UNSIGNED NOT NULL DEFAULT 1,
+  created_by   VARCHAR(255) NOT NULL,
+  created_at   DATETIME(3)  NOT NULL,
+  updated_by   VARCHAR(255) NOT NULL,
+  updated_at   DATETIME(3)  NOT NULL,
+  PRIMARY KEY (node, protocol, listen_addr, listen_port)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+GRANT SELECT, INSERT, UPDATE, DELETE ON rproxy.rproxy_rule_overlays TO 'rproxy'@'%';
+```
+
 ## エンドポイント
 
 | メソッドとパス | 本文 | 成功時 | 説明 |
@@ -1337,6 +1383,7 @@ http:
 | `POST /rules` | ルール | 201 | 転送を開始する。名前解決と bind まで済ませてから応答する |
 | `PATCH /rules/{protocol}/{listen_addr}/{listen_port}` | `{"remote_addr","remote_port"` または `"targets"`, `"balance"?,"health_check"?,"udp_idle_secs"?,"tls"?,"starttls"?,"starttls_required"?,"allow_from"?,"proxy_protocol"?,"crowdsec"?,"extra_listen_addrs"?,"http"?}` | 200 | 転送先を変える。`extra_listen_addrs` を付けると追加の待ち受けアドレスを丸ごと置き換える（`[]` ですべて外す。省けば今のまま）：足したアドレスだけを開き、外したアドレスだけを閉じる（ほかのアドレスと、外したアドレスで開いている TCP の接続はそのまま。UDP のセッションは終える、#354）。`::` で待ち受けるルールで、追加のアドレスの有無（dual-stack と IPv6 だけ）が変わる変更は `unsupported`（作り直す）。転送先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）は毎回まとめて置き換える：省いた `balance` は `round_robin`、省いた `health_check` はなし。宛先 1 つに戻すときは `remote_addr` / `remote_port` を送る（`"targets": []` は付けてもよい）。`crowdsec` を付けると、判定での切断を有効・無効にする（次の接続から）。新しい接続から即時に反映する。`tls` を付けると TLS の設定を丸ごと置き換える（`starttls` も一緒に指定する。省略すると STARTTLS なし）。`http` を付けると L7 の設定を丸ごと置き換える（次のリクエストから。`http` のないルールに付けるのは `unsupported`。上の「v0.3 の設定」）。`source_ip` とポート範囲は変更できない：`source_ip`・`listen_port_end` を今と違う値で送ると `unsupported`（同じ値なら受け付ける。変えるときは作り直す） |
 | `DELETE /rules/{protocol}/{listen_addr}/{listen_port}?drain_secs=N` | | 204 | 転送を停止する。既存の接続は即座に切断する。`drain_secs` を付けた場合は、その秒数だけ既存の接続の終了を待ってから切断する（v0.4.20 から 3600 秒まで。長い値は 3600 秒に切り詰める。組の `DELETE` も同じ） |
+| `GET` / `PUT` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}/overlay` | 重ねる分（`PUT`） | 200 / 201 / 204 | v0.4.23（#397）：固定ルールの待ち受けに API で足す分（上の「固定ルールの待ち受けに重ねる分」）。`?dry_run=true`、`ETag` / `If-Match` |
 | `GET /acme` | | 200 | ACME の状態（docs/ACME.md）：`{"accounts":[{"name","directory","contact","eab","allowed_names","registered"}],"dns_providers":[{"name","type","zones","allowed_names"}],"resolvers":[{"name","account","challenge","dns_provider"}],"certificates":[{"resolver","domains","state","not_after","renew_at","next_attempt","error","ari"}],"rate_limit":{"orders","period_secs","used"},"helper"}`。秘密も秘密のファイルの場所も出さない。`rules:read`。`global.acme` がなければ `404` |
 | `POST /acme/renew` | `{"resolver","domains"}` | 202 | その証明書を今すぐ更新する（`rate_limit` の内で。結果は `GET /acme`）。`acme:write`。`POST /config/reload` と同じく既定では Unix ソケットからだけ（`RPROXY_API_RELOAD_UNIX_ONLY`）。どのルールも使っていなければ `404`。`event=audit`（`action: acme.renew`） |
 | `POST /acme/revoke` | `{"resolver","domains","reason"?}` | 200 | 取った証明書を CA で失効させ、すぐに新しい証明書を注文する。スコープと Unix ソケットは `POST /acme/renew` と同じ。`event=audit`（`action: acme.revoke`）。docs/ACME.md |
@@ -1393,6 +1440,8 @@ IPv6 の `listen_addr` をパスに入れるときは URL エンコードする�
 | `file_not_allowed` | 403 | v0.4.17（#319）：`allow_certs` のあるトークンがルールにファイルのパスを書いた |
 | `secret_reuse` | 409 | v0.4.17（#319）：OIDC の client secret のファイルを、同じ issuer・client の client secret のほかにも使っている |
 | `file_in_use` | 409 | v0.4.18（#323）：ほかの持ち主（ほかのトークン・ほかのトークンの組・設定ファイル・作ったトークンの分からない戻したルール）のルールが指す鍵・秘密のファイルを、`admin` でないトークンが指した |
+| `not_static` | 409 | v0.4.23（#397）：重ねる分は固定ルールにだけ（API のルール・組のルールは範囲外） |
+| `overlay_conflict` | 409 | v0.4.23（#397）：重ねる分が設定ファイルにある名前（ルート・サービス・ミドルウェア・`tls.routes` の名前）を使った |
 | `limit` | 409 | v0.4.20（#358）：プロセスの上限（`RPROXY_MAX_RULES`・`RPROXY_MAX_LISTENERS`・`RPROXY_MAX_RULESETS`）かトークンの `max_rules`・`max_rulesets` を超える |
 | `busy` | 503 | v0.4.20（#358）：ほかの組の `PUT` の本文を読んでいる／DB に書けていない削除が多すぎる。少し待って送り直す |
 | `too_large` | 413 | v0.4.20（#358）：組の `PUT` の本文が 32 MiB を超える |

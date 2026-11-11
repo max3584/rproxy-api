@@ -117,6 +117,16 @@ impl ApiError {
 		Self::new(StatusCode::CONFLICT, "already_exists", message)
 	}
 
+	/// An overlay (#397) on a rule that is not from the settings file.
+	pub fn not_static(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "not_static", message)
+	}
+
+	/// An overlay (#397) naming what the settings file has.
+	pub fn overlay_conflict(message: impl Into<String>) -> Self {
+		Self::new(StatusCode::CONFLICT, "overlay_conflict", message)
+	}
+
 	pub fn static_rule(message: impl Into<String>) -> Self {
 		Self::new(StatusCode::CONFLICT, "static", message)
 	}

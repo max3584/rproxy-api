@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 		.route("/interfaces", get(interfaces))
 		.route("/rules", get(list).post(create))
 		.route("/rules/{protocol}/{listen_addr}/{listen_port}", get(get_rule).patch(update).delete(delete))
+		.route("/rules/{protocol}/{listen_addr}/{listen_port}/overlay", get(get_overlay).put(put_overlay).delete(delete_overlay))
 		.route("/metrics", get(metrics))
 		.route("/acme", get(super::acme_api::view))
 		.route("/acme/renew", post(super::acme_api::renew))
@@ -693,6 +694,107 @@ async fn delete(
 		if let (Some(store), Some(queued)) = (stored, queued) {
 			store.finish_remove(queued).await;
 		}
+		Ok(StatusCode::NO_CONTENT.into_response())
+	})
+	.await
+}
+
+/// `If-Match` of an overlay change (#397).
+fn if_match(headers: &axum::http::HeaderMap) -> AppResult<Option<String>> {
+	headers
+		.get(header::IF_MATCH)
+		.map(|v| v.to_str().map(str::to_string).map_err(|_| ApiError::invalid("If-Match is not text")))
+		.transpose()
+}
+
+fn etag_header(etag: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
+	[(header::ETAG, header::HeaderValue::from_str(etag).unwrap_or(header::HeaderValue::from_static("\"\"")))]
+}
+
+/// The ports of an overlay change (#397): the static rule's whole range, or the key's port
+/// once the rule is gone.
+async fn check_overlay_ports(state: &AppState, principal: &Principal, key: &Key) -> AppResult<()> {
+	match state.registry.get(key).await {
+		Ok(view) => check_ports(principal, view.listen_port, view.listen_port_end),
+		Err(_) => check_ports(principal, key.listen.port(), None),
+	}
+}
+
+/// Writes an overlay's row (#397) when there is a database.
+async fn persist_overlay(state: &AppState, key: &Key, by: &str) {
+	if let Some(store) = state.registry.persist().filter(|s| s.enabled()) {
+		store.save_overlay(&state.registry, key, by).await;
+	}
+}
+
+async fn get_overlay(
+	State(state): State<Arc<AppState>>,
+	Path((protocol, addr, port)): Path<(String, String, String)>,
+) -> AppResult<impl IntoResponse> {
+	let key = parse_key(&protocol, &addr, &port)?;
+	let view = state.registry.overlay_view(&key).await?;
+	Ok((etag_header(&view.etag), Json(view)))
+}
+
+async fn put_overlay(
+	State(state): State<Arc<AppState>>,
+	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
+	Path((protocol, addr, port)): Path<(String, String, String)>,
+	Query(query): Query<HashMap<String, String>>,
+	headers: axum::http::HeaderMap,
+	body: Bytes,
+) -> AppResult<Response> {
+	let key = parse_key(&protocol, &addr, &port)?;
+	let spec: crate::core::overlay::OverlaySpec = parse_body(&body)?;
+	let if_match = if_match(&headers)?;
+	if crate::config::plan::dry_run(&query)? {
+		check_overlay_ports(&state, &principal, &key).await?;
+		drop(super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?);
+		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, if_match.as_deref(), true).await?).into_response());
+	}
+	to_the_end(async move {
+		let _change = changing(&state).await?;
+		let result = async {
+			check_overlay_ports(&state, &principal, &key).await?;
+			let _files = super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?;
+			state.registry.put_overlay(&key, spec, &principal.name, if_match.as_deref(), false).await
+		}
+		.await;
+		audit(&principal, &client, "overlay.put", &key.to_string(), &result);
+		let change = result?;
+		persist_overlay(&state, &key, &principal.name).await;
+		let view = state.registry.overlay_view(&key).await?;
+		let status = if change.action == "create" { StatusCode::CREATED } else { StatusCode::OK };
+		Ok((status, etag_header(&view.etag), Json(view)).into_response())
+	})
+	.await
+}
+
+async fn delete_overlay(
+	State(state): State<Arc<AppState>>,
+	Extension(principal): Extension<Principal>,
+	Extension(client): Extension<Client>,
+	Path((protocol, addr, port)): Path<(String, String, String)>,
+	Query(query): Query<HashMap<String, String>>,
+	headers: axum::http::HeaderMap,
+) -> AppResult<Response> {
+	let key = parse_key(&protocol, &addr, &port)?;
+	let if_match = if_match(&headers)?;
+	if crate::config::plan::dry_run(&query)? {
+		check_overlay_ports(&state, &principal, &key).await?;
+		return Ok(Json(state.registry.delete_overlay(&key, if_match.as_deref(), true).await?).into_response());
+	}
+	to_the_end(async move {
+		let _change = changing(&state).await?;
+		let result = async {
+			check_overlay_ports(&state, &principal, &key).await?;
+			state.registry.delete_overlay(&key, if_match.as_deref(), false).await
+		}
+		.await;
+		audit(&principal, &client, "overlay.delete", &key.to_string(), &result);
+		result?;
+		persist_overlay(&state, &key, &principal.name).await;
 		Ok(StatusCode::NO_CONTENT.into_response())
 	})
 	.await

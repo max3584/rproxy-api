@@ -1143,6 +1143,18 @@ async fn run(opts: Options, perf: rproxy_api::config::performance::Effective, ha
 				}
 			}
 		}
+		// overlays on the static rules (#397), before the rules that could take their keys' ports
+		if let Some(store) = registry.persist() {
+			match store.load_overlays().await {
+				Ok(rows) if !rows.is_empty() => {
+					let n = registry.restore_overlays(rows.into_iter().map(|r| r.into_overlay()).collect(), "database").await;
+					info!(event = "restore.overlays", overlays = n, node = store.node());
+				}
+				Ok(_) => {}
+				Err(e) => error!(event = "degraded", part = "db", table = rproxy_api::config::persist::OVERLAYS_TABLE, error = %e,
+					"overlays on static rules are not restored"),
+			}
+		}
 		info!(event = "restore.start", rules = ui.len(), api_rules = stored.len(),
 			node = registry.persist().map(|s| s.node()).unwrap_or(""));
 		registry.restore(ui).await;
