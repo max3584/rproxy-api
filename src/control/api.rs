@@ -610,22 +610,34 @@ async fn check_rule_ports(state: &AppState, principal: &Principal, key: &Key) ->
 /// creator is not known (restored from the UI's `forward_rules`, older rows) only with
 /// `allow_restored`. Otherwise `403 not_owner`. A key without a rule passes (the change
 /// answers `404`), as do static rules and rules of sets (`409 static`, `409 owned`).
+///
+/// This early check answers before the other checks and for dry runs; the change itself is
+/// checked again under the rules lock (`owner_check`, `Registry::take_as` / `update_as`), so a
+/// rule another token makes on the key in between is not changed.
 async fn check_rule_owner(state: &AppState, principal: &Principal, key: &Key) -> AppResult<()> {
-	if principal.has(Scope::Admin) {
+	match state.registry.rule_owner(key).await {
+		Some(owner) => may_change(principal, key, &owner),
+		None => Ok(()),
+	}
+}
+
+/// `403 not_owner` unless the token may change a rule of `owner` (#401).
+fn may_change(principal: &Principal, key: &Key, owner: &crate::net::protected::Owner) -> AppResult<()> {
+	if principal.may_change(owner) {
 		return Ok(());
 	}
-	match state.registry.rule_owner(key).await {
-		Some(owner) if !principal.may_change(&owner) => {
-			let whose = match owner {
-				crate::net::protected::Owner::Restored => {
-					"its creator is not known (restored from the UI's database or an older version); only an admin token or one with allow_restored may change it"
-				}
-				_ => "it belongs to another token; only it or an admin token may change it",
-			};
-			Err(ApiError::not_owner(format!("{key}: {whose}")))
+	let whose = match owner {
+		crate::net::protected::Owner::Restored => {
+			"its creator is not known (restored from the UI's database or an older version); only an admin token or one with allow_restored may change it"
 		}
-		_ => Ok(()),
-	}
+		_ => "it belongs to another token; only it or an admin token may change it",
+	};
+	Err(ApiError::not_owner(format!("{key}: {whose}")))
+}
+
+/// The owner check the registry runs under the rules lock (#401); None for `admin`.
+fn owner_check<'a>(principal: &'a Principal, key: &'a Key) -> Option<impl Fn(&crate::net::protected::Owner) -> AppResult<()> + Sync + 'a> {
+	(!principal.has(Scope::Admin)).then_some(move |owner: &crate::net::protected::Owner| may_change(principal, key, owner))
 }
 
 /// The ports and scopes of a PATCH. A PATCH of a restored rule that did not validate
@@ -669,7 +681,8 @@ async fn update(
 			check_update_scope(&state, &principal, &key, &req).await?;
 			check_update_limits(&state, &key, &req).await?;
 			let _files = super::rule_files::check_update(&state.registry, &principal, &key, &req).await?;
-			state.registry.update(&key, req).await
+			let owner = owner_check(&principal, &key);
+			state.registry.update_as(&key, req, owner.as_ref().map(|f| f as crate::core::registry::OwnerCheck<'_>)).await
 		}
 		.await;
 		audit(&principal, &client, "update", &key.to_string(), &result);
@@ -706,7 +719,8 @@ async fn delete(
 		let result = async {
 			check_rule_owner(&state, &principal, &key).await?;
 			check_rule_ports(&state, &principal, &key).await?;
-			state.registry.take(&key).await
+			let owner = owner_check(&principal, &key);
+			state.registry.take_as(&key, owner.as_ref().map(|f| f as crate::core::registry::OwnerCheck<'_>)).await
 		}
 		.await;
 		audit(&principal, &client, "delete", &key.to_string(), &result);

@@ -18,8 +18,7 @@ The contract between the UI (TCP-UDP-rproxy-ui) and rproxy-api. When changing ei
       tokens:
         - name: ui
           sha256: 9f86d081...        # printf %s "$TOKEN" | sha256sum
-          scopes: [rules:read, rules:write, metrics:read]
-          allow_restored: true       # v0.4.23 (#401): may change and delete rules whose creator is not known (restored from the UI's forward_rules); the UI's token (default false)
+          scopes: [admin]            # the UI's token is admin (v0.4.23, #401; see below)
         - name: ci-deploy
           sha256: 2c26b46b...
           scopes: [rules:write]
@@ -35,6 +34,8 @@ The contract between the UI (TCP-UDP-rproxy-ui) and rproxy-api. When changing ei
 
     - Scopes: `rules:read` (`GET /rules`, `/interfaces`), `rules:write` (`POST` / `PATCH` / `DELETE /rules`), `metrics:read` (`GET /metrics`), `acme:write` (creating and changing rules with ACME certificates, and `POST /acme/...`; docs/en/ACME.md), `certs:read` (`GET /certs`; v0.4.2), `certs:write` (`PUT` / `DELETE /certs/{name}`; v0.4.2), `admin` (everything). `GET /capabilities` can be read with any token. Insufficient scope gives `403 forbidden`.
     - Since v0.4.23 (#401), a token without `admin` changes and deletes only the rules, overlays and rule sets it made (others are `403 not_owner`; "Only the owner changes and deletes").
+    - **Give the UI's token `admin`** (since v0.4.23): the UI's "API rules" screen (for the UI's administrators) changes and deletes rules other tokens made, and the sync of several nodes (resending) may change other tokens' rules too, which is `403 not_owner` without `admin`. A setup that uses neither and only needs to change the rules the UI restores (`forward_rules`) may use `rules:read`, `rules:write` and **`allow_restored: true`** (also change and delete rules whose creator is not known; default `false`) instead of `admin`. Tokens of the one-per-line format are `admin` already.
+    - `allow_restored` is new in v0.4.23. Remove it from the token file before going back to v0.4.22 or older (older versions reject unknown fields and do not read the file at all: no token works).
     - Creating, modifying and deleting rules is recorded in `event: "audit"` logs (`token`, `client`, `action`, `rule`, `outcome` (`ok` / `error` / `forbidden`), and `code` on failure). `client` is the sender's IP (`unix` over the Unix socket).
     - Refused requests are recorded in `event: "audit"` too (with `client`, `method` and `path`; the token itself is never logged): a missing, unknown or expired token (401) as `outcome: "unauthorized"` with `reason` (`missing` / `invalid` / `expired`, or `client_cert` when the client certificate bound to the token is missing), a lockout (429) as `outcome: "locked_out"`, a missing scope (403) as `outcome: "forbidden"` with `token` and `scope`. So that the log does not overflow, refused requests are logged up to 20 lines in a row per sender (an IPv6 /64 together at most five times that), then one line a second (and overall 200 in a row, then 50 a second, a bound separate from the data plane's; v0.4.20, see "Log thinning and length"). `suppressed` in a line is the number of lines left out for that sender before it (the total is `rproxy_log_suppressed_total` in `/metrics`).
   - Multiple tokens can be valid at the same time. To rotate, list both the old and new ones, then remove the old one later.
@@ -63,7 +64,7 @@ Hardening of the TCP control API: client certificates (mTLS), token expiry notic
 tokens:
   - name: ui
     client_cert: ui.rproxy.internal      # the certificate alone (no Authorization needed)
-    scopes: [rules:read, rules:write, metrics:read]
+    scopes: [admin]                      # the UI's token (admin since v0.4.23, #401)
   - name: gateway-controller
     sha256: 9f86d0...
     client_cert: spiffe://cluster.local/ns/rproxy/sa/controller   # both the token and the certificate
@@ -96,6 +97,7 @@ tokens:
 3. Remove the old token from the file and SIGHUP.
 
 - With `expires`, `token.expiring` reports it before it runs out (`--token-warn-days`).
+- Never give a deleted token's name to a new token for someone or something else: the owner is the name, so it could change the rules, overlays and rule sets the old token made (#401).
 - The owner of rules, overlays and rule sets is the token's **name** (v0.4.23, #401). Replacing a token's `sha256` under the same name keeps what it made its own. Renaming it (adding an entry with the new name and removing the old) makes what the old name made another token's, which only `admin` may change or delete (there is no API to move the owner; create them again under the new name). A name appears once in a file, so rotating a token without renaming it means the old secret stops working when the new one starts (a client that cannot stop retries meanwhile).
 - For client certificates, issue a new certificate with the same name and deploy it to the client (the token file stays). To change the name: add an entry with the new name, switch the client, remove the old entry (SIGHUP each time).
 - To replace the CA: put both old and new CAs in the `--tls-client-ca` file and SIGHUP, move the clients to certificates from the new CA, then remove the old CA and SIGHUP.
@@ -1189,13 +1191,13 @@ The file fields of a rule (every `*_file` of `tls` and `http`: certificates, key
 
 A token with the `admin` scope may do anything. A token without it (a service account) may create rules and change or delete **only the ones it made**; it cannot touch what other tokens made.
 
-- What: `PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}` (dry runs too). A token that is not the owner gets `403 not_owner` and nothing changes (the audit log has `outcome: "forbidden"`, `code: "not_owner"`). rproxy's API has no pause or resume (the UI pauses with `DELETE` and resumes with `POST`), so those are covered too.
+- What: `PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}` (dry runs too). The owner is checked under the rule table's lock (a rule another token makes on the key after the check is not changed). A token that is not the owner gets `403 not_owner` and nothing changes (the audit log has `outcome: "forbidden"`, `code: "not_owner"`). rproxy's API has no pause or resume (the UI pauses with `DELETE` and resumes with `POST`), so those are covered too.
 - The owner: `created_by` for `origin: "api"`; for `dynamic` rules rproxy remembers the token that created them (handed over in a live upgrade). A change by `admin` does not change the owner. Reading (`GET`) is as before.
 - Rules whose creator is not known (restored from the UI's `forward_rules`, rows of `rproxy_rules` from an older version with an empty `created_by`, `dynamic` rules after a restart): only `admin` and tokens with **`allow_restored: true`** in the token file may change or delete them. A change leaves the creator unknown (another `allow_restored` token may still change it).
 - Overlays (`PUT` / `DELETE /rules/{key}/overlay`, dry runs too): only the token in the current overlay's `created_by` and `admin`. Where there is no overlay, any token with `rules:write` and the ports may make one (it is that token's). `If-Match` / `If-None-Match` (#399) are checked first, so a token that loses a create race with `If-None-Match: *` gets `412`, not `403`.
 - Rule sets (`PUT` / `DELETE /rulesets/{name}`): their owner's already (security review M3); the refusal's `code` is `not_owner` too now. Changing or deleting a rule of a set on its own is `409 owned` for anyone, as before; rules of the settings file are `409 static`.
 - The owner is the token's **name**. Replacing its `sha256` under the same name keeps the owner; after a rename, only `admin` may change what the old name made ("Rotating tokens and certificates"). Tokens of the one-per-line format (`token-1`, ...) and requests without a token file are `admin`, so nothing changes for them.
-- **The UI (TCP-UDP-rproxy-ui)**: the UI talks with one token and checks each user's rules itself. Rules it creates while rproxy runs are its token's, so it keeps changing them. Rules restored from `forward_rules` after rproxy restarts have no known creator: if the UI's token is not `admin`, **give it `allow_restored: true`** (without it, changing, pausing or deleting those rules from the UI after a restart is `403 not_owner`). The UI's README sets it up with the one-per-line format, which is `admin` and needs nothing. Give `allow_restored` to the UI's token only, not to service accounts.
+- **The UI (TCP-UDP-rproxy-ui)**: the UI talks with one token and checks each user's rules itself. **Give the UI's token `admin`**: the UI's "API rules" screen (the UI's administrators change and delete rules other tokens made through the API) and the resending of the sync of several nodes change other tokens' rules with the UI's token, which is `403 not_owner` without `admin`. A setup that uses neither may use **`allow_restored: true`** instead of `admin`: rules the UI creates while rproxy runs are its token's, and rules restored from `forward_rules` after rproxy restarts have no known creator, which `allow_restored` may change (without it, changing, pausing or deleting those rules from the UI after a restart is `403 not_owner`). The UI's README sets it up with the one-per-line format, which is `admin` and needs nothing. Give `allow_restored` to the UI's token only, not to service accounts.
 - The rproxy-gateway controller uses rule sets only (no `PATCH` / `DELETE` of rules, no overlays), so nothing changes for it.
 
 ### Key and secret files of other owners (v0.4.18, #323, `features.file_owners`)

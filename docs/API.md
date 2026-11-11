@@ -18,8 +18,7 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
       tokens:
         - name: ui
           sha256: 9f86d081...        # printf %s "$TOKEN" | sha256sum
-          scopes: [rules:read, rules:write, metrics:read]
-          allow_restored: true       # v0.4.23（#401）：作ったトークンの分からないルール（UI の forward_rules から戻したもの）も直す・消す（UI のトークン。既定 false）
+          scopes: [admin]            # UI のトークンは admin（v0.4.23、#401。下の注）
         - name: ci-deploy
           sha256: 2c26b46b...
           scopes: [rules:write]
@@ -35,6 +34,8 @@ UI（TCP-UDP-rproxy-ui）と rproxy-api の間の取り決め。どちらかを�
 
     - スコープ: `rules:read`（`GET /rules`・`/interfaces`）、`rules:write`（`POST` / `PATCH` / `DELETE /rules`）、`metrics:read`（`GET /metrics`）、`acme:write`（ACME の証明書を使うルールの作成・変更と `POST /acme/...`。docs/ACME.md）、`certs:read`（`GET /certs`。v0.4.2）、`certs:write`（`PUT` / `DELETE /certs/{name}`。v0.4.2）、`admin`（すべて）。`GET /capabilities` はどのトークンでも読める。足りないときは `403 forbidden`。
     - v0.4.23（#401）から、`admin` でないトークンが直す・消すことができるのは自分で作ったルール・重ねる分・組だけ（ほかは `403 not_owner`。「持ち主だけが直す・消す」）。
+    - **UI のトークンは `admin` にする**（v0.4.23 から）：UI の「API のルール」の画面（UI の管理者だけ）はほかのトークンが作ったルールを直す・消し、複数のノードの同期（送り直し）もほかのトークンのルールを変えることがあるので、`admin` でないと `403 not_owner` になる。それらを使わず、UI が戻したルール（`forward_rules`）だけを直せればよい構成では、`admin` の代わりに `rules:read`・`rules:write` と **`allow_restored: true`**（作ったトークンの分からないルールも直す・消す。既定 `false`）でもよい。1 行に 1 トークンの書き方のトークンはもともと `admin`。
+    - `allow_restored` は v0.4.23 の項目。v0.4.22 以前に戻すときは先にトークンファイルから外す（古い版は知らない項目を誤りにし、ファイル全体を読まない。すべてのトークンが通らなくなる）。
     - ルールの作成・変更・削除は `event: "audit"` のログに残る（`token`、`client`、`action`、`rule`、`outcome`（`ok` / `error` / `forbidden`）、失敗時の `code`）。`client` は送信元の IP（Unix ソケットからは `unix`）。
     - 断ったリクエストも `event: "audit"` に残る（`client`・`method`・`path` つき。トークンそのものは出さない）：トークンがない・知らない・期限切れ（401）は `outcome: "unauthorized"` と `reason`（`missing` / `invalid` / `expired`、トークンに結びついたクライアント証明書がないときは `client_cert`）、一時停止中（429）は `outcome: "locked_out"`、スコープが足りない（403）は `outcome: "forbidden"` と `token`・`scope`。ログがあふれないように、断ったリクエストの行は送信元ごとに続けて 20 行まで（IPv6 の /64 は合わせてその 5 倍まで）、その後は 1 秒に 1 行にする（全体でも続けて 200 行、その後は 1 秒に 50 行。データの経路の行とは別の枠。v0.4.20、「ログの間引きと長さ」）。出した行の `suppressed` は、その送信元でその前に省いた行の数（省いた行の合計は `/metrics` の `rproxy_log_suppressed_total`）。
   - 複数のトークンを同時に有効にできる。入れ替えのときは新旧を両方書いておき、あとで古い方を消す。
@@ -63,7 +64,7 @@ TCP の制御 API の守りを足す：クライアント証明書（mTLS）、�
 tokens:
   - name: ui
     client_cert: ui.rproxy.internal      # 証明書だけで通す（Authorization は要らない）
-    scopes: [rules:read, rules:write, metrics:read]
+    scopes: [admin]                      # UI のトークン（v0.4.23 から admin、#401）
   - name: gateway-controller
     sha256: 9f86d0...
     client_cert: spiffe://cluster.local/ns/rproxy/sa/controller   # トークンと証明書の両方が要る
@@ -96,6 +97,7 @@ tokens:
 3. 古いトークンをトークンファイルから消して SIGHUP。
 
 - `expires` を付けておくと、切れる前に `token.expiring` で知らせる（`--token-warn-days`）。
+- 消したトークンの名前を、別の人・用途の新しいトークンに使い回さない：持ち主は名前なので、前のトークンが作ったルール・重ねる分・組をそのまま直せてしまう（#401）。
 - ルール・重ねる分・組の持ち主はトークンの **名前**（v0.4.23、#401）。同じ名前のまま `sha256` を新しいものに置き換えれば、作ったものはそのトークンのまま。名前を変える（新しい名前のエントリを足して古いものを消す）と、前の名前で作ったものはほかのトークンのものになり、`admin` だけが直す・消すことができる（持ち主を移す API はない。新しい名前で作り直す）。名前は 1 つのファイルに 1 回しか書けないので、名前を変えずに入れ替えるときは古いトークンが同時には通らない（止められないクライアントは、そのあいだ送り直す）。
 - クライアント証明書は、同じ名前で新しい証明書を発行してクライアントに配る（トークンファイルは変えなくてよい）。名前を変えるときは、新しい名前のエントリを足す → クライアントを切り替える → 古いエントリを消す（どれも SIGHUP）。
 - CA を入れ替えるときは、`--tls-client-ca` のファイルに新旧の CA を並べて SIGHUP → クライアントの証明書を新しい CA のものに替える → 古い CA を消して SIGHUP。
@@ -1188,13 +1190,13 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 
 `admin` のスコープのトークンは何でもできる。`admin` でないトークン（サービスアカウント）はルールを作れ、**自分で作ったものだけ** を直す・消すことができる。ほかのトークンが作ったものには触れない。
 
-- 対象：`PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}`（`dry_run` も）。持ち主でなければ `403 not_owner` で、何も変えない（監査ログは `outcome: "forbidden"`・`code: "not_owner"`）。rproxy の API に一時停止・再開の口はない（UI は一時停止を `DELETE`、再開を `POST` で行う）ので、それも同じ。
+- 対象：`PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}`（`dry_run` も）。持ち主はルールの表の鍵の中で確かめる（確かめた後にほかのトークンが同じキーに作ったルールを変えない）。持ち主でなければ `403 not_owner` で、何も変えない（監査ログは `outcome: "forbidden"`・`code: "not_owner"`）。rproxy の API に一時停止・再開の口はない（UI は一時停止を `DELETE`、再開を `POST` で行う）ので、それも同じ。
 - 持ち主：`origin: "api"` は `created_by`、`dynamic` は作ったトークンを rproxy が覚える（引き継ぎで渡す）。`admin` が直しても持ち主は変わらない。読むこと（`GET`）は今までどおり。
 - 作ったトークンの分からないルール（UI の `forward_rules` から戻したもの、前の版の `rproxy_rules` の行で `created_by` が空のもの、再起動の後の `dynamic` のルール）：`admin` と、トークンファイルで **`allow_restored: true`** のトークンだけが直す・消すことができる。直しても持ち主は分からないまま（ほかの `allow_restored` のトークンも直せる）。
 - 重ねる分（`PUT` / `DELETE /rules/{key}/overlay`、`dry_run` も）：今の重ねる分の `created_by` のトークンと `admin` だけ。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる（作ったトークンのものになる）。`If-Match` / `If-None-Match`（#399）は先に確かめるので、`If-None-Match: *` で作る取り合いに負けたトークンは `403` ではなく `412` を受け取る。
 - 組（`PUT` / `DELETE /rulesets/{name}`）：前から持ち主だけ（セキュリティレビュー M3）。断るときの `code` も `not_owner` にそろえた。組のルールを個別に直す・消すのは、誰でも今までどおり `409 owned`。設定ファイルのルールは `409 static`。
 - 持ち主はトークンの **名前**。同じ名前で `sha256` を入れ替えれば持ち主は変わらない。名前を変えると、前の名前で作ったものは `admin` だけが直せる（「トークン・証明書の入れ替え」）。1 行に 1 トークンの書き方のトークン（`token-1`…）とトークンファイルのないときは `admin` なので、何も変わらない。
-- **UI（TCP-UDP-rproxy-ui）**：UI は 1 つのトークンで話し、利用者ごとの持ち主は UI が自分で確かめる。UI が動いている間に作ったルールは UI のトークンのものなので、そのまま直せる。rproxy の再起動の後に `forward_rules` から戻したルールは作ったトークンが分からないので、UI のトークンが `admin` でなければ **`allow_restored: true` を付ける**（付けないと、再起動の後に UI からそのルールを直す・一時停止する・消すことが `403 not_owner` になる）。UI の README の手順（1 行に 1 トークンの書き方）は `admin` なので、付けなくてよい。`allow_restored` は UI のトークンにだけ付け、サービスアカウントには付けない。
+- **UI（TCP-UDP-rproxy-ui）**：UI は 1 つのトークンで話し、利用者ごとの持ち主は UI が自分で確かめる。**UI のトークンは `admin` にする**：UI の「API のルール」の画面（ほかのトークンが API で作ったルールを UI の管理者が直す・消す）と、複数のノードの同期の送り直しは、ほかのトークンが作ったルールを UI のトークンで変えるので、`admin` でないと `403 not_owner` になる。それらを使わない構成では、`admin` の代わりに **`allow_restored: true`** でもよい：UI が動いている間に作ったルールは UI のトークンのもの、rproxy の再起動の後に `forward_rules` から戻したルールは作ったトークンが分からないので `allow_restored` で直せる（付けないと、再起動の後に UI からそのルールを直す・一時停止する・消すことが `403 not_owner`）。UI の README の手順（1 行に 1 トークンの書き方）は `admin` なので何も要らない。`allow_restored` は UI のトークンにだけ付け、サービスアカウントには付けない。
 - rproxy-gateway のコントローラは組だけを使う（ルールの `PATCH` / `DELETE` も重ねる分も使わない）ので、変わらない。
 
 ### ほかの持ち主の鍵・秘密のファイル（v0.4.18、#323、`features.file_owners`）

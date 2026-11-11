@@ -18,7 +18,9 @@ use tokio::net::TcpListener;
 use common::*;
 use rproxy_api::config::persist::{Store, StoredRule};
 use rproxy_api::control::auth::Tokens;
-use rproxy_api::core::rule::{Origin, RuleRequest};
+use rproxy_api::core::rule::{Key, Origin, Protocol, RuleRequest, UpdateRequest};
+use rproxy_api::error::ApiError;
+use rproxy_api::net::protected::Owner;
 
 fn sha(s: &str) -> String {
 	use sha2::Digest;
@@ -272,4 +274,53 @@ async fn the_feature_is_announced() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["features"]["rule_owners"], true, "{caps}");
+}
+
+/// The check `a`'s change makes under the rules lock (#401): only `a`'s rules.
+fn as_a(owner: &Owner) -> Result<(), ApiError> {
+	if owner.is("a") { Ok(()) } else { Err(ApiError::not_owner("not a's")) }
+}
+
+/// The owner is checked again where the change takes the rules lock: a rule another token made
+/// on the key after the API's first check (a `DELETE` of a free key racing another token's
+/// `POST`, a `PATCH` racing a delete and re-create) is not changed nor deleted. Deterministic:
+/// the registry is called as the handler calls it after its first check passed.
+#[tokio::test]
+async fn the_owner_is_checked_again_under_the_rules_lock() {
+	let (h, dir) = with_tokens("lock").await;
+	let backend = tcp_backend("L:").await;
+	let port = free_port();
+	let key = Key { protocol: Protocol::Tcp, listen: format!("127.0.0.1:{port}").parse().unwrap() };
+	// a's check passed while the key was free; b's rule took it meanwhile
+	let (status, v) = call(&h, Method::POST, "/rules", "b", Some(rule("tcp", port, backend))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let e = h.registry.take_as(&key, Some(&as_a)).await.err().expect("refused");
+	assert_eq!(e.code, "not_owner");
+	let req: UpdateRequest = serde_json::from_value(json!({"remote_addr": "127.0.0.1", "remote_port": 9})).unwrap();
+	let e = h.registry.update_as(&key, req.clone(), Some(&as_a)).await.expect_err("refused");
+	assert_eq!(e.code, "not_owner");
+	let (status, v) = call(&h, Method::GET, &rule_path(port), "b", None).await;
+	assert_eq!(
+		(status, &v["state"], &v["remote_port"]),
+		(StatusCode::OK, &json!("running"), &json!(backend.port())),
+		"b's rule as it was: {v}"
+	);
+	// a's own rule passes the same check
+	assert_eq!(call(&h, Method::DELETE, &rule_path(port), "b", None).await.0, StatusCode::NO_CONTENT);
+	let (status, v) = call(&h, Method::POST, "/rules", "a", Some(rule("tcp", port, backend))).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	h.registry.update_as(&key, req, Some(&as_a)).await.unwrap();
+	h.registry.stop_taken(h.registry.take_as(&key, Some(&as_a)).await.unwrap(), None).await;
+
+	// a restored rule that did not validate: neither fixed nor deleted, and not made failed
+	let mut bad = rule("tcp", port, backend);
+	bad["allow_from"] = json!(["not-an-address"]);
+	h.registry.restore(vec![serde_json::from_value(bad).unwrap()]).await;
+	let fix: UpdateRequest = serde_json::from_value(json!({"remote_addr": "127.0.0.1", "remote_port": 9, "allow_from": []})).unwrap();
+	assert_eq!(h.registry.update_as(&key, fix, Some(&as_a)).await.expect_err("refused").code, "not_owner");
+	assert_eq!(h.registry.take_as(&key, Some(&as_a)).await.err().expect("refused").code, "not_owner");
+	let (status, v) = call(&h, Method::GET, &rule_path(port), "root", None).await;
+	assert_eq!((status, &v["state"], &v["allow_from"]), (StatusCode::OK, &json!("failed"), &json!(["not-an-address"])), "{v}");
+	assert_eq!(call(&h, Method::DELETE, &rule_path(port), "root", None).await.0, StatusCode::NO_CONTENT);
+	std::fs::remove_dir_all(dir).unwrap();
 }

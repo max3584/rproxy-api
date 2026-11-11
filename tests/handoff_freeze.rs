@@ -46,14 +46,16 @@ fn sha(s: &str) -> String {
 	sha2::Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `ci` stores its rules and sets; `root` is `admin` (changes other tokens' rules, #401).
+/// `ci` stores its rules and sets; `dyn` does not (its rules are `dynamic`); `root` is `admin`
+/// (changes other tokens' rules, #401).
 fn tokens(dir: &std::path::Path) -> Tokens {
 	let file = dir.join("tokens.yaml");
 	fs::write(
 		&file,
 		format!(
-			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: dyn, sha256: {}, scopes: [rules:read, rules:write]}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
 			sha("ci"),
+			sha("dyn"),
 			sha("root")
 		),
 	)
@@ -335,6 +337,10 @@ async fn invalid_rules_and_owners_carry_over() {
 	old_store.restored(std::slice::from_ref(&row));
 	old.registry.restore_as(vec![row.spec.clone()], rproxy_api::core::rule::Origin::Api).await;
 	old.registry.restore(vec![serde_json::from_value(bad(dynamic)).unwrap()]).await;
+	// a dynamic rule of a token without persist: rproxy remembers who made it (#323, #401)
+	let mine = free_port();
+	let (status, v) = call_as(&old, "dyn", Method::POST, "/rules", Some(rule("tcp", mine, "127.0.0.1:9".parse().unwrap()))).await;
+	assert_eq!((status, &v["origin"]), (StatusCode::CREATED, &json!("dynamic")), "{v}");
 
 	let state = handoff::prepare(&old.registry, Duration::from_secs(5)).await.unwrap();
 	assert!(state.rules.iter().all(|r| r["listen_port"] != api && r["listen_port"] != dynamic), "not as rules to start");
@@ -355,6 +361,17 @@ async fn invalid_rules_and_owners_carry_over() {
 	let (status, v) = call(&new, Method::GET, &format!("/rules/tcp/127.0.0.1/{dynamic}"), None).await;
 	assert_eq!((status, &v["state"], &v["origin"]), (StatusCode::OK, &json!("failed"), &json!("dynamic")), "{v}");
 	assert!(new.registry.owners().contains(&(key(made), "ci".to_string())), "{:?}", new.registry.owners());
+	// the creating tokens still change and delete their rules in the new process, others not (#401)
+	// (the old process lets go of the listeners first, as after a handoff's drain)
+	old.registry.shutdown().await;
+	let targets = json!({"remote_addr": "127.0.0.1", "remote_port": 9});
+	let (status, v) = call_as(&new, "ci", Method::PATCH, &format!("/rules/tcp/127.0.0.1/{mine}"), Some(targets.clone())).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("not_owner")), "{v}");
+	let (status, v) = call_as(&new, "dyn", Method::PATCH, &format!("/rules/tcp/127.0.0.1/{mine}"), Some(targets.clone())).await;
+	assert_eq!((status, &v["origin"]), (StatusCode::OK, &json!("dynamic")), "{v}");
+	assert_eq!(call_as(&new, "dyn", Method::DELETE, &format!("/rules/tcp/127.0.0.1/{mine}"), None).await.0, StatusCode::NO_CONTENT);
+	let (status, v) = call(&new, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{made}"), Some(targets)).await;
+	assert_eq!(status, StatusCode::OK, "ci's api rule: {v}");
 	// fixed in the new process: someone's rule, so not by ci (#401), by an admin token
 	let fix = json!({"remote_addr": "127.0.0.1", "remote_port": 9, "allow_from": []});
 	let (status, v) = call(&new, Method::PATCH, &format!("/rules/tcp/127.0.0.1/{api}"), Some(fix.clone())).await;

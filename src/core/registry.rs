@@ -369,6 +369,11 @@ pub struct Registry {
 	static_turn: Mutex<()>,
 }
 
+/// Whether a token may change or delete a rule of this owner (#401): called by `take_as`,
+/// `update_as` with the rule's owner while the rules lock is held, so the rule it looks at is
+/// the one changed (none other can take the key in between).
+pub type OwnerCheck<'a> = &'a (dyn Fn(&crate::net::protected::Owner) -> Result<(), ApiError> + Sync);
+
 /// A rule restored from the database (`forward_rules`, `rproxy_rules`) or a live upgrade
 /// that did not validate (#327): its body as stored and why.
 #[derive(Clone, Debug)]
@@ -1456,12 +1461,18 @@ impl Registry {
 	}
 
 	pub(super) async fn create_spec(self: &Arc<Self>, spec: RuleSpec) -> Result<RuleView, ApiError> {
-		self.create_spec_in(spec, false, None).await
+		self.create_spec_in(spec, false, None, None).await
 	}
 
 	/// `create_spec`; `fixing`: in place of the rule of the key that did not validate (#327);
 	/// `by`: the token that owns it (#323), recorded as it goes into the table.
-	async fn create_spec_in(self: &Arc<Self>, spec: RuleSpec, fixing: bool, by: Option<&str>) -> Result<RuleView, ApiError> {
+	async fn create_spec_in(
+		self: &Arc<Self>,
+		spec: RuleSpec,
+		fixing: bool,
+		by: Option<&str>,
+		owner: Option<OwnerCheck<'_>>,
+	) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{} would take rproxy's control API ({api})", spec.key)));
 		}
@@ -1472,6 +1483,12 @@ impl Registry {
 		}
 		if !fixing {
 			self.refuse_invalid_key(&spec.key)?;
+		}
+		// a fix by a token (#401): of the rule that did not validate, if it is still there, and
+		// only if the token may change it
+		if let (true, Some(check)) = (fixing, owner) {
+			let invalid = self.invalid_of(&spec.key).ok_or_else(|| ApiError::not_found(spec.key.to_string()))?;
+			check(&self.owner_of_key(&spec.key, invalid.origin, None))?;
 		}
 		if let Some((_, e)) = rules.iter().find(|(_, e)| overlaps(e.spec(), &spec)) {
 			return Err(ApiError::already_exists(overlap_message(&spec, e.spec())));
@@ -1535,7 +1552,7 @@ impl Registry {
 	pub async fn create_by(self: &Arc<Self>, req: RuleRequest, origin: Origin, by: &str) -> Result<RuleView, ApiError> {
 		let mut spec = req.validate(&self.caps())?;
 		spec.origin = origin;
-		self.create_spec_in(spec, false, Some(by)).await
+		self.create_spec_in(spec, false, Some(by), None).await
 	}
 
 	/// `409 already_exists` while a rule that did not validate holds the key (#327).
@@ -1549,11 +1566,17 @@ impl Registry {
 	}
 
 	pub async fn update(self: &Arc<Self>, key: &Key, req: UpdateRequest) -> Result<RuleView, ApiError> {
+		self.update_as(key, req, None).await
+	}
+
+	/// `update`, refused by `owner` (#401) unless the rule it changes, looked at under the
+	/// rules lock, may be changed by the token.
+	pub async fn update_as(self: &Arc<Self>, key: &Key, req: UpdateRequest, owner: Option<OwnerCheck<'_>>) -> Result<RuleView, ApiError> {
 		if let Some(fixed) = self.invalid_patched(key, &req) {
-			return self.fix_invalid(key, fixed).await;
+			return self.fix_invalid(key, fixed, owner).await;
 		}
 		let (_, spec, tls_changed, http_changed) = self.updated_spec(key, req).await?;
-		self.apply(key, spec, tls_changed, http_changed).await
+		self.apply_as(key, spec, tls_changed, http_changed, Overlaying::No, owner).await
 	}
 
 	/// A PATCH of a rule that did not validate (#327): the body it makes is validated
@@ -1561,19 +1584,20 @@ impl Registry {
 	/// its place, keeping its origin. One that validates but cannot start (a port in
 	/// use, a name that does not resolve) is registered as failed, as a PATCH of a
 	/// failed rule leaves it.
-	async fn fix_invalid(self: &Arc<Self>, key: &Key, req: RuleRequest) -> Result<RuleView, ApiError> {
+	async fn fix_invalid(self: &Arc<Self>, key: &Key, req: RuleRequest, owner: Option<OwnerCheck<'_>>) -> Result<RuleView, ApiError> {
 		let Some(origin) = self.invalid_of(key).map(|i| i.origin) else { return Err(ApiError::not_found(key.to_string())) };
 		let mut spec = req.validate(&self.caps())?;
 		if spec.key != *key {
 			return Err(ApiError::invalid(format!("the PATCH would move {key} to {}; delete and re-create the rule", spec.key)));
 		}
 		spec.origin = origin;
-		match self.create_spec_in(spec.clone(), true, None).await {
+		match self.create_spec_in(spec.clone(), true, None, owner).await {
 			Ok(view) => {
 				info!(event = "rule.update", rule = %key, phase = "fixed", "a restored rule that did not validate was fixed");
 				Ok(view)
 			}
-			Err(e) if e.code == "already_exists" || e.code == "reserved" => Err(e),
+			// refused before anything changed: the rule stays as it is
+			Err(e) if ["already_exists", "reserved", "not_owner", "not_found"].contains(&e.code) => Err(e),
 			Err(e) => {
 				error!(event = "rule.failed", rule = %key, error = %e.message, phase = "update");
 				self.insert_failed(spec, e.clone()).await;
@@ -1757,7 +1781,7 @@ impl Registry {
 	/// Puts a changed spec into effect on an existing rule, keeping its
 	/// connections (the fields PATCH can change: target, timeouts, TLS, allow_from, http).
 	pub(super) async fn apply(self: &Arc<Self>, key: &Key, spec: RuleSpec, tls_changed: bool, http_changed: bool) -> Result<RuleView, ApiError> {
-		self.apply_as(key, spec, tls_changed, http_changed, Overlaying::No).await
+		self.apply_as(key, spec, tls_changed, http_changed, Overlaying::No, None).await
 	}
 
 	/// `apply`; `strict`: a change of a static rule's overlay (#397), which fails if the
@@ -1769,6 +1793,7 @@ impl Registry {
 		tls_changed: bool,
 		http_changed: bool,
 		overlaying: Overlaying<'_>,
+		owner: Option<OwnerCheck<'_>>,
 	) -> Result<RuleView, ApiError> {
 		if let Some(api) = self.reserved_clash(&spec) {
 			return Err(ApiError::reserved(format!("{key} would take rproxy's control API ({api})")));
@@ -1783,6 +1808,10 @@ impl Registry {
 		self.geoip_gate(&spec)?;
 		self.acme_gate(&spec, &mut prepared)?;
 		let entry = rules.get_mut(key).ok_or_else(|| ApiError::not_found(key.to_string()))?;
+		// the rule as it is now, under the lock (#401): not one another token made in its place
+		if let Some(check) = owner {
+			check(&self.owner_of(entry.spec()))?;
+		}
 		match entry {
 			Entry::Running(r) => {
 				// open the added addresses first: a failure changes nothing
@@ -2126,8 +2155,26 @@ impl Registry {
 	/// The first half of `delete`: takes the rule out of the table (it is gone
 	/// from the list and its key is free); `stop_taken` stops it.
 	pub async fn take(&self, key: &Key) -> Result<Taken, ApiError> {
+		self.take_as(key, None).await
+	}
+
+	/// `take`, refused by `owner` (#401) unless the rule it takes, looked at under the rules
+	/// lock, may be deleted by the token.
+	pub async fn take_as(&self, key: &Key, owner: Option<OwnerCheck<'_>>) -> Result<Taken, ApiError> {
 		let entry = {
 			let mut rules = self.rules.lock().await;
+			if let Some(check) = owner {
+				match rules.get(key) {
+					// static rules and rules of sets: refused below as before
+					Some(e) if e.spec().origin == Origin::Static || e.spec().ruleset.is_some() => {}
+					Some(e) => check(&self.owner_of(e.spec()))?,
+					None => {
+						if let Some(i) = self.invalid_of(key) {
+							check(&self.owner_of_key(key, i.origin, None))?;
+						}
+					}
+				}
+			}
 			match rules.get(key) {
 				// a rule that did not validate (#327) has nothing to stop
 				None => match self.drop_invalid(key) {
@@ -3179,7 +3226,7 @@ impl Registry {
 		let (http_changed, tls_changed) = (spec.http_differs(current.as_ref().map(|o| &o.spec)), spec.tls_differs(current.as_ref().map(|o| &o.spec)));
 		// in force first (the overlay given, not held yet), then held: a failure leaves the
 		// previous one held and in force
-		self.apply_as(key, file, tls_changed, http_changed, Overlaying::Put(&spec)).await?;
+		self.apply_as(key, file, tls_changed, http_changed, Overlaying::Put(&spec), None).await?;
 		let now = tlsconf::unix_now().max(0) as u64;
 		let overlay = Overlay {
 			created_by: current.as_ref().map_or_else(|| by.to_string(), |o| o.created_by.clone()),
@@ -3213,8 +3260,9 @@ impl Registry {
 		let file = self.static_rule(key).await.ok();
 		let last = key.listen.port().saturating_add(file.as_ref().map_or(0, |f| f.port_count.saturating_sub(1)));
 		ports(key.listen.port(), last)?;
-		self.check_overlay_owner(key, by, admin)?;
+		// the preconditions first, as for a PUT
 		let current = self.check_if_match(key, if_match, None)?.ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
+		self.check_overlay_owner(key, by, admin)?;
 		let change = Change::of(key, Some(&current.spec), None);
 		if dry_run {
 			return Ok(change);
@@ -3222,7 +3270,7 @@ impl Registry {
 		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
 		if let Some(file) = file {
 			let (http_changed, tls_changed) = (current.spec.http_differs(None), current.spec.tls_differs(None));
-			if let Err(e) = self.apply_as(key, file, tls_changed, http_changed, Overlaying::Change).await {
+			if let Err(e) = self.apply_as(key, file, tls_changed, http_changed, Overlaying::Change, None).await {
 				self.overlays.lock().unwrap_or_else(|e| e.into_inner()).insert(*key, current);
 				return Err(e);
 			}
