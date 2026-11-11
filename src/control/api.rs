@@ -711,13 +711,10 @@ fn etag_header(etag: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
 	[(header::ETAG, header::HeaderValue::from_str(etag).unwrap_or(header::HeaderValue::from_static("\"\"")))]
 }
 
-/// The ports of an overlay change (#397): the static rule's whole range, or the key's port
-/// once the rule is gone.
-async fn check_overlay_ports(state: &AppState, principal: &Principal, key: &Key) -> AppResult<()> {
-	match state.registry.get(key).await {
-		Ok(view) => check_ports(principal, view.listen_port, view.listen_port_end),
-		Err(_) => check_ports(principal, key.listen.port(), None),
-	}
+/// The ports of an overlay change (#397), looked at by the registry in turn with reloads: the
+/// static rule's whole range, or the key's port once the rule is gone.
+fn overlay_ports(principal: &Principal) -> impl Fn(u16, u16) -> Result<(), ApiError> + Sync + '_ {
+	move |first, last| check_ports(principal, first, Some(last))
 }
 
 /// Writes an overlay's row (#397) when there is a database and the overlay is stored (`stored`:
@@ -749,17 +746,19 @@ async fn put_overlay(
 	let key = parse_key(&protocol, &addr, &port)?;
 	let spec: crate::core::overlay::OverlaySpec = parse_body(&body)?;
 	let if_match = if_match(&headers)?;
+	// the key's port first (the rule's whole range again in turn with reloads, `overlay_ports`)
+	check_ports(&principal, key.listen.port(), None)?;
 	if crate::config::plan::dry_run(&query)? {
-		check_overlay_ports(&state, &principal, &key).await?;
 		drop(super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?);
-		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, principal.persist, if_match.as_deref(), true).await?).into_response());
+		let ports = overlay_ports(&principal);
+		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, principal.persist, &ports, if_match.as_deref(), true).await?).into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		let result = async {
-			check_overlay_ports(&state, &principal, &key).await?;
 			let _files = super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?;
-			state.registry.put_overlay(&key, spec, &principal.name, principal.persist, if_match.as_deref(), false).await
+			let ports = overlay_ports(&principal);
+			state.registry.put_overlay(&key, spec, &principal.name, principal.persist, &ports, if_match.as_deref(), false).await
 		}
 		.await;
 		audit(&principal, &client, "overlay.put", &key.to_string(), &result);
@@ -784,16 +783,16 @@ async fn delete_overlay(
 	let key = parse_key(&protocol, &addr, &port)?;
 	let if_match = if_match(&headers)?;
 	if crate::config::plan::dry_run(&query)? {
-		check_overlay_ports(&state, &principal, &key).await?;
-		return Ok(Json(state.registry.delete_overlay(&key, if_match.as_deref(), true).await?).into_response());
+		let ports = overlay_ports(&principal);
+		return Ok(Json(state.registry.delete_overlay(&key, &ports, if_match.as_deref(), true).await?).into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		// a stored overlay's row goes with it
 		let stored = state.registry.overlay(&key).is_some_and(|o| o.stored);
 		let result = async {
-			check_overlay_ports(&state, &principal, &key).await?;
-			state.registry.delete_overlay(&key, if_match.as_deref(), false).await
+			let ports = overlay_ports(&principal);
+			state.registry.delete_overlay(&key, &ports, if_match.as_deref(), false).await
 		}
 		.await;
 		audit(&principal, &client, "overlay.delete", &key.to_string(), &result);

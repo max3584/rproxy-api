@@ -119,6 +119,59 @@ impl OverlaySpec {
 	}
 }
 
+impl OverlaySpec {
+	/// The file's services and middlewares the overlay reaches (#397 review M2): named by its
+	/// routes (`service`, `middlewares`), its middlewares' services (`mirror`, `errors`,
+	/// `forward_auth`) and its services' `servers[].middlewares`, and from those on in the file.
+	/// Their files count as the overlay's (`rule_files::check_overlay`): a secret of the file
+	/// (a client key, an `oidc` secret, a `users_file`) is `409 file_in_use` for a token without
+	/// `admin`. Without the file's own routes' middlewares: an overlay route reaches a file
+	/// service directly.
+	pub fn file_items(&self, file: &HttpSpec) -> HttpSpec {
+		let Some(h) = &self.http else { return HttpSpec::default() };
+		let mut services: Vec<&String> = vec![];
+		let mut middlewares: Vec<&String> = vec![];
+		for r in &h.routes {
+			services.extend(r.service.iter());
+			middlewares.extend(r.middlewares.iter());
+		}
+		for m in h.middlewares.values() {
+			services.extend(service_of(m));
+		}
+		for s in h.services.values() {
+			middlewares.extend(s.servers.iter().flat_map(|v| &v.middlewares));
+		}
+		let mut out = HttpSpec::default();
+		loop {
+			let mut more = false;
+			for name in std::mem::take(&mut services) {
+				if h.services.contains_key(name) || out.services.contains_key(name) {
+					continue;
+				}
+				if let Some(s) = file.services.get(name) {
+					out.services.insert(name.clone(), s.clone());
+					middlewares.extend(s.servers.iter().flat_map(|v| &v.middlewares));
+					more = true;
+				}
+			}
+			for name in std::mem::take(&mut middlewares) {
+				if h.middlewares.contains_key(name) || out.middlewares.contains_key(name) {
+					continue;
+				}
+				if let Some(m) = file.middlewares.get(name) {
+					out.middlewares.insert(name.clone(), m.clone());
+					services.extend(service_of(m));
+					more = true;
+				}
+			}
+			if !more && services.is_empty() && middlewares.is_empty() {
+				break;
+			}
+		}
+		out
+	}
+}
+
 /// An item of the overlay left out because the file has the name (or uses such an item).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shadowed {
@@ -194,6 +247,19 @@ fn service_of(m: &MiddlewareSpec) -> Option<&String> {
 		MiddlewareSpec::Mirror { service, .. } | MiddlewareSpec::Errors { service, .. } => Some(service),
 		MiddlewareSpec::ForwardAuth { service, .. } => service.as_ref(),
 		_ => None,
+	}
+}
+
+/// Whether every name the pattern `p` matches is matched by the file's pattern `file` (the
+/// overlay's pattern could never be used: the file's routes are looked at first).
+fn covers(file: &str, p: &str) -> bool {
+	let under = |d: &str| file.strip_prefix("**.").is_some_and(|e| d == e || d.ends_with(&format!(".{e}")));
+	if let Some(d) = p.strip_prefix("**.") {
+		under(d)
+	} else if let Some(d) = p.strip_prefix("*.") {
+		file == p || under(d)
+	} else {
+		crate::tls::config::best_match([std::slice::from_ref(&file.to_string())], p).is_some()
 	}
 }
 
@@ -284,12 +350,17 @@ pub fn merge(file: &RuleSpec, overlay: &OverlaySpec, features: &Features) -> Res
 			TlsMode::Terminate => {}
 			_ => return Err(shape("tls.routes need a static rule with tls mode sni (or terminate without http and client_auth)")),
 		}
-		let taken: BTreeSet<String> = file.tls.routes.iter().flat_map(|r| r.patterns()).collect();
+		let taken: Vec<String> = file.tls.routes.iter().flat_map(|r| r.patterns()).collect();
 		for r in overlay.tls_routes() {
 			let mut kept = vec![];
 			for p in r.patterns() {
-				if taken.contains(&p) {
-					shadow("tls_route", &p, "the settings file routes this name".into());
+				if let Some(by) = taken.iter().find(|f| covers(f, &p)) {
+					let why = if *by == p {
+						"the settings file routes this name".to_string()
+					} else {
+						format!("the settings file routes every such name ({by})")
+					};
+					shadow("tls_route", &p, why);
 				} else if !kept.contains(&p) {
 					kept.push(p);
 				}
@@ -550,5 +621,33 @@ mod tests {
 		let b = overlay(serde_json::json!({"http": {"routes": [{"name": "b", "match": "Host(`b.test`)", "to": "http://127.0.0.1:3"}]}}));
 		assert_ne!(a.etag(), b.etag());
 		assert_eq!(a.etag(), a.clone().etag());
+	}
+
+	#[test]
+	fn a_pattern_the_file_takes_entirely_is_covered() {
+		assert!(covers("*.wild.test", "x.wild.test"));
+		assert!(!covers("*.wild.test", "x.y.wild.test"));
+		assert!(covers("**.test", "*.a.test"));
+		assert!(covers("**.test", "**.a.test"));
+		assert!(covers("**.a.test", "*.a.test"));
+		assert!(!covers("*.a.test", "**.a.test"));
+		assert!(!covers("a.test", "*.test"));
+		assert!(covers("A.test".to_ascii_lowercase().as_str(), "a.test"));
+	}
+
+	#[test]
+	fn file_items_follow_what_the_overlay_reaches() {
+		let mut file = http_rule().http.unwrap();
+		file.middlewares.insert("m".into(), serde_json::from_value(serde_json::json!({"mirror": {"service": "copy"}})).unwrap());
+		file.services
+			.insert("copy".into(), serde_json::from_value(serde_json::json!({"servers": [{"url": "http://127.0.0.1:9"}]})).unwrap());
+		file.services
+			.insert("other".into(), serde_json::from_value(serde_json::json!({"servers": [{"url": "http://127.0.0.1:8"}]})).unwrap());
+		let ov = overlay(
+			serde_json::json!({"http": {"routes": [{"name": "x", "match": "Path(`/x`)", "service": "app", "middlewares": ["m"]}]}}),
+		);
+		let reached = ov.file_items(&file);
+		assert_eq!(reached.services.keys().collect::<Vec<_>>(), ["app", "copy"]);
+		assert_eq!(reached.middlewares.keys().collect::<Vec<_>>(), ["m"]);
 	}
 }

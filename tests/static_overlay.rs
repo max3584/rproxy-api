@@ -297,9 +297,13 @@ async fn sni_names_are_added_where_the_file_has_none() {
 	]}}]);
 	h.registry.load_static_labeled(requests(file)).await.unwrap();
 	assert_eq!(tls_roundtrip(&pki, port, "b.test", "1").await.unwrap(), "D:1");
-	let ov = json!({"tls": {"routes": [
-		{"server_names": ["b.test", "x.wild.test"], "remote_addr": "127.0.0.1", "remote_port": b.port()}
-	]}});
+	// a name under the file's wildcard could never be reached: refused
+	let covered =
+		json!({"tls": {"routes": [{"server_names": ["b.test", "x.wild.test"], "remote_addr": "127.0.0.1", "remote_port": b.port()}]}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(covered), &[]).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("overlay_conflict")), "{v}");
+	assert!(v["error"].as_str().unwrap().contains("*.wild.test"), "{v}");
+	let ov = json!({"tls": {"routes": [{"server_name": "b.test", "remote_addr": "127.0.0.1", "remote_port": b.port()}]}});
 	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(ov), &[]).await;
 	assert_eq!(status, StatusCode::CREATED, "{v}");
 	assert_eq!(tls_roundtrip(&pki, port, "b.test", "2").await.unwrap(), "B:2");
@@ -432,4 +436,204 @@ async fn the_feature_is_announced() {
 	let h = harness().await;
 	let (_, caps) = h.get("/capabilities").await;
 	assert_eq!(caps["features"]["static_overlay"], true, "{caps}");
+}
+
+/// Echoes the header `x-auth-user` it received.
+async fn echo_user() -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
+		req.headers().get("x-auth-user").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string()
+	});
+	tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+	addr
+}
+
+async fn fetch_with(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+	let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+	let mut r = client.get(format!("http://127.0.0.1:{port}{path}"));
+	for (k, v) in headers {
+		r = r.header(*k, *v);
+	}
+	let r = r.send().await.unwrap();
+	(r.status().as_u16(), r.text().await.unwrap_or_default())
+}
+
+/// Review M1: what says where a request came from is never an identity header. Behind
+/// `trusted_proxies`, an overlay `forward_auth` naming X-Forwarded-For is refused, and a file's
+/// (only warned) does not remove the proxy's X-Forwarded-For before `client_ip`, so the file's
+/// `ip_allow` still sees the client. An overlay's own identity header is removed only from the
+/// requests no file route took.
+#[tokio::test]
+async fn forwarding_headers_are_no_identity_and_overlay_identities_stay_off_file_routes() {
+	let h = harness_with_global(Tokens::disabled(), rproxy_api::l7::access::HttpGlobal::without_file(&["127.0.0.0/8".to_string()])).await;
+	let echo = echo_user().await;
+	let port = free_port();
+	let file = json!([{"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "http": {
+		"routes": [{"name": "app", "match": "PathPrefix(`/app`)", "service": "e", "middlewares": ["inside"]}],
+		"services": {"e": {"servers": [{"url": format!("http://{echo}")}]}},
+		"middlewares": {
+			"inside": {"ip_allow": {"source_range": ["127.0.0.0/8"]}},
+			"unused": {"forward_auth": {"address": "http://127.0.0.1:9/", "response_headers": ["X-Forwarded-For"]}}
+		}
+	}}]);
+	h.registry.load_static_labeled(requests(file)).await.unwrap();
+	let xff = [("x-forwarded-for", "203.0.113.5")];
+	assert_eq!(fetch_with(port, "/app", &xff).await.0, 403, "the client behind the trusted proxy is outside ip_allow");
+	assert_eq!(fetch_with(port, "/app", &[]).await.0, 200);
+
+	let bad = json!({"http": {"middlewares": {"fa": {"forward_auth": {"address": "http://127.0.0.1:9/", "response_headers": ["x-forwarded-for"]}}}}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(bad), &[]).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+	assert!(v["error"].as_str().unwrap().contains("x-forwarded-for"), "{v}");
+	let bad = json!({"http": {"middlewares": {"ba": {"basic_auth": {"users_file": "/nonexistent", "user_header": "X_Real_IP"}}}}});
+	assert_eq!(call(&h, Method::PUT, &path(port), Some(bad), &[]).await.0, StatusCode::BAD_REQUEST);
+
+	// an overlay's identity header: not removed from the file's route's requests
+	let ov = json!({"http": {
+		"routes": [{"name": "o", "match": "PathPrefix(`/o`)", "service": "e", "middlewares": ["fa"]}],
+		"middlewares": {"fa": {"forward_auth": {"address": "http://127.0.0.1:9/", "response_headers": ["x-auth-user"]}}}
+	}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(ov), &[]).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert_eq!(fetch_with(port, "/app", &[("x-auth-user", "alice")]).await, (200, "alice".into()));
+	assert_eq!(fetch_with(port, "/app", &xff).await.0, 403);
+}
+
+/// Review M2: the secrets of the file's services and middlewares an overlay reaches are the
+/// file's: `409 file_in_use` for a token without `admin`, allowed with it. #319: an overlay may
+/// not name a protected file.
+#[tokio::test]
+async fn an_overlay_reaching_the_files_secrets_needs_admin() {
+	let dir = std::env::temp_dir().join(format!("rproxy-it-overlay-files-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let users = dir.join("users");
+	std::fs::write(&users, "alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n").unwrap();
+	let tokens = dir.join("tokens.yaml");
+	std::fs::write(
+		&tokens,
+		format!(
+			"tokens:\n  - {{name: ops, sha256: {}, scopes: [rules:read, rules:write]}}\n  - {{name: root, sha256: {}, scopes: [admin]}}\n",
+			sha("o"),
+			sha("a")
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(tokens.clone()).unwrap()).await;
+	let a = backend("A").await;
+	let port = free_port();
+	let mut file = file_rule(port, a);
+	file["http"]["middlewares"]["login"] = json!({"basic_auth": {"users_file": users}});
+	file["http"]["middlewares"]["chain"] = json!({"headers": {"request": {"set": {"x-a": "1"}}}});
+	h.registry.load_static_labeled(requests(json!([file]))).await.unwrap();
+	let (ops, root) = ("Bearer o".to_string(), "Bearer a".to_string());
+	// the file's service and a middleware without files: fine
+	let plain = json!({"http": {"routes": [{"name": "x", "match": "PathPrefix(`/x`)", "service": "a", "middlewares": ["chain"]}]}});
+	let (status, v, _) = call(&h, Method::PUT, &format!("{}?dry_run=true", path(port)), Some(plain), &[("authorization", &ops)]).await;
+	assert_eq!(status, StatusCode::OK, "{v}");
+	// the file's basic_auth reads a secret file of the file's
+	let login = json!({"http": {"routes": [{"name": "x", "match": "PathPrefix(`/x`)", "service": "a", "middlewares": ["login"]}]}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(login.clone()), &[("authorization", &ops)]).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::CONFLICT, Some("file_in_use")), "{v}");
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(login), &[("authorization", &root)]).await;
+	assert_eq!(status, StatusCode::CREATED, "admin may: {v}");
+	// #319: the token file is protected
+	rproxy_api::net::protected::set_process(rproxy_api::net::protected::process_entries(Some(&tokens), None, None));
+	let protected = json!({"http": {"middlewares": {"b": {"basic_auth": {"users_file": tokens}}},
+		"routes": [{"name": "y", "match": "PathPrefix(`/y`)", "service": "a", "middlewares": ["b"]}]}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(protected), &[("authorization", &root)]).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("protected_file")), "{v}");
+	rproxy_api::net::protected::set_process(vec![]);
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `tls.routes` on a `terminate` rule without http and client_auth (relayed per name after
+/// the rule's TLS); a port range: the token must have every port.
+#[tokio::test]
+async fn terminate_rules_and_port_ranges() {
+	let pki = Pki::new("overlay-term");
+	let front = pki.server("front", &["a.test", "b.test"]);
+	let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+	for (l, tag) in [(a, "A:"), (b, "B:")] {
+		tokio::spawn(async move {
+			loop {
+				let (mut s, _) = l.accept().await.unwrap();
+				tokio::spawn(async move {
+					let mut buf = [0u8; 64];
+					while let Ok(n) = s.read(&mut buf).await {
+						if n == 0 || s.write_all(&[tag.as_bytes(), &buf[..n]].concat()).await.is_err() {
+							break;
+						}
+					}
+				});
+			}
+		});
+	}
+	let dir = std::env::temp_dir().join(format!("rproxy-it-overlay-range-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let tokens = dir.join("tokens.yaml");
+	let port = free_tcp_block(2);
+	std::fs::write(
+		&tokens,
+		format!(
+			"tokens:\n  - {{name: one, sha256: {}, scopes: [rules:read, rules:write], allow_listen_ports: '{port}'}}\n  - {{name: both, sha256: {}, scopes: [rules:read, rules:write], allow_listen_ports: '{port}-{}'}}\n",
+			sha("1"),
+			sha("2"),
+			port + 1
+		),
+	)
+	.unwrap();
+	let h = harness_with(Tokens::from_file(tokens).unwrap()).await;
+	let file = json!([{"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "listen_port_end": port + 1,
+		"remote_addr": "127.0.0.1", "remote_port": a_addr.port(),
+		"tls": {"mode": "terminate", "certificates": [{"cert_file": front.cert_file, "key_file": front.key_file}]}}]);
+	h.registry.load_static_labeled(requests(file)).await.unwrap();
+	let ov = json!({"tls": {"routes": [{"server_name": "b.test", "remote_addr": "127.0.0.1", "remote_port": b_addr.port()}]}});
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(ov.clone()), &[("authorization", "Bearer 1")]).await;
+	assert_eq!((status, v["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "the range's second port: {v}");
+	let (status, v, _) = call(&h, Method::PUT, &path(port), Some(ov), &[("authorization", "Bearer 2")]).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	let talk = |name: &'static str| {
+		let connector = pki.connector(None);
+		async move {
+			let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+			let mut s = connector.connect(name.try_into().unwrap(), tcp).await.unwrap();
+			s.write_all(b"x").await.unwrap();
+			let mut buf = [0u8; 16];
+			let n = tokio::time::timeout(Duration::from_secs(3), s.read(&mut buf)).await.unwrap().unwrap();
+			String::from_utf8_lossy(&buf[..n]).into_owned()
+		}
+	};
+	assert_eq!(talk("b.test").await, "B:x", "terminated, then the overlay's target");
+	assert_eq!(talk("a.test").await, "A:x", "the rule's own target");
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Review SHOULD 2: an overlay change takes over the file's middlewares' state: a
+/// `rate_limit` guarding the file's route is not started afresh by PUTs.
+#[tokio::test]
+async fn an_overlay_change_keeps_the_files_rate_limit() {
+	let h = harness().await;
+	let (a, b) = (backend("A").await, backend("B").await);
+	let port = free_port();
+	let file = json!([{"protocol": "tcp", "listen_addr": "127.0.0.1", "listen_port": port, "http": {
+		"routes": [{"name": "app", "match": "PathPrefix(`/app`)", "service": "a", "middlewares": ["slow"]}],
+		"services": {"a": {"servers": [{"url": format!("http://{a}")}]}},
+		"middlewares": {"slow": {"rate_limit": {"average": 1, "period": "1h", "burst": 2}}}
+	}}]);
+	h.registry.load_static_labeled(requests(file)).await.unwrap();
+	assert_eq!(fetch(port, "/app").await.0, 200);
+	assert_eq!(fetch(port, "/app").await.0, 200);
+	assert_eq!(fetch(port, "/app").await.0, 429);
+	for i in 0..3 {
+		let mut ov = overlay(b);
+		ov["http"]["routes"].as_array_mut().unwrap().truncate(1);
+		ov["http"]["routes"][0]["priority"] = json!(i);
+		assert!(call(&h, Method::PUT, &path(port), Some(ov), &[]).await.0.is_success());
+		assert_eq!(fetch(port, "/app").await.0, 429, "change {i} did not reset the bucket");
+	}
+	assert_eq!(call(&h, Method::DELETE, &path(port), None, &[]).await.0, StatusCode::NO_CONTENT);
+	assert_eq!(fetch(port, "/app").await.0, 429);
 }

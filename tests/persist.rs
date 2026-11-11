@@ -784,7 +784,7 @@ async fn global_values_survive_a_restart_with_mariadb() {
 const RPROXY_RULE_OVERLAYS: &str = "CREATE TABLE rproxy_rule_overlays (
 	node         VARCHAR(255) NOT NULL,
 	protocol     VARCHAR(8)   NOT NULL,
-	listen_addr  VARCHAR(64)  NOT NULL,
+	listen_addr  VARCHAR(45)  NOT NULL,
 	listen_port  INT UNSIGNED NOT NULL,
 	spec         JSON         NOT NULL,
 	spec_version INT UNSIGNED NOT NULL DEFAULT 1,

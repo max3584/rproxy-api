@@ -127,6 +127,27 @@ pub struct Router {
 	identity_headers: Vec<HeaderName>,
 	/// `cache` middlewares (#340), for `/metrics`.
 	caches: Vec<Arc<cache::Cache>>,
+	/// Identity headers of a static rule's overlay middlewares (#397) that the file's do not
+	/// set: removed only from requests no file route matched (an overlay route's, `default`).
+	overlay_identity: Vec<HeaderName>,
+	/// What a rebuild after an overlay change takes over (`compile_reusing`, #397).
+	reusable: Reusable,
+}
+
+/// The compiled services and middlewares with the settings they came from: a router rebuilt
+/// for an overlay change (#397) takes over those whose settings did not change, so a change
+/// through the API does not start the file's `rate_limit`, `cache`, health checks and
+/// passive health checks from scratch.
+#[derive(Default)]
+struct Reusable {
+	upstream: Upstream,
+	services: std::collections::HashMap<String, (super::ServiceSpec, Arc<Service>)>,
+	middlewares: std::collections::HashMap<String, (super::MiddlewareSpec, Arc<Middleware>)>,
+}
+
+/// Whether a middleware sends to a service (rebuilt with the services, never taken over).
+fn sends_to_service(m: &super::MiddlewareSpec) -> bool {
+	matches!(m, super::MiddlewareSpec::Mirror { .. } | super::MiddlewareSpec::Errors { .. } | super::MiddlewareSpec::ForwardAuth { service: Some(_), .. })
 }
 
 impl Drop for Router {
@@ -143,23 +164,50 @@ impl std::fmt::Debug for Router {
 
 impl Router {
 	pub fn compile(spec: &HttpSpec, upstream: &Upstream, lookup: Lookup) -> Result<Router, ApiError> {
+		Router::compile_reusing(spec, upstream, lookup, None)
+	}
+
+	/// `compile`, taking over from `previous` (#397) the services and middlewares whose settings
+	/// are the same: a service without per-server middlewares on the same `tls.upstream`, a
+	/// middleware that sends to no service. They keep their state (counters, buckets, answers,
+	/// health); their health checks run again under the new router.
+	pub fn compile_reusing(spec: &HttpSpec, upstream: &Upstream, lookup: Lookup, previous: Option<&Router>) -> Result<Router, ApiError> {
+		let previous = previous.map(|p| &p.reusable).filter(|p| p.upstream == *upstream);
+		let mut reusable = Reusable { upstream: upstream.clone(), ..Default::default() };
 		let mut services = std::collections::HashMap::new();
 		// services whose servers copy requests (a server's `mirror`) need the services they copy
 		// to: compiled after the others (validation keeps those from copying again)
 		let copies = |s: &super::ServiceSpec| super::copies_per_server(s, &spec.middlewares);
 		let ordered = spec.services.iter().filter(|(_, s)| !copies(s)).chain(spec.services.iter().filter(|(_, s)| copies(s)));
 		for (name, s) in ordered {
+			let kept = previous
+				.and_then(|p| p.services.get(name))
+				.filter(|(was, _)| was == s && s.servers.iter().all(|v| v.middlewares.is_empty()))
+				.map(|(_, svc)| svc.clone());
+			if let Some(svc) = kept {
+				reusable.services.insert(name.clone(), (s.clone(), svc.clone()));
+				services.insert(name.clone(), svc);
+				continue;
+			}
 			let mut service = Service::compile_with(name, s, &spec.middlewares, &services)?;
 			// HTTP/2 over the rule's tls.upstream: its own ALPN
 			if service.tls.is_none() && !service.protocol.is_default() && service.servers.iter().any(|v| v.https) {
 				let config = (*crate::tls::config::client_config(upstream)?).clone();
 				service.tls = Some(backend::ServiceTls::new(config, service.protocol, upstream.server_name.clone()));
 			}
-			services.insert(name.clone(), Arc::new(service));
+			let service = Arc::new(service);
+			reusable.services.insert(name.clone(), (s.clone(), service.clone()));
+			services.insert(name.clone(), service);
 		}
 		let mut middlewares = std::collections::HashMap::new();
 		for (name, m) in &spec.middlewares {
-			middlewares.insert(name.clone(), Arc::new(Middleware::errors(name, m, &services)?));
+			let kept = previous.and_then(|p| p.middlewares.get(name)).filter(|(was, _)| was == m && !sends_to_service(m)).map(|(_, mw)| mw.clone());
+			let mw = match kept {
+				Some(mw) => mw,
+				None => Arc::new(Middleware::errors(name, m, &services)?),
+			};
+			reusable.middlewares.insert(name.clone(), (m.clone(), mw.clone()));
+			middlewares.insert(name.clone(), mw);
 		}
 		let mut routes = vec![];
 		for (i, r) in spec.routes.iter().enumerate() {
@@ -239,7 +287,13 @@ impl Router {
 			.collect();
 		let secrets = middlewares.values().filter(|m| matches!(m.as_ref(), Middleware::BasicAuth(_) | Middleware::Oidc(_))).cloned().collect();
 		let match_headers = routes.iter().any(|r| r.matcher.uses_headers());
-		let identity_headers = identity_headers(middlewares.values().map(|m| m.as_ref()));
+		// the file's identity headers go from every request; an overlay's (#397) only from the
+		// requests no file route matched
+		let identity_headers = identity_headers(middlewares.iter().filter(|(n, _)| !added(n)).map(|(_, m)| m.as_ref()));
+		let overlay_identity: Vec<HeaderName> = identity_headers_of(middlewares.iter().filter(|(n, _)| added(n)).map(|(_, m)| m.as_ref()))
+			.into_iter()
+			.filter(|h| !identity_headers.contains(h))
+			.collect();
 		let mut caches: Vec<Arc<cache::Cache>> =
 			middlewares.values().filter_map(|m| if let Middleware::Cache(c) = m.as_ref() { Some(c.clone()) } else { None }).collect();
 		caches.sort_by(|a, b| a.name.cmp(&b.name));
@@ -259,6 +313,8 @@ impl Router {
 			strict_path: spec.strict_path,
 			identity_headers,
 			caches,
+			overlay_identity,
+			reusable,
 		})
 	}
 
@@ -326,6 +382,10 @@ const KNOWN_IDENTITY: [&str; 20] = [
 /// `Proxy-Authorization`, `Cookie`) and `Host` are kept. The names are removed once, before
 /// any middleware, so a value a middleware sets (oidc's) still reaches a later forward_auth.
 fn identity_headers<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Vec<HeaderName> {
+	identity_headers_of(middlewares)
+}
+
+fn identity_headers_of<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Vec<HeaderName> {
 	let mut out: Vec<HeaderName> = vec![];
 	let mut add = |h: HeaderName| {
 		if !out.contains(&h) {
@@ -346,6 +406,8 @@ fn identity_headers<'a>(middlewares: impl Iterator<Item = &'a Middleware>) -> Ve
 		}
 	}
 	out.retain(|h| !matches!(h.as_str(), "authorization" | "proxy-authorization" | "cookie" | "host"));
+	// what says where the request came from is never a client's identity to remove (#397 M1)
+	out.retain(|h| !super::is_forwarding_header(h.as_str()));
 	out
 }
 
@@ -1195,6 +1257,10 @@ impl Conn {
 		};
 		// an answer already (421, 400, a pre-routing middleware's) goes out as it is
 		let matched = if answer.is_none() { router.route(&info) } else { None };
+		// an overlay's identity headers (#397): only where no file route took the request
+		if !router.overlay_identity.is_empty() && !matched.is_some_and(|r| !r.overlay) {
+			strip_identity(&mut parts.headers, &router.overlay_identity);
+		}
 		let (route_name, service, chain, names, request_timeout, backend_timeout) = match matched {
 			Some(r) => (r.name.as_str(), r.service.clone(), r.middlewares.as_slice(), r.names.as_slice(), r.request_timeout, r.backend_timeout),
 			None if answer.is_some() => ("", None, &[][..], &[][..], None, None),

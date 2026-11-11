@@ -1340,12 +1340,13 @@ http:
 }
 ```
 
-- **http**：固定ルールに `http` があるときだけ。`routes`・`services`・`middlewares` だけを足せる（`pre_routing`・`default`・`http3`・`raw_path`・`strict_path` はファイルのもの）。重ねる分のルートは **ファイルのルートのどれにも当たらないリクエストだけ** を見る（`priority` をどれだけ高くしてもファイルのルートのリクエストは取れない。ファイルのルートの認証を避けられない）。重ねる分の中の順は今までどおり（`priority`、書いた順）。どちらにも当たらなければファイルの `default`。重ねる分のルート・ミドルウェアはファイルの `services`・`middlewares` を名前で使える。ファイルの `pre_routing` は重ねる分のルートにも掛かる。重ねる分の `oidc` のコールバック・ログアウトのパスは、ファイルのルートに当たるリクエストでは答えない。重ねる分の認証のミドルウェアが付ける身元のヘッダは、ファイルのルートのリクエストでも消す。
-- **`tls.routes`**：`tls.mode: sni`（tcp・udp）か、`http` も `client_auth` もない `terminate` の固定ルールだけ。**ファイルの `tls.routes` に当たらない名前だけ** が重ねる分の route を見る（ファイルの `*.example.com` の下の名前はファイルのもの）。重ねる分の route は `upstream` を持てない（ルールの `upstream` を使う）。`unmatched: reject` のルールでは、重ねる分の名前は受け付ける。
+- **http**：固定ルールに `http` があるときだけ。`routes`・`services`・`middlewares` だけを足せる（`pre_routing`・`default`・`http3`・`raw_path`・`strict_path` はファイルのもの）。重ねる分のルートは **ファイルのルートのどれにも当たらないリクエストだけ** を見る（`priority` をどれだけ高くしてもファイルのルートのリクエストは取れない。ファイルのルートの認証を避けられない）。重ねる分の中の順は今までどおり（`priority`、書いた順）。どちらにも当たらなければファイルの `default`。重ねる分のルート・ミドルウェアはファイルの `services`・`middlewares` を名前で使える（重ねる分のルートはファイルのサービスにファイルのルートのミドルウェアを通らずに届く。たどり着くファイルのサービス・ミドルウェアの秘密のファイル（クライアントの鍵・`oidc` の秘密・`users_file`）は設定ファイルのものなので、`admin` でないトークンは `409 file_in_use`）。ファイルの `pre_routing` は重ねる分のルートにも掛かる。重ねる分の `oidc` のコールバック・ログアウトのパスは、ファイルのルートに当たるリクエストでは答えない。重ねる分の認証のミドルウェアだけが付ける身元のヘッダは、ファイルのルートに当たらなかったリクエスト（重ねる分のルート・`default`）からだけ消す。
+- **`tls.routes`**：`tls.mode: sni`（tcp・udp）か、`http` も `client_auth` もない `terminate` の固定ルールだけ。**ファイルの `tls.routes` に当たらない名前だけ** が重ねる分の route を見る（ファイルの `*.example.com` の下の名前はファイルのもの。ファイルのパターンがすべてを受ける名前・パターンは使われないので `409 overlay_conflict`）。重ねる分の route は `upstream` を持てない（ルールの `upstream` を使う）。`unmatched: reject` のルールでは、重ねる分の名前は受け付ける。
 - 名前：ファイルにある名前（ルート・サービス・ミドルウェア、`tls.routes` は同じパターン）は `PUT` で `409 overlay_conflict`。後からファイルが同じ名前を足したら（読み直し）、ファイルが勝ち、重ねる分のその項目（と、それを使う重ねる分のルート・ミドルウェア）は外れて `shadowed` に出る（`rule.overlay` の warn）。
 - 効かないとき：読み直しで固定ルールが消えた（`reason: no_static_rule`）、`http` がなくなった・`tls.mode` が変わった（`shape`）、合わせると検証が通らない（`invalid`）、組み立てに失敗した（`failed`）ときは、重ねる分を **消さずに残し**、ルールはファイルの分だけで動く。`GET …/overlay` の `state: not_applied`・`reason`・`error`、ルールの表示の `overlay`、`/metrics` の `rproxy_rule_overlay{protocol,listen,state}`。ファイルが戻れば（読み直し・再起動）また効く。
 - `GET …/overlay`：本文の形に `rule`・`state`（`applied` / `not_applied`）・`reason`・`error`・`shadowed`（`[{"kind","name","reason"}]`）・`etag`・`created_by`・`created_at`・`updated_by`・`updated_at`・`persisted`（DB があるとき）。ルールの表示（`GET /rules`）は今までどおりファイルの形で、`overlay`（`{"state","reason"?,"routes","tls_routes","shadowed"?}`）が付く。重ねる分のルートの数は `stats.http.routes` に名前で出る。
-- 重ねる分を変えると、ルールの `http` のルーターを作り直す（`PATCH` で `http` を変えたときと同じ：今の接続はそのまま、`rate_limit`・`cache` などの状態は空から）。読み直しと重ねる分の変更は順番に動く。
+- 重ねる分を変えると、ルールの `http` のルーターを作り直す（今の接続はそのまま）。設定の変わらないサービス・ミドルウェア（ファイルのものも）は前のものをそのまま使うので、`rate_limit`・`cache`・`in_flight`・ヘルスチェックなどの状態は続く（重ねる分の変更でファイルの `rate_limit` をやり直させることはできない）。変わったものと、サービスに送るミドルウェア（`mirror`・`errors`・`service` の `forward_auth`）・転送先ごとのミドルウェアのあるサービスは空から。読み直しと重ねる分の変更は順番に動く。
+- 送り元を言うヘッダ（`X-Forwarded-For`・`X-Real-IP`・`Forwarded`・`X-Forwarded-Proto` / `-Host` / `-Port` / `-Prefix` / `-Server`・`X-Forwarded-Client-Cert`・`X-Client-Verify`）は身元のヘッダにならない（v0.4.23 から、どのルールでもクライアントの値を消さない）。`basic_auth` の `user_header`・`forward_auth` の `response_headers` にこれらを書くと、API のルール・組・重ねる分は `400 invalid`、設定ファイルは `--check-config` の警告。
 - ファイル：重ねる分が指すファイル（サービスの `tls`、`basic_auth` の `users_file`、`oidc` の秘密）は API のルールと同じく確かめる（`403 protected_file`・`file_not_allowed`、`409 file_in_use`・`secret_reuse`）。持ち主は最初に作ったトークン（`created_by`）。ほかのトークンも `rules:write` とポートがあれば直せる（`updated_by` が変わる）。
 - 範囲外：API のルール（`PATCH` で直す）と組のルール（組の `PUT` で直す）には重ねられない（`409 not_static`）。ルールのないキーは `404`。
 - 保存：トークンの `persist` に従う（API のルールと同じ）。`persist: true` のトークンが作った重ねる分は、DB（`RPROXY_DATABASE_URL`）があれば応答の前に `rproxy_rule_overlays` に書き（消すときは行を消す）、一度書いたものはどのトークンの変更・削除でも書く。`persist: false` のトークンのものと DB がないときはメモリだけ（再起動で消える。再起動なしの更新では状態で渡す）で、`persisted` は出ない。書けなければ `persisted: false`・`degraded`（`part: "db"`）、定期の照合が書き直す（行を正にはしない）。起動では設定ファイルのルールの後に戻す（`restore.overlays`）。テーブルがなければ戻すものはなく、書き込みは `degraded`。
@@ -1355,7 +1356,7 @@ http:
 CREATE TABLE IF NOT EXISTS rproxy_rule_overlays (
   node         VARCHAR(255) NOT NULL,   -- RPROXY_NODE_NAME (as in rproxy_rules)
   protocol     VARCHAR(8)   NOT NULL,   -- the static rule's key
-  listen_addr  VARCHAR(64)  NOT NULL,
+  listen_addr  VARCHAR(45)  NOT NULL,
   listen_port  INT UNSIGNED NOT NULL,
   spec         JSON         NOT NULL,   -- the body of PUT /rules/{key}/overlay
   spec_version INT UNSIGNED NOT NULL DEFAULT 1,

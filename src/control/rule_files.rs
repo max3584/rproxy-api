@@ -249,5 +249,12 @@ pub async fn check_overlay(
 	key: &Key,
 	overlay: &crate::core::overlay::OverlaySpec,
 ) -> Result<Intent, ApiError> {
-	check(registry, principal, vec![("overlay: ".to_string(), overlay.file_refs())], Replacing::Overlay(key)).await
+	// the secrets of the file's services and middlewares it reaches are the file's (#397 M2):
+	// another owner's for every token but admin (`409 file_in_use`)
+	let reached = match registry.static_http(key).await {
+		Some(file) => protected::refs(None, Some(&overlay.file_items(&file))).into_iter().filter(FileRef::is_secret).collect(),
+		None => vec![],
+	};
+	let rules = vec![("overlay: ".to_string(), overlay.file_refs()), ("overlay (the settings file's): ".to_string(), reached)];
+	check(registry, principal, rules, Replacing::Overlay(key)).await
 }
