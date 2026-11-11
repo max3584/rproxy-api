@@ -356,21 +356,48 @@ async fn scopes_and_ports_apply() {
 	std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Stored in `rproxy_rule_overlays` (a memory store here) and put back on the static rule
-/// after a restart; handed over in a live upgrade.
+/// Stored in `rproxy_rule_overlays` (a memory store here) when a `persist: true` token makes it
+/// (a `persist: false` token's stays in memory) and put back on the static rule after a
+/// restart; handed over in a live upgrade.
 #[tokio::test]
 async fn overlays_survive_a_restart_and_a_live_upgrade() {
 	let (a, b) = (backend("A").await, backend("B").await);
 	let port = free_port();
-	let old = harness().await;
+	let dir = std::env::temp_dir().join(format!("rproxy-it-overlay-persist-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let file = dir.join("tokens.yaml");
+	std::fs::write(
+		&file,
+		format!(
+			"tokens:\n  - {{name: ci, sha256: {}, scopes: [rules:read, rules:write], persist: true}}\n  - {{name: ui, sha256: {}, scopes: [rules:read, rules:write]}}\n",
+			sha("ci"),
+			sha("ui")
+		),
+	)
+	.unwrap();
+	let old = harness_with(Tokens::from_file(file).unwrap()).await;
 	let store = Arc::new(Store::memory("node-o"));
 	old.registry.set_persist(store.clone());
 	old.registry.load_static_labeled(requests(json!([file_rule(port, a)]))).await.unwrap();
-	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(overlay(b)), &[]).await;
+	let (ci, ui) = ("Bearer ci".to_string(), "Bearer ui".to_string());
+	// a token without persist: in force, in memory only (as its rules)
+	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(overlay(b)), &[("authorization", &ui)]).await;
+	assert_eq!(status, StatusCode::CREATED, "{v}");
+	assert!(v.get("persisted").is_none(), "not stored: {v}");
+	assert!(store.memory_overlays().is_empty());
+	assert_eq!(fetch(port, "/x").await, (200, "B".into()));
+	assert_eq!(call(&old, Method::DELETE, &path(port), None, &[("authorization", &ui)]).await.0, StatusCode::NO_CONTENT);
+	// a persist token's is stored, and a later change by any token is written too
+	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(overlay(b)), &[("authorization", &ci)]).await;
 	assert_eq!((status, &v["persisted"]), (StatusCode::CREATED, &json!(true)), "{v}");
+	let mut changed = overlay(b);
+	changed["http"]["routes"][1]["priority"] = json!(300000);
+	let (status, v, _) = call(&old, Method::PUT, &path(port), Some(changed), &[("authorization", &ui)]).await;
+	assert_eq!((status, &v["persisted"], &v["updated_by"]), (StatusCode::OK, &json!(true), &json!("ui")), "{v}");
 	let rows = store.memory_overlays();
 	assert_eq!(rows.len(), 1);
-	assert_eq!(rows[0].spec.http.as_ref().unwrap().routes.len(), 2);
+	assert_eq!((rows[0].spec.http.as_ref().unwrap().routes[1].priority, rows[0].updated_by.as_str()), (Some(300000), "ui"));
+	std::fs::remove_dir_all(dir).unwrap();
 
 	// a live upgrade: the state, as JSON, to a new registry that read the settings file
 	let state = rproxy_api::control::upgrade::handoff::prepare(&old.registry, Duration::from_secs(5)).await.unwrap();

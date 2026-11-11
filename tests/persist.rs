@@ -795,10 +795,10 @@ const RPROXY_RULE_OVERLAYS: &str = "CREATE TABLE rproxy_rule_overlays (
 	PRIMARY KEY (node, protocol, listen_addr, listen_port)
 )";
 
-/// #397 with the real binary and MariaDB: an overlay on a static rule is in force without
-/// `rproxy_rule_overlays` (`persisted: false`), written once the table is there (by a token
-/// without `persist` too), put back on the static rule after a restart, and its row goes
-/// with `DELETE`.
+/// #397 with the real binary and MariaDB: a `persist: true` token's overlay on a static rule
+/// is in force without `rproxy_rule_overlays` (`persisted: false`), written once the table is
+/// there, put back on the static rule after a restart, and its row goes with `DELETE`; a
+/// `persist: false` token's is kept in memory only.
 #[tokio::test]
 async fn overlays_survive_a_restart_with_mariadb() {
 	use sqlx::Executor;
@@ -817,13 +817,10 @@ async fn overlays_survive_a_restart_with_mariadb() {
 	let dir = workdir("db-overlay");
 	token_file(&dir);
 	let backend = tcp_backend("O:").await;
-	let (api_port, port) = (free_port(), free_port());
+	let (api_port, port, other) = (free_port(), free_port(), free_port());
 	let config = dir.join("rules.yaml");
-	fs::write(
-		&config,
-		format!("version: 1\nrules:\n  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {port}, remote_addr: 127.0.0.1, remote_port: 9, tls: {{mode: sni, routes: [{{server_name: a.test, remote_addr: 127.0.0.1, remote_port: 9}}]}}}}\n"),
-	)
-	.unwrap();
+	let static_rule = |p: u16| format!("  - {{protocol: tcp, listen_addr: 127.0.0.1, listen_port: {p}, remote_addr: 127.0.0.1, remote_port: 9, tls: {{mode: sni, routes: [{{server_name: a.test, remote_addr: 127.0.0.1, remote_port: 9}}]}}}}\n");
+	fs::write(&config, format!("version: 1\nrules:\n{}{}", static_rule(port), static_rule(other))).unwrap();
 	let env = [("RPROXY_CONFIG", config.display().to_string())];
 	let client = reqwest::Client::new();
 	let path = format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{port}/overlay");
@@ -832,24 +829,31 @@ async fn overlays_survive_a_restart_with_mariadb() {
 		let rp = Rproxy::start_with(&dir, api_port, &url, "first", &env);
 		rp.wait(api_port).await;
 		// before migration 014: in force, not stored
-		let r = client.put(&path).bearer_auth("ui").json(&overlay).send().await.unwrap();
+		let r = client.put(&path).bearer_auth("ci").json(&overlay).send().await.unwrap();
 		assert_eq!(r.status(), StatusCode::CREATED);
 		let v: Value = r.json().await.unwrap();
 		assert_eq!((&v["state"], &v["persisted"]), (&json!("applied"), &json!(false)), "{v}");
 		pool.execute(RPROXY_RULE_OVERLAYS).await.unwrap();
-		let r = client.put(&path).bearer_auth("ui").json(&overlay).send().await.unwrap();
+		let r = client.put(&path).bearer_auth("ci").json(&overlay).send().await.unwrap();
 		let v: Value = r.json().await.unwrap();
-		assert_eq!((&v["persisted"], &v["created_by"]), (&json!(true), &json!("ui")), "{v}\n{}", rp.log());
+		assert_eq!((&v["persisted"], &v["created_by"]), (&json!(true), &json!("ci")), "{v}\n{}", rp.log());
+		// another port's overlay by a token without persist: memory only
+		let r = client.put(format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{other}/overlay")).bearer_auth("ui").json(&overlay).send().await.unwrap();
+		let v: Value = r.json().await.unwrap();
+		assert!(v.get("persisted").is_none(), "{v}");
 	}
 	let row: (String, String, u32) =
 		sqlx::query_as("SELECT CAST(spec AS CHAR), created_by, listen_port FROM rproxy_rule_overlays WHERE node = 'node-a'").fetch_one(&pool).await.unwrap();
-	assert_eq!((serde_json::from_str::<Value>(&row.0).unwrap(), row.1.as_str(), row.2), (overlay.clone(), "ui", u32::from(port)));
+	assert_eq!((serde_json::from_str::<Value>(&row.0).unwrap(), row.1.as_str(), row.2), (overlay.clone(), "ci", u32::from(port)), "one row: the persist token's");
 	{
 		let rp = Rproxy::start_with(&dir, api_port, &url, "second", &env);
 		rp.wait(api_port).await;
 		rp.wait_log("restore.overlays").await;
 		let v: Value = client.get(&path).bearer_auth("ci").send().await.unwrap().json().await.unwrap();
-		assert_eq!((&v["state"], &v["persisted"], &v["created_by"]), (&json!("applied"), &json!(true), &json!("ui")), "{v}");
+		assert_eq!((&v["state"], &v["persisted"], &v["created_by"]), (&json!("applied"), &json!(true), &json!("ci")), "{v}");
+		// the persist: false token's is gone after the restart
+		let r = client.get(format!("http://127.0.0.1:{api_port}/rules/tcp/127.0.0.1/{other}/overlay")).bearer_auth("ci").send().await.unwrap();
+		assert_eq!(r.status(), StatusCode::NOT_FOUND);
 		let r = client.delete(&path).bearer_auth("ci").send().await.unwrap();
 		assert_eq!(r.status(), StatusCode::NO_CONTENT);
 	}

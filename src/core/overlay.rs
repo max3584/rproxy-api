@@ -170,6 +170,9 @@ pub struct Overlay {
 	pub updated_by: String,
 	pub updated_at: u64,
 	pub status: Status,
+	/// Kept in `rproxy_rule_overlays`: made by a `persist: true` token, or read from the table
+	/// (changes by any token are written then, as for `api` rules). Otherwise memory only.
+	pub stored: bool,
 }
 
 /// A static rule's spec with its overlay merged in.

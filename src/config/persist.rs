@@ -223,6 +223,7 @@ impl StoredOverlay {
 			updated_by: self.updated_by,
 			updated_at: self.updated_at,
 			status: crate::core::overlay::Status::Applied { shadowed: vec![] },
+			stored: true,
 		};
 		(self.key, overlay)
 	}

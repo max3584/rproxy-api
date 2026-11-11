@@ -206,6 +206,9 @@ pub struct OverlaySnapshot {
 	pub created_at: u64,
 	pub updated_by: String,
 	pub updated_at: u64,
+	/// Kept in `rproxy_rule_overlays` (otherwise memory only, a `persist: false` token's).
+	#[serde(default)]
+	pub stored: bool,
 }
 
 /// A rule restored from the database that did not validate (#327), as handed over.
@@ -645,6 +648,7 @@ async fn snapshot(registry: &Registry) -> State {
 				created_at: o.created_at,
 				updated_by: o.updated_by,
 				updated_at: o.updated_at,
+				stored: o.stored,
 			})
 			.collect(),
 	}
@@ -925,6 +929,7 @@ impl State {
 						updated_by: o.updated_by.clone(),
 						updated_at: o.updated_at,
 						status: crate::core::overlay::Status::Applied { shadowed: vec![] },
+						stored: o.stored,
 					},
 				)),
 				Err(e) => warn!(event = "handoff.overlay", error = %e, rule = %o.listen, "an overlay from the old process could not be read; dropped"),

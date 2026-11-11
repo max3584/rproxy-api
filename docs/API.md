@@ -1348,7 +1348,7 @@ http:
 - 重ねる分を変えると、ルールの `http` のルーターを作り直す（`PATCH` で `http` を変えたときと同じ：今の接続はそのまま、`rate_limit`・`cache` などの状態は空から）。読み直しと重ねる分の変更は順番に動く。
 - ファイル：重ねる分が指すファイル（サービスの `tls`、`basic_auth` の `users_file`、`oidc` の秘密）は API のルールと同じく確かめる（`403 protected_file`・`file_not_allowed`、`409 file_in_use`・`secret_reuse`）。持ち主は最初に作ったトークン（`created_by`）。ほかのトークンも `rules:write` とポートがあれば直せる（`updated_by` が変わる）。
 - 範囲外：API のルール（`PATCH` で直す）と組のルール（組の `PUT` で直す）には重ねられない（`409 not_static`）。ルールのないキーは `404`。
-- 保存：DB（`RPROXY_DATABASE_URL`）があれば、トークンの `persist` に関わらず応答の前に `rproxy_rule_overlays` に書く（消すときは行を消す）。書けなければ `persisted: false`・`degraded`（`part: "db"`）、定期の照合が書き直す（行を正にはしない）。起動では設定ファイルのルールの後に戻す（`restore.overlays`）。テーブルがなければ戻すものはなく、書き込みは `degraded`。再起動なしの更新では状態で渡す。DB がなければメモリだけ（再起動で消える）。
+- 保存：トークンの `persist` に従う（API のルールと同じ）。`persist: true` のトークンが作った重ねる分は、DB（`RPROXY_DATABASE_URL`）があれば応答の前に `rproxy_rule_overlays` に書き（消すときは行を消す）、一度書いたものはどのトークンの変更・削除でも書く。`persist: false` のトークンのものと DB がないときはメモリだけ（再起動で消える。再起動なしの更新では状態で渡す）で、`persisted` は出ない。書けなければ `persisted: false`・`degraded`（`part: "db"`）、定期の照合が書き直す（行を正にはしない）。起動では設定ファイルのルールの後に戻す（`restore.overlays`）。テーブルがなければ戻すものはなく、書き込みは `degraded`。
 - テーブル（UI リポジトリの `db/migrations/014_rproxy_rule_overlays.sql`）：
 
 ```sql

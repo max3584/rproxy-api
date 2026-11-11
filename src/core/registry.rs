@@ -3038,7 +3038,7 @@ impl Registry {
 	pub async fn overlay_view(&self, key: &Key) -> Result<crate::core::overlay::OverlayView, ApiError> {
 		let o = self.overlay(key).ok_or_else(|| ApiError::not_found(format!("{key} has no overlay")))?;
 		let exists = self.rules.lock().await.get(key).is_some_and(|e| e.spec().origin == Origin::Static);
-		let persisted = self.persist().filter(|s| s.enabled()).map(|s| s.overlay_persisted(key));
+		let persisted = self.persist().filter(|s| s.enabled() && o.stored).map(|s| s.overlay_persisted(key));
 		Ok(o.view(key.to_string(), exists, persisted))
 	}
 
@@ -3056,7 +3056,7 @@ impl Registry {
 		Ok(current)
 	}
 
-	/// `PUT /rules/{key}/overlay`: checks it against the file's rule (a name the file has is
+	/// `PUT /rules/{key}/overlay` (`persist`: by a `persist: true` token): checks it against the file's rule (a name the file has is
 	/// `409 overlay_conflict`, a merge that does not validate or build is the error) and puts
 	/// it in force in place. `dry_run`: only the checks and the plan.
 	pub async fn put_overlay(
@@ -3064,6 +3064,7 @@ impl Registry {
 		key: &Key,
 		spec: crate::core::overlay::OverlaySpec,
 		by: &str,
+		persist: bool,
 		if_match: Option<&str>,
 		dry_run: bool,
 	) -> Result<crate::core::overlay::Change, ApiError> {
@@ -3092,6 +3093,8 @@ impl Registry {
 			updated_by: by.to_string(),
 			updated_at: now,
 			status: Status::Applied { shadowed: vec![] },
+			// as `api` rules: a `persist: true` token's is stored, and a stored one stays stored
+			stored: persist || current.as_ref().is_some_and(|o| o.stored),
 		};
 		self.overlays.lock().unwrap_or_else(|e| e.into_inner()).insert(*key, overlay);
 		if let Err(e) = self.apply_as(key, file, tls_changed, http_changed, true).await {

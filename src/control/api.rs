@@ -720,9 +720,10 @@ async fn check_overlay_ports(state: &AppState, principal: &Principal, key: &Key)
 	}
 }
 
-/// Writes an overlay's row (#397) when there is a database.
-async fn persist_overlay(state: &AppState, key: &Key, by: &str) {
-	if let Some(store) = state.registry.persist().filter(|s| s.enabled()) {
+/// Writes an overlay's row (#397) when there is a database and the overlay is stored (`stored`:
+/// made by a `persist: true` token or read from the table, as `api` rules), also its deletion.
+async fn persist_overlay(state: &AppState, key: &Key, by: &str, stored: bool) {
+	if let Some(store) = state.registry.persist().filter(|s| s.enabled() && stored && Features::CURRENT.persistence) {
 		store.save_overlay(&state.registry, key, by).await;
 	}
 }
@@ -751,19 +752,20 @@ async fn put_overlay(
 	if crate::config::plan::dry_run(&query)? {
 		check_overlay_ports(&state, &principal, &key).await?;
 		drop(super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?);
-		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, if_match.as_deref(), true).await?).into_response());
+		return Ok(Json(state.registry.put_overlay(&key, spec, &principal.name, principal.persist, if_match.as_deref(), true).await?).into_response());
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
 		let result = async {
 			check_overlay_ports(&state, &principal, &key).await?;
 			let _files = super::rule_files::check_overlay(&state.registry, &principal, &key, &spec).await?;
-			state.registry.put_overlay(&key, spec, &principal.name, if_match.as_deref(), false).await
+			state.registry.put_overlay(&key, spec, &principal.name, principal.persist, if_match.as_deref(), false).await
 		}
 		.await;
 		audit(&principal, &client, "overlay.put", &key.to_string(), &result);
 		let change = result?;
-		persist_overlay(&state, &key, &principal.name).await;
+		let stored = state.registry.overlay(&key).is_some_and(|o| o.stored);
+		persist_overlay(&state, &key, &principal.name, stored).await;
 		let view = state.registry.overlay_view(&key).await?;
 		let status = if change.action == "create" { StatusCode::CREATED } else { StatusCode::OK };
 		Ok((status, etag_header(&view.etag), Json(view)).into_response())
@@ -787,6 +789,8 @@ async fn delete_overlay(
 	}
 	to_the_end(async move {
 		let _change = changing(&state).await?;
+		// a stored overlay's row goes with it
+		let stored = state.registry.overlay(&key).is_some_and(|o| o.stored);
 		let result = async {
 			check_overlay_ports(&state, &principal, &key).await?;
 			state.registry.delete_overlay(&key, if_match.as_deref(), false).await
@@ -794,7 +798,7 @@ async fn delete_overlay(
 		.await;
 		audit(&principal, &client, "overlay.delete", &key.to_string(), &result);
 		result?;
-		persist_overlay(&state, &key, &principal.name).await;
+		persist_overlay(&state, &key, &principal.name, stored).await;
 		Ok(StatusCode::NO_CONTENT.into_response())
 	})
 	.await
