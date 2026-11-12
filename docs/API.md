@@ -1192,7 +1192,7 @@ L4 の `tcp` のルールの中継（passthrough・`sni`・`terminate`・STARTTL
 
 - 対象：`PATCH` / `DELETE /rules/{protocol}/{listen_addr}/{listen_port}`（`dry_run` も）。持ち主はルールの表の鍵の中で確かめる（確かめた後にほかのトークンが同じキーに作ったルールを変えない）。持ち主でなければ `403 not_owner` で、何も変えない（監査ログは `outcome: "forbidden"`・`code: "not_owner"`）。rproxy の API に一時停止・再開の口はない（UI は一時停止を `DELETE`、再開を `POST` で行う）ので、それも同じ。
 - 持ち主：`origin: "api"` は `created_by`、`dynamic` は作ったトークンを rproxy が覚える（引き継ぎで渡す）。`admin` が直しても持ち主は変わらない。読むこと（`GET`）は今までどおり。
-- 作ったトークンの分からないルール（UI の `forward_rules` から戻したもの、前の版の `rproxy_rules` の行で `created_by` が空のもの、再起動の後の `dynamic` のルール）：`admin` と、トークンファイルで **`allow_restored: true`** のトークンだけが直す・消すことができる。直しても持ち主は分からないまま（ほかの `allow_restored` のトークンも直せる）。
+- 作ったトークンの分からないルール（UI の `forward_rules` から戻したもの、前の版の `rproxy_rules` の行で `created_by` が空のもの。API で作った `dynamic` のルールは再起動で消え、引き継ぎでは持ち主ごと渡るので入らない）：`admin` と、トークンファイルで **`allow_restored: true`** のトークンだけが直す・消すことができる。直しても持ち主は分からないまま（ほかの `allow_restored` のトークンも直せる）。
 - 重ねる分（`PUT` / `DELETE /rules/{key}/overlay`、`dry_run` も）：今の重ねる分の `created_by` のトークンと `admin` だけ。重ねる分がなければ、`rules:write` とポートのあるトークンならどれでも作れる（作ったトークンのものになる）。`If-Match` / `If-None-Match`（#399）は先に確かめるので、`If-None-Match: *` で作る取り合いに負けたトークンは `403` ではなく `412` を受け取る。
 - 組（`PUT` / `DELETE /rulesets/{name}`）：前から持ち主だけ（セキュリティレビュー M3）。断るときの `code` も `not_owner` にそろえた。組のルールを個別に直す・消すのは、誰でも今までどおり `409 owned`。設定ファイルのルールは `409 static`。
 - 持ち主はトークンの **名前**。同じ名前で `sha256` を入れ替えれば持ち主は変わらない。名前を変えると、前の名前で作ったものは `admin` だけが直せる（「トークン・証明書の入れ替え」）。1 行に 1 トークンの書き方のトークン（`token-1`…）とトークンファイルのないときは `admin` なので、何も変わらない。
