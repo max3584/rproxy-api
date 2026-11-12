@@ -767,8 +767,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/
 1 行 1 イベントの JSON です。`event` で種類を分けます（一覧は [README の「ログ」](../README.md#ログ)）。
 
 ```shell
-# ファイルに出しているとき（パッケージの既定）
-tail -F /var/log/rproxy/rproxy.$(date -u +%F).log      # ファイルの日付は UTC | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
+# ファイルに出しているとき（パッケージの既定。ファイルの日付は UTC）
+tail -F /var/log/rproxy/rproxy.$(date -u +%F).log | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
 # journald に出しているとき
 journalctl -u rproxy-api -o cat | jq -c 'select(.event == "conn.denied" or .event == "degraded")'
 ```

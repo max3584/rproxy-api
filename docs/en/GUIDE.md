@@ -767,8 +767,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/
 One JSON event per line, told apart by `event` (the list is under [Logs in the README](../../README.en.md#logs)).
 
 ```shell
-# when logging to a file (the package default)
-tail -F /var/log/rproxy/rproxy.$(date -u +%F).log      # file dates are UTC | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
+# when logging to a file (the package default; file dates are UTC)
+tail -F /var/log/rproxy/rproxy.$(date -u +%F).log | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
 # when logging to journald
 journalctl -u rproxy-api -o cat | jq -c 'select(.event == "conn.denied" or .event == "degraded")'
 ```
