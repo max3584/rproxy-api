@@ -58,7 +58,7 @@ These terms come up often. Each is explained in detail where it first appears.
 | `in_place` / `recreate` | A change that keeps current connections / a change that rebuilds the listener and cuts them | [9.2](#92-changes-that-keep-connections-in_place-and-changes-that-cut-them-recreate) |
 | Drain | When stopping, refusing new connections and waiting for the current ones to finish | [9.3](#93-waiting-when-stopping-drain) |
 | Handoff (SIGUSR2) | Replacing the binary with a new one while running | [9.4](#94-replacing-the-binary-no-restart) |
-| `degraded` | A notice that rproxy stopped only some parts, because of a problem in the environment such as permissions or the database, and kept running | [1.4](#14-checking-that-it-runs) |
+| `degraded` | A notice that rproxy stopped only some parts, because of a problem in the environment such as permissions, and kept running | [1.4](#14-checking-that-it-runs) |
 | Connection and session budget (fd budget) | The share of the process's file descriptors that connections and UDP sessions may use | [16.](#16-capacity-limits) |
 
 ## Contents
@@ -175,7 +175,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/capabilities | j
 If it does not start, read the log with `journalctl -u rproxy-api`. rproxy reacts differently depending on the kind of problem.
 
 - **Configuration errors** (a wrong value, a path that does not exist, wrong file contents) stop it from starting. It will not run until you fix them, so read the error in the log and correct it.
-- **Problems in the environment** (no permission, a port used by another process, an unreachable database and so on) stop only the parts that cannot work, and rproxy starts with the rest. It then logs `"event":"degraded"` with `part` naming what was stopped. This guide calls this state "`degraded`". See [the README's "When some parts cannot start"](../../README.en.md#when-some-parts-cannot-start) for details.
+- **Problems in the environment** (a log directory that cannot be written, a control API port used by another process, a token file that cannot be read and so on) stop only the parts that cannot work, and rproxy starts with the rest. It then logs `"event":"degraded"` with `part` naming what was stopped (`part: api` for the control API port). When a rule's listen port is in use, the result is not `degraded`: that rule becomes `failed`. When the database is unreachable, rproxy starts without the database's rules and logs `restore.error`. This guide calls this state "`degraded`". See [the README's "When some parts cannot start"](../../README.en.md#when-some-parts-cannot-start) for details.
 
 ### 1.5 Opening the control API's Unix socket
 
@@ -284,7 +284,7 @@ The two rules above look alike in `GET /rules`, but their origin (`origin`) and 
 |---|---|---|
 | `origin` shown | `static` | `dynamic` (`api` with a token that has `persist: true`) |
 | How to change | Edit the file (applied automatically) | `PATCH` / `DELETE`. Static rules give `409 static` |
-| After a restart | Built again from the file | `dynamic` rules are gone. UI rules come back from the database, `api` rules from `rproxy_rules` |
+| After a restart | Built again from the file | `dynamic` rules are gone (rule sets of a `persist` token come back from `rproxy_rule_sets`). UI rules come back from the database, `api` rules from `rproxy_rules` |
 | Suited to | Rules that must not disappear (such as the rule publishing the UI) | Rules changed by the UI, CI or a controller |
 
 Some notes on the terms in the table:
@@ -935,7 +935,7 @@ These are the main fields of a YAML token. `name`, `scopes`, and `sha256` (or `c
 | Field | When left out | What it decides |
 |---|---|---|
 | `name` | (required) | The token's name. Used in the log and as the owner of what it creates |
-| `sha256` | (required) | The SHA-256 of the token string |
+| `sha256` | (required unless `client_cert` is given) | The SHA-256 of the token string |
 | `scopes` | (required, may not be empty) | The operations allowed |
 | `allow_listen_ports` | every port | Listen ports of the rules it may create, change and delete |
 | `allow_rulesets` | every name | Name prefixes of the rule sets it may `PUT` / `DELETE` |
@@ -945,7 +945,7 @@ These are the main fields of a YAML token. `name`, `scopes`, and `sha256` (or `c
 | `persist` | `false` | Whether rules created with this token are stored in the database ([10.1](#101-keeping-api-created-rules)) |
 
 - **`name`**: A name unique within the file. It appears as `token` in the audit log (`event: "audit"`), so you can tell who did what. It also becomes the **owner** of the rules and rule sets created with this token (explained below).
-- **`sha256`**: The SHA-256 of the token string the client sends, in hex. rproxy compares the hash of the token it receives with this. Even if the file leaks, the token itself stays unknown.
+- **`sha256`**: The SHA-256 of the token string the client sends, in hex. rproxy compares the hash of the token it receives with this. Even if the file leaks, the token itself stays unknown. It can be left out in an entry with `client_cert` (below). With both, both the token and the certificate are checked.
 - **`scopes`**: The operations this token may perform. List only the ones needed from the table below.
 - **`allow_listen_ports`**: The listen ports of rules this token may create, change and delete, as a range such as `20000-29999` or a single number. A rule with a port range must fit entirely inside. Use it so that temporary rules made by CI cannot touch production ports (443 and so on). Ports outside give `403 forbidden`.
 - **`allow_rulesets`**: Name prefixes of the rule sets this token may `PUT` / `DELETE`. Give a controller something like `[k8s/]`, and give other `rules:write` tokens names that do not overlap, so that after an rproxy restart no other token can create a set with the same name first.
@@ -953,7 +953,7 @@ These are the main fields of a YAML token. `name`, `scopes`, and `sha256` (or `c
 - **`expires`**: The token works until the end of this day (UTC). From `RPROXY_TOKEN_WARN_DAYS` (14 by default) days before, the log shows `token.expiring`; once expired, the log shows `token.expired` and the token is no longer accepted. Use it on tokens you want to rotate regularly, such as CI tokens.
 - **`allow_restored`** and **`persist`**: Explained below and in [10.1](#101-keeping-api-created-rules).
 
-There are also prefixes of stored certificate names it may use (`allow_certs`), whether it may listen on addresses the host does not have (`allow_freebind`), and the name of a client certificate (`client_cert`). [API.md, "Basics"](API.md#basics) and "Control API hardening" explain them.
+There are also prefixes of stored certificate names it may use (`allow_certs`), whether it may listen on addresses the host does not have (`allow_freebind`), and the name of a client certificate (`client_cert`). `client_cert` needs the control API to check client certificates (`RPROXY_TLS_CLIENT_AUTH` set to `optional` or `required`, and `RPROXY_TLS_CLIENT_CA`); without that, the token file is treated as an error. [API.md, "Basics"](API.md#basics) and "Control API hardening" explain them.
 
 #### Scopes
 
@@ -964,12 +964,12 @@ There are seven scopes. `admin` includes all the others. Operations without the 
 | `rules:read` | Reading rules, rule sets, overlays and the settings file's state (`GET /rules`, `GET /interfaces` and so on) |
 | `rules:write` | Creating, changing and deleting rules; putting and deleting rule sets and overlays |
 | `metrics:read` | Reading `GET /metrics` |
-| `acme:write` | Creating and changing rules that use ACME certificates; `POST /acme/...` |
+| `acme:write` | Creating and changing rules that use ACME certificates (`rules:write` is needed too); `POST /acme/...` (only from the Unix socket by default, `RPROXY_API_RELOAD_UNIX_ONLY`) |
 | `certs:read` | Reading the list and contents (without keys) of stored certificates |
 | `certs:write` | Storing and deleting certificates (`PUT` / `DELETE /certs/{name}`) |
 | `admin` | Everything. Only this scope can use strong operations such as re-reading the settings file, the `global` settings and upgrades |
 
-Any token can read `GET /capabilities`, whatever its scopes.
+Any token can read `GET /capabilities` and `GET /openapi.json`, whatever its scopes.
 
 #### Only the owner may change or delete (v0.4.23, #401)
 
@@ -979,7 +979,7 @@ From v0.4.23, a token without `admin` may change or delete only the rules, overl
 - An `admin` token may change or delete anything, whoever owns it. The owner stays the same when `admin` changes it.
 - Reading (`GET`) depends only on scopes, not on ownership.
 
-The tricky case is **rules whose creator is unknown**: rules restored from the admin UI's database (`forward_rules`), and `dynamic` rules after a restart. Only `admin` and tokens with `allow_restored: true` may change these.
+The tricky case is **rules whose creator is unknown**: rules restored from the admin UI's database (`forward_rules`), and rows that v0.4.22 or older wrote to `rproxy_rules` with an empty `created_by`. `dynamic` rules created through the API are not among them: they are lost on restart, and a handoff ([9.4](#94-replacing-the-binary-no-restart)) passes them on together with their owner. Only `admin` and tokens with `allow_restored: true` may change these.
 
 The admin UI changes rules it did not create, on its screen for rules created by other tokens ("API rules") and when it resends rules to several nodes. **Make the UI's token `admin`**, as with `ui` in the example above.
 
@@ -1005,7 +1005,7 @@ The TCP control API temporarily locks out sources that keep failing authenticati
 
 - Change the count and times with `RPROXY_API_LOCKOUT_FAILURES`, `_WINDOW` and `_DURATION`. `RPROXY_API_LOCKOUT_FAILURES=0` turns the lockout off.
 - Legitimate clients behind the same IP are locked out too. Put sources you never want locked out, such as a controller behind NAT, in `RPROXY_API_LOCKOUT_EXEMPT` as CIDRs.
-- Requests over the Unix socket are not counted and never locked out.
+- Requests over the Unix socket, and connections with a verified client certificate (mTLS), are not counted and never locked out.
 
 #### Opening the control API beyond the host
 
