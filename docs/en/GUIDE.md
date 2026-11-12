@@ -997,7 +997,7 @@ To replace a token without downtime, go in this order:
 2. Switch the clients (UI, CI and so on) to the new token.
 3. Remove the old token from the file.
 
-Because the name decides the owner, take care with names. Do not reuse the name of a deleted token for a new token for another person or purpose: it could then change everything the old token created. Conversely, renaming a token means that what was created under the old name can be changed only by `admin`. See [API.md, "Rotating tokens and certificates"](API.md#control-api-hardening-v04-167) for details.
+Because the name decides the owner, take care with names. Do not reuse the name of a deleted token for a new token for another person or purpose: it could then change everything the old token created. Conversely, renaming a token means that what was created under the old name can be changed only by `admin`. A name can appear only once in a file, so the three steps above give the token a new name. If the token owns rules or similar and you want to keep the owner, keep the name and replace only `sha256`. Old and new then do not work at the same time, so clients that cannot be stopped must retry in the meantime. See [API.md, "Rotating tokens and certificates"](API.md#control-api-hardening-v04-167) for details.
 
 #### Locking out sources that keep failing
 
