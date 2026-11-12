@@ -13,6 +13,8 @@ English: [README.en.md](README.en.md)
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。
 制御は HTTP API で行い、管理 UI は [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) にある。
 
+はじめての方は [docs/GUIDE.md](docs/GUIDE.md)（設定と運用の手引き：設定ファイルの書き方・制御 API の使い方・更新・監視・レシピを、やりたいこと別に）。
+
 構成図（全体・モジュール・接続の流れ・ルールの状態）は [docs/architecture/](docs/architecture/README.md)。
 
 ## インストール
@@ -171,7 +173,7 @@ systemd の `TimeoutStopSec`（既定 90 秒）は `DELAY + DRAIN + 5 秒` よ�
 API の詳細は [docs/API.md](docs/API.md) を参照。
 
 ```bash
-TOKEN=$(head -1 /etc/rproxy/tokens)
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)   # /etc/rproxy は root:rproxy 750
 
 # 転送を追加
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \

@@ -42,6 +42,8 @@ assets = [
     ["contrib/rproxy.example.yaml", "usr/share/doc/rproxy-api/examples/", "644"],
     ["README.md", "usr/share/doc/rproxy-api/", "644"],
     ["README.en.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/GUIDE.md", "usr/share/doc/rproxy-api/", "644"],
+    ["docs/en/GUIDE.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["docs/API.md", "usr/share/doc/rproxy-api/", "644"],
     ["docs/en/API.md", "usr/share/doc/rproxy-api/en/", "644"],
     ["docs/PROFILES.md", "usr/share/doc/rproxy-api/", "644"],

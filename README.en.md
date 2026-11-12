@@ -13,6 +13,8 @@
 An L4 forwarder that lets you add, change, delete, and query TCP/UDP forwarding while it is running.
 It is controlled through an HTTP API; the management UI is [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui).
 
+New here? Start with [docs/en/GUIDE.md](docs/en/GUIDE.md) (configuration and operations guide: writing the settings file, using the control API, upgrades, monitoring and recipes, by task).
+
 Architecture diagrams (overall, modules, connection flow, rule states) are in [docs/en/architecture.md](docs/en/architecture.md).
 
 ## Installation
@@ -171,7 +173,7 @@ Keep systemd's `TimeoutStopSec` (default 90 seconds) above `DELAY + DRAIN + 5 se
 For API details, see [docs/en/API.md](docs/en/API.md).
 
 ```bash
-TOKEN=$(head -1 /etc/rproxy/tokens)
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)   # /etc/rproxy is root:rproxy 750
 
 # Add a forwarding rule
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \
