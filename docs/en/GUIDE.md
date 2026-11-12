@@ -80,12 +80,26 @@ Settings come from environment variables (`/etc/rproxy/rproxy.env`). Only the co
 
 ```shell
 systemctl status rproxy-api
-TOKEN=$(head -1 /etc/rproxy/tokens)          # the one-line token the package created (all permissions)
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)     # the one-line token the package created (all permissions); /etc/rproxy is root:rproxy 750
 curl -s http://127.0.0.1:8080/healthz          # ok (no authentication)
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/capabilities | jq '{version, features: (.features | keys | length)}'
 ```
 
 If it does not start, read `journalctl -u rproxy-api`. A configuration mistake (a value, a path, a file's contents) stops the start. An environment problem (permissions, a port in use, the DB) stops only the part that cannot work; the rest starts, and the log has `"event":"degraded"` with a `part` ([When some parts cannot start in the README](../../README.en.md#when-some-parts-cannot-start)).
+
+### Opening the control API's Unix socket
+
+`POST /config/reload`, `PATCH /config/global` (some items), `POST /admin/*` and the strong ACME operations are accepted only from the Unix socket by default. The package does not open the socket by default, so open it when you need it.
+
+```shell
+sudoedit /etc/rproxy/rproxy.env
+#   RPROXY_API_SOCKET=/run/rproxy/api.sock      <- uncomment
+#   RPROXY_API_SOCKET_GROUP=rproxy              <- uncomment
+sudo systemctl restart rproxy-api
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" http://localhost/capabilities | jq .version
+```
+
+The socket belongs to `rproxy-api` with mode 660. Use it with `sudo` as above, or add the user to the `rproxy` group (`sudo usermod -aG rproxy $USER`, then log in again). A token is required on the Unix socket too, and strong operations need the `admin` scope (the one-line token the package creates is `admin`). Every socket example in this guide assumes this setup and uses `$TOKEN`.
 
 ## 2. The first rule
 
@@ -153,7 +167,7 @@ A rule's key is `(protocol, listen_addr, listen_port)`. URL-encode an IPv6 addre
 | After a restart | Rebuilt from the file | `dynamic` is gone. UI rules come back from the DB, `api` rules from `rproxy_rules` |
 | Good for | Rules that must not disappear (such as the one publishing the UI) | Rules the UI, CI or a controller changes |
 
-- A key belongs to one of them. Creating a file's key through the API gives `409 static`; writing an API rule's key into the file makes the file's rule `rule.failed`.
+- A key belongs to one of them. Creating a file's key with `POST /rules` gives `409 already_exists`, `PATCH` / `DELETE` on a file's rule gives `409 static`, and writing an API rule's key into the file makes the file's rule `rule.failed`.
 - To **add** http routes or `tls.routes` names to a static rule's listener from the API, use an overlay (v0.4.23, #397). The file's rule itself does not change.
 
   ```shell
@@ -496,7 +510,7 @@ ACME `http-01` answers come before the routes, so this rule works together with 
 
 ### Time limits (`global.http.timeouts`)
 
-Limits on client connections to `http` rules live in `global`, not in the rule. They apply to new connections.
+Limits on client connections to `http` rules live in `global`, not in the rule (below is what to add to the `global` of your settings file). They apply to new connections.
 
 ```yaml
 global:
@@ -536,7 +550,7 @@ From then on, `allow_from`, `limits`, the logs and `source_ip` use the client in
 
 ### Front proxies whose `X-Forwarded-For` is trusted
 
-With a CDN or load balancer in front of `http` rules, write its range in `global.trusted_proxies`. Connections from there have their `X-Forwarded-For` trusted, and `ClientIP`, `ip_allow`, `rate_limit` and the logs use the real client.
+With a CDN or load balancer in front of `http` rules, write its range in `global.trusted_proxies` (below is what to add to the `global` of your settings file). Connections from there have their `X-Forwarded-For` trusted, and `ClientIP`, `ip_allow`, `rate_limit` and the logs use the real client.
 
 ```yaml
 global:
@@ -577,7 +591,7 @@ tokens:
 
 - Scopes: `rules:read`, `rules:write`, `metrics:read`, `acme:write`, `certs:read`, `certs:write`, `admin`. A missing scope gives `403 forbidden`.
 - **Only the owner changes or deletes** (v0.4.23, #401): a token that is not `admin` may change or delete only the rules, overlays and rule sets it created itself. Others give `403 not_owner`. The owner is the token's **name** (replacing `sha256` under the same name keeps ownership).
-- `allow_restored: true`: may also change rules whose creating token is unknown (UI rules restored from the DB and so on). Put it only on the UI's token, when that token is not `admin`. Remove it before going back to v0.4.22 or older (older versions then refuse the whole file).
+- `allow_restored: true`: may also change rules whose creating token is unknown (UI rules restored from the DB and so on). Put it only on the UI's token, when that token is not `admin`. It is new in v0.4.23 (not yet released when this was written). Written for v0.4.22 or older, it makes the whole token file unreadable and no token works (token entries treat unknown names as mistakes). Remove it before going back, too.
 - After a change, `systemctl reload rproxy-api`. Without SIGHUP the file is re-read within `RPROXY_TOKENS_CHECK_SECS` (default 10 seconds). To replace a token: add the new one, switch the clients, remove the old one.
 - A source with 20 authentication failures within a minute is blocked for 5 minutes (`429 locked_out`; the Unix socket is exempt).
 - Opening the control API outside loopback requires tokens and TLS (`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`). A UI on the same host is safest over the Unix socket. Client certificates (mTLS): [Control API hardening in API.md](API.md#control-api-hardening-v04-167).
@@ -592,6 +606,7 @@ sudo chown rproxy-api:rproxy /etc/rproxy/crowdsec.key && sudo chmod 640 /etc/rpr
 ```
 
 ```yaml
+version: 1
 global:
   crowdsec:
     lapi_url: 'http://127.0.0.1:8081'     # not the control API's port
@@ -612,6 +627,7 @@ rules:
 Decide by country or ASN. Point `global.geoip` at an mmdb such as GeoLite2.
 
 ```yaml
+version: 1
 global:
   geoip:
     country_db: /var/lib/GeoIP/GeoLite2-Country.mmdb
@@ -646,10 +662,10 @@ The order of checks is `allow_from`, then `geoip`, then `crowdsec` ([GeoIP in AP
 | `performance`, `files` | Needs a restart | File / environment |
 
 ```shell
-SOCK=/run/rproxy/api.sock
-curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost/config/global | jq '.items | map_values({value, source, apply})'
+SOCK=/run/rproxy/api.sock                    # see "Opening the control API's Unix socket" in chapter 1
+sudo curl -s --unix-socket $SOCK -H "Authorization: Bearer $TOKEN" http://localhost/config/global | jq '.items | map_values({value, source, apply})'
 
-curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" -X PATCH 'http://localhost/config/global?dry_run=true' \
+sudo curl -s --unix-socket $SOCK -H "Authorization: Bearer $TOKEN" -X PATCH 'http://localhost/config/global?dry_run=true' \
   -d '{"http":{"timeouts":{"idle":"5m"}},"udp_max_sessions":32768}'
 # if it looks right, send it again without ?dry_run=true; null removes the item's API value
 ```
@@ -665,8 +681,8 @@ curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" -X PATCH 'ht
 After an edit, the 10-second check applies only the difference. To get the result on the spot, use `POST /config/reload` (`admin`, Unix socket only by default).
 
 ```shell
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" -X POST 'http://localhost/config/reload?dry_run=true' | jq
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" -X POST http://localhost/config/reload
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" -X POST 'http://localhost/config/reload?dry_run=true' | jq
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" -X POST http://localhost/config/reload
 # {"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0,"restart_needed":[],...}
 ```
 
@@ -676,8 +692,8 @@ With a mistake it changes nothing, returns `400` with the reasons, and keeps run
 
 | What changes | Effect |
 |---|---|
-| Targets (`remote_*`, `targets`, `balance`, `health_check`), `tls`, `starttls`, `allow_from`, `http`, `extra_listen_addrs`, timeouts, `limits`, `bandwidth`, `geoip`, `labels` and so on | `in_place`: current connections stay. TCP uses it from new connections; UDP moves current sessions too |
-| `listen_port_end` (port range), `source_ip`, whether there is `http` | `recreate`: the listener is rebuilt and current connections are cut. A `PATCH` through the API gives `400 unsupported` (recreate the rule) |
+| Targets (`remote_*`, `targets`, `balance`, `health_check`), `tls`, `starttls`, `allow_from`, `http`, `extra_listen_addrs`, timeouts, `limits`, `bandwidth`, `geoip`, `labels` and so on | `in_place`: current connections stay. TCP uses it from new connections; UDP moves current sessions too (UDP sessions on addresses removed from `extra_listen_addrs` end) |
+| `listen_port_end` (port range), `source_ip`, `listen_freebind`, whether there is `http`, and on a rule listening on `::`, whether it has extra addresses (switching between dual-stack and IPv6 only) | `recreate`: the listener is rebuilt and current connections are cut. A `PATCH` through the API gives `400 unsupported` (recreate the rule) |
 
 The `change` field of a `?dry_run=true` answer tells you which it will be in advance.
 
@@ -738,9 +754,11 @@ curl -s -H "Authorization: Bearer $TOKEN" -X PUT http://127.0.0.1:8080/rulesets/
 `POST` / `PATCH` / `DELETE /rules`, `PUT /rulesets/{name}`, `POST /config/reload`, `PATCH /config/global` and overlay `PUT` / `DELETE` accept `?dry_run=true`. They run the same checks and return the difference without changing anything.
 
 ```shell
-curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/tcp/0.0.0.0/5432?dry_run=true' \
-  -d '{"remote_addr":"10.0.0.13","remote_port":5432}' | jq '{action, change, diff}'
+curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/tcp/0.0.0.0/8889?dry_run=true' \
+  -d '{"remote_addr":"10.0.0.13","remote_port":8080}' | jq '{action, change, diff}'
 ```
+
+`PATCH` replaces the targets (`remote_addr` / `remote_port` or `targets`, `balance`, `health_check`) as a whole every time. An omitted `balance` becomes `round_robin` and an omitted `health_check` is dropped, so on a rule with `targets` send them too (`diff` shows it).
 
 ## 11. Observing (logs, `/metrics`, stats)
 
@@ -750,7 +768,7 @@ One JSON event per line, told apart by `event` (the list is under [Logs in the R
 
 ```shell
 # when logging to a file (the package default)
-tail -F /var/log/rproxy/rproxy.$(date +%F).log | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
+tail -F /var/log/rproxy/rproxy.$(date -u +%F).log      # file dates are UTC | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
 # when logging to journald
 journalctl -u rproxy-api -o cat | jq -c 'select(.event == "conn.denied" or .event == "degraded")'
 ```
@@ -780,12 +798,14 @@ journalctl -u rproxy-api -n 50 | grep -E '"handoff\.|"start"'
 
 If the major.minor is the same as before, the package hands over with SIGUSR2 (connections stay); otherwise it restarts. A patch whose release notes say "restart required" restarts.
 
+- From v0.4.23, a token that is not `admin` can change only the rules it created (#401). If the YAML token file gives the UI's token `rules:read` and `rules:write`, the UI's "API rules" screen and multi-node sync get `403 not_owner`. Before upgrading, make the UI's token `admin` or add `allow_restored: true` (chapter 7).
+
 ### Self-update (containers)
 
 Make the image's entrypoint `rproxy-api launch` and pass `RPROXY_UPDATE=auto` (or `check` to only report). It verifies the signature of newer patches in the same X.Y and swaps them in by handoff. A version that dies before `RPROXY_UPDATE_HEALTHY` (default 60 seconds) is marked bad and rolled back. Keep it `off` on apt VMs and in Kubernetes ([Self-update in UPGRADE.md](UPGRADE.md#self-update-containers)).
 
 ```shell
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost/admin/update | jq
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" http://localhost/admin/update | jq
 ```
 
 ### Handing over by hand
@@ -805,6 +825,7 @@ Before going back:
 - The same goes for new items in the settings file. Run `--check-config` with the older binary before going back.
 - Values set with `PATCH /config/global` (from v0.4.19) are not handed over to older versions (the DB row stays).
 - Going back across minors is a restart (no handoff).
+- Going back to v0.4.22 or older removes the owner-only protection (#401, v0.4.23): every `rules:write` token can again change or delete other tokens' rules.
 
 ## 13. Backup and restore
 
@@ -815,7 +836,7 @@ What to back up and the order of restoring are in [BACKUP.md](BACKUP.md). The es
 | Environment file and tokens | `/etc/rproxy/rproxy.env`, `/etc/rproxy/tokens` |
 | Settings file (static rules exist only here) | `RPROXY_CONFIG` |
 | Certificates, keys and secret files | Paths in the settings and rules, `/var/lib/rproxy/certs/` (`PUT /certs`), `/var/lib/rproxy/acme/` (ACME) |
-| DB | `forward_rules` (UI rules); `rproxy_rules`, `rproxy_rule_sets`, `rproxy_global`, `rproxy_rule_overlays` (written by rproxy) |
+| DB | `forward_rules` (UI rules); `rproxy_rules`, `rproxy_rule_sets`, `rproxy_global`, `rproxy_rule_overlays` (from v0.4.23) (written by rproxy) |
 
 Order of restoring: install the packages (do not start) → restore `/etc/rproxy` and the keys → restore the DB → `--check-config` → start rproxy-api → start the UI → check. Rules created through the API with a token that does not persist are not in the DB; to keep them, save a copy of `GET /rules`.
 
@@ -827,13 +848,16 @@ Order of restoring: install the packages (do not start) → restore `/etc/rproxy
 # prometheus.yml
 scrape_configs:
   - job_name: rproxy
+    scheme: https                                       # the control API off loopback requires TLS
+    tls_config:
+      ca_file: /etc/prometheus/rproxy-api-ca.pem        # if self-signed, that certificate or its CA
     authorization:
       credentials_file: /etc/prometheus/rproxy.token     # a metrics:read token (plain text)
     static_configs:
       - targets: ['10.0.0.2:8080']
 ```
 
-If the control API listens on loopback only, collect on the same host (for example through the node exporter's textfile), or add the monitoring network's address to `RPROXY_API_ADDR` (tokens and TLS are then required; use `scheme: https`).
+Opening the control API outside loopback requires a token file and TLS (`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`); without them it does not start. Add the monitoring network's address to `RPROXY_API_ADDR` (e.g. `127.0.0.1,10.0.0.2`). To keep it on loopback only, run Prometheus on the same host with `scheme: http` and `targets: ['127.0.0.1:8080']` (no `tls_config`).
 
 ### What to watch
 
@@ -1053,8 +1077,8 @@ Answers have the form `{"error": "...", "code": "..."}`. All codes: [Errors in A
 
 | `code` (HTTP) | Meaning | What to do |
 |---|---|---|
-| `static` (409) | A settings-file rule (for `PATCH /config/global`: an item set in the file or environment) | Edit the file. To add from the API, use an overlay |
-| `already_exists` (409) | A rule with the same key or an overlapping listener exists | Find it with `GET /rules`. Change the address or port |
+| `static` (409) | `PATCH` / `DELETE` on a settings-file rule, or a rule set `PUT` trying to take one (for `PATCH /config/global`: an item set in the file or environment) | Edit the file. To add from the API, use an overlay |
+| `already_exists` (409) | A rule with the same key or an overlapping listener exists (also a `POST` of a settings-file key) | Find it with `GET /rules`. Change the address or port |
 | `reserved` (409) | Overlaps the control API's (or `http01_listen`'s) address and port | Use another port. See `reserved` in `GET /interfaces` |
 | `bind_failed` (409) | Cannot open the port (another process has it, permissions) | Find the user with `ss -lntup`. Below 1024 needs `CAP_NET_BIND_SERVICE` |
 | `not_owner` (403) | A non-`admin` token tried to change or delete something another token created | Use the creating token or `admin`. Make the UI's token `admin` (or `allow_restored`) |
@@ -1062,7 +1086,7 @@ Answers have the form `{"error": "...", "code": "..."}`. All codes: [Errors in A
 | `file_in_use` (409) | Pointed to a key or secret file used by another owner's rule | Provide your own file (or use `admin`) |
 | `protected_file` (403) | Pointed into the certificate store, the ACME storage, rproxy's secrets and so on | Put the file elsewhere |
 | `file_not_allowed` (403) | An `allow_certs` token wrote a file path | Use `{cert: <name>}` (a stored certificate) |
-| `tls_config` / `invalid` (400) | A shape mistake or an unreadable file | The reason is in the `config.file` log. Check with `--check-config` |
+| `tls_config` / `invalid` (400) | A shape mistake or a file that cannot be used | Shape mistakes give the reason in the answer. When a file cannot be used (owner, mode, missing, contents), the answer does not say why; the `config.file` log does. Check with `--check-config` |
 | `unsupported` (400) | Not available in this version or environment, or not changeable by `PATCH` | See `features` in `GET /capabilities`. Recreate the rule |
 | `limit` (409) | Over `RPROXY_MAX_*` or the token's `max_rules` / `max_rulesets` | Delete unused ones or raise the limit (chapter 16) |
 | `owned` (409) | Tried to change a single rule of a rule set | `PUT` the rule set |

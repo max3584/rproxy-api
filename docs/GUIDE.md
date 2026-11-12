@@ -80,12 +80,26 @@ curl -fsSL https://raw.githubusercontent.com/max3584/rproxy-api/master/scripts/i
 
 ```shell
 systemctl status rproxy-api
-TOKEN=$(head -1 /etc/rproxy/tokens)          # パッケージが作った 1 行のトークン（すべての権限）
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)     # パッケージが作った 1 行のトークン（すべての権限）。/etc/rproxy は root:rproxy 750
 curl -s http://127.0.0.1:8080/healthz          # ok（認証なし）
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/capabilities | jq '{version, features: (.features | keys | length)}'
 ```
 
 起動しないときは `journalctl -u rproxy-api` を見ます。設定の誤り（値・パス・ファイルの中身）では起動しません。権限・使用中のポート・DB など環境の問題では、使えない部分だけ止めて起動を続け、ログに `"event":"degraded"` と `part` を出します（[README の「起動できないものがあるとき」](../README.md#起動できないものがあるとき)）。
+
+### 制御 API の Unix ソケットを開く
+
+`POST /config/reload`・`PATCH /config/global`（一部の項目）・`POST /admin/*`・ACME の強い操作は、既定では Unix ソケットからだけ受け付けます。パッケージの既定ではソケットは開いていないので、使うときは開きます。
+
+```shell
+sudoedit /etc/rproxy/rproxy.env
+#   RPROXY_API_SOCKET=/run/rproxy/api.sock      ← コメントを外す
+#   RPROXY_API_SOCKET_GROUP=rproxy              ← コメントを外す
+sudo systemctl restart rproxy-api
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" http://localhost/capabilities | jq .version
+```
+
+ソケットは `rproxy-api` のもので、モードは 660 です。上のように `sudo` で使うか、使う人をグループ `rproxy` に入れます（`sudo usermod -aG rproxy $USER` の後に入り直す）。トークンは Unix ソケットでも要り、強い操作には `admin` のスコープが要ります（パッケージが作った 1 行のトークンは `admin`）。この手引きのソケットの例は、どれもこの準備のうえで `$TOKEN` を使います。
 
 ## 2. はじめてのルール
 
@@ -153,7 +167,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -X DELETE http://127.0.0.1:8080/rules/
 | 再起動の後 | ファイルから作り直す | `dynamic` は消える。UI のルールは DB から、`api` は `rproxy_rules` から戻す |
 | 向いているもの | 消えては困るもの（UI を公開するルールなど） | UI・CI・コントローラが変えるもの |
 
-- 同じキーはどちらか一方です。ファイルにあるキーを API で作ると `409 static`、API にあるキーをファイルに書くと、ファイルのルールが `rule.failed` になります。
+- 同じキーはどちらか一方です。ファイルにあるキーを `POST /rules` で作ると `409 already_exists`、ファイルのルールを `PATCH` / `DELETE` すると `409 static`、API にあるキーをファイルに書くと、ファイルのルールが `rule.failed` になります。
 - 固定ルールの待ち受けに API から http のルートや `tls.routes` の名前を **足す** ときは、重ねる分（overlay、v0.4.23、#397）を使います。ファイルのルールそのものは変わりません。
 
   ```shell
@@ -496,7 +510,7 @@ ACME の `http-01` の答えはルートより先に返すので、このルー�
 
 ### 時間の上限（`global.http.timeouts`）
 
-`http` のルールのクライアントの接続の上限は、ルールではなく `global` に書きます。新しい接続から効きます。
+`http` のルールのクライアントの接続の上限は、ルールではなく `global` に書きます（下は今の設定ファイルの `global` に足す分）。新しい接続から効きます。
 
 ```yaml
 global:
@@ -536,7 +550,7 @@ rproxy の前にロードバランサがいて PROXY protocol を付けてくる
 
 ### `X-Forwarded-For` を信じる前段
 
-`http` のルールの前に CDN やロードバランサがあるときは、`global.trusted_proxies` にその範囲を書きます。そこからの接続の `X-Forwarded-For` を信じて、`ClientIP`・`ip_allow`・`rate_limit`・ログに本当のクライアントを使います。
+`http` のルールの前に CDN やロードバランサがあるときは、`global.trusted_proxies` にその範囲を書きます（下は今の設定ファイルの `global` に足す分）。そこからの接続の `X-Forwarded-For` を信じて、`ClientIP`・`ip_allow`・`rate_limit`・ログに本当のクライアントを使います。
 
 ```yaml
 global:
@@ -577,7 +591,7 @@ tokens:
 
 - スコープ：`rules:read`・`rules:write`・`metrics:read`・`acme:write`・`certs:read`・`certs:write`・`admin`。足りないと `403 forbidden`。
 - **持ち主だけが直す・消す**（v0.4.23、#401）：`admin` でないトークンは、自分で作ったルール・重ねる分・組だけを直す・消すことができます。ほかは `403 not_owner`。持ち主はトークンの **名前** です（`sha256` を入れ替えても名前が同じなら持ち主は変わりません）。
-- `allow_restored: true`：作ったトークンの分からないルール（DB から戻した UI のルールなど）も直せます。UI のトークンを `admin` にしない構成で、UI のトークンにだけ付けます。v0.4.22 以前に戻すときは先に外してください（古い版はファイル全体を読みません）。
+- `allow_restored: true`：作ったトークンの分からないルール（DB から戻した UI のルールなど）も直せます。UI のトークンを `admin` にしない構成で、UI のトークンにだけ付けます。v0.4.23 からの項目です（この文書を書いた時点では未リリース）。v0.4.22 以前で書くと、トークンファイル全体が読まれず、すべてのトークンが通らなくなります（トークンの項目は知らない名前を誤りにする）。戻すときも先に外してください。
 - 変えたら `systemctl reload rproxy-api`。SIGHUP がなくても `RPROXY_TOKENS_CHECK_SECS`（既定 10 秒）のうちに読み直します。入れ替えは「新しいものを足す → クライアントを切り替える → 古いものを消す」の順です。
 - 認証に 1 分で 20 回失敗した送信元は 5 分止まります（`429 locked_out`。Unix ソケットは対象外）。
 - 制御 API を loopback の外で開くなら、トークンと TLS（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）が必須です。同じホストの UI は Unix ソケットでつなぐのが安全です。クライアント証明書（mTLS）の使い方は [API.md の「制御 API の守り」](API.md#制御-api-の守りv04167)。
@@ -592,6 +606,7 @@ sudo chown rproxy-api:rproxy /etc/rproxy/crowdsec.key && sudo chmod 640 /etc/rpr
 ```
 
 ```yaml
+version: 1
 global:
   crowdsec:
     lapi_url: 'http://127.0.0.1:8081'     # 制御 API と同じポートにしない
@@ -612,6 +627,7 @@ rules:
 国・ASN で通すものを決めます。`global.geoip` に GeoLite2 などの mmdb を書きます。
 
 ```yaml
+version: 1
 global:
   geoip:
     country_db: /var/lib/GeoIP/GeoLite2-Country.mmdb
@@ -646,10 +662,10 @@ rules:
 | `performance`・`files` | 再起動が要る | ファイル / 環境変数 |
 
 ```shell
-SOCK=/run/rproxy/api.sock
-curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost/config/global | jq '.items | map_values({value, source, apply})'
+SOCK=/run/rproxy/api.sock                    # 1 章の「制御 API の Unix ソケットを開く」
+sudo curl -s --unix-socket $SOCK -H "Authorization: Bearer $TOKEN" http://localhost/config/global | jq '.items | map_values({value, source, apply})'
 
-curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" -X PATCH 'http://localhost/config/global?dry_run=true' \
+sudo curl -s --unix-socket $SOCK -H "Authorization: Bearer $TOKEN" -X PATCH 'http://localhost/config/global?dry_run=true' \
   -d '{"http":{"timeouts":{"idle":"5m"}},"udp_max_sessions":32768}'
 # よければ ?dry_run=true を外して送る。null を送るとその項目の API の値を消す
 ```
@@ -665,8 +681,8 @@ curl -s --unix-socket $SOCK -H "Authorization: Bearer $ADMIN_TOKEN" -X PATCH 'ht
 ファイルを書き換えると、10 秒ごとの確認で差分だけを反映します。結果をその場で受け取るには `POST /config/reload`（`admin`、既定は Unix ソケットからだけ）を使います。
 
 ```shell
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" -X POST 'http://localhost/config/reload?dry_run=true' | jq
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" -X POST http://localhost/config/reload
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" -X POST 'http://localhost/config/reload?dry_run=true' | jq
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" -X POST http://localhost/config/reload
 # {"added":1,"removed":0,"changed":1,"unchanged":3,"failed":0,"restart_needed":[],...}
 ```
 
@@ -676,8 +692,8 @@ curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKE
 
 | 変えるもの | 効き方 |
 |---|---|
-| 宛先（`remote_*`・`targets`・`balance`・`health_check`）、`tls`、`starttls`、`allow_from`、`http`、`extra_listen_addrs`、時間、`limits`・`bandwidth`・`geoip`・`labels` など | `in_place`：今の接続はそのまま。TCP は新しい接続から、UDP は今のセッションも移る |
-| `listen_port_end`（ポート範囲）、`source_ip`、`http` の有無 | `recreate`：待ち受けを作り直す。今の接続は切れる。API の `PATCH` では `400 unsupported`（作り直す） |
+| 宛先（`remote_*`・`targets`・`balance`・`health_check`）、`tls`、`starttls`、`allow_from`、`http`、`extra_listen_addrs`、時間、`limits`・`bandwidth`・`geoip`・`labels` など | `in_place`：今の接続はそのまま。TCP は新しい接続から、UDP は今のセッションも移る（`extra_listen_addrs` から外したアドレスの UDP のセッションは終わる） |
+| `listen_port_end`（ポート範囲）、`source_ip`、`listen_freebind`、`http` の有無、`::` で待ち受けるルールの追加のアドレスの有無（dual-stack と IPv6 だけの切り替え） | `recreate`：待ち受けを作り直す。今の接続は切れる。API の `PATCH` では `400 unsupported`（作り直す） |
 
 どちらになるかは `?dry_run=true` の答えの `change` で前もって分かります。
 
@@ -738,9 +754,11 @@ curl -s -H "Authorization: Bearer $TOKEN" -X PUT http://127.0.0.1:8080/rulesets/
 `POST` / `PATCH` / `DELETE /rules`・`PUT /rulesets/{name}`・`POST /config/reload`・`PATCH /config/global`・重ねる分の `PUT` / `DELETE` は `?dry_run=true` を受けます。同じ検証をして、何も変えずに差分を返します。
 
 ```shell
-curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/tcp/0.0.0.0/5432?dry_run=true' \
-  -d '{"remote_addr":"10.0.0.13","remote_port":5432}' | jq '{action, change, diff}'
+curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/tcp/0.0.0.0/8889?dry_run=true' \
+  -d '{"remote_addr":"10.0.0.13","remote_port":8080}' | jq '{action, change, diff}'
 ```
+
+`PATCH` は宛先（`remote_addr` / `remote_port` か `targets`、`balance`、`health_check`）を毎回まとめて置き換えます。省いた `balance` は `round_robin`、省いた `health_check` はなしになるので、`targets` のあるルールではそれらも一緒に送ります（`diff` で確かめられます）。
 
 ## 11. 見る（ログ・`/metrics`・統計）
 
@@ -750,7 +768,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -X PATCH 'http://127.0.0.1:8080/rules/
 
 ```shell
 # ファイルに出しているとき（パッケージの既定）
-tail -F /var/log/rproxy/rproxy.$(date +%F).log | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
+tail -F /var/log/rproxy/rproxy.$(date -u +%F).log      # ファイルの日付は UTC | jq -c 'select(.event == "degraded" or .event == "rule.failed" or .event == "audit")'
 # journald に出しているとき
 journalctl -u rproxy-api -o cat | jq -c 'select(.event == "conn.denied" or .event == "degraded")'
 ```
@@ -780,12 +798,14 @@ journalctl -u rproxy-api -n 50 | grep -E '"handoff\.|"start"'
 
 パッケージは、前の版と major.minor が同じなら SIGUSR2 で引き継ぎ（接続を切らない）、違えば restart します。リリースノートに「再起動が要る」とあるパッチは restart です。
 
+- v0.4.23 に上げると、`admin` でないトークンは自分で作ったルールしか直せなくなります（#401）。YAML のトークンファイルで UI のトークンを `rules:read`・`rules:write` にしていると、UI の「API のルール」の画面と複数のノードの同期が `403 not_owner` になります。上げる前に UI のトークンを `admin` にするか、`allow_restored: true` を足します（7 章）。
+
 ### 自動更新（コンテナ）
 
 イメージの入口を `rproxy-api launch` にし、`RPROXY_UPDATE=auto`（知らせるだけなら `check`）を渡します。同じ X.Y の新しいパッチを、署名を確かめてから引き継ぎで入れ替えます。`RPROXY_UPDATE_HEALTHY`（既定 60 秒）より前に落ちた版は悪い版として戻します。apt の VM と Kubernetes では `off` のままにします（[UPGRADE.md の「自動更新」](UPGRADE.md#自動更新コンテナ)）。
 
 ```shell
-curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost/admin/update | jq
+sudo curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $TOKEN" http://localhost/admin/update | jq
 ```
 
 ### 手で引き継ぐ
@@ -805,6 +825,7 @@ sudo apt install rproxy-api=0.4.22-1        # 版は <番号>-1 の形。同じ�
 - 設定ファイルの新しい項目も同じです。戻す版のバイナリで `--check-config` を通してから戻します。
 - `PATCH /config/global` の値（v0.4.19 から）は、それより前の版への引き継ぎでは渡りません（DB の行は残ります）。
 - マイナーをまたいで戻すときは restart です（引き継げません）。
+- v0.4.22 以前に戻すと、持ち主だけが直す・消す守り（#401、v0.4.23）がなくなります。`rules:write` のトークンはどれも、ほかのトークンのルールを直す・消すことができるようになります。
 
 ## 13. バックアップと復旧
 
@@ -815,7 +836,7 @@ sudo apt install rproxy-api=0.4.22-1        # 版は <番号>-1 の形。同じ�
 | 環境変数ファイル・トークン | `/etc/rproxy/rproxy.env`、`/etc/rproxy/tokens` |
 | 設定ファイル（固定ルールはここにしかない） | `RPROXY_CONFIG` |
 | 証明書・鍵・秘密のファイル | 設定とルールに書いたパス、`/var/lib/rproxy/certs/`（`PUT /certs`）、`/var/lib/rproxy/acme/`（ACME） |
-| DB | `forward_rules`（UI のルール）、`rproxy_rules`・`rproxy_rule_sets`・`rproxy_global`・`rproxy_rule_overlays`（rproxy が書く） |
+| DB | `forward_rules`（UI のルール）、`rproxy_rules`・`rproxy_rule_sets`・`rproxy_global`・`rproxy_rule_overlays`（v0.4.23 から）（rproxy が書く） |
 
 戻す順番：パッケージを入れる（起動しない）→ `/etc/rproxy` と鍵を戻す → DB を戻す → `--check-config` → rproxy-api を起動 → UI を起動 → 確かめる。保存しないトークンで API から作ったルールは DB にないので、残したければ `GET /rules` の控えを取っておきます。
 
@@ -827,13 +848,16 @@ sudo apt install rproxy-api=0.4.22-1        # 版は <番号>-1 の形。同じ�
 # prometheus.yml
 scrape_configs:
   - job_name: rproxy
+    scheme: https                                       # loopback の外の制御 API は TLS が必須
+    tls_config:
+      ca_file: /etc/prometheus/rproxy-api-ca.pem        # 自己署名なら、その証明書か CA
     authorization:
       credentials_file: /etc/prometheus/rproxy.token     # metrics:read のトークン（平文）
     static_configs:
       - targets: ['10.0.0.2:8080']
 ```
 
-制御 API が loopback だけなら、同じホストの node exporter の textfile などで集めるか、`RPROXY_API_ADDR` に監視の網のアドレスを足します（そのときはトークンと TLS が必須。`scheme: https` にします）。
+制御 API を loopback の外で開くには、トークンファイルと TLS（`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY`）が必須です（どれかがなければ起動しません）。`RPROXY_API_ADDR` に監視の網のアドレスを足します（例 `127.0.0.1,10.0.0.2`）。loopback だけのままにするなら、Prometheus を同じホストで動かし、`scheme: http`・`targets: ['127.0.0.1:8080']` にします（`tls_config` は要りません）。
 
 ### 見る値
 
@@ -1053,8 +1077,8 @@ rules:
 
 | `code`（HTTP） | 意味 | すること |
 |---|---|---|
-| `static`（409） | 設定ファイルのルール（`PATCH /config/global` ならファイル・環境変数の項目） | ファイルを書き換える。API から足すなら重ねる分 |
-| `already_exists`（409） | 同じキーか、待ち受けの重なるルールがある | `GET /rules` で探す。アドレス・ポートを変える |
+| `static`（409） | 設定ファイルのルールを `PATCH` / `DELETE` した・組の `PUT` で取ろうとした（`PATCH /config/global` ならファイル・環境変数の項目） | ファイルを書き換える。API から足すなら重ねる分 |
+| `already_exists`（409） | 同じキーか、待ち受けの重なるルールがある（設定ファイルのキーへの `POST` も） | `GET /rules` で探す。アドレス・ポートを変える |
 | `reserved`（409） | 制御 API（か `http01_listen`）のアドレスとポートに重なる | 別のポートにする。`GET /interfaces` の `reserved` |
 | `bind_failed`（409） | ポートを開けない（ほかのプロセスが使用中、権限） | `ss -lntup` で使っているものを探す。1024 未満は `CAP_NET_BIND_SERVICE` |
 | `not_owner`（403） | `admin` でないトークンが、ほかのトークンの作ったものを直す・消そうとした | 作ったトークンか `admin` で。UI のトークンは `admin`（か `allow_restored`） |
@@ -1062,7 +1086,7 @@ rules:
 | `file_in_use`（409） | ほかの持ち主のルールが使う鍵・秘密のファイルを指した | 自分のファイルを用意する（または `admin`） |
 | `protected_file`（403） | 証明書のストア・ACME の保存先・rproxy の秘密などを指した | 別の場所に置く |
 | `file_not_allowed`（403） | `allow_certs` のトークンがファイルのパスを書いた | `{cert: <name>}`（保存した証明書）を使う |
-| `tls_config` / `invalid`（400） | 形の誤り、ファイルが読めない | 理由はログの `config.file`。`--check-config` で確かめる |
+| `tls_config` / `invalid`（400） | 形の誤り、ファイルが使えない | 形の誤りは答えに理由が出る。ファイルが使えない（所有者・モード・ない・中身）ときは理由を答えに出さず、ログの `config.file` に出す。`--check-config` で確かめる |
 | `unsupported`（400） | この版・環境で使えない、`PATCH` で変えられない項目 | `GET /capabilities` の `features`。作り直す |
 | `limit`（409） | `RPROXY_MAX_*` かトークンの `max_rules`・`max_rulesets` を超える | 使っていないものを消す・上限を上げる（16 章） |
 | `owned`（409） | 組のルールを個別に変えようとした | 組を `PUT` する |

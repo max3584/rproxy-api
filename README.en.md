@@ -173,7 +173,7 @@ Keep systemd's `TimeoutStopSec` (default 90 seconds) above `DELAY + DRAIN + 5 se
 For API details, see [docs/en/API.md](docs/en/API.md).
 
 ```bash
-TOKEN=$(head -1 /etc/rproxy/tokens)
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)   # /etc/rproxy is root:rproxy 750
 
 # Add a forwarding rule
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \

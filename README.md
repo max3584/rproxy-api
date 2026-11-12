@@ -173,7 +173,7 @@ systemd の `TimeoutStopSec`（既定 90 秒）は `DELAY + DRAIN + 5 秒` よ�
 API の詳細は [docs/API.md](docs/API.md) を参照。
 
 ```bash
-TOKEN=$(head -1 /etc/rproxy/tokens)
+TOKEN=$(sudo head -1 /etc/rproxy/tokens)   # /etc/rproxy は root:rproxy 750
 
 # 転送を追加
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rules \
