@@ -136,7 +136,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - 引き継ぎ（#174）：TCP・HTTP の接続は古いプロセスが最後まで扱い、新しい接続は新しいプロセスへ（UDP のセッションは作り直しでよい、オーナーの了承）。統計の数は減らさない（スナップショットと drain の後の差分）。渡すものの形はマイナーの中で変えない（docs/RELEASING.md）。HTTP のルールは `rt.stop` で処理中のリクエストを終えてからアイドルの接続を閉じる（`server.rs` の `serve` の `graceful_shutdown`）。
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
-- 利用者向けの文書は日本語と英語の両方がある（日本語は `README.md`・`docs/*.md`・`docs/architecture/README.md`、英語は `README.en.md`・`docs/en/`）。片方を変えたら、同じ PR でもう片方も直す。文書を足したら英語版も作り、互いの先頭のリンクと `.deb` の assets（英語版は `/usr/share/doc/rproxy-api/en/`）も揃える。
+- 利用者向けの文書は日本語と英語の両方がある（日本語は `README.md`・`docs/*.md`・`docs/architecture/README.md`、英語は `README.en.md`・`docs/en/`）。片方を変えたら、同じ PR でもう片方も直す。文書を足したら英語版も作り、互いの先頭のリンクと `.deb` の assets（英語版は `/usr/share/doc/rproxy-api/en/`）も揃える。はじめての人向けのやりたいこと別の手引きは `docs/GUIDE.md`・`docs/en/GUIDE.md`（設定と運用。例の YAML は `--check-config` で通る形にしてある）。設定の形・既定・誤りの `code`・運用の手順を変えたら、関わる章も直す。
 
 ## アクセス制御と固定ルール
 

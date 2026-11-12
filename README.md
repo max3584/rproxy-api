@@ -13,6 +13,8 @@ English: [README.en.md](README.en.md)
 稼働中に TCP/UDP の転送を追加・変更・削除・問い合わせできる L4 フォワーダ。
 制御は HTTP API で行い、管理 UI は [TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) にある。
 
+はじめての方は [docs/GUIDE.md](docs/GUIDE.md)（設定と運用の手引き：設定ファイルの書き方・制御 API の使い方・更新・監視・レシピを、やりたいこと別に）。
+
 構成図（全体・モジュール・接続の流れ・ルールの状態）は [docs/architecture/](docs/architecture/README.md)。
 
 ## インストール
