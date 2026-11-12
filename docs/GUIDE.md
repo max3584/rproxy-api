@@ -796,7 +796,7 @@ curl -s --unix-socket /run/rproxy/api.sock -H "Authorization: Bearer $ADMIN_TOKE
 
 ```shell
 apt-cache policy rproxy-api                 # 入れられる版（リポジトリは過去の版も残している）
-sudo apt install rproxy-api=<上に出た版>      # 同じマイナーなら、戻すときも引き継ぎで動く
+sudo apt install rproxy-api=0.4.22-1        # 版は <番号>-1 の形。同じマイナーなら、戻すときも引き継ぎで動く
 ```
 
 戻す前に確かめること：

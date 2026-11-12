@@ -796,7 +796,7 @@ Replace the binary, then `systemctl kill -s USR2 --kill-whom=main rproxy-api`, o
 
 ```shell
 apt-cache policy rproxy-api                 # versions you can install (the repository keeps old ones)
-sudo apt install rproxy-api=<a version listed above>   # within the same minor, going back also hands over
+sudo apt install rproxy-api=0.4.22-1        # versions look like <number>-1; within the same minor, going back also hands over
 ```
 
 Before going back:
