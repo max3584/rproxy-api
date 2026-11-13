@@ -1,0 +1,215 @@
+:root {
+	color-scheme: light dark;
+	--bg: #ffffff;
+	--fg: #1f2328;
+	--muted: #59636e;
+	--line: #d1d9e0;
+	--panel: #f6f8fa;
+	--accent: #0969da;
+	--accent-fg: #ffffff;
+	--error-bg: #ffebe9;
+	--error-fg: #82071e;
+	--mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #0d1117;
+		--fg: #e6edf3;
+		--muted: #9198a1;
+		--line: #3d444d;
+		--panel: #161b22;
+		--accent: #4493f8;
+		--accent-fg: #0d1117;
+		--error-bg: #3c1618;
+		--error-fg: #ffa198;
+	}
+}
+* {
+	box-sizing: border-box;
+}
+body {
+	background: var(--bg);
+	color: var(--fg);
+	font: 15px/1.6 system-ui, sans-serif;
+	max-width: 76rem;
+	margin: 0 auto;
+	padding: 1rem 16px 3rem;
+}
+a {
+	color: var(--accent);
+}
+h1 {
+	font-size: 1.5rem;
+	margin: 0;
+}
+.bar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem 1rem;
+	align-items: center;
+	justify-content: space-between;
+}
+.lead {
+	margin: 0.5rem 0 0.25rem;
+}
+.privacy,
+footer,
+.help,
+.tabnote {
+	color: var(--muted);
+	font-size: 0.875rem;
+}
+button {
+	font: inherit;
+	color: var(--fg);
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	padding: 0.3rem 0.75rem;
+	cursor: pointer;
+}
+button[aria-pressed='true'],
+button[aria-selected='true'] {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--accent-fg);
+}
+.lang {
+	display: flex;
+	gap: 0.25rem;
+}
+.recipes {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	margin: 1rem 0 0.5rem;
+}
+.intro {
+	margin: 0.5rem 0 1rem;
+}
+main {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 0 1.5rem;
+}
+@media (min-width: 64rem) {
+	main {
+		grid-template-columns: minmax(0, 26rem) minmax(0, 1fr);
+	}
+	.recipes {
+		grid-column: 1 / -1;
+	}
+	.output {
+		position: sticky;
+		top: 0.5rem;
+		align-self: start;
+	}
+}
+fieldset {
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	margin: 0 0 1rem;
+	padding: 0.5rem 0.75rem 0.25rem;
+}
+legend {
+	font-weight: 600;
+	padding: 0 0.25rem;
+}
+.field {
+	margin: 0 0 0.75rem;
+}
+.field label {
+	display: block;
+	font-weight: 500;
+}
+.field.check {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	align-items: center;
+	gap: 0 0.5rem;
+}
+.field.check input {
+	grid-row: 1;
+	grid-column: 1;
+	width: 1.1rem;
+	height: 1.1rem;
+}
+.field.check label {
+	grid-row: 1;
+	grid-column: 2;
+}
+.field.check .meta {
+	grid-column: 2;
+}
+input[type='text'],
+select,
+textarea {
+	width: 100%;
+	font: 14px/1.4 var(--mono);
+	color: var(--fg);
+	background: var(--bg);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	padding: 0.35rem 0.5rem;
+}
+textarea {
+	resize: vertical;
+}
+.meta {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0 0.75rem;
+	font-size: 0.8125rem;
+}
+.guide {
+	white-space: nowrap;
+}
+.reset {
+	margin-bottom: 1rem;
+}
+.tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.25rem;
+}
+.panel {
+	position: relative;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	margin-top: 0.5rem;
+	background: var(--panel);
+}
+.tabnote {
+	margin: 0;
+	padding: 0.5rem 6.5rem 0 0.75rem;
+}
+.copy {
+	position: absolute;
+	top: 0.4rem;
+	right: 0.4rem;
+}
+pre {
+	margin: 0;
+	padding: 0.75rem;
+	overflow: auto;
+	max-height: 75vh;
+	font: 13px/1.5 var(--mono);
+	white-space: pre;
+}
+.errors {
+	background: var(--error-bg);
+	color: var(--error-fg);
+	border-radius: 8px;
+	padding: 0.5rem 0.75rem 0.5rem 1.75rem;
+	margin: 0 0 0.5rem;
+}
+.errors .head {
+	list-style: none;
+	margin-left: -1rem;
+	font-weight: 600;
+}
+footer {
+	margin-top: 2rem;
+	border-top: 1px solid var(--line);
+	padding-top: 0.5rem;
+}
