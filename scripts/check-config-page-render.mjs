@@ -35,6 +35,127 @@ for (const kind of expect.middlewares) {
 	if (!rules.some((r) => Object.values(r.http?.middlewares || {}).some((m) => kind in m))) problems.push(`no rule has a ${kind} middleware (from the RproxyMiddleware)`);
 }
 
+// --- the settings file's rule against render's: each recipe's fields either match, or a note says
+// Gateway API cannot express them (the note ids in gen.js). A field in neither list fails.
+
+const ms = (d) => {
+	if (typeof d !== 'string') return d;
+	let total = 0;
+	for (const [, n, u] of d.matchAll(/([0-9.]+)(ms|s|m|h|d)/g)) total += Number(n) * { ms: 1, s: 1e3, m: 6e4, h: 36e5, d: 864e5 }[u];
+	return total;
+};
+// limits with durations normalised (render writes 1s as 1s, idle 12h as 43200s)
+const norm = (v) =>
+	v && typeof v === 'object'
+		? Array.isArray(v)
+			? v.map(norm)
+			: Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, x]) => [k, k === 'period' ? ms(x) : norm(x)]))
+		: v;
+const same = (a, b) => JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+const sameSet = (a = [], b = []) => same([...a].sort(), [...b].sort());
+const middlewares = (r) => Object.values(r?.http?.middlewares || {});
+const kinds = (r) => middlewares(r).flatMap((m) => Object.keys(m));
+
+// field → how it is compared: 'equal', 'duration', 'set', a function (s, g) → ok, or a note id that must be there
+const CROSS = {
+	'web-acme': {
+		protocol: 'equal',
+		listen_port: 'equal',
+		listen_addr: 'listen_addr',
+		tls: (s, g) => s.mode === g?.mode && Array.isArray(g?.certificates) && g.certificates.length > 0,
+		http: (s, g, notes) => {
+			if (s.http3 && !notes.includes('http3')) return false;
+			if (!s.http3 && g?.http3) return false;
+			const sk = kinds({ http: s }).filter((k) => k !== 'headers');
+			const gk = kinds({ http: g });
+			// redirect_scheme in the settings file is a redirect_regex in render
+			const want = sk.map((k) => (k === 'redirect_scheme' ? 'redirect_regex' : k));
+			if (!want.every((k) => gk.includes(k))) return false;
+			const hsts = middlewares({ http: s }).some((m) => m.headers?.hsts);
+			const gHsts = middlewares({ http: g }).some((m) => m.headers?.response?.set?.['Strict-Transport-Security']);
+			if (hsts !== gHsts) return false;
+			const health = Object.values(s.services || {}).some((x) => x.health_check);
+			return !health || notes.includes('health_check');
+		},
+	},
+	'db-tcp': {
+		protocol: 'equal',
+		listen_port: 'equal',
+		listen_addr: 'listen_addr',
+		remote_addr: 'backends',
+		remote_port: 'backends',
+		targets: 'backends',
+		balance: 'backends',
+		health_check: 'backends',
+		connect_timeout: 'duration',
+		idle_timeout: 'duration',
+		allow_from: 'set',
+		limits: 'equal',
+	},
+	'game-udp': {
+		protocol: 'equal',
+		listen_port: 'equal',
+		listen_addr: 'listen_addr',
+		extra_listen_addrs: 'extra_listen_addrs',
+		remote_addr: 'backends',
+		remote_port: 'backends',
+		udp_idle_secs: 'udp_idle_secs',
+		limits: 'equal',
+	},
+	'sni-split': {
+		protocol: 'equal',
+		listen_port: 'equal',
+		listen_addr: 'listen_addr',
+		tls: (s, g, notes) => {
+			if (s.mode !== g?.mode) return false;
+			const pt = (t) => (t?.routes || []).filter((r) => r.passthrough);
+			const [sp, gp] = [pt(s), pt(g)];
+			// rproxy's *.x is one level; Gateway API's *.x (render: **.x) any depth
+			const names = (rs, wide) => rs.flatMap((r) => r.server_names || [r.server_name]).map((n) => (wide ? n.replace(/^\*\./, '**.') : n));
+			const widened = !sameSet(names(sp), names(sp, true));
+			if (widened && !notes.includes('server_names')) return false;
+			if (!sameSet(names(sp, true), names(gp))) return false;
+			if (sp.some((r) => r.source_ip && r.source_ip !== 'proxy') && !notes.includes('source_ip')) return false;
+			// the port of the target; its address is a pod's
+			return sp.every((r) => gp.some((x) => (x.targets || []).some((t) => t.port === r.remote_port)));
+		},
+		http: (s, g, notes) => {
+			const hosts = (h) => (h?.routes || []).map((r) => /Host\(`([^`]+)`\)/.exec(r.match)?.[1]);
+			if (!sameSet(hosts(s), hosts(g))) return false;
+			if (s.default && s.default.status !== 404 && !notes.includes('default')) return false;
+			return true;
+		},
+	},
+};
+
+const key = (r) => `${r.protocol}/${r.listen_port}`;
+const cross = CROSS[expect.recipe];
+if (!cross) problems.push(`no cross-output mapping for the recipe ${expect.recipe}`);
+for (const s of cross ? expect.settings : []) {
+	const g = rules.find((r) => key(r) === key(s));
+	if (!g) {
+		problems.push(`the settings file's ${key(s)} rule has no rule from render`);
+		continue;
+	}
+	for (const [field, value] of Object.entries(s)) {
+		const how = cross[field];
+		const ok =
+			how === 'equal'
+				? same(value, g[field])
+				: how === 'duration'
+					? ms(value) === ms(g[field])
+					: how === 'set'
+						? sameSet(value, g[field])
+						: typeof how === 'function'
+							? how(value, g[field], expect.notes)
+							: typeof how === 'string'
+								? expect.notes.includes(how) || (field === 'listen_addr' && ['0.0.0.0', '::'].includes(value))
+								: false;
+		if (!ok) problems.push(`${key(s)}.${field}: ${how === undefined ? 'no cross-output mapping for this field' : `the Gateway API output differs (${JSON.stringify(value)} / ${JSON.stringify(g[field])}) and no note says why`}`);
+	}
+}
+for (const g of rules) if (cross && !expect.settings.some((s) => key(s) === key(g))) problems.push(`render made ${key(g)}, which the settings file does not have`);
+
 // render's certificate files are the Secrets' contents: the test certificate
 const tls = path.resolve(out, 'tls');
 const text = JSON.stringify({ version: 1, rules }, null, 2)

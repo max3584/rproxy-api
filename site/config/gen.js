@@ -75,6 +75,8 @@ export function sectionLabel(key) {
 // 'lines' is one value per line (also split at commas).
 
 const t = (ja, en) => ({ ja, en });
+// a note on the Gateway API output; the id names what Gateway API cannot express (CI matches it)
+const note = (id, ja, en) => ({ id, ja, en });
 
 const K8S_FIELDS = (gateway) => [
 	{ id: 'namespace', type: 'text', def: 'default', group: 'k8s', label: t('namespace', 'Namespace'), help: t('Gateway とルートを置く namespace', 'Where the Gateway and the routes live'), link: 'gw:2.2' },
@@ -227,7 +229,7 @@ export function plain(v) {
 // ---------------------------------------------------------------------------
 // A small YAML writer: block style, short leaves in flow style like the guides.
 
-const YAML_WORDS = /^(true|false|yes|no|on|off|y|n|null|~)$/i;
+const YAML_WORDS = /^(true|false|yes|no|on|off|y|n|null|~|[-+]?\.(inf|nan))$/i;
 
 function scalar(v) {
 	if (v === null || v === undefined) return 'null';
@@ -418,11 +420,13 @@ const API_TOKEN_NOTE = {
 	en: 'Put a token with the rules:write scope in TOKEN first (GUIDE 7.1; this page makes no tokens)',
 };
 
-/** "curl ... -d '<json>'" with the JSON quoted for a POSIX shell. */
-function curl({ method, url, body, socket }, lang) {
-	const json = JSON.stringify(body, null, 2).replace(/'/g, "'\\''");
-	const head = socket ? `sudo curl -s --unix-socket ${socket} -H "Authorization: Bearer $TOKEN"` : `curl -s -H "Authorization: Bearer $TOKEN"`;
-	return `${head} -X ${method} "${url}" \\\n  -d '${json}'`;
+/** A word for a POSIX shell in single quotes ('\'' for a quote inside). */
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+/** "curl ... -X METHOD '<url>' -d '<json>'": everything from the input is single-quoted. */
+function curl({ method, url, body, socket }) {
+	const head = socket ? `sudo curl -s --unix-socket ${shq(socket)} -H "Authorization: Bearer $TOKEN"` : `curl -s -H "Authorization: Bearer $TOKEN"`;
+	return `${head} -X ${method} ${shq(url)} \\\n  -d ${shq(JSON.stringify(body, null, 2))}`;
 }
 
 function apiText(calls, notes, lang) {
@@ -438,7 +442,7 @@ function apiText(calls, notes, lang) {
 	for (const call of calls) {
 		lines.push('');
 		if (call.note) lines.push(comment(call.note[lang]));
-		lines.push(curl(call, lang));
+		lines.push(curl(call));
 	}
 	return lines.join('\n') + '\n';
 }
@@ -474,6 +478,14 @@ function policyDoc(name, input, section, spec) {
 }
 
 const RULES = '/rules';
+
+// listen addresses on every interface; any other address is the platform's job in Kubernetes
+const WILDCARD = ['0.0.0.0', '::'];
+const ADDRESS_NOTE = note(
+	'listen_addr',
+	'待ち受けのアドレスは Gateway API では決めません。Service（LoadBalancer）とプラットフォームが決めます',
+	'Gateway API does not pick the listen address: the Service (LoadBalancer) and the platform do',
+);
 
 // --- 17.1 --------------------------------------------------------------------
 
@@ -585,8 +597,8 @@ function webAcme(input, lang, errors) {
 	const docs = [
 		{
 			note: t(
-				'cert-manager が証明書を取ります（rproxy の ACME は Gateway API からは使いません。rproxy-gateway GUIDE 3.2）',
-				'cert-manager obtains the certificate (rproxy\'s own ACME is not used from Gateway API; rproxy-gateway GUIDE 3.2)',
+				`cert-manager が証明書を取ります（rproxy の ACME は Gateway API からは使いません。rproxy-gateway GUIDE 3.2）\nClusterIssuer はクラスタに 1 つの名前（${issuer}）です。同じ名前のものがすでにあれば、この ClusterIssuer は当てずにそれを使います`,
+				`cert-manager obtains the certificate (rproxy's own ACME is not used from Gateway API; rproxy-gateway GUIDE 3.2)\nThe ClusterIssuer's name (${issuer}) is cluster-wide: if one with that name exists, use it and leave this one out`,
 			),
 			doc: {
 				apiVersion: 'cert-manager.io/v1',
@@ -639,9 +651,10 @@ function webAcme(input, lang, errors) {
 		});
 	}
 	const gwNotes = [];
-	if (input.http3) gwNotes.push(t('HTTP/3 は Gateway API からは開けません（rproxy-gateway は TCP の HTTPS だけ）', 'HTTP/3 cannot be turned on from Gateway API (rproxy-gateway serves HTTPS over TCP)'));
-	if (health) gwNotes.push(t('ヘルスチェックの代わりに、Pod の readinessProbe が転送先を決めます', 'Instead of the health check, the pods\' readinessProbe decides the backends'));
-	if (challenge === 'tls-alpn-01') gwNotes.push(t('cert-manager は http-01 で確かめます（tls-alpn-01 はありません）', 'cert-manager checks with http-01 (it has no tls-alpn-01)'));
+	if (!WILDCARD.includes(listen)) gwNotes.push(ADDRESS_NOTE);
+	if (input.http3) gwNotes.push(note('http3', 'HTTP/3 は Gateway API からは開けません（rproxy-gateway は TCP の HTTPS だけ）', 'HTTP/3 cannot be turned on from Gateway API (rproxy-gateway serves HTTPS over TCP)'));
+	if (health) gwNotes.push(note('health_check', 'ヘルスチェックの代わりに、Pod の readinessProbe が転送先を決めます', 'Instead of the health check, the pods\' readinessProbe decides the backends'));
+	if (challenge === 'tls-alpn-01') gwNotes.push(note('challenge', 'cert-manager は http-01 で確かめます（tls-alpn-01 はありません）', 'cert-manager checks with http-01 (it has no tls-alpn-01)'));
 	return { settings, api, apiNotes: [], docs, gwNotes };
 }
 
@@ -688,6 +701,7 @@ function dbTcp(input, lang, errors) {
 	const api = [{ method: 'POST', url: str(input.api_url) + RULES, body: plain(rule) }];
 
 	const service = str(input.service);
+	const section = `tcp-${port}`;
 	const policy = {
 		allowFrom: allow.length ? allow : undefined,
 		limits: max !== undefined ? { max_connections: max } : undefined,
@@ -695,8 +709,8 @@ function dbTcp(input, lang, errors) {
 		idleTimeout: idle || undefined,
 	};
 	const docs = [
-		{ doc: gatewayDoc(input, [{ name: 'postgres', port, protocol: 'TCP' }]) },
-		{ doc: route('TCPRoute', service, input, { parentRefs: [parent(input, 'postgres')], rules: [{ backendRefs: [{ name: service, port: servicePort }] }] }) },
+		{ doc: gatewayDoc(input, [{ name: section, port, protocol: 'TCP' }]) },
+		{ doc: route('TCPRoute', service, input, { parentRefs: [parent(input, section)], rules: [{ backendRefs: [{ name: service, port: servicePort }] }] }) },
 	];
 	if (Object.values(policy).some((v) => v !== undefined)) {
 		docs.push({
@@ -704,10 +718,11 @@ function dbTcp(input, lang, errors) {
 				'標準の Gateway API にない設定（送信元・接続の数・時間）は RproxyPolicy で（rproxy-gateway GUIDE 8.1）',
 				'Settings standard Gateway API lacks (sources, connection counts, timeouts) go in an RproxyPolicy (rproxy-gateway GUIDE 8.1)',
 			),
-			doc: policyDoc(str(input.gateway), input, 'postgres', policy),
+			doc: policyDoc(str(input.gateway), input, section, policy),
 		});
 	}
-	const gwNotes = [t('転送先は Service の ready な Pod です。balance と health_check は要りません', 'The backends are the Service\'s ready pods: no balance or health_check')];
+	const gwNotes = [note('backends', '転送先は Service の ready な Pod です（targets・balance・health_check は要りません）', 'The backends are the Service\'s ready pods (no targets, balance or health_check)')];
+	if (!WILDCARD.includes(rule.listen_addr)) gwNotes.push(ADDRESS_NOTE);
 	return { settings, api, apiNotes: [], docs, gwNotes };
 }
 
@@ -758,18 +773,19 @@ function gameUdp(input, lang, errors) {
 
 	const service = str(input.service);
 	const docs = [
-		{ doc: gatewayDoc(input, [{ name: 'game', port, protocol: 'UDP' }]) },
-		{ doc: route('UDPRoute', service, input, { parentRefs: [parent(input, 'game')], rules: [{ backendRefs: [{ name: service, port: servicePort }] }] }) },
+		{ doc: gatewayDoc(input, [{ name: `udp-${port}`, port, protocol: 'UDP' }]) },
+		{ doc: route('UDPRoute', service, input, { parentRefs: [parent(input, `udp-${port}`)], rules: [{ backendRefs: [{ name: service, port: servicePort }] }] }) },
 	];
 	if (limits) {
 		docs.push({
 			note: t('セッションとデータグラムの上限は RproxyPolicy の limits で（rproxy-gateway GUIDE 8.1）', 'Session and datagram limits go in the RproxyPolicy\'s limits (rproxy-gateway GUIDE 8.1)'),
-			doc: policyDoc(str(input.gateway), input, 'game', { limits: plain(limits) }),
+			doc: policyDoc(str(input.gateway), input, `udp-${port}`, { limits: plain(limits) }),
 		});
 	}
-	const gwNotes = [];
-	if (idle !== undefined) gwNotes.push(t('udp_idle_secs は Gateway API からは決められません（rproxy の既定の 30 秒）', 'udp_idle_secs cannot be set from Gateway API (rproxy\'s 30 s default applies)'));
-	if (input.ipv6) gwNotes.push(t('IPv6 で受けるかは Service（ipFamilyPolicy）とロードバランサが決めます', 'Whether IPv6 is served is up to the Service (ipFamilyPolicy) and the load balancer'));
+	const gwNotes = [note('backends', '転送先は Service の ready な Pod です', 'The backends are the Service\'s ready pods')];
+	if (!WILDCARD.includes(rule.listen_addr)) gwNotes.push(ADDRESS_NOTE);
+	if (idle !== undefined) gwNotes.push(note('udp_idle_secs', 'udp_idle_secs は Gateway API からは決められません（rproxy の既定の 30 秒）', 'udp_idle_secs cannot be set from Gateway API (rproxy\'s 30 s default applies)'));
+	if (input.ipv6) gwNotes.push(note('extra_listen_addrs', 'IPv6 で受けるかは Service（ipFamilyPolicy）とロードバランサが決めます', 'Whether IPv6 is served is up to the Service (ipFamilyPolicy) and the load balancer'));
 	return { settings, api, apiNotes: [], docs, gwNotes };
 }
 
@@ -865,20 +881,22 @@ function sniSplit(input, lang, errors) {
 		});
 	}
 	const gwNotes = [
-		t('Service の名前はサイトの名前の先頭（wiki など）にしています。自分の Service に合わせてください', 'The Service names are the sites\' first labels (wiki, ...); change them to your Services'),
+		note('backends', 'Service の名前はサイトの名前の先頭（wiki など）にしています。自分の Service に合わせてください', 'The Service names are the sites\' first labels (wiki, ...); change them to your Services'),
 	];
+	if (!WILDCARD.includes(listen)) gwNotes.push(ADDRESS_NOTE);
 	if (pt && names.some((n) => !n.startsWith('**.') && n.startsWith('*.'))) {
-		gwNotes.push(t('Gateway API の *.x は何階層下の名前にも当たります（rproxy の **.x と同じ）', 'In Gateway API, *.x matches any depth (like rproxy\'s **.x)'));
+		gwNotes.push(note('server_names', 'Gateway API の *.x は何階層下の名前にも当たります（rproxy の **.x と同じ）', 'In Gateway API, *.x matches any depth (like rproxy\'s **.x)'));
 	}
 	if (pt && sourceIp !== 'proxy') {
 		gwNotes.push(
-			t(
-				'TLSRoute は送信元の IP を渡しません。渡すなら RproxyRule で rproxy のルールを書きます（rproxy-gateway GUIDE 8.3）',
-				'A TLSRoute does not pass the client IP; to pass it, write the rproxy rule in an RproxyRule (rproxy-gateway GUIDE 8.3)',
+			note(
+				'source_ip',
+				'TLSRoute は送信元の IP を渡しません。渡すには、443 のルール全体（終端するサイトも）を RproxyRule に書き、Gateway から 443 のリスナーを外します。同じキーの RproxyRule は Conflicted になります。RproxyRule が指せる証明書のファイルは、その Gateway の証明書だけです（rproxy-gateway GUIDE 8.3）',
+				'A TLSRoute does not pass the client IP. To pass it, write the whole 443 rule (the terminated sites too) in an RproxyRule and drop the Gateway\'s 443 listeners: an RproxyRule with the same key is Conflicted. An RproxyRule may only name the Gateway\'s own certificate files (rproxy-gateway GUIDE 8.3)',
 			),
 		);
 	}
-	if (status !== undefined && status !== 404) gwNotes.push(t(`当たらない名前は Gateway API では 404 です（${status} にはなりません）`, `Names nothing matches get 404 in Gateway API (not ${status})`));
+	if (status !== undefined && status !== 404) gwNotes.push(note('default', `当たらない名前は Gateway API では 404 です（${status} にはなりません）`, `Names nothing matches get 404 in Gateway API (not ${status})`));
 	return { settings, api, apiNotes, docs, gwNotes };
 }
 
@@ -918,6 +936,7 @@ export function generate(recipeId, input = {}, lang = 'ja') {
 			settings: dropUndefined(plain(out.settings)),
 			api: out.api.map(({ method, url, body, socket }) => ({ method, url, body: dropUndefined(body), socket })),
 			gateway: out.docs.map((d) => dropUndefined(plain(d.doc))),
+			gatewayNotes: out.gwNotes.map((n) => n.id),
 		},
 	};
 }

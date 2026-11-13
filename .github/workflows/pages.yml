@@ -19,6 +19,8 @@ on:
 permissions:
   contents: write
 
+# 走っているものは最後まで（gh-pages の push の途中で止めない）。待っている古いものは新しいものに
+# 置き換わるが、新しいものほど新しい master を載せるので失うものはない
 concurrency:
   group: pages-config
   cancel-in-progress: false
@@ -26,6 +28,8 @@ concurrency:
 jobs:
   publish:
     name: publish site/config to gh-pages
+    # master のものだけ（ほかのブランチからの workflow_dispatch で見ていない JS を載せない）
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     container: alpine:3.24
     steps:
@@ -35,5 +39,17 @@ jobs:
           # the workspace belongs to the runner's user, not to root in the container
           git config --global --add safe.directory '*'
       - uses: actions/checkout@v4
+      # 古い実行（やり直し・遅れて動いたもの）は載せない：このコミットがまだ master の先頭のときだけ。
+      # 先頭が進んでいれば、その push の実行が新しいものを載せる
+      - name: still master's head
+        id: head
+        run: |
+          git fetch --quiet --depth 1 origin master
+          if [ "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA" ]; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$GITHUB_SHA is no longer master's head ($(git rev-parse FETCH_HEAD)); not publishing"
+          fi
       - name: scripts/publish-config-page.sh
+        if: steps.head.outputs.latest == 'true'
         run: scripts/publish-config-page.sh origin

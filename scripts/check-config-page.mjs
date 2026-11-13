@@ -38,7 +38,7 @@ const VARIATIONS = {
 	'web-acme': [
 		{},
 		{ challenge: 'tls-alpn-01', staging: true, http3: false, hsts: false, compress: false, health_path: '' },
-		{ domain: 'shop.example.org', email: 'ops@example.org', app_url: 'https://10.0.0.7:8443', listen_addr: '::', service: 'shop', service_port: 443, namespace: 'web', gateway: 'public' },
+		{ domain: 'shop.example.org', email: 'ops@example.org', app_url: 'https://10.0.0.7:8443', listen_addr: '::', service: 'shop', service_port: 443, namespace: 'web', gateway: 'public', api_socket: "/run/rproxy dir/it's api.sock" },
 	],
 	'db-tcp': [
 		{},
@@ -141,11 +141,12 @@ for (const [key, [doc, , ja, en]] of Object.entries(SECTIONS)) {
 
 // --- the API text → a settings file ------------------------------------------
 
-// the curl commands as the page shows them: -X METHOD "URL" and -d '<json>' (single quotes, '\'' inside)
+// the curl commands as the page shows them: -X METHOD '<url>' and -d '<json>' (single quotes, '\'' inside)
+const unq = (s) => s.replace(/'\\''/g, "'");
 function apiCalls(text) {
 	const calls = [];
-	const re = /-X (\w+) "([^"]+)" \\\n {2}-d '((?:[^']|'\\'')*)'/g;
-	for (const m of text.matchAll(re)) calls.push({ method: m[1], url: m[2], body: JSON.parse(m[3].replace(/'\\''/g, "'")) });
+	const re = /-X (\w+) '((?:[^']|'\\'')*)' \\\n {2}-d '((?:[^']|'\\'')*)'/g;
+	for (const m of text.matchAll(re)) calls.push({ method: m[1], url: unq(m[2]), body: JSON.parse(unq(m[3])) });
 	return calls;
 }
 
@@ -202,8 +203,11 @@ function world(docs, ns, certPem, keyPem) {
 	return extra.map((d) => JSON.stringify(d)).join('\n---\n') + '\n';
 }
 
-function expectations(docs) {
-	const e = { rule: [], middlewares: [] };
+// what render's rules must have: from the Gateway docs (rule, middlewares), and, to catch the outputs
+// drifting apart, the settings file's rules and the notes on what Gateway API cannot express
+// (scripts/check-config-page-render.mjs compares them per recipe)
+function expectations(recipe, docs, settings, notes) {
+	const e = { recipe, rule: [], middlewares: [], settings: settings.rules, notes };
 	for (const d of docs) {
 		if (d.kind === 'RproxyPolicy') {
 			const map = { allowFrom: 'allow_from', limits: 'limits', connectTimeout: 'connect_timeout', idleTimeout: 'idle_timeout' };
@@ -216,7 +220,7 @@ function expectations(docs) {
 
 // --- run ----------------------------------------------------------------------
 
-for (const dir of ['settings', 'api', 'gateway', 'world', 'expect', 'tls']) fs.mkdirSync(path.join(out, dir), { recursive: true });
+for (const dir of ['settings', 'api', 'gateway', 'world', 'expect', 'data', 'tls']) fs.mkdirSync(path.join(out, dir), { recursive: true });
 const certFile = path.resolve(out, 'tls/example.pem');
 const keyFile = path.resolve(out, 'tls/example.key');
 const certPem = fs.existsSync(certFile) ? fs.readFileSync(certFile, 'utf8') : '';
@@ -238,13 +242,17 @@ for (const r of RECIPES) {
 			const calls = apiCalls(o.api);
 			if (calls.length !== o.data.api.length) fail(`${name}: found ${calls.length} curl commands in the text, the generator made ${o.data.api.length}`);
 			if (JSON.stringify(calls.map((c) => c.body)) !== JSON.stringify(o.data.api.map((c) => c.body))) fail(`${name}: the curl text does not carry the generator's JSON`);
+			const sockets = [...o.api.matchAll(/--unix-socket '((?:[^']|'\\'')*)'/g)].map((m) => unq(m[1]));
+			if (JSON.stringify(sockets) !== JSON.stringify(o.data.api.filter((c) => c.socket).map((c) => c.socket))) fail(`${name}: the curl text does not carry the socket path`);
 			const docs = o.data.gateway;
 			const ns = docs.find((d) => d.kind === 'Gateway').metadata.namespace;
 			fs.writeFileSync(path.join(out, 'settings', `${name}.yaml`), o.settings);
 			fs.writeFileSync(path.join(out, 'api', `${name}.json`), JSON.stringify(apiSettings(calls, name), null, 2));
 			fs.writeFileSync(path.join(out, 'gateway', `${name}.yaml`), o.gateway);
 			fs.writeFileSync(path.join(out, 'world', `${name}.yaml`), world(docs, ns, certPem, keyPem));
-			fs.writeFileSync(path.join(out, 'expect', `${name}.json`), JSON.stringify(expectations(docs)));
+			fs.writeFileSync(path.join(out, 'expect', `${name}.json`), JSON.stringify(expectations(r.id, docs, o.data.settings, o.data.gatewayNotes)));
+			// what the YAML must read back as (the shell script compares it with PyYAML)
+			fs.writeFileSync(path.join(out, 'data', `${name}.json`), JSON.stringify({ settings: o.data.settings, gateway: docs }));
 		}
 	}
 }

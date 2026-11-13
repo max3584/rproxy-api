@@ -4,6 +4,9 @@
 #
 #   scripts/check-config-page.sh <rproxy-api binary> [out-dir]
 #
+# out-dir: a new or empty directory (default: a new temporary one). A non-empty directory is refused unless an
+# earlier run made it (it has .check-config-page); then only that run's files are replaced.
+#
 #   1. scripts/check-config-page.mjs: the generator's rules and global against docs/openapi.json, the guide
 #      anchors against the headings of docs/GUIDE.md, docs/en/GUIDE.md and rproxy-gateway's guides;
 #   2. the settings file YAML, and the JSON of the curl commands (as a settings file), with
@@ -16,7 +19,8 @@
 # Needs bash, curl, node, openssl, python3 with PyYAML (kubeconform's openapi2jsonschema.py) and tar.
 # Downloads pinned versions (checked by SHA-256): kubeconform, the CRDs, and the rproxy-gateway binary
 # from its image on ghcr.io (no docker). RPROXY_GATEWAY=<binary> uses a local rproxy-gateway instead,
-# RPROXY_GATEWAY_GUIDES=<checkout> its docs instead of fetching them.
+# RPROXY_GATEWAY_GUIDES=<checkout> its docs instead of fetching them (the links on the live page point at
+# rproxy-gateway's main; .github/workflows/config-page-links.yml checks them against main every week).
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -24,7 +28,11 @@ if [ $# -lt 1 ]; then
 	exit 2
 fi
 api=$(realpath "$1")
-out=$(realpath -m "${2:-${TMPDIR:-/tmp}/rproxy-config-page}")
+if [ -n "${2:-}" ]; then
+	out=$(realpath -m "$2")
+else
+	out=$(mktemp -d)
+fi
 here=$(cd "$(dirname "$0")/.." && pwd)
 
 # pinned: bump together with the SHA-256 (Gateway API: the version rproxy-gateway's GUIDE 1.1 installs)
@@ -38,10 +46,22 @@ CERT_MANAGER_SHA256=29810b2a84c8ee0731a79679ee1dfd7e93cd750eb0244542eec47fa8700f
 # ghcr.io/max3584/rproxy-gateway:0.4.22 (the image index)
 RPROXY_GATEWAY_IMAGE=max3584/rproxy-gateway
 RPROXY_GATEWAY_DIGEST=sha256:12700de1f0ffc4560c773a18cdf95d3ef46ac9d11c4a659654238bce9e49c423
-RPROXY_GATEWAY_REF=main
+# rproxy-gateway's guides (the anchors the page links to), at a commit of its main
+RPROXY_GATEWAY_REF=2fc51e8087d5666344aaa9e4d5648402d5e3421d
+RPROXY_GATEWAY_GUIDE_SHA256=74dfb923ea27d4cf62cb64c09d80a093bc046b54e924cd990eaa4ed00d46b0da
+RPROXY_GATEWAY_GUIDE_EN_SHA256=c637b3150ca862ce21393ef87a49276a434638f7623597419d9b4812502d74b3
 
-rm -rf "$out"
+# never remove a directory this script did not make
+marker=.check-config-page
+if [ -e "$out" ] && [ -n "$(ls -A "$out")" ]; then
+	if [ ! -f "$out/$marker" ]; then
+		echo "$out is not empty and not from an earlier run; give a new or empty directory" >&2
+		exit 2
+	fi
+	for d in settings api gateway world expect data tls dl schemas rendered; do rm -rf "${out:?}/$d"; done
+fi
 mkdir -p "$out"/{tls,dl,schemas,rendered}
+touch "$out/$marker"
 
 fetch() { # <url> <file> <sha256>
 	curl -fsSL --retry 3 -o "$2" "$1"
@@ -89,15 +109,35 @@ if [ -n "${RPROXY_GATEWAY_GUIDES:-}" ]; then
 	cp "$RPROXY_GATEWAY_GUIDES/docs/GUIDE.md" "$out/dl/gw-guide.md"
 	cp "$RPROXY_GATEWAY_GUIDES/docs/en/GUIDE.md" "$out/dl/gw-guide-en.md"
 else
-	# its main branch: the page links there
-	curl -fsSL --retry 3 -o "$out/dl/gw-guide.md" "https://raw.githubusercontent.com/max3584/rproxy-gateway/$RPROXY_GATEWAY_REF/docs/GUIDE.md"
-	curl -fsSL --retry 3 -o "$out/dl/gw-guide-en.md" "https://raw.githubusercontent.com/max3584/rproxy-gateway/$RPROXY_GATEWAY_REF/docs/en/GUIDE.md"
+	fetch "https://raw.githubusercontent.com/max3584/rproxy-gateway/$RPROXY_GATEWAY_REF/docs/GUIDE.md" "$out/dl/gw-guide.md" "$RPROXY_GATEWAY_GUIDE_SHA256"
+	fetch "https://raw.githubusercontent.com/max3584/rproxy-gateway/$RPROXY_GATEWAY_REF/docs/en/GUIDE.md" "$out/dl/gw-guide-en.md" "$RPROXY_GATEWAY_GUIDE_EN_SHA256"
 fi
 
 # --- 1. the generator ----------------------------------------------------------------------------
 node "$here/scripts/check-config-page.mjs" "$out" "$out/dl/gw-guide.md" "$out/dl/gw-guide-en.md"
 
 failed=0
+
+# --- the YAML on the page reads back as the generator's data (PyYAML, YAML 1.1: the stricter reading) ---
+if ! python3 - "$out" << 'PY'; then
+import glob, json, os, sys, yaml
+out, bad = sys.argv[1], 0
+for f in sorted(glob.glob(os.path.join(out, "data", "*.json"))):
+    name = os.path.basename(f)[:-5]
+    want = json.load(open(f))
+    got = {
+        "settings": yaml.safe_load(open(os.path.join(out, "settings", name + ".yaml"))),
+        "gateway": [d for d in yaml.safe_load_all(open(os.path.join(out, "gateway", name + ".yaml"))) if d is not None],
+    }
+    for part in ("settings", "gateway"):
+        if got[part] != want[part]:
+            print(f"FAIL {name}: the {part} YAML does not read back as the generator's data", file=sys.stderr)
+            bad = 1
+sys.exit(bad)
+PY
+	failed=1
+fi
+
 check_config() { # <file> <what>
 	if ! "$api" --check-config "$1" > "$out/check.log" 2>&1; then
 		echo "FAIL $2: rproxy-api --check-config $1" >&2

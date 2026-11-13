@@ -7,8 +7,10 @@
 #
 # The apt repository on the same branch (dists/, pool/, rproxy-archive-keyring.gpg, index.html, written by
 # the apt job of release.yml) is never touched: only config/ is staged, and anything else staged stops it.
-# Both push without --force; when the other one pushed in between, this starts again from the new gh-pages
-# (and the apt job puts its commit on top of it), so neither loses the other's files.
+# What keeps the two writers safe is that both push without --force: a push only fast-forwards the gh-pages
+# it was built on (FETCH_HEAD here), so git refuses it when the other one pushed in between. Then this starts
+# again from the new gh-pages (and the apt job puts its commit on top of it): neither loses the other's files.
+# The concurrency groups only keep each workflow from racing itself.
 set -euo pipefail
 
 remote=${1:-origin}
@@ -30,7 +32,8 @@ for attempt in 1 2 3 4 5; do
 
 	rm -rf "$pages/config"
 	mkdir "$pages/config"
-	cp "$src"/*.html "$src"/*.css "$src"/*.js "$pages/config/"
+	# the whole directory, as it is in the repository
+	cp -R "$src"/. "$pages/config/"
 	git -C "$pages" add --all -- config
 	others=$(git -C "$pages" diff --cached --name-only | grep -v '^config/' || true)
 	if [ -n "$others" ]; then
@@ -53,8 +56,8 @@ for attempt in 1 2 3 4 5; do
 		echo "published config/ to gh-pages"
 		exit 0
 	fi
-	echo "push refused (gh-pages moved, attempt $attempt); trying again from the new gh-pages" >&2
-	sleep $((attempt * 5))
+	echo "push refused (gh-pages moved, attempt $attempt)" >&2
+	if [ "$attempt" -lt 5 ]; then sleep $((attempt * 5)); fi
 done
 echo "could not push gh-pages" >&2
 exit 1
