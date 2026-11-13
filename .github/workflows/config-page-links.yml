@@ -1,0 +1,29 @@
+name: Config page links
+
+# 設定を作るページ（site/config、#406）は rproxy-gateway の main の GUIDE の節へリンクする。CI の
+# config page のジョブは版を固定した GUIDE で確かめるので、ここで毎週 main の見出しと照らす（見出しが
+# 変わったら gen.js の SECTIONS を直し、scripts/check-config-page.sh の RPROXY_GATEWAY_REF と SHA-256 を上げる）。
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: guide links against rproxy-gateway main
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git curl nodejs
+      - uses: actions/checkout@v4
+      - name: scripts/check-config-page.mjs (anchors)
+        run: |
+          d=$(mktemp -d)
+          for f in docs/GUIDE.md docs/en/GUIDE.md; do
+            curl -fsSL --retry 3 -o "$d/$(echo "$f" | tr / -)" "https://raw.githubusercontent.com/max3584/rproxy-gateway/main/$f"
+          done
+          node scripts/check-config-page.mjs "$d/out" "$d/docs-GUIDE.md" "$d/docs-en-GUIDE.md"

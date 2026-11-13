@@ -1597,6 +1597,8 @@ sudo systemctl restart rproxy-api
 
 この章では、よくある構成を、そのまま使える設定ファイルの形で紹介します。証明書のパスとアドレスを自分の環境に合わせて書き換え、`--check-config` を通してから使ってください。
 
+同じ 4 つのレシピは、[設定ジェネレータ](https://max3584.github.io/rproxy-api/config/) でも作れます。ポートや転送先を入れると、設定ファイル・制御 API の `curl`・Gateway API の YAML を同時に出します（ブラウザの中だけで作り、どこにも送りません）。
+
 ### 17.1 Web アプリを HTTPS で公開する（ACME）
 
 同じホストで 3000 番で動く Web アプリを、Let's Encrypt の証明書で HTTPS にして公開します。80 番は ACME の確かめに答え、ほかのリクエストは HTTPS へリダイレクトします。

@@ -206,3 +206,48 @@ jobs:
         run: |
           chmod +x target/release/rproxy-api
           sudo scripts/test-install.sh target/release/rproxy-api
+
+  # 設定を作るページ（site/config、#406）の出力を、package のバイナリの --check-config・docs/openapi.json・
+  # Gateway API / cert-manager / rproxy の CRD のスキーマ（kubeconform）・rproxy-gateway render に通す
+  # （scripts/check-config-page.sh。版は固定し SHA-256 で確かめる）。ページ・生成の元（src/・openapi.json・
+  # GUIDE）・検査そのものが変わったときだけ動かす（ほかはステップを飛ばして成功）
+  config-page:
+    name: config page (site/config)
+    needs: package
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      # coreutils: sha256sum --quiet・realpath -m、python3 + py3-yaml: kubeconform の openapi2jsonschema.py
+      - name: packages
+        run: apk add --no-cache bash git tar coreutils curl nodejs openssl python3 py3-yaml
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: changed files
+        id: changed
+        shell: bash
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # no base (a new branch, a forced push): check
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ] || ! files=$(git diff --name-only "$BASE" HEAD); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qE '^(site/|src/|docs/openapi\.json$|docs/GUIDE\.md$|docs/en/GUIDE\.md$|scripts/check-config-page|Cargo\.lock$|\.github/workflows/ci\.yml$)' <<< "$files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing the config page depends on changed"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.changed.outputs.run == 'true'
+        with:
+          name: package
+          path: target
+      - name: scripts/check-config-page.sh
+        if: steps.changed.outputs.run == 'true'
+        run: |
+          chmod +x target/release/rproxy-api
+          scripts/check-config-page.sh target/release/rproxy-api "$RUNNER_TEMP/config-page"

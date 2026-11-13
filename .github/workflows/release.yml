@@ -264,6 +264,11 @@ jobs:
           scripts/apt-repo.sh pages debs/*.deb
           cp docs/apt-index.html pages/index.html
 
+      # gh-pages also has the config page (config/, .github/workflows/pages.yml, #406): the checkout above
+      # keeps it and `git add -A` leaves it as it is. What keeps both safe is the push without --force: it
+      # only fast-forwards the gh-pages this commit was built on, so git refuses it when pages.yml pushed in
+      # between; then this one commit goes on top of the new gh-pages (pages.yml only touches config/, so
+      # they never conflict) and is pushed again.
       - name: Push gh-pages
         if: steps.key.outputs.ok
         working-directory: pages
@@ -276,4 +281,18 @@ jobs:
           else
             git commit -m "apt: ${{ github.ref_name }}"
           fi
-          git push origin HEAD:gh-pages
+          for attempt in 1 2 3 4 5; do
+            git push origin HEAD:gh-pages && exit 0
+            [ "$attempt" = 5 ] && break
+            # the first release makes gh-pages as an orphan: nothing to put this commit back on
+            if ! git rev-parse --quiet --verify HEAD~1 > /dev/null; then
+              echo "::error::gh-pages was created by someone else while this made it; run the release again"
+              exit 1
+            fi
+            echo "push refused (gh-pages moved, attempt $attempt); putting this commit on the new gh-pages"
+            sleep $((attempt * 5))
+            git fetch --depth 1 origin gh-pages
+            git rebase --onto FETCH_HEAD HEAD~1
+          done
+          echo "::error::could not push gh-pages"
+          exit 1

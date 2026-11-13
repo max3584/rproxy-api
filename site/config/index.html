@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; form-action 'none'; base-uri 'none'">
+<title>rproxy 設定ジェネレータ</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1 data-t="title">rproxy 設定ジェネレータ</h1>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-lang="ja" aria-pressed="true">日本語</button>
+      <button type="button" data-lang="en" aria-pressed="false">English</button>
+    </div>
+  </div>
+  <p class="lead" data-t="lead"></p>
+  <p class="privacy" data-t="privacy"></p>
+</header>
+
+<main>
+  <nav class="recipes" id="recipes" aria-label="Recipes"></nav>
+
+  <section class="recipe">
+    <p class="intro" id="intro"></p>
+    <form id="form" autocomplete="off" novalidate></form>
+  </section>
+
+  <section class="output" aria-live="polite">
+    <ul class="errors" id="errors" hidden></ul>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="panel">
+      <p class="tabnote" id="tabnote"></p>
+      <button type="button" class="copy" id="copy" data-t="copy">コピー</button>
+      <pre id="code" tabindex="0"></pre>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p data-t="footer"></p>
+  <noscript><p>This page needs JavaScript (it runs only in your browser).</p></noscript>
+</footer>
+</body>
+</html>

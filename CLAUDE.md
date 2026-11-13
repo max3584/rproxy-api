@@ -137,6 +137,7 @@ cargo run                     # 設定は環境変数 RPROXY_* か .env（.env.e
 - データプレーンのタスクで `unwrap()` / `panic!` を使わない。万一 panic しても、監視タスクがそのルールだけを `failed` にする。
 - ログは `event` フィールドで種類を分ける（一覧は README）。
 - 利用者向けの文書は日本語と英語の両方がある（日本語は `README.md`・`docs/*.md`・`docs/architecture/README.md`、英語は `README.en.md`・`docs/en/`）。片方を変えたら、同じ PR でもう片方も直す。文書を足したら英語版も作り、互いの先頭のリンクと `.deb` の assets（英語版は `/usr/share/doc/rproxy-api/en/`）も揃える。はじめての人向けのやりたいこと別の手引きは `docs/GUIDE.md`・`docs/en/GUIDE.md`（設定と運用。例の YAML は `--check-config` で通る形にしてある）。設定の形・既定・誤りの `code`・運用の手順を変えたら、関わる章も直す。
+- 設定ジェネレータ（#406、https://max3584.github.io/rproxy-api/config/）：`site/config/`（素の HTML・CSS・JS、ビルドなし、通信しない）。出力は純粋な `site/config/gen.js` が作り、CI の `config page (site/config)`（`scripts/check-config-page.sh`）が `docs/openapi.json`・`--check-config`・Gateway API / cert-manager / rproxy の CRD（kubeconform）・`rproxy-gateway render` に通す。項目名は openapi.json と CRD にあるものだけ。GUIDE の 17 章のレシピや見出しを変えたら `gen.js` の `SECTIONS` と `RECIPES` も直す。公開は master の `site/` の変更で `.github/workflows/pages.yml` が gh-pages の `config/` だけを書く（`scripts/publish-config-page.sh`。apt の置き場には触らない）。
 
 ## アクセス制御と固定ルール
 
