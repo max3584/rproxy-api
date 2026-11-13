@@ -1,0 +1,39 @@
+name: Pages (config)
+
+# 設定を作るページ（site/config、#406）を gh-pages の config/ に載せる：https://max3584.github.io/rproxy-api/config/
+# 書くのは config/ だけ（scripts/publish-config-page.sh）。同じブランチの apt の置き場（dists/・pool/・
+# rproxy-archive-keyring.gpg・index.html）は release.yml の apt ジョブが書き、こちらは触らない。
+# どちらも --force なしで push し、相手が間に push していたら、こちらは新しい gh-pages からやり直し、
+# apt は自分のコミットを新しい gh-pages の上に載せ直す。concurrency の組を apt と共有しないのは、
+# 待っているジョブが新しく来たジョブに取り消されるため（apt の公開が取り消されないように）。
+# 出力の中身の検査は CI の config page のジョブ（scripts/check-config-page.sh）。
+on:
+  push:
+    branches: [master]
+    paths:
+      - "site/**"
+      - "scripts/publish-config-page.sh"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-config
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish site/config to gh-pages
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: |
+          apk add --no-cache bash git
+          # the workspace belongs to the runner's user, not to root in the container
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v4
+      - name: scripts/publish-config-page.sh
+        run: scripts/publish-config-page.sh origin

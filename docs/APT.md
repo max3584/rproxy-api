@@ -39,7 +39,11 @@ pool/main/r/<パッケージ>/<パッケージ>_<version>_<arch>.deb   rproxy-ap
 dists/stable/main/binary-{amd64,arm64,armhf}/Packages{,.gz}
 dists/stable/{Release,InRelease,Release.gpg}
 rproxy-archive-keyring.gpg                                signed-by= に使う公開鍵
+index.html                                                トップページ（docs/apt-index.html を写す）
+config/                                                   設定ジェネレータ（site/config。下）
 ```
+
+`config/` は設定ジェネレータ（https://max3584.github.io/rproxy-api/config/ 、#406）で、master の `site/` が変わると `.github/workflows/pages.yml`（`scripts/publish-config-page.sh`）が `config/` だけを書き換える。apt の置き場（`dists/`・`pool/`・鍵・`index.html`）には触らない。release.yml の apt ジョブは `gh-pages` を取ってきて足すので `config/` はそのまま残り、間に pages.yml が push していたら自分のコミットをその上に載せ直す（どちらも `--force` しない）。`docs/apt-index.html` の変更は、次に apt ジョブが動いたときに載る。
 
 同じバージョンのパッケージを中身を変えて出し直すことはできない（`apt-repo.sh` が止める）。直すときはバージョンを上げる。
 

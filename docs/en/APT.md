@@ -39,7 +39,11 @@ pool/main/r/<package>/<package>_<version>_<arch>.deb   rproxy-api and rproxy-ui.
 dists/stable/main/binary-{amd64,arm64,armhf}/Packages{,.gz}
 dists/stable/{Release,InRelease,Release.gpg}
 rproxy-archive-keyring.gpg                                public key used for signed-by=
+index.html                                                the top page (a copy of docs/apt-index.html)
+config/                                                   the config generator (site/config; below)
 ```
+
+`config/` is the config generator (https://max3584.github.io/rproxy-api/config/, #406). When `site/` changes on master, `.github/workflows/pages.yml` (`scripts/publish-config-page.sh`) rewrites `config/` only and never touches the apt repository (`dists/`, `pool/`, the key, `index.html`). The apt job of release.yml adds to a checkout of `gh-pages`, so `config/` stays, and when pages.yml pushed in between, it puts its commit on top (neither uses `--force`). Changes to `docs/apt-index.html` go up the next time the apt job runs.
 
 A package with the same version cannot be republished with different contents (`apt-repo.sh` stops it). To fix something, bump the version.
 

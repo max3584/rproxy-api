@@ -21,7 +21,7 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 
 | Workflow / job | Environment |
 |---|---|
-| CI `test` and `package`, Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.24` |
+| CI `test`, `package` and `config-page`, Pages (config), Benchmarks, Integrity, Soak, Fuzz, Dependencies (cargo-deny), Milestone, Interop `build`, `mail` and `media` | `alpine:3.24` |
 | CI `transparent` | `alpine:3.24` (privileged: namespaces, veth, nft / iptables) |
 | Load | `alpine:3.24` (privileged: namespaces, veth, tc netem; `sch_netem` is loaded from the host's `/lib/modules`) |
 | Interop `crowdsec` | `crowdsecurity/crowdsec` (CrowdSec's official image, Alpine-based; Alpine has no CrowdSec package), privileged |
@@ -29,6 +29,8 @@ GitHub's runners are Ubuntu VMs only, so the jobs run inside Alpine containers (
 | Release `apt` and Cross build `apt (dry run)` | `debian:13-slim` (apt-ftparchive, which builds the apt repository, is a Debian tool) |
 | CI `deb` and `install` | Directly on the runner VM (Ubuntu). They check installing the .deb, upgrading from an apt repository and purging, and install.sh (which requires systemd), so systemd has to run as PID 1, which a container cannot do. They build no Rust: they check the musl binary and .deb made by the `package` job (Alpine) |
 | DPDK (`dpdk.yml`, #261) | Directly on the runner VM (Ubuntu). DPDK comes from Ubuntu's packages (`libdpdk-dev`); hugepages and `net_tap` (TAP devices) need the host kernel and sudo. See "The DPDK data plane" below |
+
+The config generator's outputs (`site/config`, #406) are checked by the CI job `config page (site/config)` (`scripts/check-config-page.sh <rproxy-api binary>`). For each of the four recipes, on its default input and a few variations, in Japanese and English: the rules and `global` against `docs/openapi.json` (a field that is not there is an error), the guide links against the guides' headings, the settings file YAML and the `curl` JSON (as a settings file) with the `package` job's `--check-config`, and the Gateway API YAML with kubeconform (`-strict`, the schemas of the Gateway API standard, cert-manager and rproxy CRDs) and `rproxy-gateway render` (everything `Accepted` and `ResolvedRefs`, the RproxyPolicy and RproxyMiddleware settings show up in the rules, and those rules pass `--check-config` too). The tools, the CRDs and the rproxy-gateway image are pinned and checked by SHA-256. It runs only when `site/`, `src/`, `docs/openapi.json`, the guides or the check itself change. Locally it runs with the same command given python3 with PyYAML, node, openssl and curl (`RPROXY_GATEWAY=<binary>` uses a local rproxy-gateway).
 
 Fuzzing runs without a sanitizer (Rust's AddressSanitizer exists only for glibc targets; see "Fuzzing" below).
 

@@ -1597,6 +1597,8 @@ More to know about the limits:
 
 This chapter presents common setups as settings files you can use as they are. Replace the certificate paths and addresses with your own and run `--check-config` before using them.
 
+The [config generator](https://max3584.github.io/rproxy-api/config/) makes the same four recipes. Enter your ports and targets, and it writes the settings file, the control API `curl` commands and the Gateway API YAML side by side (all in the browser; nothing is sent anywhere).
+
 ### 17.1 A web app over HTTPS (ACME)
 
 Publish a web app running on port 3000 on the same host over HTTPS, with a Let's Encrypt certificate. Port 80 answers ACME checks and redirects other requests to HTTPS.
