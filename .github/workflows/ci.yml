@@ -33,7 +33,7 @@ jobs:
         run: |
           apk add --no-cache bash git tar zstd curl gcc musl-dev mariadb mariadb-client \
             pebble pdns pdns-backend-sqlite3 pdns-doc sqlite minisign
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -87,7 +87,7 @@ jobs:
         run: |
           apk add --no-cache bash git tar zstd curl gcc musl-dev python3 \
             iproute2 util-linux-misc iptables ip6tables nftables
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
@@ -122,7 +122,7 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -145,7 +145,7 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev shellcheck
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: shellcheck
         run: shellcheck scripts/*.sh scripts/interop/*.sh scripts/load/*.sh contrib/rproxy-transparent-routing
       - uses: dtolnay/rust-toolchain@stable
@@ -155,7 +155,7 @@ jobs:
       # the server and the Traefik converter (the .deb has both)
       - run: cargo build --locked --release -p rproxy-api -p rproxy-traefik
       - run: cargo deb --no-build --output target/debian/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: package
           path: |
@@ -177,8 +177,8 @@ jobs:
         run: |
           echo "::error::the package job did not succeed (${{ needs.package.result }})"
           exit 1
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: package
           path: target
@@ -202,8 +202,8 @@ jobs:
         run: |
           echo "::error::the package job did not succeed (${{ needs.package.result }})"
           exit 1
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: package
           path: target
@@ -225,7 +225,7 @@ jobs:
       # coreutils: sha256sum --quiet・realpath -m、python3 + py3-yaml: kubeconform の openapi2jsonschema.py
       - name: packages
         run: apk add --no-cache bash git tar coreutils curl nodejs openssl python3 py3-yaml
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: changed files
@@ -246,7 +246,7 @@ jobs:
             echo "nothing the config page depends on changed"
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: steps.changed.outputs.run == 'true'
         with:
           name: package

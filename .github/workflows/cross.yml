@@ -45,7 +45,7 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.job.target }}
@@ -64,7 +64,7 @@ jobs:
           deb=$(cargo deb --no-build --no-strip --target ${{ matrix.job.target }} --output target/deb/ | tail -n1)
           [ "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.job.deb }}" ]
           dpkg-deb --info "$deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.job.deb
         with:
           name: deb-${{ matrix.job.deb }}
@@ -85,8 +85,8 @@ jobs:
           apt-get install -y -q --no-install-recommends git ca-certificates gnupg apt-utils dpkg-dev
           # the workspace belongs to the runner's user, not to root in the container
           git config --global --add safe.directory '*'
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: debs

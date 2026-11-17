@@ -101,7 +101,7 @@ jobs:
             git clone --depth 1 https://github.com/brendangregg/FlameGraph "$RUNNER_TEMP/FlameGraph"
             echo "FLAMEGRAPH=$RUNNER_TEMP/FlameGraph" >> "$GITHUB_ENV"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # the refs to compare are built from this clone
           fetch-depth: 0
@@ -174,7 +174,7 @@ jobs:
           else
             echo "no results (the run stopped early; see the log)" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: load-${{ matrix.variant }}

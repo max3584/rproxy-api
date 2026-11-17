@@ -38,7 +38,7 @@ jobs:
           apk add --no-cache bash git
           # the workspace belongs to the runner's user, not to root in the container
           git config --global --add safe.directory '*'
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # 古い実行（やり直し・遅れて動いたもの）は載せない：このコミットがまだ master の先頭のときだけ。
       # 先頭が進んでいれば、その push の実行が新しいものを載せる
       - name: still master's head
