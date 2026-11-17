@@ -182,6 +182,11 @@ jobs:
         with:
           name: package
           path: target
+      # apt-ftparchive（scripts/apt-repo.sh）の apt-utils は ubuntu-26.04 のイメージに入っていない
+      - name: apt-utils
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends apt-utils
       - name: scripts/test-deb.sh
         run: scripts/test-deb.sh target/debian/*.deb
 
