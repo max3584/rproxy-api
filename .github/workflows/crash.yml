@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev mariadb mariadb-client
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # ci.yml と同じ MariaDB（rproxy_rules・rproxy_rule_sets を書きながら kill する）

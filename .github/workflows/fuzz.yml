@@ -49,7 +49,7 @@ jobs:
       # g++: libfuzzer-sys builds libFuzzer (C++)
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc g++ musl-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: taiki-e/install-action@v2
         with:
@@ -58,7 +58,7 @@ jobs:
         with:
           workspaces: fuzz
       # 前回までのコーパス（毎日の実行で育てる）
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -87,12 +87,12 @@ jobs:
           for target in $(cargo fuzz list); do
             cargo fuzz cmin $FUZZ_FLAGS "$target" "fuzz/corpus/$target" -- -rss_limit_mb=2048 || true
           done
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: always() && github.event_name != 'pull_request'
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: fuzz-artifacts-${{ github.run_id }}

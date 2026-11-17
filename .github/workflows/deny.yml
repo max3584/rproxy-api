@@ -31,7 +31,7 @@ jobs:
       - name: packages
         # libgcc: rustc of the rustup toolchain links libgcc_s
         run: apk add --no-cache bash git curl tar libgcc
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo deny reads the dependency graph through cargo metadata
       - uses: dtolnay/rust-toolchain@stable
       # the latest release (musl build), not Alpine's package: new advisory formats need a current cargo-deny

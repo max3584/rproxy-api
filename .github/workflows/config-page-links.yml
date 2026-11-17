@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git curl nodejs
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: scripts/check-config-page.mjs (anchors)
         run: |
           d=$(mktemp -d)

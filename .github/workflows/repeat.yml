@@ -41,7 +41,7 @@ jobs:
         run: |
           apk add --no-cache bash git tar zstd curl gcc musl-dev
           if [ "${{ inputs.mariadb }}" = true ]; then apk add --no-cache mariadb mariadb-client; fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # as the CI's test job

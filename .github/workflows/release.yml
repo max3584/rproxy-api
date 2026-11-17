@@ -44,7 +44,7 @@ jobs:
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild dpkg
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Extract crate information
         shell: bash
@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload Debian package
         if: matrix.job.deb
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.job.deb }}
           path: ${{ env.DEB }}
@@ -98,7 +98,7 @@ jobs:
 
       - name: Release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             target/${{ matrix.job.target }}/release/${{ env.PROJECT_NAME }}-${{ env.VERSION }}-${{ matrix.job.target }}${{ matrix.job.extension }}
@@ -130,7 +130,7 @@ jobs:
         run: apk add --no-cache bash git github-cli minisign coreutils
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sign_tag || github.ref }}
 
@@ -224,7 +224,7 @@ jobs:
 
       - name: Checkout
         if: steps.key.outputs.ok
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Checkout gh-pages
         if: steps.key.outputs.ok
@@ -238,7 +238,7 @@ jobs:
 
       - name: Download packages
         if: steps.key.outputs.ok && github.event_name == 'push'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: debs

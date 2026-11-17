@@ -33,11 +33,11 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash git tar zstd curl gcc musl-dev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rproxy-api
           path: target/debug/rproxy-api
@@ -52,8 +52,8 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl python3 openssl postfix dovecot dovecot-pop3d
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rproxy-api
           path: target/debug
@@ -68,8 +68,8 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl tar openssl iproute2 coturn ffmpeg
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rproxy-api
           path: target/debug
@@ -84,8 +84,8 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl tar iproute2 coturn chromium nodejs
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rproxy-api
           path: target/debug
@@ -104,8 +104,8 @@ jobs:
     steps:
       - name: packages
         run: apk add --no-cache bash coreutils curl python3 iproute2 suricata
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rproxy-api
           path: target/debug
