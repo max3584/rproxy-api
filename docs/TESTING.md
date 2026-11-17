@@ -27,7 +27,7 @@ GitHub のランナーは Ubuntu の VM だけなので、ジョブは Alpine �
 | Interop の `crowdsec` | `crowdsecurity/crowdsec`（CrowdSec の公式のイメージ。Alpine。Alpine のパッケージに CrowdSec がない）、特権つき |
 | Cross build・Release の `build` | `alpine:3.24`。musl の x86_64 はそのまま、ほかは cargo-zigbuild（zig）でクロスビルドし、gnu は glibc 2.17 向けにリンクする（`scripts/build-release.sh`） |
 | Release の `apt`・Cross build の `apt (dry run)` | `debian:13-slim`（apt リポジトリを作る apt-ftparchive が Debian の道具） |
-| CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる |
+| CI の `deb`・`install` | ランナーの VM（Ubuntu）で直接。.deb のインストール・apt リポジトリからの更新・purge と、install.sh（systemd が前提）を確かめるので、systemd が PID 1 で動いている必要がある（コンテナではできない）。Rust はビルドせず、`package` ジョブ（Alpine）が作った musl のバイナリと .deb を確かめる。`deb` は署名した apt リポジトリを作るために apt-utils（apt-ftparchive）を入れる（ubuntu-26.04 のイメージにはない） |
 | DPDK（`dpdk.yml`、#261） | ランナーの VM（Ubuntu）で直接。DPDK は Ubuntu のパッケージ（`libdpdk-dev`）から入れ、ヒュージページと `net_tap`（TAP のデバイス）にホストのカーネルと sudo が要る。下の「DPDK のデータプレーン」 |
 
 ファジングは sanitizer なしで動かす（Rust の AddressSanitizer は glibc のターゲットにしかない。下の「ファジング」）。

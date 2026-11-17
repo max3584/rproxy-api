@@ -4,15 +4,29 @@
 #
 #   scripts/test-deb.sh target/debian/rproxy-api_<version>_amd64.deb
 #
-# Needs root through sudo and systemd (the GitHub Ubuntu runners have both).
+# Needs root through sudo and systemd (the GitHub Ubuntu runners have both), and
+# apt-utils for apt-ftparchive (scripts/apt-repo.sh; not on the ubuntu-26.04 image).
 # Do not run it on a machine where rproxy-api is installed for real.
 set -euo pipefail
 
 deb=$(realpath "$1")
 work=$(mktemp -d)
-trap 'kill "$http" 2>/dev/null || true; rm -rf "$work"' EXIT
+# the background HTTP servers; empty until started (the trap runs under set -u, on any exit)
+blocker=
+http=
+cleanup() {
+	[ -z "$blocker" ] || kill "$blocker" 2>/dev/null || true
+	[ -z "$http" ] || kill "$http" 2>/dev/null || true
+	rm -rf "$work"
+}
+trap cleanup EXIT
 
-fail() { echo "FAIL: $*" >&2; sudo journalctl -u rproxy-api --no-pager -n 50 >&2 || true; exit 1; }
+fail() {
+	echo "FAIL: $*" >&2
+	sudo systemctl status rproxy-api --no-pager -l >&2 || true
+	sudo journalctl -u rproxy-api --no-pager -n 50 >&2 || true
+	exit 1
+}
 PORT=8080 # read from rproxy.env after the install
 api() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(sudo cat /etc/rproxy/tokens)" "http://127.0.0.1:$PORT$1"; }
 wait_api() {
@@ -28,7 +42,8 @@ python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
 blocker=$!
 sleep 0.5
 sudo apt-get install -y "$deb"
-kill $blocker
+kill "$blocker"
+blocker=
 PORT=$(sudo sed -n 's/^RPROXY_API_PORT=//p' /etc/rproxy/rproxy.env)
 [ "$PORT" = 8081 ] || fail "the control API did not move off the busy port 8080 (RPROXY_API_PORT=$PORT)"
 getent passwd rproxy-api >/dev/null || fail "no rproxy-api user"
@@ -43,7 +58,7 @@ sudo grep -Eqx '[0-9a-f]{64}' /etc/rproxy/tokens || fail "token is not 64 hex ch
 token=$(sudo cat /etc/rproxy/tokens)
 
 echo "== start"
-sudo systemctl enable --now rproxy-api
+sudo systemctl enable --now rproxy-api || fail "rproxy-api.service did not start"
 wait_api
 [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/rules")" = 401 ] || fail "API answered without a token"
 # the unit's capability lets it listen below 1024 as the rproxy-api user
@@ -78,6 +93,7 @@ systemctl is-active --quiet rproxy-api || fail "reload stopped the service"
 printf 'version: 9\nrules: []\n' | sudo tee /etc/rproxy/broken.yaml >/dev/null
 sudo cp /etc/rproxy/rproxy.env "$work/rproxy.env.saved"
 echo 'RPROXY_CONFIG=/etc/rproxy/broken.yaml' | sudo tee -a /etc/rproxy/rproxy.env >/dev/null
+echo "(a reload with a broken settings file: \"Job for rproxy-api.service failed\" next is expected)"
 if sudo systemctl reload rproxy-api; then
 	fail "reload went through with a broken settings file"
 fi
@@ -139,7 +155,7 @@ getent passwd rproxy >/dev/null || fail "v0.3.21 did not make the rproxy user"
 old_uid=$(id -u rproxy)
 # a key of the service's, as an operator gives it (the owner check of v0.4 needs this)
 sudo install -o rproxy -g rproxy -m 0640 /dev/null /etc/rproxy/service.key
-sudo systemctl enable --now rproxy-api
+sudo systemctl enable --now rproxy-api || fail "v0.3.21's rproxy-api.service did not start"
 PORT=$(sudo sed -n 's/^RPROXY_API_PORT=//p' /etc/rproxy/rproxy.env)
 wait_api
 sudo apt-get install -y "$deb" | tee "$work/upgrade.log"
