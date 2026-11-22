@@ -52,7 +52,7 @@ v0.4.0 の後は、**形を足すだけの変更（新しい設定・API のエ�
 
 1. **バージョンを上げる PR**（ブランチ `release/vX.Y.Z`）
    - rproxy-api: `Cargo.toml` の `version` と、`Cargo.lock` の rproxy-api の版（`cargo update -p rproxy-api --offline`）。`Cargo.lock` を直し忘れると、`--locked` でビルドする CI とリリースが止まる
-   - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）。新しい rproxy-api の機能が要るようになったら、必要な rproxy-api の最小の版（UI の `components/version.ts`）も上げる
+   - UI: `npm version X.Y.Z --no-git-tag-version`（`package.json` と `package-lock.json`）と、Helm chart の `charts/rproxy-ui/Chart.yaml` の `version`・`appVersion`（CI の helm chart のジョブが `package.json` と同じかを確かめる）。新しい rproxy-api の機能が要るようになったら、必要な rproxy-api の最小の版（UI の `components/version.ts`）も上げる
    - 両方のリポジトリにまたがる変更は、両方で同じ名前のブランチにする（UI の e2e は同じ名前の rproxy-api のブランチがあればそれで、なければ既定ブランチでテストする）
 2. **マージされたらリリースする**（`vX.Y.Z`。タグはルールセットで削除・付け替えができないので、打つ前にコミットを確かめる）
    - rproxy-api: タグの push で `release.yml` がバイナリ・.deb を作り、GitHub Release に添付し、apt リポジトリに rproxy-api を載せる。タグと `Cargo.toml` の `version` が違うと止まる

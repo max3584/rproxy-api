@@ -52,7 +52,7 @@ Done only in the repository being released (the other one's version is not bumpe
 
 1. **A version bump PR** (branch `release/vX.Y.Z`)
    - rproxy-api: `version` in `Cargo.toml` and the rproxy-api entry in `Cargo.lock` (`cargo update -p rproxy-api --offline`). If `Cargo.lock` is not updated, CI and the release, which build with `--locked`, stop
-   - UI: `npm version X.Y.Z --no-git-tag-version` (`package.json` and `package-lock.json`). When the UI starts to need a newer rproxy-api feature, also raise the minimum rproxy-api version (`components/version.ts` in the UI)
+   - UI: `npm version X.Y.Z --no-git-tag-version` (`package.json` and `package-lock.json`), plus `version` and `appVersion` in the Helm chart's `charts/rproxy-ui/Chart.yaml` (the CI helm chart job checks they match `package.json`). When the UI starts to need a newer rproxy-api feature, also raise the minimum rproxy-api version (`components/version.ts` in the UI)
    - For a change spanning both repositories, use the same branch name in both (the UI's e2e tests run against the rproxy-api branch with the same name if there is one, otherwise the default branch)
 2. **Once merged, release** (`vX.Y.Z`. Tags cannot be deleted or moved because of the ruleset, so verify the commit before tagging)
    - rproxy-api: pushing the tag makes `release.yml` build the binaries and .deb files, attach them to the GitHub Release, and publish rproxy-api to the apt repository. It stops if the tag and `version` in `Cargo.toml` differ
